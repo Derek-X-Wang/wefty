@@ -75,12 +75,24 @@ and record the refusal through receipts.
 - #282 pulls the private-network tier from #109 forward for Computers without
   retracting #109's `outbound open` decision. Computer-to-Computer veth traffic,
   Computer-to-Node listeners, and unsolicited inbound are rejected; external
-  egress is routed and masqueraded. A helper DNS proxy selected from the exact
+  egress is routed and masqueraded. IPv6 is disabled inside the Computer
+  namespace and a mirrored `ip6tables` policy rejects the same crossover and
+  Node-listener paths if a future image re-enables it. A helper DNS proxy selected from the exact
   resolver snapshot mounted into the Computer preserves a Node-loopback resolver
   without exposing that or any other Node listener. It forwards from the Node
   namespace to systemd-resolved's advertised non-loopback uplink when present and
   falls back to the Node stub otherwise; routable resolvers use the veth. Ordinary
   OCI remains on shared networking.
+- Computer networking uses disjoint `/30` allocations in the RFC 2544
+  benchmarking range `198.18.0.0/15`; the endpoint range is therefore capped at
+  32,768 ports. Helper startup refuses a conflicting non-Wefty Node route, and
+  masquerading is scoped to each live Computer address rather than the whole
+  benchmarking range.
+- The helper owns the Node-wide forwarding and firewall state while Computers
+  are live. It verifies and repairs the IPv4 and IPv6 chains on each Computer
+  start and on its periodic sweep cadence, reports their observed state through
+  doctor, removes unowned veth/rule residue during startup sweep, and restores
+  helper-enabled forwarding on orderly close.
 - Runtime isolation evidence is observed after `task.Start`: the helper records
   both namespace inodes and scans its own `/proc/net/unix` for the exact X token.
   Serialized-profile inference cannot earn the doctor verdict.

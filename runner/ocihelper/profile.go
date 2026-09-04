@@ -281,10 +281,6 @@ func BuildRuntimeSpec(ctx context.Context, input RuntimeSpecInput) (*RuntimeSpec
 		return nil, &RuntimeSpecRejectionError{err: err}
 	}
 	receipt := profileReceipt(input.Workload)
-	if input.Workload.Computer {
-		// Kernel observations after task.Start fill the namespace and socket
-		// fields. The serialized profile cannot earn runtime isolation evidence.
-	}
 	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: receipt}, nil
 }
 

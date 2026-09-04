@@ -154,8 +154,10 @@ type ContainerdEngine struct {
 	cgroupRemove                func(string) error
 	afterLogSealObservation     func()
 	afterCgroupObservation      func()
-	computerFirewallOnce        sync.Once
-	computerFirewallErr         error
+	computerNetworkMu           sync.Mutex
+	computerForwardingObserved  bool
+	computerForwardingOwned     bool
+	computerFirewallConfigured  bool
 	observeComputerIsolation    func(*pinnedNetworkNamespace, string) (string, string, bool, error)
 }
 
@@ -184,7 +186,7 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	if config.RuncExecutable != "" && !filepath.IsAbs(config.RuncExecutable) {
 		return nil, errors.New("configured runc executable must be absolute")
 	}
-	for name, path := range map[string]string{"ip": config.IPExecutable, "iptables": config.IPTablesExecutable} {
+	for name, path := range map[string]string{"ip": config.IPExecutable, "iptables": config.IPTablesExecutable, "ip6tables": config.IP6TablesExecutable} {
 		if path != "" && !filepath.IsAbs(path) {
 			return nil, fmt.Errorf("configured %s executable must be absolute", name)
 		}
@@ -221,6 +223,12 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.AttemptPortMin > config.AttemptPortMax {
 		return nil, errors.New("OCI attempt port range is invalid")
+	}
+	if uint32(config.AttemptPortMax)-uint32(config.AttemptPortMin)+1 > 1<<15 {
+		return nil, errors.New("OCI Computer attempt port range exceeds 32768 disjoint /30 allocations in 198.18.0.0/15")
+	}
+	if err := validateComputerNetworkRouteSpace(); err != nil {
+		return nil, err
 	}
 	copyResolver := config.ResolverPath == ""
 	copyHosts := config.HostsPath == ""
@@ -344,6 +352,10 @@ func (engine *ContainerdEngine) Close() error {
 		if engine.cacheDone != nil {
 			<-engine.cacheDone
 		}
+		cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
+		engine.closeErr = errors.Join(engine.closeErr, engine.releaseAllAttemptRuntimeState(cleanupContext))
+		engine.closeErr = errors.Join(engine.closeErr, engine.closeComputerFirewall(cleanupContext))
+		cancelCleanup()
 		if engine.client != nil {
 			engine.closeErr = errors.Join(engine.closeErr, engine.client.Close())
 		}
@@ -360,6 +372,20 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 		status.LastProfile = &receipt
 	}
 	engine.mu.Unlock()
+	attachments := engine.computerFirewallAttachments()
+	status.ComputerAttemptsLive = len(attachments) > 0
+	firewallContext, cancelFirewall := context.WithTimeout(ctx, doctorRuntimeReadTimeout)
+	iptablePath, iptableErr := resolveRootOwnedNetworkTool(engine.config.IPTablesExecutable, "iptables", "/usr/sbin/iptables", "/usr/bin/iptables", "/sbin/iptables")
+	ip6tablePath, ip6tableErr := resolveRootOwnedNetworkTool(engine.config.IP6TablesExecutable, "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if iptableErr == nil && ip6tableErr == nil {
+		status.ComputerFirewallPresent, iptableErr = observeComputerFirewall(firewallContext, iptablePath, ip6tablePath, attachments)
+	}
+	cancelFirewall()
+	if iptableErr != nil || ip6tableErr != nil {
+		status.ComputerFirewallRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorComputerFirewall}
+	} else {
+		status.ComputerFirewallRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+	}
 	engine.capacityMu.Lock()
 	if engine.lastAdmission != nil {
 		receipt := *engine.lastAdmission
@@ -2228,13 +2254,21 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		return VerifyResponse{}, err
 	}
 	if absent && request.Scope == VerifyNamespace {
-		engine.releaseVerifiedNamespace()
+		if err := engine.releaseVerifiedNamespace(ctx); err != nil {
+			return VerifyResponse{}, err
+		}
 	}
 	return response, nil
 }
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
 	ctx = engineContext(ctx)
+	engine.computerNetworkMu.Lock()
+	computerNetworkInventory, computerNetworkEvidence, err := engine.sweepComputerNetworkResidue(ctx)
+	engine.computerNetworkMu.Unlock()
+	if err != nil {
+		return SweepResponse{}, err
+	}
 	if err := engine.cleanupExpiredHandoffs(time.Now()); err != nil {
 		return SweepResponse{}, err
 	}
@@ -2261,7 +2295,7 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	observedInventory := cloneResourceInventory(inventory)
+	observedInventory := mergeResourceInventory(cloneResourceInventory(inventory), computerNetworkInventory)
 	containersList, err := engine.client.Containers(ctx)
 	if err != nil {
 		return SweepResponse{}, err
@@ -2329,7 +2363,8 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
 	response.DurableRetentions = append(logRetentions, cgroupRetentions...)
-	response.Evidence = append(computerDiskEvidence, logEvidence...)
+	response.Evidence = append(computerNetworkEvidence, computerDiskEvidence...)
+	response.Evidence = append(response.Evidence, logEvidence...)
 	response.Evidence = append(response.Evidence, cgroupEvidence...)
 	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
 		return SweepResponse{}, err
@@ -2491,12 +2526,14 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
 	var networkNamespace *pinnedNetworkNamespace
-	if request.Authority.validate() == nil {
+	if authorityErr := request.Authority.validate(); authorityErr == nil {
 		attempt, err := engine.attempt(request.Authority)
 		if err != nil {
 			return err
 		}
 		networkNamespace = attempt.networkNamespace
+	} else if request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl {
+		return &ComputerAttemptAuthorityRefusalError{Cause: authorityErr}
 	}
 	if request.CgroupID != "" {
 		bindContext, cancelBind := context.WithTimeout(ctx, engine.config.AttemptPortBindTimeout)
@@ -2522,6 +2559,16 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 	}
 	return Relay(ctx, stream, backend)
 }
+
+type ComputerAttemptAuthorityRefusalError struct {
+	Cause error
+}
+
+func (failure *ComputerAttemptAuthorityRefusalError) Error() string {
+	return "refuse Computer endpoint without complete attempt authority: " + failure.Cause.Error()
+}
+
+func (failure *ComputerAttemptAuthorityRefusalError) Unwrap() error { return failure.Cause }
 
 func (engine *ContainerdEngine) SetComputerControlState(_ context.Context, request SetComputerControlStateRequest) error {
 	attempt, err := engine.attempt(request.Authority)
@@ -2709,10 +2756,10 @@ func (engine *ContainerdEngine) sweepDeletedAttemptCgroup(ctx context.Context, r
 
 func (engine *ContainerdEngine) releaseVerifiedAttempt(ctx context.Context, authorityKey string) error {
 	pinErr := engine.releaseAttemptImagePin(ctx, authorityKey)
-	engine.releaseAttemptRuntimeState(authorityKey)
+	runtimeErr := engine.releaseAttemptRuntimeState(ctx, authorityKey)
 	engine.releaseCapacityReservation(authorityKey)
 	ownershipErr := deferRetryableAttemptOwnershipRelease(engine.removeAttemptOwnershipRecordByKeyIfQuiescent(ctx, authorityKey))
-	return errors.Join(pinErr, ownershipErr)
+	return errors.Join(pinErr, runtimeErr, ownershipErr)
 }
 
 func deferRetryableAttemptOwnershipRelease(ownershipErr error) error {
@@ -2784,20 +2831,10 @@ func (engine *ContainerdEngine) releaseAttemptImagePin(ctx context.Context, auth
 	return nil
 }
 
-func (engine *ContainerdEngine) releaseAttemptRuntimeState(authorityKey string) {
+func (engine *ContainerdEngine) releaseAttemptRuntimeState(ctx context.Context, authorityKey string) error {
 	engine.mu.Lock()
 	attempt := engine.attempts[authorityKey]
 	delete(engine.attempts, authorityKey)
-	if attempt != nil {
-		attempt.mu.Lock()
-		for name, hold := range attempt.endpointHolds {
-			_ = hold.Close()
-			delete(attempt.endpointHolds, name)
-		}
-		_ = attempt.computerNetwork.close()
-		_ = attempt.networkNamespace.close()
-		attempt.mu.Unlock()
-	}
 	if attempt != nil {
 		for _, port := range attempt.endpoints {
 			if engine.ports[port] == authorityKey {
@@ -2806,29 +2843,62 @@ func (engine *ContainerdEngine) releaseAttemptRuntimeState(authorityKey string) 
 		}
 	}
 	engine.mu.Unlock()
+	if attempt == nil {
+		return nil
+	}
+	attempt.mu.Lock()
+	holds := make([]net.Listener, 0, len(attempt.endpointHolds))
+	for name, hold := range attempt.endpointHolds {
+		holds = append(holds, hold)
+		delete(attempt.endpointHolds, name)
+	}
+	network := attempt.computerNetwork
+	attempt.computerNetwork = nil
+	namespace := attempt.networkNamespace
+	attempt.networkNamespace = nil
+	attempt.mu.Unlock()
+	var errs []error
+	for _, hold := range holds {
+		errs = append(errs, hold.Close())
+	}
+	if network != nil {
+		engine.computerNetworkMu.Lock()
+		errs = append(errs, network.closeContext(ctx))
+		engine.computerNetworkMu.Unlock()
+	}
+	if namespace != nil {
+		errs = append(errs, namespace.close())
+	}
+	return errors.Join(errs...)
 }
 
-func (engine *ContainerdEngine) releaseVerifiedNamespace() {
+func (engine *ContainerdEngine) releaseAllAttemptRuntimeState(ctx context.Context) error {
+	engine.mu.Lock()
+	keys := make([]string, 0, len(engine.attempts))
+	for key := range engine.attempts {
+		keys = append(keys, key)
+	}
+	engine.mu.Unlock()
+	var errs []error
+	for _, key := range keys {
+		errs = append(errs, engine.releaseAttemptRuntimeState(ctx, key))
+	}
+	return errors.Join(errs...)
+}
+
+func (engine *ContainerdEngine) releaseVerifiedNamespace(ctx context.Context) error {
 	engine.imageResourceMu.Lock()
 	engine.attemptImagePins = make(map[string]imageOperationKey)
 	engine.bindingImagePins = make(map[string]imageOperationKey)
 	engine.cacheReady = false
 	engine.imageResourceMu.Unlock()
+	err := engine.releaseAllAttemptRuntimeState(ctx)
 	engine.mu.Lock()
-	for _, attempt := range engine.attempts {
-		attempt.mu.Lock()
-		for _, hold := range attempt.endpointHolds {
-			_ = hold.Close()
-		}
-		_ = attempt.computerNetwork.close()
-		_ = attempt.networkNamespace.close()
-		attempt.mu.Unlock()
-	}
-	engine.attempts = make(map[string]*containerdAttempt)
 	engine.ports = make(map[uint16]string)
 	engine.nextPort = engine.config.AttemptPortMin
 	engine.mu.Unlock()
 	engine.clearCapacityReservations()
+	return err
 }
 
 func (engine *ContainerdEngine) localImage(ctx context.Context, reference, immutableDigest string) (containerd.Image, ImageEvidence, error) {
@@ -3482,6 +3552,8 @@ func sortResourceInventory(result *ResourceInventory) {
 		return recoveryInventoryEntryKey(result.ComputerStorageQuarantined[i]) < recoveryInventoryEntryKey(result.ComputerStorageQuarantined[j])
 	})
 	sort.Strings(result.ComputerDiskAnomalies)
+	sort.Strings(result.ComputerNetworkLinks)
+	sort.Strings(result.ComputerFirewallRules)
 }
 
 func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInventory) error {
@@ -4680,6 +4752,8 @@ func subtractResourceInventory(observed, residue ResourceInventory) ResourceInve
 		ComputerStorageDeferred:    subtractRecoveryInventory(observed.ComputerStorageDeferred, residue.ComputerStorageDeferred),
 		ComputerStorageQuarantined: subtractRecoveryInventory(observed.ComputerStorageQuarantined, residue.ComputerStorageQuarantined),
 		ComputerDiskAnomalies:      subtract(observed.ComputerDiskAnomalies, residue.ComputerDiskAnomalies),
+		ComputerNetworkLinks:       subtract(observed.ComputerNetworkLinks, residue.ComputerNetworkLinks),
+		ComputerFirewallRules:      subtract(observed.ComputerFirewallRules, residue.ComputerFirewallRules),
 	}
 }
 
@@ -4714,7 +4788,7 @@ func readDirectoryIfPresent(path string) ([]os.DirEntry, error) {
 }
 
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies) + len(inventory.ComputerNetworkLinks) + len(inventory.ComputerFirewallRules)
 }
 
 func subtractRecoveryInventory(values, excluded []ComputerStorageRecoveryInventoryEntry) []ComputerStorageRecoveryInventoryEntry {

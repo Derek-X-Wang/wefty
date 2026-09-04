@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,41 @@ const (
 	computerEgressProbeBody = "wefty-computer-egress-v1\n"
 	computerResolverUplink  = "/run/systemd/resolve/resolv.conf"
 )
+
+type ComputerNetworkConflictError struct {
+	Route string
+}
+
+func (failure *ComputerNetworkConflictError) Error() string {
+	return "Computer network address space 198.18.0.0/15 conflicts with Node route " + failure.Route
+}
+
+func validateComputerNetworkRouteSpace() error {
+	_, reserved, err := net.ParseCIDR("198.18.0.0/15")
+	if err != nil {
+		return err
+	}
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("inspect Node routes for Computer network address space: %w", err)
+	}
+	for _, route := range routes {
+		if route.Dst == nil || !cidrIntersects(reserved, route.Dst) {
+			continue
+		}
+		if route.LinkIndex > 0 {
+			if link, linkErr := netlink.LinkByIndex(route.LinkIndex); linkErr == nil && strings.HasPrefix(link.Attrs().Name, computerHostLinkPrefix) {
+				continue
+			}
+		}
+		return &ComputerNetworkConflictError{Route: route.String()}
+	}
+	return nil
+}
+
+func cidrIntersects(left, right *net.IPNet) bool {
+	return left != nil && right != nil && (left.Contains(right.IP) || right.Contains(left.IP))
+}
 
 type pinnedNetworkNamespace struct {
 	mu   sync.Mutex
@@ -126,21 +162,26 @@ func inNetworkNamespace(namespace *pinnedNetworkNamespace, operation func() erro
 }
 
 type computerNetworkAttachment struct {
-	hostLink     string
-	hostAddress  string
-	guestAddress string
-	gateway      string
-	ipPath       string
-	iptablesPath string
-	probePort    uint16
-	probe        net.Listener
-	dns          *computerDNSProxy
+	hostLink      string
+	hostAddress   string
+	guestAddress  string
+	gateway       string
+	ipPath        string
+	iptablesPath  string
+	ip6tablesPath string
+	probePort     uint16
+	probe         net.Listener
+	dns           *computerDNSProxy
 }
 
 type computerDNSProxy struct {
 	udp       net.PacketConn
 	tcp       net.Listener
 	upstream  string
+	tcpSlots  chan struct{}
+	rateMu    sync.Mutex
+	rateStart time.Time
+	rateCount int
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -176,13 +217,24 @@ func (engine *ContainerdEngine) prepareComputerNetwork(ctx context.Context, name
 	if err != nil {
 		return nil, err
 	}
-	engine.computerFirewallOnce.Do(func() {
-		engine.computerFirewallErr = ensureComputerFirewall(ctx, iptablesPath)
-	})
-	if engine.computerFirewallErr != nil {
-		return nil, engine.computerFirewallErr
+	ip6tablesPath, err := resolveRootOwnedNetworkTool(engine.config.IP6TablesExecutable, "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if err != nil {
+		return nil, err
 	}
-	return setupComputerNetwork(ctx, namespace, port, engine.config.AttemptPortMin, ipPath, iptablesPath, engine.config.ResolverPath)
+	engine.computerNetworkMu.Lock()
+	defer engine.computerNetworkMu.Unlock()
+	if !engine.computerForwardingObserved {
+		value, readErr := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+		if readErr != nil {
+			return nil, fmt.Errorf("observe Computer IPv4 forwarding: %w", readErr)
+		}
+		engine.computerForwardingObserved = true
+		engine.computerForwardingOwned = strings.TrimSpace(string(value)) == "0"
+	}
+	if err := engine.reconcileComputerFirewallLocked(ctx, iptablesPath, ip6tablesPath); err != nil {
+		return nil, err
+	}
+	return setupComputerNetworkWithTools(ctx, namespace, port, engine.config.AttemptPortMin, ipPath, iptablesPath, ip6tablesPath, engine.config.ResolverPath)
 }
 
 func computerNetworkAddresses(port, minimum uint16) (host, guest net.IP, err error) {
@@ -201,8 +253,16 @@ func uint32IPv4(value uint32) net.IP {
 }
 
 func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace, port, minimum uint16, ipPath, iptablesPath, resolverPath string) (_ *computerNetworkAttachment, err error) {
-	if namespace == nil || port == 0 || ipPath == "" || iptablesPath == "" || resolverPath == "" {
-		return nil, errors.New("Computer network setup requires namespace, port, ip, iptables, and resolver configuration")
+	ip6tablesPath, err := resolveRootOwnedNetworkTool("", "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if err != nil {
+		return nil, err
+	}
+	return setupComputerNetworkWithTools(ctx, namespace, port, minimum, ipPath, iptablesPath, ip6tablesPath, resolverPath)
+}
+
+func setupComputerNetworkWithTools(ctx context.Context, namespace *pinnedNetworkNamespace, port, minimum uint16, ipPath, iptablesPath, ip6tablesPath, resolverPath string) (_ *computerNetworkAttachment, err error) {
+	if namespace == nil || port == 0 || ipPath == "" || iptablesPath == "" || ip6tablesPath == "" || resolverPath == "" {
+		return nil, errors.New("Computer network setup requires namespace, port, ip, iptables, ip6tables, and resolver configuration")
 	}
 	hostAddress, guestAddress, err := computerNetworkAddresses(port, minimum)
 	if err != nil {
@@ -212,7 +272,8 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 	guestLink := computerGuestLinkPrefix + strconv.Itoa(int(port))
 	attachment := &computerNetworkAttachment{
 		hostLink: hostLink, hostAddress: hostAddress.String(), guestAddress: guestAddress.String(),
-		gateway: hostAddress.String(), ipPath: ipPath, iptablesPath: iptablesPath, probePort: port,
+		gateway: hostAddress.String(), ipPath: ipPath, iptablesPath: iptablesPath, ip6tablesPath: ip6tablesPath,
+		probePort: port,
 	}
 	defer func() {
 		if err != nil {
@@ -252,6 +313,11 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 		return nil, err
 	}
 	err = inNetworkNamespace(namespace, func() error {
+		for _, name := range []string{"all", "default"} {
+			if writeErr := os.WriteFile("/proc/sys/net/ipv6/conf/"+name+"/disable_ipv6", []byte("1\n"), 0); writeErr != nil {
+				return fmt.Errorf("disable Computer IPv6 for %s: %w", name, writeErr)
+			}
+		}
 		for _, arguments := range [][]string{
 			{"link", "set", "lo", "up"},
 			{"link", "set", guestLink, "name", computerGuestLinkName},
@@ -282,13 +348,21 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 			return nil, fmt.Errorf("start Computer loopback resolver proxy: %w", err)
 		}
 	}
-	attachment.probe, err = net.Listen("tcp4", net.JoinHostPort(attachment.gateway, strconv.Itoa(int(port))))
+	listenConfig := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
+		var controlErr error
+		if err := raw.Control(func(fd uintptr) {
+			controlErr = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
+		}); err != nil {
+			return err
+		}
+		return controlErr
+	}}
+	attachment.probe, err = listenConfig.Listen(ctx, "tcp4", net.JoinHostPort(attachment.gateway, strconv.Itoa(int(port))))
 	if err != nil {
 		return nil, fmt.Errorf("listen on Computer egress probe: %w", err)
 	}
-	allowRule := []string{"-w", "5", "-I", computerFirewallInput, "1", "-i", hostLink, "-d", attachment.gateway, "-p", "tcp", "--dport", strconv.Itoa(int(port)), "-j", "ACCEPT"}
-	if output, commandErr := exec.CommandContext(ctx, iptablesPath, allowRule...).CombinedOutput(); commandErr != nil {
-		return nil, fmt.Errorf("allow Computer egress probe: %w: %s", commandErr, strings.TrimSpace(string(output)))
+	if err := ensureComputerAttemptFirewallRules(ctx, attachment); err != nil {
+		return nil, err
 	}
 	go serveComputerEgressProbe(attachment.probe)
 	return attachment, nil
@@ -346,7 +420,7 @@ func startComputerDNSProxy(namespace *pinnedNetworkNamespace, listenAddress, ups
 	if namespace == nil || listenAddress == "" || upstreamAddress == "" {
 		return nil, errors.New("Computer DNS proxy requires namespace, listener, and upstream")
 	}
-	proxy := &computerDNSProxy{upstream: upstreamAddress}
+	proxy := &computerDNSProxy{upstream: upstreamAddress, tcpSlots: make(chan struct{}, 8)}
 	defer func() {
 		if err != nil {
 			_ = proxy.close()
@@ -377,19 +451,23 @@ func (proxy *computerDNSProxy) serveUDP() {
 		if err != nil {
 			return
 		}
+		query := slices.Clone(buffer[:length])
+		if !validDNSQuery(query) || !proxy.allowDNSQuery(time.Now()) {
+			continue
+		}
 		upstream, err := net.DialTimeout("udp4", proxy.upstream, 2*time.Second)
 		if err != nil {
 			continue
 		}
 		_ = upstream.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := upstream.Write(buffer[:length]); err != nil {
+		if _, err := upstream.Write(query); err != nil {
 			_ = upstream.Close()
 			continue
 		}
 		response := make([]byte, 65535)
 		length, err = upstream.Read(response)
 		_ = upstream.Close()
-		if err == nil {
+		if err == nil && validDNSResponse(query, response[:length]) {
 			_, _ = listener.WriteTo(response[:length], client)
 		}
 	}
@@ -402,8 +480,16 @@ func (proxy *computerDNSProxy) serveTCP() {
 		if err != nil {
 			return
 		}
-		_ = proxy.forwardTCP(client)
-		_ = client.Close()
+		select {
+		case proxy.tcpSlots <- struct{}{}:
+			go func() {
+				defer func() { <-proxy.tcpSlots }()
+				_ = proxy.forwardTCP(client)
+				_ = client.Close()
+			}()
+		default:
+			_ = client.Close()
+		}
 	}
 }
 
@@ -416,6 +502,7 @@ func (proxy *computerDNSProxy) forwardTCP(client net.Conn) error {
 	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = upstream.SetDeadline(time.Now().Add(5 * time.Second))
 	for {
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
 		header := make([]byte, 2)
 		if _, err := io.ReadFull(client, header); err != nil {
 			return err
@@ -424,9 +511,14 @@ func (proxy *computerDNSProxy) forwardTCP(client net.Conn) error {
 		if _, err := io.ReadFull(client, query); err != nil {
 			return err
 		}
+		if !validDNSQuery(query) || !proxy.allowDNSQuery(time.Now()) {
+			return errors.New("reject non-DNS or rate-limited Computer resolver payload")
+		}
+		_ = upstream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := upstream.Write(append(header, query...)); err != nil {
 			return err
 		}
+		_ = upstream.SetReadDeadline(time.Now().Add(5 * time.Second))
 		if _, err := io.ReadFull(upstream, header); err != nil {
 			return err
 		}
@@ -434,10 +526,36 @@ func (proxy *computerDNSProxy) forwardTCP(client net.Conn) error {
 		if _, err := io.ReadFull(upstream, response); err != nil {
 			return err
 		}
+		if !validDNSResponse(query, response) {
+			return errors.New("reject invalid upstream DNS response")
+		}
+		_ = client.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := client.Write(append(header, response...)); err != nil {
 			return err
 		}
 	}
+}
+
+func validDNSQuery(payload []byte) bool {
+	return len(payload) >= 12 && payload[2]&0x80 == 0 && binary.BigEndian.Uint16(payload[4:6]) > 0
+}
+
+func validDNSResponse(query, response []byte) bool {
+	return len(query) >= 2 && len(response) >= 12 && response[2]&0x80 != 0 && response[0] == query[0] && response[1] == query[1]
+}
+
+func (proxy *computerDNSProxy) allowDNSQuery(now time.Time) bool {
+	proxy.rateMu.Lock()
+	defer proxy.rateMu.Unlock()
+	if proxy.rateStart.IsZero() || now.Sub(proxy.rateStart) >= time.Second {
+		proxy.rateStart = now
+		proxy.rateCount = 0
+	}
+	if proxy.rateCount >= 128 {
+		return false
+	}
+	proxy.rateCount++
+	return true
 }
 
 func (proxy *computerDNSProxy) close() error {
@@ -470,104 +588,433 @@ func serveComputerEgressProbe(listener net.Listener) {
 }
 
 func (attachment *computerNetworkAttachment) close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return attachment.closeContext(ctx)
+}
+
+func (attachment *computerNetworkAttachment) closeContext(ctx context.Context) error {
 	if attachment == nil || attachment.hostLink == "" || attachment.ipPath == "" {
 		return nil
 	}
+	var errs []error
 	if attachment.probe != nil {
-		_ = attachment.probe.Close()
+		errs = append(errs, attachment.probe.Close())
 		attachment.probe = nil
 	}
 	if attachment.dns != nil {
-		_ = attachment.dns.close()
+		errs = append(errs, attachment.dns.close())
 		attachment.dns = nil
 	}
-	if attachment.iptablesPath != "" && attachment.probePort != 0 {
-		arguments := []string{"-w", "5", "-D", computerFirewallInput, "-i", attachment.hostLink, "-d", attachment.gateway, "-p", "tcp", "--dport", strconv.Itoa(int(attachment.probePort)), "-j", "ACCEPT"}
-		_, _ = exec.Command(attachment.iptablesPath, arguments...).CombinedOutput()
+	for _, rule := range computerAttemptFirewallRules(attachment) {
+		arguments := append([]string{"-w", "5"}, rule.prefix()...)
+		arguments = append(arguments, "-D", rule.chain)
+		arguments = append(arguments, rule.arguments...)
+		if output, err := exec.CommandContext(ctx, rule.executable, arguments...).CombinedOutput(); err != nil && !strings.Contains(string(output), "Bad rule") {
+			errs = append(errs, fmt.Errorf("remove Computer firewall rule: %w: %s", err, strings.TrimSpace(string(output))))
+		}
 	}
-	output, err := exec.Command(attachment.ipPath, "link", "del", attachment.hostLink).CombinedOutput()
+	output, err := exec.CommandContext(ctx, attachment.ipPath, "link", "del", attachment.hostLink).CombinedOutput()
 	if err != nil && !strings.Contains(string(output), "Cannot find device") {
-		return fmt.Errorf("remove Computer veth %s: %w: %s", attachment.hostLink, err, strings.TrimSpace(string(output)))
+		errs = append(errs, fmt.Errorf("remove Computer veth %s: %w: %s", attachment.hostLink, err, strings.TrimSpace(string(output))))
 	}
 	attachment.hostLink = ""
-	return nil
+	return errors.Join(errs...)
 }
 
 func ensureComputerFirewall(ctx context.Context, iptablesPath string) error {
-	if iptablesPath == "" {
-		return errors.New("Computer firewall requires iptables")
+	ip6tablesPath, err := resolveRootOwnedNetworkTool("", "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if err != nil {
+		return err
+	}
+	return ensureComputerFirewallFamilies(ctx, iptablesPath, ip6tablesPath)
+}
+
+type computerFirewallRule struct {
+	executable string
+	table      string
+	chain      string
+	arguments  []string
+	insert     bool
+}
+
+func (rule computerFirewallRule) prefix() []string {
+	if rule.table == "" || rule.table == "filter" {
+		return nil
+	}
+	return []string{"-t", rule.table}
+}
+
+func runComputerFirewallCommand(ctx context.Context, executable string, arguments ...string) error {
+	output, err := exec.CommandContext(ctx, executable, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %w: %s", executable, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func ensureComputerFirewallRule(ctx context.Context, rule computerFirewallRule) error {
+	prefix := rule.prefix()
+	check := append(append(slices.Clone(prefix), "-C", rule.chain), rule.arguments...)
+	if err := runComputerFirewallCommand(ctx, rule.executable, check...); err == nil {
+		return nil
+	}
+	action := "-A"
+	position := []string{}
+	if rule.insert {
+		action = "-I"
+		position = []string{"1"}
+	}
+	add := append(append(append(slices.Clone(prefix), action, rule.chain), position...), rule.arguments...)
+	return runComputerFirewallCommand(ctx, rule.executable, add...)
+}
+
+func ensureComputerFirewallFamilies(ctx context.Context, iptablesPath, ip6tablesPath string) error {
+	if iptablesPath == "" || ip6tablesPath == "" {
+		return errors.New("Computer firewall requires iptables and ip6tables")
 	}
 	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0); err != nil {
 		return fmt.Errorf("enable Computer IPv4 forwarding: %w", err)
 	}
-	run := func(arguments ...string) error {
-		output, err := exec.CommandContext(ctx, iptablesPath, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s %s: %w: %s", iptablesPath, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
-		}
-		return nil
-	}
-	ensureChain := func(table, chain string) error {
+	ensureChain := func(executable, table, chain string) error {
 		arguments := []string{}
 		if table != "filter" {
 			arguments = append(arguments, "-t", table)
 		}
-		if err := run(append(arguments, "-N", chain)...); err != nil {
-			if checkErr := run(append(arguments, "-L", chain)...); checkErr != nil {
+		if err := runComputerFirewallCommand(ctx, executable, append(arguments, "-N", chain)...); err != nil {
+			if checkErr := runComputerFirewallCommand(ctx, executable, append(arguments, "-L", chain)...); checkErr != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	ensureRule := func(table, chain string, rule ...string) error {
-		prefix := []string{}
-		if table != "filter" {
-			prefix = append(prefix, "-t", table)
-		}
-		if err := run(append(append(prefix, "-C", chain), rule...)...); err == nil {
-			return nil
-		}
-		return run(append(append(prefix, "-I", chain, "1"), rule...)...)
-	}
-	for _, chain := range []struct{ table, name string }{{"filter", computerFirewallInput}, {"filter", computerFirewallForward}, {"nat", computerFirewallNAT}} {
-		if err := ensureChain(chain.table, chain.name); err != nil {
-			return err
-		}
-		arguments := []string{}
-		if chain.table != "filter" {
-			arguments = append(arguments, "-t", chain.table)
-		}
-		if err := run(append(arguments, "-F", chain.name)...); err != nil {
-			return err
+	for _, executable := range []string{iptablesPath, ip6tablesPath} {
+		for _, chain := range []struct{ table, name string }{{"filter", computerFirewallInput}, {"filter", computerFirewallForward}, {"nat", computerFirewallNAT}} {
+			if err := ensureChain(executable, chain.table, chain.name); err != nil {
+				return err
+			}
 		}
 	}
-	for _, jump := range []struct {
-		table, chain, target string
-	}{{"filter", "INPUT", computerFirewallInput}, {"filter", "FORWARD", computerFirewallForward}, {"nat", "POSTROUTING", computerFirewallNAT}} {
-		if err := ensureRule(jump.table, jump.chain, "-j", jump.target); err != nil {
+	for _, executable := range []string{iptablesPath, ip6tablesPath} {
+		for _, jump := range []struct {
+			table, chain, target string
+		}{{"filter", "INPUT", computerFirewallInput}, {"filter", "FORWARD", computerFirewallForward}, {"nat", "POSTROUTING", computerFirewallNAT}} {
+			if err := ensureComputerFirewallRule(ctx, computerFirewallRule{executable: executable, table: jump.table, chain: jump.chain, arguments: []string{"-j", jump.target}, insert: true}); err != nil {
+				return err
+			}
+		}
+	}
+	for _, rule := range computerBaseFirewallRules(iptablesPath, "icmp-port-unreachable") {
+		if err := ensureComputerFirewallRule(ctx, rule); err != nil {
 			return err
 		}
 	}
-	for _, rule := range []struct {
-		table, chain string
-		arguments    []string
-	}{
-		{"filter", computerFirewallInput, []string{"-i", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"}},
-		{"filter", computerFirewallForward, []string{"-i", computerHostLinkPrefix + "+", "-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"}},
-		{"filter", computerFirewallForward, []string{"-o", computerHostLinkPrefix + "+", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"}},
-		{"filter", computerFirewallForward, []string{"-i", computerHostLinkPrefix + "+", "-j", "ACCEPT"}},
-		{"filter", computerFirewallForward, []string{"-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"}},
-		{"nat", computerFirewallNAT, []string{"-s", "198.18.0.0/15", "-j", "MASQUERADE"}},
-	} {
-		prefix := []string{}
-		if rule.table != "filter" {
-			prefix = append(prefix, "-t", rule.table)
-		}
-		if err := run(append(append(prefix, "-A", rule.chain), rule.arguments...)...); err != nil {
+	for _, rule := range computerIPv6BaseFirewallRules(ip6tablesPath) {
+		if err := ensureComputerFirewallRule(ctx, rule); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func computerBaseFirewallRules(executable, rejectWith string) []computerFirewallRule {
+	return []computerFirewallRule{
+		{executable: executable, chain: computerFirewallInput, arguments: []string{"-i", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
+		{executable: executable, chain: computerFirewallForward, arguments: []string{"-i", computerHostLinkPrefix + "+", "-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
+		{executable: executable, chain: computerFirewallForward, arguments: []string{"-o", computerHostLinkPrefix + "+", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"}},
+		{executable: executable, chain: computerFirewallForward, arguments: []string{"-i", computerHostLinkPrefix + "+", "-j", "ACCEPT"}},
+		{executable: executable, chain: computerFirewallForward, arguments: []string{"-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
+	}
+}
+
+func computerIPv6BaseFirewallRules(executable string) []computerFirewallRule {
+	rules := computerBaseFirewallRules(executable, "icmp6-port-unreachable")
+	return append([]computerFirewallRule{
+		{executable: executable, chain: computerFirewallInput, arguments: []string{"-i", computerHostLinkPrefix + "+", "-p", "ipv6-icmp", "--icmpv6-type", "neighbor-solicitation", "-j", "ACCEPT"}, insert: true},
+		{executable: executable, chain: computerFirewallInput, arguments: []string{"-i", computerHostLinkPrefix + "+", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"}, insert: true},
+	}, rules...)
+}
+
+func computerAttemptFirewallRules(attachment *computerNetworkAttachment) []computerFirewallRule {
+	if attachment == nil || attachment.hostLink == "" || attachment.probePort == 0 {
+		return nil
+	}
+	comment := "WEFTY-COMPUTER-ATTEMPT:" + attachment.hostLink
+	return []computerFirewallRule{
+		{executable: attachment.iptablesPath, chain: computerFirewallInput, arguments: []string{"-i", attachment.hostLink, "-d", attachment.gateway, "-p", "tcp", "--dport", strconv.Itoa(int(attachment.probePort)), "-m", "socket", "--nowildcard", "--transparent", "-m", "comment", "--comment", comment + ":probe", "-j", "ACCEPT"}, insert: true},
+		{executable: attachment.iptablesPath, table: "nat", chain: computerFirewallNAT, arguments: []string{"-s", attachment.guestAddress + "/32", "-m", "comment", "--comment", comment + ":nat", "-j", "MASQUERADE"}, insert: true},
+	}
+}
+
+func ensureComputerAttemptFirewallRules(ctx context.Context, attachment *computerNetworkAttachment) error {
+	for _, rule := range computerAttemptFirewallRules(attachment) {
+		if err := ensureComputerFirewallRule(ctx, rule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) reconcileComputerFirewallLocked(ctx context.Context, iptablesPath, ip6tablesPath string) error {
+	if err := ensureComputerFirewallFamilies(ctx, iptablesPath, ip6tablesPath); err != nil {
+		return err
+	}
+	if err := removeLegacyComputerMasquerade(ctx, iptablesPath); err != nil {
+		return err
+	}
+	engine.computerFirewallConfigured = true
+	engine.mu.Lock()
+	attachments := make([]computerNetworkAttachment, 0, len(engine.attempts))
+	for _, attempt := range engine.attempts {
+		attempt.mu.Lock()
+		if attempt.computerNetwork != nil && attempt.computerNetwork.hostLink != "" {
+			attachments = append(attachments, *attempt.computerNetwork)
+		}
+		attempt.mu.Unlock()
+	}
+	engine.mu.Unlock()
+	for index := range attachments {
+		if err := ensureComputerAttemptFirewallRules(ctx, &attachments[index]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) reconcileComputerFirewall(ctx context.Context) error {
+	iptablesPath, err := resolveRootOwnedNetworkTool(engine.config.IPTablesExecutable, "iptables", "/usr/sbin/iptables", "/usr/bin/iptables", "/sbin/iptables")
+	if err != nil {
+		return err
+	}
+	ip6tablesPath, err := resolveRootOwnedNetworkTool(engine.config.IP6TablesExecutable, "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if err != nil {
+		return err
+	}
+	engine.computerNetworkMu.Lock()
+	defer engine.computerNetworkMu.Unlock()
+	return engine.reconcileComputerFirewallLocked(ctx, iptablesPath, ip6tablesPath)
+}
+
+func (engine *ContainerdEngine) computerFirewallAttachments() []computerNetworkAttachment {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	attachments := make([]computerNetworkAttachment, 0, len(engine.attempts))
+	for _, attempt := range engine.attempts {
+		attempt.mu.Lock()
+		if attempt.computerNetwork != nil && attempt.computerNetwork.hostLink != "" {
+			attachments = append(attachments, *attempt.computerNetwork)
+		}
+		attempt.mu.Unlock()
+	}
+	return attachments
+}
+
+func observeComputerFirewall(ctx context.Context, iptablesPath, ip6tablesPath string, attachments []computerNetworkAttachment) (bool, error) {
+	if iptablesPath == "" || ip6tablesPath == "" {
+		return false, errors.New("Computer firewall observation requires iptables and ip6tables")
+	}
+	rules := []computerFirewallRule{}
+	for _, executable := range []string{iptablesPath, ip6tablesPath} {
+		for _, jump := range []struct {
+			table, chain, target string
+		}{{"filter", "INPUT", computerFirewallInput}, {"filter", "FORWARD", computerFirewallForward}, {"nat", "POSTROUTING", computerFirewallNAT}} {
+			rules = append(rules, computerFirewallRule{executable: executable, table: jump.table, chain: jump.chain, arguments: []string{"-j", jump.target}})
+		}
+	}
+	rules = append(rules, computerBaseFirewallRules(iptablesPath, "icmp-port-unreachable")...)
+	rules = append(rules, computerIPv6BaseFirewallRules(ip6tablesPath)...)
+	for index := range attachments {
+		rules = append(rules, computerAttemptFirewallRules(&attachments[index])...)
+	}
+	for _, rule := range rules {
+		arguments := append(rule.prefix(), "-C", rule.chain)
+		arguments = append(arguments, rule.arguments...)
+		if err := runComputerFirewallCommand(ctx, rule.executable, arguments...); err != nil {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (engine *ContainerdEngine) closeComputerFirewall(ctx context.Context) error {
+	engine.computerNetworkMu.Lock()
+	defer engine.computerNetworkMu.Unlock()
+	if !engine.computerFirewallConfigured && !engine.computerForwardingObserved {
+		return nil
+	}
+	iptablesPath, iptablesErr := resolveRootOwnedNetworkTool(engine.config.IPTablesExecutable, "iptables", "/usr/sbin/iptables", "/usr/bin/iptables", "/sbin/iptables")
+	ip6tablesPath, ip6tablesErr := resolveRootOwnedNetworkTool(engine.config.IP6TablesExecutable, "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	var errs []error
+	if iptablesErr != nil || ip6tablesErr != nil {
+		errs = append(errs, iptablesErr, ip6tablesErr)
+	} else if engine.computerFirewallConfigured {
+		for _, executable := range []string{iptablesPath, ip6tablesPath} {
+			for _, jump := range []struct {
+				table, chain, target string
+			}{{"filter", "INPUT", computerFirewallInput}, {"filter", "FORWARD", computerFirewallForward}, {"nat", "POSTROUTING", computerFirewallNAT}} {
+				prefix := []string{}
+				if jump.table != "filter" {
+					prefix = []string{"-t", jump.table}
+				}
+				arguments := append(append(prefix, "-D", jump.chain), "-j", jump.target)
+				output, err := exec.CommandContext(ctx, executable, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
+				if err != nil && !computerFirewallRuleAbsent(output) {
+					errs = append(errs, fmt.Errorf("remove Computer firewall jump: %w: %s", err, strings.TrimSpace(string(output))))
+				}
+			}
+			for _, chain := range []struct{ table, name string }{{"filter", computerFirewallInput}, {"filter", computerFirewallForward}, {"nat", computerFirewallNAT}} {
+				prefix := []string{}
+				if chain.table != "filter" {
+					prefix = []string{"-t", chain.table}
+				}
+				for _, action := range []string{"-F", "-X"} {
+					arguments := append(append(slices.Clone(prefix), action), chain.name)
+					output, err := exec.CommandContext(ctx, executable, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
+					if err != nil && !computerFirewallRuleAbsent(output) {
+						errs = append(errs, fmt.Errorf("remove Computer firewall chain: %w: %s", err, strings.TrimSpace(string(output))))
+					}
+				}
+			}
+		}
+	}
+	if engine.computerForwardingOwned {
+		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("0\n"), 0); err != nil {
+			errs = append(errs, fmt.Errorf("restore Computer IPv4 forwarding: %w", err))
+		}
+	}
+	engine.computerFirewallConfigured = false
+	engine.computerForwardingObserved = false
+	engine.computerForwardingOwned = false
+	return errors.Join(errs...)
+}
+
+func computerFirewallRuleAbsent(output []byte) bool {
+	text := string(output)
+	return strings.Contains(text, "Bad rule") || strings.Contains(text, "No chain/target/match") || strings.Contains(text, "does a matching rule exist")
+}
+
+func removeLegacyComputerMasquerade(ctx context.Context, iptablesPath string) error {
+	legacy := []string{"-t", "nat", "-D", computerFirewallNAT, "-s", "198.18.0.0/15", "-j", "MASQUERADE"}
+	output, err := exec.CommandContext(ctx, iptablesPath, append([]string{"-w", "5"}, legacy...)...).CombinedOutput()
+	if err != nil && !computerFirewallRuleAbsent(output) {
+		return fmt.Errorf("remove broad Computer masquerade rule: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) sweepComputerNetworkResidue(ctx context.Context) (ResourceInventory, []SweepEvidence, error) {
+	inventory := ResourceInventory{ComputerNetworkLinks: []string{}, ComputerFirewallRules: []string{}}
+	active := make(map[string]struct{})
+	for _, attachment := range engine.computerFirewallAttachments() {
+		active[attachment.hostLink] = struct{}{}
+	}
+	links, err := netlink.LinkList()
+	if err != nil {
+		return inventory, nil, fmt.Errorf("inventory Computer network links: %w", err)
+	}
+	for _, link := range links {
+		name := link.Attrs().Name
+		if !strings.HasPrefix(name, computerHostLinkPrefix) {
+			continue
+		}
+		if _, owned := active[name]; !owned {
+			inventory.ComputerNetworkLinks = append(inventory.ComputerNetworkLinks, name)
+		}
+	}
+	iptablesPath, err := resolveRootOwnedNetworkTool(engine.config.IPTablesExecutable, "iptables", "/usr/sbin/iptables", "/usr/bin/iptables", "/sbin/iptables")
+	if err != nil {
+		return inventory, nil, err
+	}
+	ipPath, err := resolveRootOwnedNetworkTool(engine.config.IPExecutable, "ip", "/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip")
+	if err != nil {
+		return inventory, nil, err
+	}
+	rules, err := computerResidueFirewallRules(ctx, iptablesPath)
+	if err != nil {
+		return inventory, nil, err
+	}
+	var staleRules []computerFirewallRule
+	for _, rule := range rules {
+		link := computerFirewallRuleLink(rule.arguments)
+		_, owned := active[link]
+		legacyMasquerade := rule.table == "nat" && slices.Equal(rule.arguments, []string{"-s", "198.18.0.0/15", "-j", "MASQUERADE"})
+		if !owned || legacyMasquerade {
+			staleRules = append(staleRules, rule)
+			inventory.ComputerFirewallRules = append(inventory.ComputerFirewallRules, strings.Join(append([]string{rule.table, rule.chain}, rule.arguments...), " "))
+		}
+	}
+	var evidence []SweepEvidence
+	for index, rule := range staleRules {
+		started := time.Now()
+		arguments := append(rule.prefix(), "-D", rule.chain)
+		arguments = append(arguments, rule.arguments...)
+		if err := runComputerFirewallCommand(ctx, rule.executable, arguments...); err != nil {
+			return inventory, evidence, err
+		}
+		evidence = append(evidence, SweepEvidence{Class: RemovalResourceComputerFirewallRule, ID: inventory.ComputerFirewallRules[index], Action: SweepActionRemoved, Method: "iptables_delete", Duration: time.Since(started)})
+	}
+	for _, name := range inventory.ComputerNetworkLinks {
+		started := time.Now()
+		output, err := exec.CommandContext(ctx, ipPath, "link", "del", name).CombinedOutput()
+		if err != nil && !strings.Contains(string(output), "Cannot find device") {
+			return inventory, evidence, fmt.Errorf("sweep Computer network link %s: %w: %s", name, err, strings.TrimSpace(string(output)))
+		}
+		evidence = append(evidence, SweepEvidence{Class: RemovalResourceComputerNetworkLink, ID: name, Action: SweepActionRemoved, Method: "ip_link_delete", Duration: time.Since(started)})
+	}
+	slices.Sort(inventory.ComputerNetworkLinks)
+	slices.Sort(inventory.ComputerFirewallRules)
+	return inventory, evidence, nil
+}
+
+func computerResidueFirewallRules(ctx context.Context, iptablesPath string) ([]computerFirewallRule, error) {
+	queries := []struct{ table, chain string }{{"filter", computerFirewallInput}, {"nat", computerFirewallNAT}}
+	var rules []computerFirewallRule
+	for _, query := range queries {
+		prefix := []string{}
+		if query.table != "filter" {
+			prefix = []string{"-t", query.table}
+		}
+		arguments := append(slices.Clone(prefix), "-S", query.chain)
+		output, err := exec.CommandContext(ctx, iptablesPath, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
+		if err != nil {
+			if computerFirewallRuleAbsent(output) {
+				continue
+			}
+			return nil, fmt.Errorf("inventory Computer firewall rules: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 || fields[0] != "-A" || fields[1] != query.chain {
+				continue
+			}
+			for index := range fields {
+				fields[index] = strings.Trim(fields[index], "\"")
+			}
+			rule := computerFirewallRule{executable: iptablesPath, table: query.table, chain: query.chain, arguments: fields[2:]}
+			link := computerFirewallRuleLink(rule.arguments)
+			legacyMasquerade := query.table == "nat" && slices.Equal(rule.arguments, []string{"-s", "198.18.0.0/15", "-j", "MASQUERADE"})
+			if (strings.HasPrefix(link, computerHostLinkPrefix) && link != computerHostLinkPrefix+"+") || legacyMasquerade {
+				rules = append(rules, rule)
+			}
+		}
+	}
+	return rules, nil
+}
+
+func computerFirewallRuleLink(arguments []string) string {
+	for index, argument := range arguments {
+		if argument == "-i" && index+1 < len(arguments) {
+			return arguments[index+1]
+		}
+		if argument == "--comment" && index+1 < len(arguments) {
+			value := strings.TrimPrefix(arguments[index+1], "WEFTY-COMPUTER-ATTEMPT:")
+			if value != arguments[index+1] {
+				link, _, _ := strings.Cut(value, ":")
+				return link
+			}
+		}
+	}
+	return ""
 }
 
 func listenTaskLoopback(namespace *pinnedNetworkNamespace, port uint16) (net.Listener, error) {

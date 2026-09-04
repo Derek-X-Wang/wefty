@@ -476,6 +476,7 @@ const (
 	DiagnosticErrorCacheStatus       = "cache_status_unavailable"
 	DiagnosticErrorCacheEviction     = "cache_eviction_failed"
 	DiagnosticErrorMountRoots        = "mount_roots_unavailable"
+	DiagnosticErrorComputerFirewall  = "computer_firewall_unavailable"
 
 	RuncVersionSourceConfiguredPath = "configured_absolute_path"
 	RuncVersionSourceContainerdInfo = "containerd_runtime_info"
@@ -493,19 +494,22 @@ type DiagnosticReadReceipt struct {
 // session capability, raw error, or mutation control and is safe to surface to
 // the operator-only node doctor.
 type DoctorStatus struct {
-	RuntimePlatform    OCIPlatform               `json:"runtime_platform"`
-	ContainerdVersion  string                    `json:"containerd_version"`
-	ContainerdRead     DiagnosticReadReceipt     `json:"containerd_read"`
-	RuncVersion        string                    `json:"runc_version"`
-	RuncVersionSource  string                    `json:"runc_version_source"`
-	RuncRead           DiagnosticReadReceipt     `json:"runc_read"`
-	AllowedMountRoots  []string                  `json:"allowed_mount_roots"`
-	MountRootsRead     DiagnosticReadReceipt     `json:"mount_roots_read"`
-	Cache              ImageCacheStatus          `json:"cache"`
-	CacheRead          DiagnosticReadReceipt     `json:"cache_read"`
-	CacheLastErrorCode string                    `json:"cache_last_error_code,omitempty"`
-	LastProfile        *ProfileReceipt           `json:"last_profile,omitempty"`
-	LastAdmission      *ResourceAdmissionReceipt `json:"last_admission,omitempty"`
+	RuntimePlatform         OCIPlatform               `json:"runtime_platform"`
+	ContainerdVersion       string                    `json:"containerd_version"`
+	ContainerdRead          DiagnosticReadReceipt     `json:"containerd_read"`
+	RuncVersion             string                    `json:"runc_version"`
+	RuncVersionSource       string                    `json:"runc_version_source"`
+	RuncRead                DiagnosticReadReceipt     `json:"runc_read"`
+	AllowedMountRoots       []string                  `json:"allowed_mount_roots"`
+	MountRootsRead          DiagnosticReadReceipt     `json:"mount_roots_read"`
+	Cache                   ImageCacheStatus          `json:"cache"`
+	CacheRead               DiagnosticReadReceipt     `json:"cache_read"`
+	CacheLastErrorCode      string                    `json:"cache_last_error_code,omitempty"`
+	ComputerFirewallPresent bool                      `json:"computer_firewall_present"`
+	ComputerAttemptsLive    bool                      `json:"computer_attempts_live"`
+	ComputerFirewallRead    DiagnosticReadReceipt     `json:"computer_firewall_read"`
+	LastProfile             *ProfileReceipt           `json:"last_profile,omitempty"`
+	LastAdmission           *ResourceAdmissionReceipt `json:"last_admission,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1
@@ -870,6 +874,8 @@ const (
 	RemovalResourceComputerAttachment     RemovalResourceClass = "computer_attachment"
 	RemovalResourceComputerResetManifest  RemovalResourceClass = "computer_reset_manifest"
 	RemovalResourceComputerQuarantine     RemovalResourceClass = "computer_quarantine"
+	RemovalResourceComputerNetworkLink    RemovalResourceClass = "computer_network_link"
+	RemovalResourceComputerFirewallRule   RemovalResourceClass = "computer_firewall_rule"
 )
 
 type RemovalResource struct {
@@ -1401,6 +1407,8 @@ type ResourceInventory struct {
 	// ComputerDiskAnomalies are per-disk observations. They remain auditable
 	// without turning one durable disk's accounting drift into node-wide helper failure.
 	ComputerDiskAnomalies []string `json:"computer_disk_anomalies"`
+	ComputerNetworkLinks  []string `json:"computer_network_links"`
+	ComputerFirewallRules []string `json:"computer_firewall_rules"`
 }
 
 // ComputerStorageRecoveryInventoryEntry gives deferred and quarantined disk

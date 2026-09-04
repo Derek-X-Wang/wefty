@@ -57,6 +57,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					RuncVersion: TestedRuncVersion, RuncVersionSource: ocihelper.RuncVersionSourceConfiguredPath, RuncRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
+					ComputerFirewallPresent: true, ComputerAttemptsLive: true, ComputerFirewallRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					LastProfile:   &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false, ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
 					LastAdmission: &ocihelper.ResourceAdmissionReceipt{ObservedAt: now.Add(-30 * time.Second), Admitted: true, MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30, MemoryCommittedBeforeBytes: 1 << 30, RequestedMemoryBytes: 1 << 30, MemoryCommittedAfterBytes: 2 << 30, MemTotalBytes: 4 << 30, MemAvailableBytes: 64 << 20, RequestedDiskBytes: 8 << 30, FilesystemAvailableBytes: 12 << 30, ComputerTmpfsCeilingBytes: 1600 << 20},
 				},
@@ -81,6 +82,23 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 	}
 }
 
+func TestDoctorFailsClosedWhenComputerFirewallDisappearsWhileAttemptLives(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	base := config.Helper
+	config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+		snapshot, err := base(ctx)
+		snapshot.Runtime.ComputerFirewallPresent = false
+		return snapshot, err
+	}
+	report := BuildDoctor(t.Context(), config)
+	if report.ComputerScreenIsolation.Outcome != DiagnosticFailed || !slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "computer-screen-isolation" && item.Code == "oci_computer_screen_isolation_not_enforced" && item.Outcome == DiagnosticFailed
+	}) {
+		t.Fatalf("missing live Computer firewall did not fail closed: fact=%+v findings=%+v", report.ComputerScreenIsolation, report.Findings)
+	}
+}
+
 func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
@@ -99,7 +117,7 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	if err := WriteDoctorHuman(&human, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1") {
+	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1 computer_firewall_present=true computer_attempts_live=true") {
 		t.Fatalf("human doctor omitted screen isolation fact:\n%s", human.String())
 	}
 }

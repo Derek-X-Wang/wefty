@@ -71,6 +71,11 @@ func (engine *ContainerdEngine) imageCacheLoop() {
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if len(engine.computerFirewallAttachments()) > 0 {
+				if err := engine.reconcileComputerFirewall(ctx); err != nil {
+					log.Printf("OCI Computer firewall periodic reconciliation: %v", err)
+				}
+			}
 			if err := engine.enforceImageCache(ctx, "periodic"); err != nil {
 				engine.recordCacheError(err)
 				log.Printf("OCI image cache periodic enforcement: %v", err)

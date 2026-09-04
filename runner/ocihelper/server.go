@@ -1883,6 +1883,8 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.ComputerStorageDeferred = mergeRecoveryInventory(left.ComputerStorageDeferred, right.ComputerStorageDeferred)
 	left.ComputerStorageQuarantined = mergeRecoveryInventory(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined)
 	left.ComputerDiskAnomalies = mergeInventoryClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
+	left.ComputerNetworkLinks = mergeInventoryClass(left.ComputerNetworkLinks, right.ComputerNetworkLinks)
+	left.ComputerFirewallRules = mergeInventoryClass(left.ComputerFirewallRules, right.ComputerFirewallRules)
 	return left
 }
 

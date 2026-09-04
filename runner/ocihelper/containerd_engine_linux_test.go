@@ -41,6 +41,25 @@ func TestContainerdEngineRejectsPATHResolvedRunc(t *testing.T) {
 	}
 }
 
+func TestContainerdEngineRejectsComputerPortRangeBeyondAddressSpace(t *testing.T) {
+	_, err := NewContainerdEngine(NativeEngineConfig{RuntimeRoot: t.TempDir(), AttemptPortMin: 1, AttemptPortMax: 32769})
+	if err == nil || !strings.Contains(err.Error(), "32768 disjoint /30 allocations") {
+		t.Fatalf("oversized Computer port range = %v", err)
+	}
+}
+
+func TestDialComputerAttemptPortRejectsMalformedAuthority(t *testing.T) {
+	engine := &ContainerdEngine{}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	err := engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Name: contract.ComputerDisplayEndpointView, Port: 42000}, left)
+	var refusal *ComputerAttemptAuthorityRefusalError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("malformed Computer authority = %v, want typed refusal", err)
+	}
+}
+
 func TestDoctorCacheReadIsBoundedBehindPullLocks(t *testing.T) {
 	engine := &ContainerdEngine{}
 	engine.imageContentMu.Lock()
@@ -54,6 +73,37 @@ func TestDoctorCacheReadIsBoundedBehindPullLocks(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("blocked cache read was not bounded: %s", elapsed)
+	}
+}
+
+func TestAttemptNetworkTeardownDoesNotHoldEngineLock(t *testing.T) {
+	tool := filepath.Join(t.TempDir(), "slow-ip")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nsleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authority := testAuthority()
+	engine := &ContainerdEngine{
+		attempts: map[string]*containerdAttempt{
+			authority.key(): {authority: authority, endpointHolds: map[string]net.Listener{}, computerNetwork: &computerNetworkAttachment{hostLink: "wftchtest", ipPath: tool}},
+		},
+		ports: map[uint16]string{},
+	}
+	done := make(chan error, 1)
+	go func() { done <- engine.releaseAttemptRuntimeState(t.Context(), authority.key()) }()
+	time.Sleep(50 * time.Millisecond)
+	lockAcquired := make(chan struct{})
+	go func() {
+		engine.mu.Lock()
+		engine.mu.Unlock()
+		close(lockAcquired)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Computer network teardown held the engine-wide lock")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
