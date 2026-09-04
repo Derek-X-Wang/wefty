@@ -204,7 +204,22 @@ case "$evidence_source" in
 esac
 
 require_unique_value "$l1_agent_receipt" service_fresh_attempt_readmission true
-require_duration_within "$l1_agent_receipt" service_recovery_elapsed 15
+require_unique_value "$l1_agent_receipt" service_helper_loss_injected true
+require_unique_value "$l1_agent_receipt" service_barrier_advertised_reap_timeout 10s
+require_unique_value "$l1_agent_receipt" service_barrier_takeover_bound 20s
+require_unique_value "$l1_agent_receipt" service_barrier_verified_ready_bound 30s
+require_unique_value "$l1_agent_receipt" service_fresh_attempt_admission_bound 30s
+require_duration_within_receipt_bound "$l1_agent_receipt" service_fresh_attempt_admission_elapsed service_fresh_attempt_admission_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_handshake_elapsed service_barrier_takeover_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_session_admission_elapsed service_barrier_takeover_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_sweep_elapsed service_barrier_advertised_reap_timeout
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_verify_elapsed service_barrier_advertised_reap_timeout
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_verified_ready_elapsed service_barrier_verified_ready_bound
+require_unique_value "$l1_agent_receipt" service_lost_log_typed true
+if ! grep -Eq '^service_lost_log_disposition=(swept|retained):[a-z_]+$' "$l1_agent_receipt"; then
+  printf 'receipt must contain one typed lost-attempt log disposition\n' >&2
+  exit 1
+fi
 require_unique_value "$service_receipt" term_kill_escalation true
 require_unique_boolean "$service_receipt" term_kill_log_evidence_incomplete
 require_unique_value "$service_receipt" term_kill_log_seal_pairing true

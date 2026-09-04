@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -196,7 +197,10 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var freshRestart, stopStart, saturation, retainedBinding bool
 	var serviceFreshAttemptReadmission bool
 	var serviceResidueVerifiedAbsent, serviceRetainedBindingVerified bool
-	var serviceRecoveryElapsed, staleEvidenceElapsed time.Duration
+	var serviceHelperLossInjected, serviceLostLogTyped bool
+	var serviceLostLogDisposition string
+	var serviceRecoveryElapsed, serviceFreshAttemptAdmissionElapsed, serviceFreshAttemptAdmissionBound, staleEvidenceElapsed time.Duration
+	var serviceBarrierTimeline ocihelper.BootBarrierTimelineReceipt
 	var staleEvidenceLate bool
 	var staleEvidenceArm string
 	var staleOutboxState, staleOutboxReason string
@@ -205,7 +209,7 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_helper_loss_injected=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_fresh_attempt_admission_elapsed=%s\nservice_fresh_attempt_admission_bound=%s\nservice_barrier_advertised_reap_timeout=%s\nservice_barrier_takeover_bound=%s\nservice_barrier_verified_ready_bound=%s\nservice_barrier_handshake_elapsed=%s\nservice_barrier_session_admission_elapsed=%s\nservice_barrier_sweep_elapsed=%s\nservice_barrier_verify_elapsed=%s\nservice_barrier_verified_ready_elapsed=%s\nservice_lost_log_typed=%t\nservice_lost_log_disposition=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceHelperLossInjected, serviceFreshAttemptReadmission, serviceRecoveryElapsed, serviceFreshAttemptAdmissionElapsed, serviceFreshAttemptAdmissionBound, serviceBarrierTimeline.AdvertisedReapTimeout, serviceBarrierTimeline.TakeoverBound, serviceBarrierTimeline.VerifiedReadyBound, serviceBarrierTimeline.HandshakeElapsed, serviceBarrierTimeline.SessionAdmissionElapsed, serviceBarrierTimeline.SweepElapsed, serviceBarrierTimeline.VerifyElapsed, serviceBarrierTimeline.VerifiedReadyElapsed, serviceLostLogTyped, serviceLostLogDisposition, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -373,21 +377,56 @@ while :; do sleep 1; done
 	if !ready {
 		t.Fatal("service helper generation was not ready before runtime-loss injection")
 	}
+	oldSession, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceFreshAttemptAdmissionBound = ocihelper.VerifiedReadyTimeoutForReap(oldSession.Handshake().ReapTimeout)
 	recoveryStarted := time.Now()
+	if runtime.GOOS == "linux" {
+		requestNativeOCIRootFault(t, "kill-helper:service-l1-fresh-attempt")
+		serviceHelperLossInjected = true
+	}
 	barrier.Invalidate()
-	readmitted := waitNativeServiceAttempt(t, store, nodeAgent, barrier, primary.JobID, firstAttempt, 15*time.Second)
+	readmitted := waitNativeServiceAttempt(t, store, nodeAgent, barrier, primary.JobID, firstAttempt, serviceFreshAttemptAdmissionBound)
+	serviceFreshAttemptAdmissionElapsed = time.Since(recoveryStarted)
 	healthElapsed := waitNativePublishedServiceHealth(t, serviceClientFabric, publishedPort, 15*time.Second)
 	serviceRecoveryElapsed = time.Since(recoveryStarted)
 	newGeneration, ready := barrier.Generation()
 	sweepReceipt, sweepReceiptOK := barrier.SweepReceipt()
 	retainedIdentity, retainedIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(firstAuthority))
 	serviceResidueVerifiedAbsent = sweepReceiptOK && sweepReceipt.VerifiedAbsent && ocihelper.InventoryEmpty(sweepReceipt.VerifiedResidue)
+	serviceBarrierTimeline = sweepReceipt.BarrierTimeline
 	serviceRetainedBindingVerified = retainedIdentityErr == nil &&
 		slices.Contains(sweepReceipt.VerifiedRetained.ManagedVolumes, retainedIdentity.ServiceVolumeDirectory) &&
 		slices.Contains(sweepReceipt.VerifiedRetained.ManagedVolumeRecords, retainedIdentity.ServiceVolumeOwnerRecord)
 	if !serviceResidueVerifiedAbsent || !serviceRetainedBindingVerified {
 		t.Fatalf("runtime-loss service sweep receipt = %+v present=%t retained_identity=%+v identity_err=%v",
 			sweepReceipt, sweepReceiptOK, retainedIdentity, retainedIdentityErr)
+	}
+	lostIdentity, lostIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(firstAuthority))
+	if lostIdentityErr == nil {
+		for _, evidence := range sweepReceipt.SweepEvidence {
+			if evidence.Class == ocihelper.RemovalResourceLogSegments && evidence.ID == lostIdentity.LogSegmentDirectory && evidence.AttemptID == firstAttempt {
+				serviceLostLogTyped = true
+				serviceLostLogDisposition = "swept:" + string(evidence.Action)
+			}
+		}
+		for _, retention := range sweepReceipt.DurableRetentions {
+			if retention.Class == ocihelper.RemovalResourceLogSegments && retention.ID == lostIdentity.LogSegmentDirectory && retention.AttemptID == firstAttempt {
+				serviceLostLogTyped = true
+				serviceLostLogDisposition = "retained:" + string(retention.Reason)
+			}
+		}
+	}
+	if !serviceLostLogTyped {
+		t.Fatalf("lost attempt log segment lacked typed sweep or retention evidence: identity=%+v identity_err=%v sweep=%+v", lostIdentity, lostIdentityErr, sweepReceipt)
+	}
+	if serviceBarrierTimeline.AdvertisedReapTimeout <= 0 || serviceBarrierTimeline.TakeoverBound != ocihelper.TakeoverTimeoutForReap(serviceBarrierTimeline.AdvertisedReapTimeout) ||
+		serviceBarrierTimeline.VerifiedReadyBound != ocihelper.VerifiedReadyTimeoutForReap(serviceBarrierTimeline.AdvertisedReapTimeout) ||
+		serviceBarrierTimeline.HandshakeElapsed <= 0 || serviceBarrierTimeline.SessionAdmissionElapsed < serviceBarrierTimeline.HandshakeElapsed ||
+		serviceBarrierTimeline.VerifiedReadyElapsed < serviceBarrierTimeline.SessionAdmissionElapsed || serviceBarrierTimeline.VerifiedReadyElapsed > serviceBarrierTimeline.VerifiedReadyBound {
+		t.Fatalf("runtime-loss barrier timeline is incomplete or outside its derived bound: %+v", serviceBarrierTimeline)
 	}
 	newAuthority := authorities.wait(t, readmitted.CurrentAttemptID, 5*time.Second)
 	stale, staleEvidenceElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceObserved := waitNativeRuntimeLossEvidence(
@@ -402,7 +441,7 @@ while :; do sleep 1; done
 	}
 	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration &&
 		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&
-		serviceRecoveryElapsed <= 15*time.Second && healthElapsed <= 15*time.Second
+		serviceFreshAttemptAdmissionElapsed <= serviceFreshAttemptAdmissionBound && healthElapsed <= 15*time.Second
 	if !serviceFreshAttemptReadmission {
 		t.Fatalf("runtime-loss service re-admission = old_generation:%+v new_generation:%+v ready:%t old_authority:%+v new_authority:%+v stale:%+v stale_evidence_late:%t stale_evidence_elapsed:%s current:%+v health_elapsed:%s",
 			oldGeneration, newGeneration, ready, firstAuthority, newAuthority, stale, staleEvidenceLate, staleEvidenceElapsed, readmitted, serviceRecoveryElapsed)
@@ -685,6 +724,46 @@ func importRealtimeProbeImage(t *testing.T, ctx context.Context, barrier *ocihel
 	if imported.TopLevelDigest != digest || imported.PlatformDigest == "" {
 		t.Fatalf("realtiming probe import = %+v, want top-level digest %s and a platform digest", imported, digest)
 	}
+}
+
+func requestNativeOCIRootFault(t *testing.T, action string) {
+	t.Helper()
+	fifo := os.Getenv("WEFTY_OCI_FAULT_FIFO")
+	directory := os.Getenv("WEFTY_OCI_FAULT_DIR")
+	if fifo == "" || directory == "" {
+		t.Fatal("Linux OCI root fault supervisor is not provisioned")
+	}
+	ack := filepath.Join(directory, action+".done")
+	failure := filepath.Join(directory, action+".failed")
+	_ = os.Remove(ack)
+	_ = os.Remove(failure)
+	writeDeadline := time.Now().Add(2 * time.Second)
+	for {
+		writer, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_, writeErr := writer.Write([]byte(action + "\n"))
+			closeErr := writer.Close()
+			if writeErr == nil && closeErr == nil {
+				break
+			}
+			err = errors.Join(writeErr, closeErr)
+		}
+		if time.Now().After(writeDeadline) {
+			t.Fatalf("write root fault %s before deadline: %v", action, err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(ack); err == nil {
+			return
+		}
+		if payload, err := os.ReadFile(failure); err == nil {
+			t.Fatalf("root fault %s failed: %s", action, payload)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("root fault %s was not acknowledged within 20s", action)
 }
 
 func waitRuntimeRemovalManifestPhase(t *testing.T, directory, jobID string, want runtimeRemovalPhase, timeout time.Duration) runtimeRemovalRecord {

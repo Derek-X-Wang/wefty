@@ -1315,80 +1315,54 @@ func TestBootBarrierDoesNotReclassifyCallerCancellationAsUnavailableUnit(t *test
 	}
 }
 
-func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) {
+func TestBootBarrierDerivesTakeoverFromHandshakeDuringSlowStartup(t *testing.T) {
 	const (
 		reapTimeout     = 500 * time.Millisecond
 		startupDuration = reapTimeout - 75*time.Millisecond
 		responseDelay   = 125 * time.Millisecond
 	)
-	for _, test := range []struct {
-		name            string
-		takeoverTimeout time.Duration
-		wantReady       bool
-	}{
-		{name: "former one-reap window expires", takeoverTimeout: reapTimeout},
-		{name: "derived two-reap window passes", takeoverTimeout: TakeoverTimeoutForReap(reapTimeout), wantReady: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			engine := newFakeEngine()
-			engine.sweepEntered = make(chan struct{})
-			engine.releaseSweep = make(chan struct{})
-			client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
-			defer stop()
-			baseDial := client.Dial
-			client.Dial = func(ctx context.Context) (net.Conn, error) {
-				connection, err := baseDial(ctx)
-				if err != nil {
-					return nil, err
-				}
-				return newDelayedFirstResponseConn(connection, responseDelay), nil
-			}
-			barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
-				TakeoverTimeout:     test.takeoverTimeout,
-				TakeoverReapTimeout: reapTimeout,
-				TakeoverRetry:       time.Millisecond,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			releaseStartup := engine.releaseSweep
-			go func() {
-				<-engine.sweepEntered
-				engine.mu.Lock()
-				engine.sweepEntered = nil
-				engine.releaseSweep = nil
-				engine.mu.Unlock()
-				time.Sleep(startupDuration)
-				close(releaseStartup)
-			}()
-			err = barrier.Ensure(t.Context())
-			if test.wantReady {
-				if err != nil || !barrier.Ready() {
-					t.Fatalf("two-reap takeover did not publish authority: ready=%t err=%v", barrier.Ready(), err)
-				}
-				t.Logf("GREEN: derived two-reap takeover published authority after startup=%s and handshake delay=%s", startupDuration, responseDelay)
-			} else if err == nil || barrier.Ready() {
-				t.Fatalf("one-reap takeover unexpectedly survived startup=%s plus handshake=%s", startupDuration, responseDelay)
-			} else {
-				t.Logf("RED: former one-reap takeover refused authority after startup=%s and handshake delay=%s: %v", startupDuration, responseDelay, err)
-			}
-			_ = barrier.Close()
-		})
-	}
-}
-
-func TestBootBarrierRejectsAdvertisedReapTimeoutAboveTakeoverDerivation(t *testing.T) {
-	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{ReapTimeout: defaultReapTimeout + time.Second})
+	engine := newFakeEngine()
+	engine.sweepEntered = make(chan struct{})
+	engine.releaseSweep = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
 	defer stop()
-	barrier, err := NewBootBarrier(client, testSessionRequest())
+	baseDial := client.Dial
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		connection, err := baseDial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return newDelayedFirstResponseConn(connection, responseDelay), nil
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 250 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = barrier.Ensure(t.Context())
-	var mismatch *ReapTimeoutConfigurationError
-	if !errors.As(err, &mismatch) || mismatch.AdvertisedReapTimeout != defaultReapTimeout+time.Second || mismatch.TakeoverReapTimeout != defaultReapTimeout || barrier.Ready() {
-		t.Fatalf("reap-timeout mismatch = %+v err=%v ready=%t", mismatch, err, barrier.Ready())
+	releaseStartup := engine.releaseSweep
+	go func() {
+		<-engine.sweepEntered
+		engine.mu.Lock()
+		engine.sweepEntered = nil
+		engine.releaseSweep = nil
+		engine.mu.Unlock()
+		time.Sleep(startupDuration)
+		close(releaseStartup)
+	}()
+	if err := barrier.Ensure(t.Context()); err != nil || !barrier.Ready() {
+		t.Fatalf("advertised reap timeout did not derive takeover after authority-free handshake: ready=%t err=%v", barrier.Ready(), err)
 	}
+	receipt, ok := barrier.SweepReceipt()
+	timeline := receipt.BarrierTimeline
+	if !ok || timeline.AdvertisedReapTimeout != reapTimeout || timeline.TakeoverBound != 2*reapTimeout || timeline.VerifiedReadyBound != 3*reapTimeout ||
+		timeline.HandshakeElapsed <= 0 || timeline.SessionAdmissionElapsed < timeline.HandshakeElapsed ||
+		timeline.VerifiedReadyElapsed < timeline.SessionAdmissionElapsed || timeline.VerifiedReadyElapsed > timeline.VerifiedReadyBound {
+		t.Fatalf("barrier timeline receipt = %+v present=%t", timeline, ok)
+	}
+	t.Logf("GREEN: authority-free handshake derived takeover from reap=%s during startup=%s and response delay=%s", reapTimeout, startupDuration, responseDelay)
+	_ = barrier.Close()
 }
 
 func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.T) {
@@ -1523,6 +1497,76 @@ func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
 	}
 }
 
+func TestHelperHandshakeReportsReapTimeoutWhileStartupSweepBlocksAuthority(t *testing.T) {
+	engine := newFakeEngine()
+	engine.sweepEntered = make(chan struct{})
+	engine.releaseSweep = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: 250 * time.Millisecond})
+	defer stop()
+	releaseStartup := sync.OnceFunc(func() { close(engine.releaseSweep) })
+	defer releaseStartup()
+	<-engine.sweepEntered
+
+	connection, err := client.Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	wire := newFramedConn(connection)
+	body, err := marshalBody(testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.write(frame{Version: ProtocolVersion, Method: MethodAcquireSession, Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var handshake AcquireSessionResponse
+	if err := decodeResponse(wire, &handshake); err != nil {
+		t.Fatalf("authority-free handshake waited for startup sweep: %v", err)
+	}
+	if handshake.ReapTimeout != 250*time.Millisecond || handshake.SessionCapability != "" || handshake.SessionGeneration != 0 {
+		t.Fatalf("startup handshake minted authority or omitted the reap budget: %+v", handshake)
+	}
+
+	operation, err := client.Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.Close()
+	operationWire := newFramedConn(operation)
+	verifyBody, err := marshalBody(VerifyRequest{Scope: VerifyNamespace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := operationWire.write(frame{Version: ProtocolVersion, Method: MethodVerify, Body: verifyBody}); err != nil {
+		t.Fatal(err)
+	}
+	if err := operation.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var unavailable VerifyResponse
+	err = decodeResponse(operationWire, &unavailable)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeSessionStale {
+		t.Fatalf("operation acquired authority before startup verification: response=%+v err=%v", unavailable, err)
+	}
+
+	releaseStartup()
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var admitted AcquireSessionResponse
+	if err := decodeResponse(wire, &admitted); err != nil {
+		t.Fatalf("verified startup did not admit the pending handshake: %v", err)
+	}
+	if admitted.SessionCapability == "" || admitted.SessionGeneration == 0 || admitted.ReapTimeout != handshake.ReapTimeout {
+		t.Fatalf("verified startup admission = %+v, handshake=%+v", admitted, handshake)
+	}
+}
+
 func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 	engine := newFakeEngine()
 	engine.verifyResponses = []VerifyResponse{{Absent: false, Inventory: ResourceInventory{Leases: []string{"wefty-residue"}}, RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}}}}
@@ -1547,6 +1591,71 @@ func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 	}
 	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "Verify"}) {
 		t.Fatalf("failed helper startup operations = %v", got)
+	}
+}
+
+func TestHelperStartupFailureClosesPrefacedHandshakeWithoutAuthority(t *testing.T) {
+	engine := newFakeEngine()
+	engine.sweepEntered = make(chan struct{})
+	engine.releaseSweep = make(chan struct{})
+	engine.verifyResponses = []VerifyResponse{{
+		Absent:         false,
+		Inventory:      ResourceInventory{Leases: []string{"wefty-residue"}},
+		RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}},
+	}}
+	server, err := NewServer(engine, ServerConfig{
+		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp("", "wefty-startup-fail-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	listener, err := net.Listen("unix", filepath.Join(directory, "helper.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(t.Context(), listener) }()
+	<-engine.sweepEntered
+
+	connection, err := net.Dial("unix", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	wire := newFramedConn(connection)
+	body, err := marshalBody(testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.write(frame{Version: ProtocolVersion, Method: MethodAcquireSession, Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	var handshake AcquireSessionResponse
+	if err := decodeResponse(wire, &handshake); err != nil {
+		t.Fatalf("startup failure hid its authority-free handshake: %v", err)
+	}
+	if handshake.ReapTimeout != defaultReapTimeout || handshake.SessionCapability != "" || handshake.SessionGeneration != 0 {
+		t.Fatalf("startup failure prefaced usable authority: %+v", handshake)
+	}
+	close(engine.releaseSweep)
+	var admitted AcquireSessionResponse
+	if err := decodeResponse(wire, &admitted); err == nil {
+		t.Fatalf("failed startup admitted a session: %+v", admitted)
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "startup verify OCI runtime namespace: residue remains after sweep:") {
+		t.Fatalf("helper startup failure = %v", err)
+	}
+	server.sessionMu.Lock()
+	active := server.active
+	generation := server.nextSessionGeneration
+	server.sessionMu.Unlock()
+	if active != nil || generation != 0 {
+		t.Fatalf("failed startup minted session authority: active=%+v generation=%d", active, generation)
 	}
 }
 

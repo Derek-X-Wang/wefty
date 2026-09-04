@@ -213,7 +213,7 @@ func assertServeQuarantinesAndAdmits(t *testing.T, root string, storage Computer
 	})
 	client := NewUnixClient(socket, "checksum")
 	barrier, err := NewBootBarrierWithConfig(client, AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, BootBarrierConfig{
-		TakeoverTimeout: time.Second, TakeoverReapTimeout: 10 * time.Second, TakeoverRetry: 5 * time.Millisecond,
+		TakeoverTimeout: time.Second, TakeoverRetry: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)

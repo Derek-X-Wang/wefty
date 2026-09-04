@@ -1031,7 +1031,7 @@ func TestNativeLinuxHelperRestartsAcrossLaneFaultBudget(t *testing.T) {
 	}()
 	unavailableBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{
 		NodeID: "native-helper-unavailable-node", BootSessionID: "native-helper-unavailable-boot",
-	}, ocihelper.BootBarrierConfig{TakeoverReapTimeout: reapTimeout})
+	}, ocihelper.BootBarrierConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

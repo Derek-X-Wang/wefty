@@ -337,7 +337,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"reproduce-helper-start-burst:[1-9]*",
 			"manufacture-computer-allocation-mismatch:wefty-computer-disk-*",
 			"kill-helper:native-lost-attempt-sweep", "kill-helper:native-computer-helper-death",
-			"kill-helper:service-restart-survival", "kill-helper:service-reconfiguration-reset",
+			"kill-helper:service-restart-survival", "kill-helper:service-reconfiguration-reset", "kill-helper:service-l1-fresh-attempt",
 			"assert-helper-units-active",
 			"stop-helper-topology",
 			`"/tmp/wefty-oci-faults/$action.failed"`,

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"slices"
 	"sync"
@@ -35,19 +37,9 @@ func VerifiedReadyTimeoutForReap(reapTimeout time.Duration) time.Duration {
 }
 
 type BootBarrierConfig struct {
-	Clock               Clock
-	TakeoverTimeout     time.Duration
-	TakeoverReapTimeout time.Duration
-	TakeoverRetry       time.Duration
-}
-
-type ReapTimeoutConfigurationError struct {
-	AdvertisedReapTimeout time.Duration
-	TakeoverReapTimeout   time.Duration
-}
-
-func (err *ReapTimeoutConfigurationError) Error() string {
-	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
+	Clock           Clock
+	TakeoverTimeout time.Duration
+	TakeoverRetry   time.Duration
 }
 
 // HelperUnitUnavailableError means no handshake completed and the final dial
@@ -223,11 +215,8 @@ func NewBootBarrierWithConfig(client *Client, request AcquireSessionRequest, con
 	if config.Clock == nil {
 		config.Clock = systemClock{}
 	}
-	if config.TakeoverReapTimeout <= 0 {
-		config.TakeoverReapTimeout = defaultReapTimeout
-	}
 	if config.TakeoverTimeout <= 0 {
-		config.TakeoverTimeout = TakeoverTimeoutForReap(config.TakeoverReapTimeout)
+		config.TakeoverTimeout = TakeoverTimeoutForReap(defaultReapTimeout)
 	}
 	if config.TakeoverRetry <= 0 {
 		config.TakeoverRetry = defaultTakeoverRetryInterval
@@ -302,9 +291,8 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 		return nil
 	}
 	barrier.detachSession()
-	takeoverContext, cancel := context.WithTimeoutCause(ctx, barrier.config.TakeoverTimeout, errTakeoverWindowExpired)
-	defer cancel()
-	session, err := barrier.takeExclusiveSession(takeoverContext)
+	takeoverStarted := time.Now()
+	session, handshakeElapsed, sessionAdmissionElapsed, err := barrier.takeExclusiveSession(ctx, takeoverStarted)
 	if err != nil {
 		return err
 	}
@@ -318,15 +306,15 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	if handshake.HelperInstanceID == "" || handshake.SessionGeneration == 0 || handshake.ReapTimeout <= 0 {
 		return errors.New("OCI helper handshake omitted barrier authority")
 	}
-	if handshake.ReapTimeout > barrier.config.TakeoverReapTimeout {
-		return &ReapTimeoutConfigurationError{AdvertisedReapTimeout: handshake.ReapTimeout, TakeoverReapTimeout: barrier.config.TakeoverReapTimeout}
-	}
 	barrierContext, barrierCancel := context.WithTimeout(ctx, handshake.ReapTimeout)
 	defer barrierCancel()
+	sweepStarted := time.Now()
 	sweep, err := session.Sweep(barrierContext, SweepRequest{})
 	if err != nil {
 		return fmt.Errorf("sweep all OCI runtime state: %w", err)
 	}
+	sweepElapsed := time.Since(sweepStarted)
+	verifyStarted := time.Now()
 	verification, err := session.Verify(barrierContext, VerifyRequest{Scope: VerifyNamespace})
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
@@ -337,6 +325,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	if !verification.Absent {
 		return namespaceResidueError("verify OCI runtime namespace", verification)
 	}
+	verifiedReadyElapsed := time.Since(takeoverStarted)
 	receipt := VerifiedSweepReceipt{
 		SweepEpoch:                      sweep.SweepEpoch,
 		HelperSession:                   HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration},
@@ -351,6 +340,16 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 		DurableRetentions:               slices.Clone(verification.DurableRetentions),
 		SweepEvidence:                   cloneSweepEvidence(sweep.Evidence),
 		Attempts:                        slices.Clone(sweep.Attempts),
+		BarrierTimeline: BootBarrierTimelineReceipt{
+			AdvertisedReapTimeout:   handshake.ReapTimeout,
+			TakeoverBound:           TakeoverTimeoutForReap(handshake.ReapTimeout),
+			VerifiedReadyBound:      VerifiedReadyTimeoutForReap(handshake.ReapTimeout),
+			HandshakeElapsed:        handshakeElapsed,
+			SessionAdmissionElapsed: sessionAdmissionElapsed,
+			SweepElapsed:            sweepElapsed,
+			VerifyElapsed:           time.Since(verifyStarted),
+			VerifiedReadyElapsed:    verifiedReadyElapsed,
+		},
 	}
 	if receipt.SweepEpoch == "" {
 		return errors.New("sweep all OCI runtime state: helper omitted sweep epoch")
@@ -412,63 +411,92 @@ func (barrier *BootBarrier) recordCapabilityReason(err error) {
 	barrier.mu.Unlock()
 }
 
-func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session, error) {
+func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context, takeoverStarted time.Time) (*Session, time.Duration, time.Duration, error) {
+	takeoverDeadline := takeoverStarted.Add(barrier.config.TakeoverTimeout)
+	var advertisedReapTimeout time.Duration
+	var handshakeElapsed time.Duration
 	dialAttempts := 0
 	completedHandshakes := 0
 	lastDialConnected := false
 	var lastUnavailableError error
-	takeoverError := func(contextError error) error {
-		if dialAttempts > 0 && completedHandshakes == 0 && !lastDialConnected && lastUnavailableError != nil && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+	takeoverError := func(contextError error, windowExpired bool) error {
+		if dialAttempts > 0 && completedHandshakes == 0 && !lastDialConnected && lastUnavailableError != nil && windowExpired {
 			return &HelperUnitUnavailableError{
 				DialAttempts: dialAttempts,
 				Cause:        errors.Join(contextError, lastUnavailableError),
 			}
 		}
-		if dialAttempts > 0 && completedHandshakes == 0 && lastDialConnected && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+		if dialAttempts > 0 && completedHandshakes == 0 && lastDialConnected && windowExpired {
 			return &HelperHandshakeStalledError{DialAttempts: dialAttempts, Cause: contextError}
 		}
 		return fmt.Errorf("acquire exclusive OCI helper session: %w", contextError)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, takeoverError(err)
+			return nil, 0, 0, takeoverError(err, false)
+		}
+		if !time.Now().Before(takeoverDeadline) {
+			return nil, 0, 0, takeoverError(errors.Join(errTakeoverWindowExpired, context.DeadlineExceeded), true)
 		}
 		dialAttempts++
 		lastDialConnected = false
 		lastUnavailableError = nil
-		session, err := barrier.client.openSession(ctx, barrier.request, &lastDialConnected)
+		handshakeCompleted := false
+		session, err := barrier.client.openSession(ctx, barrier.request, &lastDialConnected, takeoverDeadline, func(handshake AcquireSessionResponse) (time.Time, error) {
+			handshakeCompleted = true
+			if advertisedReapTimeout == 0 {
+				advertisedReapTimeout = handshake.ReapTimeout
+				handshakeElapsed = time.Since(takeoverStarted)
+				takeoverDeadline = takeoverStarted.Add(TakeoverTimeoutForReap(advertisedReapTimeout))
+			} else if handshake.ReapTimeout != advertisedReapTimeout {
+				return time.Time{}, fmt.Errorf("OCI helper reap timeout changed during takeover: first=%s current=%s", advertisedReapTimeout, handshake.ReapTimeout)
+			}
+			return takeoverDeadline, nil
+		})
+		if handshakeCompleted {
+			completedHandshakes++
+		}
 		if err == nil {
-			return session, nil
+			return session, handshakeElapsed, time.Since(takeoverStarted), nil
 		}
 		if contextError := ctx.Err(); contextError != nil {
-			return nil, takeoverError(contextError)
+			return nil, 0, 0, takeoverError(contextError, false)
 		}
 		// A socket-backlog connection can reach its I/O deadline immediately
 		// before the context timer publishes Done. OpenSession applies this
 		// context's deadline to the connection, so synchronize that edge before
 		// classifying a handshake transport error.
-		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) && errors.Is(err, os.ErrDeadlineExceeded) {
-			<-ctx.Done()
-			return nil, takeoverError(ctx.Err())
+		if !time.Now().Before(takeoverDeadline) && errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil, 0, 0, takeoverError(errors.Join(errTakeoverWindowExpired, context.DeadlineExceeded), true)
 		}
 		var rpcErr *RPCError
 		var dialErr *helperDialError
+		var admissionErr *sessionAdmissionTransportError
 		if errors.As(err, &dialErr) && (errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED) || errors.Is(dialErr, syscall.ECONNRESET)) {
 			lastUnavailableError = err
 		} else if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionBusy {
-			completedHandshakes++
+			lastUnavailableError = nil
+		} else if errors.As(err, &admissionErr) {
+			lastUnavailableError = nil
+		} else if lastDialConnected && !handshakeCompleted && helperHandshakeTransportFailure(err) {
 			lastUnavailableError = nil
 		} else {
-			return nil, fmt.Errorf("acquire exclusive OCI helper session: %w", err)
+			return nil, 0, 0, fmt.Errorf("acquire exclusive OCI helper session: %w", err)
 		}
 		timer := barrier.config.Clock.NewTimerAt(barrier.config.Clock.Now().Add(barrier.config.TakeoverRetry))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, takeoverError(ctx.Err())
+			return nil, 0, 0, takeoverError(ctx.Err(), false)
 		case <-timer.C():
 		}
 	}
+}
+
+func helperHandshakeTransportFailure(err error) bool {
+	var networkError net.Error
+	return errors.As(err, &networkError) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 func (barrier *BootBarrier) Session() (*Session, error) {
