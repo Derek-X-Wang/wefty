@@ -192,6 +192,16 @@ The exclusive, attempt-scoped period in which one Take-over session holds a
 Computer's human input path.
 _Avoid_: grant, control role, lock, idle session
 
+**Friendly name**:
+The stable, memorable, wefty-owned name presented as the primary handle for a
+Computer connection. It is the Computer name supplied by the operator.
+_Avoid_: connect host, hostname, network name, display name
+
+**Connect host**:
+The raw Fabric-produced address used to reach a published listener. It is a
+secondary connection field and never identity, authority, or a primary handle.
+_Avoid_: friendly name, Computer name, Node identity
+
 **Slot**:
 One unit of a node's configured admission capacity within one workload
 class. A one-shot slot is occupied by a live attempt; a service slot is

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,7 +102,8 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 	}
 	var signalMu sync.Mutex
 	signals := []bool{}
-	frontFabric := &acceptanceCLIFabric{l1: personPlain, identity: personIdentity, connectHost: "operator-connect-marker"}
+	frontFabric := &acceptanceCLIFabric{l1: personPlain, identity: personIdentity,
+		connectHost: "cli-connect-address.example.test", routes: make(map[string]string)}
 	backendServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
 		if err != nil {
@@ -144,7 +146,14 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 	}
 	frontServer := httptest.NewServer(handler)
 	defer frontServer.Close()
-	endpoint := "ws" + strings.TrimPrefix(frontServer.URL, "http") + contract.ComputerDisplayWebSocketPath
+	frontURL, err := url.Parse(frontServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawConnectHost := "computer-connect-address.example.test"
+	rawConnectAddress := net.JoinHostPort(rawConnectHost, frontURL.Port())
+	frontFabric.routes[rawConnectAddress] = frontURL.Host
+	endpoint := (&url.URL{Scheme: "ws", Host: rawConnectAddress, Path: contract.ComputerDisplayWebSocketPath}).String()
 	ready := true
 	if _, err := store.SetAttemptPublication(t.Context(), nodeIdentity.NodeID, claim.Job.JobID, claim.Lease.AttemptID,
 		l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready, DisplayEndpoint: &endpoint}); err != nil {
@@ -179,8 +188,9 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 	if err := <-viewDone; err != nil {
 		t.Fatalf("view command: %v stderr=%s", err, viewError.String())
 	}
-	if output := viewOutput.String(); !strings.Contains(output, "DISPLAY ENDPOINT\toperator-connect-marker") || strings.Contains(output, "127.0.0.1") || strings.Contains(output, frontServer.URL) {
-		t.Fatalf("view projection leaked a dial host or omitted ConnectHost marker: %s", output)
+	if output := viewOutput.String(); !strings.HasPrefix(output, "FRIENDLY NAME\ttakeover-cli-acceptance\nCONNECT HOST\t"+rawConnectHost+"\n") ||
+		strings.Contains(output, frontFabric.connectHost) || strings.Contains(output, "127.0.0.1") || strings.Contains(output, frontServer.URL) {
+		t.Fatalf("view projection did not keep friendly name primary and accepted raw connect host secondary: %s", output)
 	}
 	signalMu.Lock()
 	defer signalMu.Unlock()
@@ -218,6 +228,7 @@ type acceptanceCLIFabric struct {
 	l1          fabric.Fabric
 	identity    fabric.Identity
 	connectHost string
+	routes      map[string]string
 }
 
 func (f *acceptanceCLIFabric) Listen(network, address string) (net.Listener, error) {
@@ -226,6 +237,9 @@ func (f *acceptanceCLIFabric) Listen(network, address string) (net.Listener, err
 func (f *acceptanceCLIFabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
 	if address == l3.DefaultL1Address || address == l3.DefaultL3Address {
 		return f.l1.Dial(ctx, network, address)
+	}
+	if target, ok := f.routes[address]; ok {
+		address = target
 	}
 	return (&net.Dialer{}).DialContext(ctx, network, address)
 }

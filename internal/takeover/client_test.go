@@ -7,12 +7,50 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/coder/websocket"
 )
+
+func TestOpenAcceptsAndRetainsRawConnectHost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set(contract.ComputerControlTokenHeader, "session-token")
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
+			Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if err := connection.Write(request.Context(), websocket.MessageBinary, []byte("RFB 003.008\n")); err != nil {
+			return
+		}
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawHost := "fabric-address.example.test"
+	rawAddress := net.JoinHostPort(rawHost, target.Port())
+	participant := &routedFabric{rawAddress: rawAddress, targetAddress: target.Host}
+	endpoint := (&url.URL{Scheme: "ws", Host: rawAddress, Path: contract.ComputerDisplayWebSocketPath}).String()
+	session, err := Open(t.Context(), participant, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if participant.dialedAddress != rawAddress || session.ConnectHost != rawHost {
+		t.Fatalf("raw connect host = dialed %q projected %q, want %q / %q",
+			participant.dialedAddress, session.ConnectHost, rawAddress, rawHost)
+	}
+}
 
 func TestPerformUsesStructuredControlCodesAndUnknownStatusesAreNotRetryable(t *testing.T) {
 	for _, test := range []struct {
@@ -54,3 +92,24 @@ func (directFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
 	return fabric.Identity{}, errors.New("unused")
 }
 func (directFabric) ConnectHost() string { return "unused" }
+
+type routedFabric struct {
+	rawAddress    string
+	targetAddress string
+	dialedAddress string
+}
+
+func (*routedFabric) Listen(string, string) (net.Listener, error) {
+	return nil, errors.New("unused")
+}
+func (f *routedFabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	f.dialedAddress = address
+	if address != f.rawAddress {
+		return nil, errors.New("unexpected raw connect host")
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, f.targetAddress)
+}
+func (*routedFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
+	return fabric.Identity{}, errors.New("unused")
+}
+func (*routedFabric) ConnectHost() string { return "unused" }

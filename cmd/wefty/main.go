@@ -343,7 +343,7 @@ Commands:
     resize COMPUTER --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current]
     abort COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
     logs|forget JOB_ID
-    grants|grant|revoke|takeover
+    grants|grant|revoke|takeover  Take-over view prints FRIENDLY NAME first and raw CONNECT HOST second
   services submission <verb>
                              Enable, disable, or set Computer Run submission inflight capacity
     enable|disable COMPUTER [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]

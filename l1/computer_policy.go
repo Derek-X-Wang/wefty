@@ -63,6 +63,7 @@ type ComputerGrantList struct {
 // admission decision. The front door remains the sole admission authority.
 type ComputerTakeoverAvailability struct {
 	ComputerID      string  `json:"computer_id"`
+	FriendlyName    string  `json:"friendly_name"`
 	UserID          string  `json:"user_id"`
 	DeviceID        string  `json:"device_id"`
 	DisplayName     string  `json:"display_name,omitempty"`
@@ -501,9 +502,10 @@ func (s *Store) GetComputerTakeoverAvailability(
 	}
 	// Authorization precedes existence/endpoint discovery to avoid an oracle.
 	var endpoint sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint FROM computers
+	if err := tx.QueryRowContext(ctx, `SELECT computers.name, service_jobs.display_endpoint FROM computers
 		JOIN service_jobs ON service_jobs.job_id=computers.current_job_id
-		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).Scan(&endpoint); errors.Is(err, sql.ErrNoRows) {
+		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).
+		Scan(&access.FriendlyName, &endpoint); errors.Is(err, sql.ErrNoRows) {
 		return ComputerTakeoverAvailability{}, protocolError(contract.ErrorNotFound, "Computer %q not found", computerID)
 	} else if err != nil {
 		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over endpoint")

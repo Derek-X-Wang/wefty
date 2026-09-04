@@ -637,7 +637,7 @@
       "get": {
         "operationId": "getComputerTakeoverAccess",
         "summary": "Discover person-authorized view-first Computer admission",
-        "description": "Returns the authenticated person/device, server-derived role, policy revision, and authorized front door. It never returns a session bearer or raw backend address, and no URL or option selects control.",
+        "description": "Returns the wefty-owned Computer friendly name, authenticated person/device, server-derived role, policy revision, and authorized front door. It never returns a session bearer or raw backend address, and no URL or option selects control.",
         "responses": {
           "200": { "description": "View-first admission projection; display_endpoint is null until ready.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAccess" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

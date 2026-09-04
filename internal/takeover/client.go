@@ -28,9 +28,10 @@ func (failure *ActionError) Error() string {
 }
 
 type Session struct {
-	Endpoint string
-	Token    string
-	conn     *websocket.Conn
+	Endpoint    string
+	ConnectHost string
+	Token       string
+	conn        *websocket.Conn
 }
 
 func Open(ctx context.Context, participant fabric.Fabric, endpoint string) (*Session, error) {
@@ -83,7 +84,7 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 		return nil, fmt.Errorf("Computer view admission banner is invalid")
 	}
 	transport.CloseIdleConnections()
-	return &Session{Endpoint: endpoint, Token: token, conn: connection}, nil
+	return &Session{Endpoint: endpoint, ConnectHost: parsed.Hostname(), Token: token, conn: connection}, nil
 }
 
 func (session *Session) Wait(ctx context.Context) error {

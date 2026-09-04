@@ -56,6 +56,34 @@ func TestTakeoverViewPolicyRetryIsTypedAndBounded(t *testing.T) {
 	})
 }
 
+func TestComputerTakeoverViewProjectsFriendlyNameBeforeRawConnectHost(t *testing.T) {
+	result := computerTakeoverViewResult{
+		FriendlyName:     "alice",
+		ConnectHost:      "fabric-address.example.test",
+		ComputerID:       "computer-1",
+		Action:           "view",
+		SessionTokenFile: "/private/session.json",
+	}
+
+	var human bytes.Buffer
+	if err := writeComputerTakeoverView(&human, result, false); err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := "FRIENDLY NAME\talice\nCONNECT HOST\tfabric-address.example.test\n"
+	if !strings.HasPrefix(human.String(), wantPrefix) || strings.Contains(human.String(), "DISPLAY ENDPOINT") {
+		t.Fatalf("take-over view table = %q, want friendly name primary and raw connect host secondary", human.String())
+	}
+
+	var encoded bytes.Buffer
+	if err := writeComputerTakeoverView(&encoded, result, true); err != nil {
+		t.Fatal(err)
+	}
+	wantJSONPrefix := "{\n  \"friendly_name\": \"alice\",\n  \"connect_host\": \"fabric-address.example.test\","
+	if !strings.HasPrefix(encoded.String(), wantJSONPrefix) || strings.Contains(encoded.String(), "display_endpoint") {
+		t.Fatalf("take-over view JSON = %s, want friendly name primary and raw connect host secondary", encoded.String())
+	}
+}
+
 func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "access-cli-control"})

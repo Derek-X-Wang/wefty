@@ -321,9 +321,11 @@ Registration increments authority generation but never changes
 `claims_enabled`, `intent_revision`, `intent_reason`, `intent_updated_at`, or
 `intent_actor` on an existing row.
 
-`connect_host` is a Fabric-produced, non-authoritative registration fact used
-only to tell an operator which host to combine with a published port. It never
-participates in identity, authorization, tags, capacity, or claim eligibility.
+`connect_host` is the raw Fabric-produced, non-authoritative registration fact
+used to tell an operator which host to combine with a published port. It stays
+usable as a secondary connection field behind the wefty-owned friendly name;
+it never participates in identity, authorization, tags, capacity, or claim
+eligibility.
 
 An operator intent write supplies the revision it observed and conflicts if the
 revision moved. The write is valid regardless of whether the node is alive,

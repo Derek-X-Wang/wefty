@@ -234,6 +234,11 @@ func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
 
 	common := readObject(t, "common.v1.json")
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	takeoverAccess := object(t, schemas["ComputerTakeoverAccess"], "ComputerTakeoverAccess")
+	takeoverRequired := stringSet(t, takeoverAccess["required"])
+	if !takeoverRequired["friendly_name"] {
+		t.Fatal("ComputerTakeoverAccess does not require the wefty-owned friendly name")
+	}
 	policy := object(t, schemas["AdminPolicy"], "AdminPolicy")
 	required := stringSet(t, policy["required"])
 	if !required["revision"] || required["admins"] {

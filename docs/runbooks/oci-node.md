@@ -72,6 +72,23 @@ wefty node oci stop
 
 An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, and zero live OCI attempts. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
 
+## Connect to a Computer
+
+Create each Computer with a stable `--name`; that wefty-owned friendly name is
+the primary connection handle shown by `services takeover view`. The output
+also includes `connect_host`, the raw Fabric address actually accepted by the
+dial path, as a secondary field. Do not substitute the raw address for the
+friendly name in operator notes or automation, and do not derive identity,
+authorization, placement, or scheduling facts from it.
+
+The full private front-door endpoint and session bearer remain together only
+in the owner-readable file supplied with `--session-token-file`; neither is
+printed. Open a view session with `wefty services takeover view COMPUTER_ID
+--session-token-file ./computer-session.json`.
+
+Use the printed friendly name to identify the Computer. Use `connect_host`
+only when a downstream connection field explicitly accepts a raw host.
+
 ## FileVault, TCC, and the attended Mac boundary
 
 “Headless” begins only after FileVault unlock and OS boot. No daemon can use an encrypted startup volume before unlock. The system LaunchDaemon uses absolute paths and explicit `HOME`, `LIMA_HOME`, `USER`, `LOGNAME`, and `PATH`; it must not depend on a GUI login, login Keychain prompt, shell profile, or a TCC prompt. Put runtime state, Lima state, logs, and allowed mount roots in paths already accessible to the configured operator. If protected data is required, pre-authorize the exact installed binary or keep that data outside the node path; setup does not grant TCC.

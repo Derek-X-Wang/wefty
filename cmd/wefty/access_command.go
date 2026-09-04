@@ -235,9 +235,10 @@ func executeComputerTakeover(
 }
 
 type computerTakeoverViewResult struct {
+	FriendlyName     string `json:"friendly_name"`
+	ConnectHost      string `json:"connect_host"`
 	ComputerID       string `json:"computer_id"`
 	Action           string `json:"action"`
-	DisplayEndpoint  string `json:"display_endpoint"`
 	SessionTokenFile string `json:"session_token_file"`
 }
 
@@ -285,11 +286,8 @@ func executeComputerTakeoverAction(
 		if err := writeTakeoverSessionCapability(tokenFile, takeoverSessionCapability{Endpoint: session.Endpoint, Token: session.Token}); err != nil {
 			return err
 		}
-		// OWNER-CALL: whether a MagicDNS-shaped ConnectHost may appear on the
-		// CLI surface at all is an owner decision. It is sanctioned presentation
-		// data here; no dial endpoint or other host-shaped value is printed.
-		result := computerTakeoverViewResult{ComputerID: availability.ComputerID, Action: action,
-			DisplayEndpoint: clients.fabric.ConnectHost(), SessionTokenFile: tokenFile}
+		result := computerTakeoverViewResult{FriendlyName: availability.FriendlyName, ConnectHost: session.ConnectHost,
+			ComputerID: availability.ComputerID, Action: action, SessionTokenFile: tokenFile}
 		if err := writeComputerTakeoverView(stdout, result, jsonOutput); err != nil {
 			return err
 		}
@@ -409,8 +407,8 @@ func writeComputerTakeoverView(writer io.Writer, result computerTakeoverViewResu
 	if jsonOutput {
 		return writeJSON(writer, result)
 	}
-	_, err := fmt.Fprintf(writer, "COMPUTER ID\t%s\nACTION\t%s\nDISPLAY ENDPOINT\t%s\nSESSION TOKEN FILE\t%s\n",
-		result.ComputerID, result.Action, result.DisplayEndpoint, result.SessionTokenFile)
+	_, err := fmt.Fprintf(writer, "FRIENDLY NAME\t%s\nCONNECT HOST\t%s\nCOMPUTER ID\t%s\nACTION\t%s\nSESSION TOKEN FILE\t%s\n",
+		result.FriendlyName, result.ConnectHost, result.ComputerID, result.Action, result.SessionTokenFile)
 	return err
 }
 
