@@ -59,29 +59,55 @@ func TestTakeoverViewPolicyRetryIsTypedAndBounded(t *testing.T) {
 func TestComputerTakeoverViewProjectsFriendlyNameBeforeRawConnectHost(t *testing.T) {
 	result := computerTakeoverViewResult{
 		FriendlyName:     "alice",
-		ConnectHost:      "fabric-address.example.test",
+		ConnectHost:      "fabric-address.example.test:8443",
+		DisplayEndpoint:  "fabric-address.example.test:8443",
 		ComputerID:       "computer-1",
 		Action:           "view",
 		SessionTokenFile: "/private/session.json",
 	}
 
-	var human bytes.Buffer
-	if err := writeComputerTakeoverView(&human, result, false); err != nil {
-		t.Fatal(err)
-	}
-	wantPrefix := "FRIENDLY NAME\talice\nCONNECT HOST\tfabric-address.example.test\n"
-	if !strings.HasPrefix(human.String(), wantPrefix) || strings.Contains(human.String(), "DISPLAY ENDPOINT") {
-		t.Fatalf("take-over view table = %q, want friendly name primary and raw connect host secondary", human.String())
-	}
+	t.Run("exact human labels", func(t *testing.T) {
+		var human bytes.Buffer
+		if err := writeComputerTakeoverView(&human, result, false); err != nil {
+			t.Fatal(err)
+		}
+		wantHuman := "FRIENDLY NAME\talice\n" +
+			"CONNECT HOST\tfabric-address.example.test:8443\n" +
+			"DISPLAY ENDPOINT\tfabric-address.example.test:8443\n" +
+			"COMPUTER ID\tcomputer-1\n" +
+			"ACTION\tview\n" +
+			"SESSION TOKEN FILE\t/private/session.json\n"
+		if human.String() != wantHuman {
+			t.Fatalf("take-over view table = %q, want exact compatibility labels %q", human.String(), wantHuman)
+		}
+	})
 
-	var encoded bytes.Buffer
-	if err := writeComputerTakeoverView(&encoded, result, true); err != nil {
-		t.Fatal(err)
-	}
-	wantJSONPrefix := "{\n  \"friendly_name\": \"alice\",\n  \"connect_host\": \"fabric-address.example.test\","
-	if !strings.HasPrefix(encoded.String(), wantJSONPrefix) || strings.Contains(encoded.String(), "display_endpoint") {
-		t.Fatalf("take-over view JSON = %s, want friendly name primary and raw connect host secondary", encoded.String())
-	}
+	t.Run("exact JSON keys", func(t *testing.T) {
+		var encoded bytes.Buffer
+		if err := writeComputerTakeoverView(&encoded, result, true); err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded.Bytes(), &fields); err != nil {
+			t.Fatal(err)
+		}
+		wantFields := map[string]bool{
+			"friendly_name": true, "connect_host": true, "display_endpoint": true,
+			"computer_id": true, "action": true, "session_token_file": true,
+		}
+		if len(fields) != len(wantFields) {
+			t.Fatalf("take-over view JSON keys = %v, want exactly %v", fields, wantFields)
+		}
+		for field := range fields {
+			if !wantFields[field] {
+				t.Fatalf("take-over view JSON includes unexpected key %q: %s", field, encoded.String())
+			}
+		}
+		if string(fields["connect_host"]) != `"fabric-address.example.test:8443"` ||
+			string(fields["display_endpoint"]) != string(fields["connect_host"]) {
+			t.Fatalf("take-over view JSON = %s, want deprecated display_endpoint alias equal to dialable connect_host", encoded.String())
+		}
+	})
 }
 
 func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
@@ -202,6 +228,31 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	resolvedByName, err := resolveComputerID(ctx, adminClients, computer.Name)
+	if err != nil || resolvedByName != computer.ComputerID {
+		t.Fatalf("person-authorized friendly-name resolution = %q err=%v, want %q", resolvedByName, err, computer.ComputerID)
+	}
+	resolution, err := adminClients.resolvePersonComputerHandle(ctx, computer.Name)
+	if err != nil || resolution.ComputerID != computer.ComputerID || resolution.MatchedBy != "friendly_name" {
+		t.Fatalf("person handle resolution = %#v err=%v", resolution, err)
+	}
+	collision, _, err := store.CreateComputer(ctx, l1.CreateComputerRequest{
+		Name: computer.ComputerID, Spec: accessCLIComputerSpec("id-shaped-friendly-name"), Actor: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution, err = adminClients.resolvePersonComputerHandle(ctx, computer.ComputerID)
+	if err != nil || resolution.ComputerID != computer.ComputerID || resolution.ComputerID == collision.ComputerID ||
+		resolution.MatchedBy != "computer_id" {
+		t.Fatalf("exact person Computer ID precedence = %#v err=%v; colliding name belongs to %q",
+			resolution, err, collision.ComputerID)
+	}
+	if _, err := resolveComputerID(ctx, viewerClients, computer.Name); err == nil {
+		t.Fatal("ungranted person resolved a Computer friendly name")
+	} else {
+		assertCLIErrorCode(t, err, contract.ErrorForbidden)
 	}
 	stdout.Reset()
 	err = execute(ctx, viewerClients, true, []string{"services", "takeover", "view", computer.ComputerID, "--session-token-file", filepath.Join(t.TempDir(), "viewer")}, &stdout, &stderr)

@@ -19,6 +19,28 @@ import (
 const computerCLITestDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 const computerCLITestDigestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+func TestComputerCLIResolvesFriendlyNameAfterExactID(t *testing.T) {
+	harness, computer, _, _ := newRunningComputerCLIFixture(t, "primary-handle")
+	ctx := context.Background()
+
+	byID := runServiceCLI(t, ctx, harness.clients, true, "services", "status", computer.ComputerID)
+	byName := runServiceCLI(t, ctx, harness.clients, true, "services", "status", computer.Name)
+	if !bytes.Equal(byName, byID) {
+		t.Fatalf("services status <name> = %s, want services status <id> = %s", byName, byID)
+	}
+
+	collision := createComputerCLIProjection(t, ctx, harness.clients, computer.ComputerID, "id-shaped-name-create")
+	resolved := runServiceCLI(t, ctx, harness.clients, true, "services", "status", computer.ComputerID)
+	var projection computerOperatorProjection
+	if err := json.Unmarshal(resolved, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if projection.ComputerID != computer.ComputerID || projection.ComputerID == collision.ComputerID {
+		t.Fatalf("exact ID resolution selected %q, want %q ahead of same-shaped friendly name %q",
+			projection.ComputerID, computer.ComputerID, collision.ComputerID)
+	}
+}
+
 func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 	harness := newServiceCLIHarness(t)
 	harness.clients.images = &fakeImageResolver{digest: computerCLITestDigest}

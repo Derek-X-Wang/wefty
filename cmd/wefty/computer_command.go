@@ -256,14 +256,41 @@ func (mutation computerMutationFlags) key() (string, error) {
 }
 
 func resolveComputerID(ctx context.Context, clients *apiClients, target string) (string, error) {
-	_, computer, err := resolveServiceTarget(ctx, clients, target)
+	computer, computerErr := clients.getComputer(ctx, target)
+	if computerErr == nil {
+		return computer.ComputerID, nil
+	}
+	var responseErr *apiResponseError
+	if errors.As(computerErr, &responseErr) && responseErr.APIError.Code == contract.ErrorPrincipalForbidden {
+		resolution, err := clients.resolvePersonComputerHandle(ctx, target)
+		if err != nil {
+			return "", err
+		}
+		return resolution.ComputerID, nil
+	}
+	if !errors.As(computerErr, &responseErr) || responseErr.APIError.Code != contract.ErrorNotFound {
+		return "", computerErr
+	}
+
+	job, jobErr := clients.getService(ctx, target)
+	if jobErr == nil {
+		if job.ComputerID != "" {
+			return job.ComputerID, nil
+		}
+		return "", usageError(fmt.Sprintf("service %q is not Computer-owned", target))
+	}
+	if !errors.As(jobErr, &responseErr) || responseErr.APIError.Code != contract.ErrorNotFound {
+		return "", jobErr
+	}
+
+	computer, found, err := findComputerByName(ctx, clients, target)
 	if err != nil {
 		return "", err
 	}
-	if computer == nil {
-		return "", usageError(fmt.Sprintf("service %q is not Computer-owned", target))
+	if found {
+		return computer.ComputerID, nil
 	}
-	return computer.ComputerID, nil
+	return "", computerErr
 }
 
 func writeComputerMutation(stdout io.Writer, computer l1.Computer, receipt mutationReceipt, jsonOutput bool) error {
@@ -285,7 +312,7 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 		return err
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(image) == "" {
-		return usageError("usage: wefty services reimage COMPUTER_ID --image IMAGE --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services reimage COMPUTER --image IMAGE --idempotency-key KEY [CAS flags | --expect-current]")
 	}
 	if err := mutation.validate(true); err != nil {
 		return err
@@ -340,7 +367,7 @@ func executeComputerReset(ctx context.Context, clients *apiClients, jsonOutput b
 		return err
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty services reset COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services reset COMPUTER --idempotency-key KEY [CAS flags | --expect-current]")
 	}
 	if err := mutation.validate(true); err != nil {
 		return err
@@ -380,7 +407,7 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 		return err
 	}
 	if flags.NArg() != 1 || !diskBytes.set {
-		return usageError("usage: wefty services resize COMPUTER_ID --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current] [--wait DURATION]")
+		return usageError("usage: wefty services resize COMPUTER --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current] [--wait DURATION]")
 	}
 	if err := wait.validate(flags); err != nil {
 		return err
@@ -587,7 +614,7 @@ func executeComputerAbort(ctx context.Context, clients *apiClients, jsonOutput b
 		return err
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty services abort COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services abort COMPUTER --idempotency-key KEY [CAS flags | --expect-current]")
 	}
 	if err := mutation.validate(true); err != nil {
 		return err

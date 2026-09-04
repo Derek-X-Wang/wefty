@@ -174,6 +174,10 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 			"--session-token-file", tokenFile}, &viewOutput, &viewError)
 	}()
 	waitForAcceptanceFile(t, tokenFile, viewDone, &viewError)
+	capability, err := readTakeoverSessionCapability(tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	takeOutput := runAccessCLI(t, t.Context(), clients, true, "services", "takeover", "take", computer.ComputerID, "--session-token-file", tokenFile)
 	var take contract.ComputerControlReceipt
 	if err := json.Unmarshal(takeOutput, &take); err != nil || take.Action != "take" || take.TenureState != contract.ComputerControlTenureHeld || !take.HumanDriving || take.HolderSessionID == "" {
@@ -188,9 +192,33 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 	if err := <-viewDone; err != nil {
 		t.Fatalf("view command: %v stderr=%s", err, viewError.String())
 	}
-	if output := viewOutput.String(); !strings.HasPrefix(output, "FRIENDLY NAME\ttakeover-cli-acceptance\nCONNECT HOST\t"+rawConnectHost+"\n") ||
+	if output := viewOutput.String(); !strings.HasPrefix(output, "FRIENDLY NAME\ttakeover-cli-acceptance\nCONNECT HOST\t"+rawConnectAddress+"\n") ||
+		strings.Contains(output, capability.Token) || strings.Contains(output, capability.Endpoint) ||
 		strings.Contains(output, frontFabric.connectHost) || strings.Contains(output, "127.0.0.1") || strings.Contains(output, frontServer.URL) {
 		t.Fatalf("view projection did not keep friendly name primary and accepted raw connect host secondary: %s", output)
+	}
+	idOutput := viewOutput.String()
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	nameContext, stopNameView := context.WithCancel(t.Context())
+	var nameOutput, nameError bytes.Buffer
+	nameDone := make(chan error, 1)
+	go func() {
+		nameDone <- execute(nameContext, clients, false, []string{"services", "takeover", "view", computer.Name,
+			"--session-token-file", tokenFile}, &nameOutput, &nameError)
+	}()
+	waitForAcceptanceFile(t, tokenFile, nameDone, &nameError)
+	nameCapability, err := readTakeoverSessionCapability(tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopNameView()
+	if err := <-nameDone; err != nil {
+		t.Fatalf("view by friendly name: %v stderr=%s", err, nameError.String())
+	}
+	if output := nameOutput.String(); output != idOutput || strings.Contains(output, nameCapability.Token) || strings.Contains(output, nameCapability.Endpoint) {
+		t.Fatalf("takeover view <name> = %q, want takeover view <id> = %q without bearer or full endpoint", output, idOutput)
 	}
 	signalMu.Lock()
 	defer signalMu.Unlock()

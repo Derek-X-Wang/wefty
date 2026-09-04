@@ -434,6 +434,17 @@
         },
         "description": "Person-bound view-first discovery. friendly_name is the wefty-owned Computer name. The endpoint is the authorized Fabric front door, never a raw view/control backend; null means admission is not ready."
       },
+      "ComputerHandleResolution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["computer_id", "friendly_name", "matched_by"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "friendly_name": { "type": "string", "minLength": 1 },
+          "matched_by": { "enum": ["computer_id", "current_job_id", "friendly_name"] }
+        },
+        "description": "Person-authorized CLI handle resolution. Exact computer_id wins, then current_job_id, then the UNIQUE friendly name."
+      },
       "ComputerIntent": {
         "type": "object",
         "additionalProperties": false,

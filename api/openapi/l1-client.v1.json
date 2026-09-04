@@ -8,6 +8,21 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/computer-handle-resolutions/{computer}": {
+      "parameters": [{ "name": "computer", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "get": {
+        "operationId": "resolvePersonComputerHandle",
+        "summary": "Resolve a person-authorized Computer handle",
+        "description": "Accepts an exact Computer ID, current Job ID, or UNIQUE friendly name. Exact IDs take precedence over an ID-shaped friendly name. Administrators may resolve every live Computer; other people may resolve only Computers they can view or control, so the route does not expose an existence oracle.",
+        "responses": {
+          "200": { "description": "Canonical Computer ID and the matching handle class.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerHandleResolution" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/whoami": {
       "get": {
         "operationId": "observeAuthenticatedPerson",

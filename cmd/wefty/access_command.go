@@ -81,9 +81,13 @@ func executeAdmins(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 
 func executeComputerGrants(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
 	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return usageError("usage: wefty services grants COMPUTER_ID")
+		return usageError("usage: wefty services grants COMPUTER")
 	}
-	grants, err := clients.listComputerGrants(ctx, args[0])
+	computerID, err := resolveComputerID(ctx, clients, args[0])
+	if err != nil {
+		return err
+	}
+	grants, err := clients.listComputerGrants(ctx, computerID)
 	if err != nil {
 		return err
 	}
@@ -119,7 +123,7 @@ func executeComputerGrant(
 	flags.Visit(func(visited *flag.Flag) { seenRevision = seenRevision || visited.Name == "policy-revision" })
 	if flags.NArg() != 2 || strings.TrimSpace(flags.Arg(0)) == "" || strings.TrimSpace(flags.Arg(1)) == "" ||
 		!seenRevision || revision < 1 {
-		return usageError("usage: wefty services grant COMPUTER_ID USER_ID --permission view|control --policy-revision REVISION [--idempotency-key KEY]")
+		return usageError("usage: wefty services grant COMPUTER USER_ID --permission view|control --policy-revision REVISION [--idempotency-key KEY]")
 	}
 	if revoke {
 		if permission != "" {
@@ -140,7 +144,11 @@ func executeComputerGrant(
 	if err != nil {
 		return err
 	}
-	result, err := clients.mutateComputerGrant(ctx, flags.Arg(0), flags.Arg(1), l1.ComputerGrantMutationRequest{
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	result, err := clients.mutateComputerGrant(ctx, computerID, flags.Arg(1), l1.ComputerGrantMutationRequest{
 		PolicyRevision: revision,
 		FabricID:       fabricID,
 		Permission:     l1.ComputerGrantPermission(permission),
@@ -201,9 +209,13 @@ func executeComputerTakeover(
 	}
 	if len(args) > 0 && args[0] == "sessions" {
 		if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
-			return usageError("usage: wefty services takeover sessions COMPUTER_ID")
+			return usageError("usage: wefty services takeover sessions COMPUTER")
 		}
-		sessions, err := clients.listComputerTakeoverSessions(ctx, args[1])
+		computerID, err := resolveComputerID(ctx, clients, args[1])
+		if err != nil {
+			return err
+		}
+		sessions, err := clients.listComputerTakeoverSessions(ctx, computerID)
 		if err != nil {
 			return err
 		}
@@ -220,23 +232,30 @@ func executeComputerTakeover(
 			return usageError(err.Error())
 		}
 		if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" || limit < 1 || limit > l1.MaxJobPageLimit {
-			return usageError(fmt.Sprintf("usage: wefty services takeover audit COMPUTER_ID [--limit 1..%d] [--cursor CURSOR]", l1.MaxJobPageLimit))
+			return usageError(fmt.Sprintf("usage: wefty services takeover audit COMPUTER [--limit 1..%d] [--cursor CURSOR]", l1.MaxJobPageLimit))
 		}
 		if tailAudit && cursor != "" {
 			return usageError("takeover audit tail does not accept --cursor")
 		}
-		page, err := clients.listComputerTakeoverAudit(ctx, flags.Arg(0), cursor, limit, tailAudit)
+		computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		page, err := clients.listComputerTakeoverAudit(ctx, computerID, cursor, limit, tailAudit)
 		if err != nil {
 			return err
 		}
 		return writeComputerTakeoverAudit(stdout, page, jsonOutput)
 	}
-	return usageError("usage: wefty services takeover view|take|release|sessions|audit COMPUTER_ID")
+	return usageError("usage: wefty services takeover view|take|release|sessions|audit COMPUTER")
 }
 
 type computerTakeoverViewResult struct {
-	FriendlyName     string `json:"friendly_name"`
-	ConnectHost      string `json:"connect_host"`
+	FriendlyName string `json:"friendly_name"`
+	ConnectHost  string `json:"connect_host"`
+	// DisplayEndpoint is a deprecated JSON and table alias for ConnectHost.
+	// Compatibility ends on 2026-10-04; it must never contain the full endpoint.
+	DisplayEndpoint  string `json:"display_endpoint"`
 	ComputerID       string `json:"computer_id"`
 	Action           string `json:"action"`
 	SessionTokenFile string `json:"session_token_file"`
@@ -264,13 +283,17 @@ func executeComputerTakeoverAction(
 		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
-		return usageError("usage: wefty services takeover " + action + " COMPUTER_ID" + takeoverTokenFileUsage(action))
+		return usageError("usage: wefty services takeover " + action + " COMPUTER" + takeoverTokenFileUsage(action))
 	}
 	if strings.TrimSpace(tokenFile) == "" {
 		return usageError("takeover " + action + " requires --session-token-file from the live view session")
 	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
 	if action == "view" {
-		availability, err := clients.getComputerTakeoverAvailability(ctx, flags.Arg(0))
+		availability, err := clients.getComputerTakeoverAvailability(ctx, computerID)
 		if err != nil {
 			return err
 		}
@@ -287,7 +310,7 @@ func executeComputerTakeoverAction(
 			return err
 		}
 		result := computerTakeoverViewResult{FriendlyName: availability.FriendlyName, ConnectHost: session.ConnectHost,
-			ComputerID: availability.ComputerID, Action: action, SessionTokenFile: tokenFile}
+			DisplayEndpoint: session.ConnectHost, ComputerID: availability.ComputerID, Action: action, SessionTokenFile: tokenFile}
 		if err := writeComputerTakeoverView(stdout, result, jsonOutput); err != nil {
 			return err
 		}
@@ -407,8 +430,8 @@ func writeComputerTakeoverView(writer io.Writer, result computerTakeoverViewResu
 	if jsonOutput {
 		return writeJSON(writer, result)
 	}
-	_, err := fmt.Fprintf(writer, "FRIENDLY NAME\t%s\nCONNECT HOST\t%s\nCOMPUTER ID\t%s\nACTION\t%s\nSESSION TOKEN FILE\t%s\n",
-		result.FriendlyName, result.ConnectHost, result.ComputerID, result.Action, result.SessionTokenFile)
+	_, err := fmt.Fprintf(writer, "FRIENDLY NAME\t%s\nCONNECT HOST\t%s\nDISPLAY ENDPOINT\t%s\nCOMPUTER ID\t%s\nACTION\t%s\nSESSION TOKEN FILE\t%s\n",
+		result.FriendlyName, result.ConnectHost, result.DisplayEndpoint, result.ComputerID, result.Action, result.SessionTokenFile)
 	return err
 }
 

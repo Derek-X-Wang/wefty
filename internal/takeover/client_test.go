@@ -37,18 +37,21 @@ func TestOpenAcceptsAndRetainsRawConnectHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rawHost := "fabric-address.example.test"
-	rawAddress := net.JoinHostPort(rawHost, target.Port())
-	participant := &routedFabric{rawAddress: rawAddress, targetAddress: target.Host}
-	endpoint := (&url.URL{Scheme: "ws", Host: rawAddress, Path: contract.ComputerDisplayWebSocketPath}).String()
-	session, err := Open(t.Context(), participant, endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	if participant.dialedAddress != rawAddress || session.ConnectHost != rawHost {
-		t.Fatalf("raw connect host = dialed %q projected %q, want %q / %q",
-			participant.dialedAddress, session.ConnectHost, rawAddress, rawHost)
+	for _, rawHost := range []string{"fabric-address.example.test", "2001:db8::1"} {
+		t.Run(rawHost, func(t *testing.T) {
+			rawAddress := net.JoinHostPort(rawHost, target.Port())
+			participant := &routedFabric{rawAddress: rawAddress, targetAddress: target.Host}
+			endpoint := (&url.URL{Scheme: "ws", Host: rawAddress, Path: contract.ComputerDisplayWebSocketPath}).String()
+			session, err := Open(t.Context(), participant, endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			if participant.dialedAddress != rawAddress || session.ConnectHost != rawAddress {
+				t.Fatalf("raw connect host = dialed %q projected %q, want %q / %q",
+					participant.dialedAddress, session.ConnectHost, rawAddress, rawAddress)
+			}
+		})
 	}
 }
 
