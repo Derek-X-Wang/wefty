@@ -44,6 +44,22 @@ working directory. Wefty adds no capability, device, GPU, ptrace, privilege,
 browser sandbox exception, font, locale, or D-Bus policy. Image labels,
 `EXPOSE`, and declared volumes are not allocation or publication inputs.
 
+## Computer isolation boundary
+
+Every Computer is isolated from every other Computer on the same Node,
+regardless of owner. A Computer may reach its orchestrator channel -- the
+helper-reserved `view` and `control` endpoints and the agent directive channel
+-- its own Storage, and its own screen. It may not reach any neighbour's
+screen, sockets, processes, or files. A real attempt to cross that boundary
+must be refused; distinct names or the absence of an accidental collision are
+not proof of isolation.
+
+The boundary is ratified by
+[ADR-0005](../adr/0005-computer-isolation-boundary.md). Enforcement closes the
+known shared-Node gaps mechanism by mechanism. This contract states only the
+mechanisms currently proved and does not convert an untested surface into an
+isolation claim.
+
 ## Reserved environment and targets
 
 Image and operator values for every reserved OCI environment name are removed
@@ -184,8 +200,9 @@ endpoints before the ordered publication controller may republish.
 A Computer keeps the ordinary `wefty-v1` isolation walls: resolved image user,
 12 fixed capabilities, explicit empty inheritable/ambient capability sets,
 `noNewPrivileges`, containerd's generated seccomp profile, private
-PID/IPC/UTS/mount/cgroup namespaces, shared networking, and deny-all devices
-plus the six pseudo-devices. The root filesystem is read-only; the Computer
+PID/IPC/UTS/mount/cgroup namespaces, a private network namespace, and deny-all
+devices plus the six pseudo-devices. The helper brings up only that namespace's
+loopback interface before start. The root filesystem is read-only; the Computer
 disk at `/wefty/service` is the persistent writable path. After attaching the
 disk and before retaining profile sources, the helper creates `etc/machine-id`
 when absent or repairs it when invalid, and records the repair in helper logs.
@@ -209,13 +226,23 @@ quarantine remains operator-visible and does not withdraw OCI service from
 unaffected Computers on the Node. Namespace absence remains verified for all
 non-quarantined generations.
 
-Computers share the Node network namespace even though PID, IPC, UTS, mount,
-and cgroup namespaces remain private. Image-side local or abstract socket names
-should therefore be attempt-unique. The XFCE reference derives its X display
-number from the helper-reserved view port instead of claiming a fixed `:99`;
-this prevents accidental display-name collisions. It does not isolate X11:
-co-located processes in the shared Node network namespace can still reach the
-node-wide abstract X socket, which remains a separate isolation risk.
+Screen isolation is enforced at the network-namespace boundary. The XFCE
+reference still derives its X display number from the helper-reserved view port,
+but its abstract `@/tmp/.X11-unix/X<n>` socket exists only in that Computer's
+private network namespace: a neighbour can neither enumerate nor connect to it.
+The Wayland compositor socket remains inside the Computer's private mount
+namespace, and both variants bind their RFB servers only to private loopback.
+For `view`, `control`, and the agent's Computer submission bridge, the helper
+enters only the exact live Computer's network namespace and exposes the existing
+attempt-authority-bound stream; the Computer receives no new capability or
+privilege.
+
+This screen mechanism does not by itself prove the complete isolation boundary.
+Other neighbour socket surfaces, process interactions, and file paths retain
+their existing namespace, cgroup, read-only-root, Storage, and mount controls,
+but complete crossover-refusal coverage for those categories remains a known
+gap. Shared operator-selected mounts in particular are not reclassified as
+isolated by this change.
 
 The Computer-specific profile adds a private `/dev/shm` tmpfs with a 1 GiB
 size ceiling, mode `1777`, and `nosuid,nodev,noexec`. It is created in the
