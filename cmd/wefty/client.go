@@ -549,6 +549,13 @@ func (c *apiClients) importComputerCustody(ctx context.Context, exportID string,
 	return imported, responseWasIdempotentReplay(headers), err
 }
 
+func (c *apiClients) getComputerCustodyImport(ctx context.Context, importID string) (l1.ComputerCustodyImportObservation, error) {
+	var observation l1.ComputerCustodyImportObservation
+	path := "/v1/custody-imports/" + url.PathEscape(importID)
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &observation, http.StatusOK)
+	return observation, err
+}
+
 func responseWasIdempotentReplay(headers http.Header) bool {
 	return strings.EqualFold(headers.Get("Idempotent-Replay"), "true")
 }

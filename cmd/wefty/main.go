@@ -102,17 +102,34 @@ func hasArg(args []string, name string) bool {
 }
 
 const (
-	exitFailure      = 1
-	exitUsage        = 2
-	exitUnauthorized = 3
-	exitNotFound     = 4
-	exitConflict     = 5
+	exitFailure                  = 1
+	exitUsage                    = 2
+	exitUnauthorized             = 3
+	exitNotFound                 = 4
+	exitConflict                 = 5
+	exitCustodyImportDeferred    = 6
+	exitCustodyImportQuarantined = 7
+	exitCustodyImportFailed      = 8
+	exitCustodyImportSuperseded  = 9
 )
 
 func commandExitCode(err error) int {
 	var usage usageError
 	if errors.As(err, &usage) {
 		return exitUsage
+	}
+	var importOutcome *custodyImportOutcomeError
+	if errors.As(err, &importOutcome) {
+		switch importOutcome.outcome {
+		case custodyImportDeferred:
+			return exitCustodyImportDeferred
+		case custodyImportQuarantined:
+			return exitCustodyImportQuarantined
+		case custodyImportFailed:
+			return exitCustodyImportFailed
+		case custodyImportSuperseded:
+			return exitCustodyImportSuperseded
+		}
 	}
 	var apiError contract.APIError
 	var localErr *ocicontrol.ResponseError

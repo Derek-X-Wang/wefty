@@ -1675,6 +1675,38 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 	}
 }
 
+func TestBootBarrierExecutionSnapshotCarriesLastVerifiedReceiptAfterSessionLoss(t *testing.T) {
+	storage := ComputerStorageReference{ComputerID: "computer-import", StorageID: "storage-import",
+		StorageGeneration: 1, IntentRevision: 3, DiskBytes: 2 << 30}
+	deferred := ComputerStorageRecoveryInventoryEntry{Storage: storage, DiskName: "disk-import",
+		Operation: "computer_storage_copy", Reason: "operational_failure", Attempts: 2}
+	engine := newFakeEngine()
+	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
+		Absent:          true,
+		Inventory:       ResourceInventory{ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{deferred}},
+		DurableRetained: ResourceInventory{ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{deferred}},
+	}}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	live, ok := barrier.SweepReceipt()
+	if !ok || len(live.VerifiedRetained.ComputerStorageDeferred) != 1 {
+		t.Fatalf("live retained receipt = %+v ok=%t", live, ok)
+	}
+	barrier.Invalidate()
+	session, retained, err := barrier.ExecutionSnapshot()
+	if err == nil || session != nil || retained.SweepEpoch != live.SweepEpoch ||
+		retained.HelperSession != live.HelperSession || len(retained.VerifiedRetained.ComputerStorageDeferred) != 1 {
+		t.Fatalf("unavailable ExecutionSnapshot = session=%v receipt=%+v err=%v", session, retained, err)
+	}
+}
+
 func TestNamespaceVerificationRequiresExactLogRetentionOwnerAndReason(t *testing.T) {
 	const logSegment = "wefty-log-segments-0123456789abcdef0123456789abcdef"
 	verification := VerifyResponse{

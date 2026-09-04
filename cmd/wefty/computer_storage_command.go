@@ -140,6 +140,28 @@ func (err *storageObservationError) Error() string {
 
 func (err *storageObservationError) Unwrap() error { return err.cause }
 
+type custodyImportOutcome string
+
+const (
+	custodyImportDeferred    custodyImportOutcome = "deferred"
+	custodyImportQuarantined custodyImportOutcome = "quarantined"
+	custodyImportFailed      custodyImportOutcome = "failed"
+	custodyImportSuperseded  custodyImportOutcome = "superseded"
+)
+
+type custodyImportOutcomeError struct {
+	importID string
+	outcome  custodyImportOutcome
+	detail   string
+}
+
+func (err *custodyImportOutcomeError) Error() string {
+	if err.detail == "" {
+		return fmt.Sprintf("Custody import %q is %s", err.importID, err.outcome)
+	}
+	return fmt.Sprintf("Custody import %q is %s: %s", err.importID, err.outcome, err.detail)
+}
+
 func executeComputerStorage(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usageError(computerStorageUsage)
@@ -561,9 +583,16 @@ func executeComputerCustodyImport(ctx context.Context, clients *apiClients, json
 	}
 	output := storageMutationOutput{MutationApplied: !replayed, IdempotentReplay: replayed, CustodyImport: &imported}
 	if wait.timeout > 0 {
-		observed, observation, waitErr := waitForComputerRevision(ctx, clients, imported.DestinationComputerID, imported.OperationRevision, wait)
-		output.Computer, output.Observation = &observed, &observation
-		waitErr = attachStorageProvenance(ctx, clients, imported.DestinationComputerID, &output, waitErr)
+		observed, computer, observation, waitErr := waitForCustodyImport(ctx, clients, imported.ImportID, imported.OperationRevision, wait)
+		imported.Status, imported.FailureCode = observed.Status, observed.FailureCode
+		imported.PreparationOutcome, imported.CompletedAt = observed.PreparationOutcome, observed.CompletedAt
+		output.CustodyImport, output.Observation = &imported, &observation
+		if computer.ComputerID != "" {
+			output.Computer = &computer
+		}
+		if waitErr == nil {
+			waitErr = attachStorageProvenance(ctx, clients, imported.DestinationComputerID, &output, nil)
+		}
 		return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
 	}
 	return writeStorageMutation(stdout, output, jsonOutput)
@@ -659,6 +688,52 @@ func waitForComputerRevision(ctx context.Context, clients *apiClients, computerI
 		return observed.AppliedRevision >= operationRevision && observed.ReconfigurationPhase == l1.ComputerReconfigurationStable, nil
 	})
 	return observed, observation, err
+}
+
+func waitForCustodyImport(ctx context.Context, clients *apiClients, importID string, operationRevision int64, wait storageWaitFlags) (l1.ComputerCustodyImportObservation, l1.Computer, storageWaitObservation, error) {
+	var observed l1.ComputerCustodyImportObservation
+	var computer l1.Computer
+	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
+		var readErr error
+		observed, readErr = clients.getComputerCustodyImport(ctx, importID)
+		if readErr != nil {
+			return false, readErr
+		}
+		if observed.OperationRevision != operationRevision {
+			return false, fmt.Errorf("Custody import %q observation revision %d does not match accepted revision %d", importID, observed.OperationRevision, operationRevision)
+		}
+		if observed.Status == "failed" {
+			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportFailed, detail: observed.FailureCode}
+		}
+		if observed.Status == "superseded" {
+			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportSuperseded, detail: observed.FailureCode}
+		}
+		if observed.PreparationOutcome != nil {
+			outcome := custodyImportFailed
+			switch observed.PreparationOutcome.Code {
+			case l1.ComputerStoragePreparationResumeDeferred:
+				outcome = custodyImportDeferred
+			case l1.ComputerStoragePreparationQuarantined:
+				outcome = custodyImportQuarantined
+			}
+			return false, &custodyImportOutcomeError{importID: importID, outcome: outcome, detail: observed.PreparationOutcome.Code}
+		}
+		if observed.Status == "reserved" {
+			return false, nil
+		}
+		if observed.Status != "complete" {
+			return false, fmt.Errorf("Custody import %q reported unexpected status %q", importID, observed.Status)
+		}
+		computer, readErr = clients.getComputerStorageAuthority(ctx, importID)
+		if readErr != nil {
+			return false, readErr
+		}
+		if computer.AppliedRevision < operationRevision || computer.ReconfigurationPhase != l1.ComputerReconfigurationStable {
+			return false, fmt.Errorf("Custody import %q completed without matching stable Computer authority", importID)
+		}
+		return true, nil
+	})
+	return observed, computer, observation, err
 }
 
 func waitForCustodyExport(ctx context.Context, clients *apiClients, computerID, exportID string, wait storageWaitFlags) (l1.ComputerCustodyExport, storageWaitObservation, error) {
@@ -769,13 +844,20 @@ func writeStorageMutation(writer io.Writer, output storageMutationOutput, jsonOu
 	}
 	if output.CustodyImport != nil {
 		table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-		if _, err := fmt.Fprintln(table, "IMPORT ID\tEXPORT ID\tOPERATION REVISION\tDESTINATION COMPUTER\tDESTINATION STORAGE\tNAME\tSIZE\tSTATUS"); err != nil {
+		if _, err := fmt.Fprintln(table, "IMPORT ID\tEXPORT ID\tOPERATION REVISION\tDESTINATION COMPUTER\tDESTINATION STORAGE\tNAME\tSIZE\tSTATUS\tFAILURE CODE\tPREPARATION OUTCOME\tHELPER GENERATION\tSWEEP EPOCH"); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\n",
+		preparationCode, helperGeneration, sweepEpoch := "N/A", "N/A", "N/A"
+		if outcome := output.CustodyImport.PreparationOutcome; outcome != nil {
+			preparationCode = outcome.Code
+			helperGeneration = strconv.FormatUint(outcome.HelperGeneration, 10)
+			sweepEpoch = valueOrNA(outcome.SweepEpoch)
+		}
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			output.CustodyImport.ImportID, output.CustodyImport.ExportID, output.CustodyImport.OperationRevision,
 			output.CustodyImport.DestinationComputerID, output.CustodyImport.DestinationStorageID,
-			output.CustodyImport.DestinationName, output.CustodyImport.DestinationSize, output.CustodyImport.Status); err != nil {
+			output.CustodyImport.DestinationName, output.CustodyImport.DestinationSize, output.CustodyImport.Status,
+			valueOrNA(output.CustodyImport.FailureCode), preparationCode, helperGeneration, sweepEpoch); err != nil {
 			return err
 		}
 		if err := table.Flush(); err != nil {

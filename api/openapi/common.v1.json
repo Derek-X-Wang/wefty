@@ -616,7 +616,45 @@
           "custody_exports": { "type": "array", "items": { "type": "object" } }
         }
       },
-      "ComputerCustodyImport": {
+      "ComputerStoragePreparationOutcome": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation", "recorded_at"],
+    "properties": {
+      "code": { "enum": ["computer_storage_preparation_interrupted", "computer_storage_resume_deferred", "computer_storage_quarantined"] },
+      "destination_computer_id": { "type": "string", "minLength": 1 },
+      "destination_storage_id": { "type": "string", "minLength": 1 },
+      "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+      "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+      "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+      "helper_generation": { "type": "integer", "minimum": 1 },
+      "sweep_epoch": { "type": "string", "minLength": 1 },
+      "disk_name": { "type": "string", "minLength": 1 },
+      "operation": { "type": "string", "minLength": 1 },
+      "reason": { "type": "string", "minLength": 1 },
+      "deferred_reason": { "type": "string", "minLength": 1 },
+      "attempts": { "type": "integer", "minimum": 1 },
+      "first_deferred_at": { "type": "string", "format": "date-time" },
+      "payload_dropped_at": { "type": "string", "format": "date-time" },
+      "recorded_at": { "type": "string", "format": "date-time" }
+    },
+    "description": "Generation-bound reason why a Custody import destination is not currently preparable. Runtime-loss observations are agent-authored from typed helper generation evidence; sweep fields are present when the outcome came from durable startup-recovery inventory."
+    },
+    "ComputerCustodyImportObservation": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["import_id", "operation_revision", "status"],
+    "properties": {
+      "import_id": { "type": "string", "minLength": 1 },
+      "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+      "status": { "enum": ["reserved", "complete", "failed", "superseded"] },
+      "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node"] },
+      "preparation_outcome": { "$ref": "#/components/schemas/ComputerStoragePreparationOutcome" },
+      "completed_at": { "type": "string", "format": "date-time" }
+    },
+    "description": "Durable revision-bound observation used by services custody import --wait."
+    },
+    "ComputerCustodyImport": {
         "type": "object",
         "additionalProperties": false,
         "required": ["import_id", "export_id", "operation_revision", "destination_computer_id", "destination_storage_id", "destination_name", "destination_size", "status", "requested_at"],
@@ -628,7 +666,9 @@
           "destination_storage_id": { "type": "string", "minLength": 1 },
           "destination_name": { "type": "string", "minLength": 1 },
           "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
-          "status": { "enum": ["reserved", "prepared", "complete", "failed"] },
+      "status": { "enum": ["reserved", "prepared", "complete", "failed", "superseded"] },
+      "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node"] },
+      "preparation_outcome": { "$ref": "#/components/schemas/ComputerStoragePreparationOutcome" },
           "requested_at": { "type": "string", "format": "date-time" },
           "completed_at": { "type": "string", "format": "date-time" }
         }
@@ -1120,24 +1160,24 @@
         },
         "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection."
       },
-	  "ComputerStorageClaim": {
-		"type": "object",
-		"additionalProperties": false,
-		"required": ["computer_id", "storage_id", "storage_generation", "intent_revision", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "disk_bytes"],
-		"properties": {
-		  "computer_id": { "type": "string", "minLength": 1 },
-		  "storage_id": { "type": "string", "minLength": 1 },
-		  "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-		  "intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
-		  "submit_enabled": { "type": "boolean" },
-		  "submit_intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
-		  "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
-		  "submit_policy_revision": { "type": "integer", "format": "int64", "minimum": 0 },
-		  "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
-		  "chown": { "type": "boolean", "default": false, "description": "One-shot ownership migration authority for the current reimage projection." }
-		}
-	  },
-	  "RemovalDirective": {
+    "ComputerStorageClaim": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["computer_id", "storage_id", "storage_generation", "intent_revision", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "disk_bytes"],
+    "properties": {
+      "computer_id": { "type": "string", "minLength": 1 },
+      "storage_id": { "type": "string", "minLength": 1 },
+      "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+      "intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+      "submit_enabled": { "type": "boolean" },
+      "submit_intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+      "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+      "submit_policy_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+      "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+      "chown": { "type": "boolean", "default": false, "description": "One-shot ownership migration authority for the current reimage projection." }
+    }
+    },
+    "RemovalDirective": {
         "type": "object",
         "additionalProperties": false,
         "required": ["job_id", "bound_node_id", "kind", "removal_generation", "cleanup_fence", "root_instance_id"],
@@ -1211,16 +1251,16 @@
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
-		  "bound_node_id": { "type": "string", "minLength": 1 },
-		  "root_instance_id": { "type": "string", "minLength": 1 },
+      "bound_node_id": { "type": "string", "minLength": 1 },
+      "root_instance_id": { "type": "string", "minLength": 1 },
           "job_id": { "type": "string", "minLength": 1 },
           "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "storage_id": { "type": "string", "minLength": 1 },
           "old_generation": { "type": "integer", "format": "int64", "minimum": 1 },
           "new_generation": { "type": "integer", "format": "int64", "minimum": 2 },
           "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
-		  "cleanup_fence": { "type": "string", "minLength": 1 },
-		  "phase": { "type": "string", "enum": ["reserved", "prepared", "published"] }
+      "cleanup_fence": { "type": "string", "minLength": 1 },
+      "phase": { "type": "string", "enum": ["reserved", "prepared", "published"] }
         }
       },
       "ComputerStorageGrowDirective": {

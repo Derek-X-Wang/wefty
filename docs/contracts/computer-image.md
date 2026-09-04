@@ -11,6 +11,20 @@ mismatch and invalid authority quarantine immediately. Quarantine retains its
 payload for 24 hours and its typed tombstone thereafter, so N is never
 admissible again; the supported recovery path prepares and admits reset
 generation N+1 and clears N only through authorized removal.
+For a never-attached Custody import generation, the agent persists an exact
+helper-generation `computer_storage_preparation_interrupted`,
+`computer_storage_resume_deferred`, or `computer_storage_quarantined` result in
+L1's import ledger. The CLI observes that immutable import identity
+and revision directly; completion recorded before polling begins is still
+visible, while the first durable preparation outcome ends `--wait` immediately
+with distinct interrupted/failed, deferred, or quarantined wording and exit
+status instead of a generic wait deadline. Preparation acknowledgements carry
+their idempotency key and hash. L1 accepts an identical replay, rejects an older
+helper generation or timestamp, and keeps the copy directive retryable. A
+later successful or terminal copy receipt clears the provisional evidence and
+success remains the only route to publication. The terminal import operation
+row is retained as immutable idempotency and provenance authority; deleting it
+would allow the same source operation to reserve a second destination.
 
 This contract defines the image-owned half of a `computer`-trait OCI service
 and the agent's all-or-nothing screen-door readiness verdict. The ratified

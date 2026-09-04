@@ -2057,8 +2057,11 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 	if adapter == nil || adapter.sessions == nil {
 		return workloadrunner.ComputerStorageCopyReceipt{}, errors.New("OCI helper session is not configured")
 	}
-	session, err := adapter.sessions.Session()
+	session, sweepReceipt, err := adapter.sessions.ExecutionSnapshot()
 	if err != nil {
+		if outcome, ok := computerStoragePreparationOutcome(request.Destination, sweepReceipt); ok {
+			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.ComputerStoragePreparationError{Outcome: outcome}
+		}
 		return workloadrunner.ComputerStorageCopyReceipt{}, err
 	}
 	handshake := session.Handshake()
@@ -2075,6 +2078,31 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 			JobID: request.JobID, OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
 	})
 	if err != nil {
+		var runtimeLoss *ocihelper.RuntimeLossError
+		if request.Operation == "import" && errors.As(err, &runtimeLoss) {
+			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.RuntimeLossError{
+				Generation: workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration},
+				Err:        err,
+			}
+		}
+		var rpcError *ocihelper.RPCError
+		if errors.As(err, &rpcError) && (rpcError.Code == ocihelper.CodeComputerStorageResumeDeferred || rpcError.Code == ocihelper.CodeComputerStorageQuarantined) {
+			outcome := workloadrunner.ComputerStoragePreparationOutcome{
+				Code: string(rpcError.Code), Storage: request.Destination, HelperGeneration: handshake.SessionGeneration,
+				Operation: request.Operation, Reason: string(rpcError.Code), RecordedAt: time.Now().UTC(),
+			}
+			if retained, ok := computerStoragePreparationOutcome(request.Destination, sweepReceipt); ok {
+				outcome.SweepEpoch = retained.SweepEpoch
+				outcome.DiskName = retained.DiskName
+				outcome.Operation = retained.Operation
+				outcome.Reason = retained.Reason
+				outcome.DeferredReason = retained.DeferredReason
+				outcome.Attempts = retained.Attempts
+				outcome.FirstDeferredAt = retained.FirstDeferredAt
+				outcome.PayloadDroppedAt = retained.PayloadDroppedAt
+			}
+			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.ComputerStoragePreparationError{Outcome: outcome}
+		}
 		return workloadrunner.ComputerStorageCopyReceipt{}, err
 	}
 	if (response.Receipt.Kind != "computer_storage_copy_verified" && response.Receipt.Kind != "computer_storage_copy_failed_absent") || response.Receipt.ReceiptID == "" ||
@@ -2082,6 +2110,41 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 		return workloadrunner.ComputerStorageCopyReceipt{}, errors.New("OCI helper did not positively verify Computer Storage copy")
 	}
 	return response.Receipt, nil
+}
+
+func computerStoragePreparationOutcome(storage workloadrunner.ComputerStorage, receipt ocihelper.VerifiedSweepReceipt) (workloadrunner.ComputerStoragePreparationOutcome, bool) {
+	for _, candidate := range []struct {
+		code    string
+		entries []ocihelper.ComputerStorageRecoveryInventoryEntry
+	}{
+		{code: workloadrunner.ComputerStoragePreparationResumeDeferred, entries: receipt.VerifiedRetained.ComputerStorageDeferred},
+		{code: workloadrunner.ComputerStoragePreparationQuarantined, entries: receipt.VerifiedRetained.ComputerStorageQuarantined},
+	} {
+		for _, entry := range candidate.entries {
+			observed := entry.Storage
+			if observed.ComputerID != storage.ComputerID || observed.StorageID != storage.StorageID ||
+				observed.StorageGeneration != storage.StorageGeneration || observed.IntentRevision != storage.IntentRevision ||
+				observed.DiskBytes != storage.DiskBytes {
+				continue
+			}
+			return workloadrunner.ComputerStoragePreparationOutcome{
+				Code: candidate.code, Storage: storage, HelperGeneration: receipt.HelperSession.SessionGeneration,
+				SweepEpoch: receipt.SweepEpoch, DiskName: entry.DiskName, Operation: entry.Operation,
+				Reason: entry.Reason, DeferredReason: entry.DeferredReason, Attempts: entry.Attempts,
+				FirstDeferredAt: optionalPreparationTime(entry.FirstDeferredAt), PayloadDroppedAt: entry.PayloadDroppedAt,
+				RecordedAt: time.Now().UTC(),
+			}, true
+		}
+	}
+	return workloadrunner.ComputerStoragePreparationOutcome{}, false
+}
+
+func optionalPreparationTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	value = value.UTC()
+	return &value
 }
 
 func (adapter *Adapter) ExportComputerCustody(ctx context.Context, request workloadrunner.ComputerCustodyExportRequest) (workloadrunner.ComputerCustodyExportReceipt, error) {

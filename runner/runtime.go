@@ -117,8 +117,8 @@ type RuntimeGeneration struct {
 	Generation uint64
 }
 
-// RuntimeLossError carries positive adapter evidence that a reap operation
-// lost the runtime generation whose resources it was trying to verify.
+// RuntimeLossError carries positive adapter evidence that an operation lost
+// the runtime generation whose resources it was trying to use or verify.
 type RuntimeLossError struct {
 	Generation RuntimeGeneration
 	Err        error
@@ -126,9 +126,9 @@ type RuntimeLossError struct {
 
 func (err *RuntimeLossError) Error() string {
 	if err == nil || err.Err == nil {
-		return "workload runtime lost during quiescence verification"
+		return "workload runtime lost during operation"
 	}
-	return "workload runtime lost during quiescence verification: " + err.Err.Error()
+	return "workload runtime lost during operation: " + err.Err.Error()
 }
 
 func (err *RuntimeLossError) Unwrap() error {
@@ -691,6 +691,38 @@ type ComputerStorageCopyRequest struct {
 }
 
 type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
+
+const (
+	ComputerStoragePreparationInterrupted    = "computer_storage_preparation_interrupted"
+	ComputerStoragePreparationResumeDeferred = "computer_storage_resume_deferred"
+	ComputerStoragePreparationQuarantined    = "computer_storage_quarantined"
+)
+
+// ComputerStoragePreparationOutcome is helper-authored evidence that a
+// detached destination cannot currently be prepared. Unlike an ordinary copy
+// error, these closed outcomes are safe for the agent to persist at L1.
+type ComputerStoragePreparationOutcome struct {
+	Code             string
+	Storage          ComputerStorage
+	HelperGeneration uint64
+	SweepEpoch       string
+	DiskName         string
+	Operation        string
+	Reason           string
+	DeferredReason   string
+	Attempts         int
+	FirstDeferredAt  *time.Time
+	PayloadDroppedAt string
+	RecordedAt       time.Time
+}
+
+type ComputerStoragePreparationError struct {
+	Outcome ComputerStoragePreparationOutcome
+}
+
+func (err *ComputerStoragePreparationError) Error() string {
+	return "Computer Storage preparation reported " + err.Outcome.Code
+}
 
 // ComputerCustodyExporter transfers one already-published Backup copy beyond
 // the managed root. L1 records the permanent custody event before calling it.

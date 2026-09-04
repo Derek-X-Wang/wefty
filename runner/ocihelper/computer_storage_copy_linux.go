@@ -418,6 +418,9 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	if present && !sameComputerStorageCopyRequest(manifest.Request, request) {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination has different durable authority")
 	}
+	if present && manifest.Phase != computerStorageCopyPublished && manifest.Recovery.Attempts > 0 {
+		return CopyComputerStorageResponse{}, &ComputerStorageResumeDeferredError{Storage: request.Destination}
+	}
 	publishedPath := filepath.Join(destinationRoot, "disk.ext4")
 	stagingPath := filepath.Join(destinationRoot, "disk.ext4.staging")
 	if present && manifest.Phase == computerStorageCopyPublished && manifest.Receipt != nil {

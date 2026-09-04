@@ -207,6 +207,9 @@ type BootBarrier struct {
 	prepared        bool
 	receipt         VerifiedSweepReceipt
 	lastLossReceipt VerifiedSweepReceipt
+	// retainedReceipt remains available after session loss so callers can bind
+	// a preparation outcome to the last verified helper generation and sweep.
+	retainedReceipt VerifiedSweepReceipt
 	loss            func(HelperSession, error)
 	reason          contract.CapabilityReasonCode
 	stalledWindows  uint64
@@ -294,10 +297,10 @@ func (barrier *BootBarrier) ExecutionSnapshot() (*Session, VerifiedSweepReceipt,
 	barrier.mu.RLock()
 	defer barrier.mu.RUnlock()
 	if !barrier.prepared || barrier.session == nil {
-		return nil, VerifiedSweepReceipt{}, errors.New("OCI boot barrier has not completed")
+		return nil, cloneVerifiedSweepReceipt(barrier.retainedReceipt), errors.New("OCI boot barrier has not completed")
 	}
 	if err := barrier.session.HealthError(); err != nil {
-		return nil, VerifiedSweepReceipt{}, err
+		return nil, cloneVerifiedSweepReceipt(barrier.retainedReceipt), err
 	}
 	return barrier.session, cloneVerifiedSweepReceipt(barrier.receipt), nil
 }
@@ -408,6 +411,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	if barrier.lastLossAt.Equal(lossObservedAt) {
 		barrier.lastLossAt = time.Time{}
 	}
+	barrier.retainedReceipt = receipt
 	barrier.mu.Unlock()
 	cleanup = false
 	return nil

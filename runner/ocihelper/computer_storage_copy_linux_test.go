@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func publishedStorageCopySource(t *testing.T) (string, *fakeComputerDiskSystem, CreateComputerBackupResponse) {
@@ -193,6 +194,38 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 				}
 			})
 		}
+	}
+}
+
+func TestComputerStorageCopyReturnsDeferredAfterStartupRecoveryDefers(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		storageCopyFinalize: fakeCloneFinalize(t)}
+	crash := errors.New("injected helper runtime loss")
+	engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+		if phase == computerStorageCopyAllocated {
+			return crash
+		}
+		return nil
+	}
+	if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+		t.Fatalf("initial copy error = %v", err)
+	}
+	name, _ := deterministicComputerDiskName(request.Destination)
+	destinationRoot := filepath.Join(root, "computer-disks", name)
+	manifest, present, err := readComputerStorageCopyManifest(filepath.Join(destinationRoot, "storage-copy.json"))
+	if err != nil || !present {
+		t.Fatalf("durable copy manifest = %+v present=%t err=%v", manifest, present, err)
+	}
+	manifest.Recovery = computerStorageRecoveryDeferral{Attempts: 1, FirstDeferredAt: time.Now().UTC(), Reason: "operational_failure"}
+	if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.CopyComputerStorage(t.Context(), request)
+	var deferred *ComputerStorageResumeDeferredError
+	if !errors.As(err, &deferred) || deferred.Storage != request.Destination {
+		t.Fatalf("copy after deferred startup recovery = %T %v", err, err)
 	}
 }
 

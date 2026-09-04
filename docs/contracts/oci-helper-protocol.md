@@ -255,7 +255,11 @@ The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 
 Successful verification produces an immutable receipt retained by the client
-barrier. It names the sweep epoch and helper process/session generation and
+barrier, including across loss of the session that produced it. An unavailable
+execution snapshot returns that last verified receipt alongside its error so
+the adapter can bind a preparation outcome to production evidence; it never
+returns the retained session as runnable. The receipt names the sweep epoch and
+helper process/session generation and
 copies the prior boot sessions, class-separated swept inventory, independent
 post-sweep observed inventory, runtime-residue projection, durable-retained
 projection, exact durable-retention bindings, and recovered `(removal_generation, attempt_id,
@@ -857,7 +861,10 @@ destination generation was published. Grow and copy recovery emit typed
 `resumed` or `rolled_back` sweep evidence. Operational recovery failures with
 valid durable authority increment `attempts`, preserve `first_deferred_at` and
 a closed reason, emit `resume_deferred`, and keep that Computer generation
-unattachable. Only boot-barrier startup sweeps increment the durable attempt
+unattachable. A later `CopyComputerStorage` call for the same durable request
+returns typed `computer_storage_resume_deferred` while that deferred manifest
+remains; a quarantined generation returns the existing typed quarantine result.
+Only boot-barrier startup sweeps increment the durable attempt
 count; in-session `ReapSession` sweeps retain state without consuming it.
 Recovery becomes terminal only after both 24 failed helper-start sweeps and 24
 elapsed hours: `resume_abandoned` quarantines the
@@ -884,6 +891,24 @@ authorized recovery path is a reset that prepares and admits generation N+1,
 followed by normal removal authority for N. The affected Computer therefore stays
 fail-closed while the helper continues serving the rest of the Node. Startup's
 namespace-absence promise remains exact for every non-quarantined generation.
+
+For a Custody import, typed helper runtime loss during `CopyComputerStorage`
+becomes an exact-generation `computer_storage_preparation_interrupted`
+observation; startup recovery also carries exact-generation
+`computer_storage_resume_deferred` or `computer_storage_quarantined` results.
+Receipt-backed outcomes retain the sweep epoch, disk name, closed reason,
+attempt count, and deferral timestamps. All outcomes bind Computer ID, Storage
+ID, generation, intent revision, disk bytes, helper generation, and observation
+time; an identity mismatch never attaches to an import. L1 records the
+preparation idempotency key and body hash, accepts identical replay, and rejects
+an older helper generation or timestamp. This evidence grants no publication
+or cleanup authority, leaves the reserved directive retryable, and is cleared
+by later success, terminal failure, or supersession. L1's import ledger remains
+the immutable idempotency and provenance authority even after a terminal result
+has released the reserved Computer identity, so its row is not age-pruned.
+`services custody import --wait` ends on the first durable preparation outcome
+and distinguishes deferred, quarantined, failed/interrupted, and superseded
+exit statuses instead of timing out on an unchanging Computer projection.
 
 Required-file recovery classification is exact:
 

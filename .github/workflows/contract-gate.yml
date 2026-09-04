@@ -31,6 +31,8 @@ jobs:
           cache-dependency-path: go.sum
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
+      - name: Check OpenAPI JSON formatting
+        run: go test ./api/openapi -run '^TestOpenAPIFilesUseSpaceIndentation$'
       - name: Enforce Fabric import boundary
         run: bash scripts/check-fabric-boundary.sh
       - name: Vet

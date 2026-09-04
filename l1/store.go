@@ -573,6 +573,9 @@ CREATE TABLE IF NOT EXISTS computer_storage_copy_operations (
   request_hash TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'superseded')),
 	  failure_code TEXT NOT NULL DEFAULT '',
+	preparation_outcome_json BLOB,
+	preparation_acknowledgement_key TEXT,
+	preparation_acknowledgement_hash TEXT,
   verification_receipt_json BLOB,
   verification_receipt_hash TEXT,
   old_backup_receipt_json BLOB,
@@ -914,6 +917,15 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "failure_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "preparation_outcome_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "preparation_acknowledgement_key", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "preparation_acknowledgement_hash", "TEXT"); err != nil {
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
