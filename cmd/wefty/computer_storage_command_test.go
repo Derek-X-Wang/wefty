@@ -12,14 +12,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	agentpkg "github.com/Derek-X-Wang/wefty/agent"
+	"github.com/Derek-X-Wang/wefty/agent/managedroot"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 const (
@@ -28,12 +33,14 @@ const (
 )
 
 type storageCLIHarness struct {
-	ctx      context.Context
-	store    *l1.Store
-	clients  *apiClients
-	node     l1.Node
-	computer l1.Computer
-	claim    *l1.Claim
+	ctx         context.Context
+	store       *l1.Store
+	clients     *apiClients
+	agentFabric fabric.Fabric
+	managedRoot string
+	node        l1.Node
+	computer    l1.Computer
+	claim       *l1.Claim
 }
 
 func TestComputerStorageCLIOverRealL1AndHelperSeams(t *testing.T) {
@@ -410,6 +417,7 @@ func TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome(t *testin
 		var observationErr *storageObservationError
 		var output storageMutationOutput
 		if !errors.As(err, &observationErr) || !strings.Contains(err.Error(), l1.ComputerStoragePreparationResumeDeferred) ||
+			commandExitCodeForArgs(err, []string{"services", "custody", "import"}) != exitCustodyImportDeferred ||
 			json.Unmarshal(stdout.Bytes(), &output) != nil || output.CustodyImport == nil ||
 			output.CustodyImport.PreparationOutcome == nil ||
 			output.CustodyImport.PreparationOutcome.Code != l1.ComputerStoragePreparationResumeDeferred ||
@@ -432,12 +440,189 @@ func TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome(t *testin
 		}
 		var output storageMutationOutput
 		if !strings.Contains(fmt.Sprint(err), "manifest_invalid") || json.Unmarshal(stdout.Bytes(), &output) != nil ||
+			commandExitCodeForArgs(err, []string{"services", "custody", "import"}) != exitCustodyImportFailed ||
 			output.CustodyImport == nil || output.CustodyImport.Status != "failed" ||
 			output.CustodyImport.FailureCode != "manifest_invalid" || output.Computer != nil ||
 			output.Observation == nil || output.Observation.Status != "failed" {
 			t.Fatalf("failed import stdout=%s stderr=%s err=%v", stdout.String(), stderr.String(), err)
 		}
 	})
+}
+
+func TestCustodyImportTerminalOutcomeWordingAndExitCodes(t *testing.T) {
+	tests := []struct {
+		outcome custodyImportOutcome
+		detail  string
+		want    int
+		word    string
+	}{
+		{outcome: custodyImportDeferred, detail: l1.ComputerStoragePreparationResumeDeferred, want: exitCustodyImportDeferred, word: "is deferred"},
+		{outcome: custodyImportQuarantined, detail: l1.ComputerStoragePreparationQuarantined, want: exitCustodyImportQuarantined, word: "is quarantined"},
+		{outcome: custodyImportFailed, detail: "manifest_invalid", want: exitCustodyImportFailed, word: "is failed"},
+		{outcome: custodyImportSuperseded, detail: "aborted_dead_node", want: exitCustodyImportSuperseded, word: "is superseded"},
+	}
+	for _, test := range tests {
+		err := &storageObservationError{cause: &custodyImportOutcomeError{importID: "import-one", outcome: test.outcome, detail: test.detail}}
+		got := commandExitCodeForArgs(err, []string{"services", "custody", "import"})
+		if got != test.want || !strings.Contains(err.Error(), test.word) {
+			t.Fatalf("%s outcome error=%q exit=%d, want wording %q exit=%d", test.outcome, err, got, test.word, test.want)
+		}
+	}
+}
+
+type fix303RuntimeLossRuntime struct {
+	copyCalls chan workloadrunner.ComputerStorageCopyRequest
+	barrier   *fix303BootBarrier
+}
+
+type fix303CapabilityProbe struct{}
+
+func (fix303CapabilityProbe) Probe(context.Context) (agentpkg.CapabilityProbeResult, error) {
+	return agentpkg.CapabilityProbeResult{Capabilities: map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, MissingCapabilities: []string{}}, nil
+}
+
+type fix303BootBarrier struct {
+	mu               sync.Mutex
+	unavailableUntil time.Time
+}
+
+func (barrier *fix303BootBarrier) Ready() bool {
+	barrier.mu.Lock()
+	defer barrier.mu.Unlock()
+	return time.Now().After(barrier.unavailableUntil)
+}
+func (barrier *fix303BootBarrier) Ensure(context.Context) error {
+	if !barrier.Ready() {
+		return errors.New("OCI boot barrier has not completed")
+	}
+	return nil
+}
+func (*fix303BootBarrier) Close() error                                        { return nil }
+func (*fix303BootBarrier) SetLossHandler(func(ocihelper.HelperSession, error)) {}
+func (*fix303BootBarrier) Generation() (ocihelper.HelperSession, bool) {
+	return ocihelper.HelperSession{HelperInstanceID: "helper-fix-303", SessionGeneration: 17}, true
+}
+func (*fix303BootBarrier) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
+	return ocihelper.VerifiedSweepReceipt{SweepEpoch: "sweep-fix-303",
+		HelperSession:  ocihelper.HelperSession{HelperInstanceID: "helper-fix-303", SessionGeneration: 17},
+		VerifiedAbsent: true}, true
+}
+
+func (barrier *fix303BootBarrier) failFor(duration time.Duration) {
+	barrier.mu.Lock()
+	barrier.unavailableUntil = time.Now().Add(duration)
+	barrier.mu.Unlock()
+}
+
+type fix303ComputerTokenMinter struct{}
+
+func (fix303ComputerTokenMinter) MintComputerToken(context.Context, l3.ComputerTokenMintRequest) (l3.ComputerTokenGrant, error) {
+	return l3.ComputerTokenGrant{}, errors.New("unexpected Computer token mint")
+}
+
+func (fix303ComputerTokenMinter) RevokeComputerAttemptTokens(context.Context, l3.ComputerAttemptTokenRevocationRequest) error {
+	return nil
+}
+
+func (fix303ComputerTokenMinter) RevokeHostComputerTokens(context.Context, l3.HostComputerTokenRevocationRequest) error {
+	return nil
+}
+
+func (fix303RuntimeLossRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (fix303RuntimeLossRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	return workloadrunner.Result{}, errors.New("unexpected workload admission in Custody import preparation regression")
+}
+
+func (fix303RuntimeLossRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+func (runtime fix303RuntimeLossRuntime) CopyComputerStorage(_ context.Context, request workloadrunner.ComputerStorageCopyRequest) (workloadrunner.ComputerStorageCopyReceipt, error) {
+	select {
+	case runtime.copyCalls <- request:
+	default:
+	}
+	runtime.barrier.failFor(2 * time.Second)
+	return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.RuntimeLossError{
+		Generation: workloadrunner.RuntimeGeneration{InstanceID: "helper-fix-303", Generation: 17},
+		Err:        errors.New("oci helper engine_failure operation_failed followed by EOF"),
+	}
+}
+
+func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing.T) {
+	h := newStorageCLIHarness(t)
+	barrier := &fix303BootBarrier{}
+	runtime := fix303RuntimeLossRuntime{copyCalls: make(chan workloadrunner.ComputerStorageCopyRequest, 1), barrier: barrier}
+	nodeAgent, err := agentpkg.New(agentpkg.Config{
+		Fabric: h.agentFabric, ControlPlaneAddress: l3.DefaultL1Address,
+		NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID, Version: "fix-303-regression",
+		OS: "linux", Architecture: "amd64",
+		Capabilities:    map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true},
+		CapabilityProbe: fix303CapabilityProbe{}, OCIBootBarrier: barrier,
+		OCIIntent: func(context.Context) (agentpkg.OCIIntentObservation, error) {
+			return agentpkg.OCIIntentObservation{Enabled: true, Revision: 1}, nil
+		},
+		WorkloadRuntimes:  map[string]agentpkg.WorkloadRuntime{contract.JobKindOCI: runtime},
+		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond,
+		LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: h.managedRoot,
+		ComputerTokenMinter: fix303ComputerTokenMinter{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	agentContext, stopAgent := context.WithCancel(h.ctx)
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- nodeAgent.Run(agentContext) }()
+	readyDeadline := time.Now().Add(2 * time.Second)
+	for nodeAgent.Status().State != agentpkg.LifecycleReady && time.Now().Before(readyDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if state := nodeAgent.Status().State; state != agentpkg.LifecycleReady {
+		status := nodeAgent.Status()
+		semantic := "none"
+		if status.LastSemanticError != nil {
+			semantic = fmt.Sprintf("%+v", *status.LastSemanticError)
+		}
+		stopAgent()
+		if agentErr := <-agentDone; agentErr != nil {
+			t.Fatalf("agent did not become ready: status=%+v semantic=%s err=%v", status, semantic, agentErr)
+		}
+		t.Fatalf("agent did not become ready: status=%+v semantic=%s", status, semantic)
+	}
+
+	manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
+	started := time.Now()
+	var stdout, stderr bytes.Buffer
+	err = execute(h.ctx, h.clients, true, []string{"services", "custody", "import", manifest.ExportID,
+		"--name", "runtime-loss-import", "--disk-bytes", fmt.Sprint(2 << 30), "--node", h.node.NodeID,
+		"--path", t.TempDir(), "--manifest", manifestPath, "--manifest-digest", manifestDigest,
+		"--idempotency-key", "runtime-loss-import", "--wait", "750ms", "--poll-interval", "1ms"}, &stdout, &stderr)
+	elapsed := time.Since(started)
+	stopAgent()
+	if agentErr := <-agentDone; agentErr != nil {
+		t.Fatalf("agent stopped with error: %v", agentErr)
+	}
+	select {
+	case request := <-runtime.copyCalls:
+		t.Logf("agent attempted Custody import copy for %s", request.Destination.ComputerID)
+	default:
+		directives, directiveErr := h.store.ListNodeComputerStorageCopyDirectives(h.ctx, "fabric-storage-node", h.node.NodeID, h.node.BootSessionID)
+		t.Logf("agent made no copy call; directives=%+v err=%v", directives, directiveErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "computer_storage_preparation_interrupted") ||
+		strings.Contains(err.Error(), "context deadline exceeded") || elapsed >= 500*time.Millisecond ||
+		!bytes.Contains(stdout.Bytes(), []byte(`"code": "computer_storage_preparation_interrupted"`)) {
+		t.Fatalf("runtime-loss import stdout=%s stderr=%s elapsed=%s err=%v", stdout.String(), stderr.String(), elapsed, err)
+	}
+	if barrierErr := barrier.Ensure(t.Context()); barrierErr == nil || !strings.Contains(barrierErr.Error(), "boot barrier has not completed") {
+		t.Fatalf("runtime loss did not leave the boot barrier unavailable beyond the 750ms wait: %v", barrierErr)
+	}
 }
 
 func TestComputerStorageCLIUsageIsTypedJSONAndWaitReportsAcceptedMutation(t *testing.T) {
@@ -529,6 +714,26 @@ func newStorageCLIHarness(t *testing.T) *storageCLIHarness {
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	operatorFabric := network.NewFabric(fabric.Identity{NodeID: "operator", Tags: []string{l1.DefaultClientPrincipalTag}})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-storage-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeRoot := filepath.Join(managedRoot, "agent", "nodes", managedroot.EncodeID("storage-node"))
+	if err := os.MkdirAll(nodeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rootManifest, err := json.Marshal(managedroot.RootManifest{Version: 1, RootInstanceID: "root-storage-node", NodeID: "storage-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeRoot, managedroot.RootManifestName), rootManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeBoot := []byte(`{"version":1,"root_instance_id":"root-storage-node","boot_session_id":"previous-storage-boot"}`)
+	if err := os.WriteFile(filepath.Join(nodeRoot, "active-boot-session"), activeBoot, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	fixed := time.Date(2026, 8, 28, 20, 0, 0, 0, time.UTC)
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{Clock: l1.ClockFunc(func() time.Time { return fixed })})
 	if err != nil {
@@ -590,7 +795,8 @@ func newStorageCLIHarness(t *testing.T) *storageCLIHarness {
 			t.Errorf("close L1: %v", err)
 		}
 	})
-	return &storageCLIHarness{ctx: ctx, store: store, clients: clients, node: node, computer: computer, claim: claim}
+	return &storageCLIHarness{ctx: ctx, store: store, clients: clients, agentFabric: agentFabric,
+		managedRoot: managedRoot, node: node, computer: computer, claim: claim}
 }
 
 func (h *storageCLIHarness) completeBackupHelper(t *testing.T) {
@@ -783,6 +989,7 @@ func (h *storageCLIHarness) startStorageCopyPreparationOutcome(code string) <-ch
 							IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize, HelperGeneration: 7,
 							SweepEpoch: "sweep-deferred", DiskName: "computer-deferred", Operation: "import",
 							Reason: "resume_deferred", DeferredReason: "recovery_attempt_budget", Attempts: 3,
+							RecordedAt: func() *time.Time { value := time.Now().UTC(); return &value }(),
 						},
 					})
 				done <- err

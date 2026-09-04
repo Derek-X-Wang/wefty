@@ -643,11 +643,15 @@ func (s *Store) GetComputerCustodyImport(ctx context.Context, importID string) (
 }
 
 func validateCustodyImportPreparationOutcome(row computerStorageCopyRow, outcome *ComputerStoragePreparationOutcome) error {
-	if outcome == nil || (outcome.Code != ComputerStoragePreparationResumeDeferred && outcome.Code != ComputerStoragePreparationQuarantined) ||
+	if outcome == nil || (outcome.Code != ComputerStoragePreparationInterrupted && outcome.Code != ComputerStoragePreparationResumeDeferred && outcome.Code != ComputerStoragePreparationQuarantined) ||
 		outcome.DestinationComputerID != row.DestinationComputerID || outcome.DestinationStorageID != row.DestinationStorageID ||
 		outcome.DestinationGeneration != row.DestinationGeneration || outcome.IntentRevision != row.OperationRevision ||
-		outcome.DiskBytes != row.DestinationSize || outcome.HelperGeneration == 0 || outcome.RecordedAt != nil {
+		outcome.DiskBytes != row.DestinationSize || outcome.HelperGeneration == 0 || outcome.RecordedAt == nil || outcome.RecordedAt.IsZero() {
 		return protocolError(contract.ErrorStorageReferenceConflict, "Custody import preparation outcome does not bind the reserved destination generation")
+	}
+	if outcome.Code == ComputerStoragePreparationInterrupted &&
+		(outcome.SweepEpoch != "" || outcome.DiskName != "" || outcome.Operation != "computer_storage_copy" || outcome.Reason == "") {
+		return protocolError(contract.ErrorInvalidRequest, "interrupted Custody import preparation outcome is incomplete")
 	}
 	if outcome.SweepEpoch != "" && (outcome.DiskName == "" || outcome.Operation == "" || outcome.Reason == "") {
 		return protocolError(contract.ErrorInvalidRequest, "receipt-backed Custody import preparation outcome is incomplete")
@@ -697,16 +701,44 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 		if err := validateCustodyImportPreparationOutcome(row, request.PreparationOutcome); err != nil {
 			return Computer{}, err
 		}
+		var storedOutcomeJSON []byte
+		var storedKey, storedHash sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT preparation_outcome_json, preparation_acknowledgement_key,
+			preparation_acknowledgement_hash FROM computer_storage_copy_operations
+			WHERE destination_computer_id=? AND operation_revision=?`, destinationComputerID, row.OperationRevision).
+			Scan(&storedOutcomeJSON, &storedKey, &storedHash); err != nil {
+			return Computer{}, internalError(err, "read Custody import preparation idempotency")
+		}
+		if storedKey.Valid && storedKey.String == request.IdempotencyKey {
+			if !storedHash.Valid || storedHash.String != bodyHash {
+				return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Custody import preparation replay differs from durable evidence")
+			}
+			return readComputerAuthority(ctx, tx, destinationComputerID, now)
+		}
+		if len(storedOutcomeJSON) != 0 {
+			var stored ComputerStoragePreparationOutcome
+			if err := json.Unmarshal(storedOutcomeJSON, &stored); err != nil {
+				return Computer{}, internalError(err, "decode prior Custody import preparation outcome")
+			}
+			if stored.RecordedAt == nil || request.PreparationOutcome.HelperGeneration < stored.HelperGeneration ||
+				request.PreparationOutcome.RecordedAt.Before(*stored.RecordedAt) {
+				return Computer{}, protocolError(contract.ErrorConflict, "Custody import preparation outcome is older than durable evidence")
+			}
+		}
 		outcome := *request.PreparationOutcome
-		outcome.RecordedAt = &now
 		outcomeJSON, err := json.Marshal(outcome)
 		if err != nil {
 			return Computer{}, internalError(err, "encode Custody import preparation outcome")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET preparation_outcome_json=?
+		result, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET preparation_outcome_json=?,
+			preparation_acknowledgement_key=?, preparation_acknowledgement_hash=?
 			WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`, outcomeJSON,
-			destinationComputerID, row.OperationRevision); err != nil {
+			request.IdempotencyKey, bodyHash, destinationComputerID, row.OperationRevision)
+		if err != nil {
 			return Computer{}, internalError(err, "record Custody import preparation outcome")
+		}
+		if err := requireSingleStorageGenerationMutation(result, "record Custody import preparation outcome"); err != nil {
+			return Computer{}, err
 		}
 		computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
 		if err != nil {
@@ -739,6 +771,7 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 	}
 	if receipt.Kind == "computer_storage_copy_failed_absent" {
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed', preparation_outcome_json=NULL,
+			preparation_acknowledgement_key=NULL, preparation_acknowledgement_hash=NULL,
 			failure_code=?, verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?,
 			acknowledgement_hash=?, completed_ns=? WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
 			receipt.FailureCode, receiptJSON, bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(),
@@ -811,6 +844,7 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 		return Computer{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='complete', preparation_outcome_json=NULL,
+		preparation_acknowledgement_key=NULL, preparation_acknowledgement_hash=NULL,
 		verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?, acknowledgement_hash=?,
 		verified_ns=?, published_ns=?, completed_ns=? WHERE destination_computer_id=? AND operation_revision=1 AND status='reserved'`,
 		receiptJSON, bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(), now.UnixNano(), now.UnixNano(),

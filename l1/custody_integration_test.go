@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -340,24 +341,93 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 		DestinationComputerID: operation.DestinationComputerID, DestinationStorageID: operation.DestinationStorageID,
 		DestinationGeneration: 1, IntentRevision: operation.OperationRevision, DiskBytes: operation.DestinationSize,
 		HelperGeneration: 4, SweepEpoch: "sweep-import", DiskName: "computer-import",
-		Operation: "computer_storage_copy", Reason: "resume_deferred", DeferredReason: "recovery_attempt_budget", Attempts: 3}
-	tampered := preparation
-	tampered.IntentRevision++
-	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
-		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: "tampered-preparation", PreparationOutcome: &tampered}); errorCode(err) != contract.ErrorStorageReferenceConflict {
-		t.Fatalf("foreign preparation outcome error = %v", err)
+		Operation: "computer_storage_copy", Reason: "resume_deferred", DeferredReason: "recovery_attempt_budget", Attempts: 3,
+		RecordedAt: func() *time.Time { value := time.Now().UTC(); return &value }()}
+	for _, test := range []struct {
+		name   string
+		mutate func(*ComputerStoragePreparationOutcome)
+	}{
+		{name: "destination_computer_id", mutate: func(value *ComputerStoragePreparationOutcome) { value.DestinationComputerID = "other-computer" }},
+		{name: "destination_storage_id", mutate: func(value *ComputerStoragePreparationOutcome) { value.DestinationStorageID = "other-storage" }},
+		{name: "destination_generation", mutate: func(value *ComputerStoragePreparationOutcome) { value.DestinationGeneration++ }},
+		{name: "intent_revision", mutate: func(value *ComputerStoragePreparationOutcome) { value.IntentRevision++ }},
+		{name: "disk_bytes", mutate: func(value *ComputerStoragePreparationOutcome) { value.DiskBytes++ }},
+		{name: "helper_generation", mutate: func(value *ComputerStoragePreparationOutcome) { value.HelperGeneration = 0 }},
+		{name: "recorded_at", mutate: func(value *ComputerStoragePreparationOutcome) { value.RecordedAt = nil }},
+	} {
+		t.Run("rejects_"+test.name, func(t *testing.T) {
+			tampered := preparation
+			test.mutate(&tampered)
+			if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+				operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+					BootSessionID: node.BootSessionID, IdempotencyKey: "tampered-" + test.name, PreparationOutcome: &tampered}); errorCode(err) != contract.ErrorStorageReferenceConflict {
+				t.Fatalf("foreign preparation outcome error = %v", err)
+			}
+		})
 	}
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
 		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
 			BootSessionID: node.BootSessionID, IdempotencyKey: "deferred-preparation", PreparationOutcome: &preparation}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "deferred-preparation", PreparationOutcome: &preparation}); err != nil {
+		t.Fatalf("identical preparation replay failed: %v", err)
+	}
+	conflictingReplay := preparation
+	conflictingReplay.Attempts++
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "deferred-preparation", PreparationOutcome: &conflictingReplay}); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("conflicting preparation replay error = %v", err)
+	}
+	newer := preparation
+	newer.HelperGeneration++
+	newerTime := preparation.RecordedAt.Add(time.Minute)
+	newer.RecordedAt = &newerTime
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "newer-preparation", PreparationOutcome: &newer}); err != nil {
+		t.Fatalf("newer preparation outcome failed: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*ComputerStoragePreparationOutcome)
+	}{
+		{name: "older_helper_generation", mutate: func(value *ComputerStoragePreparationOutcome) {
+			value.HelperGeneration = preparation.HelperGeneration
+			stamp := newerTime.Add(time.Minute)
+			value.RecordedAt = &stamp
+		}},
+		{name: "older_recorded_at", mutate: func(value *ComputerStoragePreparationOutcome) {
+			value.HelperGeneration = newer.HelperGeneration + 1
+			stamp := preparation.RecordedAt.Add(-time.Minute)
+			value.RecordedAt = &stamp
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			older := newer
+			test.mutate(&older)
+			if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+				operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+					BootSessionID: node.BootSessionID, IdempotencyKey: test.name, PreparationOutcome: &older}); errorCode(err) != contract.ErrorConflict {
+				t.Fatalf("non-monotonic preparation outcome error = %v", err)
+			}
+		})
+	}
 	observed, err := h.store.GetComputerCustodyImport(context.Background(), operation.ImportID)
 	if err != nil || observed.OperationRevision != operation.OperationRevision || observed.Status != "reserved" ||
 		observed.PreparationOutcome == nil || observed.PreparationOutcome.RecordedAt == nil ||
-		observed.PreparationOutcome.Code != ComputerStoragePreparationResumeDeferred {
+		observed.PreparationOutcome.Code != ComputerStoragePreparationResumeDeferred ||
+		observed.PreparationOutcome.HelperGeneration != newer.HelperGeneration || !observed.PreparationOutcome.RecordedAt.Equal(newerTime) {
 		t.Fatalf("durable preparation outcome = %#v err=%v", observed, err)
+	}
+	var preparationKey, preparationHash string
+	if err := h.store.db.QueryRow(`SELECT preparation_acknowledgement_key, preparation_acknowledgement_hash
+		FROM computer_storage_copy_operations WHERE destination_computer_id=?`, operation.DestinationComputerID).
+		Scan(&preparationKey, &preparationHash); err != nil || preparationKey != "newer-preparation" || preparationHash == "" {
+		t.Fatalf("durable preparation idempotency = key %q hash %q err=%v", preparationKey, preparationHash, err)
 	}
 	directives, err = h.store.ListNodeComputerStorageCopyDirectives(context.Background(),
 		"fabric-computer-node", node.NodeID, node.BootSessionID)
@@ -391,6 +461,13 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	if err := h.store.db.QueryRow(`SELECT status FROM computer_storage_copy_operations
 		WHERE destination_computer_id=?`, operation.DestinationComputerID).Scan(&status); err != nil || status != "failed" {
 		t.Fatalf("durable failed import status=%q err=%v", status, err)
+	}
+	var provisionalFields int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND (preparation_outcome_json IS NOT NULL OR
+		preparation_acknowledgement_key IS NOT NULL OR preparation_acknowledgement_hash IS NOT NULL)`,
+		operation.DestinationComputerID).Scan(&provisionalFields); err != nil || provisionalFields != 0 {
+		t.Fatalf("terminal import retained provisional preparation fields: count=%d err=%v", provisionalFields, err)
 	}
 	if _, err := h.store.GetComputer(context.Background(), operation.DestinationComputerID); errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("failed import retained reserved identity: %v", err)

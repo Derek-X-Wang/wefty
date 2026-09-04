@@ -2078,15 +2078,28 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 			JobID: request.JobID, OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
 	})
 	if err != nil {
+		var runtimeLoss *ocihelper.RuntimeLossError
+		if request.Operation == "import" && errors.As(err, &runtimeLoss) {
+			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.RuntimeLossError{
+				Generation: workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration},
+				Err:        err,
+			}
+		}
 		var rpcError *ocihelper.RPCError
 		if errors.As(err, &rpcError) && (rpcError.Code == ocihelper.CodeComputerStorageResumeDeferred || rpcError.Code == ocihelper.CodeComputerStorageQuarantined) {
 			outcome := workloadrunner.ComputerStoragePreparationOutcome{
 				Code: string(rpcError.Code), Storage: request.Destination, HelperGeneration: handshake.SessionGeneration,
-				Operation: request.Operation, Reason: string(rpcError.Code),
+				Operation: request.Operation, Reason: string(rpcError.Code), RecordedAt: time.Now().UTC(),
 			}
 			if retained, ok := computerStoragePreparationOutcome(request.Destination, sweepReceipt); ok {
-				retained.Code = string(rpcError.Code)
-				outcome = retained
+				outcome.SweepEpoch = retained.SweepEpoch
+				outcome.DiskName = retained.DiskName
+				outcome.Operation = retained.Operation
+				outcome.Reason = retained.Reason
+				outcome.DeferredReason = retained.DeferredReason
+				outcome.Attempts = retained.Attempts
+				outcome.FirstDeferredAt = retained.FirstDeferredAt
+				outcome.PayloadDroppedAt = retained.PayloadDroppedAt
 			}
 			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.ComputerStoragePreparationError{Outcome: outcome}
 		}
@@ -2119,6 +2132,7 @@ func computerStoragePreparationOutcome(storage workloadrunner.ComputerStorage, r
 				SweepEpoch: receipt.SweepEpoch, DiskName: entry.DiskName, Operation: entry.Operation,
 				Reason: entry.Reason, DeferredReason: entry.DeferredReason, Attempts: entry.Attempts,
 				FirstDeferredAt: optionalPreparationTime(entry.FirstDeferredAt), PayloadDroppedAt: entry.PayloadDroppedAt,
+				RecordedAt: time.Now().UTC(),
 			}, true
 		}
 	}

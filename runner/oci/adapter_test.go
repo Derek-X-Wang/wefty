@@ -38,10 +38,23 @@ func TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity(t *testing.
 		outcome.HelperGeneration != 9 || outcome.SweepEpoch != "sweep-import" || outcome.Attempts != 3 {
 		t.Fatalf("deferred preparation outcome = %#v ok=%t", outcome, ok)
 	}
-	tampered := storage
-	tampered.IntentRevision++
-	if outcome, ok := computerStoragePreparationOutcome(tampered, receipt); ok {
-		t.Fatalf("foreign revision received preparation evidence: %#v", outcome)
+	for _, test := range []struct {
+		name   string
+		mutate func(*workloadrunner.ComputerStorage)
+	}{
+		{name: "computer_id", mutate: func(value *workloadrunner.ComputerStorage) { value.ComputerID = "other-computer" }},
+		{name: "storage_id", mutate: func(value *workloadrunner.ComputerStorage) { value.StorageID = "other-storage" }},
+		{name: "storage_generation", mutate: func(value *workloadrunner.ComputerStorage) { value.StorageGeneration++ }},
+		{name: "intent_revision", mutate: func(value *workloadrunner.ComputerStorage) { value.IntentRevision++ }},
+		{name: "disk_bytes", mutate: func(value *workloadrunner.ComputerStorage) { value.DiskBytes++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tampered := storage
+			test.mutate(&tampered)
+			if outcome, ok := computerStoragePreparationOutcome(tampered, receipt); ok {
+				t.Fatalf("foreign identity received preparation evidence: %#v", outcome)
+			}
+		})
 	}
 	_, err := (&Adapter{sessions: &adapterReceiptSource{receipt: receipt}}).CopyComputerStorage(t.Context(),
 		workloadrunner.ComputerStorageCopyRequest{Operation: "import", Destination: storage})
@@ -49,6 +62,67 @@ func TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity(t *testing.
 	if !errors.As(err, &preparation) || preparation.Outcome.Code != workloadrunner.ComputerStoragePreparationResumeDeferred ||
 		preparation.Outcome.Storage != storage {
 		t.Fatalf("adapter preparation error = %#v err=%v", preparation, err)
+	}
+}
+
+func TestComputerStorageCopyRuntimeLossCarriesHelperGenerationToAgent(t *testing.T) {
+	engine := &adapterTestEngine{storageCopyErr: io.ErrUnexpectedEOF}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handshake := session.Handshake()
+	request := workloadrunner.ComputerStorageCopyRequest{
+		Operation: "import", BackupID: "backup-import", CopyID: "copy-import",
+		SourceComputerID: "source-computer", SourceStorageID: "source-storage", SourceGeneration: 1,
+		SourceSize: 1 << 20, SourceDigest: adapterTestDigest, ExportID: "export-import",
+		ExternalPath: "/operator/import", ManifestDigest: adapterTestDigest,
+		Destination: workloadrunner.ComputerStorage{ComputerID: "computer-import", StorageID: "storage-import",
+			StorageGeneration: 1, IntentRevision: 3, DiskBytes: 2 << 20},
+		NodeID: "node", BootSessionID: "boot", RootInstanceID: "root-import", JobID: "job-import",
+		OperationRevision: 3, CleanupFence: "cleanup-import",
+	}
+	_, err = adapter.CopyComputerStorage(t.Context(), request)
+	var loss *workloadrunner.RuntimeLossError
+	var rpcError *ocihelper.RPCError
+	if !errors.As(err, &loss) || loss.Generation.InstanceID != handshake.HelperInstanceID ||
+		loss.Generation.Generation != handshake.SessionGeneration || !errors.As(err, &rpcError) ||
+		rpcError.Code != ocihelper.CodeEngineFailure || rpcError.EngineFailure == nil ||
+		rpcError.EngineFailure.Operation != ocihelper.MethodCopyStorage ||
+		rpcError.EngineFailure.Reason != ocihelper.EngineFailureOperationFailed {
+		t.Fatalf("Storage copy runtime loss = %#v err=%v", loss, err)
+	}
+}
+
+func TestComputerStorageCopyUsesRetainedProductionBootBarrierReceipt(t *testing.T) {
+	storage := workloadrunner.ComputerStorage{ComputerID: "computer-import", StorageID: "storage-import",
+		StorageGeneration: 1, IntentRevision: 3, DiskBytes: 2 << 30}
+	deferred := ocihelper.ComputerStorageRecoveryInventoryEntry{
+		Storage: ocihelper.ComputerStorageReference{ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+			StorageGeneration: storage.StorageGeneration, IntentRevision: storage.IntentRevision, DiskBytes: storage.DiskBytes},
+		DiskName: "disk-import", Operation: "computer_storage_copy", Reason: "operational_failure", Attempts: 2,
+	}
+	retained := ocihelper.ResourceInventory{ComputerStorageDeferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{deferred}}
+	engine := &adapterTestEngine{verifyResponses: []ocihelper.VerifyResponse{{Absent: true}, {
+		Absent: true, Inventory: retained, DurableRetained: retained,
+	}}}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	liveReceipt, ok := barrier.SweepReceipt()
+	if !ok {
+		t.Fatal("production barrier omitted live receipt")
+	}
+	barrier.Invalidate()
+	_, err := adapter.CopyComputerStorage(t.Context(), workloadrunner.ComputerStorageCopyRequest{
+		Operation: "import", Destination: storage,
+	})
+	var preparation *workloadrunner.ComputerStoragePreparationError
+	if !errors.As(err, &preparation) || preparation.Outcome.Code != workloadrunner.ComputerStoragePreparationResumeDeferred ||
+		preparation.Outcome.Storage != storage || preparation.Outcome.HelperGeneration != liveReceipt.HelperSession.SessionGeneration ||
+		preparation.Outcome.SweepEpoch != liveReceipt.SweepEpoch || preparation.Outcome.RecordedAt.IsZero() {
+		t.Fatalf("production retained preparation outcome = %#v err=%v", preparation, err)
 	}
 }
 
@@ -1608,6 +1682,9 @@ type adapterTestEngine struct {
 	volumeDeleteBeforeReap        bool
 	volumeDeleteFailures          int
 	volumeDeleteCalls             int
+	storageCopyErr                error
+	verifyResponses               []ocihelper.VerifyResponse
+	verifyCalls                   int
 }
 
 type endpointAdapterTestEngine struct{ *adapterTestEngine }
@@ -1804,13 +1881,22 @@ func (engine *adapterTestEngine) DeleteManagedVolume(_ context.Context, request 
 	}
 	return ocihelper.DeleteManagedVolumeResponse{Deleted: true}, nil
 }
+func (engine *adapterTestEngine) CopyComputerStorage(context.Context, ocihelper.CopyComputerStorageRequest) (ocihelper.CopyComputerStorageResponse, error) {
+	return ocihelper.CopyComputerStorageResponse{}, engine.storageCopyErr
+}
 func (engine *adapterTestEngine) InventoryRemoval(context.Context, ocihelper.InventoryRemovalRequest) (ocihelper.InventoryRemovalResponse, error) {
 	return engine.inventoryRemoval, engine.inventoryErr
 }
 func (engine *adapterTestEngine) AttestRemoval(context.Context, ocihelper.AttestRemovalRequest) (ocihelper.AttestRemovalResponse, error) {
 	return engine.attestRemoval, engine.attestErr
 }
-func (*adapterTestEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+
+func (engine *adapterTestEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	if engine.verifyCalls < len(engine.verifyResponses) {
+		response := engine.verifyResponses[engine.verifyCalls]
+		engine.verifyCalls++
+		return response, nil
+	}
 	return ocihelper.VerifyResponse{Absent: true}, nil
 }
 func (*adapterTestEngine) Sweep(context.Context, ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {

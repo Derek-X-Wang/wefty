@@ -1,12 +1,14 @@
 # Fix #303 report
 
-Status: PARTIAL — source fix and all required local non-root gates pass; hosted PR rows are pending.
+Status: PARTIAL — round-one source rulings, the required RED/GREEN regression, and all local non-root gates are proven; hosted PR rows are pending.
 
 ## Scope and base
 
 - Repository: `Derek-X-Wang/wefty`
+- PR: #316
 - Branch: `Derek-X-Wang/wefty-flake-303`
-- Verified base: `4a17dc7` (equal to fetched `origin/main` at investigation start)
+- Round-one starting head: `a94c91a`
+- Verified issue base: `4a17dc7`
 - Issue: #303, `services custody import --wait` intermittently never observes completion
 - Related recovery contract: #304, durable `storage-copy.json` phases and per-generation `resume_deferred` / quarantine inventory
 
@@ -23,79 +25,83 @@ Both cited failures were the XFCE Ubuntu realtiming row. The durable import muta
 | Recovery / completion | The agent alternates the same copy failure with `OCI boot barrier has not completed` through `10:45:12` (`computer-agent-03.log:176-186`); no success/failure copy receipt exists | Same through `04:45:16` (`computer-agent-03.log:216-225`); no success/failure copy receipt exists | L1 never received completion, so `applied_revision` remained 0 and status remained `reserved`. |
 | CLI result | Observation ended `10:45:26.189053597Z`; job log lines 6204-6311 show `context deadline exceeded`, `applied_revision=0`, `reconfiguration_phase=importing`, import `status=reserved` | Observation ended `04:45:28.891592622Z`; job log lines 6293-6400 show the same facts | The four-minute deadline was the symptom, not the cause. |
 
-The artifacts predate #304, so they contain no durable `storage-copy.json` recovery outcome to replay. After #304, that evidence existed in the helper's `VerifiedRetained.ComputerStorageDeferred` / `ComputerStorageQuarantined` inventory but stopped at the adapter/doctor boundary. The import controller only logged the error, leaving L1 and the CLI silent until timeout.
+The artifacts predate #304, so they contain no durable `storage-copy.json` recovery outcome to replay. The reproduced incident shape is the earlier failure: an exact reserved import reaches `CopyComputerStorage`, the helper reports `engine_failure` / `operation_failed` and EOF, the helper generation becomes unavailable, and no typed result reaches L1.
 
-## Source fix
+## Round-one dispositions
 
-- The OCI adapter now recognizes only an exact five-field destination Storage identity in retained startup recovery evidence. It also preserves helper RPC `computer_storage_resume_deferred` and `computer_storage_quarantined` outcomes. A valid live session still retries the copy; retained startup evidence is used directly only when session acquisition is unavailable, so the receipt does not become a stale retry veto.
-- The agent translates that closed helper result into a generation-bound L1 preparation acknowledgement. It is mutually exclusive with copy receipts and grants neither publication nor cleanup authority.
-- L1 validates Computer ID, Storage ID, generation, intent revision, disk bytes, helper generation, and receipt shape before recording the outcome. The copy stays retryable. A later successful or failed copy receipt clears the provisional outcome.
-- L1 exposes `GET /v1/custody-imports/{import_id}` from the durable copy ledger. It remains available after a failed import releases its reserved Computer identity.
-- `services custody import --wait` polls that immutable import ID and operation revision. It reports `complete`, terminal failure, supersession, or typed deferred/quarantined preparation without a subscription ordering gap; only `complete` is then cross-checked against stable Computer authority.
-- OpenAPI and both Computer/helper contracts describe the new evidence and observation surface.
-- No CLI wait was widened. Both incidents failed preparation about 15 seconds after acceptance, well inside the existing four-minute wait.
+| Ruling | Disposition | Source result | Proof |
+| --- | --- | --- | --- |
+| S1 — actual #303 timeline still timed out | APPLIED+PROVEN | The OCI client already classifies copy `engine_failure` or EOF as typed runtime loss. The adapter now carries the exact helper instance/generation to the agent; an import runtime loss becomes `computer_storage_preparation_interrupted`, bound to the reserved destination authority and recorded in L1. A durable deferred `storage-copy.json` now makes the live copy RPC return `computer_storage_resume_deferred`. `BootBarrier.ExecutionSnapshot` returns the last verified receipt with its unavailable-session error, never as a runnable session. | `TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline`; `TestComputerStorageCopyRuntimeLossCarriesHelperGenerationToAgent`; `TestStorageCopyControllerRecordsImportRuntimeLossAsInterruptedPreparation`; `TestComputerStorageCopyReturnsDeferredAfterStartupRecoveryDefers`; `TestBootBarrierExecutionSnapshotCarriesLastVerifiedReceiptAfterSessionLoss`; `TestComputerStorageCopyUsesRetainedProductionBootBarrierReceipt`. |
+| S2 — agent translation hop uncovered | APPLIED+PROVEN | Agent tests cover every preparation field, exact `preparation-%s-%d-%s` key construction, runtime-loss translation, and refusal to route a non-import preparation error. | `TestStorageCopyControllerMapsPreparationOutcomeToL1`; `TestStorageCopyControllerRecordsImportRuntimeLossAsInterruptedPreparation`; `TestStorageCopyControllerDoesNotMisrouteNonImportPreparationError`. |
+| S3 — identity checks mutation-survived | APPLIED+PROVEN | L1 table tests independently corrupt Computer ID, Storage ID, destination generation, intent revision, disk bytes, helper generation, and recorded time. Adapter table tests independently corrupt all five retained-receipt Storage fields. | `TestCustodyImportFailureUsesStoredVerbAndReleasesName/rejects_*`; `TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity/{computer_id,storage_id,storage_generation,intent_revision,disk_bytes}`. |
+| S4 — evidence not monotonic/idempotent | APPLIED+PROVEN | The reserved operation now stores the preparation acknowledgement key and body hash. Identical replay is accepted; same-key/different-body replay conflicts; lower helper generation or older `recorded_at` conflicts without replacing newer evidence. Success, failure, and supersession clear all provisional fields. | `TestCustodyImportFailureUsesStoredVerbAndReleasesName`, including identical replay, conflicting replay, older-generation, older-time, persisted key/hash, and later terminal clearing checks. |
+| S5 — CLI outcome contract | APPLIED+PROVEN | `--wait` terminates on the first durable preparation outcome. Deferred, quarantined, failed/interrupted, and superseded results have distinct wording and exit statuses 6, 7, 8, and 9. The timeout was not widened. | `TestCustodyImportTerminalOutcomeWordingAndExitCodes`; `TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome`; `TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline`. |
+| S6 — evidence retention | DISPUTED by contract, with source rationale | Provisional evidence is bounded by state rather than age: later success, terminal failure, or supersession clears it. The operation row itself is intentionally retained because it is the immutable idempotency and custody-provenance authority; age-pruning it would permit the same external source operation to reserve another destination and erase audit evidence. | `docs/contracts/computer-image.md`; `docs/contracts/oci-helper-protocol.md`; terminal-clear assertions in `TestCustodyImportFailureUsesStoredVerbAndReleasesName`. |
 
-## Regression evidence
+No preparation outcome publishes, cleans up, restores, clones, exports, or resets Storage. The import row remains `reserved`, so a later copy retry is still eligible; only a verified success receipt publishes it.
+
+## RED/GREEN evidence
 
 ### RED on `4a17dc7`
 
-Command (detached baseline worktree, real L1 store and CLI import wait path):
+The detached worktree was created at exact commit `4a17dc7`. A baseline-compatible copy of the named regression used the raw artifact error because that base had no workload-level typed runtime-loss carrier yet. It drove a real agent, a real `l1.Store`/server, the accepted import directive, a copy failure containing `engine_failure operation_failed ... EOF`, a boot barrier unavailable for two seconds, and the real CLI `--wait 750ms` path.
 
 ```text
-go test ./cmd/wefty -run TestFix303DeferredImportMustNotBecomeGenericDeadline -count=1
+go test ./cmd/wefty -run '^TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline$' -count=1 -v
 ```
 
-Exit `1`. The accepted import stayed `reserved` / `applied_revision=0` and returned:
+Exit `1` after `753.947708ms`. The failure preserved the reproduced symptom:
 
 ```text
+status=reserved
+applied_revision=0
+reconfiguration_phase=importing
 mutation was accepted but observing completion failed: context deadline exceeded
 ```
 
-### GREEN after the fix
+### GREEN on the round-one source
+
+The same named regression uses the typed adapter-to-agent runtime-loss fact introduced by the fix and otherwise preserves the ordering and unavailable-barrier window.
 
 ```text
-go test ./cmd/wefty -run TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome -count=1
-go test ./l1 -run TestCustodyImportFailureUsesStoredVerbAndReleasesName -count=1
-go test ./runner/oci -run TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity -count=1
+go test ./cmd/wefty -run '^TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline$' -count=1 -v
 ```
 
-Each exited `0`. Coverage includes:
+Exit `0` in `0.09s`. The CLI observed `computer_storage_preparation_interrupted` well inside the 750 ms wait, did not return `context deadline exceeded`, and the barrier remained unavailable after the observation returned.
 
-- completion committed before the CLI begins observation;
-- preparation delayed after mutation acceptance;
-- a real-store `resume_deferred` acknowledgement surfaced immediately with sweep evidence;
-- a failed import remaining observable after its Computer identity is deleted;
-- foreign intent-revision recovery evidence rejected;
-- deferred work remaining eligible for later retry;
-- exact retained helper evidence converted at the OCI adapter boundary.
+The focused cross-layer suite also exited `0`:
+
+```text
+go test ./agent ./l1 ./runner/oci ./runner/ocihelper ./cmd/wefty -run 'TestStorageCopyController|TestCustodyImportFailureUsesStoredVerbAndReleasesName|TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity|TestComputerStorageCopyRuntimeLossCarriesHelperGenerationToAgent|TestComputerStorageCopyUsesRetainedProductionBootBarrierReceipt|TestBootBarrierExecutionSnapshotCarriesLastVerifiedReceiptAfterSessionLoss|TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline|TestCustodyImportTerminalOutcomeWordingAndExitCodes|TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome' -count=1
+```
+
+The Linux-native `TestComputerStorageCopyReturnsDeferredAfterStartupRecoveryDefers` is compiled by the Linux vet gate and must execute in hosted Ubuntu CI; a macOS host cannot execute a `GOOS=linux` test binary.
 
 ## Local gates
 
-All commands ran as non-root UID `502` where applicable.
+All commands ran as non-root UID `502`.
 
 | Gate | Exit | Result |
 | --- | ---: | --- |
-| `gofmt -l .` | 0 | no output |
-| `bash scripts/check-fabric-boundary.sh` | 0 | clean |
-| `go vet ./...` | 0 | pass |
-| `GOOS=linux go vet -tags=service_acceptance_realtiming ./...` | 0 | pass |
-| `GOOS=darwin go vet -tags=service_acceptance_realtiming ./...` | 0 | pass |
-| `go test ./...` | 0 | portable suite pass |
-| `go test -race -count=1 ./...` | 0 | uncached race suite pass |
-| `go test -count=1 -tags=sqlite_integration ./...` | 0 | uncached SQLite-tagged suite pass |
-| `go test -count=1 -p 1 -tags=service_acceptance ./...` | 0 | uncached service-acceptance tagged suite pass |
-| `npm ci && npm run lint && npm run typecheck && npm test && npm run build` in `workflows/dogfood` | 0 | pass |
-
-One intermediate repeat of `go test -race ./...` exited `1` in the unrelated existing `agent/TestFinalizationTimeoutStartsAfterServicePayloadStops`: its in-process L1 listener disappeared during drain (`wefty://control-plane is not listening`). The isolated test immediately passed (`go test -race ./agent -run '^TestFinalizationTimeoutStartsAfterServicePayloadStops$' -count=1`), followed by the authoritative uncached full-race pass above. The failed run is not counted as green and did not motivate any source or assertion change.
+| `gofmt -l .` | 0 | No output. |
+| `bash scripts/check-fabric-boundary.sh` | 0 | Clean. |
+| `go vet ./...` | 0 | Pass. |
+| `GOOS=linux go vet -tags=service_acceptance_realtiming ./...` | 0 | Pass; compiles the Linux-only deferred-copy regression. |
+| `GOOS=darwin go vet -tags=service_acceptance_realtiming ./...` | 0 | Pass. |
+| `go test ./...` | 0 | Complete portable suite pass. |
+| `go test -race -count=1 ./...` | 0 | Complete uncached race suite pass. |
+| `go test -count=1 -tags=sqlite_integration ./...` | 0 | Complete uncached SQLite-tagged suite pass. |
+| `go test -count=1 -p 1 -tags=service_acceptance ./...` | 0 | Complete serialized service-acceptance suite pass. |
+| `npm ci && npm run lint && npm run typecheck && npm test && npm run build` in `workflows/dogfood` | 0 | Pass; npm audit found zero vulnerabilities. |
 
 ## Hosted PR evidence
 
 | Authority | Status | Evidence |
 | --- | --- | --- |
-| PR | PENDING | Created after the first signed commit and push. |
-| `contract-gate` / `all-tests-pass` | PENDING | Not pushed yet. |
-| realtiming Ubuntu XFCE | PENDING | Must run on the PR head. |
-| realtiming Ubuntu Wayland | PENDING | Must run on the PR head and is reported separately. |
+| PR #316 head | PENDING | Round-one commit not pushed yet. |
+| `contract-gate` / `all-tests-pass` | PENDING | Must run on the round-one head. |
+| realtiming Ubuntu XFCE | PENDING | Must run on the round-one head. |
+| realtiming Ubuntu Wayland | PENDING | Must run on the round-one head and is reported separately. |
 | `mergeStateStatus` | PENDING | Checked after hosted runs. |
 
-Known unrelated hosted failure families, if encountered, must remain inherited and separately attributed: #307 (fresh attempt vs boot barrier), #308, #309, and #312.
+Known unrelated hosted failure families, if encountered, remain separately attributed: #307, #308, #309, and #312.

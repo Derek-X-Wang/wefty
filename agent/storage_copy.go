@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -89,23 +90,22 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence,
 	})
 	if err != nil {
+		var runtimeLoss *workloadrunner.RuntimeLossError
+		if directive.Operation == "import" && errors.As(err, &runtimeLoss) && runtimeLoss.Generation.Generation > 0 {
+			recordedAt := time.Now().UTC()
+			outcome := workloadrunner.ComputerStoragePreparationOutcome{
+				Code: workloadrunner.ComputerStoragePreparationInterrupted,
+				Storage: workloadrunner.ComputerStorage{ComputerID: directive.DestinationComputerID,
+					StorageID: directive.DestinationStorageID, StorageGeneration: directive.DestinationGeneration,
+					IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize},
+				HelperGeneration: runtimeLoss.Generation.Generation, Operation: "computer_storage_copy",
+				Reason: "runtime_loss", RecordedAt: recordedAt,
+			}
+			return controller.acknowledgePreparation(ctx, directive, outcome)
+		}
 		var preparation *workloadrunner.ComputerStoragePreparationError
 		if directive.Operation == "import" && errors.As(err, &preparation) {
-			outcome := preparation.Outcome
-			_, acknowledgeErr := controller.client.AcknowledgeComputerStorageCopy(ctx, directive.DestinationComputerID,
-				l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
-					BootSessionID:  controller.bootSessionID,
-					IdempotencyKey: fmt.Sprintf("preparation-%s-%d-%s", outcome.Code, outcome.HelperGeneration, outcome.SweepEpoch),
-					PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
-						Code: outcome.Code, DestinationComputerID: outcome.Storage.ComputerID,
-						DestinationStorageID: outcome.Storage.StorageID, DestinationGeneration: outcome.Storage.StorageGeneration,
-						IntentRevision: outcome.Storage.IntentRevision, DiskBytes: outcome.Storage.DiskBytes,
-						HelperGeneration: outcome.HelperGeneration, SweepEpoch: outcome.SweepEpoch, DiskName: outcome.DiskName,
-						Operation: outcome.Operation, Reason: outcome.Reason, DeferredReason: outcome.DeferredReason,
-						Attempts: outcome.Attempts, FirstDeferredAt: outcome.FirstDeferredAt, PayloadDroppedAt: outcome.PayloadDroppedAt,
-					},
-				})
-			return acknowledgeErr
+			return controller.acknowledgePreparation(ctx, directive, preparation.Outcome)
 		}
 		return err
 	}
@@ -118,6 +118,25 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
 			BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID,
 			Receipt: receipt, OldBackupReceipt: oldBackupReceipt})
+	return err
+}
+
+func (controller *storageCopyController) acknowledgePreparation(ctx context.Context, directive l1.ComputerStorageCopyDirective,
+	outcome workloadrunner.ComputerStoragePreparationOutcome) error {
+	_, err := controller.client.AcknowledgeComputerStorageCopy(ctx, directive.DestinationComputerID,
+		l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
+			BootSessionID:  controller.bootSessionID,
+			IdempotencyKey: fmt.Sprintf("preparation-%s-%d-%s", outcome.Code, outcome.HelperGeneration, outcome.SweepEpoch),
+			PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
+				Code: outcome.Code, DestinationComputerID: outcome.Storage.ComputerID,
+				DestinationStorageID: outcome.Storage.StorageID, DestinationGeneration: outcome.Storage.StorageGeneration,
+				IntentRevision: outcome.Storage.IntentRevision, DiskBytes: outcome.Storage.DiskBytes,
+				HelperGeneration: outcome.HelperGeneration, SweepEpoch: outcome.SweepEpoch, DiskName: outcome.DiskName,
+				Operation: outcome.Operation, Reason: outcome.Reason, DeferredReason: outcome.DeferredReason,
+				Attempts: outcome.Attempts, FirstDeferredAt: outcome.FirstDeferredAt, PayloadDroppedAt: outcome.PayloadDroppedAt,
+				RecordedAt: &outcome.RecordedAt,
+			},
+		})
 	return err
 }
 

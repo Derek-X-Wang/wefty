@@ -75,13 +75,14 @@ type ComputerStorageCopyAcknowledgementRequest struct {
 }
 
 const (
+	ComputerStoragePreparationInterrupted    = "computer_storage_preparation_interrupted"
 	ComputerStoragePreparationResumeDeferred = "computer_storage_resume_deferred"
 	ComputerStoragePreparationQuarantined    = "computer_storage_quarantined"
 )
 
-// ComputerStoragePreparationOutcome carries the helper's closed recovery
-// result for one exact never-attached destination generation. L1 records the
-// time independently when it accepts this evidence.
+// ComputerStoragePreparationOutcome carries a generation-bound helper recovery
+// result or an agent observation of typed helper runtime loss for one exact
+// never-attached destination generation.
 type ComputerStoragePreparationOutcome struct {
 	Code                  string     `json:"code"`
 	DestinationComputerID string     `json:"destination_computer_id"`

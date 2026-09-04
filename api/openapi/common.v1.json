@@ -621,7 +621,7 @@
 		"additionalProperties": false,
 		"required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation", "recorded_at"],
 		"properties": {
-		  "code": { "enum": ["computer_storage_resume_deferred", "computer_storage_quarantined"] },
+		  "code": { "enum": ["computer_storage_preparation_interrupted", "computer_storage_resume_deferred", "computer_storage_quarantined"] },
 		  "destination_computer_id": { "type": "string", "minLength": 1 },
 		  "destination_storage_id": { "type": "string", "minLength": 1 },
 		  "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
@@ -638,7 +638,7 @@
 		  "payload_dropped_at": { "type": "string", "format": "date-time" },
 		  "recorded_at": { "type": "string", "format": "date-time" }
 		},
-		"description": "Helper-authored, generation-bound reason why a Custody import destination is not currently preparable. Sweep fields are present when the outcome came from durable startup-recovery inventory."
+		"description": "Generation-bound reason why a Custody import destination is not currently preparable. Runtime-loss observations are agent-authored from typed helper generation evidence; sweep fields are present when the outcome came from durable startup-recovery inventory."
 	  },
 	  "ComputerCustodyImportObservation": {
 		"type": "object",

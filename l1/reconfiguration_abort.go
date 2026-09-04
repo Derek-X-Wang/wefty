@@ -171,6 +171,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 		}
 	case ComputerReconfigurationImporting:
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded', preparation_outcome_json=NULL,
+			preparation_acknowledgement_key=NULL, preparation_acknowledgement_hash=NULL,
 			failure_code='aborted_dead_node', completed_ns=? WHERE destination_computer_id=? AND operation_revision=?
 			AND operation='import' AND status IN ('reserved', 'prepared')`, now.UnixNano(), computerID, abortedRevision); err != nil {
 			return Computer{}, false, internalError(err, "supersede aborted Custody import")

@@ -140,6 +140,28 @@ func (err *storageObservationError) Error() string {
 
 func (err *storageObservationError) Unwrap() error { return err.cause }
 
+type custodyImportOutcome string
+
+const (
+	custodyImportDeferred    custodyImportOutcome = "deferred"
+	custodyImportQuarantined custodyImportOutcome = "quarantined"
+	custodyImportFailed      custodyImportOutcome = "failed"
+	custodyImportSuperseded  custodyImportOutcome = "superseded"
+)
+
+type custodyImportOutcomeError struct {
+	importID string
+	outcome  custodyImportOutcome
+	detail   string
+}
+
+func (err *custodyImportOutcomeError) Error() string {
+	if err.detail == "" {
+		return fmt.Sprintf("Custody import %q is %s", err.importID, err.outcome)
+	}
+	return fmt.Sprintf("Custody import %q is %s: %s", err.importID, err.outcome, err.detail)
+}
+
 func executeComputerStorage(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usageError(computerStorageUsage)
@@ -680,11 +702,21 @@ func waitForCustodyImport(ctx context.Context, clients *apiClients, importID str
 		if observed.OperationRevision != operationRevision {
 			return false, fmt.Errorf("Custody import %q observation revision %d does not match accepted revision %d", importID, observed.OperationRevision, operationRevision)
 		}
-		if observed.Status == "failed" || observed.Status == "superseded" {
-			return false, fmt.Errorf("Custody import %q failed with %s", importID, observed.FailureCode)
+		if observed.Status == "failed" {
+			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportFailed, detail: observed.FailureCode}
+		}
+		if observed.Status == "superseded" {
+			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportSuperseded, detail: observed.FailureCode}
 		}
 		if observed.PreparationOutcome != nil {
-			return false, fmt.Errorf("Custody import %q preparation reported %s", importID, observed.PreparationOutcome.Code)
+			outcome := custodyImportFailed
+			switch observed.PreparationOutcome.Code {
+			case l1.ComputerStoragePreparationResumeDeferred:
+				outcome = custodyImportDeferred
+			case l1.ComputerStoragePreparationQuarantined:
+				outcome = custodyImportQuarantined
+			}
+			return false, &custodyImportOutcomeError{importID: importID, outcome: outcome, detail: observed.PreparationOutcome.Code}
 		}
 		if observed.Status == "reserved" {
 			return false, nil
