@@ -193,13 +193,13 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	doctorJSON := ocicontrol.BuildDoctor(ctx, ocicontrol.DoctorConfig{
 		HostPlatform: ocicontrol.PlatformFacts{OS: "linux", Architecture: runtime.GOARCH},
 		AgentUser:    fmt.Sprintf("uid:%d", os.Getuid()), LaunchUnit: "wefty-agent.service",
-		CapabilitySnapshot: func() agent.CapabilitySnapshot {
+		CapabilitySnapshot: func() ocicontrol.CapabilitySnapshot {
 			observation := contract.CapabilityObservation{
 				Revision: 2, ObservedAt: doctorObservedAt, Capabilities: map[string]bool{
 					"kind:process": true, "kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true,
 				}, MissingCapabilities: []string{},
 			}
-			return agent.CapabilitySnapshot{CapabilityObservation: observation, LastProbe: &observation}
+			return ocicontrol.CapabilitySnapshot{CapabilityObservation: observation, LastProbe: &observation}
 		},
 		Intent: func(context.Context) (lima.OCIIntent, error) {
 			return lima.OCIIntent{Version: lima.OCIIntentVersion, Revision: 1, Enabled: true, UpdatedAt: doctorObservedAt}, nil
@@ -2374,10 +2374,19 @@ func exerciseOrdinaryL3OCIOneshot(
 	probe := realOCIProbe{run: func(probeContext context.Context) error {
 		return adapter.Probe(probeContext, "native-node", "native-boot", probeReference, probeDigest, l1.DefaultLeaseDuration)
 	}}
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: "native-node", BootSessionID: "native-boot", Version: "realtiming", OS: "linux", Architecture: runtime.GOARCH,
 		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: probe, OCIBootBarrier: barrier,
+		OCIIntent: func(intentContext context.Context) (agent.OCIIntentObservation, error) {
+			intent, intentErr := intentSource.ReadIntent(intentContext)
+			return agent.OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, intentErr
+		},
 		WorkloadRuntimes:  map[string]agent.WorkloadRuntime{contract.JobKindOCI: adapter},
 		HeartbeatInterval: time.Second, ClaimInterval: 25 * time.Millisecond, RenewalInterval: time.Second,
 		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: managedRoot,

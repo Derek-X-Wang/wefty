@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -370,7 +371,7 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	if len(attempts) != 1 || attempts[0].attemptID != claim.Lease.AttemptID {
 		t.Fatalf("completion recovery attempts = %#v", attempts)
 	}
-	if err := spool.completionDelivered(context.Background(), claim.Lease.AttemptID); err != nil {
+	if err := spool.completionDelivered(context.Background(), claim.Lease.AttemptID, 0); err != nil {
 		t.Fatal(err)
 	}
 	var count int
@@ -406,6 +407,47 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestSuppressedCompletionSurvivesReceiptPruning(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "suppression-prune-node", 1024)
+	defer spool.Close()
+	claim := serviceSpoolTestClaim("suppression-prune")
+	claim.Job.Spec.Kind = contract.JobKindOCI
+	if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	newerObservedAt := time.Now().Add(time.Hour).UnixNano()
+	for index := range 1025 {
+		if _, err := spool.db.ExecContext(t.Context(), `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns)
+VALUES(?, 'delivered', 'test', ?)`, fmt.Sprintf("newer-%04d", index), newerObservedAt+int64(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	var receiptCount int
+	if err := spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM spool_completion_receipts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if receiptCount != 0 {
+		t.Fatalf("old audit receipt was not pruned: count=%d", receiptCount)
+	}
+	inspection := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if inspection.State != "suppressed" || inspection.IntentRevision != 2 || inspection.Result.ExitCode == nil || *inspection.Result.ExitCode != 7 {
+		t.Fatalf("payload-owned suppression after pruning=%+v", inspection)
+	}
+	if attempts, err := spool.pendingAttempts(t.Context()); err != nil || len(attempts) != 0 {
+		t.Fatalf("pruned suppressed payload became replayable=%+v err=%v", attempts, err)
+	}
+}
+
 func TestLogSpoolDeletesDeliveredAttemptWhenLastEventDrains(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "node-delivered-backlog", 1024)
 	defer spool.Close()
@@ -422,7 +464,7 @@ func TestLogSpoolDeletesDeliveredAttemptWhenLastEventDrains(t *testing.T) {
 	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID); err != nil {
+	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID, 0); err != nil {
 		t.Fatal(err)
 	}
 	var rows int
@@ -458,7 +500,7 @@ func TestLogSpoolInspectionDistinguishesSuppressedAndNeverPersistedCompletion(t 
 	if before.State != "never_persisted" {
 		t.Fatalf("pre-completion inspection = %+v", before)
 	}
-	if err := spool.suppressCompletion(context.Background(), claim.Lease.AttemptID); err != nil {
+	if err := spool.recordCompletionDisposition(context.Background(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
 		t.Fatal(err)
 	}
 	after := spool.inspectCompletion(context.Background(), claim.Lease.AttemptID)

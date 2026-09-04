@@ -84,3 +84,21 @@ func TestStopOCIRuntimeJoinsClaimBeforeResidentPublication(t *testing.T) {
 	}
 	<-started
 }
+
+func TestOCIIntentCompletionFencePredicateIsExplicit(t *testing.T) {
+	tests := []struct {
+		kind, class string
+		want        bool
+	}{
+		{kind: contract.JobKindOCI, class: contract.JobClassService, want: true},
+		{kind: legacyUnclassifiedKind, class: contract.JobClassService, want: true},
+		{kind: contract.JobKindProcess, class: contract.JobClassService, want: false},
+		{kind: "future-kind", class: contract.JobClassService, want: false},
+		{kind: contract.JobKindOCI, class: contract.JobClassOneShot, want: false},
+	}
+	for _, test := range tests {
+		if got := requiresOCIIntentFence(test.kind, test.class); got != test.want {
+			t.Fatalf("requiresOCIIntentFence(%q, %q)=%t want %t", test.kind, test.class, got, test.want)
+		}
+	}
+}

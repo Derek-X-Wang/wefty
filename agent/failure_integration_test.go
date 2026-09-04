@@ -72,6 +72,10 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 				"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
 			}}, nil
 		}),
+		OCIIntent: func(ctx context.Context) (OCIIntentObservation, error) {
+			intent, err := intentSource.ReadIntent(ctx)
+			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+		},
 		OCIBootBarrier:       readyOCIBootBarrier{},
 		WorkloadRuntimes:     map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
@@ -165,7 +169,9 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		cancelRun()
-		t.Fatal("explicit OCI start did not restore service admission")
+		current, _ := store.GetJob(t.Context(), job.JobID)
+		nodes, _ := store.ListNodes(t.Context())
+		t.Fatalf("explicit OCI start did not restore service admission: job=%+v service=%+v nodes=%+v status=%+v", current, current.ServiceJob, nodes, nodeAgent.Status())
 	}
 	cancelRun()
 	if err := <-runDone; err != nil {
@@ -198,6 +204,8 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newOutcomeFirstIntentRuntime()
+	var intentEnabled atomic.Bool
+	intentEnabled.Store(true)
 	newAgent := func(bootSessionID string, workload WorkloadRuntime) *Agent {
 		agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-outcome-agent-" + bootSessionID, Tags: []string{l1.DefaultAgentPrincipalTag}})
 		nodeAgent, err := New(Config{
@@ -211,6 +219,14 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 					"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
 				}}, nil
 			}),
+			OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+				enabled := intentEnabled.Load()
+				revision := uint64(1)
+				if !enabled {
+					revision = 2
+				}
+				return OCIIntentObservation{Enabled: enabled, Revision: revision}, nil
+			},
 			OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: workload},
 			ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 			HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
@@ -234,7 +250,15 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 	}
 	stopDone := make(chan error, 1)
 	nodeAgent.outbox.completionStored = func() {
-		go func() { stopDone <- nodeAgent.StopOCIRuntime(t.Context()) }()
+		intentEnabled.Store(false)
+		go func() {
+			releaseFence, err := nodeAgent.FenceOCIIntentStop(t.Context(), 2)
+			if err == nil {
+				releaseFence()
+				err = nodeAgent.StopOCIRuntime(t.Context())
+			}
+			stopDone <- err
+		}()
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
 			if nodeAgent.CapabilitySnapshot().ReasonCode == contract.CapabilityReasonOCIIntentDisabled {
@@ -248,9 +272,9 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 	if err := <-stopDone; err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, present, err := nodeAgent.outbox.spool.completionWithEvidence(t.Context(), attemptID)
-	if err != nil || present {
-		t.Fatalf("intent-stop outcome left replayable completion present=%t err=%v", present, err)
+	receipt := nodeAgent.outbox.spool.inspectCompletion(t.Context(), attemptID)
+	if receipt.State != "suppressed" || receipt.Reason != "service_intent_stop" || receipt.IntentRevision != 2 {
+		t.Fatalf("intent-stop outcome receipt=%+v", receipt)
 	}
 	stillRunning, err := store.GetJob(t.Context(), job.JobID)
 	if err != nil || stillRunning.State != contract.JobClaimed || stillRunning.CurrentAttemptID != attemptID ||
@@ -281,6 +305,160 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 	restarted.Close()
 }
 
+func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"intent-marker-node": {Tags: []string{"intent-marker"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 500*time.Millisecond)
+	defer stopServer()
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-marker-finished-service",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RoutingTags: []string{"intent-marker"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-marker:v1", Digest: &digest},
+			Argv:  []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
+	intentEnabled := func(ctx context.Context) (OCIIntentObservation, error) {
+		intent, err := intentSource.ReadIntent(ctx)
+		return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+	}
+	runtime := newIntentMarkerRaceRuntime()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-marker-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "intent-marker-node", BootSessionID: "intent-marker-boot", Version: "test",
+		Capabilities: map[string]bool{
+			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+		},
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{
+				"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+			}}, nil
+		}),
+		OCIIntent:      intentEnabled,
+		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	intentObserved := make(chan struct{})
+	releaseCompletion := make(chan struct{})
+	var observeOnce sync.Once
+	nodeAgent.ociIntentGate.observed = func(observation OCIIntentObservation) {
+		if observation.Enabled {
+			observeOnce.Do(func() { close(intentObserved) })
+			<-releaseCompletion
+		}
+	}
+	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- nodeAgent.Run(runContext) }()
+	var firstAttempt string
+	select {
+	case firstAttempt = <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("intent-marker OCI service did not start")
+	}
+	runtime.finishFirst()
+	select {
+	case <-intentObserved:
+	case <-time.After(3 * time.Second):
+		t.Fatal("completion did not pause after its final enabled intent read")
+	}
+	stopDone := make(chan error, 1)
+	go func() {
+		intent, stopErr := lima.SetOCIIntent(t.Context(), intentPath, 1, false, time.Now())
+		if stopErr == nil {
+			var releaseFence func()
+			releaseFence, stopErr = nodeAgent.FenceOCIIntentStop(t.Context(), intent.Revision)
+			if stopErr == nil {
+				releaseFence()
+				stopErr = nodeAgent.StopOCIRuntime(t.Context())
+			}
+		}
+		stopDone <- stopErr
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		intent, readErr := intentSource.ReadIntent(t.Context())
+		if readErr == nil && !intent.Enabled && intent.Revision == 2 && nodeAgent.ociIntentGate.disabledRevision.Load() == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stop did not durably flip intent while completion paused: intent=%+v err=%v", intent, readErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseCompletion)
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+
+	var secondAttempt string
+	deadline = time.Now().Add(3 * time.Second)
+	for secondAttempt == "" {
+		receipt := nodeAgent.outbox.spool.inspectCompletion(t.Context(), firstAttempt)
+		if receipt.State == "suppressed" && receipt.Reason == "service_intent_stop" && receipt.IntentRevision == 1 &&
+			receipt.Result.ExitCode != nil && *receipt.Result.ExitCode == 1 && nodeAgent.LiveOCIAttempts() == 0 {
+			break
+		}
+		select {
+		case secondAttempt = <-runtime.started:
+		case <-time.After(5 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("intent-stop completion neither suppressed nor restarted: receipt=%+v", nodeAgent.outbox.spool.inspectCompletion(t.Context(), firstAttempt))
+		}
+	}
+	var queued l1.Job
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		if _, err := store.Reconcile(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		queued, err = store.GetJob(t.Context(), job.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if queued.State == contract.JobQueued {
+			break
+		}
+		if time.Now().After(deadline) {
+			attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
+			t.Fatalf("intent-stop job remained %q after lease expiry: attempts=%+v err=%v status=%+v receipt=%+v", queued.State, attempts, attemptsErr, nodeAgent.Status(), nodeAgent.outbox.spool.inspectCompletion(t.Context(), firstAttempt))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
+	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != firstAttempt || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
+		t.Fatalf("intent-stop marker evidence=%+v second_attempt=%q job=%+v err=%v", attempts, secondAttempt, queued, err)
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		t.Fatalf("agent shutdown: %v", err)
+	}
+}
+
 func TestLostLeaseCompletionReconcilesAfterFreshServiceReadmission(t *testing.T) {
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
@@ -308,6 +486,9 @@ func TestLostLeaseCompletionReconcilesAfterFreshServiceReadmission(t *testing.T)
 		t.Fatal(err)
 	}
 	defer outbox.Close()
+	outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
+		return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+	}}
 
 	// Seed one completion before startup and wait for its delivery. This proves
 	// the initial outbox snapshot finished before the lease-loss completion is
@@ -441,6 +622,226 @@ func TestLostLeaseCompletionReconcilesAfterFreshServiceReadmission(t *testing.T)
 		late.LateResult.ObservedAt.Format(time.RFC3339Nano), freshElapsed, evidenceElapsed, measuredRecoveryBound, l1.DefaultLeaseDuration)
 }
 
+func TestDurableOCIIntentStopSuppressesSpooledServiceCompletion(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"intent-spool-node": {Tags: []string{"intent-spool"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 500*time.Millisecond)
+	defer stopServer()
+	client, err := newClient(network.NewFabric(fabric.Identity{
+		NodeID: "intent-spool-agent", Tags: []string{l1.DefaultAgentPrincipalTag},
+	}), "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	registration := contract.NodeRegistration{
+		NodeID: "intent-spool-node", BootSessionID: "intent-spool-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{
+			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+		},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now(), MissingCapabilities: []string{},
+	}
+	if _, err := client.Register(t.Context(), registration); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-spool-service",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RoutingTags: []string{"intent-spool"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-spool:v1", Digest: &digest}, Argv: []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := client.Claim(t.Context(), registration.NodeID, registration.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil || claim.Job.JobID != service.JobID {
+		t.Fatalf("intent-spool claim=%+v err=%v", claim, err)
+	}
+	start := func(claim *l1.Claim) {
+		t.Helper()
+		observation := l1.ImageObservationRequest{
+			FencingToken: claim.Lease.FencingToken, SubmittedReference: "example.invalid/intent-spool:v1", TopLevelDigest: digest,
+			TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json", PlatformManifestDigest: digest,
+			Platform: l1.OCIPlatform{OS: "linux", Architecture: "amd64"}, RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+		}
+		if _, err := client.ObserveAttemptImage(t.Context(), claim.Job.JobID, claim.Lease.AttemptID, observation); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.StartAttempt(t.Context(), claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start(claim)
+	outbox, err := newEvidenceOutbox(t.TempDir(), registration.NodeID, 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	if err := outbox.ensureAttempt(t.Context(), *claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 1
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now(), l1.RuntimeQuiescenceAttempt); err != nil {
+		t.Fatal(err)
+	}
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 1, false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
+	outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(ctx context.Context) (OCIIntentObservation, error) {
+		intent, err := intentSource.ReadIntent(ctx)
+		return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+	}}
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover intent-stop evidence: %v", err) })
+
+	var receipt completionInspectionReceipt
+	deadline := time.Now().Add(3 * time.Second)
+	for receipt.State != "suppressed" {
+		receipt = outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+		if time.Now().After(deadline) {
+			t.Fatalf("intent-spool completion disposition=%+v", receipt)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if receipt.Reason != "service_intent_stop" || receipt.IntentRevision != 2 ||
+		receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 1 {
+		t.Fatalf("suppressed late evidence was not retained and typed: %+v", receipt)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		_, _ = store.Reconcile(t.Context())
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		lastLost := listErr == nil && len(attempts) > 0 && attempts[len(attempts)-1].State == contract.AttemptLost
+		if lastLost {
+			if len(attempts) != 1 || attempts[0].AttemptID != claim.Lease.AttemptID || attempts[0].Result != nil {
+				t.Fatalf("intent-spool expiry evidence=%+v receipt=%+v err=%v", attempts, receipt, listErr)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("intent-spool attempt did not become lost: attempts=%+v receipt=%+v err=%v", attempts, receipt, listErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"authority-recovery-node": {Tags: []string{"authority-recovery"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 500*time.Millisecond)
+	defer stopServer()
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "authority-recovery-service",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RoutingTags: []string{"authority-recovery"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/authority-recovery:v1", Digest: &digest}, Argv: []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newLiveIntentAuthorityRuntime()
+	var authorityAvailable atomic.Bool
+	authorityAvailable.Store(true)
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "authority-recovery-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "authority-recovery-node", BootSessionID: "authority-recovery-boot", Version: "test",
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true},
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
+		}),
+		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			if !authorityAvailable.Load() {
+				return OCIIntentObservation{}, errors.New("transient intent authority read failure")
+			}
+			return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+		},
+		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		LogRetryInterval: 20 * time.Millisecond, Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- nodeAgent.Run(runContext) }()
+	var attemptID string
+	select {
+	case attemptID = <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OCI service did not start")
+	}
+	if _, err := store.SetNodeClaimsByOperator(t.Context(), "authority-recovery-node", "operator", l1.NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "hold replacement while observing late evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	authorityAvailable.Store(false)
+	runtime.complete()
+	waitCompletionReceiptState(t, nodeAgent.outbox, attemptID, "withheld", 3*time.Second)
+
+	var lost l1.Attempt
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, _ = store.Reconcile(t.Context())
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		if listErr == nil && len(attempts) == 1 && attempts[0].State == contract.AttemptLost {
+			lost = attempts[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("withheld live completion did not become lost: attempts=%+v err=%v", attempts, listErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if lost.Result != nil || lost.LateResult != nil {
+		t.Fatalf("authority-unavailable completion published before recovery: %+v", lost)
+	}
+	authorityAvailable.Store(true)
+	nodeAgent.outbox.scheduleRecovery()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		if listErr == nil && len(attempts) == 1 && attempts[0].LateResult != nil {
+			late := attempts[0].LateResult
+			if late.Kind != l1.LateResultObservation || !late.Late || late.Result == nil || late.Result.ExitCode == nil || *late.Result.ExitCode != 7 {
+				t.Fatalf("recovered late result=%+v", late)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retained completion did not publish after authority recovery: attempts=%+v err=%v", attempts, listErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitCompletionReceiptState(t, nodeAgent.outbox, attemptID, "delivered", 3*time.Second)
+	cancelRun()
+	var unavailable *OCIIntentAuthorityUnavailableError
+	if runErr := <-runDone; runErr != nil && !errors.As(runErr, &unavailable) {
+		t.Fatalf("agent shutdown after unavailable completion authority: %v", runErr)
+	}
+}
+
 func waitCompletionReceiptState(t *testing.T, outbox *evidenceOutbox, attemptID, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -487,6 +888,9 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
 		}),
+		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
+		},
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
@@ -2290,6 +2694,82 @@ type outcomeFirstIntentRuntime struct {
 type oneShotIntentRuntime struct {
 	*intentStopRuntime
 	finalized atomic.Int32
+}
+
+type intentMarkerRaceRuntime struct {
+	*intentStopRuntime
+	firstFinished chan struct{}
+	finishOnce    sync.Once
+}
+
+type liveIntentAuthorityRuntime struct {
+	*intentStopRuntime
+	finish chan struct{}
+}
+
+func newLiveIntentAuthorityRuntime() *liveIntentAuthorityRuntime {
+	return &liveIntentAuthorityRuntime{intentStopRuntime: newIntentStopRuntime(), finish: make(chan struct{})}
+}
+
+func (runtime *liveIntentAuthorityRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	observation := workloadrunner.OCIImageObservation{
+		SubmittedReference: request.Execution.OCI.Image.Reference,
+		TopLevelDigest:     digest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json",
+		PlatformManifestDigest: digest, PlatformOS: "linux", PlatformArchitecture: "amd64",
+		RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+	}
+	if err := request.OCIImageResolved(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if err := request.OCIStarted(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	runtime.starts.Add(1)
+	runtime.started <- request.Authority.AttemptID
+	<-runtime.finish
+	exitCode := 7
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (runtime *liveIntentAuthorityRuntime) complete() {
+	runtime.once.Do(func() { close(runtime.finish) })
+}
+
+func newIntentMarkerRaceRuntime() *intentMarkerRaceRuntime {
+	return &intentMarkerRaceRuntime{intentStopRuntime: newIntentStopRuntime(), firstFinished: make(chan struct{})}
+}
+
+func (runtime *intentMarkerRaceRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	observation := workloadrunner.OCIImageObservation{
+		SubmittedReference: request.Execution.OCI.Image.Reference,
+		TopLevelDigest:     digest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json",
+		PlatformManifestDigest: digest, PlatformOS: "linux", PlatformArchitecture: "amd64",
+		RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+	}
+	if err := request.OCIImageResolved(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if err := request.OCIStarted(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	started := runtime.starts.Add(1)
+	runtime.started <- request.Authority.AttemptID
+	if started == 1 {
+		<-runtime.firstFinished
+		exitCode := 1
+		return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode, LogEvidenceIncomplete: true}}, nil
+	}
+	<-ctx.Done()
+	runtime.canceled <- request.Authority.AttemptID
+	return workloadrunner.Result{Outcome: contract.ProcessResult{
+		Signal: "terminated", TerminationCause: contract.TerminationCauseAgent,
+	}}, context.Cause(ctx)
+}
+
+func (runtime *intentMarkerRaceRuntime) finishFirst() {
+	runtime.finishOnce.Do(func() { close(runtime.firstFinished) })
 }
 
 func newOneShotIntentRuntime() *oneShotIntentRuntime {

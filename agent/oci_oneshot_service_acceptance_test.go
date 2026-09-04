@@ -97,6 +97,7 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 		}),
+		OCIIntent:         enabledTestOCIIntent,
 		OCIBootBarrier:    readyOCIBootBarrier{},
 		WorkloadRuntimes:  map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,

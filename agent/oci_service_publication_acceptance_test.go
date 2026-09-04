@@ -29,6 +29,7 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -261,6 +262,10 @@ while :; do sleep 1; done
 		t.Fatal(err)
 	}
 	intentSource := lima.FileIntentSource{Path: intentPath}
+	intentObservation := func(ctx context.Context) (OCIIntentObservation, error) {
+		intent, err := intentSource.ReadIntent(ctx)
+		return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+	}
 	authorities := newNativeClaimAuthorityRecorder()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-service-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
@@ -280,7 +285,7 @@ while :; do sleep 1; done
 			}
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true}}, nil
 		}),
-		OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: adapter},
+		OCIIntent: intentObservation, OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: adapter},
 		AttemptDeadman:       nativeAcceptanceDeadman{barrier: barrier, nodeID: "native-service-node", bootSessionID: "native-service-boot", observe: authorities.record},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,
@@ -307,14 +312,15 @@ while :; do sleep 1; done
 	if err != nil || !containsBindingPin(pinsBeforeStop, primary.JobID, digest) {
 		t.Fatalf("initial OCI binding pin=%+v err=%v", pinsBeforeStop, err)
 	}
-	stopContext, cancelStop := context.WithTimeout(t.Context(), 15*time.Second)
-	if _, err := lima.SetOCIIntent(stopContext, intentPath, 1, false, time.Now()); err != nil {
-		cancelStop()
+	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{IntentPath: intentPath, Runtime: nodeAgent})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := nodeAgent.StopOCIRuntime(stopContext); err != nil {
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 15*time.Second)
+	stopResponse, err := controller.Stop(stopContext, ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
+	if err != nil || stopResponse.Intent.Enabled || stopResponse.Intent.Revision != 2 || !stopResponse.RuntimeQuiesced {
 		cancelStop()
-		t.Fatal(err)
+		t.Fatalf("OCI controller stop=%+v err=%v", stopResponse, err)
 	}
 	cancelStop()
 	// The real two-second lease proves that local OCI intent stop is neither an
@@ -328,6 +334,11 @@ while :; do sleep 1; done
 	attempts, err := store.ListJobAttempts(t.Context(), primary.JobID)
 	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != firstAttempt || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
 		t.Fatalf("intent-stop expiry evidence=%+v err=%v", attempts, err)
+	}
+	intentStopReceipt := nodeAgent.logSpool.inspectCompletion(t.Context(), firstAttempt)
+	if intentStopReceipt.State != "suppressed" || intentStopReceipt.Reason != "service_intent_stop" ||
+		intentStopReceipt.IntentRevision != stopResponse.Intent.Revision || intentStopReceipt.Result == (l1.ProcessResult{}) {
+		t.Fatalf("intent-stop spool disposition=%+v stop=%+v", intentStopReceipt, stopResponse)
 	}
 	pinsAfterStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
 	bindingPinBefore := containsBindingPin(pinsBeforeStop, primary.JobID, digest)
@@ -533,7 +544,7 @@ while :; do sleep 1; done
 			}
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true}}, nil
 		}),
-		OCIBootBarrier: restartBarrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: restartAdapter},
+		OCIIntent: intentObservation, OCIBootBarrier: restartBarrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: restartAdapter},
 		AttemptDeadman:       nativeAcceptanceDeadman{barrier: restartBarrier, nodeID: "native-service-node", bootSessionID: restartBootID},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,

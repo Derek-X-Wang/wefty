@@ -26,6 +26,7 @@ type evidenceOutbox struct {
 	batchSize     int
 	flushInterval time.Duration
 	retryInterval time.Duration
+	ociIntentGate *ociIntentCompletionGate
 	// completionStored is a test seam for ordering cancellation against the
 	// durable commit edge. Production construction leaves it nil.
 	completionStored func()
@@ -72,12 +73,20 @@ func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID str
 	return nil
 }
 
-func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID string) error {
-	return outbox.spool.completionDelivered(ctx, attemptID)
+func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID string, revision ...uint64) error {
+	var observed uint64
+	if len(revision) > 0 {
+		observed = revision[0]
+	}
+	return outbox.spool.completionDelivered(ctx, attemptID, observed)
 }
 
-func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string) error {
-	return outbox.spool.suppressCompletion(ctx, attemptID)
+func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string, revision uint64) error {
+	return outbox.spool.recordCompletionDisposition(ctx, attemptID, "suppressed", "service_intent_stop", revision)
+}
+
+func (outbox *evidenceOutbox) withholdCompletion(ctx context.Context, attemptID, reason string, revision uint64) error {
+	return outbox.spool.recordCompletionDisposition(ctx, attemptID, "withheld", reason, revision)
 }
 
 func (outbox *evidenceOutbox) beginRemoval(ctx context.Context, removal localRemoval) error {
@@ -382,13 +391,44 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 	if err != nil || !present {
 		return err
 	}
+	var observation OCIIntentObservation
+	var releaseIntent func()
+	if requiresOCIIntentFence(attempt.kind, attempt.class) {
+		disposition, _, dispositionRevision, dispositionErr := outbox.spool.completionDisposition(ctx, attempt.attemptID)
+		if dispositionErr != nil {
+			return dispositionErr
+		}
+		if disposition == "suppressed" {
+			return nil
+		}
+		if outbox.ociIntentGate != nil {
+			var intentErr error
+			observation, releaseIntent, intentErr = outbox.ociIntentGate.beginCompletion(ctx)
+			if intentErr != nil {
+				if disposition == "withheld" && dispositionRevision == 0 {
+					return intentErr
+				}
+				if receiptErr := outbox.withholdCompletion(context.WithoutCancel(ctx), attempt.attemptID, "intent_authority_unavailable", 0); receiptErr != nil {
+					return errors.Join(intentErr, receiptErr)
+				}
+				return intentErr
+			}
+			if !outbox.ociIntentGate.allows(observation) {
+				releaseIntent()
+				return outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID, observation.Revision)
+			}
+		}
+	}
 	request := l1.CompletionRequest{
 		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,
 		Result: result, RuntimeQuiescenceEvidence: evidence,
 	}
 	_, err = client.Complete(ctx, attempt.jobID, attempt.attemptID, request)
+	if releaseIntent != nil {
+		releaseIntent()
+	}
 	if err == nil || protocolErrorCode(err) == contract.ErrorLeaseExpired {
-		return outbox.spool.completionDelivered(ctx, attempt.attemptID)
+		return outbox.spool.completionDelivered(ctx, attempt.attemptID, observation.Revision)
 	}
 	code := protocolErrorCode(err)
 	if permanentEvidenceRejection(code) {

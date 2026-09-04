@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -30,13 +29,13 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		Clock:        &controlTestClock{now: now},
 		HostPlatform: PlatformFacts{OS: "linux", Architecture: "amd64"},
 		AgentUser:    "wefty-agent", LaunchUnit: "wefty-agent.service",
-		CapabilitySnapshot: func() agent.CapabilitySnapshot {
+		CapabilitySnapshot: func() CapabilitySnapshot {
 			probe := contract.CapabilityObservation{
 				Revision: 9, ObservedAt: now.Add(-time.Minute), Capabilities: map[string]bool{
 					"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
 				}, MissingCapabilities: []string{},
 			}
-			return agent.CapabilitySnapshot{
+			return CapabilitySnapshot{
 				CapabilityObservation: contract.CapabilityObservation{
 					Revision: 9, ObservedAt: now.Add(-2 * time.Minute), Capabilities: capabilities,
 					MissingCapabilities: missing, ReasonCode: reason,
@@ -209,7 +208,7 @@ func TestDoctorDoesNotRenderARefusedAdmissionAsHealthy(t *testing.T) {
 
 func setProbeReason(config *DoctorConfig, reason contract.CapabilityReasonCode) {
 	base := config.CapabilitySnapshot
-	config.CapabilitySnapshot = func() agent.CapabilitySnapshot {
+	config.CapabilitySnapshot = func() CapabilitySnapshot {
 		snapshot := base()
 		delete(snapshot.Capabilities, "kind:oci")
 		snapshot.MissingCapabilities = []string{"kind:oci"}
@@ -220,7 +219,7 @@ func setProbeReason(config *DoctorConfig, reason contract.CapabilityReasonCode) 
 
 func setLastProbeReason(config *DoctorConfig, reason contract.CapabilityReasonCode) {
 	base := config.CapabilitySnapshot
-	config.CapabilitySnapshot = func() agent.CapabilitySnapshot {
+	config.CapabilitySnapshot = func() CapabilitySnapshot {
 		snapshot := base()
 		if snapshot.LastProbe == nil {
 			return snapshot
@@ -461,7 +460,7 @@ func TestDoctorAdversarialRowsFailClosedWithoutMutation(t *testing.T) {
 	t.Run("stale capability revision", func(t *testing.T) {
 		config := healthyDoctorConfig(now, "")
 		base := config.CapabilitySnapshot
-		config.CapabilitySnapshot = func() agent.CapabilitySnapshot {
+		config.CapabilitySnapshot = func() CapabilitySnapshot {
 			snapshot := base()
 			snapshot.PendingPublicationRevision = snapshot.Revision
 			return snapshot
@@ -551,7 +550,7 @@ func TestDoctorReadsSourcesExactlyOnceAndSurfacesUIDLimitation(t *testing.T) {
 	setup := config.ReadSetupState
 	desired := config.ReadDesiredSetupState
 	config.Intent = func(ctx context.Context) (lima.OCIIntent, error) { intentReads++; return intent(ctx) }
-	config.CapabilitySnapshot = func() agent.CapabilitySnapshot { capabilityReads++; return capability() }
+	config.CapabilitySnapshot = func() CapabilitySnapshot { capabilityReads++; return capability() }
 	config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) { helperReads++; return helper(ctx) }
 	config.ReadSetupState = func(path string) (SetupState, error) { setupReads++; return setup(path) }
 	config.ReadDesiredSetupState = func(path string) (SetupState, error) { desiredReads++; return desired(path) }

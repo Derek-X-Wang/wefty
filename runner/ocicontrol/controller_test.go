@@ -21,15 +21,38 @@ type controlTestClock struct{ now time.Time }
 func (clock *controlTestClock) Now() time.Time { return clock.now }
 
 type controlTestRuntime struct {
-	intentPath string
-	mu         sync.Mutex
-	recovered  int
-	stopped    int
-	stopErr    error
-	live       bool
+	intentPath   string
+	mu           sync.Mutex
+	recovered    int
+	stopped      int
+	fenced       bool
+	stopErr      error
+	live         bool
+	fenceEntered chan struct{}
+	fenceRelease chan struct{}
 }
 
 func (runtime *controlTestRuntime) OCIRuntimeLive() bool { return runtime.live }
+
+func (runtime *controlTestRuntime) FenceOCIIntentStop(ctx context.Context, revision uint64) (func(), error) {
+	intent, err := (lima.FileIntentSource{Path: runtime.intentPath}).ReadIntent(context.Background())
+	runtime.mu.Lock()
+	if err == nil && !intent.Enabled && intent.Revision == revision {
+		runtime.fenced = true
+	}
+	runtime.mu.Unlock()
+	if runtime.fenceEntered != nil {
+		close(runtime.fenceEntered)
+	}
+	if runtime.fenceRelease != nil {
+		select {
+		case <-runtime.fenceRelease:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return func() {}, nil
+}
 
 func (runtime *controlTestRuntime) RecoverOCIRuntimeCapabilities(context.Context) error {
 	runtime.mu.Lock()
@@ -48,6 +71,9 @@ func (runtime *controlTestRuntime) StopOCIRuntime(context.Context) error {
 	intent, err := (lima.FileIntentSource{Path: runtime.intentPath}).ReadIntent(context.Background())
 	if err != nil || intent.Enabled {
 		return errors.New("runtime stop preceded durable disable")
+	}
+	if !runtime.fenced {
+		return errors.New("runtime stop preceded completion fence")
 	}
 	runtime.stopped++
 	return runtime.stopErr
@@ -95,6 +121,44 @@ func TestControllerPersistsIntentBeforeRuntimeEffects(t *testing.T) {
 	loaded, err := controller.LoadImage(t.Context(), bytes.NewReader([]byte("verified-archive")))
 	if err != nil || loaded.TopLevelDigest == "" || images.reference != "" || images.archive != "verified-archive" {
 		t.Fatalf("load-image response=%+v reference=%q archive=%q err=%v", loaded, images.reference, images.archive, err)
+	}
+}
+
+func TestControllerWaitsForCompletionDrainBeforeRuntimeStop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	clock := &controlTestClock{now: time.Date(2026, 8, 28, 12, 30, 0, 0, time.UTC)}
+	if _, err := lima.InitializeOCIIntent(path, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &controlTestRuntime{intentPath: path, fenceEntered: make(chan struct{}), fenceRelease: make(chan struct{})}
+	controller, err := NewController(ControllerConfig{IntentPath: path, Runtime: runtime, Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := controller.Stop(t.Context(), IntentMutationRequest{ExpectedRevision: 1})
+		done <- err
+	}()
+	select {
+	case <-runtime.fenceEntered:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not reach completion drain")
+	}
+	runtime.mu.Lock()
+	stopped := runtime.stopped
+	runtime.mu.Unlock()
+	if stopped != 0 {
+		t.Fatal("runtime stop overtook completion drain")
+	}
+	close(runtime.fenceRelease)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped != 1 {
+		t.Fatalf("runtime stop calls=%d, want 1", runtime.stopped)
 	}
 }
 

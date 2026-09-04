@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -252,7 +255,7 @@ func TestDurableOCIIntentGatesBackgroundRecoveryUntilControllerStart(t *testing.
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "intent-node", BootSessionID: "intent-boot", Version: "test", OS: "linux", Architecture: "amd64",
-		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe,
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: probe.intentObservation,
 		OCIBootBarrier: readyMainTestOCIBootBarrier{}, HeartbeatInterval: 10 * time.Millisecond, ClaimInterval: time.Second,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})
@@ -306,6 +309,185 @@ func TestDurableOCIIntentGatesBackgroundRecoveryUntilControllerStart(t *testing.
 	if err := <-agentDone; err != nil {
 		t.Fatalf("agent shutdown: %v", err)
 	}
+}
+
+func TestControllerStopWaitsForRealInFlightCompletionRequest(t *testing.T) {
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := limarunner.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := limarunner.FileIntentSource{Path: intentPath}
+	network := plain.NewNetwork()
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
+		"controller-fence-node": {MaxServiceSlots: 1},
+	}})
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	requestEntered := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.HasSuffix(request.URL.Path, "/complete") {
+			enteredOnce.Do(func() { close(requestEntered) })
+			<-releaseRequest
+		}
+		l1Server.Handler().ServeHTTP(w, request)
+	})
+	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: handler}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- httpServer.Serve(listener) }()
+	defer func() {
+		_ = httpServer.Close()
+		if serveErr := <-serverDone; serveErr != nil && serveErr != http.ErrServerClosed {
+			t.Errorf("serve L1: %v", serveErr)
+		}
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close L1: %v", closeErr)
+		}
+	}()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	if _, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "controller-fence-service",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/controller-fence:v1", Digest: &digest},
+			Argv:  []string{"/payload"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "controller-fence-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := agent.New(agent.Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "controller-fence-node", BootSessionID: "controller-fence-boot", Version: "test", OS: "linux", Architecture: "amd64",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: staticMainOCIProbe{},
+		OCIIntent: func(ctx context.Context) (agent.OCIIntentObservation, error) {
+			intent, readErr := intentSource.ReadIntent(ctx)
+			return agent.OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, readErr
+		},
+		OCIBootBarrier: readyMainTestOCIBootBarrier{},
+		WorkloadRuntimes: map[string]agent.WorkloadRuntime{
+			contract.JobKindOCI: immediateMainOCIRuntime{},
+		},
+		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancelRun := context.WithCancel(t.Context())
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- nodeAgent.Run(runContext) }()
+	defer func() {
+		releaseOnce.Do(func() { close(releaseRequest) })
+		cancelRun()
+		if runErr := <-agentDone; runErr != nil {
+			t.Errorf("agent run: %v", runErr)
+		}
+		nodeAgent.Close()
+	}()
+	select {
+	case <-requestEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("completion request did not enter L1")
+	}
+	observedRuntime := &stopObservingAgentRuntime{Agent: nodeAgent, stopEntered: make(chan struct{})}
+	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{IntentPath: intentPath, Runtime: observedRuntime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type stopResult struct {
+		response ocicontrol.IntentResponse
+		err      error
+	}
+	stopDone := make(chan stopResult, 1)
+	go func() {
+		response, stopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
+		stopDone <- stopResult{response: response, err: stopErr}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		intent, readErr := intentSource.ReadIntent(t.Context())
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !intent.Enabled && intent.Revision == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("controller did not durably disable intent: %+v", intent)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-observedRuntime.stopEntered:
+		t.Fatal("StopOCIRuntime overtook the in-flight completion")
+	case result := <-stopDone:
+		t.Fatalf("controller stop returned before completion: %+v err=%v", result.response, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseRequest) })
+	select {
+	case result := <-stopDone:
+		if result.err != nil || !result.response.RuntimeQuiesced || result.response.Intent.Revision != 2 {
+			t.Fatalf("controller stop=%+v err=%v", result.response, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("controller stop did not finish after completion returned")
+	}
+	select {
+	case <-observedRuntime.stopEntered:
+	default:
+		t.Fatal("StopOCIRuntime was not reached after completion returned")
+	}
+}
+
+type staticMainOCIProbe struct{}
+
+func (staticMainOCIProbe) Probe(context.Context) (agent.CapabilityProbeResult, error) {
+	return agent.CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+}
+
+type immediateMainOCIRuntime struct{}
+
+func (immediateMainOCIRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (immediateMainOCIRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	exitCode := 7
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (immediateMainOCIRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+type stopObservingAgentRuntime struct {
+	*agent.Agent
+	stopEntered chan struct{}
+	stopOnce    sync.Once
+}
+
+func (runtime *stopObservingAgentRuntime) StopOCIRuntime(ctx context.Context) error {
+	runtime.stopOnce.Do(func() { close(runtime.stopEntered) })
+	return runtime.Agent.StopOCIRuntime(ctx)
 }
 
 func waitForMainTestNode(t *testing.T, store *l1.Store, nodeID string, predicate func(l1.Node) bool) l1.Node {

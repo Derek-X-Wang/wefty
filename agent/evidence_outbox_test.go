@@ -19,11 +19,261 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
 func TestAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	assertAttemptPersistsCompletionBeforeDelivery(t)
+}
+
+func TestOCIServiceCompletionAuthorityUnavailableRetainsEvidence(t *testing.T) {
+	var completionCalls int
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		completionCalls++
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+
+	newPending := func(t *testing.T, attemptID, kind string) (*evidenceOutbox, l1.Claim, logSpoolAttempt) {
+		t.Helper()
+		outbox, err := newEvidenceOutbox(t.TempDir(), "intent-authority-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim := l1.Claim{Job: l1.Job{JobID: "intent-authority-job-" + attemptID, Spec: contract.JobSpec{
+			Kind: kind, Class: contract.JobClassService,
+		}}, Lease: l1.AttemptLease{AttemptID: attemptID, FencingToken: "fence-" + attemptID}}
+		if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+			t.Fatal(err)
+		}
+		exitCode := 7
+		if err := outbox.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now(), l1.RuntimeQuiescenceAttempt); err != nil {
+			t.Fatal(err)
+		}
+		return outbox, claim, logSpoolAttempt{jobID: claim.Job.JobID, attemptID: attemptID, fencingToken: claim.Lease.FencingToken, class: contract.JobClassService, kind: kind}
+	}
+
+	t.Run("transient read error retries intact payload", func(t *testing.T) {
+		outbox, _, attempt := newPending(t, "transient", contract.JobKindOCI)
+		defer outbox.Close()
+		reads := 0
+		outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
+			reads++
+			if reads <= 2 {
+				return OCIIntentObservation{}, errors.New("transient EIO")
+			}
+			return OCIIntentObservation{Enabled: true, Revision: 9}, nil
+		}}
+		err := outbox.recoverCompletion(t.Context(), client, attempt)
+		var unavailable *OCIIntentAuthorityUnavailableError
+		if !errors.As(err, &unavailable) || completionCalls != 0 {
+			t.Fatalf("first recovery err=%v calls=%d", err, completionCalls)
+		}
+		receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+		if receipt.State != "withheld" || receipt.Reason != "intent_authority_unavailable" || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
+			t.Fatalf("withheld completion receipt=%+v", receipt)
+		}
+		var firstObservedNS int64
+		if err := outbox.spool.db.QueryRowContext(t.Context(), `SELECT observed_ns FROM spool_completion_receipts WHERE attempt_id=?`, attempt.attemptID).Scan(&firstObservedNS); err != nil {
+			t.Fatal(err)
+		}
+		if err := outbox.recoverCompletion(t.Context(), client, attempt); !errors.As(err, &unavailable) {
+			t.Fatalf("second unavailable recovery err=%v", err)
+		}
+		var secondObservedNS int64
+		if err := outbox.spool.db.QueryRowContext(t.Context(), `SELECT observed_ns FROM spool_completion_receipts WHERE attempt_id=?`, attempt.attemptID).Scan(&secondObservedNS); err != nil {
+			t.Fatal(err)
+		}
+		if secondObservedNS != firstObservedNS {
+			t.Fatalf("withheld disposition rewritten: before=%d after=%d", firstObservedNS, secondObservedNS)
+		}
+		if err := outbox.recoverCompletion(t.Context(), client, attempt); err != nil {
+			t.Fatal(err)
+		}
+		receipt = outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+		if receipt.State != "delivered" || receipt.IntentRevision != 9 || completionCalls != 1 {
+			t.Fatalf("retried completion receipt=%+v calls=%d", receipt, completionCalls)
+		}
+	})
+
+	t.Run("nil authority leaves the fence inapplicable", func(t *testing.T) {
+		for _, kind := range []string{contract.JobKindProcess, contract.JobKindOCI} {
+			t.Run(kind, func(t *testing.T) {
+				outbox, _, attempt := newPending(t, "nil-"+kind, kind)
+				defer outbox.Close()
+				callsBefore := completionCalls
+				if err := outbox.recoverCompletion(t.Context(), client, attempt); err != nil {
+					t.Fatalf("nil authority %s completion: %v", kind, err)
+				}
+				receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+				if receipt.State != "delivered" || completionCalls != callsBefore+1 {
+					t.Fatalf("nil-authority %s receipt=%+v calls=%d", kind, receipt, completionCalls)
+				}
+			})
+		}
+	})
+
+	t.Run("absent production marker is typed and withheld", func(t *testing.T) {
+		outbox, _, attempt := newPending(t, "absent", contract.JobKindOCI)
+		defer outbox.Close()
+		source := lima.FileIntentSource{Path: filepath.Join(t.TempDir(), "missing-intent.json")}
+		outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(ctx context.Context) (OCIIntentObservation, error) {
+			intent, err := source.ReadIntent(ctx)
+			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+		}}
+		err := outbox.recoverCompletion(t.Context(), client, attempt)
+		var unavailable *OCIIntentAuthorityUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("absent marker err=%T %v", err, err)
+		}
+		receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+		if receipt.State != "withheld" || receipt.Reason != "intent_authority_unavailable" || receipt.IntentRevision != 0 ||
+			receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
+			t.Fatalf("absent-marker receipt=%+v", receipt)
+		}
+	})
+}
+
+func TestSuppressedCompletionStillDrainsLogsWithoutRedispositionLoop(t *testing.T) {
+	var logCalls, completionCalls int
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/logs"):
+			logCalls++
+			var appendRequest l1.AppendLogsRequest
+			if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+				t.Error(err)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+				Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: eventEndSequence(appendRequest.Events[0])},
+				AttemptState: contract.AttemptRunning,
+			})
+		case strings.HasSuffix(request.URL.Path, "/complete"):
+			completionCalls++
+			_ = json.NewEncoder(w).Encode(l1.Job{})
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "suppressed-logs-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "suppressed-logs-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}},
+		Lease: l1.AttemptLease{AttemptID: "suppressed-logs-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "final log")); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.suppressCompletion(t.Context(), claim.Lease.AttemptID, 4); err != nil {
+		t.Fatal(err)
+	}
+	var observedNS int64
+	if err := outbox.spool.db.QueryRowContext(t.Context(), `SELECT observed_ns FROM spool_completion_receipts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&observedNS); err != nil {
+		t.Fatal(err)
+	}
+	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken, class: contract.JobClassService, kind: contract.JobKindOCI}
+	for range 3 {
+		if err := outbox.recoverAttempt(t.Context(), client, attempt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if logCalls != 1 || completionCalls != 0 {
+		t.Fatalf("recovery calls logs=%d complete=%d, want 1/0", logCalls, completionCalls)
+	}
+	if events, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8); err != nil || len(events) != 0 {
+		t.Fatalf("suppressed attempt retained events=%+v err=%v", events, err)
+	}
+	var observedAfter int64
+	if err := outbox.spool.db.QueryRowContext(t.Context(), `SELECT observed_ns FROM spool_completion_receipts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&observedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if observedAfter != observedNS {
+		t.Fatalf("suppressed disposition rewritten: before=%d after=%d", observedNS, observedAfter)
+	}
+	if attempts, err := outbox.spool.pendingAttempts(t.Context()); err != nil || len(attempts) != 0 {
+		t.Fatalf("drained suppressed attempt remained pending=%+v err=%v", attempts, err)
+	}
+}
+
+func TestOCIIntentStopWaitsForInFlightCompletionRequest(t *testing.T) {
+	requestEntered := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		close(requestEntered)
+		<-releaseRequest
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "inflight-fence-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
+		return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+	}}
+	claim := l1.Claim{Job: l1.Job{JobID: "inflight-fence-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}},
+		Lease: l1.AttemptLease{AttemptID: "inflight-fence-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken, class: contract.JobClassService, kind: contract.JobKindOCI}
+	completionDone := make(chan error, 1)
+	go func() { completionDone <- outbox.recoverCompletion(t.Context(), client, attempt) }()
+	select {
+	case <-requestEntered:
+	case <-time.After(time.Second):
+		t.Fatal("completion request did not enter L1")
+	}
+	stopDone := make(chan error, 1)
+	go func() {
+		release, err := outbox.ociIntentGate.beginStop(t.Context(), 2)
+		if err == nil {
+			release()
+		}
+		stopDone <- err
+	}()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("stop crossed in-flight completion: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseRequest)
+	if err := <-completionDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *testing.T) {

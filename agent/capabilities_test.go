@@ -25,6 +25,10 @@ func (probe capabilityProbeFunc) Probe(ctx context.Context) (CapabilityProbeResu
 	return probe(ctx)
 }
 
+func enabledTestOCIIntent(context.Context) (OCIIntentObservation, error) {
+	return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+}
+
 func TestConcurrentCapabilityRefreshWaitsForProbeOwnership(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
@@ -340,6 +344,38 @@ func TestAgentRefusesOCIProbeWithoutBootBarrier(t *testing.T) {
 	})
 	if err == nil || err.Error() != "agent: OCI capability probe requires a boot barrier" {
 		t.Fatalf("agent construction error = %v", err)
+	}
+}
+
+func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{name: "raw capability", config: Config{Capabilities: map[string]bool{"kind:oci": true}}},
+		{name: "probe only", config: Config{
+			CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+				return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+			}),
+			OCIBootBarrier: readyOCIBootBarrier{},
+		}},
+		{name: "normalized capability", config: Config{Capabilities: map[string]bool{"  KiNd:OcI  ": true}}},
+		{name: "bare job kind", config: Config{Capabilities: map[string]bool{contract.JobKindOCI: true}}},
+		{name: "runtime only", config: Config{WorkloadRuntimes: map[string]WorkloadRuntime{
+			contract.JobKindOCI: instantWorkloadRuntime{},
+		}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.config.NodeID = "node"
+			test.config.BootSessionID = "boot"
+			test.config.Version = "test"
+			_, err := New(test.config)
+			var required *OCIIntentAuthorityRequiredError
+			if !errors.As(err, &required) {
+				t.Fatalf("agent construction error = %T %v", err, err)
+			}
+		})
 	}
 }
 
@@ -867,7 +903,7 @@ func newBootBarrierTestAgent(
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-reused",
 		Version: "test", OS: "linux", Architecture: "amd64",
-		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe,
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: enabledTestOCIIntent,
 		OCIBootBarrier: barrier, HeartbeatInterval: time.Hour, ClaimInterval: 250 * time.Millisecond,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})
@@ -887,7 +923,7 @@ func newCapabilityTestAgent(t *testing.T, network *plain.Network, nodeID string,
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-" + nodeID,
 		Version: "test", OS: "linux", Architecture: "amd64",
-		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe,
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: enabledTestOCIIntent,
 		OCIBootBarrier:         readyOCIBootBarrier{},
 		CapabilityProbeTimeout: probeTimeout, HeartbeatInterval: heartbeatInterval, ClaimInterval: 5 * time.Millisecond,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
@@ -955,7 +991,7 @@ func assertAgentPublishesProbeWithdrawalByNextSuccessfulHeartbeat(t *testing.T) 
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1",
 		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
-		CapabilityProbe: probe, OCIBootBarrier: readyOCIBootBarrier{},
+		CapabilityProbe: probe, OCIIntent: enabledTestOCIIntent, OCIBootBarrier: readyOCIBootBarrier{},
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: time.Second,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})

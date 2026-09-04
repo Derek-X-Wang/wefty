@@ -58,6 +58,10 @@ type Config struct {
 	CapabilityProbe CapabilityProbe
 	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
 	CapabilityProbeTimeout time.Duration
+	// OCIIntent reads the durable node-local OCI intent marker. It is required
+	// when this configuration offers an OCI runtime or capability; otherwise a
+	// nil reader means the completion fence is not applicable.
+	OCIIntent func(context.Context) (OCIIntentObservation, error)
 	// OCIBootBarrier must prove exclusive sweep and namespace absence before
 	// the functional probe can earn OCI capability publication.
 	OCIBootBarrier       OCIBootBarrier
@@ -122,6 +126,7 @@ type Agent struct {
 	computerTokens        ComputerTokenMinter
 	computerTokenCloser   interface{ Close() }
 	computerControlTokens *computerControlTokenCodec
+	ociIntentGate         *ociIntentCompletionGate
 	nodeLock              nodeLock
 }
 
@@ -146,6 +151,12 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.CapabilityProbe != nil && config.OCIBootBarrier == nil {
 		return nil, errors.New("agent: OCI capability probe requires a boot barrier")
+	}
+	normalizedCapabilities := normalizeConfiguredCapabilities(config.Capabilities)
+	_, offersOCIRuntime := config.WorkloadRuntimes[contract.JobKindOCI]
+	if config.OCIIntent == nil && (normalizedCapabilities["kind:oci"] || normalizedCapabilities[contract.JobKindOCI] ||
+		config.CapabilityProbe != nil || offersOCIRuntime) {
+		return nil, &OCIIntentAuthorityRequiredError{}
 	}
 	osName := config.OS
 	if osName == "" {
@@ -237,6 +248,11 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
+	var intentGate *ociIntentCompletionGate
+	if config.OCIIntent != nil {
+		intentGate = &ociIntentCompletionGate{observe: config.OCIIntent}
+	}
+	outbox.ociIntentGate = intentGate
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
 	if err != nil {
 		_ = outbox.Close()
@@ -383,6 +399,7 @@ func New(config Config) (*Agent, error) {
 		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
 		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
 		computerControlTokens: computerControlTokens,
+		ociIntentGate:         intentGate,
 		nodeLock:              stableNodeLock,
 	}, nil
 }
@@ -509,6 +526,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		prepareServiceEndpoint:     prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:       a.prepareAuthorityLoss,
 		allowsStart:                allowsStart,
+		ociIntentGate:              a.ociIntentGate,
 		currentOCIGeneration:       a.currentOCIRuntimeGeneration,
 		embargoOCIRuntime:          a.embargoOCIRuntimeLoss,
 		recoverOCIRuntime:          a.recoverOCIRuntimeAfterLoss,
@@ -626,6 +644,17 @@ func (a *Agent) StopOCIRuntime(ctx context.Context) error {
 		return errors.New("agent: OCI runtime control is unavailable")
 	}
 	return a.session.stopOCIRuntime(ctx)
+}
+
+// FenceOCIIntentStop joins any completion request that already observed the
+// prior enabled revision. The OCI controller calls this after durably writing
+// disabled intent, waits for readers to drain, then releases the barrier before
+// StopOCIRuntime joins resident work.
+func (a *Agent) FenceOCIIntentStop(ctx context.Context, revision uint64) (func(), error) {
+	if a == nil || a.ociIntentGate == nil {
+		return func() {}, nil
+	}
+	return a.ociIntentGate.beginStop(ctx, revision)
 }
 
 // OCIRuntimeLive reports the already-earned, locally current OCI state used
