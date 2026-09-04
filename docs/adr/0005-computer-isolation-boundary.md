@@ -83,6 +83,9 @@ and record the refusal through receipts.
   namespace to systemd-resolved's advertised non-loopback uplink after a bounded
   lookup proves it reachable and falls back only to a Node stub that answers the
   same probe; neither candidate answering is typed `egress_dns_unavailable`.
+  Userspace forwarding is tested against a fake upstream on every Linux run,
+  while the hosted realtiming lane runs the real UDP/TCP proxy in a root network
+  namespace before exercising Computer egress.
   Routable resolvers use the veth. Ordinary
   OCI remains on shared networking.
 - Computer networking uses disjoint `/30` allocations in the RFC 2544
@@ -90,6 +93,12 @@ and record the refusal through receipts.
   32,768 ports. Helper startup refuses a conflicting non-Wefty Node route, and
   masquerading is scoped to each live Computer address rather than the whole
   benchmarking range.
+- Helper-owned firewall chain bodies are ordered policy, not a set: doctor
+  requires the exact canonical sequence and reconciliation rebuilds any
+  reordered, missing, duplicated, or foreign body. Base-chain jumps are
+  inserted at position one before duplicate cleanup. Missing `ip6table_nat` is
+  a typed nonfatal fact only while Computer IPv6 remains disabled; filter-chain
+  failures stay fail closed.
 - The helper owns the Node-wide forwarding and firewall state while Computers
   are live. It verifies and repairs the IPv4 and IPv6 chains on each Computer
   start and on its periodic sweep cadence. Their INPUT, FORWARD, and

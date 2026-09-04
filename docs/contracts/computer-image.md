@@ -266,7 +266,12 @@ image re-enables IPv6. The endpoint is bound only to the attempt's
 gateway/interface tuple and returns no tenant or Node data. The helper verifies
 and repairs both chain sets at every Computer start and on its periodic sweep
 cadence. Each INPUT, FORWARD, and POSTROUTING jump must be the first rule in
-its base chain; a merely present later jump does not prove isolation. Startup
+its base chain; a merely present later jump does not prove isolation. Every
+helper-owned chain body must also exactly match its canonical ordered rules;
+presence without order does not prove the crossover rejection precedes egress
+acceptance. Missing kernel `ip6table_nat` support is recorded as
+`unavailable_ipv6_disabled` because IPv6 is disabled inside the Computer, but
+IPv6 filter failures remain fatal. Startup
 sweep removes unowned `wftch*`/`wftcg*` links and IPv4/IPv6 attempt rules, while
 orderly helper close tears down live network state and helper-owned Node-wide
 firewall/forwarding state. If the helper process crashes after enabling

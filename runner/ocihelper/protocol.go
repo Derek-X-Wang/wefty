@@ -681,31 +681,44 @@ type ProfileWarning struct {
 	LimitBytes   int64              `json:"limit_bytes"`
 }
 
+// ComputerIPv6NATState records whether the defence-in-depth IPv6 NAT table is
+// configured or safely unavailable while Computer IPv6 is disabled.
+type ComputerIPv6NATState string
+
+const (
+	// ComputerIPv6NATConfigured means the helper installed the IPv6 NAT chain.
+	ComputerIPv6NATConfigured              ComputerIPv6NATState = "configured"
+	// ComputerIPv6NATUnavailableIPv6Disabled means the kernel has no IPv6 NAT
+	// table; IPv6 filter policy remains mandatory and Computer IPv6 is disabled.
+	ComputerIPv6NATUnavailableIPv6Disabled ComputerIPv6NATState = "unavailable_ipv6_disabled"
+)
+
 // ProfileReceipt is assertion-derived from the exact runtime profile handed
 // to containerd. ComputerTmpfsCeilingBytes covers /dev/shm, /tmp, and
 // /var/tmp; ordinary baseline tmpfs mounts remain outside that product delta.
 type ProfileReceipt struct {
-	Computer                     bool             `json:"computer"`
-	NetworkNamespacePresent      bool             `json:"network_namespace_present"`
-	HelperNetworkNamespaceInode  string           `json:"helper_network_namespace_inode,omitempty"`
-	TaskNetworkNamespaceInode    string           `json:"task_network_namespace_inode,omitempty"`
-	HostAbstractSocketVisible    bool             `json:"host_abstract_socket_visible"`
-	ComputerNetworkAddress       string           `json:"computer_network_address,omitempty"`
-	ComputerNetworkGateway       string           `json:"computer_network_gateway,omitempty"`
-	ComputerResolverAddress      string           `json:"computer_resolver_address,omitempty"`
-	ComputerDNSProxyUDP          bool             `json:"computer_dns_proxy_udp"`
-	ComputerDNSProxyTCP          bool             `json:"computer_dns_proxy_tcp"`
-	ComputerDNSUpstreamAddress   string           `json:"computer_dns_upstream_address,omitempty"`
-	ComputerDNSUpstreamSource    string           `json:"computer_dns_upstream_source,omitempty"`
-	ComputerDNSUpstreamReachable bool             `json:"computer_dns_upstream_reachable"`
-	MemoryLimitBytes             int64            `json:"memory_limit_bytes"`
-	MemoryMaxBytes               int64            `json:"memory_max_bytes"`
-	MemoryOOMGroup               bool             `json:"memory_oom_group"`
-	MemorySwapMaxBytes           int64            `json:"memory_swap_max_bytes"`
-	ComputerTmpfsCeilingBytes    int64            `json:"computer_tmpfs_ceiling_bytes"`
-	LargestTmpfsTarget           string           `json:"largest_tmpfs_target,omitempty"`
-	LargestTmpfsCeilingBytes     int64            `json:"largest_tmpfs_ceiling_bytes"`
-	Warnings                     []ProfileWarning `json:"warnings"`
+	Computer                     bool                 `json:"computer"`
+	NetworkNamespacePresent      bool                 `json:"network_namespace_present"`
+	HelperNetworkNamespaceInode  string               `json:"helper_network_namespace_inode,omitempty"`
+	TaskNetworkNamespaceInode    string               `json:"task_network_namespace_inode,omitempty"`
+	HostAbstractSocketVisible    bool                 `json:"host_abstract_socket_visible"`
+	ComputerNetworkAddress       string               `json:"computer_network_address,omitempty"`
+	ComputerNetworkGateway       string               `json:"computer_network_gateway,omitempty"`
+	ComputerResolverAddress      string               `json:"computer_resolver_address,omitempty"`
+	ComputerDNSProxyUDP          bool                 `json:"computer_dns_proxy_udp"`
+	ComputerDNSProxyTCP          bool                 `json:"computer_dns_proxy_tcp"`
+	ComputerDNSUpstreamAddress   string               `json:"computer_dns_upstream_address,omitempty"`
+	ComputerDNSUpstreamSource    string               `json:"computer_dns_upstream_source,omitempty"`
+	ComputerDNSUpstreamReachable bool                 `json:"computer_dns_upstream_reachable"`
+	ComputerIPv6NATState         ComputerIPv6NATState `json:"computer_ipv6_nat_state,omitempty"`
+	MemoryLimitBytes             int64                `json:"memory_limit_bytes"`
+	MemoryMaxBytes               int64                `json:"memory_max_bytes"`
+	MemoryOOMGroup               bool                 `json:"memory_oom_group"`
+	MemorySwapMaxBytes           int64                `json:"memory_swap_max_bytes"`
+	ComputerTmpfsCeilingBytes    int64                `json:"computer_tmpfs_ceiling_bytes"`
+	LargestTmpfsTarget           string               `json:"largest_tmpfs_target,omitempty"`
+	LargestTmpfsCeilingBytes     int64                `json:"largest_tmpfs_ceiling_bytes"`
+	Warnings                     []ProfileWarning     `json:"warnings"`
 }
 
 // ImageEvidence is produced from the local immutable image selected by the

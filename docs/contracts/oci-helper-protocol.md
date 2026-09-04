@@ -520,12 +520,19 @@ then falls back to the Node stub only after that stub answers the same probe; a
 routable resolver traverses the veth directly. The proxy validates DNS framing,
 rate limits each attempt, and bounds concurrent TCP clients. Mirrored
 `ip6tables` chains retain the same boundary if an image re-enables IPv6. The
+absence of the kernel `ip6table_nat` table is recorded as
+`unavailable_ipv6_disabled`, rather than refusing a Computer whose namespace
+has IPv6 disabled; IPv6 filter-chain failures still fail closed. The
 firewall rejects Computer-to-Computer, Node-local, and unsolicited inbound
 traffic except the attempt/interface-bound helper egress proof endpoint, whose
 ACCEPT additionally requires the owning transparent helper socket. The helper
 reconciles both chain sets at every Computer start and on its periodic sweep
 cadence. The INPUT, FORWARD, and POSTROUTING jumps must each be the first base
-chain rule; later presence is reported absent and repaired. Startup removes
+chain rule; later presence is reported absent and repaired. The helper also
+compares every helper-owned chain body with its canonical ordered rules and
+rebuilds a body whose rule order, membership, or duplication differs. A new
+first-position jump is inserted before stale copies are removed, so repair
+does not create a no-jump window. Startup removes
 unowned host/guest link ends and IPv4/IPv6 rule residue, and tears down live
 network state plus helper-owned Node-wide state on close. It creates the `view`,
 `control`, and Computer submission listeners inside that namespace, then enters
@@ -791,12 +798,13 @@ last assertion-derived comparison as `WARN` when applicable and exposes the
 last atomic admission facts. The post-start runtime receipt records the helper
 and task network namespace inodes, their observed inequality, the veth
 address/gateway, mounted resolver address, UDP/TCP proxy listeners, selected
-upstream address/source/reachability, and whether the exact abstract X11 socket token is visible from
+upstream address/source/reachability, the typed IPv6 NAT state, and whether the exact abstract X11 socket token is visible from
 the helper namespace. The node doctor reports screen isolation as `OK` only for
 distinct non-empty inodes, `present=true`, and `visible=false`; a missing
 Computer receipt remains `NOT-RUN`, and any other combination is `FAILED`.
 Doctor also performs a fresh `iptables -S` and `ip6tables -S` observation:
-`computer_firewall_present=true` requires every helper chain and Node jump, and
+`computer_firewall_present=true` requires every helper chain in canonical
+order and every Node jump exactly once at position one, and
 a missing attachment while any Computer attempt is live is `FAILED` rather than
 inferred from startup configuration.
 

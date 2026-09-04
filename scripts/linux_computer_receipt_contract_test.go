@@ -146,6 +146,24 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"missing network veth gateway": func(receipt map[string]any) {
 			delete(receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string), "veth_gateway")
 		},
+		"missing mounted resolver snapshot": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string), "resolver_snapshot")
+		},
+		"loopback resolver without UDP proxy": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["proxy_udp_listening"] = "false"
+		},
+		"loopback resolver without reachable upstream": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["proxy_upstream_reachable"] = "false"
+		},
+		"wrong default route gateway": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["default_route_gateway"] = "198.18.0.9"
+		},
+		"public IP probe did not connect": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["public_ipv4_outcome"] = "refused"
+		},
+		"DNS probe did not resolve": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["dns_outcome"] = "gaierror:EAI_AGAIN"
+		},
 		"missing crossover source computer": func(receipt map[string]any) {
 			delete(receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string), "source_computer_id")
 		},
@@ -243,9 +261,12 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	}
 	crossover["evidence"] = crossoverEvidence
 	network := rows["linux.network_egress"].(map[string]any)
-	network["assertions"] = map[string]bool{"private_veth_address_present": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_listener_ipv4_refused": true, "node_listener_ipv6_refused": true}
+	network["assertions"] = map[string]bool{"private_veth_address_present": true, "mounted_resolver_recorded": true, "loopback_proxy_listening": true, "proxy_upstream_reachable": true, "default_route_present": true, "public_ipv4_connected": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_listener_ipv4_refused": true, "node_listener_ipv6_refused": true}
 	network["evidence"] = map[string]string{
 		"computer_id": "computer-1", "attempt_id": "attempt-1", "veth_address": "198.18.0.2", "veth_gateway": "198.18.0.1",
+		"resolver_snapshot": "nameserver 127.0.0.53", "resolver_address": "127.0.0.53", "proxy_udp_listening": "true", "proxy_tcp_listening": "true",
+		"proxy_upstream_address": "168.63.129.16", "proxy_upstream_source": "systemd_uplink", "proxy_upstream_reachable": "true",
+		"default_route_interface": "eth0", "default_route_gateway": "198.18.0.1", "public_ipv4_address": "1.1.1.1:443", "public_ipv4_outcome": "connected", "dns_outcome": "resolved",
 		"resolved_name": "example.com", "resolved_address": "192.0.2.1", "helper_http_status": "200",
 		"helper_http_body": "wefty-computer-egress-v1", "node_listener_ipv4_address": "198.18.0.1:45000", "node_listener_ipv4_outcome": "refused", "node_listener_ipv4_errno": "ECONNREFUSED",
 		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "EADDRNOTAVAIL",

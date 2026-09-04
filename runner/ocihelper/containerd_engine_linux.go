@@ -161,6 +161,7 @@ type ContainerdEngine struct {
 	computerForwardingObserved  bool
 	computerForwardingOwned     bool
 	computerFirewallConfigured  bool
+	computerIPv6NATState        ComputerIPv6NATState
 	observeComputerIsolation    func(*pinnedNetworkNamespace, string) (string, string, bool, error)
 }
 
@@ -1140,6 +1141,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		profile.ComputerDNSUpstreamAddress = computerNetwork.dnsUpstreamAddress
 		profile.ComputerDNSUpstreamSource = computerNetwork.dnsUpstreamSource
 		profile.ComputerDNSUpstreamReachable = computerNetwork.dnsUpstreamReachable
+		profile.ComputerIPv6NATState = computerNetwork.ipv6NATState
 		for name, hold := range endpointHolds {
 			port := endpoints[name]
 			if err := hold.Close(); err != nil {

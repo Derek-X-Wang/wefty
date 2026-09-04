@@ -153,21 +153,22 @@ type ProfileDoctorFacts struct {
 }
 
 type ComputerScreenIsolationDoctorFacts struct {
-	Outcome                      DiagnosticOutcome `json:"outcome"`
-	NetworkNamespacePresent      bool              `json:"network_namespace_present"`
-	HelperNetworkNamespaceInode  string            `json:"helper_network_namespace_inode,omitempty"`
-	TaskNetworkNamespaceInode    string            `json:"task_network_namespace_inode,omitempty"`
-	HostAbstractSocketVisible    bool              `json:"host_abstract_socket_visible"`
-	ComputerNetworkAddress       string            `json:"computer_network_address,omitempty"`
-	ComputerNetworkGateway       string            `json:"computer_network_gateway,omitempty"`
-	ComputerResolverAddress      string            `json:"computer_resolver_address,omitempty"`
-	ComputerDNSProxyUDP          bool              `json:"computer_dns_proxy_udp"`
-	ComputerDNSProxyTCP          bool              `json:"computer_dns_proxy_tcp"`
-	ComputerDNSUpstreamAddress   string            `json:"computer_dns_upstream_address,omitempty"`
-	ComputerDNSUpstreamSource    string            `json:"computer_dns_upstream_source,omitempty"`
-	ComputerDNSUpstreamReachable bool              `json:"computer_dns_upstream_reachable"`
-	ComputerFirewallPresent      bool              `json:"computer_firewall_present"`
-	ComputerAttemptsLive         bool              `json:"computer_attempts_live"`
+	Outcome                      DiagnosticOutcome              `json:"outcome"`
+	NetworkNamespacePresent      bool                           `json:"network_namespace_present"`
+	HelperNetworkNamespaceInode  string                         `json:"helper_network_namespace_inode,omitempty"`
+	TaskNetworkNamespaceInode    string                         `json:"task_network_namespace_inode,omitempty"`
+	HostAbstractSocketVisible    bool                           `json:"host_abstract_socket_visible"`
+	ComputerNetworkAddress       string                         `json:"computer_network_address,omitempty"`
+	ComputerNetworkGateway       string                         `json:"computer_network_gateway,omitempty"`
+	ComputerResolverAddress      string                         `json:"computer_resolver_address,omitempty"`
+	ComputerDNSProxyUDP          bool                           `json:"computer_dns_proxy_udp"`
+	ComputerDNSProxyTCP          bool                           `json:"computer_dns_proxy_tcp"`
+	ComputerDNSUpstreamAddress   string                         `json:"computer_dns_upstream_address,omitempty"`
+	ComputerDNSUpstreamSource    string                         `json:"computer_dns_upstream_source,omitempty"`
+	ComputerDNSUpstreamReachable bool                           `json:"computer_dns_upstream_reachable"`
+	ComputerIPv6NATState         ocihelper.ComputerIPv6NATState `json:"computer_ipv6_nat_state,omitempty"`
+	ComputerFirewallPresent      bool                           `json:"computer_firewall_present"`
+	ComputerAttemptsLive         bool                           `json:"computer_attempts_live"`
 }
 
 type ConvergenceDoctorFacts struct {
@@ -669,6 +670,7 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 				ComputerDNSUpstreamAddress:   profile.ComputerDNSUpstreamAddress,
 				ComputerDNSUpstreamSource:    profile.ComputerDNSUpstreamSource,
 				ComputerDNSUpstreamReachable: profile.ComputerDNSUpstreamReachable,
+				ComputerIPv6NATState:         profile.ComputerIPv6NATState,
 				ComputerFirewallPresent:      runtimeStatus.ComputerFirewallPresent,
 				ComputerAttemptsLive:         runtimeStatus.ComputerAttemptsLive,
 			}
@@ -1084,7 +1086,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
 		fmt.Sprintf("CACHE\t%s bytes=%d cap=%d within_bound=%t last_eviction=%s", report.Cache.Outcome, report.Cache.Bytes, report.Cache.CapBytes, report.Cache.WithinBound, lastEviction),
 		fmt.Sprintf("PROFILE\t%s memory_limit=%d memory_max=%d memory_oom_group=%t memory_swap_max=%d computer_tmpfs_ceiling=%d largest_tmpfs_ceiling=%d warnings=%d", report.Profile.Outcome, report.Profile.MemoryLimitBytes, report.Profile.MemoryMaxBytes, report.Profile.MemoryOOMGroup, report.Profile.MemorySwapMaxBytes, report.Profile.ComputerTmpfsCeilingBytes, report.Profile.LargestTmpfsCeilingBytes, len(report.Profile.Warnings)),
-		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
+		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
 	}

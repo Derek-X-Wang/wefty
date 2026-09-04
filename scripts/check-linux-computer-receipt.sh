@@ -63,6 +63,11 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
    else
     .rows["linux.network_egress"].status == "PASS" and
     .rows["linux.network_egress"].assertions.private_veth_address_present and
+    .rows["linux.network_egress"].assertions.mounted_resolver_recorded and
+    .rows["linux.network_egress"].assertions.loopback_proxy_listening and
+    .rows["linux.network_egress"].assertions.proxy_upstream_reachable and
+    .rows["linux.network_egress"].assertions.default_route_present and
+    .rows["linux.network_egress"].assertions.public_ipv4_connected and
     .rows["linux.network_egress"].assertions.resolver_reachable and
     .rows["linux.network_egress"].assertions.helper_http_through_veth and
     .rows["linux.network_egress"].assertions.node_listener_ipv4_refused and
@@ -72,6 +77,20 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     (.rows["linux.network_egress"].evidence.veth_address | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+$")) and
     (.rows["linux.network_egress"].evidence.veth_gateway | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+$")) and
     .rows["linux.network_egress"].evidence.veth_address != .rows["linux.network_egress"].evidence.veth_gateway and
+    (.rows["linux.network_egress"].evidence.resolver_snapshot | contains("nameserver")) and
+    (.rows["linux.network_egress"].evidence.resolver_address | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (if (.rows["linux.network_egress"].evidence.resolver_address | startswith("127.")) then
+      .rows["linux.network_egress"].evidence.proxy_udp_listening == "true" and
+      .rows["linux.network_egress"].evidence.proxy_tcp_listening == "true" and
+      (.rows["linux.network_egress"].evidence.proxy_upstream_address | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+      (.rows["linux.network_egress"].evidence.proxy_upstream_source == "systemd_uplink" or .rows["linux.network_egress"].evidence.proxy_upstream_source == "node_stub") and
+      .rows["linux.network_egress"].evidence.proxy_upstream_reachable == "true"
+     else true end) and
+    .rows["linux.network_egress"].evidence.default_route_interface == "eth0" and
+    .rows["linux.network_egress"].evidence.default_route_gateway == .rows["linux.network_egress"].evidence.veth_gateway and
+    .rows["linux.network_egress"].evidence.public_ipv4_address == "1.1.1.1:443" and
+    .rows["linux.network_egress"].evidence.public_ipv4_outcome == "connected" and
+    .rows["linux.network_egress"].evidence.dns_outcome == "resolved" and
     .rows["linux.network_egress"].evidence.resolved_name == "example.com" and
     (.rows["linux.network_egress"].evidence.resolved_address | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) and
     .rows["linux.network_egress"].evidence.helper_http_status == "200" and
@@ -148,3 +167,9 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
   (.rows["linux.removal"].evidence.inventory_source == "helper VerifyNamespaceReadOnly route") and
   (.residue_inventories.post_removal_helper_namespace | type == "object")
 ' "$receipt" >/dev/null
+
+jq -r '
+  (.rows["linux.network_egress"].evidence.node_listener_ipv6_errno // "unavailable") as $egress |
+  (.rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_errno // "unavailable") as $crossover |
+  "linux-computer-ipv6-refusal image=\(.image.variant) egress=\($egress) crossover=\($crossover)"
+' "$receipt"
