@@ -32,6 +32,7 @@ const (
 	computerFirewallForward = "WEFTY-COMPUTER-FWD"
 	computerFirewallNAT     = "WEFTY-COMPUTER-NAT"
 	computerEgressProbeBody = "wefty-computer-egress-v1\n"
+	computerResolverUplink  = "/run/systemd/resolve/resolv.conf"
 )
 
 type pinnedNetworkNamespace struct {
@@ -181,7 +182,7 @@ func (engine *ContainerdEngine) prepareComputerNetwork(ctx context.Context, name
 	if engine.computerFirewallErr != nil {
 		return nil, engine.computerFirewallErr
 	}
-	return setupComputerNetwork(ctx, namespace, port, engine.config.AttemptPortMin, ipPath, iptablesPath)
+	return setupComputerNetwork(ctx, namespace, port, engine.config.AttemptPortMin, ipPath, iptablesPath, engine.config.ResolverPath)
 }
 
 func computerNetworkAddresses(port, minimum uint16) (host, guest net.IP, err error) {
@@ -199,9 +200,9 @@ func uint32IPv4(value uint32) net.IP {
 	return net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value))
 }
 
-func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace, port, minimum uint16, ipPath, iptablesPath string) (_ *computerNetworkAttachment, err error) {
-	if namespace == nil || port == 0 || ipPath == "" || iptablesPath == "" {
-		return nil, errors.New("Computer network setup requires namespace, port, ip, and iptables")
+func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace, port, minimum uint16, ipPath, iptablesPath, resolverPath string) (_ *computerNetworkAttachment, err error) {
+	if namespace == nil || port == 0 || ipPath == "" || iptablesPath == "" || resolverPath == "" {
+		return nil, errors.New("Computer network setup requires namespace, port, ip, iptables, and resolver configuration")
 	}
 	hostAddress, guestAddress, err := computerNetworkAddresses(port, minimum)
 	if err != nil {
@@ -267,12 +268,16 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 	if err != nil {
 		return nil, err
 	}
-	resolverAddress, err := computerResolverAddress("/etc/resolv.conf")
+	resolverAddress, err := computerResolverAddress(resolverPath)
 	if err != nil {
 		return nil, err
 	}
 	if net.ParseIP(resolverAddress).IsLoopback() {
-		attachment.dns, err = startComputerDNSProxy(namespace, net.JoinHostPort(resolverAddress, "53"), net.JoinHostPort(resolverAddress, "53"))
+		upstreamAddress := resolverAddress
+		if uplinkAddress, uplinkErr := computerNonLoopbackResolverAddress(computerResolverUplink); uplinkErr == nil {
+			upstreamAddress = uplinkAddress
+		}
+		attachment.dns, err = startComputerDNSProxy(namespace, net.JoinHostPort(resolverAddress, "53"), net.JoinHostPort(upstreamAddress, "53"))
 		if err != nil {
 			return nil, fmt.Errorf("start Computer loopback resolver proxy: %w", err)
 		}
@@ -311,6 +316,30 @@ func computerResolverAddress(path string) (string, error) {
 		return "", fmt.Errorf("read Computer resolver configuration: %w", err)
 	}
 	return "", errors.New("Computer resolver configuration has no IPv4 nameserver")
+}
+
+func computerNonLoopbackResolverAddress(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open Computer resolver uplink configuration: %w", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		address := net.ParseIP(fields[1])
+		if address == nil || address.To4() == nil || address.IsLoopback() {
+			continue
+		}
+		return address.String(), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read Computer resolver uplink configuration: %w", err)
+	}
+	return "", errors.New("Computer resolver uplink configuration has no non-loopback IPv4 nameserver")
 }
 
 func startComputerDNSProxy(namespace *pinnedNetworkNamespace, listenAddress, upstreamAddress string) (_ *computerDNSProxy, err error) {

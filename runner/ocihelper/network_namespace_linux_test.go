@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,7 +31,22 @@ func requireRootNetworkNamespaceTest(t *testing.T) {
 
 func startIsolatedNetworkTask(t *testing.T) *exec.Cmd {
 	t.Helper()
-	command := exec.Command("unshare", "--net", "--", "sh", "-c", "ip link set lo up; readlink /proc/self/ns/net; exec sleep 30")
+	return startIsolatedNetworkTaskCommand(t, exec.Command("unshare", "--net", "--", "sh", "-c", "ip link set lo up; readlink /proc/self/ns/net; exec sleep 30"))
+}
+
+func startIsolatedNetworkTaskWithResolver(t *testing.T, resolverPath string) *exec.Cmd {
+	t.Helper()
+	if _, err := exec.LookPath("nsenter"); err != nil {
+		t.Skip("nsenter is unavailable")
+	}
+	return startIsolatedNetworkTaskCommand(t, exec.Command("unshare", "--net", "--mount", "--propagation", "private", "--", "sh", "-c", `mount --bind "$1" /etc/resolv.conf
+ip link set lo up
+readlink /proc/self/ns/net
+exec sleep 30`, "sh", resolverPath))
+}
+
+func startIsolatedNetworkTaskCommand(t *testing.T, command *exec.Cmd) *exec.Cmd {
+	t.Helper()
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -227,6 +243,33 @@ func TestComputerDNSProxyForwardsLoopbackResolver(t *testing.T) {
 	}
 }
 
+func TestComputerNetworkUsesMountedResolverForLoopbackProxy(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	resolverPath := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(resolverPath, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := startIsolatedNetworkTaskWithResolver(t, resolverPath)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	engine := &ContainerdEngine{config: NativeEngineConfig{ResolverPath: resolverPath, AttemptPortMin: 42120}}
+	attachment, err := engine.prepareComputerNetwork(t.Context(), namespace, 42120)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attachment.close()
+	if attachment.dns == nil {
+		t.Fatal("Computer mounted loopback resolver did not start a private DNS proxy")
+	}
+	output, err := exec.Command("nsenter", "--target", strconv.Itoa(command.Process.Pid), "--net", "--mount", "--", "getent", "ahostsv4", "example.com").CombinedOutput()
+	if err != nil || len(strings.TrimSpace(string(output))) == 0 {
+		t.Fatalf("Computer mounted loopback resolver lookup failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+}
+
 func TestComputerNetworkAddressesAreDisjointPerReservedPort(t *testing.T) {
 	hostA, guestA, err := computerNetworkAddresses(42000, 42000)
 	if err != nil {
@@ -278,7 +321,7 @@ func TestComputerVethPreservesDNSAndOutbound(t *testing.T) {
 	if err := ensureComputerFirewall(t.Context(), iptablesPath); err != nil {
 		t.Fatal(err)
 	}
-	attachment, err := setupComputerNetwork(t.Context(), namespace, 42000, 42000, ipPath, iptablesPath)
+	attachment, err := setupComputerNetwork(t.Context(), namespace, 42000, 42000, ipPath, iptablesPath, "/etc/resolv.conf")
 	if err != nil {
 		t.Fatal(err)
 	}

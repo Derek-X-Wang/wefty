@@ -1406,6 +1406,12 @@ fi`},
 			AttemptEndpointReady: func(string, workloadrunner.AttemptEndpoint) error {
 				return nil
 			}}
+		request.HostBridgeFallbackActive = true
+		request.HostBridgeEndpointReady = func(string) error { return nil }
+		request.HostBridgeDial = func(dialContext context.Context) (net.Conn, error) {
+			<-dialContext.Done()
+			return nil, context.Cause(dialContext)
+		}
 		request.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			_, err := store.ObserveAttemptImage(callbackContext, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, nativeImageObservation(claim.Lease.FencingToken, observation))
 			return err

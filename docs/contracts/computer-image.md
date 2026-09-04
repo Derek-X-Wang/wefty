@@ -244,9 +244,10 @@ privilege.
 The helper attaches one point-to-point `/30` veth to the private namespace,
 installs a default route, retains the helper-managed resolver and hosts mounts,
 and masquerades outbound traffic through the Node or Lima VM. If the mounted
-resolver names a Node-loopback stub such as `127.0.0.53`, the helper binds that
-address only inside the Computer namespace and proxies DNS to the same resolver
-in the Node namespace; a routable resolver continues over the veth. Firewall policy
+resolver snapshot names a Node-loopback stub such as `127.0.0.53`, the helper
+binds that address only inside the Computer namespace and proxies DNS from the
+Node namespace to systemd-resolved's advertised non-loopback uplink when present,
+falling back to the Node stub otherwise; a routable resolver continues over the veth. Firewall policy
 rejects veth-to-veth forwarding, unsolicited traffic toward a Computer veth,
 and every Computer-originated Node-local listener except the exact helper-owned
 egress proof endpoint. That endpoint is bound only to the attempt's

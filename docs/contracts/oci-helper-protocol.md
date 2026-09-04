@@ -504,9 +504,11 @@ swap escape. `Resources.Pids` remains absent in M3; the missing PID limit is a
 known profile gap, not an implicit default. The helper attaches a point-to-point
 veth, brings the Computer namespace's loopback and veth interfaces up, installs
 a default route, and masquerades external egress through the Node/VM. A
-Node-loopback resolver is mirrored by an attempt-private UDP/TCP helper proxy at
-the same address inside the Computer namespace; a routable resolver traverses
-the veth directly. Its
+Node-loopback resolver in the exact mounted snapshot is mirrored by an
+attempt-private UDP/TCP helper proxy at the same address inside the Computer
+namespace. The proxy forwards from the Node namespace to systemd-resolved's
+advertised non-loopback uplink when present and otherwise to the Node stub; a
+routable resolver traverses the veth directly. Its
 firewall rejects Computer-to-Computer, Node-local, and unsolicited inbound
 traffic except the attempt/interface-bound helper egress proof endpoint. It creates the `view`,
 `control`, and Computer submission listeners inside that namespace, then enters
