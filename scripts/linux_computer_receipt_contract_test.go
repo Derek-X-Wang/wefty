@@ -11,6 +11,7 @@ import (
 
 var linuxComputerReceiptRows = []string{
 	"linux.create_boot",
+	"linux.network_egress",
 	"linux.screen_crossover_refused",
 	"linux.remote_takeover",
 	"linux.restart_survival",
@@ -85,6 +86,54 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"wrong image variant": func(receipt map[string]any) {
 			receipt["image"].(map[string]any)["variant"] = "wayland"
 		},
+		"missing crossover target liveness": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string), "target_liveness_view")
+		},
+		"wrong crossover view errno": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["view_read_errno"] = "EACCES"
+		},
+		"wrong crossover view outcome": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["view_read_outcome"] = "protocol_error"
+		},
+		"wrong crossover control outcome": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["control_inject_outcome"] = "protocol_error"
+		},
+		"wrong crossover control errno": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["control_inject_errno"] = "EACCES"
+		},
+		"wrong crossover abstract visibility": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_visible"] = "true"
+		},
+		"wrong crossover abstract outcome": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_outcome"] = "connected"
+		},
+		"wrong crossover abstract errno": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_errno"] = "ECONNREFUSED"
+		},
+		"wrong crossover display class": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["derived_display_class"] = "x_auth"
+		},
+		"wrong crossover display outcome": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["derived_display_outcome"] = "auth_refused"
+		},
+		"wrong crossover egress outcome": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["egress_address_outcome"] = "connected"
+		},
+		"wrong crossover egress errno": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["egress_address_errno"] = "EHOSTUNREACH"
+		},
+		"wrong crossover target control liveness": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_liveness_control"] = "refused"
+		},
+		"wrong crossover target X liveness": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_liveness_x"] = "refused"
+		},
+		"wrong crossover target egress liveness": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_liveness_egress"] = "refused"
+		},
+		"wrong network helper body": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["helper_http_body"] = "wrong"
+		},
 	} {
 		t.Run("reject/"+name, func(t *testing.T) {
 			receipt := conformantLinuxComputerReceipt(candidate, "xfce")
@@ -129,17 +178,26 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"view_read_outcome": "refused", "view_read_errno": "ECONNREFUSED",
 		"control_inject_outcome": "refused", "control_inject_errno": "ECONNREFUSED",
 		"abstract_socket_outcome": "refused", "abstract_socket_errno": "ENOENT",
-		"abstract_socket_visible": "false", "derived_display_outcome": "refused",
+		"abstract_socket_visible": "false", "derived_display_outcome": "transport_refused", "derived_display_class": "x_transport",
+		"target_liveness_view": "read_succeeded", "target_liveness_control": "inject_succeeded", "target_liveness_x": "read_succeeded", "target_liveness_egress": "connected",
+		"egress_address_outcome": "refused", "egress_address_errno": "ECONNREFUSED",
 	}
+	crossover["assertions"] = map[string]bool{"crossover_refused": true, "target_alive_at_refusal_edge": true}
 	if variant == "wayland" {
 		crossoverEvidence["abstract_socket_outcome"] = "not_applicable"
 		crossoverEvidence["derived_display_outcome"] = "not_applicable"
 	}
 	crossover["evidence"] = crossoverEvidence
+	network := rows["linux.network_egress"].(map[string]any)
+	network["assertions"] = map[string]bool{"private_veth_address_present": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_loopback_refused": true}
+	network["evidence"] = map[string]string{
+		"resolved_name": "example.com", "resolved_address": "192.0.2.1", "helper_http_status": "200",
+		"helper_http_body": "wefty-computer-egress-v1", "node_loopback_outcome": "refused", "node_loopback_errno": "ECONNREFUSED",
+	}
 	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespaceReadOnly route"}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	return map[string]any{
-		"version":       3,
+		"version":       4,
 		"status":        "NOT-RUN",
 		"not_run_issue": 157,
 		"candidate_sha": candidate,

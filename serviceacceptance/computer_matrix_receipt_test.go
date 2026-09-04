@@ -9,12 +9,13 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
-const linuxComputerMatrixVersion = 3
+const linuxComputerMatrixVersion = 4
 
 var linuxComputerMatrixRows = []struct {
 	ID, Proof string
 }{
 	{"linux.create_boot", "Create and boot"},
+	{"linux.network_egress", "Private network outbound"},
 	{"linux.screen_crossover_refused", "Screen crossover refused"},
 	{"linux.remote_takeover", "Remote take-over"},
 	{"linux.restart_survival", "Restart survival"},
@@ -179,8 +180,8 @@ func TestLinuxComputerMatrixReceiptRejectsUnearnedPass(t *testing.T) {
 
 func TestLinuxComputerMatrixRowsAreStableAndComplete(t *testing.T) {
 	receipt := newLinuxComputerMatrixReceipt()
-	if len(receipt.Rows) != 8 {
-		t.Fatalf("Linux Computer matrix rows = %d, want 8", len(receipt.Rows))
+	if len(receipt.Rows) != 9 {
+		t.Fatalf("Linux Computer matrix rows = %d, want 9", len(receipt.Rows))
 	}
 	for _, required := range linuxComputerMatrixRows {
 		row, ok := receipt.Rows[required.ID]

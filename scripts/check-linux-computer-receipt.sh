@@ -16,6 +16,7 @@ test -s "$receipt"
 jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutated "$mutated_row" '
   def required_rows: [
     "linux.create_boot",
+    "linux.network_egress",
     "linux.screen_crossover_refused",
     "linux.remote_takeover",
     "linux.restart_survival",
@@ -25,7 +26,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     "linux.removal"
   ];
   . as $root |
-  .version == 3 and
+  .version == 4 and
   .platform == "linux/amd64" and
   .candidate_sha == $candidate and
   .image.variant == $image and
@@ -57,20 +58,43 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     ([.rows[$mutated].assertions[] | select(. != true)] | length == 1)
    end) and
   ([required_rows[] | select(. != "linux.guest_authority" and . != $mutated) as $id | $root.rows[$id].status == "PASS"] | all) and
+  (if $mutated == "linux.network_egress" then
+    .rows["linux.network_egress"].status == "FAIL"
+   else
+    .rows["linux.network_egress"].status == "PASS" and
+    .rows["linux.network_egress"].assertions.private_veth_address_present and
+    .rows["linux.network_egress"].assertions.resolver_reachable and
+    .rows["linux.network_egress"].assertions.helper_http_through_veth and
+    .rows["linux.network_egress"].assertions.node_loopback_refused and
+    .rows["linux.network_egress"].evidence.resolved_name == "example.com" and
+    (.rows["linux.network_egress"].evidence.resolved_address | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    .rows["linux.network_egress"].evidence.helper_http_status == "200" and
+    .rows["linux.network_egress"].evidence.helper_http_body == "wefty-computer-egress-v1" and
+    .rows["linux.network_egress"].evidence.node_loopback_outcome == "refused" and
+    .rows["linux.network_egress"].evidence.node_loopback_errno == "ECONNREFUSED"
+   end) and
   (if $mutated == "linux.screen_crossover_refused" then
     .rows["linux.screen_crossover_refused"].status == "FAIL"
    else
     .rows["linux.screen_crossover_refused"].status == "PASS" and
     .rows["linux.screen_crossover_refused"].assertions.crossover_refused and
+    .rows["linux.screen_crossover_refused"].assertions.target_alive_at_refusal_edge and
+    .rows["linux.screen_crossover_refused"].evidence.target_liveness_view == "read_succeeded" and
+    .rows["linux.screen_crossover_refused"].evidence.target_liveness_control == "inject_succeeded" and
+    .rows["linux.screen_crossover_refused"].evidence.target_liveness_egress == "connected" and
     .rows["linux.screen_crossover_refused"].evidence.view_read_outcome == "refused" and
     .rows["linux.screen_crossover_refused"].evidence.control_inject_outcome == "refused" and
     .rows["linux.screen_crossover_refused"].evidence.view_read_errno == "ECONNREFUSED" and
     .rows["linux.screen_crossover_refused"].evidence.control_inject_errno == "ECONNREFUSED" and
+    .rows["linux.screen_crossover_refused"].evidence.egress_address_outcome == "refused" and
+    .rows["linux.screen_crossover_refused"].evidence.egress_address_errno == "ECONNREFUSED" and
     (if .image.variant == "xfce" then
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_visible == "false" and
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_outcome == "refused" and
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_errno == "ENOENT" and
-      .rows["linux.screen_crossover_refused"].evidence.derived_display_outcome == "refused"
+      .rows["linux.screen_crossover_refused"].evidence.derived_display_outcome == "transport_refused" and
+      .rows["linux.screen_crossover_refused"].evidence.derived_display_class == "x_transport" and
+      .rows["linux.screen_crossover_refused"].evidence.target_liveness_x == "read_succeeded"
      else
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_outcome == "not_applicable" and
       .rows["linux.screen_crossover_refused"].evidence.derived_display_outcome == "not_applicable"
