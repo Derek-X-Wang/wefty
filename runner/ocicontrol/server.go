@@ -73,9 +73,16 @@ func (server *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/oci/stop", server.handleStop)
 	mux.HandleFunc("POST /v1/images/load", server.handleLoadImage)
 	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Minute}
-	shutdown := context.AfterFunc(ctx, func() { _ = server.server.Close() })
+	shutdownComplete := make(chan struct{})
+	shutdown := context.AfterFunc(ctx, func() {
+		defer close(shutdownComplete)
+		_ = server.server.Shutdown(context.WithoutCancel(ctx))
+	})
 	defer shutdown()
 	err = server.server.Serve(authenticated)
+	if ctx.Err() != nil {
+		<-shutdownComplete
+	}
 	_ = os.Remove(server.path)
 	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
 		return nil
