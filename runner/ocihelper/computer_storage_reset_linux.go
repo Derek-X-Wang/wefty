@@ -66,7 +66,7 @@ func openComputerDiskLock(root string) (*os.File, error) {
 	}
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = lock.Close()
-		return nil, errors.New("Computer Storage generation already has an attachment owner")
+		return nil, errComputerStorageAttachmentOwned
 	}
 	return lock, nil
 }

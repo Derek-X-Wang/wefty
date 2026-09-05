@@ -26,6 +26,7 @@ const (
 	defaultComputerStorageRecoveryAttempts  = 24
 	defaultComputerDiskQuarantineGCFailures = 3
 	computerOperationalDeferralRecordName   = "recovery-deferral.json"
+	computerOperationalDeferralFaultSuffix  = "-recovery-deferral-fault.json"
 )
 
 var errComputerStoragePreenCorrected = errors.New("Computer Storage preen corrected filesystem errors")
@@ -79,8 +80,13 @@ func (err *computerDiskRecoveryStructuralError) Error() string {
 }
 func (err *computerDiskRecoveryStructuralError) Unwrap() error { return err.Cause }
 
-func computerStorageResumePending(root string) (bool, error) {
+func (engine *ContainerdEngine) computerStorageResumePending(root, name string) (bool, error) {
 	if _, present, err := readOperationalComputerRecoveryDeferral(root); err != nil {
+		return false, err
+	} else if present {
+		return true, nil
+	}
+	if _, present, err := readOperationalComputerRecoveryDeferralFault(root, name); err != nil {
 		return false, err
 	} else if present {
 		return true, nil
@@ -136,19 +142,90 @@ func readOperationalComputerRecoveryDeferral(root string) (computerOperationalRe
 	return record, true, nil
 }
 
+func operationalComputerRecoveryDeferralFaultPath(root, name string) string {
+	return filepath.Join(filepath.Dir(root), "."+name+computerOperationalDeferralFaultSuffix)
+}
+
+func readOperationalComputerRecoveryDeferralFault(root, name string) (computerOperationalRecoveryDeferral, bool, error) {
+	return readOperationalComputerRecoveryDeferralAt(operationalComputerRecoveryDeferralFaultPath(root, name), name)
+}
+
+func readOperationalComputerRecoveryDeferralAt(path, name string) (computerOperationalRecoveryDeferral, bool, error) {
+	payload, present, err := readComputerRecoveryRecord(path)
+	if err != nil || !present {
+		return computerOperationalRecoveryDeferral{}, present, err
+	}
+	var record computerOperationalRecoveryDeferral
+	if json.Unmarshal(payload, &record) != nil || record.Version != 1 || record.DiskName != name || record.Operation == "" ||
+		record.Recovery.Attempts < 1 || record.Recovery.FirstDeferredAt.IsZero() || record.Recovery.Reason == "" {
+		return computerOperationalRecoveryDeferral{}, false, errors.New("Computer operational recovery fault deferral record is invalid")
+	}
+	if record.Storage.ComputerID != "" {
+		expected, identityErr := deterministicComputerDiskName(record.Storage)
+		if identityErr != nil || expected != record.DiskName {
+			return computerOperationalRecoveryDeferral{}, false, errors.New("Computer operational recovery fault deferral identity is invalid")
+		}
+	}
+	return record, true, nil
+}
+
+func mergeOperationalComputerRecoveryDeferrals(primary computerOperationalRecoveryDeferral, primaryPresent bool, fallback computerOperationalRecoveryDeferral, fallbackPresent bool) (computerOperationalRecoveryDeferral, bool) {
+	if !primaryPresent {
+		return fallback, fallbackPresent
+	}
+	if fallbackPresent && fallback.Recovery.Attempts > primary.Recovery.Attempts {
+		return fallback, true
+	}
+	return primary, true
+}
+
+func (engine *ContainerdEngine) inspectOperationalComputerRecoveryDeferral(root, name string) (computerOperationalRecoveryDeferral, bool, error) {
+	if _, err := engine.lstatComputerDisk(root); err != nil {
+		fallback, present, fallbackErr := readOperationalComputerRecoveryDeferralFault(root, name)
+		if fallbackErr == nil && present {
+			return fallback, true, nil
+		}
+		return computerOperationalRecoveryDeferral{}, false, errors.Join(err, fallbackErr)
+	}
+	primary, primaryPresent, primaryErr := readOperationalComputerRecoveryDeferral(root)
+	fallback, fallbackPresent, fallbackErr := readOperationalComputerRecoveryDeferralFault(root, name)
+	if primaryErr != nil {
+		if fallbackErr == nil && fallbackPresent {
+			return fallback, true, nil
+		}
+		return computerOperationalRecoveryDeferral{}, false, errors.Join(primaryErr, fallbackErr)
+	}
+	if fallbackErr != nil {
+		return computerOperationalRecoveryDeferral{}, false, fallbackErr
+	}
+	record, present := mergeOperationalComputerRecoveryDeferrals(primary, primaryPresent, fallback, fallbackPresent)
+	return record, present, nil
+}
+
 func (engine *ContainerdEngine) deferOperationalComputerRecovery(root, name, operation string, storage ComputerStorageReference, cause error, countAttempt bool) (computerStorageRecoveryDeferral, bool, error) {
+	if _, err := engine.lstatComputerDisk(root); err != nil {
+		return engine.deferOperationalComputerRecoveryFault(root, name, operation, storage, cause, countAttempt, recoveryDeferralReason(cause))
+	}
 	record, present, err := readOperationalComputerRecoveryDeferral(root)
 	if err != nil {
-		return computerStorageRecoveryDeferral{}, false, err
+		return engine.deferOperationalComputerRecoveryFault(root, name, operation, storage, cause, countAttempt, "deferral_record_unreadable")
 	}
-	if present && (record.DiskName != name || record.Operation != operation ||
+	fallback, fallbackPresent, fallbackErr := readOperationalComputerRecoveryDeferralFault(root, name)
+	if fallbackErr != nil {
+		return computerStorageRecoveryDeferral{}, false, fallbackErr
+	}
+	record, present = mergeOperationalComputerRecoveryDeferrals(record, present, fallback, fallbackPresent)
+	if present && (record.DiskName != name ||
 		record.Storage.ComputerID != "" && storage.ComputerID != "" && !sameComputerStorageIdentity(record.Storage, storage)) {
 		return computerStorageRecoveryDeferral{}, false, errors.New("Computer operational recovery deferral conflicts with current recovery")
 	}
 	if !present {
 		record = computerOperationalRecoveryDeferral{Version: 1, DiskName: name, Operation: operation, Storage: storage}
-	} else if record.Storage.ComputerID == "" && storage.ComputerID != "" {
-		record.Storage = storage
+	} else {
+		record.Operation = operation
+		if record.Storage.ComputerID == "" && storage.ComputerID != "" {
+			record.Storage = storage
+		}
 	}
 	if !countAttempt {
 		return record.Recovery, false, nil
@@ -159,21 +236,112 @@ func (engine *ContainerdEngine) deferOperationalComputerRecovery(root, name, ope
 	}
 	record.Recovery, present = advanceRecoveryDeferral(now, record.Recovery, recoveryDeferralReason(cause))
 	payload, err := json.Marshal(record)
+	if err != nil {
+		return record.Recovery, present, err
+	}
+	err = writeDurableFile(root, ".recovery-deferral.json.tmp-", computerOperationalDeferralRecordName, payload, 0o600)
+	parent := filepath.Dir(root)
+	if err != nil {
+		fallbackErr := writeDurableFile(parent, ".recovery-deferral-fault.tmp-", filepath.Base(operationalComputerRecoveryDeferralFaultPath(root, name)), payload, 0o600)
+		return record.Recovery, present, fallbackErr
+	}
+	_ = writeDurableFile(parent, ".recovery-deferral-fault.tmp-", filepath.Base(operationalComputerRecoveryDeferralFaultPath(root, name)), payload, 0o600)
+	return record.Recovery, present, nil
+}
+
+func (engine *ContainerdEngine) deferOperationalComputerRecoveryFault(root, name, operation string, storage ComputerStorageReference, cause error, countAttempt bool, reason string) (computerStorageRecoveryDeferral, bool, error) {
+	record, present, err := readOperationalComputerRecoveryDeferralFault(root, name)
+	if err != nil {
+		return computerStorageRecoveryDeferral{}, false, err
+	}
+	if present && record.Storage.ComputerID != "" && storage.ComputerID != "" && !sameComputerStorageIdentity(record.Storage, storage) {
+		return computerStorageRecoveryDeferral{}, false, errors.New("Computer operational recovery fault deferral conflicts with current recovery")
+	}
+	if !present {
+		record = computerOperationalRecoveryDeferral{Version: 1, DiskName: name, Operation: operation, Storage: storage}
+	} else {
+		record.Operation = operation
+		if record.Storage.ComputerID == "" && storage.ComputerID != "" {
+			record.Storage = storage
+		}
+	}
+	if !countAttempt {
+		return record.Recovery, false, nil
+	}
+	now := time.Now()
+	if engine.config.Clock != nil {
+		now = engine.config.Clock.Now()
+	}
+	if reason == "" {
+		reason = recoveryDeferralReason(cause)
+	}
+	record.Recovery, present = advanceRecoveryDeferral(now, record.Recovery, reason)
+	payload, err := json.Marshal(record)
 	if err == nil {
-		err = writeDurableFile(root, ".recovery-deferral.json.tmp-", computerOperationalDeferralRecordName, payload, 0o600)
+		parent := filepath.Dir(root)
+		err = writeDurableFile(parent, ".recovery-deferral-fault.tmp-", filepath.Base(operationalComputerRecoveryDeferralFaultPath(root, name)), payload, 0o600)
 	}
 	return record.Recovery, present, err
 }
 
-func clearOperationalComputerRecoveryDeferral(root, operation string) error {
+func removeOperationalComputerRecoveryDeferralFault(root, name string) error {
+	path := operationalComputerRecoveryDeferralFaultPath(root, name)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(root))
+}
+
+func clearAllOperationalComputerRecoveryDeferrals(root, name string) error {
+	removedPrimary := false
+	if err := os.Remove(filepath.Join(root, computerOperationalDeferralRecordName)); err == nil {
+		removedPrimary = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if removedPrimary {
+		if err := syncDirectory(root); err != nil {
+			return err
+		}
+	}
+	return removeOperationalComputerRecoveryDeferralFault(root, name)
+}
+
+func (engine *ContainerdEngine) clearOperationalComputerRecoveryDeferral(root, name, operation string) error {
+	if _, err := engine.lstatComputerDisk(root); err != nil {
+		return err
+	}
 	record, present, err := readOperationalComputerRecoveryDeferral(root)
-	if err != nil || !present || record.Operation != operation {
+	if err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(root, computerOperationalDeferralRecordName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	removedPrimary := false
+	if present && record.Operation == operation {
+		if err := os.Remove(filepath.Join(root, computerOperationalDeferralRecordName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removedPrimary = true
+	}
+	fallback, fallbackPresent, err := readOperationalComputerRecoveryDeferralFault(root, name)
+	if err != nil {
 		return err
 	}
-	return syncDirectory(root)
+	removedFallback := false
+	if fallbackPresent && fallback.Operation == operation {
+		if err := os.Remove(operationalComputerRecoveryDeferralFaultPath(root, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removedFallback = true
+	}
+	if removedPrimary {
+		if err := syncDirectory(root); err != nil {
+			return err
+		}
+	}
+	if removedFallback {
+		return syncDirectory(filepath.Dir(root))
+	}
+	return nil
 }
 
 func (engine *ContainerdEngine) deferComputerStorageRecovery(root, operation string, cause error, countAttempt bool) (ComputerStorageReference, computerStorageRecoveryDeferral, bool, error) {
@@ -288,6 +456,15 @@ func (engine *ContainerdEngine) operationalComputerRecoveryDeferral(name string)
 
 func (engine *ContainerdEngine) resolveOperationalComputerRecoveryFailure(root, name, operation string, storage ComputerStorageReference, cause error, countAttempt bool) SweepEvidence {
 	deferral, abandoned, err := engine.deferOperationalComputerRecovery(root, name, operation, storage, cause, countAttempt)
+	return engine.resolveOperationalComputerRecoveryDeferral(root, name, operation, storage, cause, deferral, abandoned, err)
+}
+
+func (engine *ContainerdEngine) resolveOperationalComputerRecoveryFault(root, name, operation string, storage ComputerStorageReference, cause error, countAttempt bool, reason string) SweepEvidence {
+	deferral, abandoned, err := engine.deferOperationalComputerRecoveryFault(root, name, operation, storage, cause, countAttempt, reason)
+	return engine.resolveOperationalComputerRecoveryDeferral(root, name, operation, storage, cause, deferral, abandoned, err)
+}
+
+func (engine *ContainerdEngine) resolveOperationalComputerRecoveryDeferral(root, name, operation string, storage ComputerStorageReference, cause error, deferral computerStorageRecoveryDeferral, abandoned bool, err error) SweepEvidence {
 	if err != nil {
 		engine.rememberOperationalComputerRecoveryDeferral(name, operation, storage, err)
 		return SweepEvidence{Class: RemovalResourceComputerDiskManifest, ID: name, Action: SweepActionResumeDeferred,
@@ -313,13 +490,14 @@ func (engine *ContainerdEngine) resolveOperationalComputerRecoveryFailure(root, 
 		return SweepEvidence{Class: RemovalResourceComputerDiskManifest, ID: name, Action: SweepActionResumeDeferred,
 			Method: operation + ":quarantine_failed"}
 	}
+	_ = removeOperationalComputerRecoveryDeferralFault(root, name)
 	return SweepEvidence{Class: RemovalResourceComputerQuarantine, ID: name, Action: SweepActionQuarantined,
 		Method: "resume_abandoned:" + deferral.Reason}
 }
 
 func (engine *ContainerdEngine) resolveOperationalDeferralRecordFailure(root, name, operation string, storage ComputerStorageReference, cause error, countAttempt bool) SweepEvidence {
 	if classifyComputerRecoveryFileFailure(cause) == computerRecoveryFileOperational {
-		return engine.resolveOperationalComputerRecoveryFailure(root, name, operation, storage, cause, countAttempt)
+		return engine.resolveOperationalComputerRecoveryFault(root, name, operation, storage, cause, countAttempt, "deferral_record_unreadable")
 	}
 	if err := engine.quarantineComputerDiskAuthorityFailure(root, name, "recovery_deferral_invalid"); err != nil {
 		engine.rememberOperationalComputerRecoveryDeferral(name, operation, storage, errors.Join(cause, err))
@@ -775,7 +953,10 @@ func (engine *ContainerdEngine) quarantineComputerDisk(root, name string, receip
 	if err := syncDirectory(filepath.Dir(root)); err != nil {
 		return err
 	}
-	return syncDirectory(quarantineRoot)
+	if err := syncDirectory(quarantineRoot); err != nil {
+		return err
+	}
+	return removeOperationalComputerRecoveryDeferralFault(root, name)
 }
 
 func validComputerDiskDirectoryName(name string) bool {
@@ -786,7 +967,7 @@ func validComputerDiskAuthorityFailureReason(reason string) bool {
 	return reason == "manifest_invalid" || reason == "quarantine_authority_invalid" ||
 		reason == "copy_recovery_authority_invalid" || reason == "grow_recovery_authority_invalid" ||
 		reason == "identity_mismatch" || reason == "record_not_regular" || reason == "resume_abandoned" ||
-		reason == "legacy_reset_quarantine" || reason == "recovery_deferral_invalid"
+		reason == "legacy_reset_quarantine" || reason == "recovery_deferral_invalid" || reason == "manifest_missing"
 }
 
 func validateComputerDiskQuarantineReceipt(receipt computerDiskQuarantineReceipt) error {
@@ -849,7 +1030,10 @@ func (engine *ContainerdEngine) resumeComputerDiskQuarantine(root, name string) 
 	if err := syncDirectory(filepath.Dir(root)); err != nil {
 		return false, err
 	}
-	return true, syncDirectory(quarantineRoot)
+	if err := syncDirectory(quarantineRoot); err != nil {
+		return false, err
+	}
+	return true, removeOperationalComputerRecoveryDeferralFault(root, name)
 }
 
 func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context.Context) error {

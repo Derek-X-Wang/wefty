@@ -3,6 +3,15 @@
 Computer Storage recovery is fail-closed per generation. A valid interrupted
 grow or copy record that cannot yet resume remains in place as
 `resume_deferred` with an attempt count, first-deferred time, and closed reason.
+Operational recovery deferral belongs to the Storage generation rather than
+one recovery operation: a later failure updates the live operation while
+preserving the generation's first-deferred time and accumulated attempt count.
+The helper mirrors that record beside the generation so an unreadable disk
+directory or deferral record remains countable as `deferral_record_unreadable`
+across helper replacement. A missing attachment manifest never authorizes
+deleting an existing image; it quarantines the bytes unless a valid matching
+pre-publication copy record proves that its staged destination was never
+published and can be rolled back.
 Only boot-barrier startup sweeps increment the attempt count; in-session reap
 sweeps do not. Recovery terminates as `resume_abandoned` only after both
 twenty-four failed agent boot-barrier sweeps and 24 elapsed hours, so a helper
