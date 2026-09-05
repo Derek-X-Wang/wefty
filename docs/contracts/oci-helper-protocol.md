@@ -137,6 +137,17 @@ Every JSON message is a four-byte big-endian length followed by at most 1 MiB
 of JSON. Handshake and initial request reads have deadlines, the helper caps
 concurrent connections, and a decoder never reads beyond one frame.
 
+The closed wire error-code vocabulary is `invalid_request`,
+`peer_unauthenticated`, `version_mismatch`, `checksum_mismatch`, `session_busy`,
+`session_stale`, `computer_storage_busy`, `computer_storage_retired`,
+`computer_storage_resume_deferred`, `computer_storage_quarantined`,
+`computer_storage_grow_uncertain`, `unauthorized_attempt`,
+`attempt_outside_session`, `unauthorized_port`, `unauthorized_bridge`,
+`oci_spec_rejected`, `image_unavailable`, `insufficient_memory`,
+`insufficient_disk`, `engine_failure`, `diagnostic_failure`,
+`unsupported_operation`, and `sweep_required`. Adding a code requires changing
+this contract in the same commit as the wire implementation.
+
 The acquisition connection remains the control connection. Strictly increasing
 heartbeats refresh a deadline measured only from the helper's monotonic clock.
 Control EOF invalidates the session immediately, while an open but blackholed
@@ -946,10 +957,14 @@ evidence with the closed reason. Quarantined generations remain visible in
 `ComputerQuarantines` and operator/removal surfaces but are durable retained
 state, not runnable namespace residue. Quarantine receipts retain the full
 payload for 24 hours. GC revalidates the complete receipt under the generation
-flock, records `payload_dropped_at` and typed evidence, and keeps the receipt
-and lock tombstone until authorized removal. Invalid authority never permits
-byte deletion, and GC failure does not fail helper startup, so generation N is
-never admissible again. The
+flock, records typed `payload_dropped_at` evidence, and keeps the receipt and
+lock tombstone until authorized removal. Tombstones have no autonomous age
+bound. Three authority-valid payload-GC failures record
+`quarantine_gc_escalated` and stop automatic retry; legacy `-reset-N`
+quarantines are first normalized into the same receipt-backed retention and GC
+path. Invalid authority never permits byte deletion, and a per-generation GC
+failure does not fail helper startup, so generation N is never admissible
+again. The
 authorized recovery path is a reset that prepares and admits generation N+1,
 followed by normal removal authority for N. The affected Computer therefore stays
 fail-closed while the helper continues serving the rest of the Node. Startup's

@@ -98,7 +98,7 @@ type ComputerStoragePreparationOutcome struct {
 	DeferredReason        string     `json:"deferred_reason,omitempty"`
 	Attempts              int        `json:"attempts,omitempty"`
 	FirstDeferredAt       *time.Time `json:"first_deferred_at,omitempty"`
-	PayloadDroppedAt      string     `json:"payload_dropped_at,omitempty"`
+	PayloadDroppedAt      *time.Time `json:"payload_dropped_at,omitempty"`
 	RecordedAt            *time.Time `json:"recorded_at,omitempty"`
 }
 

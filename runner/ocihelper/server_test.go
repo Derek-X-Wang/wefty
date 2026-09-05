@@ -23,6 +23,13 @@ import (
 
 var testImagePlatform = OCIPlatform{OS: "linux", Architecture: "amd64"}
 
+func TestComputerStorageRecoveryInventoryRejectsUntypedPayloadDropTime(t *testing.T) {
+	var entry ComputerStorageRecoveryInventoryEntry
+	if err := json.Unmarshal([]byte(`{"disk_name":"disk","operation":"quarantine","reason":"test","payload_dropped_at":"not-a-time"}`), &entry); err == nil {
+		t.Fatal("untyped payload_dropped_at was accepted")
+	}
+}
+
 func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	authority := testAuthority()
 	authority.Class = contract.JobClassService

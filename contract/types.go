@@ -796,6 +796,30 @@ var capabilityReasonCodes = []CapabilityReasonCode{
 	CapabilityReasonLocalPermissionDenied,
 }
 
+// ociRestrictionCapabilityReasonCodes is intentionally separate from the wire
+// vocabulary. A future non-OCI capability reason must not silently become
+// authority for withdrawing kind:oci merely because Valid accepts it.
+var ociRestrictionCapabilityReasonCodes = []CapabilityReasonCode{
+	CapabilityReasonOCIIntentDisabled,
+	CapabilityReasonPrerequisiteMissing,
+	CapabilityReasonRuntimeVersionUnsupported,
+	CapabilityReasonHelperUnreachable,
+	CapabilityReasonHelperUnitUnavailable,
+	CapabilityReasonHelperHandshakeStalled,
+	CapabilityReasonHelperHandshakeStalledPersistent,
+	CapabilityReasonHelperVersionMismatch,
+	CapabilityReasonHelperHandshakeFailed,
+	CapabilityReasonBootSweepFailed,
+	CapabilityReasonProbeFailed,
+	CapabilityReasonLimaStopped,
+	CapabilityReasonLimaBroken,
+	CapabilityReasonLimaStartTimeout,
+	CapabilityReasonTemplateRestartRequired,
+	CapabilityReasonTemplateRecreateRequired,
+	CapabilityReasonMountRootUnavailable,
+	CapabilityReasonLocalPermissionDenied,
+}
+
 // CapabilityReasonCodes returns the complete wire vocabulary accepted by
 // CapabilityReasonCode.Valid. Callers may modify the returned slice.
 func CapabilityReasonCodes() []CapabilityReasonCode {
@@ -814,7 +838,12 @@ func (code CapabilityReasonCode) Valid() bool {
 // ValidOCIRestriction reports whether code can explain an observation that
 // has atomically withdrawn kind:oci during registration or recovery.
 func (code CapabilityReasonCode) ValidOCIRestriction() bool {
-	return code.Valid()
+	for _, valid := range ociRestrictionCapabilityReasonCodes {
+		if code == valid {
+			return true
+		}
+	}
+	return false
 }
 
 // CapabilityObservation is one immutable, boot-scoped observation of the

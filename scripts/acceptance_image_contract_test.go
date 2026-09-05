@@ -286,10 +286,19 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if strings.Contains(scheduledText, "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}") || strings.Contains(scheduledText, "ref: ${{ github.event.workflow_run.head_sha }}") {
 		t.Fatal("scheduled realtiming must check out the commit selected by the resolved immutable artifact")
 	}
+	faultSupervisorText := string(mustReadFile(t, "../scripts/oci-realtiming-fault-supervisor-v1.sh"))
+	if !strings.Contains(faultSupervisorText, "readonly WEFTY_OCI_FAULT_HARNESS_VERSION=1") {
+		t.Fatal("shared realtiming fault supervisor is missing its version authority")
+	}
+	const faultSupervisorInstall = "sudo install --owner=root --group=root --mode=0755 scripts/oci-realtiming-fault-supervisor-v1.sh /usr/local/libexec/wefty-oci-fault-supervisor"
 	for name, fixture := range map[string]struct {
 		workflow workflowContract
 		text     string
 	}{"workflow-run": {realtiming, realtimeText}, "scheduled": {scheduled, scheduledText}} {
+		if strings.Count(fixture.text, faultSupervisorInstall) != 1 || strings.Contains(fixture.text, "record_action_failure()") {
+			t.Fatalf("%s must consume the shared versioned fault supervisor exactly once without an inline copy", name)
+		}
+		faultText := fixture.text + "\n" + faultSupervisorText
 		jobTimeout := fixture.workflow.Jobs["service-acceptance-realtiming"].TimeoutMinutes
 		goTimeout := workflowGoTestTimeoutMinutes(t, name, fixture.text)
 		if jobTimeout != 100 || jobTimeout < goTimeout+15 {
@@ -320,11 +329,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 				t.Fatalf("%s realtiming diagnostics are missing %q", name, required)
 			}
 		}
-		assertRegistryFaultAction(t, name, fixture.text, "disable-registry",
+		assertRegistryFaultAction(t, name, faultText, "disable-registry",
 			"iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT")
-		assertRegistryFaultAction(t, name, fixture.text, "enable-registry",
+		assertRegistryFaultAction(t, name, faultText, "enable-registry",
 			"iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT")
-		assertAllPort443RulesOwnerScoped(t, name, fixture.text)
+		assertAllPort443RulesOwnerScoped(t, name, faultText)
 		for _, required := range []string{
 			"sudo iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
 			"sudo iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
@@ -343,15 +352,15 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			`"/tmp/wefty-oci-faults/$action.failed"`,
 			"start-helper-topology",
 		} {
-			if !strings.Contains(fixture.text, required) {
+			if !strings.Contains(faultText, required) {
 				t.Fatalf("%s realtiming provisioning is missing %q", name, required)
 			}
 		}
-		if strings.Contains(fixture.text, "systemctl reset-failed wefty-oci-helper-realtiming.service") {
+		if strings.Contains(faultText, "systemctl reset-failed wefty-oci-helper-realtiming.service") {
 			t.Fatalf("%s helper fault path masks the service start counter", name)
 		}
-		if strings.Contains(fixture.text, "systemctl is-active --quiet wefty-oci-helper-realtiming.service && exit 1 || true") ||
-			strings.Contains(fixture.text, "systemctl is-active --quiet wefty-oci-helper-realtiming.socket && exit 1 || true") {
+		if strings.Contains(faultText, "systemctl is-active --quiet wefty-oci-helper-realtiming.service && exit 1 || true") ||
+			strings.Contains(faultText, "systemctl is-active --quiet wefty-oci-helper-realtiming.socket && exit 1 || true") {
 			t.Fatalf("%s topology fault exits its long-lived supervisor instead of recording .failed", name)
 		}
 	}
@@ -531,6 +540,32 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 	if composed > takeover || linuxunit.HelperSaturatedRestartDelaySum != 7*time.Second {
 		t.Fatalf("saturated helper restart derivation = delays %s + reap %s + margin %s = %s, takeover %s",
 			linuxunit.HelperSaturatedRestartDelaySum, ocihelper.DefaultReapTimeout, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
+	}
+}
+
+func TestOCIHelperWireErrorCodeVocabularyMatchesContract(t *testing.T) {
+	protocol := string(mustReadFile(t, "../runner/ocihelper/protocol.go"))
+	constantPattern := regexp.MustCompile(`(?m)^\s+Code\w+\s+ErrorCode = "([a-z_]+)"$`)
+	var implemented []string
+	for _, match := range constantPattern.FindAllStringSubmatch(protocol, -1) {
+		implemented = append(implemented, match[1])
+	}
+	contract := string(mustReadFile(t, "../docs/contracts/oci-helper-protocol.md"))
+	start := strings.Index(contract, "The closed wire error-code vocabulary is ")
+	if start < 0 {
+		t.Fatal("OCI helper contract is missing its closed wire error-code paragraph")
+	}
+	end := strings.Index(contract[start:], "Adding a code requires")
+	if end < 0 {
+		t.Fatal("OCI helper contract is missing its closed wire error-code paragraph")
+	}
+	codePattern := regexp.MustCompile("`([a-z_]+)`")
+	var documented []string
+	for _, match := range codePattern.FindAllStringSubmatch(contract[start:start+end], -1) {
+		documented = append(documented, match[1])
+	}
+	if !slices.Equal(documented, implemented) {
+		t.Fatalf("documented OCI helper wire codes = %v, want implementation order %v", documented, implemented)
 	}
 }
 

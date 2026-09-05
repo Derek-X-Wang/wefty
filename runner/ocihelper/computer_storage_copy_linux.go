@@ -101,7 +101,7 @@ func sameComputerStorageCopyRequest(left, right CopyComputerStorageRequest) bool
 		left.Authority == right.Authority
 }
 
-func validateStorageCopySource(root string, request CopyComputerStorageRequest) (string, error) {
+func validateStorageCopySource(ctx context.Context, root string, request CopyComputerStorageRequest) (string, error) {
 	manifest, present, err := readComputerBackupManifest(filepath.Join(root, "copy.json"))
 	if err != nil {
 		return "", err
@@ -122,7 +122,7 @@ func validateStorageCopySource(root string, request CopyComputerStorageRequest) 
 	if !info.Mode().IsRegular() || info.Size() != request.SourceSize {
 		return "", errors.New("Computer Storage copy source is truncated or not a regular file")
 	}
-	digest, err := digestFile(path)
+	digest, err := digestFile(ctx, path)
 	if err != nil {
 		return "", err
 	}
@@ -132,13 +132,30 @@ func validateStorageCopySource(root string, request CopyComputerStorageRequest) 
 	return path, nil
 }
 
-func digestFilePrefix(path string, size int64) (string, error) {
+func digestFilePrefix(ctx context.Context, path string, size int64) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	digest := sha256.New()
-	copied, copyErr := io.CopyN(digest, file, size)
+	buffer := make([]byte, 256*1024)
+	var copied int64
+	var copyErr error
+	for copied < size && copyErr == nil {
+		if err := ctx.Err(); err != nil {
+			copyErr = err
+			break
+		}
+		want := min(int64(len(buffer)), size-copied)
+		read, readErr := io.ReadFull(file, buffer[:want])
+		if read > 0 {
+			_, copyErr = digest.Write(buffer[:read])
+			copied += int64(read)
+		}
+		if copyErr == nil {
+			copyErr = readErr
+		}
+	}
 	err = errors.Join(copyErr, file.Close())
 	if err != nil {
 		return "", err
@@ -387,7 +404,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
 		if err == nil {
 			sourceRoot := filepath.Join(engine.config.RuntimeRoot, "computer-backups", copyName)
-			sourcePath, err = validateStorageCopySource(sourceRoot, request)
+			sourcePath, err = validateStorageCopySource(ctx, sourceRoot, request)
 		}
 	}
 	if err != nil {
@@ -424,7 +441,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	publishedPath := filepath.Join(destinationRoot, "disk.ext4")
 	stagingPath := filepath.Join(destinationRoot, "disk.ext4.staging")
 	if present && manifest.Phase == computerStorageCopyPublished && manifest.Receipt != nil {
-		digest, err := digestFile(publishedPath)
+		digest, err := digestFile(ctx, publishedPath)
 		if err != nil {
 			return CopyComputerStorageResponse{}, err
 		}
@@ -491,7 +508,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 			return CopyComputerStorageResponse{}, err
 		}
 	}
-	sourceDigest, err := digestFile(sourcePath)
+	sourceDigest, err := digestFile(ctx, sourcePath)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
@@ -500,7 +517,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	}
 	manifest.SourceDigest = sourceDigest
 	if manifest.Phase == computerStorageCopyCopied {
-		stagingDigest, err := digestFilePrefix(stagingPath, request.SourceSize)
+		stagingDigest, err := digestFilePrefix(ctx, stagingPath, request.SourceSize)
 		if err != nil {
 			return CopyComputerStorageResponse{}, err
 		}
@@ -572,14 +589,14 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	if err := verifyComputerDiskAllocation(workingPath, request.Destination.DiskBytes); err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
-	destinationDigest, err := digestFile(workingPath)
+	destinationDigest, err := digestFile(ctx, workingPath)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
 	if request.Operation == "restore" && request.Destination.DiskBytes == request.SourceSize && destinationDigest != sourceDigest {
 		return CopyComputerStorageResponse{}, errors.New("Computer restore destination digest mismatch")
 	}
-	postMutationSourceDigest, err := digestFile(sourcePath)
+	postMutationSourceDigest, err := digestFile(ctx, sourcePath)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}

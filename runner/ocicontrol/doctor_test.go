@@ -221,6 +221,28 @@ func TestDoctorDetectsInstalledHelperUnitPolicyDrift(t *testing.T) {
 	}
 }
 
+func TestDoctorParsesEffectiveRestartPolicyAcrossSystemdDropIns(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC), "")
+	config.InstalledHelperServiceUnit = func(context.Context) (string, error) {
+		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=5s\n" +
+			"# /etc/systemd/system/wefty-oci-helper.service.d/restart.conf\n[Service]\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if item := findDoctorFinding(t, report, "helper-restart-policy"); item.Outcome != DiagnosticOK || item.Code != "oci_helper_restart_policy_current" {
+		t.Fatalf("effective drop-in policy = %+v", item)
+	}
+}
+
+func TestDoctorValidateRequiresHelperHandshakeStallsFinding(t *testing.T) {
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC), ""))
+	report.Findings = slices.DeleteFunc(report.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "helper-handshake-stalls"
+	})
+	if err := report.Validate(); err == nil || !strings.Contains(err.Error(), "helper-handshake-stalls") {
+		t.Fatalf("missing helper-handshake-stalls validation = %v", err)
+	}
+}
+
 func TestDoctorReportsNonzeroNativeHelperHandshakeStallCount(t *testing.T) {
 	config := healthyDoctorConfig(time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC), "")
 	config.HelperHandshakeStalledWindows = func() uint64 { return 3 }
@@ -238,12 +260,12 @@ func TestDoctorReportsQuarantinePayloadDropTimestamp(t *testing.T) {
 	mutateHelper(&config, func(snapshot *HelperDoctorSnapshot) {
 		droppedAt := now.Add(-time.Hour)
 		snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined = []ocihelper.ComputerStorageRecoveryInventoryEntry{{
-			DiskName: "wefty-computer-disk-example", Operation: "quarantine", Reason: "allocation_mismatch", PayloadDroppedAt: droppedAt.Format(time.RFC3339Nano),
+			DiskName: "wefty-computer-disk-example", Operation: "quarantine", Reason: "allocation_mismatch", PayloadDroppedAt: droppedAt,
 		}}
 		snapshot.SweepReceipt.ComputerStorageQuarantinedCount = 1
 	})
 	report := BuildDoctor(t.Context(), config)
-	if len(report.ComputerStorageRecovery.Quarantined) != 1 || report.ComputerStorageRecovery.Quarantined[0].PayloadDroppedAt != now.Add(-time.Hour).Format(time.RFC3339Nano) {
+	if len(report.ComputerStorageRecovery.Quarantined) != 1 || !report.ComputerStorageRecovery.Quarantined[0].PayloadDroppedAt.Equal(now.Add(-time.Hour)) {
 		t.Fatalf("payload drop doctor facts=%+v", report.ComputerStorageRecovery)
 	}
 }

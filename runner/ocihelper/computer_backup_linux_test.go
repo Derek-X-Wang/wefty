@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -11,6 +12,18 @@ import (
 	"syscall"
 	"testing"
 )
+
+func TestDigestFileHonorsRPCCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disk.ext4")
+	if err := os.WriteFile(path, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := digestFile(ctx, path); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled digest = %v", err)
+	}
+}
 
 func prepareDetachedBackupSource(t *testing.T) (string, *fakeComputerDiskSystem, ComputerStorageReference, AttemptAuthority) {
 	t.Helper()
@@ -103,7 +116,7 @@ func TestComputerBackupResumesEveryTrackedCrashBoundary(t *testing.T) {
 			request := backupTestRequest(storage, sourceAuthority)
 			diskName, _ := deterministicComputerDiskName(storage)
 			sourcePath := filepath.Join(root, "computer-disks", diskName, "disk.ext4")
-			sourceBefore, err := digestFile(sourcePath)
+			sourceBefore, err := digestFile(t.Context(), sourcePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -125,7 +138,7 @@ func TestComputerBackupResumesEveryTrackedCrashBoundary(t *testing.T) {
 			if _, err := os.Lstat(filepath.Join(copyRoot, "copy.json")); err != nil {
 				t.Fatalf("checkpoint %q left untracked copy state: %v", checkpoint, err)
 			}
-			sourceAfterCrash, err := digestFile(sourcePath)
+			sourceAfterCrash, err := digestFile(t.Context(), sourcePath)
 			if err != nil || sourceAfterCrash != sourceBefore {
 				t.Fatalf("checkpoint %q mutated source: before=%s after=%s err=%v", checkpoint, sourceBefore, sourceAfterCrash, err)
 			}
@@ -164,7 +177,7 @@ func TestComputerBackupResumesEveryTrackedCrashBoundary(t *testing.T) {
 					t.Fatalf("Backup permission %s = %o, want %o", path, info.Mode().Perm(), want)
 				}
 			}
-			sourceAfterResume, err := digestFile(sourcePath)
+			sourceAfterResume, err := digestFile(t.Context(), sourcePath)
 			if err != nil || sourceAfterResume != sourceBefore {
 				t.Fatalf("resumed checkpoint %q mutated source: before=%s after=%s err=%v", checkpoint, sourceBefore, sourceAfterResume, err)
 			}
@@ -211,7 +224,7 @@ func TestComputerBackupENOSPCAndDigestMismatchLeaveNoBackupOrSourceMutation(t *t
 			request := backupTestRequest(storage, sourceAuthority)
 			diskName, _ := deterministicComputerDiskName(storage)
 			sourcePath := filepath.Join(root, "computer-disks", diskName, "disk.ext4")
-			before, err := digestFile(sourcePath)
+			before, err := digestFile(t.Context(), sourcePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -226,7 +239,7 @@ func TestComputerBackupENOSPCAndDigestMismatchLeaveNoBackupOrSourceMutation(t *t
 			if _, err := os.Lstat(filepath.Join(root, "computer-backups", copyName)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("failed Backup copy remains: %v", err)
 			}
-			after, err := digestFile(sourcePath)
+			after, err := digestFile(t.Context(), sourcePath)
 			if err != nil || after != before {
 				t.Fatalf("failed Backup mutated source: before=%s after=%s err=%v", before, after, err)
 			}

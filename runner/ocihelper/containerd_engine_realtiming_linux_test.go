@@ -527,27 +527,22 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 
 	activeDigest := lruRegistry.addVariant(t, "active-attempt")
 	activeRequest := nativeAdapterRequest(lruRegistry.reference(), activeDigest, "active-cache-pressure", []string{"/bin/sh", "-c", "printf active-cache-pressure; sleep 2"})
-	activeRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-	activeLog := make(chan struct{}, 1)
+	activeStarted := make(chan struct{}, 1)
+	activeRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		activeStarted <- struct{}{}
+		return nil
+	}
 	activeDone := make(chan error, 1)
 	go func() {
-		_, runErr := adapter.Run(ctx, activeRequest, workloadrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
-			if strings.Contains(string(event.Bytes), "active-cache-pressure") {
-				select {
-				case activeLog <- struct{}{}:
-				default:
-				}
-			}
-			return nil
-		}))
+		_, runErr := adapter.Run(ctx, activeRequest, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
 		activeDone <- runErr
 	}()
 	select {
-	case <-activeLog:
+	case <-activeStarted:
 	case err := <-activeDone:
 		t.Fatalf("active cache-pressure attempt ended early: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("active cache-pressure attempt did not start")
+	case <-ctx.Done():
+		t.Fatalf("active cache-pressure attempt did not report OCIStarted: %v", ctx.Err())
 	}
 	if _, err := session.ReconcileImagePins(ctx, ocihelper.ReconcileImagePinsRequest{CacheMaxBytes: 1}); err != nil {
 		t.Fatal(err)
