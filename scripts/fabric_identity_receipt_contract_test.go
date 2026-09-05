@@ -60,6 +60,10 @@ func TestFabricIdentityWorkflowContract(t *testing.T) {
 		if !assembleGuarded {
 			t.Fatalf("%s receipt assembler must be guarded by artifact availability", name)
 		}
+		personArmedGuard := "PERSON_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}"
+		if strings.Count(fixture.text, personArmedGuard) != 2 {
+			t.Fatalf("%s workflow must derive both PERSON_ARMED inputs from the complete person job guard", name)
+		}
 		for _, required := range []string{"assemble-fabric-identity-receipt.sh", "check-fabric-identity-receipt.sh", "MACHINE_RESULT", "PERSON_RESULT", "MACHINE_ARMED", "PERSON_ARMED", "fabric-identity-receipt.json"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s result gate is missing %q", name, required)
@@ -93,23 +97,28 @@ func TestFabricIdentityReceiptSkipIsNeverSuccess(t *testing.T) {
 	emptyReceipt := filepath.Join(directory, "absent.json")
 	machineReceipt := machineFabricReceipt(t, directory, candidate)
 	for _, test := range []struct {
-		name                        string
-		machineResult, personResult string
-		machineArmed, personArmed   string
-		wantSuccess                 bool
+		name                          string
+		machineResult, personResult   string
+		smokeRequired, testerRequired string
+		wantSuccess                   bool
 	}{
-		{name: "reality both credentials unarmed", machineResult: "skipped", personResult: "skipped", machineArmed: "false", personArmed: "false", wantSuccess: true},
-		{name: "armed machine skipped", machineResult: "skipped", personResult: "skipped", machineArmed: "true", personArmed: "false", wantSuccess: false},
-		{name: "machine ran person unarmed", machineResult: "success", personResult: "skipped", machineArmed: "true", personArmed: "false", wantSuccess: true},
-		{name: "machine failed", machineResult: "failure", personResult: "skipped", machineArmed: "true", personArmed: "false", wantSuccess: false},
+		{name: "reality both credentials unarmed", machineResult: "skipped", personResult: "skipped", smokeRequired: "false", testerRequired: "false", wantSuccess: true},
+		{name: "CI tester armed before smoke", machineResult: "skipped", personResult: "skipped", smokeRequired: "false", testerRequired: "true", wantSuccess: true},
+		{name: "armed machine skipped", machineResult: "skipped", personResult: "skipped", smokeRequired: "true", testerRequired: "false", wantSuccess: false},
+		{name: "machine ran person unarmed", machineResult: "success", personResult: "skipped", smokeRequired: "true", testerRequired: "false", wantSuccess: true},
+		{name: "machine failed", machineResult: "failure", personResult: "skipped", smokeRequired: "true", testerRequired: "false", wantSuccess: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			personArmed := "false"
+			if test.smokeRequired == "true" && test.testerRequired == "true" {
+				personArmed = "true"
+			}
 			assembled := filepath.Join(directory, strings.ReplaceAll(test.name, " ", "-")+".json")
-			assembleFabricIdentityReceipt(t, assembled, candidate, "trusted", test.machineResult, test.personResult, test.machineArmed, test.personArmed, machineReceipt, emptyReceipt)
-			if test.machineResult == "failure" || (test.machineResult == "skipped" && test.machineArmed == "true") {
+			assembleFabricIdentityReceipt(t, assembled, candidate, "trusted", test.machineResult, test.personResult, test.smokeRequired, personArmed, machineReceipt, emptyReceipt)
+			if test.machineResult == "failure" || (test.machineResult == "skipped" && test.smokeRequired == "true") {
 				assertFabricDeviationRetained(t, assembled, "fabric.machine_dns_acl", "fabric.machine_second_peer_reachability")
 			}
-			checkFabricIdentityReceipt(t, assembled, candidate, "trusted", test.machineResult, test.personResult, test.machineArmed, test.personArmed, test.wantSuccess)
+			checkFabricIdentityReceipt(t, assembled, candidate, "trusted", test.machineResult, test.personResult, test.smokeRequired, personArmed, test.wantSuccess)
 		})
 	}
 
@@ -185,6 +194,22 @@ func TestFabricIdentityReceiptRejectsProviderSpecificOrInvalidConnectHosts(t *te
 	directory := t.TempDir()
 	valid := filepath.Join(directory, "valid.json")
 	assembleFabricIdentityReceipt(t, valid, candidate, "trusted", "success", "success", "true", "true", machineFabricReceipt(t, directory, candidate), personFabricReceipt(t, directory, candidate))
+
+	t.Run("provider-shaped key outside row evidence", func(t *testing.T) {
+		mutated := filepath.Join(directory, "provider-shaped-key.json")
+		mutateFabricReceipt(t, valid, mutated, func(root map[string]any) {
+			root["tailscale_metadata"] = true
+		})
+		checkFabricIdentityReceipt(t, mutated, candidate, "trusted", "success", "success", "true", "true", false)
+	})
+
+	t.Run("provider-shaped value outside ConnectHost evidence", func(t *testing.T) {
+		mutated := filepath.Join(directory, "provider-shaped-value.json")
+		mutateFabricReceipt(t, valid, mutated, func(root map[string]any) {
+			root["provider_metadata"] = "node.example.ts.net"
+		})
+		checkFabricIdentityReceipt(t, mutated, candidate, "trusted", "success", "success", "true", "true", false)
+	})
 
 	for _, value := range []string{"node.example.ts.net", "svc:node", "MagicDNS", "Tailscale", "not a hostname"} {
 		t.Run(value, func(t *testing.T) {

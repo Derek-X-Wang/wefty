@@ -779,7 +779,7 @@ jobs:
           MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}
           PERSON_RESULT: ${{ needs.fabric-person-identity.result }}
           MACHINE_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' }}
-          PERSON_ARMED: ${{ vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+          PERSON_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
         run: |
           scripts/assemble-fabric-identity-receipt.sh \
             "$RUNNER_TEMP/fabric-identity-receipt.json" \
@@ -796,7 +796,7 @@ jobs:
           MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}
           PERSON_RESULT: ${{ needs.fabric-person-identity.result }}
           MACHINE_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' }}
-          PERSON_ARMED: ${{ vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+          PERSON_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
         run: |
           set -eu
           printf '%s\n' \
