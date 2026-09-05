@@ -122,9 +122,7 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 		_ = conn.Close()
 		return nil, err
 	}
-	key := conn.LocalAddr().String()
-	f.network.registerPeer(key, f.identity)
-	return &connWithIdentity{Conn: conn, network: f.network, key: key}, nil
+	return conn, nil
 }
 
 // WhoIs returns the identity injected into the peer's plain Fabric.
@@ -171,12 +169,16 @@ func (n *Network) resolveName(name string) (string, error) {
 	return address, nil
 }
 
-func (n *Network) registerPeer(address string, identity fabric.Identity) {
+func (n *Network) registerPeer(address string, identity fabric.Identity) error {
 	identity.Tags = append([]string(nil), identity.Tags...)
 	identity.FabricID = n.fabricID
 	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, exists := n.peers[address]; exists {
+		return fmt.Errorf("plain fabric: identity for %q is already registered", address)
+	}
 	n.peers[address] = identity
-	n.mu.Unlock()
+	return nil
 }
 
 func (n *Network) unregisterPeer(address string) {
@@ -216,6 +218,13 @@ type listener struct {
 	once    sync.Once
 }
 
+type peerAddress struct {
+	net.Addr
+	token string
+}
+
+func (a peerAddress) String() string { return a.Addr.String() + "#" + a.token }
+
 func (l *listener) Accept() (net.Conn, error) {
 	for {
 		conn, err := l.Listener.Accept()
@@ -227,9 +236,18 @@ func (l *listener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			continue
 		}
-		key := conn.RemoteAddr().String()
-		l.network.registerPeer(key, identity)
-		return &connWithIdentity{Conn: conn, network: l.network, key: key}, nil
+		token, err := newPeerToken()
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		address := peerAddress{Addr: conn.RemoteAddr(), token: token}
+		key := address.String()
+		if err := l.network.registerPeer(key, identity); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		return &connWithIdentity{Conn: conn, network: l.network, key: key, remoteAddress: address}, nil
 	}
 }
 
@@ -244,10 +262,13 @@ func (l *listener) Close() error {
 
 type connWithIdentity struct {
 	net.Conn
-	network *Network
-	key     string
-	once    sync.Once
+	network       *Network
+	key           string
+	remoteAddress net.Addr
+	once          sync.Once
 }
+
+func (c *connWithIdentity) RemoteAddr() net.Addr { return c.remoteAddress }
 
 func (c *connWithIdentity) Close() error {
 	c.once.Do(func() { c.network.unregisterPeer(c.key) })
@@ -259,6 +280,14 @@ func (c *connWithIdentity) CloseWrite() error {
 		return connection.CloseWrite()
 	}
 	return fmt.Errorf("plain fabric: connection %T does not support CloseWrite", c.Conn)
+}
+
+func newPeerToken() (string, error) {
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return "", fmt.Errorf("plain fabric: generate peer token: %w", err)
+	}
+	return hex.EncodeToString(token), nil
 }
 
 func writeIdentity(writer io.Writer, identity fabric.Identity) error {
