@@ -69,16 +69,12 @@ func (server *Server) Serve(ctx context.Context) error {
 	if err := prepareSocketPath(server.path); err != nil {
 		return err
 	}
-	listener, err := net.Listen("unix", server.path)
+	listener, err := listenControlSocket(server.path)
 	if err != nil {
-		return fmt.Errorf("listen on OCI control socket: %w", err)
+		return err
 	}
 	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs}
 	server.listener = authenticated
-	if err := os.Chmod(server.path, 0o600); err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("restrict OCI control socket: %w", err)
-	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/doctor", server.handleDoctor)
 	mux.HandleFunc("GET /v1/intent", server.handleIntent)
@@ -115,6 +111,28 @@ func (server *Server) Serve(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+func listenControlSocket(path string) (net.Listener, error) {
+	stagingDirectory, err := os.MkdirTemp(filepath.Dir(path), ".wefty-control-socket-*")
+	if err != nil {
+		return nil, fmt.Errorf("create private OCI control socket staging directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stagingDirectory) }()
+	stagedPath := filepath.Join(stagingDirectory, "socket")
+	listener, err := net.Listen("unix", stagedPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on OCI control socket: %w", err)
+	}
+	if err := os.Chmod(stagedPath, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("restrict OCI control socket: %w", err)
+	}
+	if err := os.Rename(stagedPath, path); err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("publish OCI control socket: %w", err)
+	}
+	return listener, nil
 }
 
 func (server *Server) handleDoctor(writer http.ResponseWriter, request *http.Request) {
