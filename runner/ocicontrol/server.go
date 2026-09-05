@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -16,14 +17,24 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
-const maximumControlJSONBytes = 1 << 20
+const (
+	maximumControlJSONBytes   = 1 << 20
+	controlReadHeaderTimeout  = 5 * time.Second
+	controlRequestReadTimeout = 10 * time.Minute
+	// Offline image import is the longest control response and owns the same
+	// ten-minute operation budget. Keep that full window plus the existing
+	// header allowance so a completed response has time to flush.
+	controlShutdownDrainTimeout = controlRequestReadTimeout + controlReadHeaderTimeout
+)
 
 type Server struct {
-	path        string
-	service     Service
-	listener    net.Listener
-	server      *http.Server
-	allowedUIDs map[uint32]struct{}
+	path                 string
+	service              Service
+	listener             net.Listener
+	server               *http.Server
+	allowedUIDs          map[uint32]struct{}
+	shutdownDrainTimeout time.Duration
+	logf                 func(string, ...any)
 }
 
 func NewServer(path string, service Service, allowedUIDs ...uint32) (*Server, error) {
@@ -40,7 +51,10 @@ func NewServer(path string, service Service, allowedUIDs ...uint32) (*Server, er
 	for _, uid := range allowedUIDs {
 		allowlist[uid] = struct{}{}
 	}
-	return &Server{path: filepath.Clean(path), service: service, allowedUIDs: allowlist}, nil
+	return &Server{
+		path: filepath.Clean(path), service: service, allowedUIDs: allowlist,
+		shutdownDrainTimeout: controlShutdownDrainTimeout, logf: log.Printf,
+	}, nil
 }
 
 func (server *Server) Serve(ctx context.Context) error {
@@ -72,11 +86,24 @@ func (server *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/oci/start", server.handleStart)
 	mux.HandleFunc("POST /v1/oci/stop", server.handleStop)
 	mux.HandleFunc("POST /v1/images/load", server.handleLoadImage)
-	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Minute}
+	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: controlReadHeaderTimeout, ReadTimeout: controlRequestReadTimeout}
 	shutdownComplete := make(chan struct{})
 	shutdown := context.AfterFunc(ctx, func() {
 		defer close(shutdownComplete)
-		_ = server.server.Shutdown(context.WithoutCancel(ctx))
+		drainContext, stopDrain := context.WithTimeout(context.WithoutCancel(ctx), server.shutdownDrainTimeout)
+		defer stopDrain()
+		if drainErr := server.server.Shutdown(drainContext); drainErr != nil {
+			reason := "graceful_drain_failed"
+			if errors.Is(drainErr, context.DeadlineExceeded) {
+				reason = "graceful_drain_timeout"
+			}
+			closeErr := server.server.Close()
+			closeError := ""
+			if closeErr != nil {
+				closeError = closeErr.Error()
+			}
+			server.logf("ocicontrol: shutdown_fallback outcome=forced_close reason=%s budget=%s drain_error=%q close_error=%q", reason, server.shutdownDrainTimeout, drainErr.Error(), closeError)
+		}
 	})
 	defer shutdown()
 	err = server.server.Serve(authenticated)
