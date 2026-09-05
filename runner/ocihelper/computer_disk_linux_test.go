@@ -1627,7 +1627,7 @@ func TestComputerDiskQuarantineExpiryDropsPayloadButKeepsGenerationTombstone(t *
 	}
 	inventory := ResourceInventory{}
 	if err := engine.inventoryComputerDiskResources(&inventory); err != nil || len(inventory.ComputerStorageQuarantined) != 1 ||
-		inventory.ComputerStorageQuarantined[0].PayloadDroppedAt != updated.PayloadDroppedAt.UTC().Format(time.RFC3339Nano) {
+		!inventory.ComputerStorageQuarantined[0].PayloadDroppedAt.Equal(updated.PayloadDroppedAt.UTC()) {
 		t.Fatalf("payload drop inventory=%+v err=%v", inventory.ComputerStorageQuarantined, err)
 	}
 }
@@ -1685,17 +1685,67 @@ func TestComputerDiskQuarantineGCFailureIsEvidenceNotSweepFailure(t *testing.T) 
 	if err := os.WriteFile(receiptPath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	engine.computerQuarantineRemoveAll = func(string) error { return errors.New("injected remove failure") }
-	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
-		t.Fatalf("GC failed whole sweep: %v", err)
+	removeAttempts := 0
+	engine.computerQuarantineRemoveAll = func(string) error {
+		removeAttempts++
+		return errors.New("injected remove failure")
+	}
+	for attempt := 1; attempt <= defaultComputerDiskQuarantineGCFailures+1; attempt++ {
+		if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+			t.Fatalf("GC attempt %d failed whole sweep: %v", attempt, err)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(quarantineRoot, "disk.ext4")); err != nil {
 		t.Fatalf("failed GC removed payload: %v", err)
 	}
-	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-		return item.Action == SweepActionQuarantineGCFailed && item.Method == "remove_payload"
+	updated, err := readAndValidateComputerDiskQuarantineReceipt(receiptPath)
+	if err != nil || updated.GCFailures != defaultComputerDiskQuarantineGCFailures || updated.GCFirstFailedAt == nil || updated.GCEscalatedAt == nil {
+		t.Fatalf("bounded GC receipt = %+v err=%v", updated, err)
+	}
+	if removeAttempts != defaultComputerDiskQuarantineGCFailures || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionQuarantineGCEscalated && item.Method == "remove_payload"
+	}) || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated"
 	}) {
 		t.Fatalf("GC failure evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestLegacyResetQuarantineGCNormalizesAndDropsExpiredPayload(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	legacyRoot := filepath.Join(root, "computer-disk-quarantine", name+"-reset-2")
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "disk.ext4"), []byte("legacy tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(legacyRoot, createdAt, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(createdAt.Add(defaultComputerDiskQuarantineRetention))}}
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "computer-disk-quarantine"))
+	if err != nil || len(entries) != 1 || strings.Contains(entries[0].Name(), "-reset-") {
+		t.Fatalf("legacy quarantine was not normalized: entries=%v err=%v", entries, err)
+	}
+	normalizedRoot := filepath.Join(root, "computer-disk-quarantine", entries[0].Name())
+	receipt, err := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(normalizedRoot, "quarantine.json"))
+	if err != nil || receipt.Reason != "legacy_reset_quarantine" || receipt.PayloadDroppedAt == nil {
+		t.Fatalf("legacy GC receipt = %+v err=%v", receipt, err)
+	}
+	if _, err := os.Lstat(filepath.Join(normalizedRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired legacy payload remained: %v", err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantinePayloadDropped && item.Method == "legacy_reset_quarantine"
+	}) {
+		t.Fatalf("legacy GC evidence = %+v", engine.computerDiskSweepEvidence)
 	}
 }
 

@@ -22,13 +22,14 @@ func (copier storageCopyTestCopier) CopyComputerStorage(context.Context, workloa
 
 func TestStorageCopyControllerMapsPreparationOutcomeToL1(t *testing.T) {
 	recordedAt := time.Date(2026, 9, 4, 12, 34, 56, 789, time.UTC)
+	droppedAt := recordedAt.Add(time.Hour)
 	outcome := workloadrunner.ComputerStoragePreparationOutcome{
 		Code: workloadrunner.ComputerStoragePreparationResumeDeferred,
 		Storage: workloadrunner.ComputerStorage{ComputerID: "computer-import", StorageID: "storage-import",
 			StorageGeneration: 3, IntentRevision: 7, DiskBytes: 8 << 30},
 		HelperGeneration: 11, SweepEpoch: "sweep-import", DiskName: "disk-import",
 		Operation: "computer_storage_copy", Reason: "operational_failure", DeferredReason: "context_expired",
-		Attempts: 4, FirstDeferredAt: &recordedAt, PayloadDroppedAt: recordedAt.Add(time.Hour).Format(time.RFC3339Nano),
+		Attempts: 4, FirstDeferredAt: &recordedAt, PayloadDroppedAt: &droppedAt,
 		RecordedAt: recordedAt,
 	}
 	received := make(chan l1.ComputerStorageCopyAcknowledgementRequest, 1)
@@ -68,7 +69,7 @@ func TestStorageCopyControllerMapsPreparationOutcomeToL1(t *testing.T) {
 		got.DiskName != outcome.DiskName || got.Operation != outcome.Operation || got.Reason != outcome.Reason ||
 		got.DeferredReason != outcome.DeferredReason || got.Attempts != outcome.Attempts ||
 		got.FirstDeferredAt == nil || !got.FirstDeferredAt.Equal(*outcome.FirstDeferredAt) ||
-		got.PayloadDroppedAt != outcome.PayloadDroppedAt || got.RecordedAt == nil || !got.RecordedAt.Equal(outcome.RecordedAt) {
+		got.PayloadDroppedAt == nil || !got.PayloadDroppedAt.Equal(*outcome.PayloadDroppedAt) || got.RecordedAt == nil || !got.RecordedAt.Equal(outcome.RecordedAt) {
 		t.Fatalf("mapped preparation outcome = %#v, want %#v", got, outcome)
 	}
 }

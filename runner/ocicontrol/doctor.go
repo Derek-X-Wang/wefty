@@ -2,7 +2,6 @@ package ocicontrol
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -16,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
 const (
@@ -815,17 +815,7 @@ func buildConvergence(ctx context.Context, config DoctorConfig, report *DoctorRe
 }
 
 func expectedHelperRestartUnitPolicy(systemdVersion int) map[string]string {
-	policy := map[string]string{
-		"Unit.StartLimitIntervalSec": "0",
-		"Service.Restart":            "on-failure",
-		"Service.RestartSec":         "1s",
-	}
-	if systemdVersion >= 254 {
-		policy["Service.RestartSec"] = "250ms"
-		policy["Service.RestartSteps"] = "6"
-		policy["Service.RestartMaxDelaySec"] = "1s"
-	}
-	return policy
+	return systemdpolicy.UnitPolicy(systemdVersion)
 }
 
 func helperRestartPolicyFromUnit(unit string) (map[string]string, error) {
@@ -852,9 +842,8 @@ func helperRestartPolicyFromUnit(unit string) (map[string]string, error) {
 		if _, tracked := wanted[qualified]; !tracked {
 			continue
 		}
-		if _, duplicate := result[qualified]; duplicate {
-			return nil, errors.New("installed helper service unit repeats a restart-policy key")
-		}
+		// systemctl cat concatenates the base unit and its drop-ins. For scalar
+		// restart-policy keys, systemd's effective value is the last assignment.
 		result[qualified] = strings.TrimSpace(value)
 	}
 	return result, nil
@@ -1033,7 +1022,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "mount-roots", "convergence", "helper-restart-policy"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "mount-roots", "convergence", "helper-restart-policy"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}

@@ -392,7 +392,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		return ExportComputerCustodyResponse{}, errors.New("Custody export source belongs to different Node or managed-root authority")
 	}
 	source := filepath.Join(sourceRoot, backup.PublishedFile)
-	if digest, err := digestFile(source); err != nil || digest != request.SourceDigest {
+	if digest, err := digestFile(ctx, source); err != nil || digest != request.SourceDigest {
 		return ExportComputerCustodyResponse{}, errors.New("Custody export source digest changed")
 	}
 	if engine.computerCustodyHook != nil {
