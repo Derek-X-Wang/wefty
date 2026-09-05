@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -51,6 +54,8 @@ func TestControlResponsePreservesSanitizedHelperMechanics(t *testing.T) {
 	}
 }
 
+// TestOperatorControlSocketUsesARealProcess self-reexecutes the test binary.
+// Run it with -count=1; it is not a valid repeated-sample test harness.
 func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	if os.Getenv(controlChildEnvironment) == "1" {
 		runControlChild(t)
@@ -159,6 +164,95 @@ func TestControlSocketRejectsUIDOutsideOperatorAllowlist(t *testing.T) {
 	}
 }
 
+func TestControlSocketForcesCloseAfterGracefulDrainBudget(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "wefty-control-drain-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	socket := filepath.Join(root, "control.sock")
+	archive := filepath.Join(root, "image.tar")
+	if err := os.WriteFile(archive, []byte("archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handlerEntered := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	defer close(releaseHandler)
+	server, err := NewServer(socket, ServiceFuncs{LoadImageFunc: func(context.Context, io.Reader) (LoadImageResponse, error) {
+		close(handlerEntered)
+		<-releaseHandler
+		return LoadImageResponse{}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const drainBudget = 50 * time.Millisecond
+	server.shutdownDrainTimeout = drainBudget
+	var logs bytes.Buffer
+	server.logf = func(format string, args ...any) { _, _ = fmt.Fprintf(&logs, format, args...) }
+	ctx, cancel := context.WithCancel(t.Context())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ctx) }()
+	waitForControlSocket(t, socket)
+	client, err := NewClient(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	loadDone := make(chan error, 1)
+	go func() {
+		_, err := client.LoadImage(context.Background(), archive)
+		loadDone <- err
+	}()
+	select {
+	case <-handlerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("load-image handler did not start")
+	}
+
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve after forced close: %v", err)
+		}
+	case <-time.After(drainBudget + 500*time.Millisecond):
+		t.Fatal("Serve remained blocked after the graceful drain budget")
+	}
+	if elapsed := time.Since(started); elapsed < drainBudget || elapsed >= drainBudget+500*time.Millisecond {
+		t.Fatalf("forced close elapsed %s, want drain budget %s honored and prompt exit", elapsed, drainBudget)
+	}
+	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+		t.Fatalf("control socket after forced close: %v", err)
+	}
+	if logLine := logs.String(); !strings.Contains(logLine, "outcome=forced_close") || !strings.Contains(logLine, "reason=graceful_drain_timeout") {
+		t.Fatalf("forced-close log = %q", logLine)
+	}
+	select {
+	case err := <-loadDone:
+		if err == nil {
+			t.Fatal("load-image request unexpectedly survived forced close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("load-image client remained blocked after forced close")
+	}
+}
+
+func waitForControlSocket(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("control socket was not published")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func runControlChild(t *testing.T) {
 	socket := os.Getenv("WEFTY_CONTROL_TEST_SOCKET")
 	intentPath := os.Getenv("WEFTY_CONTROL_TEST_INTENT")
@@ -174,7 +268,9 @@ func runControlChild(t *testing.T) {
 		StopFunc: func(_ context.Context, request IntentMutationRequest) (IntentResponse, error) {
 			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
 			if err == nil {
-				go stop()
+				stop()
+				// Force the response to overlap shutdown without retrying the request.
+				time.Sleep(100 * time.Millisecond)
 			}
 			return IntentResponse{Intent: intent, RuntimeQuiesced: err == nil}, err
 		},
