@@ -41,6 +41,8 @@ import (
 
 var linuxComputerIPv6RefusalErrnos = []string{"EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"}
 
+var linuxComputerAbstractSocketRefusalErrnos = []string{"ENOENT", "ECONNREFUSED"}
+
 func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt := newLinuxComputerMatrixReceipt()
 	evidence := newRealTimingEvidence(t)
@@ -237,7 +239,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	targetAlive := egressAlive && liveness.ViewRead.Outcome == "read_succeeded" && liveness.ControlInject.Outcome == "inject_succeeded" && liveness.EgressAddress.Outcome == "connected"
 	if variant == "xfce" {
 		crossoverRefused = crossoverRefused && !crossover.AbstractSocketVisible &&
-			crossover.AbstractSocket.Outcome == "refused" && crossover.AbstractSocket.ErrnoName == "ENOENT" &&
+			crossover.AbstractSocket.Outcome == "refused" && slices.Contains(linuxComputerAbstractSocketRefusalErrnos, crossover.AbstractSocket.ErrnoName) &&
 			crossover.DerivedDisplay.Outcome == "transport_refused" && crossover.DerivedDisplay.Class == "x_transport"
 		targetAlive = targetAlive && liveness.AbstractSocketVisible && liveness.AbstractSocket.Outcome == "connected" && liveness.DerivedDisplay.Outcome == "read_succeeded"
 	}

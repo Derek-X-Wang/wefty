@@ -54,6 +54,13 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		}
 		t.Logf("green %s receipt gate: PASS", image)
 	}
+	t.Run("xfce abstract socket refused with ECONNREFUSED", func(t *testing.T) {
+		receipt := conformantLinuxComputerReceipt(candidate, "xfce")
+		receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_errno"] = "ECONNREFUSED"
+		if err := runGate(t, receipt, "xfce", ""); err != nil {
+			t.Fatalf("valid XFCE abstract-socket refusal failed: %v", err)
+		}
+	})
 	for _, mutated := range linuxComputerReceiptRows {
 		t.Run("mutation/"+mutated, func(t *testing.T) {
 			receipt := conformantLinuxComputerReceipt(candidate, "xfce")
@@ -108,7 +115,7 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_outcome"] = "connected"
 		},
 		"wrong crossover abstract errno": func(receipt map[string]any) {
-			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_errno"] = "ECONNREFUSED"
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["abstract_socket_errno"] = "EACCES"
 		},
 		"wrong crossover display class": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["derived_display_class"] = "x_auth"

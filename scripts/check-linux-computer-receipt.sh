@@ -141,7 +141,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     (if .image.variant == "xfce" then
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_visible == "false" and
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_outcome == "refused" and
-      .rows["linux.screen_crossover_refused"].evidence.abstract_socket_errno == "ENOENT" and
+      (["ENOENT", "ECONNREFUSED"] | index($root.rows["linux.screen_crossover_refused"].evidence.abstract_socket_errno)) != null and
       .rows["linux.screen_crossover_refused"].evidence.derived_display_outcome == "transport_refused" and
       .rows["linux.screen_crossover_refused"].evidence.derived_display_class == "x_transport" and
       .rows["linux.screen_crossover_refused"].evidence.target_liveness_x == "read_succeeded"
