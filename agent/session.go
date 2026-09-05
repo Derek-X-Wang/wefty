@@ -1174,6 +1174,7 @@ func (session *agentSession) claim(
 	if !session.capabilities.allowsClaim() {
 		return nil, false, nil
 	}
+	capabilityRevision := session.capabilities.snapshot().Revision
 	if !gate.canAcquire() && !serviceReservation {
 		return nil, false, nil
 	}
@@ -1181,8 +1182,8 @@ func (session *agentSession) claim(
 	for jobID := range session.residentJobID {
 		excluded = append(excluded, jobID)
 	}
-	claim, err := session.client.Claim(
-		ctx, session.registration.NodeID, session.registration.BootSessionID, selector, excluded...,
+	claim, err := session.client.ClaimAtCapabilityRevision(
+		ctx, session.registration.NodeID, session.registration.BootSessionID, selector, capabilityRevision, excluded...,
 	)
 	if err != nil || claim == nil {
 		return claim, true, err
