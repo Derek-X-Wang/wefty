@@ -333,30 +333,21 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err := engine.sweepComputerDisks(t.Context(), "corrupted-preparation-sweep"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(successorRoot); err != nil {
-		t.Fatalf("corrupted preparation-shaped anomaly was deleted: %v", err)
-	}
-	manifest.DiskImage = "disk.ext4"
-	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.sweepComputerDisks(t.Context(), "replacement-sweep"); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := os.Lstat(successorRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unverified reset successor survived helper sweep: %v", err)
+		t.Fatalf("corrupted preparation-shaped anomaly remained admissible: %v", err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "identity_mismatch"
+	}) {
+		t.Fatalf("corrupted reset preparation evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+	if quarantined, err := computerDiskQuarantined(root, successor); err != nil || !quarantined {
+		t.Fatalf("corrupted reset successor quarantine=%t err=%v", quarantined, err)
 	}
 	request.Authority.BootSessionID = "boot-b"
 	request.Authority.HelperGeneration = 2
-	response, err := engine.ResetComputerStorage(t.Context(), request)
-	if err != nil || !response.Verified || response.Receipt.HelperGeneration != 2 {
-		t.Fatalf("reset did not recreate swept successor: %+v err=%v", response, err)
-	}
-	if err := engine.sweepComputerDisks(t.Context(), "post-verification-sweep"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(successorRoot); err != nil {
-		t.Fatalf("verified reset successor was removed by helper sweep: %v", err)
+	if _, err := engine.ResetComputerStorage(t.Context(), request); err == nil {
+		t.Fatal("corrupted quarantined successor was recreated under the same generation authority")
 	}
 }
 
