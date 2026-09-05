@@ -320,8 +320,23 @@ func copyManagedNetworkFile(source, target string) error {
 	if err != nil {
 		return fmt.Errorf("read helper network source %s: %w", source, err)
 	}
-	if err := os.WriteFile(target, payload, 0o600); err != nil {
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return fmt.Errorf("write helper-managed network source %s: %w", target, err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write helper-managed network source %s: %w", target, err)
+	}
+	// The helper runs as root, but the mounted resolver and hosts snapshots
+	// must remain readable by the unprivileged Computer user. Chmod also
+	// repairs snapshots created with the old 0600 mode during refresh.
+	if err := file.Chmod(0o644); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("set helper-managed network source mode %s: %w", target, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close helper-managed network source %s: %w", target, err)
 	}
 	return nil
 }

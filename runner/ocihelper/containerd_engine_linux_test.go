@@ -48,6 +48,30 @@ func TestContainerdEngineRejectsComputerPortRangeBeyondAddressSpace(t *testing.T
 	}
 }
 
+func TestCopyManagedNetworkFileIsContainerReadable(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source-resolv.conf")
+	target := filepath.Join(directory, "managed-resolv.conf")
+	if err := os.WriteFile(source, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce a snapshot created by the old helper. Refresh must repair its
+	// mode as well as its contents because the Computer does not run as root.
+	if err := os.WriteFile(target, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyManagedNetworkFile(source, target); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("managed network file mode = %04o, want 0644", got)
+	}
+}
+
 func TestDialComputerAttemptPortRejectsMalformedAuthority(t *testing.T) {
 	engine := &ContainerdEngine{}
 	left, right := net.Pipe()
