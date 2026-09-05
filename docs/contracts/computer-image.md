@@ -21,8 +21,12 @@ payload for 24 hours and its typed tombstone thereafter without an autonomous
 age bound, so N is never admissible again; three authority-valid payload-GC
 failures escalate and stop automatic retries. The supported recovery path
 prepares and admits reset generation N+1 and clears N only through authorized
-removal. Legacy `-reset-N` quarantines enter that same receipt-backed retention
-and payload-drop path.
+removal. A legacy `-reset-N` directory is only a retained
+`legacy_reset_quarantine` tombstone when it lacks a validated historical reset
+manifest; its name and modification time never authorize deletion. When that
+manifest proves the exact disk generation, the helper normalizes the tombstone
+and begins the same receipt-backed retention and payload-drop path from the
+normalization time.
 For a never-attached Custody import generation, the agent persists an exact
 helper-generation `computer_storage_preparation_interrupted`,
 `computer_storage_resume_deferred`, or `computer_storage_quarantined` result in

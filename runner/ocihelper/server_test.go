@@ -30,6 +30,16 @@ func TestComputerStorageRecoveryInventoryRejectsUntypedPayloadDropTime(t *testin
 	}
 }
 
+func TestComputerStorageRecoveryInventoryOmitsAbsentPayloadDropTime(t *testing.T) {
+	payload, err := json.Marshal(ComputerStorageRecoveryInventoryEntry{DiskName: "disk", Operation: "quarantine", Reason: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(payload, []byte("payload_dropped_at")) {
+		t.Fatalf("absent payload_dropped_at serialized as %s", payload)
+	}
+}
+
 func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	authority := testAuthority()
 	authority.Class = contract.JobClassService

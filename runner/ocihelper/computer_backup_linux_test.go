@@ -25,6 +25,16 @@ func TestDigestFileHonorsRPCCancellation(t *testing.T) {
 	}
 }
 
+type zeroProgressReader struct{}
+
+func (zeroProgressReader) Read([]byte) (int, error) { return 0, nil }
+
+func TestDigestReaderRejectsZeroProgress(t *testing.T) {
+	if _, err := digestReader(t.Context(), zeroProgressReader{}); !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("zero-progress digest = %v, want %v", err, io.ErrNoProgress)
+	}
+}
+
 func prepareDetachedBackupSource(t *testing.T) (string, *fakeComputerDiskSystem, ComputerStorageReference, AttemptAuthority) {
 	t.Helper()
 	root := t.TempDir()

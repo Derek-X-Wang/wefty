@@ -14,7 +14,14 @@ func TestOCIRestrictionReasonVocabularyIsExplicitlyPinned(t *testing.T) {
 			t.Fatalf("OCI restriction reason %q is not accepted", reason)
 		}
 	}
-	if CapabilityReasonCode("future_non_oci_reason").ValidOCIRestriction() {
+	future := CapabilityReasonCode("future_non_oci_reason")
+	original := capabilityReasonCodes
+	capabilityReasonCodes = append(append([]CapabilityReasonCode(nil), capabilityReasonCodes...), future)
+	t.Cleanup(func() { capabilityReasonCodes = original })
+	if !future.Valid() {
+		t.Fatal("mutation control did not extend the general wire vocabulary")
+	}
+	if future.ValidOCIRestriction() {
 		t.Fatal("unknown future reason was accepted as OCI restriction authority")
 	}
 }

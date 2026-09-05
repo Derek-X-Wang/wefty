@@ -260,7 +260,7 @@ func TestDoctorReportsQuarantinePayloadDropTimestamp(t *testing.T) {
 	mutateHelper(&config, func(snapshot *HelperDoctorSnapshot) {
 		droppedAt := now.Add(-time.Hour)
 		snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined = []ocihelper.ComputerStorageRecoveryInventoryEntry{{
-			DiskName: "wefty-computer-disk-example", Operation: "quarantine", Reason: "allocation_mismatch", PayloadDroppedAt: droppedAt,
+			DiskName: "wefty-computer-disk-example", Operation: "quarantine", Reason: "allocation_mismatch", PayloadDroppedAt: &droppedAt,
 		}}
 		snapshot.SweepReceipt.ComputerStorageQuarantinedCount = 1
 	})

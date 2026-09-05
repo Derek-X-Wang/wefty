@@ -15,7 +15,7 @@ while true; do
     printf '%s\n' "$action" >> /tmp/wefty-oci-faults/actions.log
     case "$action" in
       kill-shim)
-        printf '%s\n' 'kill-shim requires an exact workload Job binding' > "/tmp/wefty-oci-faults/$action.failed"
+        record_action_failure 'kill-shim requires an exact workload Job binding'
         continue
         ;;
       kill-payload:*|kill-shim:*)
@@ -29,7 +29,7 @@ while true; do
         done
         set -- $containers
         if [ "$#" -ne 1 ]; then
-          printf 'exact Job binding matched %s workloads\n' "$#" > "/tmp/wefty-oci-faults/$action.failed"
+          record_action_failure "exact Job binding matched $# workloads"
           continue
         fi
         container="$1"
@@ -47,7 +47,7 @@ while true; do
           done
           set -- $shim_pids
           if [ "$#" -ne 1 ]; then
-            printf 'exact workload shim binding matched %s processes\n' "$#" > "/tmp/wefty-oci-faults/$action.failed"
+            record_action_failure "exact workload shim binding matched $# processes"
             continue
           fi
           kill -KILL "$1"
@@ -151,7 +151,7 @@ MANIFEST
         name="${action#assert-computer-clean:}"
         path="/var/lib/wefty/oci/logs/$name"
         if grep -F " $path/control " /proc/mounts >/dev/null || test -e "$path"; then
-          printf 'control mount or log directory remains at %s\n' "$path" > "/tmp/wefty-oci-faults/$action.failed"
+          record_action_failure "control mount or log directory remains at $path"
           continue
         fi
         ;;

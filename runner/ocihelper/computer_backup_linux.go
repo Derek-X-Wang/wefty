@@ -273,32 +273,34 @@ func digestFile(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	digest, readErr := digestReader(ctx, file)
+	if err := errors.Join(readErr, file.Close()); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func digestReader(ctx context.Context, reader io.Reader) (string, error) {
 	hash := sha256.New()
 	buffer := make([]byte, 256*1024)
-	var copyErr error
-	for copyErr == nil {
+	for {
 		if err := ctx.Err(); err != nil {
-			copyErr = err
-			break
+			return "", err
 		}
-		read, readErr := file.Read(buffer)
+		read, readErr := reader.Read(buffer)
 		if read > 0 {
-			_, copyErr = hash.Write(buffer[:read])
+			_, _ = hash.Write(buffer[:read])
 		}
 		if errors.Is(readErr, io.EOF) {
-			break
+			return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 		}
 		if readErr != nil {
-			copyErr = readErr
+			return "", readErr
+		}
+		if read == 0 {
+			return "", io.ErrNoProgress
 		}
 	}
-	if closeErr := file.Close(); copyErr == nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil {
-		return "", copyErr
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func removeComputerBackupRoot(root string) error {

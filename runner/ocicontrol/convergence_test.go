@@ -4,7 +4,17 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
+
+func TestSetupStateRestartPolicyUsesSharedAuthority(t *testing.T) {
+	for _, version := range []int{252, 254, 255} {
+		if got, want := setupStateRestartPolicy(version), systemdpolicy.Name(version); got != want {
+			t.Fatalf("systemd %d setup-state policy = %q, want shared authority %q", version, got, want)
+		}
+	}
+}
 
 func TestConvergenceClassesAndAuthorization(t *testing.T) {
 	base := SetupState{

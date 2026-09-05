@@ -1029,6 +1029,37 @@ func legacyComputerDiskQuarantineName(entryName string) (string, bool) {
 	return name, validComputerDiskDirectoryName(name)
 }
 
+const legacyComputerStorageResetManifestVersion = 1
+
+type legacyComputerStorageResetManifest struct {
+	Version        int                           `json:"version"`
+	Storage        ComputerStorageReference      `json:"storage"`
+	NewGeneration  int64                         `json:"new_generation"`
+	Authority      ComputerStorageResetAuthority `json:"authority"`
+	QuarantineName string                        `json:"quarantine_name"`
+	Phase          string                        `json:"phase"`
+}
+
+func validatedLegacyComputerStorageResetManifest(runtimeRoot, diskName, quarantineName string) bool {
+	payload, err := os.ReadFile(filepath.Join(runtimeRoot, "computer-storage-resets", diskName+".json"))
+	if err != nil {
+		return false
+	}
+	var manifest legacyComputerStorageResetManifest
+	if json.Unmarshal(payload, &manifest) != nil || manifest.Version != legacyComputerStorageResetManifestVersion ||
+		manifest.Storage.DiskBytes <= 0 || manifest.Storage.StorageGeneration <= 0 ||
+		manifest.NewGeneration != manifest.Storage.StorageGeneration+1 || manifest.QuarantineName != quarantineName ||
+		manifest.Storage.IntentRevision != manifest.Authority.IntentRevision || manifest.Authority.NodeID == "" ||
+		manifest.Authority.BootSessionID == "" || manifest.Authority.JobID == "" || manifest.Authority.HelperGeneration == 0 ||
+		manifest.Authority.IntentRevision <= 0 || strings.TrimSpace(manifest.Authority.CleanupFence) == "" ||
+		(manifest.Phase != "quarantined" && manifest.Phase != "deleted" && manifest.Phase != "verified") {
+		return false
+	}
+	wantDiskName, err := deterministicComputerDiskName(manifest.Storage)
+	return err == nil && wantDiskName == diskName &&
+		quarantineName == fmt.Sprintf("%s-reset-%d", diskName, manifest.Authority.IntentRevision)
+}
+
 func (engine *ContainerdEngine) normalizeLegacyComputerDiskQuarantine(root, name string, createdAt time.Time) (computerDiskQuarantineReceipt, string, error) {
 	receiptID, err := randomCapability()
 	if err != nil {
@@ -1096,7 +1127,6 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 		if !entry.IsDir() {
 			continue
 		}
-		entryInfo, entryInfoErr := entry.Info()
 		root := filepath.Join(quarantineRoot, entry.Name())
 		lock, lockErr := openComputerDiskLock(root)
 		if lockErr != nil {
@@ -1106,8 +1136,15 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 		receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(root, "quarantine.json"))
 		entryName := entry.Name()
 		legacyName, legacy := legacyComputerDiskQuarantineName(entryName)
-		if legacy && entryInfoErr == nil {
-			receipt, root, readErr = engine.normalizeLegacyComputerDiskQuarantine(root, legacyName, entryInfo.ModTime())
+		if legacy && !validatedLegacyComputerStorageResetManifest(engine.config.RuntimeRoot, legacyName, entryName) {
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerQuarantine, ID: legacyName, Action: SweepActionRetained, Method: "legacy_reset_quarantine",
+			})
+			closeComputerDiskLock(lock)
+			continue
+		}
+		if legacy {
+			receipt, root, readErr = engine.normalizeLegacyComputerDiskQuarantine(root, legacyName, now)
 			entryName = receipt.DiskName + "-anomaly-" + receipt.ReceiptID
 		}
 		if readErr != nil || entryName != receipt.DiskName+"-anomaly-"+receipt.ReceiptID {

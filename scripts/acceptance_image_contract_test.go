@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/linuxunit"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 
 	"gopkg.in/yaml.v3"
 )
@@ -45,6 +45,7 @@ type workflowStep struct {
 	Uses string         `yaml:"uses"`
 	Run  string         `yaml:"run"`
 	With map[string]any `yaml:"with"`
+	Env  map[string]any `yaml:"env"`
 }
 
 func TestAcceptanceImageWorkflowContract(t *testing.T) {
@@ -53,6 +54,15 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	gate, gateBytes := readWorkflow(t, "../.github/workflows/contract-gate.yml")
 	realtiming, realtimingBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming.yml")
 	scheduled, scheduledBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming-scheduled.yml")
+	debian252, ok := gate.Jobs["debian-systemd-252"]
+	if !ok || !strings.Contains(string(gateBytes), "container: debian:12") {
+		t.Fatal("contract gate is missing its Debian 12 systemd 252 lane")
+	}
+	if !slices.ContainsFunc(debian252.Steps, func(step workflowStep) bool {
+		return step.Env["WEFTY_REQUIRE_SYSTEMD_252"] == "1" && strings.Contains(step.Run, "TestSystemd252LaneValidatesLegacyHelperPolicy")
+	}) {
+		t.Fatal("Debian 12 lane does not require execution of the systemd 252 guard")
+	}
 
 	if _, ok := build.On["workflow_call"]; !ok {
 		t.Fatal("acceptance-image must expose the secretless required workflow_call lane")
@@ -292,6 +302,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if !strings.Contains(faultSupervisorText, "readonly WEFTY_OCI_FAULT_HARNESS_VERSION=1") {
 		t.Fatal("shared realtiming fault supervisor is missing its version authority")
 	}
+	assertAtomicFaultFailurePublications(t, faultSupervisorText)
 	const faultSupervisorInstall = "sudo install --owner=root --group=root --mode=0755 scripts/oci-realtiming-fault-supervisor-v1.sh /usr/local/libexec/wefty-oci-fault-supervisor"
 	for name, fixture := range map[string]struct {
 		workflow workflowContract
@@ -488,17 +499,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 }
 
 func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
-	modernWant := map[string]map[string]string{
-		"Unit": {
-			"StartLimitIntervalSec": "0",
-		},
-		"Service": {
-			"Restart":            "on-failure",
-			"RestartSec":         linuxunit.HelperRestartInitialDelay.String(),
-			"RestartSteps":       strconv.Itoa(linuxunit.HelperRestartSteps),
-			"RestartMaxDelaySec": linuxunit.HelperRestartMaximumDelay.String(),
-		},
-	}
+	modernWant := splitQualifiedPolicy(systemdpolicy.UnitPolicy(255))
 	for name, path := range map[string]string{
 		"pr-realtiming": "../.github/workflows/service-acceptance-realtiming.yml",
 		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
@@ -545,6 +546,43 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 		t.Fatalf("saturated helper restart derivation = delays %s + reap %s + margin %s = %s, takeover %s",
 			linuxunit.HelperSaturatedRestartDelaySum, ocihelper.DefaultReapTimeout, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
 	}
+}
+
+func assertAtomicFaultFailurePublications(t *testing.T, text string) {
+	t.Helper()
+	validate := func(candidate string) error {
+		for lineNumber, raw := range strings.Split(candidate, "\n") {
+			line := strings.TrimSpace(raw)
+			if strings.Contains(line, "$action.failed\"") && (strings.Contains(line, ">") || strings.Contains(line, ">>")) {
+				return fmt.Errorf("line %d writes .failed directly: %s", lineNumber+1, line)
+			}
+		}
+		if !strings.Contains(candidate, "$action.failed.tmp.$$") || !strings.Contains(candidate, `mv "$temporary" "/tmp/wefty-oci-faults/$action.failed"`) {
+			return errors.New("record_action_failure lacks durable temporary publication")
+		}
+		return nil
+	}
+	if err := validate(text); err != nil {
+		t.Fatal(err)
+	}
+	mutated := strings.Replace(text, "record_action_failure 'kill-shim requires an exact workload Job binding'", `printf '%s\n' 'kill-shim requires an exact workload Job binding' > "/tmp/wefty-oci-faults/$action.failed"`, 1)
+	if mutated == text {
+		t.Fatal("atomic failure publication mutation control did not apply")
+	}
+	if err := validate(mutated); err == nil {
+		t.Fatal("direct .failed publication mutation was accepted")
+	}
+}
+
+func splitQualifiedPolicy(policy map[string]string) map[string]map[string]string {
+	result := map[string]map[string]string{"Unit": {}, "Service": {}}
+	for qualified, value := range policy {
+		section, key, ok := strings.Cut(qualified, ".")
+		if ok {
+			result[section][key] = value
+		}
+	}
+	return result
 }
 
 func TestOCIHelperWireErrorCodeVocabularyMatchesContract(t *testing.T) {

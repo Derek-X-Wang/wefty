@@ -1711,7 +1711,7 @@ func TestComputerDiskQuarantineGCFailureIsEvidenceNotSweepFailure(t *testing.T) 
 	}
 }
 
-func TestLegacyResetQuarantineGCNormalizesAndDropsExpiredPayload(t *testing.T) {
+func TestLegacyResetQuarantineWithoutManifestNeverDeletesPayload(t *testing.T) {
 	root := t.TempDir()
 	storage := testComputerStorage()
 	name, _ := deterministicComputerDiskName(storage)
@@ -1731,21 +1731,71 @@ func TestLegacyResetQuarantineGCNormalizesAndDropsExpiredPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(filepath.Join(root, "computer-disk-quarantine"))
-	if err != nil || len(entries) != 1 || strings.Contains(entries[0].Name(), "-reset-") {
-		t.Fatalf("legacy quarantine was not normalized: entries=%v err=%v", entries, err)
+	if err != nil || len(entries) != 1 || entries[0].Name() != name+"-reset-2" {
+		t.Fatalf("legacy quarantine tombstone changed: entries=%v err=%v", entries, err)
 	}
-	normalizedRoot := filepath.Join(root, "computer-disk-quarantine", entries[0].Name())
-	receipt, err := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(normalizedRoot, "quarantine.json"))
-	if err != nil || receipt.Reason != "legacy_reset_quarantine" || receipt.PayloadDroppedAt == nil {
-		t.Fatalf("legacy GC receipt = %+v err=%v", receipt, err)
-	}
-	if _, err := os.Lstat(filepath.Join(normalizedRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expired legacy payload remained: %v", err)
+	if payload, err := os.ReadFile(filepath.Join(legacyRoot, "disk.ext4")); err != nil || string(payload) != "legacy tenant bytes" {
+		t.Fatalf("legacy payload changed: %q err=%v", payload, err)
 	}
 	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-		return item.ID == name && item.Action == SweepActionQuarantinePayloadDropped && item.Method == "legacy_reset_quarantine"
+		return item.ID == name && item.Action == SweepActionRetained && item.Method == "legacy_reset_quarantine"
 	}) {
 		t.Fatalf("legacy GC evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestLegacyResetQuarantineRequiresValidatedManifestBeforeRetention(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	storage.IntentRevision = 2
+	name, _ := deterministicComputerDiskName(storage)
+	legacyName := name + "-reset-2"
+	legacyRoot := filepath.Join(root, "computer-disk-quarantine", legacyName)
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "disk.ext4"), []byte("legacy tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := legacyComputerStorageResetManifest{Version: legacyComputerStorageResetManifestVersion, Storage: storage,
+		NewGeneration: storage.StorageGeneration + 1, QuarantineName: legacyName, Phase: "quarantined",
+		Authority: ComputerStorageResetAuthority{NodeID: "node-a", BootSessionID: "boot-a", HelperGeneration: 1,
+			JobID: "job-a", IntentRevision: storage.IntentRevision, CleanupFence: "reset-fence-a"}}
+	manifestPayload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestRoot := filepath.Join(root, "computer-storage-resets")
+	if err := os.MkdirAll(manifestRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(manifestRoot, name+".json"), manifestPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: clock}}
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "computer-disk-quarantine"))
+	if err != nil || len(entries) != 1 || strings.Contains(entries[0].Name(), "-reset-") {
+		t.Fatalf("validated legacy quarantine was not normalized: entries=%v err=%v", entries, err)
+	}
+	normalizedRoot := filepath.Join(root, "computer-disk-quarantine", entries[0].Name())
+	if _, err := os.Stat(filepath.Join(normalizedRoot, "disk.ext4")); err != nil {
+		t.Fatalf("validated legacy payload was dropped before retention: %v", err)
+	}
+	clock.Advance(defaultComputerDiskQuarantineRetention)
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(normalizedRoot, "quarantine.json"))
+	if err != nil || receipt.PayloadDroppedAt == nil {
+		t.Fatalf("validated legacy GC receipt = %+v err=%v", receipt, err)
+	}
+	if _, err := os.Lstat(filepath.Join(normalizedRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("validated expired legacy payload remained: %v", err)
 	}
 }
 

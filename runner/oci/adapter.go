@@ -2131,7 +2131,7 @@ func computerStoragePreparationOutcome(storage workloadrunner.ComputerStorage, r
 				Code: candidate.code, Storage: storage, HelperGeneration: receipt.HelperSession.SessionGeneration,
 				SweepEpoch: receipt.SweepEpoch, DiskName: entry.DiskName, Operation: entry.Operation,
 				Reason: entry.Reason, DeferredReason: entry.DeferredReason, Attempts: entry.Attempts,
-				FirstDeferredAt: optionalPreparationTime(entry.FirstDeferredAt), PayloadDroppedAt: optionalPreparationTime(entry.PayloadDroppedAt),
+				FirstDeferredAt: optionalPreparationTime(entry.FirstDeferredAt), PayloadDroppedAt: entry.PayloadDroppedAt,
 				RecordedAt: time.Now().UTC(),
 			}, true
 		}

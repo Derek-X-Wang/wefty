@@ -50,6 +50,23 @@ jobs:
       - name: Exercise privileged OCI install and configure path
         run: bash scripts/test-install-oci-privileged.sh
 
+  debian-systemd-252:
+    name: debian-systemd-252
+    runs-on: ubuntu-latest
+    container: debian:12
+    steps:
+      - name: Install lane prerequisites
+        run: apt-get update && apt-get install --yes ca-certificates git systemd
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify the Debian 12 helper unit with systemd 252
+        env:
+          WEFTY_REQUIRE_SYSTEMD_252: "1"
+        run: go test ./runner/linuxunit -run '^TestSystemd252LaneValidatesLegacyHelperPolicy$' -count=1
+
   sqlite-integration:
     name: sqlite-integration
     runs-on: ubuntu-latest
