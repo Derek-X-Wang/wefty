@@ -97,7 +97,6 @@ func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 			_, _ = command.Process.Wait()
 			t.Fatalf("real control process did not publish its socket:\n%s", childOutput.String())
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
 	client, err := NewClient(socket)
 	if err != nil {
@@ -160,6 +159,8 @@ func TestControlSocketRejectsUIDOutsideOperatorAllowlist(t *testing.T) {
 }
 
 func runControlChild(t *testing.T) {
+	previousUmask := syscall.Umask(0)
+	defer syscall.Umask(previousUmask)
 	socket := os.Getenv("WEFTY_CONTROL_TEST_SOCKET")
 	intentPath := os.Getenv("WEFTY_CONTROL_TEST_INTENT")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
