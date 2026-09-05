@@ -933,7 +933,7 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 				})
 				recovery.DeferredReason = receipt.DeferredReason
 				if receipt.PayloadDroppedAt != nil {
-					recovery.PayloadDroppedAt = receipt.PayloadDroppedAt.UTC().Format(time.RFC3339Nano)
+					recovery.PayloadDroppedAt = receipt.PayloadDroppedAt.UTC()
 				}
 				result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined, recovery)
 			}
@@ -1072,7 +1072,7 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 					recovery := recoveryInventoryEntry(name, "quarantine", receipt.Storage, computerStorageRecoveryDeferral{Attempts: receipt.RecoveryAttempts, Reason: receipt.Reason, FirstDeferredAt: receipt.FirstDeferredAt})
 					recovery.DeferredReason = receipt.DeferredReason
 					if receipt.PayloadDroppedAt != nil {
-						recovery.PayloadDroppedAt = receipt.PayloadDroppedAt.UTC().Format(time.RFC3339Nano)
+						recovery.PayloadDroppedAt = receipt.PayloadDroppedAt.UTC()
 					}
 					result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined, recovery)
 				}

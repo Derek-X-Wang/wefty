@@ -1361,6 +1361,7 @@ const (
 	SweepActionQuarantined              SweepAction = "quarantined"
 	SweepActionQuarantinePayloadDropped SweepAction = "quarantine_payload_dropped"
 	SweepActionQuarantineGCFailed       SweepAction = "quarantine_gc_failed"
+	SweepActionQuarantineGCEscalated    SweepAction = "quarantine_gc_escalated"
 	SweepActionPreenCorrected           SweepAction = "preen_corrected"
 )
 
@@ -1444,7 +1445,7 @@ type ComputerStorageRecoveryInventoryEntry struct {
 	DeferredReason   string                   `json:"deferred_reason,omitempty"`
 	Attempts         int                      `json:"attempts"`
 	FirstDeferredAt  time.Time                `json:"first_deferred_at,omitempty"`
-	PayloadDroppedAt string                   `json:"payload_dropped_at,omitempty"`
+	PayloadDroppedAt time.Time                `json:"payload_dropped_at,omitempty"`
 }
 
 type ComputerStorageResumeDeferredError struct{ Storage ComputerStorageReference }
@@ -1460,7 +1461,7 @@ func (err *ComputerStorageQuarantinedError) Error() string {
 }
 
 func recoveryInventoryEntryKey(entry ComputerStorageRecoveryInventoryEntry) string {
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d\x00%s", entry.DiskName, entry.Operation, entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts, entry.PayloadDroppedAt)
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d\x00%s", entry.DiskName, entry.Operation, entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts, entry.PayloadDroppedAt.UTC().Format(time.RFC3339Nano))
 }
 
 // SweptAttemptAuthority is the immutable removal-validation subset recovered

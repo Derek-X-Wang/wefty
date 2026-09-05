@@ -268,13 +268,30 @@ func sameComputerBackupRemovalSupersession(supersession computerBackupSupersessi
 		supersession.OperationRevision == request.Authority.OperationRevision && supersession.L1OperationState == wantState
 }
 
-func digestFile(path string) (string, error) {
+func digestFile(ctx context.Context, path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	hash := sha256.New()
-	_, copyErr := io.Copy(hash, file)
+	buffer := make([]byte, 256*1024)
+	var copyErr error
+	for copyErr == nil {
+		if err := ctx.Err(); err != nil {
+			copyErr = err
+			break
+		}
+		read, readErr := file.Read(buffer)
+		if read > 0 {
+			_, copyErr = hash.Write(buffer[:read])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			copyErr = readErr
+		}
+	}
 	if closeErr := file.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
@@ -378,7 +395,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 			if err := verifyComputerDiskAllocation(published, request.Storage.DiskBytes); err != nil {
 				return CreateComputerBackupResponse{}, err
 			}
-			digest, err := digestFile(published)
+			digest, err := digestFile(ctx, published)
 			if err != nil || digest != manifest.ContentDigest {
 				return CreateComputerBackupResponse{}, errors.New("published Computer Backup digest no longer matches its manifest")
 			}
@@ -466,7 +483,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 		}
 	}
 
-	sourceDigest, err := digestFile(sourcePath)
+	sourceDigest, err := digestFile(ctx, sourcePath)
 	if err != nil {
 		return CreateComputerBackupResponse{}, err
 	}
@@ -477,7 +494,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 	if _, err := os.Lstat(publishedPath); err == nil {
 		targetPath = publishedPath
 	}
-	destinationDigest, err := digestFile(targetPath)
+	destinationDigest, err := digestFile(ctx, targetPath)
 	if err != nil {
 		return CreateComputerBackupResponse{}, err
 	}

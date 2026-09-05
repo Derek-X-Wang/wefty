@@ -1,6 +1,10 @@
 package linuxunit
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -62,6 +66,37 @@ func TestRenderUsesBoundedLegacySystemdRestartPolicy(t *testing.T) {
 func TestUnknownSystemdVersionUsesConservativeRestartPolicy(t *testing.T) {
 	if got := HelperRestartPolicy(0); got != "RestartSec=1s\n" || HelperRestartPolicyName(0) != "conservative_fixed_1s" {
 		t.Fatalf("unknown systemd policy = %q name=%q", got, HelperRestartPolicyName(0))
+	}
+}
+
+func TestSystemd252LaneValidatesLegacyHelperPolicy(t *testing.T) {
+	if os.Getenv("WEFTY_REQUIRE_SYSTEMD_252") != "1" {
+		t.Skip("set WEFTY_REQUIRE_SYSTEMD_252=1 in the Debian 12 validation lane")
+	}
+	output, err := exec.Command("systemd-analyze", "--version").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		t.Fatalf("systemd version output = %q", output)
+	}
+	version, err := strconv.Atoi(fields[1])
+	if err != nil || version != 252 {
+		t.Fatalf("legacy lane systemd version = %q, want 252", fields[1])
+	}
+	working := t.TempDir()
+	units, err := Render(Config{AgentPath: "/bin/true", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1000, OperatorGID: 1000,
+		WorkingDirectory: working, ContainerdAddress: "/run/containerd/containerd.sock", ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", SystemdVersion: version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(working, HelperServiceUnit)
+	if err := os.WriteFile(path, units.HelperService, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("systemd-analyze", "verify", path).CombinedOutput(); err != nil {
+		t.Fatalf("systemd 252 rejected rendered legacy policy: %v\n%s", err, output)
 	}
 }
 
