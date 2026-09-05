@@ -41,6 +41,49 @@ func TestContainerdEngineRejectsPATHResolvedRunc(t *testing.T) {
 	}
 }
 
+func TestContainerdEngineRejectsComputerPortRangeBeyondAddressSpace(t *testing.T) {
+	_, err := NewContainerdEngine(NativeEngineConfig{RuntimeRoot: t.TempDir(), AttemptPortMin: 1, AttemptPortMax: 32769})
+	if err == nil || !strings.Contains(err.Error(), "32768 disjoint /30 allocations") {
+		t.Fatalf("oversized Computer port range = %v", err)
+	}
+}
+
+func TestCopyManagedNetworkFileIsContainerReadable(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source-resolv.conf")
+	target := filepath.Join(directory, "managed-resolv.conf")
+	if err := os.WriteFile(source, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce a snapshot created by the old helper. Refresh must repair its
+	// mode as well as its contents because the Computer does not run as root.
+	if err := os.WriteFile(target, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyManagedNetworkFile(source, target); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("managed network file mode = %04o, want 0644", got)
+	}
+}
+
+func TestDialComputerAttemptPortRejectsMalformedAuthority(t *testing.T) {
+	engine := &ContainerdEngine{}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	err := engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Name: contract.ComputerDisplayEndpointView, Port: 42000}, left)
+	var refusal *ComputerAttemptAuthorityRefusalError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("malformed Computer authority = %v, want typed refusal", err)
+	}
+}
+
 func TestDoctorCacheReadIsBoundedBehindPullLocks(t *testing.T) {
 	engine := &ContainerdEngine{}
 	engine.imageContentMu.Lock()
@@ -54,6 +97,37 @@ func TestDoctorCacheReadIsBoundedBehindPullLocks(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("blocked cache read was not bounded: %s", elapsed)
+	}
+}
+
+func TestAttemptNetworkTeardownDoesNotHoldEngineLock(t *testing.T) {
+	tool := filepath.Join(t.TempDir(), "slow-ip")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nsleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authority := testAuthority()
+	engine := &ContainerdEngine{
+		attempts: map[string]*containerdAttempt{
+			authority.key(): {authority: authority, endpointHolds: map[string]net.Listener{}, computerNetwork: &computerNetworkAttachment{hostLink: "wftchtest", ipPath: tool}},
+		},
+		ports: map[uint16]string{},
+	}
+	done := make(chan error, 1)
+	go func() { done <- engine.releaseAttemptRuntimeState(t.Context(), authority.key()) }()
+	time.Sleep(50 * time.Millisecond)
+	lockAcquired := make(chan struct{})
+	go func() {
+		engine.mu.Lock()
+		engine.mu.Unlock()
+		close(lockAcquired)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Computer network teardown held the engine-wide lock")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -307,6 +381,63 @@ func TestLoadAttemptOwnershipRecordsIgnoresUnknownAndStaleEntries(t *testing.T) 
 	records, err := engine.loadAttemptOwnershipRecords()
 	if err != nil || len(records) != 0 {
 		t.Fatalf("unknown ownership entries records=%v err=%v", records, err)
+	}
+}
+
+func TestAttemptOwnershipSnapshotCannotOverlapPublication(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationEntered := make(chan struct{})
+	releasePublication := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(releasePublication) })
+	defer releaseOnce()
+	engine := &ContainerdEngine{
+		config: NativeEngineConfig{RuntimeRoot: t.TempDir()},
+		afterAttemptOwnershipSync: func() {
+			close(publicationEntered)
+			<-releasePublication
+		},
+	}
+	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- engine.ensureAttemptOwnershipRecord(authority, resources) }()
+	<-publicationEntered
+
+	type snapshotResult struct {
+		records map[string]durableAttemptOwnership
+		err     error
+	}
+	snapshotDone := make(chan snapshotResult, 1)
+	go func() {
+		records, err := engine.loadAttemptOwnershipRecords()
+		snapshotDone <- snapshotResult{records: records, err: err}
+	}()
+	select {
+	case result := <-snapshotDone:
+		t.Fatalf("Attempt ownership snapshot overlapped publication: records=%v err=%v", result.records, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseOnce()
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-snapshotDone:
+		if result.err != nil || len(result.records) != 1 || result.records[authority.key()].Authority != authority {
+			t.Fatalf("serialized Attempt ownership snapshot = records=%v err=%v", result.records, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Attempt ownership snapshot did not proceed after publication")
+	}
+	if err := engine.removeAttemptOwnershipRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(engine.attemptOwnershipRoot()); err != nil || !info.IsDir() {
+		t.Fatalf("removing the final Attempt ownership record removed its parent: info=%v err=%v", info, err)
 	}
 }
 
@@ -2026,7 +2157,7 @@ func TestAttemptEndpointOwnershipRejectsWildcardListener(t *testing.T) {
 	}
 	defer wildcard.Close()
 	port := uint16(wildcard.Addr().(*net.TCPAddr).Port)
-	if inode, found, err := loopbackListenInode(port); err != nil || found || inode != "" {
+	if inode, found, err := loopbackListenInode(nil, port); err != nil || found || inode != "" {
 		t.Fatalf("wildcard listener was accepted as loopback ownership: inode=%q found=%t err=%v", inode, found, err)
 	}
 }
@@ -2122,7 +2253,7 @@ func TestAttemptPortRejectsAdversarialBindOutsidePayloadCgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &ContainerdEngine{config: NativeEngineConfig{CgroupRoot: cgroupRoot}}
-	err = engine.waitAttemptPortOwnership(t.Context(), cgroupID, port)
+	err = engine.waitAttemptPortOwnership(t.Context(), cgroupID, nil, port)
 	if err == nil || !strings.Contains(err.Error(), "outside the attempt cgroup") {
 		t.Fatalf("adversarial bind error = %v", err)
 	}
@@ -2152,7 +2283,7 @@ func TestAttemptPortAcceptsListenerInNestedPayloadCgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &ContainerdEngine{config: NativeEngineConfig{CgroupRoot: cgroupRoot}}
-	if err := engine.waitAttemptPortOwnership(t.Context(), cgroupID, port); err != nil {
+	if err := engine.waitAttemptPortOwnership(t.Context(), cgroupID, nil, port); err != nil {
 		t.Fatalf("nested payload listener ownership: %v", err)
 	}
 }

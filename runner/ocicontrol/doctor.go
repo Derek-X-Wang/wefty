@@ -152,6 +152,25 @@ type ProfileDoctorFacts struct {
 	Warnings                  []ocihelper.ProfileWarning `json:"warnings"`
 }
 
+type ComputerScreenIsolationDoctorFacts struct {
+	Outcome                      DiagnosticOutcome              `json:"outcome"`
+	NetworkNamespacePresent      bool                           `json:"network_namespace_present"`
+	HelperNetworkNamespaceInode  string                         `json:"helper_network_namespace_inode,omitempty"`
+	TaskNetworkNamespaceInode    string                         `json:"task_network_namespace_inode,omitempty"`
+	HostAbstractSocketVisible    bool                           `json:"host_abstract_socket_visible"`
+	ComputerNetworkAddress       string                         `json:"computer_network_address,omitempty"`
+	ComputerNetworkGateway       string                         `json:"computer_network_gateway,omitempty"`
+	ComputerResolverAddress      string                         `json:"computer_resolver_address,omitempty"`
+	ComputerDNSProxyUDP          bool                           `json:"computer_dns_proxy_udp"`
+	ComputerDNSProxyTCP          bool                           `json:"computer_dns_proxy_tcp"`
+	ComputerDNSUpstreamAddress   string                         `json:"computer_dns_upstream_address,omitempty"`
+	ComputerDNSUpstreamSource    string                         `json:"computer_dns_upstream_source,omitempty"`
+	ComputerDNSUpstreamReachable bool                           `json:"computer_dns_upstream_reachable"`
+	ComputerIPv6NATState         ocihelper.ComputerIPv6NATState `json:"computer_ipv6_nat_state,omitempty"`
+	ComputerFirewallPresent      bool                           `json:"computer_firewall_present"`
+	ComputerAttemptsLive         bool                           `json:"computer_attempts_live"`
+}
+
 type ConvergenceDoctorFacts struct {
 	Outcome DiagnosticOutcome `json:"outcome"`
 	Class   ConvergenceClass  `json:"class,omitempty"`
@@ -204,6 +223,7 @@ type DoctorResponse struct {
 	Cache                   CacheDoctorFacts                    `json:"cache"`
 	Mounts                  MountDoctorFacts                    `json:"mounts"`
 	Profile                 ProfileDoctorFacts                  `json:"profile"`
+	ComputerScreenIsolation ComputerScreenIsolationDoctorFacts  `json:"computer_screen_isolation"`
 	ResourceAdmission       *ocihelper.ResourceAdmissionReceipt `json:"resource_admission,omitempty"`
 	Convergence             ConvergenceDoctorFacts              `json:"convergence"`
 	ComputerStorageRecovery ComputerStorageRecoveryFacts        `json:"computer_storage_recovery"`
@@ -324,9 +344,10 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 		Helper: HelperDoctorFacts{Outcome: DiagnosticNotRun}, Versions: VersionFacts{Outcome: DiagnosticNotRun},
 		Probe:  ProbeDoctorFacts{Outcome: DiagnosticNotRun, Verdict: "not_run", Capabilities: map[string]bool{}, MissingCapabilities: []string{}},
 		Intent: IntentDoctorFacts{Outcome: DiagnosticNotRun}, Cache: CacheDoctorFacts{Outcome: DiagnosticNotRun},
-		Mounts:      MountDoctorFacts{Outcome: DiagnosticNotRun, AllowedRoots: []string{}},
-		Profile:     ProfileDoctorFacts{Outcome: DiagnosticNotRun, Warnings: []ocihelper.ProfileWarning{}},
-		Convergence: ConvergenceDoctorFacts{Outcome: DiagnosticNotRun},
+		Mounts:                  MountDoctorFacts{Outcome: DiagnosticNotRun, AllowedRoots: []string{}},
+		Profile:                 ProfileDoctorFacts{Outcome: DiagnosticNotRun, Warnings: []ocihelper.ProfileWarning{}},
+		ComputerScreenIsolation: ComputerScreenIsolationDoctorFacts{Outcome: DiagnosticNotRun},
+		Convergence:             ConvergenceDoctorFacts{Outcome: DiagnosticNotRun},
 		ComputerStorageRecovery: ComputerStorageRecoveryFacts{Outcome: DiagnosticNotRun,
 			Deferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{}, Quarantined: []ocihelper.ComputerStorageRecoveryInventoryEntry{}},
 		Findings: []DiagnosticFinding{},
@@ -613,6 +634,7 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 
 	if runtimeStatus.LastProfile == nil {
 		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{code: "oci_profile_ceilings_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "no completed runtime profile receipt was recorded"}))
+		report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnosticReceipt{code: "oci_computer_screen_isolation_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "no completed Computer runtime profile receipt was recorded"}))
 	} else {
 		profile := runtimeStatus.LastProfile
 		report.Profile = ProfileDoctorFacts{Outcome: DiagnosticOK, MemoryLimitBytes: profile.MemoryLimitBytes,
@@ -628,6 +650,38 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 			detail = "tmpfs ceilings are caps rather than reservations; the last profile can reach its cgroup memory limit before those ceilings"
 		}
 		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{ran: true, passed: true, code: code, severity: severity, detail: detail}))
+		if profile.Computer {
+			firewallObserved := runtimeStatus.ComputerFirewallRead.Outcome == ocihelper.DiagnosticReadOK
+			firewallEnforced := firewallObserved && (!runtimeStatus.ComputerAttemptsLive || runtimeStatus.ComputerFirewallPresent)
+			enforced := profile.NetworkNamespacePresent && profile.HelperNetworkNamespaceInode != "" && profile.TaskNetworkNamespaceInode != "" &&
+				profile.HelperNetworkNamespaceInode != profile.TaskNetworkNamespaceInode && !profile.HostAbstractSocketVisible &&
+				profile.ComputerNetworkAddress != "" && profile.ComputerNetworkGateway != "" && profile.ComputerNetworkAddress != profile.ComputerNetworkGateway && firewallEnforced
+			report.ComputerScreenIsolation = ComputerScreenIsolationDoctorFacts{
+				Outcome:                      outcomeFor(true, enforced),
+				NetworkNamespacePresent:      profile.NetworkNamespacePresent,
+				HelperNetworkNamespaceInode:  profile.HelperNetworkNamespaceInode,
+				TaskNetworkNamespaceInode:    profile.TaskNetworkNamespaceInode,
+				HostAbstractSocketVisible:    profile.HostAbstractSocketVisible,
+				ComputerNetworkAddress:       profile.ComputerNetworkAddress,
+				ComputerNetworkGateway:       profile.ComputerNetworkGateway,
+				ComputerResolverAddress:      profile.ComputerResolverAddress,
+				ComputerDNSProxyUDP:          profile.ComputerDNSProxyUDP,
+				ComputerDNSProxyTCP:          profile.ComputerDNSProxyTCP,
+				ComputerDNSUpstreamAddress:   profile.ComputerDNSUpstreamAddress,
+				ComputerDNSUpstreamSource:    profile.ComputerDNSUpstreamSource,
+				ComputerDNSUpstreamReachable: profile.ComputerDNSUpstreamReachable,
+				ComputerIPv6NATState:         profile.ComputerIPv6NATState,
+				ComputerFirewallPresent:      runtimeStatus.ComputerFirewallPresent,
+				ComputerAttemptsLive:         runtimeStatus.ComputerAttemptsLive,
+			}
+			isolationCode := "oci_computer_screen_isolation_enforced"
+			if !enforced {
+				isolationCode = "oci_computer_screen_isolation_not_enforced"
+			}
+			report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnosticReceipt{ran: true, passed: enforced, code: isolationCode, detail: "the last post-start Computer observation compares namespace and socket facts; the current doctor read verifies the IPv4/IPv6 firewall chains and live-attempt rules"}))
+		} else {
+			report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnosticReceipt{code: "oci_computer_screen_isolation_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "the last completed runtime profile receipt was not for a Computer"}))
+		}
 	}
 	if runtimeStatus.LastAdmission == nil {
 		report.Findings = append(report.Findings, finding("resource-admission", diagnosticReceipt{code: "oci_resource_admission_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "no atomic resource-admission receipt was recorded"}))
@@ -670,13 +724,13 @@ func appendComputerStorageRecoveryNotRun(report *DoctorResponse, cause NotRunCau
 }
 
 func appendRuntimeDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "resource-admission", "mount-roots"} {
+	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "computer-screen-isolation", "resource-admission", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
 
 func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "resource-admission", "mount-roots"} {
+	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "computer-screen-isolation", "resource-admission", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
@@ -935,6 +989,7 @@ func StableDoctorCodes() []string {
 		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_unsupported", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
 		"oci_cache_not_run", "oci_cache_status_unavailable", "oci_cache_within_bound", "oci_cache_over_bound", "oci_cache_eviction_failed",
 		"oci_profile_ceilings_not_run", "oci_profile_ceilings_not_recorded", "oci_profile_tmpfs_ceilings_within_memory_limit", "oci_profile_tmpfs_ceilings_exceed_memory_limit",
+		"oci_computer_screen_isolation_not_run", "oci_computer_screen_isolation_not_recorded", "oci_computer_screen_isolation_enforced", "oci_computer_screen_isolation_not_enforced",
 		"oci_resource_admission_not_run", "oci_resource_admission_not_recorded", "oci_resource_admission_admitted", "oci_resource_admission_refused",
 		"oci_mount_roots_not_run", "oci_mount_roots_unavailable", "oci_mount_roots_observed", "oci_mount_root_unavailable",
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
@@ -948,7 +1003,7 @@ func (report DoctorResponse) Validate() error {
 		return fmt.Errorf("invalid doctor header")
 	}
 	if len(report.Findings) == 0 || report.Probe.Capabilities == nil || report.Probe.MissingCapabilities == nil || report.Mounts.AllowedRoots == nil ||
-		!report.ComputerStorageRecovery.Outcome.Valid() {
+		!report.ComputerStorageRecovery.Outcome.Valid() || !report.ComputerScreenIsolation.Outcome.Valid() {
 		return fmt.Errorf("doctor report is incomplete")
 	}
 	if len(report.Limitations) != 1 || report.Limitations[0].Code != DoctorUIDLimitation || report.Limitations[0].Issue != DoctorUIDIssue || report.Limitations[0].Detail == "" {
@@ -978,7 +1033,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "resource-admission", "mount-roots", "convergence", "helper-restart-policy"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "mount-roots", "convergence", "helper-restart-policy"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}
@@ -1031,6 +1086,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
 		fmt.Sprintf("CACHE\t%s bytes=%d cap=%d within_bound=%t last_eviction=%s", report.Cache.Outcome, report.Cache.Bytes, report.Cache.CapBytes, report.Cache.WithinBound, lastEviction),
 		fmt.Sprintf("PROFILE\t%s memory_limit=%d memory_max=%d memory_oom_group=%t memory_swap_max=%d computer_tmpfs_ceiling=%d largest_tmpfs_ceiling=%d warnings=%d", report.Profile.Outcome, report.Profile.MemoryLimitBytes, report.Profile.MemoryMaxBytes, report.Profile.MemoryOOMGroup, report.Profile.MemorySwapMaxBytes, report.Profile.ComputerTmpfsCeilingBytes, report.Profile.LargestTmpfsCeilingBytes, len(report.Profile.Warnings)),
+		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
 	}

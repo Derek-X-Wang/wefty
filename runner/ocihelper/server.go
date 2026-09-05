@@ -650,6 +650,9 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if computer && request.Authority.Class != contract.JobClassService {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
 	}
+	if computer && (!request.EnableHostBridgeFallback || !request.ActivateHostBridgeFallback) {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require the private network namespace bridge"}
+	}
 	if err := validateRunEndpointContract(computer, request.AllocateEndpoints); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
@@ -1880,6 +1883,8 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.ComputerStorageDeferred = mergeRecoveryInventory(left.ComputerStorageDeferred, right.ComputerStorageDeferred)
 	left.ComputerStorageQuarantined = mergeRecoveryInventory(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined)
 	left.ComputerDiskAnomalies = mergeInventoryClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
+	left.ComputerNetworkLinks = mergeInventoryClass(left.ComputerNetworkLinks, right.ComputerNetworkLinks)
+	left.ComputerFirewallRules = mergeInventoryClass(left.ComputerFirewallRules, right.ComputerFirewallRules)
 	return left
 }
 
@@ -2003,6 +2008,7 @@ func engineFailureRPC(method Method, message string, reason EngineFailureReason,
 
 func engineFailureReason(err error) EngineFailureReason {
 	var retentionBound interface{ RetentionBoundExceeded() bool }
+	var egressDNSUnavailable interface{ EgressDNSUnavailable() bool }
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return EngineFailureDeadlineExceeded
@@ -2012,6 +2018,8 @@ func engineFailureReason(err error) EngineFailureReason {
 		return EngineFailurePermissionDenied
 	case errors.As(err, &retentionBound) && retentionBound.RetentionBoundExceeded():
 		return EngineFailureRetentionBound
+	case errors.As(err, &egressDNSUnavailable) && egressDNSUnavailable.EgressDNSUnavailable():
+		return EngineFailureEgressDNS
 	default:
 		return EngineFailureOperationFailed
 	}

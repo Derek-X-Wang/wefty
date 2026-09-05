@@ -1122,6 +1122,16 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference, Digest: &digestCopy}, Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: storage.DiskBytes}, Limits: &contract.OCILimits{MemoryBytes: &memory}}},
 		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}}, AttemptEndpoints: []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl},
 		OCIImageResolved: func(context.Context, workloadrunner.OCIImageObservation) error { return nil }, OCIStarted: func(context.Context, workloadrunner.OCIImageObservation) error { return nil }}
+	// Production Computers always carry the authority-bound reverse bridge,
+	// even when this image-only fixture has no L3 endpoint that will use it.
+	// Keep the native fixture on that mandatory request shape so it exercises
+	// the same private-network admission contract as the agent.
+	request.HostBridgeFallbackActive = true
+	request.HostBridgeEndpointReady = func(string) error { return nil }
+	request.HostBridgeDial = func(dialContext context.Context) (net.Conn, error) {
+		<-dialContext.Done()
+		return nil, context.Cause(dialContext)
+	}
 	helperStarted := make(chan time.Time, 1)
 	request.OCIStartedAt = func(startedAt time.Time) { helperStarted <- startedAt }
 	endpoints := make(map[string]workloadrunner.AttemptEndpoint)
@@ -1396,6 +1406,12 @@ fi`},
 			AttemptEndpointReady: func(string, workloadrunner.AttemptEndpoint) error {
 				return nil
 			}}
+		request.HostBridgeFallbackActive = true
+		request.HostBridgeEndpointReady = func(string) error { return nil }
+		request.HostBridgeDial = func(dialContext context.Context) (net.Conn, error) {
+			<-dialContext.Done()
+			return nil, context.Cause(dialContext)
+		}
 		request.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			_, err := store.ObserveAttemptImage(callbackContext, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, nativeImageObservation(claim.Lease.FencingToken, observation))
 			return err
@@ -1480,6 +1496,7 @@ func exerciseNativeLinuxComputerCapacity(t *testing.T, ctx context.Context, barr
 		}
 		return ocihelper.RunRequest{
 			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration, AllocateEndpoints: []string{"view", "control"},
+			EnableHostBridgeFallback: true, ActivateHostBridgeFallback: true,
 			Workload: ocihelper.WorkloadInput{ImageReference: reference, ImageDigest: digest, Computer: true,
 				Argv: []string{"/bin/sh", "-c", `
 WEFTY_SERVICE_PORT="$WEFTY_COMPUTER_VIEW_PORT" /usr/local/bin/wefty-echo-service &
@@ -1582,7 +1599,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		authority.Class = contract.JobClassService
 		return ocihelper.RunRequest{
 			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration,
-			AllocateEndpoints: []string{"view", "control"},
+			AllocateEndpoints: []string{"view", "control"}, EnableHostBridgeFallback: true, ActivateHostBridgeFallback: true,
 			Workload: ocihelper.WorkloadInput{
 				ImageReference: reference, ImageDigest: digest, Computer: true, Argv: argv,
 				Limits:         ocihelper.WorkloadLimits{MemoryBytes: 64 << 20},

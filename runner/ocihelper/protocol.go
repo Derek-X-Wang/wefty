@@ -128,12 +128,13 @@ const (
 	EngineFailureCanceled         EngineFailureReason = "canceled"
 	EngineFailurePermissionDenied EngineFailureReason = "permission_denied"
 	EngineFailureRetentionBound   EngineFailureReason = "retention_bound_exceeded"
+	EngineFailureEgressDNS        EngineFailureReason = "egress_dns_unavailable"
 	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
 )
 
 func (reason EngineFailureReason) valid() bool {
 	switch reason {
-	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureOperationFailed:
+	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureEgressDNS, EngineFailureOperationFailed:
 		return true
 	default:
 		return false
@@ -476,6 +477,7 @@ const (
 	DiagnosticErrorCacheStatus       = "cache_status_unavailable"
 	DiagnosticErrorCacheEviction     = "cache_eviction_failed"
 	DiagnosticErrorMountRoots        = "mount_roots_unavailable"
+	DiagnosticErrorComputerFirewall  = "computer_firewall_unavailable"
 
 	RuncVersionSourceConfiguredPath = "configured_absolute_path"
 	RuncVersionSourceContainerdInfo = "containerd_runtime_info"
@@ -493,19 +495,22 @@ type DiagnosticReadReceipt struct {
 // session capability, raw error, or mutation control and is safe to surface to
 // the operator-only node doctor.
 type DoctorStatus struct {
-	RuntimePlatform    OCIPlatform               `json:"runtime_platform"`
-	ContainerdVersion  string                    `json:"containerd_version"`
-	ContainerdRead     DiagnosticReadReceipt     `json:"containerd_read"`
-	RuncVersion        string                    `json:"runc_version"`
-	RuncVersionSource  string                    `json:"runc_version_source"`
-	RuncRead           DiagnosticReadReceipt     `json:"runc_read"`
-	AllowedMountRoots  []string                  `json:"allowed_mount_roots"`
-	MountRootsRead     DiagnosticReadReceipt     `json:"mount_roots_read"`
-	Cache              ImageCacheStatus          `json:"cache"`
-	CacheRead          DiagnosticReadReceipt     `json:"cache_read"`
-	CacheLastErrorCode string                    `json:"cache_last_error_code,omitempty"`
-	LastProfile        *ProfileReceipt           `json:"last_profile,omitempty"`
-	LastAdmission      *ResourceAdmissionReceipt `json:"last_admission,omitempty"`
+	RuntimePlatform         OCIPlatform               `json:"runtime_platform"`
+	ContainerdVersion       string                    `json:"containerd_version"`
+	ContainerdRead          DiagnosticReadReceipt     `json:"containerd_read"`
+	RuncVersion             string                    `json:"runc_version"`
+	RuncVersionSource       string                    `json:"runc_version_source"`
+	RuncRead                DiagnosticReadReceipt     `json:"runc_read"`
+	AllowedMountRoots       []string                  `json:"allowed_mount_roots"`
+	MountRootsRead          DiagnosticReadReceipt     `json:"mount_roots_read"`
+	Cache                   ImageCacheStatus          `json:"cache"`
+	CacheRead               DiagnosticReadReceipt     `json:"cache_read"`
+	CacheLastErrorCode      string                    `json:"cache_last_error_code,omitempty"`
+	ComputerFirewallPresent bool                      `json:"computer_firewall_present"`
+	ComputerAttemptsLive    bool                      `json:"computer_attempts_live"`
+	ComputerFirewallRead    DiagnosticReadReceipt     `json:"computer_firewall_read"`
+	LastProfile             *ProfileReceipt           `json:"last_profile,omitempty"`
+	LastAdmission           *ResourceAdmissionReceipt `json:"last_admission,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1
@@ -676,19 +681,44 @@ type ProfileWarning struct {
 	LimitBytes   int64              `json:"limit_bytes"`
 }
 
+// ComputerIPv6NATState records whether the defence-in-depth IPv6 NAT table is
+// configured or safely unavailable while Computer IPv6 is disabled.
+type ComputerIPv6NATState string
+
+const (
+	// ComputerIPv6NATConfigured means the helper installed the IPv6 NAT chain.
+	ComputerIPv6NATConfigured ComputerIPv6NATState = "configured"
+	// ComputerIPv6NATUnavailableIPv6Disabled means the kernel has no IPv6 NAT
+	// table; IPv6 filter policy remains mandatory and Computer IPv6 is disabled.
+	ComputerIPv6NATUnavailableIPv6Disabled ComputerIPv6NATState = "unavailable_ipv6_disabled"
+)
+
 // ProfileReceipt is assertion-derived from the exact runtime profile handed
 // to containerd. ComputerTmpfsCeilingBytes covers /dev/shm, /tmp, and
 // /var/tmp; ordinary baseline tmpfs mounts remain outside that product delta.
 type ProfileReceipt struct {
-	Computer                  bool             `json:"computer"`
-	MemoryLimitBytes          int64            `json:"memory_limit_bytes"`
-	MemoryMaxBytes            int64            `json:"memory_max_bytes"`
-	MemoryOOMGroup            bool             `json:"memory_oom_group"`
-	MemorySwapMaxBytes        int64            `json:"memory_swap_max_bytes"`
-	ComputerTmpfsCeilingBytes int64            `json:"computer_tmpfs_ceiling_bytes"`
-	LargestTmpfsTarget        string           `json:"largest_tmpfs_target,omitempty"`
-	LargestTmpfsCeilingBytes  int64            `json:"largest_tmpfs_ceiling_bytes"`
-	Warnings                  []ProfileWarning `json:"warnings"`
+	Computer                     bool                 `json:"computer"`
+	NetworkNamespacePresent      bool                 `json:"network_namespace_present"`
+	HelperNetworkNamespaceInode  string               `json:"helper_network_namespace_inode,omitempty"`
+	TaskNetworkNamespaceInode    string               `json:"task_network_namespace_inode,omitempty"`
+	HostAbstractSocketVisible    bool                 `json:"host_abstract_socket_visible"`
+	ComputerNetworkAddress       string               `json:"computer_network_address,omitempty"`
+	ComputerNetworkGateway       string               `json:"computer_network_gateway,omitempty"`
+	ComputerResolverAddress      string               `json:"computer_resolver_address,omitempty"`
+	ComputerDNSProxyUDP          bool                 `json:"computer_dns_proxy_udp"`
+	ComputerDNSProxyTCP          bool                 `json:"computer_dns_proxy_tcp"`
+	ComputerDNSUpstreamAddress   string               `json:"computer_dns_upstream_address,omitempty"`
+	ComputerDNSUpstreamSource    string               `json:"computer_dns_upstream_source,omitempty"`
+	ComputerDNSUpstreamReachable bool                 `json:"computer_dns_upstream_reachable"`
+	ComputerIPv6NATState         ComputerIPv6NATState `json:"computer_ipv6_nat_state,omitempty"`
+	MemoryLimitBytes             int64                `json:"memory_limit_bytes"`
+	MemoryMaxBytes               int64                `json:"memory_max_bytes"`
+	MemoryOOMGroup               bool                 `json:"memory_oom_group"`
+	MemorySwapMaxBytes           int64                `json:"memory_swap_max_bytes"`
+	ComputerTmpfsCeilingBytes    int64                `json:"computer_tmpfs_ceiling_bytes"`
+	LargestTmpfsTarget           string               `json:"largest_tmpfs_target,omitempty"`
+	LargestTmpfsCeilingBytes     int64                `json:"largest_tmpfs_ceiling_bytes"`
+	Warnings                     []ProfileWarning     `json:"warnings"`
 }
 
 // ImageEvidence is produced from the local immutable image selected by the
@@ -864,6 +894,8 @@ const (
 	RemovalResourceComputerAttachment     RemovalResourceClass = "computer_attachment"
 	RemovalResourceComputerResetManifest  RemovalResourceClass = "computer_reset_manifest"
 	RemovalResourceComputerQuarantine     RemovalResourceClass = "computer_quarantine"
+	RemovalResourceComputerNetworkLink    RemovalResourceClass = "computer_network_link"
+	RemovalResourceComputerFirewallRule   RemovalResourceClass = "computer_firewall_rule"
 )
 
 type RemovalResource struct {
@@ -1395,6 +1427,8 @@ type ResourceInventory struct {
 	// ComputerDiskAnomalies are per-disk observations. They remain auditable
 	// without turning one durable disk's accounting drift into node-wide helper failure.
 	ComputerDiskAnomalies []string `json:"computer_disk_anomalies"`
+	ComputerNetworkLinks  []string `json:"computer_network_links"`
+	ComputerFirewallRules []string `json:"computer_firewall_rules"`
 }
 
 // ComputerStorageRecoveryInventoryEntry gives deferred and quarantined disk

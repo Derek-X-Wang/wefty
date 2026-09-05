@@ -44,6 +44,24 @@ working directory. Wefty adds no capability, device, GPU, ptrace, privilege,
 browser sandbox exception, font, locale, or D-Bus policy. Image labels,
 `EXPOSE`, and declared volumes are not allocation or publication inputs.
 
+## Computer isolation boundary
+
+Every Computer is isolated from every other Computer on the same Node,
+regardless of owner. A Computer may reach its orchestrator channel -- the
+helper-reserved `view` and `control` endpoints and the agent directive channel
+-- its own Storage, its own screen, and outbound networks through the Node.
+Outbound stays open under the #109 profile ruling; the Fabric front door
+remains the only supported inbound path. A Computer may not reach any neighbour's
+screen, sockets, processes, or files. A real attempt to cross that boundary
+must be refused; distinct names or the absence of an accidental collision are
+not proof of isolation.
+
+The boundary is ratified by
+[ADR-0005](../adr/0005-computer-isolation-boundary.md). Enforcement closes the
+known shared-Node gaps mechanism by mechanism. This contract states only the
+mechanisms currently proved and does not convert an untested surface into an
+isolation claim.
+
 ## Reserved environment and targets
 
 Image and operator values for every reserved OCI environment name are removed
@@ -184,8 +202,9 @@ endpoints before the ordered publication controller may republish.
 A Computer keeps the ordinary `wefty-v1` isolation walls: resolved image user,
 12 fixed capabilities, explicit empty inheritable/ambient capability sets,
 `noNewPrivileges`, containerd's generated seccomp profile, private
-PID/IPC/UTS/mount/cgroup namespaces, shared networking, and deny-all devices
-plus the six pseudo-devices. The root filesystem is read-only; the Computer
+PID/IPC/UTS/mount/cgroup namespaces, a private network namespace, and deny-all
+devices plus the six pseudo-devices. The helper brings up only that namespace's
+loopback interface before start. The root filesystem is read-only; the Computer
 disk at `/wefty/service` is the persistent writable path. After attaching the
 disk and before retaining profile sources, the helper creates `etc/machine-id`
 when absent or repairs it when invalid, and records the repair in helper logs.
@@ -209,13 +228,69 @@ quarantine remains operator-visible and does not withdraw OCI service from
 unaffected Computers on the Node. Namespace absence remains verified for all
 non-quarantined generations.
 
-Computers share the Node network namespace even though PID, IPC, UTS, mount,
-and cgroup namespaces remain private. Image-side local or abstract socket names
-should therefore be attempt-unique. The XFCE reference derives its X display
-number from the helper-reserved view port instead of claiming a fixed `:99`;
-this prevents accidental display-name collisions. It does not isolate X11:
-co-located processes in the shared Node network namespace can still reach the
-node-wide abstract X socket, which remains a separate isolation risk.
+Screen isolation is enforced at the network-namespace boundary. The XFCE
+reference still derives its X display number from the helper-reserved view port,
+but its abstract `@/tmp/.X11-unix/X<n>` socket exists only in that Computer's
+private network namespace: a neighbour can neither enumerate nor connect to it.
+The Wayland compositor socket remains inside the Computer's private mount
+namespace, and both variants bind their RFB servers only to private loopback.
+The filesystem X socket under the attempt-private `/tmp/.X11-unix` is private
+by mount namespace; the abstract socket is private by network namespace.
+For `view`, `control`, and the agent's Computer submission bridge, the helper
+enters only the exact live Computer's network namespace and exposes the existing
+attempt-authority-bound stream; the Computer receives no new capability or
+privilege.
+
+The helper attaches one point-to-point `/30` veth to the private namespace,
+installs a default route, retains the helper-managed resolver and hosts mounts,
+disables IPv6 through both the namespace `all` and `default` sysctls, and
+masquerades the exact Computer IPv4 address through the Node or Lima VM. The
+address is allocated from RFC 2544 benchmarking space `198.18.0.0/15`; port
+`p` uses the `/30` at byte offset `(p - AttemptPortMin) * 4`. The attempt port
+range is capped at 32,768 disjoint `/30`s and helper startup refuses a
+conflicting non-Wefty Node route. If the mounted
+resolver snapshot names a Node-loopback stub such as `127.0.0.53`, the helper
+binds that address only inside the Computer namespace and proxies DNS from the
+Node namespace to systemd-resolved's advertised non-loopback uplink after a
+bounded lookup proves it reachable, falling back only to a Node stub that
+answers the same probe. If neither candidate answers, `Run` fails as
+`egress_dns_unavailable`; a routable resolver continues over the
+veth. The proxy admits only minimally valid DNS queries and responses, rate
+limits each attempt, and bounds concurrent TCP connections. Firewall policy
+rejects veth-to-veth forwarding, unsolicited traffic toward a Computer veth,
+and every Computer-originated Node-local listener except the exact helper-owned
+egress proof endpoint. That exception also requires the owning transparent helper
+socket, so closing the helper listener before removing the rule cannot expose a
+foreign binder. Mirrored `ip6tables` chains enforce the same refusal if a future
+image re-enables IPv6. The endpoint is bound only to the attempt's
+gateway/interface tuple and returns no tenant or Node data. The helper verifies
+and repairs both chain sets at every Computer start and on its periodic sweep
+cadence. Each INPUT, FORWARD, and POSTROUTING jump must be the first rule in
+its base chain; a merely present later jump does not prove isolation. Every
+helper-owned chain body must also exactly match its canonical ordered rules;
+presence without order does not prove the crossover rejection precedes egress
+acceptance. Missing kernel `ip6table_nat` support is recorded as
+`unavailable_ipv6_disabled` because IPv6 is disabled inside the Computer, but
+IPv6 filter failures remain fatal. Startup
+sweep removes unowned `wftch*`/`wftcg*` links and IPv4/IPv6 attempt rules, while
+orderly helper close tears down live network state and helper-owned Node-wide
+firewall/forwarding state. If the helper process crashes after enabling
+`net.ipv4.ip_forward`, startup sweep cannot prove its prior Node-wide value and
+therefore leaves it enabled; an orderly close restores only a value this helper
+observed as disabled. The authority-bound
+view, control, and directive paths remain private loopback bridges. Ordinary OCI
+jobs keep shared networking unchanged.
+
+Computer submission uses the helper reverse bridge as its only transport on
+every platform. Exactly four bridge pumps may be active per Computer attempt;
+additional guest connections wait behind that fixed concurrency bound.
+
+This screen mechanism does not by itself prove the complete isolation boundary.
+Other neighbour socket surfaces, process interactions, and file paths retain
+their existing namespace, cgroup, read-only-root, Storage, and mount controls,
+but complete crossover-refusal coverage for those categories remains a known
+gap. Shared operator-selected mounts in particular are not reclassified as
+isolated by this change.
 
 The Computer-specific profile adds a private `/dev/shm` tmpfs with a 1 GiB
 size ceiling, mode `1777`, and `nosuid,nodev,noexec`. It is created in the

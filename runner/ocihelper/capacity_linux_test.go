@@ -156,7 +156,9 @@ func TestJobUnbindingAndVerifiedBootSweepReleaseReservations(t *testing.T) {
 	if _, exists := engine.capacityReservations["job-a"]; exists || len(engine.capacityReservations) != 1 {
 		t.Fatalf("job unbinding did not release exactly its reservation: %+v", engine.capacityReservations)
 	}
-	engine.releaseVerifiedNamespace()
+	if err := engine.releaseVerifiedNamespace(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	if len(engine.capacityReservations) != 0 {
 		t.Fatalf("verified boot sweep retained reservations: %+v", engine.capacityReservations)
 	}

@@ -595,6 +595,17 @@ jobs:
             printf 'WEFTY_OCI_FAULT_DIR=%s\n' /tmp/wefty-oci-faults
             printf 'WEFTY_OCI_PROVISION_RECEIPT=%s\n' /tmp/wefty-oci-provision.txt
           } >> "$GITHUB_ENV"
+      - name: Prove the Computer DNS proxy in a root network namespace
+        if: runner.os == 'Linux'
+        env:
+          WEFTY_RUN_NETWORK_NAMESPACE_EGRESS_TEST: 1
+        run: |
+          set -euo pipefail
+          go_bin="$(command -v go)"
+          sudo env "PATH=$(dirname "$go_bin"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            WEFTY_RUN_NETWORK_NAMESPACE_EGRESS_TEST="$WEFTY_RUN_NETWORK_NAMESPACE_EGRESS_TEST" \
+            "$go_bin" test -count=1 -v ./runner/ocihelper \
+              -run '^(TestComputerDNSProxyForwardsLoopbackResolver|TestComputerDNSProxyRejectsNonDNSPayload|TestComputerNetworkUsesMountedResolverForLoopbackProxy)$'
       - name: Run service acceptance at production timings
         env:
           WEFTY_REALTIME_EVIDENCE_DIR: ${{ runner.temp }}/service-acceptance-realtiming

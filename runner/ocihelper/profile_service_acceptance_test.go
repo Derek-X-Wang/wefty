@@ -36,10 +36,13 @@ func TestServiceAcceptancePinnedRuntimeProfiles(t *testing.T) {
 				capabilities.Ambient == nil || len(capabilities.Ambient) != 0 {
 				t.Fatalf("golden capability sets do not match wefty-v1: %#v", capabilities)
 			}
-			if slices.ContainsFunc(profile.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
-				return namespace.Type == specs.NetworkNamespace || namespace.Type == specs.UserNamespace
+			hasNetworkNamespace := slices.ContainsFunc(profile.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
+				return namespace.Type == specs.NetworkNamespace
+			})
+			if hasNetworkNamespace != test.computer || slices.ContainsFunc(profile.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
+				return namespace.Type == specs.UserNamespace
 			}) {
-				t.Fatalf("golden contains an unsupported namespace: %#v", profile.Linux.Namespaces)
+				t.Fatalf("golden namespace policy does not match Computer isolation: %#v", profile.Linux.Namespaces)
 			}
 			architecture := specs.ArchX86_64
 			if test.architecture == "arm64" {

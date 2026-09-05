@@ -51,6 +51,9 @@ type NativeEngineConfig struct {
 	HostsPath                       string
 	AllowedMountRoots               []string
 	RuncExecutable                  string
+	IPExecutable                    string
+	IPTablesExecutable              string
+	IP6TablesExecutable             string
 	HostMountRoot                   string
 	GuestMountRoot                  string
 	AttemptPortMin                  uint16

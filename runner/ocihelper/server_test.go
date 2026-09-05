@@ -133,6 +133,7 @@ func TestRemovalInventoryDispatchKeepsHeartbeatsLiveAndRechecksRunAdmission(t *t
 	runRequest.Workload.Limits.MemoryBytes = 64 << 20
 	runRequest.Workload.ManagedVolumes = testComputerManagedVolumes()
 	runRequest.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	runRequest.EnableHostBridgeFallback, runRequest.ActivateHostBridgeFallback = true, true
 	engine.runResponse.Endpoints = map[string]uint16{contract.ComputerDisplayEndpointView: 31001, contract.ComputerDisplayEndpointControl: 31002}
 	runErr := make(chan error, 1)
 	go func() {
@@ -656,6 +657,7 @@ func TestComputerAttachmentConflictDoesNotInvalidateSession(t *testing.T) {
 		},
 	}}
 	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	request.EnableHostBridgeFallback, request.ActivateHostBridgeFallback = true, true
 	_, err = session.Run(t.Context(), request)
 	var refusal *RPCError
 	if !errors.As(err, &refusal) || refusal.Code != CodeComputerStorageBusy {
@@ -685,6 +687,7 @@ func TestComputerAttachmentConflictWithoutPositiveReapIsNotDefinitive(t *testing
 		},
 	}}
 	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	request.EnableHostBridgeFallback, request.ActivateHostBridgeFallback = true, true
 	_, err := session.Run(t.Context(), request)
 	close(responseRead)
 	if serveErr := <-serverDone; serveErr != nil {
@@ -718,6 +721,7 @@ func TestRetiredComputerStorageRefusalDoesNotInvalidateSession(t *testing.T) {
 		},
 	}}
 	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	request.EnableHostBridgeFallback, request.ActivateHostBridgeFallback = true, true
 	_, err = session.Run(t.Context(), request)
 	var refusal *RPCError
 	if !errors.As(err, &refusal) || refusal.Code != CodeComputerStorageRetired {
@@ -2663,6 +2667,7 @@ func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
 	request.Workload.Limits.MemoryBytes = 1 << 30
 	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
+	request.EnableHostBridgeFallback, request.ActivateHostBridgeFallback = true, true
 	if _, err := session.Run(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -2703,6 +2708,16 @@ func TestComputerEndpointContractFailsClosed(t *testing.T) {
 		request.AllocateEndpoints = endpoints
 		_, err := session.Run(t.Context(), request)
 		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	withoutPrivateBridge := testRunRequest(testAuthority(), time.Second)
+	withoutPrivateBridge.Authority.Class = contract.JobClassService
+	withoutPrivateBridge.Workload.Computer = true
+	withoutPrivateBridge.Workload.Limits.MemoryBytes = 1 << 30
+	withoutPrivateBridge.Workload.ManagedVolumes = testComputerManagedVolumes()
+	withoutPrivateBridge.AllocateEndpoints = []string{"view", "control"}
+	_, err = session.Run(t.Context(), withoutPrivateBridge)
+	if !strings.Contains(err.Error(), "private network namespace bridge") {
+		t.Fatalf("Computer without isolation bridge = %v", err)
 	}
 	oneShot := testRunRequest(testAuthority(), time.Second)
 	oneShot.Workload.Computer = true
@@ -2765,6 +2780,7 @@ func TestComputerControlStateRequiresExactLiveComputerAuthority(t *testing.T) {
 	computer.Workload.Limits.MemoryBytes = 1 << 30
 	computer.Workload.ManagedVolumes = testComputerManagedVolumes()
 	computer.AllocateEndpoints = []string{"view", "control"}
+	computer.EnableHostBridgeFallback, computer.ActivateHostBridgeFallback = true, true
 	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"view": 42011, "control": 42012}})
 	if _, err := session.Run(t.Context(), computer); err != nil {
 		t.Fatal(err)

@@ -72,6 +72,7 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	computerRequest.Workload.Limits.MemoryBytes = 1 << 30
 	computerRequest.Workload.ManagedVolumes = testComputerManagedVolumes()
 	computerRequest.AllocateEndpoints = []string{"view", "control"}
+	computerRequest.EnableHostBridgeFallback, computerRequest.ActivateHostBridgeFallback = true, true
 	if _, err := session.Run(ctx, computerRequest); err != nil {
 		t.Fatal(err)
 	}

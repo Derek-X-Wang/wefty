@@ -280,7 +280,8 @@ func BuildRuntimeSpec(ctx context.Context, input RuntimeSpecInput) (*RuntimeSpec
 		_ = retained.close()
 		return nil, &RuntimeSpecRejectionError{err: err}
 	}
-	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: profileReceipt(input.Workload)}, nil
+	receipt := profileReceipt(input.Workload)
+	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: receipt}, nil
 }
 
 func profileReceipt(workload WorkloadInput) ProfileReceipt {
@@ -436,7 +437,7 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	spec.Linux = &specs.Linux{
 		Devices:       isolationDevices(),
 		CgroupsPath:   input.CgroupPath,
-		Namespaces:    isolationNamespaces(),
+		Namespaces:    isolationNamespaces(input.Workload.Computer),
 		Resources:     resources,
 		MaskedPaths:   isolationMaskedPaths(),
 		ReadonlyPaths: isolationReadonlyPaths(),
@@ -589,14 +590,18 @@ func explicitIsolationCapabilities() *specs.LinuxCapabilities {
 	}
 }
 
-func isolationNamespaces() []specs.LinuxNamespace {
-	return []specs.LinuxNamespace{
+func isolationNamespaces(computer bool) []specs.LinuxNamespace {
+	namespaces := []specs.LinuxNamespace{
 		{Type: specs.PIDNamespace},
 		{Type: specs.IPCNamespace},
 		{Type: specs.UTSNamespace},
 		{Type: specs.MountNamespace},
 		{Type: specs.CgroupNamespace},
 	}
+	if computer {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+	}
+	return namespaces
 }
 
 func isolationDevices() []specs.LinuxDevice {

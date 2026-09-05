@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -37,6 +38,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"github.com/coder/websocket"
 )
+
+var linuxComputerIPv6RefusalErrnos = []string{"EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"}
+
+var linuxComputerAbstractSocketRefusalErrnos = []string{"ENOENT", "ECONNREFUSED"}
 
 func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt := newLinuxComputerMatrixReceipt()
@@ -172,6 +177,112 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"attempt_id": ready.CurrentJob.CurrentAttemptID, "storage_id": ready.StorageID,
 		"storage_generation": fmt.Sprint(ready.StorageGeneration), "intent_revision": fmt.Sprint(ready.IntentRevision),
 		"disk_path": diskEvidence.Path, "disk_blocks_bytes": fmt.Sprint(diskEvidence.BlocksBytes)})
+
+	receipt.begin("linux.network_egress")
+	readyEndpoints := readLiveComputerEndpointEnvironment(t, ready)
+	nodeListenerPort, stopNodeListener := startDualStackNodeBoundaryListener(t)
+	defer stopNodeListener()
+	nodeGatewayIPv6 := readComputerHostLinkIPv6(t, readyEndpoints.ViewPort)
+	egress := probeComputerNetworkEgress(t, ready, readyEndpoints, nodeGatewayIPv6, nodeListenerPort)
+	completeLinuxComputerRow(t, receipt, "linux.network_egress", map[string]bool{
+		"private_veth_address_present": egress.Address != "" && egress.Gateway != "" && egress.Address != egress.Gateway,
+		"mounted_resolver_recorded":    egress.ResolverSnapshot != "" && egress.ResolverAddress != "",
+		"loopback_proxy_listening":     !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUDPListening && egress.ProxyTCPListening,
+		"proxy_upstream_reachable":     !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUpstreamReachable,
+		"default_route_present":        egress.DefaultRouteInterface == "eth0" && egress.DefaultRouteGateway == egress.Gateway,
+		"public_ipv4_connected":        egress.PublicIPv4.Outcome == "connected",
+		"resolver_reachable":           egress.DNSOutcome == "resolved" && egress.ResolvedName == "example.com" && egress.ResolvedAddress != "",
+		"helper_http_through_veth":     egress.HelperHTTPStatus == 200 && egress.HelperHTTPBody == "wefty-computer-egress-v1" && !mutatingLinuxComputerRow("linux.network_egress"),
+		"node_listener_ipv4_refused":   egress.NodeListenerIPv4.Outcome == "refused" && egress.NodeListenerIPv4.ErrnoName == "ECONNREFUSED",
+		"node_listener_ipv6_refused":   egress.NodeListenerIPv6.Outcome == "refused" && slices.Contains(linuxComputerIPv6RefusalErrnos, egress.NodeListenerIPv6.ErrnoName),
+	}, map[string]string{
+		"computer_id": ready.ComputerID, "attempt_id": ready.CurrentJob.CurrentAttemptID,
+		"veth_address": egress.Address, "veth_gateway": egress.Gateway,
+		"resolver_snapshot": egress.ResolverSnapshot, "resolver_address": egress.ResolverAddress,
+		"proxy_udp_listening": strconv.FormatBool(egress.ProxyUDPListening), "proxy_tcp_listening": strconv.FormatBool(egress.ProxyTCPListening),
+		"proxy_upstream_address": egress.ProxyUpstreamAddress, "proxy_upstream_source": egress.ProxyUpstreamSource,
+		"proxy_upstream_reachable": strconv.FormatBool(egress.ProxyUpstreamReachable),
+		"default_route_interface":  egress.DefaultRouteInterface, "default_route_gateway": egress.DefaultRouteGateway,
+		"public_ipv4_address": egress.PublicIPv4.Address, "public_ipv4_outcome": egress.PublicIPv4.Outcome,
+		"public_ipv4_errno": egress.PublicIPv4.ErrnoName, "dns_outcome": egress.DNSOutcome,
+		"resolved_name": egress.ResolvedName, "resolved_address": egress.ResolvedAddress,
+		"helper_http_status": fmt.Sprint(egress.HelperHTTPStatus), "helper_http_body": egress.HelperHTTPBody,
+		"node_listener_ipv4_address": egress.NodeListenerIPv4.Address, "node_listener_ipv4_outcome": egress.NodeListenerIPv4.Outcome,
+		"node_listener_ipv4_errno":   egress.NodeListenerIPv4.ErrnoName,
+		"node_listener_ipv6_address": egress.NodeListenerIPv6.Address, "node_listener_ipv6_outcome": egress.NodeListenerIPv6.Outcome,
+		"node_listener_ipv6_errno": egress.NodeListenerIPv6.ErrnoName,
+	})
+
+	receipt.begin("linux.screen_crossover_refused")
+	neighbour := createReadyComputer(t, harness, reference, digest, "linux-native-crossover-neighbour", "linux-native-crossover-neighbour-create")
+	recordComputerAuthority(receipt, neighbour)
+	probeTarget := neighbour
+	if mutatingLinuxComputerRow("linux.screen_crossover_refused") {
+		// The negative lane targets the source Computer's own endpoints. Those
+		// must remain readable/controllable, proving the refusal assertions are
+		// sensitive to a real reachable screen rather than fixed receipt values.
+		probeTarget = ready
+	}
+	targetEndpoints := readLiveComputerEndpointEnvironment(t, probeTarget)
+	stopEgressListener := startLiveComputerEgressListener(t, probeTarget, targetEndpoints.Address)
+	egressAlive := probeLiveComputerEgressListener(t, probeTarget, targetEndpoints.Address)
+	crossover := probeComputerScreenCrossover(t, ready, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort)
+	// The target-local success immediately after A's refusals proves the target
+	// screen and test listener were alive at the same boundary edge.
+	liveness := probeComputerScreenCrossover(t, probeTarget, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort)
+	stopEgressListener()
+	removedNeighbour := removeAndWaitComputer(t, harness, neighbour, 4*time.Minute)
+	crossoverRefused := crossover.ViewRead.Outcome == "refused" && crossover.ViewRead.ErrnoName == "ECONNREFUSED" &&
+		crossover.ControlInject.Outcome == "refused" && crossover.ControlInject.ErrnoName == "ECONNREFUSED" &&
+		crossover.EgressAddress.Outcome == "refused" && crossover.EgressAddress.ErrnoName == "ECONNREFUSED" &&
+		crossover.NodeListenerIPv6.Outcome == "refused" && slices.Contains(linuxComputerIPv6RefusalErrnos, crossover.NodeListenerIPv6.ErrnoName)
+	targetAlive := egressAlive && liveness.ViewRead.Outcome == "read_succeeded" && liveness.ControlInject.Outcome == "inject_succeeded" && liveness.EgressAddress.Outcome == "connected"
+	if variant == "xfce" {
+		crossoverRefused = crossoverRefused && !crossover.AbstractSocketVisible &&
+			crossover.AbstractSocket.Outcome == "refused" && slices.Contains(linuxComputerAbstractSocketRefusalErrnos, crossover.AbstractSocket.ErrnoName) &&
+			crossover.DerivedDisplay.Outcome == "transport_refused" && crossover.DerivedDisplay.Class == "x_transport"
+		targetAlive = targetAlive && liveness.AbstractSocketVisible && liveness.AbstractSocket.Outcome == "connected" && liveness.DerivedDisplay.Outcome == "read_succeeded"
+	}
+	completeLinuxComputerRow(t, receipt, "linux.screen_crossover_refused", map[string]bool{
+		"two_colocated_computers_live": ready.CurrentJob.CurrentAttemptID != "" && neighbour.CurrentJob.CurrentAttemptID != "" && ready.ComputerID != neighbour.ComputerID,
+		"target_alive_at_refusal_edge": targetAlive,
+		"crossover_refused":            crossoverRefused,
+		"neighbour_removed_verified":   removedNeighbour.RemovalOutcome == "removed_verified",
+	}, map[string]string{
+		"source_computer_id":         ready.ComputerID,
+		"source_attempt_id":          ready.CurrentJob.CurrentAttemptID,
+		"target_computer_id":         probeTarget.ComputerID,
+		"target_attempt_id":          probeTarget.CurrentJob.CurrentAttemptID,
+		"target_view_port":           fmt.Sprint(targetEndpoints.ViewPort),
+		"target_control_port":        fmt.Sprint(targetEndpoints.ControlPort),
+		"target_egress_address":      targetEndpoints.Address,
+		"target_veth_gateway":        targetEndpoints.Gateway,
+		"target_egress_port":         fmt.Sprint(liveComputerEgressListenerPort),
+		"target_liveness_view":       liveness.ViewRead.Outcome,
+		"target_liveness_control":    liveness.ControlInject.Outcome,
+		"target_liveness_x":          liveness.DerivedDisplay.Outcome,
+		"target_liveness_egress":     liveness.EgressAddress.Outcome,
+		"abstract_socket":            crossover.AbstractSocketName,
+		"abstract_socket_visible":    strconv.FormatBool(crossover.AbstractSocketVisible),
+		"abstract_socket_outcome":    crossover.AbstractSocket.Outcome,
+		"abstract_socket_errno":      crossover.AbstractSocket.ErrnoName,
+		"derived_display":            crossover.DerivedDisplay.Address,
+		"derived_display_outcome":    crossover.DerivedDisplay.Outcome,
+		"derived_display_class":      crossover.DerivedDisplay.Class,
+		"view_read_outcome":          crossover.ViewRead.Outcome,
+		"view_read_address":          crossover.ViewRead.Address,
+		"view_read_errno":            crossover.ViewRead.ErrnoName,
+		"control_inject_outcome":     crossover.ControlInject.Outcome,
+		"control_inject_address":     crossover.ControlInject.Address,
+		"control_inject_errno":       crossover.ControlInject.ErrnoName,
+		"egress_address_outcome":     crossover.EgressAddress.Outcome,
+		"egress_address_target":      crossover.EgressAddress.Address,
+		"egress_address_errno":       crossover.EgressAddress.ErrnoName,
+		"node_listener_ipv6_address": crossover.NodeListenerIPv6.Address,
+		"node_listener_ipv6_outcome": crossover.NodeListenerIPv6.Outcome,
+		"node_listener_ipv6_errno":   crossover.NodeListenerIPv6.ErrnoName,
+		"neighbour_removal_outcome":  removedNeighbour.RemovalOutcome,
+	})
 
 	receipt.begin("linux.remote_takeover")
 	viewerIdentity := runComputerCLIPersonWithEvidence[l1.AuthenticatedPerson](t, evidence, "whoami-cli-viewer.json", harness, "linux-viewer", "linux-viewer-device", "whoami")
@@ -784,6 +895,595 @@ func stringSetDifference(before, after []string) []string {
 		}
 	}
 	return removed
+}
+
+type liveComputerEndpointEnvironment struct {
+	ViewPort    int    `json:"view_port"`
+	ControlPort int    `json:"control_port"`
+	Address     string `json:"address"`
+	Gateway     string `json:"gateway"`
+}
+
+type computerNetworkEgressReceipt struct {
+	Version                int                    `json:"version"`
+	ComputerID             string                 `json:"computer_id"`
+	Address                string                 `json:"address"`
+	Gateway                string                 `json:"gateway"`
+	ResolverSnapshot       string                 `json:"resolver_snapshot"`
+	ResolverAddress        string                 `json:"resolver_address"`
+	ProxyUDPListening      bool                   `json:"proxy_udp_listening"`
+	ProxyTCPListening      bool                   `json:"proxy_tcp_listening"`
+	ProxyUpstreamAddress   string                 `json:"proxy_upstream_address"`
+	ProxyUpstreamSource    string                 `json:"proxy_upstream_source"`
+	ProxyUpstreamReachable bool                   `json:"proxy_upstream_reachable"`
+	DefaultRouteInterface  string                 `json:"default_route_interface"`
+	DefaultRouteGateway    string                 `json:"default_route_gateway"`
+	PublicIPv4             screenCrossoverAttempt `json:"public_ipv4"`
+	DNSOutcome             string                 `json:"dns_outcome"`
+	ResolvedName           string                 `json:"resolved_name"`
+	ResolvedAddress        string                 `json:"resolved_address"`
+	HelperHTTPStatus       int                    `json:"helper_http_status"`
+	HelperHTTPBody         string                 `json:"helper_http_body"`
+	NodeListenerIPv4       screenCrossoverAttempt `json:"node_listener_ipv4"`
+	NodeListenerIPv6       screenCrossoverAttempt `json:"node_listener_ipv6"`
+}
+
+type screenCrossoverAttempt struct {
+	Address   string `json:"address"`
+	Outcome   string `json:"outcome"`
+	Class     string `json:"class,omitempty"`
+	Errno     int    `json:"errno,omitempty"`
+	ErrnoName string `json:"errno_name,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+type screenCrossoverReceipt struct {
+	Version               int                    `json:"version"`
+	Variant               string                 `json:"variant"`
+	SourceComputerID      string                 `json:"source_computer_id"`
+	TargetComputerID      string                 `json:"target_computer_id"`
+	AbstractSocketName    string                 `json:"abstract_socket_name"`
+	AbstractSocketVisible bool                   `json:"abstract_socket_visible"`
+	AbstractSocket        screenCrossoverAttempt `json:"abstract_socket"`
+	DerivedDisplay        screenCrossoverAttempt `json:"derived_display"`
+	ViewRead              screenCrossoverAttempt `json:"view_read"`
+	ControlInject         screenCrossoverAttempt `json:"control_inject"`
+	EgressAddress         screenCrossoverAttempt `json:"egress_address"`
+	NodeListenerIPv6      screenCrossoverAttempt `json:"node_listener_ipv6"`
+}
+
+func startDualStackNodeBoundaryListener(t *testing.T) (int, func()) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "[::]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_, _ = connection.Write([]byte("wefty-node-boundary-live\n"))
+			_ = connection.Close()
+		}
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	for _, target := range []struct{ network, address string }{
+		{"tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(port))},
+		{"tcp6", net.JoinHostPort("::1", fmt.Sprint(port))},
+	} {
+		connection, dialErr := net.DialTimeout(target.network, target.address, time.Second)
+		if dialErr != nil {
+			_ = listener.Close()
+			t.Fatalf("Node boundary listener is not live on %s %s: %v", target.network, target.address, dialErr)
+		}
+		_ = connection.Close()
+	}
+	return port, func() { _ = listener.Close() }
+}
+
+func readComputerHostLinkIPv6(t *testing.T, viewPort int) string {
+	t.Helper()
+	link := fmt.Sprintf("wftch%d", viewPort)
+	output, err := exec.Command("sudo", "/usr/sbin/ip", "-6", "-o", "addr", "show", "dev", link, "scope", "link").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read Computer host veth IPv6 address: %v\n%s", err, output)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		for index, field := range fields {
+			if field == "inet6" && index+1 < len(fields) {
+				address, _, _ := strings.Cut(fields[index+1], "/")
+				if strings.HasPrefix(address, "fe80:") {
+					return address
+				}
+			}
+		}
+	}
+	t.Fatalf("Computer host link %s has no link-local IPv6 address", link)
+	return ""
+}
+
+const liveComputerEndpointEnvironmentPython = `
+import json, socket, struct
+values = {}
+for item in open("/proc/1/environ", "rb").read().split(b"\0"):
+    if b"=" in item:
+        key, value = item.split(b"=", 1)
+        values[key.decode()] = value.decode()
+gateway = ""
+for line in open("/proc/net/route", encoding="utf-8").read().splitlines()[1:]:
+    fields = line.split()
+    if len(fields) >= 3 and fields[1] == "00000000":
+        gateway = socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+        break
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.connect((gateway, int(values["WEFTY_COMPUTER_VIEW_PORT"])))
+address = probe.getsockname()[0]
+probe.close()
+print(json.dumps({
+    "view_port": int(values["WEFTY_COMPUTER_VIEW_PORT"]),
+    "control_port": int(values["WEFTY_COMPUTER_CONTROL_PORT"]),
+    "address": address,
+    "gateway": gateway,
+}))
+`
+
+const liveComputerNetworkEgressPython = `
+import errno, http.client, json, socket, struct, sys
+computer_id, address, gateway, view_text, node_ipv6, node_port_text = sys.argv[1:7]
+view_port, node_port = int(view_text), int(node_port_text)
+
+def refused(target, error):
+    number = error.errno or 0
+    return {"address": target, "outcome": "refused", "errno": number,
+            "errno_name": errno.errorcode.get(number, type(error).__name__), "detail": str(error)}
+
+def attempted_connect(host, port):
+    target = host + ":" + str(port)
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect((host, port))
+        return {"address": target, "outcome": "connected"}
+    except OSError as error:
+        return refused(target, error)
+    finally:
+        connection.close()
+
+def socket_present(path, host, port, tcp):
+    encoded = "%08X:%04X" % (struct.unpack("<I", socket.inet_aton(host))[0], port)
+    with open(path, "r", encoding="ascii") as table:
+        for line in table.readlines()[1:]:
+            fields = line.split()
+            if len(fields) > 3 and fields[1] == encoded and (not tcp or fields[3] == "0A"):
+                return True
+    return False
+
+with open("/etc/resolv.conf", "r", encoding="utf-8") as resolver_file:
+    resolver_snapshot = resolver_file.read()
+resolver_address = ""
+for line in resolver_snapshot.splitlines():
+    fields = line.split()
+    if len(fields) >= 2 and fields[0] == "nameserver":
+        try:
+            if socket.inet_aton(fields[1]):
+                resolver_address = fields[1]
+                break
+        except OSError:
+            pass
+proxy_udp = bool(resolver_address) and socket_present("/proc/net/udp", resolver_address, 53, False)
+proxy_tcp = bool(resolver_address) and socket_present("/proc/net/tcp", resolver_address, 53, True)
+
+route_interface, route_gateway = "", ""
+with open("/proc/net/route", "r", encoding="ascii") as route_file:
+    for line in route_file.readlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == "00000000":
+            route_interface = fields[0]
+            route_gateway = socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+            break
+
+helper = http.client.HTTPConnection(gateway, view_port, timeout=5)
+helper.request("GET", "/health")
+response = helper.getresponse()
+helper_status = response.status
+helper_body = response.read().decode().strip()
+helper.close()
+public_ipv4 = attempted_connect("1.1.1.1", 443)
+
+dns_outcome, resolved = "egress_dns_unavailable", ""
+try:
+    resolved = socket.getaddrinfo("example.com", 443, family=socket.AF_INET, type=socket.SOCK_STREAM)[0][4][0]
+    dns_outcome = "resolved"
+except socket.gaierror:
+    pass
+node_ipv4_address = gateway + ":" + str(node_port)
+connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    connection.settimeout(5)
+    connection.connect((gateway, node_port))
+    node_ipv4 = {"address": node_ipv4_address, "outcome": "connected"}
+except OSError as error:
+    node_ipv4 = refused(node_ipv4_address, error)
+finally:
+    connection.close()
+node_ipv6_address = "[" + node_ipv6 + "%eth0]:" + str(node_port)
+connection = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+try:
+    connection.settimeout(5)
+    connection.connect((node_ipv6, node_port, 0, socket.if_nametoindex("eth0")))
+    node_ipv6_result = {"address": node_ipv6_address, "outcome": "connected"}
+except OSError as error:
+    node_ipv6_result = refused(node_ipv6_address, error)
+finally:
+    connection.close()
+print(json.dumps({
+    "version": 2,
+    "computer_id": computer_id,
+    "address": address,
+    "gateway": gateway,
+    "resolver_snapshot": resolver_snapshot,
+    "resolver_address": resolver_address,
+    "proxy_udp_listening": proxy_udp,
+    "proxy_tcp_listening": proxy_tcp,
+    "default_route_interface": route_interface,
+    "default_route_gateway": route_gateway,
+    "public_ipv4": public_ipv4,
+    "dns_outcome": dns_outcome,
+    "resolved_name": "example.com",
+    "resolved_address": resolved,
+    "helper_http_status": helper_status,
+    "helper_http_body": helper_body,
+    "node_listener_ipv4": node_ipv4,
+    "node_listener_ipv6": node_ipv6_result,
+}, sort_keys=True))
+`
+
+func probeComputerNetworkEgress(t *testing.T, computer l1.Computer, endpoints liveComputerEndpointEnvironment, nodeIPv6 string, nodePort int) computerNetworkEgressReceipt {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, computer.CurrentJobID)
+	execID := fmt.Sprintf("network-egress-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerNetworkEgressPython,
+		computer.ComputerID, endpoints.Address, endpoints.Gateway, fmt.Sprint(endpoints.ViewPort), nodeIPv6, fmt.Sprint(nodePort)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("execute Computer network egress probe: %v\n%s", err, output)
+	}
+	var receipt computerNetworkEgressReceipt
+	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
+	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &receipt) != nil || receipt.Version != 2 || receipt.ComputerID != computer.ComputerID {
+		t.Fatalf("decode Computer network egress receipt: %s", output)
+	}
+	resolverIP := net.ParseIP(receipt.ResolverAddress)
+	if resolverIP != nil && resolverIP.IsLoopback() {
+		upstream, upstreamErr := ocihelper.ObserveComputerDNSUpstream(t.Context(), receipt.ResolverAddress)
+		if upstreamErr == nil {
+			receipt.ProxyUpstreamAddress = upstream.Address
+			receipt.ProxyUpstreamSource = upstream.Source
+			receipt.ProxyUpstreamReachable = upstream.Reachable
+		}
+	}
+	t.Logf("Computer egress computer=%s address=%s gateway=%s route=%s/%s resolver=%s proxy_udp=%t proxy_tcp=%t upstream=%s source=%s reachable=%t dns=%s resolved=%s public=%s helper_status=%d node_v4=%s errno=%s node_v6=%s errno=%s",
+		receipt.ComputerID, receipt.Address, receipt.Gateway, receipt.DefaultRouteInterface, receipt.DefaultRouteGateway,
+		receipt.ResolverAddress, receipt.ProxyUDPListening, receipt.ProxyTCPListening, receipt.ProxyUpstreamAddress,
+		receipt.ProxyUpstreamSource, receipt.ProxyUpstreamReachable, receipt.DNSOutcome, receipt.ResolvedAddress, receipt.PublicIPv4.Outcome, receipt.HelperHTTPStatus,
+		receipt.NodeListenerIPv4.Outcome, receipt.NodeListenerIPv4.ErrnoName, receipt.NodeListenerIPv6.Outcome, receipt.NodeListenerIPv6.ErrnoName)
+	return receipt
+}
+
+const liveComputerScreenCrossoverPython = `
+import base64, errno, json, os, socket, struct, subprocess, sys
+
+variant, source_id, target_id, view_text, control_text, egress_address, egress_port_text, node_ipv6, node_port_text = sys.argv[1:10]
+view_port, control_port, egress_port, node_port = int(view_text), int(control_text), int(egress_port_text), int(node_port_text)
+target_host = "127.0.0.1" if source_id == target_id else egress_address
+
+def refused(address, error):
+    number = error.errno or 0
+    return {"address": address, "outcome": "refused", "errno": number,
+            "errno_name": errno.errorcode.get(number, type(error).__name__), "detail": str(error)}
+
+def recv_exact(connection, count):
+    result = b""
+    while len(result) < count:
+        chunk = connection.recv(count - len(result))
+        if not chunk:
+            raise EOFError("peer closed the WebSocket stream")
+        result += chunk
+    return result
+
+class websocket_stream:
+    def __init__(self, connection):
+        self.connection = connection
+        self.buffer = b""
+
+    def send(self, payload):
+        mask = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            header = bytes([0x82, 0x80 | length])
+        elif length < 65536:
+            header = bytes([0x82, 0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([0x82, 0x80 | 127]) + struct.pack("!Q", length)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self.connection.sendall(header + mask + masked)
+
+    def frame(self):
+        first, second = recv_exact(self.connection, 2)
+        opcode, length = first & 0x0f, second & 0x7f
+        if length == 126:
+            length = struct.unpack("!H", recv_exact(self.connection, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", recv_exact(self.connection, 8))[0]
+        if second & 0x80:
+            mask = recv_exact(self.connection, 4)
+            payload = recv_exact(self.connection, length)
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        else:
+            payload = recv_exact(self.connection, length)
+        if opcode == 0x8:
+            raise EOFError("peer closed the WebSocket")
+        if opcode == 0x9:
+            self.send(payload)
+            return self.frame()
+        return payload
+
+    def read(self, count):
+        while len(self.buffer) < count:
+            self.buffer += self.frame()
+        result, self.buffer = self.buffer[:count], self.buffer[count:]
+        return result
+
+def rfb_attempt(port, inject):
+    address = target_host + ":" + str(port)
+    connection = None
+    try:
+        connection = socket.create_connection((target_host, port), timeout=5)
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = ("GET /websockify HTTP/1.1\r\nHost: " + address +
+                   "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+                   "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key +
+                   "\r\nSec-WebSocket-Protocol: binary\r\n\r\n").encode()
+        connection.sendall(request)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += connection.recv(1)
+            if len(response) > 16384:
+                raise ValueError("oversized WebSocket response")
+        if not response.startswith(b"HTTP/1.1 101"):
+            raise RuntimeError("WebSocket upgrade refused: " + response.decode(errors="replace"))
+        stream = websocket_stream(connection)
+        if not stream.read(12).startswith(b"RFB 003."):
+            raise RuntimeError("RFB banner missing")
+        stream.send(b"RFB 003.008\n")
+        count = stream.read(1)[0]
+        security = stream.read(count)
+        if 1 not in security:
+            raise RuntimeError("RFB None security unavailable")
+        stream.send(b"\x01")
+        if stream.read(4) != b"\x00\x00\x00\x00":
+            raise RuntimeError("RFB security failed")
+        stream.send(b"\x01")
+        server_init = stream.read(24)
+        stream.read(struct.unpack("!I", server_init[20:24])[0])
+        if inject:
+            stream.send(b"\x05\x01\x00\x11\x00\x13")
+            stream.send(b"\x05\x00\x00\x11\x00\x13")
+            outcome = "inject_succeeded"
+        else:
+            outcome = "read_succeeded"
+        return {"address": address, "outcome": outcome}
+    except OSError as error:
+        return refused(address, error)
+    except Exception as error:
+        return {"address": address, "outcome": "protocol_error", "detail": type(error).__name__ + ":" + str(error)}
+    finally:
+        if connection is not None:
+            connection.close()
+
+abstract_name = "@/tmp/.X11-unix/X" + str(view_port)
+abstract_visible = False
+abstract_attempt = {"address": abstract_name, "outcome": "not_applicable"}
+display_attempt = {"address": ":" + str(view_port), "outcome": "not_applicable"}
+if variant == "xfce":
+    abstract_visible = any(len(line.split()) >= 8 and line.split()[-1] == abstract_name
+                           for line in open("/proc/net/unix", encoding="utf-8"))
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect("\0/tmp/.X11-unix/X" + str(view_port))
+        abstract_attempt = {"address": abstract_name, "outcome": "connected"}
+    except OSError as error:
+        abstract_attempt = refused(abstract_name, error)
+    finally:
+        connection.close()
+    display = subprocess.run(["/usr/bin/xdpyinfo", "-display", ":" + str(view_port)],
+                             text=True, capture_output=True, timeout=5)
+    detail = display.stderr.strip()[-512:]
+    if display.returncode == 0:
+        display_attempt = {"address": ":" + str(view_port), "outcome": "read_succeeded"}
+    elif "authorization required" in detail.lower() or "no protocol specified" in detail.lower():
+        display_attempt = {"address": ":" + str(view_port), "outcome": "auth_refused", "class": "x_auth", "detail": detail}
+    elif "unable to open display" in detail.lower():
+        display_attempt = {"address": ":" + str(view_port), "outcome": "transport_refused", "class": "x_transport", "detail": detail}
+    else:
+        display_attempt = {"address": ":" + str(view_port), "outcome": "other_error", "class": "x_other", "detail": detail}
+
+def tcp_attempt(host, port):
+    address = host + ":" + str(port)
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect((host, port))
+        return {"address": address, "outcome": "connected"}
+    except OSError as error:
+        return refused(address, error)
+    finally:
+        connection.close()
+
+def tcp6_attempt(host, port):
+    address = "[" + host + "%eth0]:" + str(port)
+    connection = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect((host, port, 0, socket.if_nametoindex("eth0")))
+        return {"address": address, "outcome": "connected"}
+    except OSError as error:
+        return refused(address, error)
+    finally:
+        connection.close()
+
+print(json.dumps({
+    "version": 1,
+    "variant": variant,
+    "source_computer_id": source_id,
+    "target_computer_id": target_id,
+    "abstract_socket_name": abstract_name,
+    "abstract_socket_visible": abstract_visible,
+    "abstract_socket": abstract_attempt,
+    "derived_display": display_attempt,
+    "view_read": rfb_attempt(view_port, False),
+    "control_inject": rfb_attempt(control_port, True),
+    "egress_address": tcp_attempt(egress_address, egress_port),
+    "node_listener_ipv6": tcp6_attempt(node_ipv6, node_port),
+}, sort_keys=True))
+`
+
+const liveComputerEgressListenerPort = 43999
+
+const liveComputerEgressListenerPython = `
+import socket, sys
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((sys.argv[1], int(sys.argv[2])))
+listener.listen(8)
+while True:
+    connection, _ = listener.accept()
+    connection.sendall(b"wefty-crossover-live\n")
+    connection.close()
+`
+
+const liveComputerTCPProbePython = `
+import socket, sys, time
+deadline = time.time() + 10
+last = None
+while time.time() < deadline:
+    try:
+        connection = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1)
+        payload = connection.recv(64)
+        connection.close()
+        if payload == b"wefty-crossover-live\n":
+            print("live")
+            sys.exit(0)
+    except OSError as error:
+        last = error
+    time.sleep(0.1)
+raise SystemExit("listener unavailable: " + str(last))
+`
+
+func startLiveComputerEgressListener(t *testing.T, computer l1.Computer, address string) func() {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, computer.CurrentJobID)
+	execID := fmt.Sprintf("egress-listener-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--detach", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerEgressListenerPython,
+		address, fmt.Sprint(liveComputerEgressListenerPort)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("start Computer egress crossover listener: %v\n%s", err, output)
+	}
+	return func() {
+		_, _ = exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+			"tasks", "kill", "--exec-id", execID, "--signal", "SIGKILL", containerID).CombinedOutput()
+	}
+}
+
+func probeLiveComputerEgressListener(t *testing.T, computer l1.Computer, address string) bool {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, computer.CurrentJobID)
+	execID := fmt.Sprintf("egress-liveness-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerTCPProbePython,
+		address, fmt.Sprint(liveComputerEgressListenerPort)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("probe Computer egress crossover listener locally: %v\n%s", err, output)
+	}
+	return strings.TrimSpace(string(output)) == "live"
+}
+
+func readLiveComputerEndpointEnvironment(t *testing.T, computer l1.Computer) liveComputerEndpointEnvironment {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, computer.CurrentJobID)
+	execID := fmt.Sprintf("computer-endpoints-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerEndpointEnvironmentPython).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read live Computer endpoint environment: %v\n%s", err, output)
+	}
+	var environment liveComputerEndpointEnvironment
+	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
+	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &environment) != nil || environment.ViewPort <= 0 || environment.ControlPort <= 0 || environment.ViewPort == environment.ControlPort || environment.Address == "" || environment.Gateway == "" || environment.Address == environment.Gateway {
+		t.Fatalf("decode live Computer endpoint environment: %s", output)
+	}
+	return environment
+}
+
+func probeComputerScreenCrossover(t *testing.T, source, target l1.Computer, variant string, endpoints liveComputerEndpointEnvironment, nodeIPv6 string, nodePort int) screenCrossoverReceipt {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, source.CurrentJobID)
+	execID := fmt.Sprintf("screen-crossover-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerScreenCrossoverPython,
+		variant, source.ComputerID, target.ComputerID, fmt.Sprint(endpoints.ViewPort), fmt.Sprint(endpoints.ControlPort), endpoints.Address, fmt.Sprint(liveComputerEgressListenerPort), nodeIPv6, fmt.Sprint(nodePort)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("execute Computer screen crossover probe: %v\n%s", err, output)
+	}
+	var receipt screenCrossoverReceipt
+	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
+	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &receipt) != nil || receipt.Version != 1 || receipt.SourceComputerID != source.ComputerID || receipt.TargetComputerID != target.ComputerID {
+		t.Fatalf("decode Computer screen crossover receipt: %s", output)
+	}
+	t.Logf("screen crossover source=%s target=%s abstract=%s errno=%s display=%s class=%s view=%s errno=%s control=%s errno=%s egress=%s errno=%s",
+		receipt.SourceComputerID, receipt.TargetComputerID, receipt.AbstractSocket.Outcome, receipt.AbstractSocket.ErrnoName,
+		receipt.DerivedDisplay.Outcome, receipt.DerivedDisplay.Class, receipt.ViewRead.Outcome, receipt.ViewRead.ErrnoName,
+		receipt.ControlInject.Outcome, receipt.ControlInject.ErrnoName, receipt.EgressAddress.Outcome, receipt.EgressAddress.ErrnoName)
+	return receipt
+}
+
+func TestScreenCrossoverProbeRecordsTypedTransportRefusal(t *testing.T) {
+	ports := make([]int, 0, 2)
+	for range 2 {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ports = append(ports, listener.Addr().(*net.TCPAddr).Port)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output, err := exec.Command("python3", "-c", liveComputerScreenCrossoverPython,
+		"wayland", "source", "target", fmt.Sprint(ports[0]), fmt.Sprint(ports[1]), "127.0.0.1", fmt.Sprint(ports[0]), "::1", "1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("execute crossover probe contract: %v\n%s", err, output)
+	}
+	var receipt screenCrossoverReceipt
+	if err := json.Unmarshal(bytes.TrimSpace(output), &receipt); err != nil {
+		t.Fatalf("decode crossover probe contract: %v\n%s", err, output)
+	}
+	if receipt.ViewRead.Outcome != "refused" || receipt.ViewRead.ErrnoName != "ECONNREFUSED" ||
+		receipt.ControlInject.Outcome != "refused" || receipt.ControlInject.ErrnoName != "ECONNREFUSED" ||
+		receipt.EgressAddress.Outcome != "refused" || receipt.EgressAddress.ErrnoName != "ECONNREFUSED" ||
+		receipt.AbstractSocket.Outcome != "not_applicable" || receipt.DerivedDisplay.Outcome != "not_applicable" {
+		t.Fatalf("typed crossover refusal = %+v", receipt)
+	}
 }
 
 func TestCompareRemovalInventoryBaselineAllowsOnlySelfGCContraction(t *testing.T) {

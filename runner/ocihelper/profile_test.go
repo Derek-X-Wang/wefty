@@ -261,9 +261,14 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 		t.Fatalf("Computer changed image USER/ENTRYPOINT/CMD or privilege boundary: %+v", spec.Process)
 	}
 	if spec.Process.Capabilities == nil || !slices.Equal(spec.Process.Capabilities.Bounding, isolationCapabilities) ||
-		spec.Linux == nil || spec.Linux.Seccomp == nil || !slices.Equal(spec.Linux.Namespaces, isolationNamespaces()) ||
+		spec.Linux == nil || spec.Linux.Seccomp == nil || !slices.Equal(spec.Linux.Namespaces, isolationNamespaces(true)) ||
 		len(spec.Linux.Devices) != len(isolationDevices()) {
 		t.Fatal("Computer profile diverged from the ordinary M3 isolation walls")
+	}
+	if !slices.ContainsFunc(spec.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
+		return namespace.Type == specs.NetworkNamespace
+	}) {
+		t.Fatalf("Computer profile omitted its private network namespace: %#v", spec.Linux.Namespaces)
 	}
 	for _, device := range spec.Linux.Devices {
 		if strings.Contains(device.Path, "dri") || strings.Contains(device.Path, "nvidia") {
@@ -278,12 +283,23 @@ func TestComputerProfileReceiptExposesTmpfsCeilingsWithoutAdmissionRejection(t *
 	if receipt.ComputerTmpfsCeilingBytes != 1600<<20 || receipt.LargestTmpfsTarget != "/dev/shm" || receipt.LargestTmpfsCeilingBytes != 1<<30 {
 		t.Fatalf("Computer profile receipt = %+v", receipt)
 	}
+	if receipt.NetworkNamespacePresent || receipt.HelperNetworkNamespaceInode != "" || receipt.TaskNetworkNamespaceInode != "" || receipt.HostAbstractSocketVisible {
+		t.Fatalf("serialized profile inferred runtime isolation facts: %+v", receipt)
+	}
 	if len(receipt.Warnings) != 2 || receipt.Warnings[0].Code != ProfileWarningTmpfsCeilingExceedsMemory || receipt.Warnings[1].Code != ProfileWarningTmpfsCombinedExceedsMemory {
 		t.Fatalf("typed profile warnings = %+v", receipt.Warnings)
 	}
 	ordinary := profileReceipt(WorkloadInput{Limits: WorkloadLimits{MemoryBytes: 64 << 20}})
 	if ordinary.ComputerTmpfsCeilingBytes != 0 || len(ordinary.Warnings) != 0 {
 		t.Fatalf("ordinary profile inherited Computer ceilings: %+v", ordinary)
+	}
+}
+
+func TestIsolationCapabilitiesExcludeNetworkAdministration(t *testing.T) {
+	for _, capability := range []string{"CAP_NET_ADMIN", "CAP_NET_RAW"} {
+		if slices.Contains(isolationCapabilities, capability) {
+			t.Fatalf("ordinary OCI capability policy includes %s; Computer transparent-socket isolation depends on its absence", capability)
+		}
 	}
 }
 

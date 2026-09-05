@@ -183,7 +183,10 @@ failed quiescence proof and does not authorize a namespace sweep.
 
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
-`permission_denied`, `retention_bound_exceeded`, or `operation_failed`). Raw privileged error text,
+`permission_denied`, `retention_bound_exceeded`, `egress_dns_unavailable`, or
+`operation_failed`). The DNS reason means neither the advertised non-loopback
+resolver nor the Node-loopback stub answered the helper's bounded preflight.
+Raw privileged error text,
 containerd types, and host paths remain local. The Computer reimage preflight
 may additionally report the fixed positive-detachment refusal so native
 evidence distinguishes that durable authority mismatch; the closed fact,
@@ -325,8 +328,8 @@ heartbeats.
 | --- | --- |
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. The agent supplies the canonical platform retained from the successful probe for this helper generation; manifest selection and image singleflight are keyed by it. The sole offline-bootstrap exception is the clean-cache `node load-image` archive import that must precede that probe: it may use the current helper diagnostic OS/architecture after OCI default-variant normalization, but it does not retain or promote that diagnostic fact as probe evidence. Every registry delivery, binding pin, and other caller remains gated on the probe-retained canonical platform, and later probe evidence must select the same archived platform digest. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks that platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly that platform, and imports/unpacks it. Both modes return the same complete image evidence used by `Run`, including top-level/platform digests, platform, runtime handler, and snapshotter; no containerd type, private registry credential, or retry policy crosses the boundary. |
 | `ImageCacheStatus` | Session-authorized read of namespace content bytes, applied cap, and the last completed eviction. It never enforces the cap or changes a pin. |
-| `DoctorStatus` | Session-authorized read of runtime platform, containerd/runc versions, allowed mount roots, and bounded `ImageCacheStatus`. Each sub-read carries its own assertion-derived receipt, so a partial failure does not erase the authenticated handshake or successful siblings. Runc comes only from containerd runtime info or a setup-resolved absolute executable path; the privileged helper never performs an operator-triggered PATH lookup. A whole-RPC failure uses `diagnostic_failure`, which is explicitly not runtime-loss evidence: the client does not invalidate the session, reap attempts, or withdraw capability. It never acquires a session, probes, sweeps, starts a task, mutates policy, or evicts content. |
-| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started`, the helper-captured `started_at` timestamp from that exact edge, assertion-derived profile evidence, helper-observed image evidence, and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. A live Computer Storage attachment refuses a different attempt with `computer_storage_busy`; this is definitive no-runtime evidence for only the losing attempt and never changes the live owner's authority. An explicit Mac bridge-fallback preparation creates a separate guest loopback listener and capability; activation rewrites the start-time endpoint, while a dormant preparation exposes nothing to a default-off Computer and remains available for a later policy enable. |
+| `DoctorStatus` | Session-authorized read of runtime platform, containerd/runc versions, allowed mount roots, bounded `ImageCacheStatus`, and the actually observed IPv4/IPv6 Computer firewall attachment state. Each sub-read carries its own assertion-derived receipt, so a partial failure does not erase the authenticated handshake or successful siblings. A failed firewall read fails closed, and a missing chain or jump while a Computer attempt is live is a typed `FAILED` screen-isolation finding. Runc comes only from containerd runtime info or a setup-resolved absolute executable path; the privileged helper never performs an operator-triggered PATH lookup. A whole-RPC failure uses `diagnostic_failure`, which is explicitly not runtime-loss evidence: the client does not invalidate the session, reap attempts, or withdraw capability. It never acquires a session, probes, sweeps, starts a task, mutates policy, or evicts content. |
+| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started`, the helper-captured `started_at` timestamp from that exact edge, assertion-derived profile evidence, helper-observed image evidence, and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. Before a Computer starts, the helper brings up its private network namespace's loopback interface and transfers the held view, control, and submission listeners into it. A live Computer Storage attachment refuses a different attempt with `computer_storage_busy`; this is definitive no-runtime evidence for only the losing attempt and never changes the live owner's authority. An ordinary OCI Mac bridge-fallback preparation creates a separate guest loopback listener and capability; every Computer instead uses the same constrained bridge shape as its only agent submission path. Default-off exposes no endpoint file while retaining the private listener for a later policy enable. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. A containerd `NotFound` after authorization is the closed `task already terminated` mechanics fact: the helper returns `already_terminated=true` without recording delivery of that signal, and `Watch` remains authoritative for the terminal arm. This race alone is not `engine_failure` or runtime-loss evidence; if `Watch` then cannot publish terminal evidence inside the fixed post-KILL release bound, the positive reaped-task fact makes the missing Wait confirmation typed runtime loss. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only, except that one tombstoned attempt whose helper deadman completed a successful guardian reap may authorize exactly one later `Delete` with full seven-field attempt-authority equality and the current node/boot-session gate. That exception still calls engine `Delete`, repeats independent absence verification, and releases image pins, capacity, ports, and retained runtime state before returning positive deletion; it never treats the earlier reap alone as the response. The helper consumes the guardian evidence when that call completes, so a second exact call, stale fence, foreign attempt, different removal generation or boot session, and every failed guardian reap remain refused. In every path, a positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
@@ -339,9 +342,9 @@ heartbeats.
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A missing manifest cannot be reconstructed as empty lineage when an immutable copy receipt or durable reset-preparation record proves prior storage preparation; that contradiction returns typed `computer_storage_grow_uncertain` before reserving capacity or mutating bytes. A failure after ext4 may have expanded returns the same typed uncertainty, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace. `namespace` is the mutating boot-barrier proof that may update pins, cache state, and sweep completion. `namespace_read_only` is an observation-only inventory route for acceptance baselines; it cannot satisfy the boot barrier or update helper policy state. |
-| `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
-| `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend. A refused payload listener is a typed, attempt-scoped `engine_failure` and does not invalidate the healthy helper session, so readiness can observe withdrawal and retry republication. Only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
-| `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
+| `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. It inventories and removes every unowned `wftch*` link and `WEFTY-COMPUTER-*` per-attempt firewall rule with typed evidence; verified live attempts are the only exclusions. |
+| `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. For a Computer, the engine enters that exact task's network namespace only while creating the backend socket, restores the helper namespace, then relays the authority-bound stream. Success is withheld until the helper has connected that backend. A refused payload listener is a typed, attempt-scoped `engine_failure` and does not invalidate the healthy helper session, so readiness can observe withdrawal and retry republication. Only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
+| `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the bridge and the helper issued that attempt's separate capability. It is mandatory for Computers because their private network namespace cannot address the agent's Node-loopback listener directly; ordinary OCI uses it only for the Mac bind-failure fallback. It never accepts an arbitrary host address or port. |
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
 
@@ -373,6 +376,9 @@ required instead.
 stream with one accepted connection on that attempt's helper-owned guest
 listener; the host agent dials only its already-created loopback run bridge.
 Neither direction accepts a caller-supplied network destination.
+The OCI adapter runs exactly four `DialHostBridge` pumps per Computer attempt;
+that fixed bound is the only Computer submission path on every platform, and
+additional guest connections wait for one of those pumps.
 
 For service stop, the agent keeps `Watch` independent from execution-context
 cancellation, sends `TERM`, waits the configured grace, and escalates to
@@ -490,15 +496,50 @@ The privileged adapter constructs `wefty-v1` from containerd v2.3.4's generated
 Linux baseline, then replaces every security-sensitive field explicitly. It
 resolves the image `USER` and supplemental groups from the pinned guest rootfs;
 sets the fixed capability sets, `noNewPrivileges`, containerd default seccomp,
-private PID/IPC/UTS/mount/cgroup namespaces, shared networking, deny-all device
-policy plus the six permitted pseudo-devices, masked/read-only proc paths, a
+private PID/IPC/UTS/mount/cgroup namespaces, plus a private network namespace
+for Computers only, deny-all device policy plus the six permitted pseudo-devices,
+masked/read-only proc paths, a
 read-only `/sys/fs/cgroup` cgroup mount, and a writable rootfs for ordinary
 workloads or read-only rootfs for Computers; and serializes
 cgroup-v2 memory/CPU limits when present. A memory limit also sets OCI swap to
 the same value, producing `memory.swap.max=0` on cgroup v2 rather than leaving a
 swap escape. `Resources.Pids` remains absent in M3; the missing PID limit is a
-known profile gap, not an implicit default. The
-runtime handler, snapshotter, and containerd namespace are fixed at
+known profile gap, not an implicit default. The helper attaches a point-to-point
+veth, brings the Computer namespace's loopback and veth interfaces up, installs
+a default route, disables IPv6 through the namespace `all` and `default`
+sysctls, and masquerades the exact Computer IPv4 address through the Node/VM.
+Computer `/30`s use RFC 2544 benchmarking space `198.18.0.0/15`; endpoint port
+`p` selects byte offset `(p - AttemptPortMin) * 4`. The helper admits at most
+32,768 endpoint ports and refuses a conflicting non-Wefty Node
+route. A
+Node-loopback resolver in the exact mounted snapshot is mirrored by an
+attempt-private UDP/TCP helper proxy at the same address inside the Computer
+namespace. The proxy forwards from the Node namespace to systemd-resolved's
+advertised non-loopback uplink after a bounded lookup proves it reachable,
+then falls back to the Node stub only after that stub answers the same probe; a
+routable resolver traverses the veth directly. The proxy validates DNS framing,
+rate limits each attempt, and bounds concurrent TCP clients. Mirrored
+`ip6tables` chains retain the same boundary if an image re-enables IPv6. The
+absence of the kernel `ip6table_nat` table is recorded as
+`unavailable_ipv6_disabled`, rather than refusing a Computer whose namespace
+has IPv6 disabled; IPv6 filter-chain failures still fail closed. The
+firewall rejects Computer-to-Computer, Node-local, and unsolicited inbound
+traffic except the attempt/interface-bound helper egress proof endpoint, whose
+ACCEPT additionally requires the owning transparent helper socket. The helper
+reconciles both chain sets at every Computer start and on its periodic sweep
+cadence. The INPUT, FORWARD, and POSTROUTING jumps must each be the first base
+chain rule; later presence is reported absent and repaired. The helper also
+compares every helper-owned chain body with its canonical ordered rules and
+rebuilds a body whose rule order, membership, or duplication differs. A new
+first-position jump is inserted before stale copies are removed, so repair
+does not create a no-jump window. Startup removes
+unowned host/guest link ends and IPv4/IPv6 rule residue, and tears down live
+network state plus helper-owned Node-wide state on close. It creates the `view`,
+`control`, and Computer submission listeners inside that namespace, then enters
+it only to create an exact-authority named-endpoint dial. The resulting socket
+returns to the helper namespace for relay; no helper thread or general guest
+dialer remains inside the Computer namespace. Ordinary OCI workloads retain
+shared networking. The runtime handler, snapshotter, and containerd namespace are fixed at
 `io.containerd.runc.v2`, `overlayfs`, and `wefty`.
 
 Before any task reaches `Started`, the helper serializes one node-local
@@ -636,7 +677,10 @@ io.wefty/removal_generation
 
 Before task creation, the helper fsyncs a versioned Attempt-ownership record
 containing the complete seven-field authority and its derived resource
-identities. Labelled containerd metadata may reconstruct the same record before
+identities. Publication, snapshot loading, stale-temp cleanup, record removal,
+and unknown-version GC share one engine lock, so no sweep or read-only Verify
+can unlink an in-flight publication. Removing the final record preserves the
+`attempt-ownership` parent directory. Labelled containerd metadata may reconstruct the same record before
 that metadata is deleted during sweep. A deterministic-looking name is never
 ownership: sweep mutates a log directory or cgroup only when the exact resource
 identity is bound by that durable record and the helper's locked registry says
@@ -751,7 +795,18 @@ memory limit, and typed ceiling-over-limit warnings. These tmpfs values are
 caps rather than reservations, so the warnings do not reject admission; the
 memory cgroup remains the enforcement boundary. The node doctor repeats the
 last assertion-derived comparison as `WARN` when applicable and exposes the
-last atomic admission facts. A missing receipt remains `NOT-RUN`.
+last atomic admission facts. The post-start runtime receipt records the helper
+and task network namespace inodes, their observed inequality, the veth
+address/gateway, mounted resolver address, UDP/TCP proxy listeners, selected
+upstream address/source/reachability, the typed IPv6 NAT state, and whether the exact abstract X11 socket token is visible from
+the helper namespace. The node doctor reports screen isolation as `OK` only for
+distinct non-empty inodes, `present=true`, and `visible=false`; a missing
+Computer receipt remains `NOT-RUN`, and any other combination is `FAILED`.
+Doctor also performs a fresh `iptables -S` and `ip6tables -S` observation:
+`computer_firewall_present=true` requires every helper chain in canonical
+order and every Node jump exactly once at position one, and
+a missing attachment while any Computer attempt is live is `FAILED` rather than
+inferred from startup configuration.
 
 The helper holds an exclusive per-generation file lock for the attachment
 lifetime and durably records exact attempt/fence/boot authority beside the

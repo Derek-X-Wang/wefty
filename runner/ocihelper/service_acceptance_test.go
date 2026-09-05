@@ -61,6 +61,7 @@ func TestServiceAcceptanceComputerControlStateFailsClosed(t *testing.T) {
 	request.Workload.Limits.MemoryBytes = 1 << 30
 	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
+	request.EnableHostBridgeFallback, request.ActivateHostBridgeFallback = true, true
 	if _, err := session.Run(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}

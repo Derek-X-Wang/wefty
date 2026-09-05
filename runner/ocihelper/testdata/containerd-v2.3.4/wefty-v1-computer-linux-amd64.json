@@ -85,6 +85,9 @@
       },
       {
         "type": "cgroup"
+      },
+      {
+        "type": "network"
       }
     ],
     "readonlyPaths": [

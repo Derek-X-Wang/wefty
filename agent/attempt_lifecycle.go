@@ -48,38 +48,37 @@ func (disabledAttemptWatch) Check() error           { return nil }
 func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
-	client                     *Client
-	runtimes                   workloadRuntimeSet
-	outbox                     *evidenceOutbox
-	logSinkFactory             attemptLogSinkFactory
-	watchdog                   attemptWatchdog
-	clock                      Clock
-	renewalInterval            time.Duration
-	completionRetry            time.Duration
-	finalizationTimeout        time.Duration
-	outputSinkFactory          OutputSinkFactory
-	managedResource            managedResourceManager
-	handoffs                   *handoffManager
-	nodeID                     string
-	bootSessionID              string
-	workflowBridge             func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
-	logf                       func(string, ...any)
-	observer                   *lifecycleObserver
-	fabric                     fabric.Fabric
-	computerPolicy             *ComputerPolicyCache
-	reservePublishedPort       func(l1.Claim) (net.Listener, *contract.SpawnFailure)
-	prepareServiceEndpoint     func(context.Context) (serviceRuntimeEndpoint, error)
-	prepareAuthorityLoss       func(context.Context, string) error
-	allowsStart                func(contract.JobSpec) bool
-	ociIntentGate              *ociIntentCompletionGate
-	currentOCIGeneration       func() (workloadrunner.RuntimeGeneration, bool)
-	embargoOCIRuntime          func(workloadrunner.RuntimeGeneration)
-	recoverOCIRuntime          func(context.Context, workloadrunner.RuntimeGeneration) error
-	runtimeReaped              func(string, workloadrunner.ReapReceipt, error)
-	attemptDeadman             AttemptDeadmanRenewer
-	computerTokens             ComputerTokenMinter
-	computerControlTokens      *computerControlTokenCodec
-	computerHostBridgeFallback bool
+	client                 *Client
+	runtimes               workloadRuntimeSet
+	outbox                 *evidenceOutbox
+	logSinkFactory         attemptLogSinkFactory
+	watchdog               attemptWatchdog
+	clock                  Clock
+	renewalInterval        time.Duration
+	completionRetry        time.Duration
+	finalizationTimeout    time.Duration
+	outputSinkFactory      OutputSinkFactory
+	managedResource        managedResourceManager
+	handoffs               *handoffManager
+	nodeID                 string
+	bootSessionID          string
+	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
+	logf                   func(string, ...any)
+	observer               *lifecycleObserver
+	fabric                 fabric.Fabric
+	computerPolicy         *ComputerPolicyCache
+	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
+	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
+	prepareAuthorityLoss   func(context.Context, string) error
+	allowsStart            func(contract.JobSpec) bool
+	ociIntentGate          *ociIntentCompletionGate
+	currentOCIGeneration   func() (workloadrunner.RuntimeGeneration, bool)
+	embargoOCIRuntime      func(workloadrunner.RuntimeGeneration)
+	recoverOCIRuntime      func(context.Context, workloadrunner.RuntimeGeneration) error
+	runtimeReaped          func(string, workloadrunner.ReapReceipt, error)
+	attemptDeadman         AttemptDeadmanRenewer
+	computerTokens         ComputerTokenMinter
+	computerControlTokens  *computerControlTokenCodec
 }
 
 type attemptLogSink interface {
@@ -925,11 +924,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
 			executionSpec.Env[contract.EnvL3Endpoint] = endpoint
 		}
-		if lifecycle.dependencies.computerHostBridgeFallback {
-			request.HostBridgeDial = computerBridge.dial
-			request.HostBridgeEndpointReady = computerBridge.setGuestEndpoint
-			request.HostBridgeFallbackActive = computerBridge.usesHostBridgeFallback()
-		}
+		request.HostBridgeDial = computerBridge.dial
+		request.HostBridgeEndpointReady = computerBridge.setGuestEndpoint
+		request.HostBridgeFallbackActive = true
 	} else if claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.workflowBridge != nil {
 		bridge, bridgeErr := lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec)
 		if bridgeErr != nil {
