@@ -230,3 +230,9 @@ _Avoid_: lane, pool, worker, CPU, core, "execution path" as a countable noun
 The network seam — transport, identity, naming, provisioning — behind which
 Tailscale (or any successor) lives. This word belongs to networking alone.
 _Avoid_: reusing "fabric" for compute or scheduling concepts
+
+**Identity subject** _(open question)_:
+The person or organization represented by stable Fabric authority. Current
+operator policy names people; a personal organization may later become the
+durable subject without turning a device into that subject.
+_Avoid_: device as person, assuming every future subject is one person
