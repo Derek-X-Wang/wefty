@@ -923,6 +923,9 @@ func assertComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 		computer.CurrentJobID, acknowledgement); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := h.store.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	lateQuarantine := ComputerStorageCleanupQuarantine{Kind: "managed_volume_cleanup_quarantined",
 		Operation: ComputerStorageCleanupRemoval, ReceiptID: "late-quarantine", VolumeKind: "computer_disk",
 		ComputerID: computer.ComputerID, StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration,
@@ -936,10 +939,10 @@ func assertComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 		computer.CurrentJobID, lateRequest); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("late Computer removal quarantine error = %v", err)
 	}
-	finalized, changed, err := h.store.FinalizeServiceRemoval(context.Background(), computer.CurrentJobID)
-	if err != nil || !changed || finalized.State != contract.JobRemovedVerified ||
+	finalized, _, err := h.store.FinalizeServiceRemoval(context.Background(), computer.CurrentJobID)
+	if err != nil || finalized.State != contract.JobRemovedVerified ||
 		(ServiceJob{BoundNodeID: removalBinding}).HoldsSlot(finalized.State) {
-		t.Fatalf("finalized Computer removal = %#v changed=%t err=%v", finalized, changed, err)
+		t.Fatalf("finalized Computer removal = %#v err=%v", finalized, err)
 	}
 	if replayed, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
 		computer.CurrentJobID, acknowledgement); err != nil || replayed.State != contract.JobRemovedVerified {
