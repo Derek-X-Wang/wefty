@@ -2,6 +2,7 @@ package ocicontrol
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -18,14 +20,25 @@ import (
 )
 
 const (
-	maximumControlJSONBytes   = 1 << 20
-	controlReadHeaderTimeout  = 5 * time.Second
-	controlRequestReadTimeout = 10 * time.Minute
+	maximumControlJSONBytes          = 1 << 20
+	controlReadHeaderTimeout         = 5 * time.Second
+	controlRequestReadTimeout        = 10 * time.Minute
+	legacyControlSocketStagingPrefix = ".wefty-control-socket-"
+	controlSocketStagingPrefix       = ".s-"
 	// Offline image import is the longest control response and owns the same
 	// ten-minute operation budget. Keep that full window plus the existing
 	// header allowance so a completed response has time to flush.
 	controlShutdownDrainTimeout = controlRequestReadTimeout + controlReadHeaderTimeout
 )
+
+type SocketPathLengthError struct {
+	Length  int
+	Maximum int
+}
+
+func (err *SocketPathLengthError) Error() string {
+	return fmt.Sprintf("OCI control socket path length %d exceeds maximum %d", err.Length, err.Maximum)
+}
 
 type Server struct {
 	path                 string
@@ -38,8 +51,12 @@ type Server struct {
 }
 
 func NewServer(path string, service Service, allowedUIDs ...uint32) (*Server, error) {
-	if !filepath.IsAbs(path) || filepath.Clean(path) == string(filepath.Separator) {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) || path == string(filepath.Separator) {
 		return nil, errors.New("OCI control socket path must be absolute and non-root")
+	}
+	if err := validateUnixSocketPath(path); err != nil {
+		return nil, err
 	}
 	if service == nil {
 		return nil, errors.New("OCI control service is required")
@@ -52,7 +69,7 @@ func NewServer(path string, service Service, allowedUIDs ...uint32) (*Server, er
 		allowlist[uid] = struct{}{}
 	}
 	return &Server{
-		path: filepath.Clean(path), service: service, allowedUIDs: allowlist,
+		path: path, service: service, allowedUIDs: allowlist,
 		shutdownDrainTimeout: controlShutdownDrainTimeout, logf: log.Printf,
 	}, nil
 }
@@ -69,16 +86,12 @@ func (server *Server) Serve(ctx context.Context) error {
 	if err := prepareSocketPath(server.path); err != nil {
 		return err
 	}
-	listener, err := net.Listen("unix", server.path)
+	listener, err := listenControlSocket(server.path)
 	if err != nil {
-		return fmt.Errorf("listen on OCI control socket: %w", err)
+		return err
 	}
 	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs}
 	server.listener = authenticated
-	if err := os.Chmod(server.path, 0o600); err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("restrict OCI control socket: %w", err)
-	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/doctor", server.handleDoctor)
 	mux.HandleFunc("GET /v1/intent", server.handleIntent)
@@ -117,14 +130,70 @@ func (server *Server) Serve(ctx context.Context) error {
 	return err
 }
 
+func listenControlSocket(path string) (net.Listener, error) {
+	if err := validateUnixSocketPath(path); err != nil {
+		return nil, err
+	}
+	stagingDirectory, err := createControlSocketStagingDirectory(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("create private OCI control socket staging directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stagingDirectory) }()
+	stagedPath := filepath.Join(stagingDirectory, "s")
+	if err := validateUnixSocketPath(stagedPath); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", stagedPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on OCI control socket: %w", err)
+	}
+	if err := os.Chmod(stagedPath, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("restrict OCI control socket: %w", err)
+	}
+	if err := os.Rename(stagedPath, path); err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("publish OCI control socket: %w", err)
+	}
+	return listener, nil
+}
+
+func createControlSocketStagingDirectory(directory string) (string, error) {
+	for range 100 {
+		var random [3]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return "", err
+		}
+		path := filepath.Join(directory, fmt.Sprintf("%s%x", controlSocketStagingPrefix, random))
+		if err := os.Mkdir(path, 0o700); err == nil {
+			return path, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("allocate unique OCI control socket staging directory")
+}
+
+func validateUnixSocketPath(path string) error {
+	maximum := maximumUnixSocketPathBytes()
+	if maximum > 0 && len(path) > maximum {
+		return &SocketPathLengthError{Length: len(path), Maximum: maximum}
+	}
+	return nil
+}
+
 func (server *Server) handleDoctor(writer http.ResponseWriter, request *http.Request) {
 	value, err := server.service.Doctor(request.Context())
 	writeControlResponse(writer, value, err)
 }
 
 func prepareSocketPath(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create OCI control directory: %w", err)
+	}
+	if err := sweepControlSocketStagingDirectories(directory, legacyControlSocketStagingPrefix, controlSocketStagingPrefix); err != nil {
+		return err
 	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -142,6 +211,32 @@ func prepareSocketPath(path string) error {
 	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("remove stale OCI control socket: %w", err)
+	}
+	return nil
+}
+
+func sweepControlSocketStagingDirectories(directory string, prefixes ...string) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return fmt.Errorf("inspect OCI control socket staging directories: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		staging := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry.Name(), prefix) {
+				staging = true
+				break
+			}
+		}
+		if !staging {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(directory, entry.Name())); err != nil {
+			return fmt.Errorf("remove stale OCI control socket staging directory: %w", err)
+		}
 	}
 	return nil
 }

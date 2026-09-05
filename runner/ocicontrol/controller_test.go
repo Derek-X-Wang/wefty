@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -297,7 +298,12 @@ func TestInstalledConfigAndSocketPathFailClosed(t *testing.T) {
 			}
 		})
 	}
-	nonSocket := filepath.Join(root, "control.sock")
+	socketRoot, err := os.MkdirTemp("/tmp", "wefty-control-nonsocket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	nonSocket := filepath.Join(socketRoot, "control.sock")
 	if err := os.WriteFile(nonSocket, []byte("do not replace"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -307,5 +313,68 @@ func TestInstalledConfigAndSocketPathFailClosed(t *testing.T) {
 	}
 	if err := server.Serve(t.Context()); err == nil {
 		t.Fatal("control server replaced a non-socket path")
+	}
+}
+
+func TestPrepareSocketPathSweepsStaleStagingDirectory(t *testing.T) {
+	root := t.TempDir()
+	staleDirectories := []string{
+		filepath.Join(root, ".wefty-control-socket-orphan"),
+		filepath.Join(root, ".s-orphan"),
+	}
+	for _, stale := range staleDirectories {
+		if err := os.Mkdir(stale, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(stale, "socket"), []byte("orphaned"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := prepareSocketPath(filepath.Join(root, "control.sock")); err != nil {
+		t.Fatal(err)
+	}
+	for _, stale := range staleDirectories {
+		if _, err := os.Lstat(stale); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale control socket staging directory %q after prepare: %v", stale, err)
+		}
+	}
+}
+
+func TestControlSocketPathBoundary(t *testing.T) {
+	maximum := maximumUnixSocketPathBytes()
+	if maximum == 0 {
+		t.Skip("Unix socket paths are unavailable")
+	}
+	root, err := os.MkdirTemp("/tmp", "w-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	const socketName = "control.sock"
+	directoryLength := maximum - len(socketName) - 1
+	segmentLength := directoryLength - len(root) - 1
+	if segmentLength < 1 {
+		t.Fatalf("temporary root %q leaves no room for boundary path", root)
+	}
+	directory := filepath.Join(root, strings.Repeat("d", segmentLength))
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	boundaryPath := filepath.Join(directory, socketName)
+	if len(boundaryPath) != maximum {
+		t.Fatalf("boundary path length=%d, want %d", len(boundaryPath), maximum)
+	}
+	listener, err := listenControlSocket(boundaryPath)
+	if err != nil {
+		t.Fatalf("listen at Unix socket path boundary: %v", err)
+	}
+	_ = listener.Close()
+	_ = os.Remove(boundaryPath)
+
+	tooLongPath := boundaryPath + "x"
+	_, err = NewServer(tooLongPath, ServiceFuncs{})
+	var lengthErr *SocketPathLengthError
+	if !errors.As(err, &lengthErr) || lengthErr.Length != maximum+1 || lengthErr.Maximum != maximum {
+		t.Fatalf("overlong Unix socket path error=%#v, want typed length=%d maximum=%d", err, maximum+1, maximum)
 	}
 }
