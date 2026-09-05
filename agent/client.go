@@ -118,14 +118,9 @@ func (c *Client) Drain(ctx context.Context, nodeID, bootSessionID string) (l1.No
 }
 
 func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (*l1.Claim, error) {
-	return c.ClaimAtCapabilityRevision(ctx, nodeID, bootSessionID, class, 0, excludedJobIDs...)
-}
-
-func (c *Client) ClaimAtCapabilityRevision(ctx context.Context, nodeID, bootSessionID, class string, capabilityRevision int64, excludedJobIDs ...string) (*l1.Claim, error) {
 	var claim l1.Claim
 	noContent, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", l1.ClaimRequest{
-		NodeID: nodeID, BootSessionID: bootSessionID, Class: class,
-		CapabilityRevision: capabilityRevision, ExcludedJobIDs: excludedJobIDs,
+		NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs,
 	}, &claim)
 	if err != nil || noContent {
 		return nil, err

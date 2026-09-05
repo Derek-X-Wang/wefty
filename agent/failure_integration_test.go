@@ -179,160 +179,154 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 	}
 }
 
-func TestOCIIntentRevisionFencesStaleRecoveryClaim(t *testing.T) {
-	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
-		"intent-revision-node": {Tags: []string{"intent-revision"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-	}, time.Second)
-	defer stopServer()
-	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-revision-service",
-		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
-		RoutingTags: []string{"intent-revision"}, RuntimeHandler: "io.containerd.runc.v2",
-		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
-			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-revision:v1", Digest: &digest},
-			Argv:  []string{"/payload"},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
-	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	intentSource := lima.FileIntentSource{Path: intentPath}
-	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-revision-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	client, err := newClient(agentFabric, "wefty://control-plane", time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	registration := contract.NodeRegistration{
-		NodeID: "intent-revision-node", BootSessionID: "intent-revision-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test",
-		Capabilities: map[string]bool{
-			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
-		},
-		CapabilityRevision: 1, CapabilityObservedAt: time.Now(), MissingCapabilities: []string{},
-	}
-	if _, err := client.Register(t.Context(), registration); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 1, false, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	intent, err := intentSource.ReadIntent(t.Context())
-	if err != nil || intent.Enabled || intent.Revision != 2 {
-		t.Fatalf("disabled intent marker=%+v err=%v", intent, err)
-	}
-	claim, err := client.ClaimAtCapabilityRevision(
-		t.Context(), registration.NodeID, registration.BootSessionID, contract.JobClassService, int64(intent.Revision),
-	)
-	if err != nil || claim != nil {
-		t.Fatalf("stale recovery claim=%+v err=%v, want no work at unpublished intent revision %d", claim, err, intent.Revision)
-	}
-	attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
-	if err != nil || len(attempts) != 0 {
-		t.Fatalf("stale recovery manufactured attempts=%+v err=%v", attempts, err)
-	}
-}
-
 func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *testing.T) {
-	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
-		"prestarted-loss-node": {Tags: []string{"prestarted-loss"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-	}, 5*time.Second)
-	defer stopServer()
-	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "prestarted-loss-service",
-		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
-		RoutingTags: []string{"prestarted-loss"}, RuntimeHandler: "io.containerd.runc.v2",
-		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
-			Image: contract.OCIImageSpec{Reference: "example.invalid/prestarted-loss:v1", Digest: &digest},
-			Argv:  []string{"/payload"},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
-	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	intentSource := lima.FileIntentSource{Path: intentPath}
-	barrier := &stageLossBarrier{ready: true}
-	runtime := newPreStartedRuntimeLossRuntime(barrier)
-	agentFabric := network.NewFabric(fabric.Identity{NodeID: "prestarted-loss-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
-		NodeID: "prestarted-loss-node", BootSessionID: "prestarted-loss-boot", Version: "test",
-		Capabilities: map[string]bool{"kind:process": true},
-		CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
-			intent, err := intentSource.ReadIntent(ctx)
-			if err != nil || !intent.Enabled {
-				if err == nil {
-					err = errors.New("OCI intent is disabled")
-				}
-				return CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonOCIIntentDisabled}, err
+	for _, test := range []struct {
+		name       string
+		intentStop bool
+	}{
+		{name: "enabled intent delivers phase-valid spawn failure"},
+		{name: "disabled intent suppresses phase-valid spawn failure", intentStop: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			network := plain.NewNetwork()
+			store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+				"prestarted-loss-node": {Tags: []string{"prestarted-loss"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+			}, 750*time.Millisecond)
+			defer stopServer()
+			digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+				SchemaVersion: contract.SchemaVersionV1, DispatchKey: "prestarted-loss-service",
+				Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+				RoutingTags: []string{"prestarted-loss"}, RuntimeHandler: "io.containerd.runc.v2",
+				Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+					Image: contract.OCIImageSpec{Reference: "example.invalid/prestarted-loss:v1", Digest: &digest},
+					Argv:  []string{"/payload"},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			return CapabilityProbeResult{Capabilities: map[string]bool{
-				"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
-			}}, nil
-		}),
-		OCIIntent: func(ctx context.Context) (OCIIntentObservation, error) {
-			intent, err := intentSource.ReadIntent(ctx)
-			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
-		},
-		OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
-		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
-		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
-		Logf: t.Logf,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer nodeAgent.Close()
-	runContext, cancelRun := context.WithCancel(t.Context())
-	runDone := make(chan error, 1)
-	go func() { runDone <- nodeAgent.Run(runContext) }()
-	select {
-	case <-runtime.entered:
-	case <-time.After(5 * time.Second):
-		cancelRun()
-		t.Fatal("pre-Started runtime loss did not enter Run")
-	}
-	if _, err := store.SetNodeClaimsByOperator(t.Context(), "prestarted-loss-node", "operator", l1.NodeIntentRequest{
-		ClaimsEnabled: false, IntentRevision: 0, Reason: "hold replacement while checking pre-Started completion",
-	}); err != nil {
-		cancelRun()
-		t.Fatal(err)
-	}
-	close(runtime.release)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		attempts, listErr := store.ListJobAttempts(t.Context(), job.JobID)
-		if listErr == nil && len(attempts) == 1 && attempts[0].State == contract.AttemptFailed && attempts[0].Result != nil {
-			if attempts[0].Result.SpawnError == nil || attempts[0].Result.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable || attempts[0].Result.OutputError != "" {
+			intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+			if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			intentSource := lima.FileIntentSource{Path: intentPath}
+			barrier := &stageLossBarrier{ready: true}
+			runtime := newPreStartedRuntimeLossRuntime(barrier)
+			agentFabric := network.NewFabric(fabric.Identity{NodeID: "prestarted-loss-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+			managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			nodeAgent, err := New(Config{
+				Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+				NodeID: "prestarted-loss-node", BootSessionID: "prestarted-loss-boot", Version: "test",
+				Capabilities: map[string]bool{"kind:process": true},
+				CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
+					intent, err := intentSource.ReadIntent(ctx)
+					if err != nil || !intent.Enabled {
+						if err == nil {
+							err = errors.New("OCI intent is disabled")
+						}
+						return CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonOCIIntentDisabled}, err
+					}
+					return CapabilityProbeResult{Capabilities: map[string]bool{
+						"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+					}}, nil
+				}),
+				OCIIntent: func(ctx context.Context) (OCIIntentObservation, error) {
+					intent, err := intentSource.ReadIntent(ctx)
+					return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+				},
+				OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+				ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+				HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+				Logf: t.Logf,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodeAgent.Close()
+			runContext, cancelRun := context.WithCancel(t.Context())
+			runDone := make(chan error, 1)
+			go func() { runDone <- nodeAgent.Run(runContext) }()
+			select {
+			case <-runtime.entered:
+			case <-time.After(5 * time.Second):
 				cancelRun()
-				t.Fatalf("pre-Started completion=%+v, want sole runtime_unavailable spawn failure", attempts[0].Result)
+				t.Fatal("pre-Started OCI runtime did not enter Run")
 			}
-			break
-		}
-		if time.Now().After(deadline) {
+			if test.intentStop {
+				intent, err := lima.SetOCIIntent(t.Context(), intentPath, 1, false, time.Now())
+				if err != nil {
+					cancelRun()
+					t.Fatal(err)
+				}
+				releaseFence, err := nodeAgent.FenceOCIIntentStop(t.Context(), intent.Revision)
+				if err != nil {
+					cancelRun()
+					t.Fatal(err)
+				}
+				releaseFence()
+			} else if _, err := store.SetNodeClaimsByOperator(t.Context(), "prestarted-loss-node", "operator", l1.NodeIntentRequest{
+				ClaimsEnabled: false, IntentRevision: 0, Reason: "hold replacement while checking pre-Started completion",
+			}); err != nil {
+				cancelRun()
+				t.Fatal(err)
+			}
+			close(runtime.release)
+			deadline := time.Now().Add(3 * time.Second)
+			if test.intentStop {
+				for {
+					receipt := nodeAgent.outbox.spool.inspectCompletion(t.Context(), runtime.attemptID)
+					if receipt.State == "suppressed" && receipt.Reason == "service_intent_stop" && receipt.IntentRevision == 2 &&
+						receipt.Result.SpawnError != nil && receipt.Result.SpawnError.Code == contract.SpawnFailureRuntimeUnavailable &&
+						receipt.Result.OutputError == "" {
+						break
+					}
+					if time.Now().After(deadline) {
+						cancelRun()
+						t.Fatalf("pre-Started intent-stop completion was not suppressed with its spawn failure: receipt=%+v", receipt)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				for {
+					if _, err := store.Reconcile(t.Context()); err != nil {
+						cancelRun()
+						t.Fatal(err)
+					}
+					attempts, listErr := store.ListJobAttempts(t.Context(), job.JobID)
+					if listErr == nil && len(attempts) == 1 && attempts[0].State == contract.AttemptLost && attempts[0].Result == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						cancelRun()
+						t.Fatalf("intent-stopped pre-Started attempt did not expire lost with no result: attempts=%+v err=%v", attempts, listErr)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			} else {
+				for {
+					attempts, listErr := store.ListJobAttempts(t.Context(), job.JobID)
+					if listErr == nil && len(attempts) == 1 && attempts[0].State == contract.AttemptFailed && attempts[0].Result != nil {
+						if attempts[0].Result.SpawnError == nil || attempts[0].Result.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable || attempts[0].Result.OutputError != "" {
+							cancelRun()
+							t.Fatalf("pre-Started completion=%+v, want sole runtime_unavailable spawn failure", attempts[0].Result)
+						}
+						break
+					}
+					if time.Now().After(deadline) {
+						cancelRun()
+						t.Fatalf("pre-Started attempt remained uncompleted: attempts=%+v err=%v", attempts, listErr)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
 			cancelRun()
-			t.Fatalf("pre-Started attempt remained uncompleted: attempts=%+v err=%v", attempts, listErr)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	cancelRun()
-	if err := <-runDone; err != nil && !strings.Contains(err.Error(), "helper remains unavailable") {
-		t.Fatalf("agent shutdown after pre-Started runtime loss: %v", err)
+			if err := <-runDone; err != nil && !strings.Contains(err.Error(), "helper remains unavailable") {
+				t.Fatalf("agent shutdown after pre-Started runtime loss: %v", err)
+			}
+		})
 	}
 }
 
@@ -2866,9 +2860,10 @@ type liveIntentAuthorityRuntime struct {
 
 type preStartedRuntimeLossRuntime struct {
 	*intentStopRuntime
-	barrier *stageLossBarrier
-	entered chan struct{}
-	release chan struct{}
+	barrier   *stageLossBarrier
+	entered   chan struct{}
+	release   chan struct{}
+	attemptID string
 }
 
 func newPreStartedRuntimeLossRuntime(barrier *stageLossBarrier) *preStartedRuntimeLossRuntime {
@@ -2889,12 +2884,13 @@ func (runtime *preStartedRuntimeLossRuntime) Run(ctx context.Context, request wo
 	if err := request.OCIImageResolved(ctx, observation); err != nil {
 		return workloadrunner.Result{}, err
 	}
+	runtime.attemptID = request.Authority.AttemptID
+	close(runtime.entered)
+	<-runtime.release
 	runtime.barrier.lose(errors.New("helper lost during Run before Started"))
 	if request.OCIRuntimeUnavailable != nil {
 		request.OCIRuntimeUnavailable(workloadrunner.RuntimeGeneration{InstanceID: "stage-loss", Generation: 1})
 	}
-	close(runtime.entered)
-	<-runtime.release
 	err := &workloadrunner.RuntimeLossError{
 		Generation: workloadrunner.RuntimeGeneration{InstanceID: "stage-loss", Generation: 1},
 		Err:        errors.New("helper lost during Run before Started"),

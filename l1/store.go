@@ -2062,13 +2062,6 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 // admission, fencing, attempt creation, and lease establishment. Every
 // eligibility predicate is part of the UPDATE that wins the queued row.
 func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string, excludedJobIDs ...string) (*Claim, error) {
-	return s.ClaimJobAtCapabilityRevision(ctx, identityNodeID, nodeID, bootSessionID, class, 0, excludedJobIDs...)
-}
-
-// ClaimJobAtCapabilityRevision binds admission to the exact capability
-// observation held by the caller. A zero revision preserves the direct Store
-// API's legacy behavior; agent protocol callers always provide their snapshot.
-func (s *Store) ClaimJobAtCapabilityRevision(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string, capabilityRevision int64, excludedJobIDs ...string) (*Claim, error) {
 	if class != contract.JobClassOneShot && class != contract.JobClassService {
 		return nil, protocolError(contract.ErrorInvalidRequest, "claim class must be %q or %q", contract.JobClassOneShot, contract.JobClassService)
 	}
@@ -2086,10 +2079,9 @@ func (s *Store) ClaimJobAtCapabilityRevision(ctx context.Context, identityNodeID
 	var storedIdentity, storedBoot string
 	var heartbeatNS int64
 	var authorityGeneration int64
-	var storedCapabilityRevision int64
 	var claimsEnabled bool
-	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns, authority_generation, claims_enabled, capability_revision FROM nodes WHERE node_id=?", nodeID).
-		Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS, &authorityGeneration, &claimsEnabled, &storedCapabilityRevision)
+	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns, authority_generation, claims_enabled FROM nodes WHERE node_id=?", nodeID).
+		Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS, &authorityGeneration, &claimsEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
 	}
@@ -2122,9 +2114,6 @@ func (s *Store) ClaimJobAtCapabilityRevision(ctx context.Context, identityNodeID
 	}
 	if !claimsEnabled {
 		return nil, protocolError(contract.ErrorNodeDraining, "node %q has claims disabled by operator intent", nodeID)
-	}
-	if capabilityRevision > 0 && storedCapabilityRevision != capabilityRevision {
-		return nil, nil
 	}
 	if class == contract.JobClassOneShot {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs

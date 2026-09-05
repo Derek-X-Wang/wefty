@@ -1826,14 +1826,9 @@ func (s *Server) claimJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocolError(contract.ErrorInvalidRequest, "claim class must be %q or %q", contract.JobClassOneShot, contract.JobClassService))
 		return
 	}
-	if request.CapabilityRevision < 0 {
-		writeError(w, protocolError(contract.ErrorInvalidRequest, "capability_revision must be positive when provided"))
-		return
-	}
 	identity := identityFromRequest(r)
-	claim, err := s.store.ClaimJobAtCapabilityRevision(
-		r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class,
-		request.CapabilityRevision, request.ExcludedJobIDs...,
+	claim, err := s.store.ClaimJob(
+		r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class, request.ExcludedJobIDs...,
 	)
 	if err != nil {
 		writeError(w, err)
