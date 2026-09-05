@@ -243,6 +243,111 @@ func TestInjectedIdentityCrossesNetworkInstances(t *testing.T) {
 	}
 }
 
+func TestConnectionsWithSameRemoteAddressKeepTheirOwnIdentity(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+
+	firstServer, firstClient := net.Pipe()
+	secondServer, secondClient := net.Pipe()
+	if firstServer.RemoteAddr().String() != secondServer.RemoteAddr().String() {
+		t.Fatalf("test connections do not share a remote address: %q != %q", firstServer.RemoteAddr(), secondServer.RemoteAddr())
+	}
+	underlying := &connectionListener{
+		address:     firstServer.LocalAddr(),
+		connections: []net.Conn{firstServer, secondServer},
+	}
+	listener := &listener{Listener: underlying, network: network}
+
+	writeErrors := make(chan error, 2)
+	go func() { writeErrors <- writeIdentity(firstClient, fabric.Identity{NodeID: "runner-1"}) }()
+	go func() { writeErrors <- writeIdentity(secondClient, fabric.Identity{NodeID: "runner-2"}) }()
+
+	first, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	for _, connection := range []struct {
+		name   string
+		conn   net.Conn
+		nodeID string
+	}{
+		{name: "first", conn: first, nodeID: "runner-1"},
+		{name: "second", conn: second, nodeID: "runner-2"},
+	} {
+		t.Run(connection.name, func(t *testing.T) {
+			identity, err := server.WhoIs(t.Context(), connection.conn.RemoteAddr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if identity.NodeID != connection.nodeID {
+				t.Fatalf("WhoIs() NodeID = %q, want %q", identity.NodeID, connection.nodeID)
+			}
+		})
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.WhoIs(t.Context(), second.RemoteAddr().String()); err != nil {
+		t.Fatalf("closing first connection removed second identity: %v", err)
+	}
+	for range 2 {
+		if err := <-writeErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = firstClient.Close()
+	_ = secondClient.Close()
+}
+
+func TestPeerRegistrationCollisionPreservesExistingIdentity(t *testing.T) {
+	network := NewNetwork()
+	if err := network.registerPeer("peer-token", fabric.Identity{NodeID: "runner-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := network.registerPeer("peer-token", fabric.Identity{NodeID: "runner-2"}); err == nil {
+		t.Fatal("registerPeer() overwrote an existing peer")
+	}
+	identity, err := network.NewFabric(fabric.Identity{}).WhoIs(t.Context(), "peer-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.NodeID != "runner-1" {
+		t.Fatalf("WhoIs() NodeID = %q, want runner-1", identity.NodeID)
+	}
+}
+
+type connectionListener struct {
+	address     net.Addr
+	connections []net.Conn
+}
+
+func (l *connectionListener) Accept() (net.Conn, error) {
+	if len(l.connections) == 0 {
+		return nil, net.ErrClosed
+	}
+	connection := l.connections[0]
+	l.connections = l.connections[1:]
+	return connection, nil
+}
+
+func (l *connectionListener) Close() error {
+	for _, connection := range l.connections {
+		_ = connection.Close()
+	}
+	l.connections = nil
+	return nil
+}
+
+func (l *connectionListener) Addr() net.Addr { return l.address }
+
 func TestGarbageConnectionDoesNotStopListenerAccepting(t *testing.T) {
 	network := NewNetwork()
 	server := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
