@@ -40,6 +40,8 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
+	Name string         `yaml:"name"`
+	If   string         `yaml:"if"`
 	Uses string         `yaml:"uses"`
 	Run  string         `yaml:"run"`
 	With map[string]any `yaml:"with"`
@@ -291,7 +293,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		text     string
 	}{"workflow-run": {realtiming, realtimeText}, "scheduled": {scheduled, scheduledText}} {
 		jobTimeout := fixture.workflow.Jobs["service-acceptance-realtiming"].TimeoutMinutes
-		goTimeout := workflowGoTestTimeoutMinutes(t, name, fixture.text)
+		goTimeout := workflowGoTestTimeoutMinutes(t, name, fixture.text, "service_acceptance_realtiming")
 		if jobTimeout != 100 || jobTimeout < goTimeout+15 {
 			t.Fatalf("%s realtiming timeouts: job=%dm go=%dm, want job=100m and at least 15m outer margin", name, jobTimeout, goTimeout)
 		}
@@ -732,9 +734,9 @@ func assertAllPort443RulesOwnerScoped(t *testing.T, workflowName, workflowText s
 	}
 }
 
-func workflowGoTestTimeoutMinutes(t *testing.T, workflowName, workflowText string) int {
+func workflowGoTestTimeoutMinutes(t *testing.T, workflowName, workflowText, buildTag string) int {
 	t.Helper()
-	matches := regexp.MustCompile(`(?m)\bgo test [^\n]*-timeout=([0-9]+)m[^\n]*-tags=service_acceptance_realtiming\b`).FindAllStringSubmatch(workflowText, -1)
+	matches := regexp.MustCompile(`(?m)\bgo test [^\n]*-timeout=([0-9]+)m[^\n]*-tags=`+regexp.QuoteMeta(buildTag)+`\b`).FindAllStringSubmatch(workflowText, -1)
 	if len(matches) != 1 {
 		t.Fatalf("%s realtiming go test timeout count = %d, want 1", workflowName, len(matches))
 	}

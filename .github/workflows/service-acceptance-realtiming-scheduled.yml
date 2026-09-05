@@ -73,7 +73,7 @@ jobs:
   fabric-machine-identity:
     name: fabric-identity / machine
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -116,7 +116,7 @@ jobs:
   fabric-person-identity:
     name: fabric-identity / person-whoami
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -736,6 +736,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Detach the receipt gate to the validated publishing commit
+        if: needs.resolve-published-artifact.outputs.available == 'true'
         env:
           EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
         run: |
@@ -772,7 +773,9 @@ jobs:
           name: fabric-person-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-person-identity
       - name: Assemble the typed Fabric identity receipt
+        if: needs.resolve-published-artifact.outputs.available == 'true'
         env:
+          TRUST_DOMAIN: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || 'trusted' }}
           MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}
           PERSON_RESULT: ${{ needs.fabric-person-identity.result }}
           MACHINE_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' }}
@@ -781,7 +784,7 @@ jobs:
           scripts/assemble-fabric-identity-receipt.sh \
             "$RUNNER_TEMP/fabric-identity-receipt.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
-            trusted "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED" \
+            "$TRUST_DOMAIN" "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED" \
             "$RUNNER_TEMP/fabric-machine-identity/fabric-machine-identity.json" \
             "$RUNNER_TEMP/fabric-person-identity/fabric-person-identity.json"
       - name: Fail closed unless the published lane executed and passed
@@ -789,6 +792,7 @@ jobs:
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
           ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}
           REALTIMING_RESULT: ${{ needs.service-acceptance-realtiming.result }}
+          TRUST_DOMAIN: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || 'trusted' }}
           MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}
           PERSON_RESULT: ${{ needs.fabric-person-identity.result }}
           MACHINE_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' }}
@@ -805,7 +809,7 @@ jobs:
           scripts/check-fabric-identity-receipt.sh \
             "$RUNNER_TEMP/fabric-identity-receipt.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
-            trusted "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED"
+            "$TRUST_DOMAIN" "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED"
           scripts/check-linux-computer-receipt.sh \
             "$RUNNER_TEMP/linux-computer-receipt-xfce/linux-computer-matrix.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" xfce \

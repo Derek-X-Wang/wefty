@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 9 ] || [ "$#" -gt 10 ]; then
-  printf '%s\n' 'usage: assemble-fabric-identity-receipt.sh OUTPUT CANDIDATE_SHA trusted|pull_request MACHINE_RESULT PERSON_RESULT MACHINE_ARMED PERSON_ARMED MACHINE_RECEIPT PERSON_RECEIPT [MUTATION]' >&2
+if [ "$#" -ne 9 ]; then
+  printf '%s\n' 'usage: assemble-fabric-identity-receipt.sh OUTPUT CANDIDATE_SHA trusted|pull_request|workflow_dispatch MACHINE_RESULT PERSON_RESULT MACHINE_ARMED PERSON_ARMED MACHINE_RECEIPT PERSON_RECEIPT' >&2
   exit 64
 fi
 
@@ -15,18 +15,16 @@ machine_armed=$6
 person_armed=$7
 machine_receipt=$8
 person_receipt=$9
-mutation=${10:-}
 
 case "$candidate_sha" in
   *[!0-9a-f]*|'') exit 64 ;;
 esac
 test "${#candidate_sha}" -eq 40
-case "$trust_domain" in trusted|pull_request) ;; *) exit 64 ;; esac
+case "$trust_domain" in trusted|pull_request|workflow_dispatch) ;; *) exit 64 ;; esac
 case "$machine_result" in success|failure|cancelled|skipped) ;; *) exit 64 ;; esac
 case "$person_result" in success|failure|cancelled|skipped) ;; *) exit 64 ;; esac
 case "$machine_armed" in true|false) ;; *) exit 64 ;; esac
 case "$person_armed" in true|false) ;; *) exit 64 ;; esac
-case "$mutation" in ''|skipped_person_as_success) ;; *) exit 64 ;; esac
 
 work_directory=$(mktemp -d "${TMPDIR:-/tmp}/wefty-fabric-receipt.XXXXXX")
 trap 'rm -rf "$work_directory"' EXIT HUP INT TERM
@@ -49,15 +47,30 @@ not_run_row() {
 
 failed_row() {
   reason=$1
-  jq -n --arg reason "$reason" '{status:"FAIL",reason:$reason,assertions:{},evidence:{},deviations:[]}'
+  jq -n --arg reason "$reason" '{
+    status:"FAIL",
+    reason:$reason,
+    assertions:{},
+    evidence:{},
+    deviations:[{
+      id:"dev.plain_fabric_identity",
+      status:"DEVIATION",
+      reason:"production Fabric identity evidence did not complete successfully"
+    }]
+  }'
 }
 
-if [ "$trust_domain" = pull_request ]; then
+if [ "$trust_domain" != trusted ]; then
   test "$machine_result" = skipped
   test "$person_result" = skipped
-  machine_dns_acl=$(not_run_row pull_request_secretless)
-  machine_second_peer=$(not_run_row pull_request_secretless)
-  person_whoami=$(not_run_row pull_request_secretless)
+  if [ "$trust_domain" = pull_request ]; then
+    skip_reason=pull_request_secretless
+  else
+    skip_reason=manual_dispatch_secretless
+  fi
+  machine_dns_acl=$(not_run_row "$skip_reason")
+  machine_second_peer=$(not_run_row "$skip_reason")
+  person_whoami=$(not_run_row "$skip_reason")
 else
   if [ "$machine_result" = success ]; then
     test "$machine_armed" = true
@@ -69,6 +82,9 @@ else
     ' "$machine_receipt" >/dev/null
     machine_dns_acl=$(jq -c '.rows["fabric.machine_dns_acl"]' "$machine_receipt")
     machine_second_peer=$(jq -c '.rows["fabric.machine_second_peer_reachability"]' "$machine_receipt")
+  elif [ "$machine_result" = skipped ] && [ "$machine_armed" = false ]; then
+    machine_dns_acl=$(not_run_row secret_unarmed)
+    machine_second_peer=$(not_run_row secret_unarmed)
   else
     machine_dns_acl=$(failed_row "machine_job_$machine_result")
     machine_second_peer=$(failed_row "machine_job_$machine_result")
@@ -88,10 +104,6 @@ else
   else
     person_whoami=$(failed_row "person_job_$person_result")
   fi
-fi
-
-if [ "$mutation" = skipped_person_as_success ] && [ "$person_result" = skipped ]; then
-  person_whoami='{"status":"PASS","assertions":{"whoami_authenticated":true},"evidence":{},"deviations":[]}'
 fi
 
 jq -n \

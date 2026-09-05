@@ -105,7 +105,7 @@ jobs:
   fabric-machine-identity:
     name: fabric-identity / machine
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && github.event_name == 'workflow_run' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -139,7 +139,7 @@ jobs:
   fabric-person-identity:
     name: fabric-identity / person-whoami
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && github.event_name == 'workflow_run' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -761,6 +761,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the receipt gate from the artifact-producing commit
+        if: needs.resolve-published-artifact.outputs.available == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}
@@ -791,6 +792,7 @@ jobs:
           name: fabric-person-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-person-identity
       - name: Assemble the typed Fabric identity receipt
+        if: needs.resolve-published-artifact.outputs.available == 'true'
         env:
           TRUST_DOMAIN: ${{ github.event_name == 'pull_request' && 'pull_request' || 'trusted' }}
           MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}

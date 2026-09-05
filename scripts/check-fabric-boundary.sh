@@ -8,7 +8,7 @@ if violations=$(git grep -n '"tailscale.com/' -- '*.go' ':(exclude)fabric/tsnet/
 fi
 
 if violations=$(git grep -n -E 'MagicDNS|\.ts\.net|svc:' -- '*.go' '*.json' \
-  ':(exclude)fabric/tsnet/**' ':(exclude)scripts/*_test.go'); then
+  ':(exclude)fabric/tsnet/**' ':(exclude)scripts/fabric_identity_receipt_contract_test.go'); then
   echo "provider-specific DNS and service-name shapes must stay behind fabric/tsnet:" >&2
   echo "${violations}" >&2
   exit 1

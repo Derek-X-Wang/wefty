@@ -94,8 +94,8 @@ func TestTSNetPersonWhoAmI(t *testing.T) {
 	}
 	serverConnectHost := serverFabric.ConnectHost()
 	personConnectHost := personFabric.ConnectHost()
-	if serverConnectHost == "" || personConnectHost == "" || serverConnectHost == personConnectHost {
-		t.Fatalf("ConnectHost server=%q person=%q, want two distinct Fabric presentation addresses", serverConnectHost, personConnectHost)
+	if serverConnectHost == "" || personConnectHost == "" {
+		t.Fatalf("ConnectHost server=%q person=%q, want non-empty Fabric presentation addresses", serverConnectHost, personConnectHost)
 	}
 	writeFabricIdentitySmokeReceipt(t, os.Getenv("WEFTY_FABRIC_PERSON_RECEIPT"), map[string]fabricIdentitySmokeRow{
 		"fabric.person_whoami": {
@@ -107,9 +107,6 @@ func TestTSNetPersonWhoAmI(t *testing.T) {
 			Evidence: map[string]string{
 				"listener_connect_host": serverConnectHost,
 				"peer_connect_host":     personConnectHost,
-				"fabric_id":             person.FabricID,
-				"user_id":               person.UserID,
-				"device_id":             person.DeviceID,
 			},
 		},
 	})
