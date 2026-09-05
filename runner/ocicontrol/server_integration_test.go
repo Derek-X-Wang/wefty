@@ -51,6 +51,8 @@ func TestControlResponsePreservesSanitizedHelperMechanics(t *testing.T) {
 	}
 }
 
+// TestOperatorControlSocketUsesARealProcess self-reexecutes the test binary.
+// Run it with -count=1; it is not a valid repeated-sample test harness.
 func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	if os.Getenv(controlChildEnvironment) == "1" {
 		runControlChild(t)
@@ -174,7 +176,9 @@ func runControlChild(t *testing.T) {
 		StopFunc: func(_ context.Context, request IntentMutationRequest) (IntentResponse, error) {
 			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
 			if err == nil {
-				go stop()
+				stop()
+				// Force the response to overlap shutdown without retrying the request.
+				time.Sleep(100 * time.Millisecond)
 			}
 			return IntentResponse{Intent: intent, RuntimeQuiesced: err == nil}, err
 		},
