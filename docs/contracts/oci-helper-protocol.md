@@ -881,6 +881,11 @@ legacy reset manifest, and quarantine root; `AttestRemoval` returns only
 assertions that were actually inventoried absent. A later helper session may
 replay that receipt but cannot restamp it with a newer generation.
 
+Startup recovery scopes structural and I/O failures to the affected disk.
+Identity mismatches and invalid clean-reap evidence produce typed quarantine;
+unreadable per-disk files and quarantine-root inventory produce typed deferral.
+Neither condition turns one disk's state into a whole-node sweep failure.
+
 `GrowComputerStorage` binds its receipt to Computer, Storage generation, Node,
 managed-root instance, Job, operation revision and fence, helper generation,
 and both byte counts. Grow serializes with reset, Backup, attach, detach, and
@@ -916,7 +921,10 @@ destination generation was published. Grow and copy recovery emit typed
 `resumed` or `rolled_back` sweep evidence. Operational recovery failures with
 valid durable authority increment `attempts`, preserve `first_deferred_at` and
 a closed reason, emit `resume_deferred`, and keep that Computer generation
-unattachable. A later `CopyComputerStorage` call for the same durable request
+unattachable. Generation-local operational deferrals, including unreadable
+manifests and images, are persisted separately from the unreadable artifact so
+their attempt count and first-deferred time survive helper replacement. A later
+`CopyComputerStorage` call for the same durable request
 returns typed `computer_storage_resume_deferred` while that deferred manifest
 remains; a quarantined generation returns the existing typed quarantine result.
 Only boot-barrier startup sweeps increment the durable attempt
