@@ -301,36 +301,50 @@ func TestReadinessProbeStillCallsNonUpgradeHTTPPlainTCP(t *testing.T) {
 	<-done
 }
 
-func TestLateRawTCPProbeDetectsRawRFBListener(t *testing.T) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for accepted := 0; accepted < 2; accepted++ {
-			connection, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
+func TestLateRawTCPProbeDetectsNonWebSocketListenerShapes(t *testing.T) {
+	for name, serve := range map[string]func(net.Conn){
+		"raw RFB": func(connection net.Conn) {
 			_, _ = io.WriteString(connection, "RFB 003.008\n")
-			_ = connection.Close()
-		}
-	}()
-	port := listener.Addr().(*net.TCPAddr).Port
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	ready, event, probeErr := (&runtimeRunner{}).probeReady(ctx, port, ReadinessEventControlEndpointReady)
-	if ready || event != ReadinessEventControlEndpointReady || probeErr == nil {
-		t.Fatalf("raw RFB readiness probe = ready %t event %q err %v", ready, event, probeErr)
+		},
+		"silent accept": func(connection net.Conn) {
+			_, _ = io.Copy(io.Discard, connection)
+		},
+		"accept then close": func(net.Conn) {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			listener, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for accepted := 0; accepted < 2; accepted++ {
+					connection, acceptErr := listener.Accept()
+					if acceptErr != nil {
+						return
+					}
+					if accepted == 0 {
+						serve(connection)
+					}
+					_ = connection.Close()
+				}
+			}()
+			port := listener.Addr().(*net.TCPAddr).Port
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			ready, event, probeErr := (&runtimeRunner{}).probeReady(ctx, port, ReadinessEventControlEndpointReady)
+			if ready || event != ReadinessEventControlEndpointReady || probeErr == nil {
+				t.Fatalf("non-WebSocket readiness probe = ready %t event %q err %v", ready, event, probeErr)
+			}
+			if !probeProvesPlainTCP(ctx, port, probeErr) {
+				t.Fatal("late raw TCP probe did not detect the listener")
+			}
+			_ = listener.Close()
+			<-done
+		})
 	}
-	if !probeProvesPlainTCP(ctx, port, probeErr) {
-		t.Fatal("late raw TCP probe did not detect the raw RFB listener")
-	}
-	_ = listener.Close()
-	<-done
 }
 
 func TestViewIsolationClassifiesRFBNegotiationFailureAsAssertion(t *testing.T) {
