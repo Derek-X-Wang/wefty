@@ -35,6 +35,7 @@ type batchingLogSink struct {
 	closeOnce     sync.Once
 	closeErr      error
 	pendingEvents atomic.Int64
+	retainLate    func(contract.LogEvent)
 }
 
 type logSinkCloseRequest struct {
@@ -101,18 +102,17 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 	case <-sink.done:
 		return sink.err()
 	case <-ctx.Done():
-		return ctx.Err()
+		err := ctx.Err()
+		sink.retainDeadlineInterrupted(ctx, event, err)
+		return err
 	default:
 	}
 	if err := sink.spool.append(ctx, event); err != nil {
+		sink.retainDeadlineInterrupted(ctx, event, err)
 		return err
 	}
-	sink.pendingEvents.Add(1)
-	pending, err := sink.spool.pendingCount(ctx, event.AttemptID)
-	if err != nil {
-		return err
-	}
-	if pending < sink.batchSize {
+	pending := sink.pendingEvents.Add(1)
+	if pending < int64(sink.batchSize) {
 		return nil
 	}
 	select {
@@ -120,6 +120,12 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 	default:
 	}
 	return nil
+}
+
+func (sink *batchingLogSink) retainDeadlineInterrupted(ctx context.Context, event contract.LogEvent, err error) {
+	if cause := context.Cause(ctx); cause == context.DeadlineExceeded && err == cause && sink.retainLate != nil {
+		sink.retainLate(event)
+	}
 }
 
 func (sink *batchingLogSink) Close() error {

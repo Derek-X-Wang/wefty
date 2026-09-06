@@ -40,6 +40,12 @@ type evidenceOutbox struct {
 	recoveryWake   chan struct{}
 	ownershipMu    sync.RWMutex
 	liveAttempts   map[string]struct{}
+	lateEvents     map[string]int
+	lateMu         sync.Mutex
+	lateContext    context.Context
+	lateCancel     context.CancelFunc
+	lateWG         sync.WaitGroup
+	lateClosed     bool
 }
 
 func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) (*evidenceOutbox, error) {
@@ -47,16 +53,25 @@ func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, ba
 	if err != nil {
 		return nil, err
 	}
+	lateContext, lateCancel := context.WithCancel(context.Background())
 	return &evidenceOutbox{
 		spool: spool, clock: clock, batchSize: batchSize,
 		flushInterval: flushInterval, retryInterval: retryInterval,
 		recoveryWake: make(chan struct{}, 1),
 		liveAttempts: make(map[string]struct{}),
+		lateEvents:   make(map[string]int),
+		lateContext:  lateContext,
+		lateCancel:   lateCancel,
 	}, nil
 }
 
 func (outbox *evidenceOutbox) newLogSink(ctx context.Context, client *Client, claim l1.Claim) (*batchingLogSink, error) {
-	return newBatchingLogSink(ctx, client, claim, outbox.spool, outbox.clock, outbox.batchSize, outbox.flushInterval, outbox.retryInterval)
+	sink, err := newBatchingLogSink(ctx, client, claim, outbox.spool, outbox.clock, outbox.batchSize, outbox.flushInterval, outbox.retryInterval)
+	if err != nil {
+		return nil, err
+	}
+	sink.retainLate = outbox.retainLateEvent
+	return sink, nil
 }
 
 func (outbox *evidenceOutbox) ensureAttempt(ctx context.Context, claim l1.Claim) error {
@@ -305,8 +320,48 @@ func (outbox *evidenceOutbox) releaseAttempt(attemptID string, reconcile bool) {
 func (outbox *evidenceOutbox) attemptIsLive(attemptID string) bool {
 	outbox.ownershipMu.RLock()
 	_, live := outbox.liveAttempts[attemptID]
+	live = live || outbox.lateEvents[attemptID] > 0
 	outbox.ownershipMu.RUnlock()
 	return live
+}
+
+// retainLateEvent transfers a redacted event whose first durable append was
+// interrupted by the bounded finalization deadline to the process-lifetime
+// outbox. The append is idempotent, and recovery treats the attempt as live
+// until this retry finishes so it cannot deliver completion ahead of the log.
+func (outbox *evidenceOutbox) retainLateEvent(event contract.LogEvent) {
+	if outbox == nil || outbox.spool == nil {
+		return
+	}
+	retained := event
+	retained.Bytes = append([]byte(nil), event.Bytes...)
+	if event.Gap != nil {
+		gap := *event.Gap
+		retained.Gap = &gap
+	}
+	outbox.lateMu.Lock()
+	if outbox.lateClosed {
+		outbox.lateMu.Unlock()
+		return
+	}
+	outbox.lateWG.Add(1)
+	outbox.ownershipMu.Lock()
+	outbox.lateEvents[event.AttemptID]++
+	outbox.ownershipMu.Unlock()
+	lateContext := outbox.lateContext
+	outbox.lateMu.Unlock()
+
+	go func() {
+		defer outbox.lateWG.Done()
+		_ = outbox.spool.append(lateContext, retained)
+		outbox.ownershipMu.Lock()
+		outbox.lateEvents[event.AttemptID]--
+		if outbox.lateEvents[event.AttemptID] == 0 {
+			delete(outbox.lateEvents, event.AttemptID)
+		}
+		outbox.ownershipMu.Unlock()
+		outbox.scheduleRecovery()
+	}()
 }
 
 // scheduleRecovery wakes the process-lifetime outbox reconciler after the
@@ -506,6 +561,11 @@ func (outbox *evidenceOutbox) Close() error {
 	if outbox == nil || outbox.spool == nil {
 		return nil
 	}
+	outbox.lateMu.Lock()
+	outbox.lateClosed = true
+	outbox.lateCancel()
+	outbox.lateMu.Unlock()
+	outbox.lateWG.Wait()
 	outbox.recoveryMu.Lock()
 	if outbox.recoveryCancel != nil {
 		outbox.recoveryCancel()

@@ -661,6 +661,15 @@ incomplete-evidence fact remains additive. The deadline rule applies to both
 service and one-shot payload results, but never adds runtime evidence to a
 pre-`Started` OCI `spawn_error`.
 
+Once an output event is durably appended, the sink decides whether to wake its
+uploader from its attempt-local pending count; it does not synchronously recount
+SQLite rows under the caller's finalization context. Contention while deciding
+when to upload cannot turn a healthy payload result into `output_error`. If the
+append itself instead returns the caller's expired finalization cause, the
+preceding incomplete-evidence rule applies rather than reclassifying the payload;
+the process-lifetime outbox retries the retained redacted event and orders its
+late-evidence upload before completion.
+
 `one_shot` and `services` report independent occupied/limit pairs. They are
 local admission counts, not slot identities and not L1 state.
 

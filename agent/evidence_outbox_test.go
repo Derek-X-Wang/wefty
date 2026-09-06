@@ -540,6 +540,428 @@ func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
 	}
 }
 
+func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *testing.T) {
+	uploadedTail := make(chan contract.LogEvent, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/logs") {
+			http.NotFound(w, request)
+			return
+		}
+		var appendRequest l1.AppendLogsRequest
+		if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		if len(appendRequest.Events) != 1 {
+			t.Errorf("final redaction upload events = %d, want 1", len(appendRequest.Events))
+			return
+		}
+		uploadedTail <- appendRequest.Events[0]
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
+		})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "pending-count-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+
+	countStarted := make(chan struct{}, 1)
+	outbox.spool.pendingCountCheckpoint = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); !bounded {
+			return
+		}
+		countStarted <- struct{}{}
+		<-ctx.Done()
+	}
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "pending-count-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{
+				contract.EnvRunToken: "tail-secret",
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "pending-count-attempt", FencingToken: "pending-count-fence"},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, runtimes: testRuntimeSet(bufferedOutputRunner{}),
+		clock: systemClock{}, nodeID: "pending-count-node", bootSessionID: "pending-count-boot",
+		finalizationTimeout: 25 * time.Millisecond,
+		observer:            newLifecycleObserver(systemClock{}),
+	})
+
+	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	countWasContended := false
+	select {
+	case <-countStarted:
+		countWasContended = true
+	default:
+	}
+	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || result.LogEvidenceIncomplete {
+		t.Fatalf("healthy attempt under pending-count contention = result %#v err=%v, want exit 0 with complete output evidence", result, runErr)
+	}
+	if countWasContended {
+		t.Fatal("final redaction flush synchronously recounted pending spool events")
+	}
+	select {
+	case tail := <-uploadedTail:
+		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" {
+			t.Fatalf("final redaction tail = %#v, want durable stdout sequence 0 with bytes tail", tail)
+		}
+	default:
+		t.Fatal("final redaction tail did not reach the durable spool and bounded upload")
+	}
+}
+
+func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
+	var mu sync.Mutex
+	var callOrder []string
+	recoveredTail := make(chan contract.LogEvent, 1)
+	completionSeen := make(chan l1.CompletionRequest, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/logs"):
+			var appendRequest l1.AppendLogsRequest
+			if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+				t.Error(err)
+				return
+			}
+			if len(appendRequest.Events) != 1 {
+				t.Errorf("late append recovery events = %d, want 1", len(appendRequest.Events))
+				return
+			}
+			mu.Lock()
+			callOrder = append(callOrder, "logs")
+			mu.Unlock()
+			recoveredTail <- appendRequest.Events[0]
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+				Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
+				AttemptState: contract.AttemptRunning,
+			})
+		case strings.HasSuffix(request.URL.Path, "/complete"):
+			var completion l1.CompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			callOrder = append(callOrder, "completion")
+			mu.Unlock()
+			completionSeen <- completion
+			_ = json.NewEncoder(w).Encode(l1.Job{})
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "append-deadline-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover late append evidence: %v", err) })
+
+	appendStarted := make(chan struct{}, 1)
+	outbox.spool.appendCheckpoint = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); !bounded {
+			return
+		}
+		appendStarted <- struct{}{}
+		<-ctx.Done()
+	}
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "append-deadline-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{
+				contract.EnvRunToken: "tail-secret",
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "append-deadline-attempt", FencingToken: "append-deadline-fence"},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, runtimes: testRuntimeSet(bufferedOutputRunner{}),
+		clock: systemClock{}, nodeID: "append-deadline-node", bootSessionID: "append-deadline-boot",
+		finalizationTimeout: 25 * time.Millisecond,
+		observer:            newLifecycleObserver(systemClock{}),
+	})
+
+	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	select {
+	case <-appendStarted:
+	default:
+		t.Fatal("final redaction flush never reached the injected spool append contention")
+	}
+	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || !result.LogEvidenceIncomplete {
+		t.Fatalf("healthy attempt under append contention = result %#v err=%v, want exit 0 with incomplete output evidence", result, runErr)
+	}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, toL1Result(result), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	outbox.scheduleRecovery()
+	select {
+	case tail := <-recoveredTail:
+		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" {
+			t.Fatalf("recovered redaction tail = %#v, want stdout sequence 0 with bytes tail", tail)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline-interrupted redaction tail was not recovered as late evidence")
+	}
+	select {
+	case completion := <-completionSeen:
+		if completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
+			t.Fatalf("late-evidence completion = %#v, want exit 0 with incomplete output evidence", completion.Result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-evidence recovery did not deliver completion")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(callOrder, []string{"logs", "completion"}) {
+		t.Fatalf("late append recovery order = %v, want logs before completion", callOrder)
+	}
+}
+
+func TestServiceFinalizationEvictionDeadlinePreservesPayloadAndRecoversTail(t *testing.T) {
+	var mu sync.Mutex
+	var targetCallOrder []string
+	recoveredTail := make(chan contract.LogEvent, 1)
+	completionSeen := make(chan l1.CompletionRequest, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/logs"):
+			var appendRequest l1.AppendLogsRequest
+			if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+				t.Error(err)
+				return
+			}
+			acknowledged := make(map[contract.LogStream]uint64)
+			for _, event := range appendRequest.Events {
+				acknowledged[event.Stream] = eventEndSequence(event)
+				if event.AttemptID == "service-eviction-deadline-attempt" {
+					mu.Lock()
+					targetCallOrder = append(targetCallOrder, "logs")
+					mu.Unlock()
+					recoveredTail <- event
+				}
+			}
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+				Acknowledged: acknowledged,
+				AttemptState: contract.AttemptRunning,
+			})
+		case strings.HasSuffix(request.URL.Path, "/complete"):
+			var completion l1.CompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+				t.Error(err)
+				return
+			}
+			if strings.Contains(request.URL.Path, "service-eviction-deadline-attempt") {
+				mu.Lock()
+				targetCallOrder = append(targetCallOrder, "completion")
+				mu.Unlock()
+				completionSeen <- completion
+			}
+			_ = json.NewEncoder(w).Encode(l1.Job{})
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "service-eviction-deadline-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.spool.maxServiceBytes = 4
+
+	retained := serviceSpoolTestClaim("service-eviction-retained-attempt")
+	if err := outbox.ensureAttempt(t.Context(), retained); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.spool.append(t.Context(), spoolTestEvent(retained.Lease.AttemptID, contract.LogStdout, 0, "full")); err != nil {
+		t.Fatal(err)
+	}
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedResource, err := initializeManagedResource(managedRoot, "service-eviction-deadline-node", "service-eviction-deadline-boot")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evictionStarted := make(chan struct{}, 1)
+	outbox.spool.serviceEvictionCheckpoint = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); !bounded {
+			return
+		}
+		evictionStarted <- struct{}{}
+		<-ctx.Done()
+	}
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "service-eviction-deadline-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassService,
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{
+				contract.EnvRunToken: "tail-secret",
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "service-eviction-deadline-attempt", FencingToken: "service-eviction-deadline-fence"},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, runtimes: testRuntimeSet(bufferedOutputRunner{}),
+		clock: systemClock{}, nodeID: "service-eviction-deadline-node", bootSessionID: "service-eviction-deadline-boot",
+		finalizationTimeout: 25 * time.Millisecond,
+		managedResource:     managedResource,
+		observer:            newLifecycleObserver(systemClock{}),
+	})
+
+	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	select {
+	case <-evictionStarted:
+	default:
+		t.Fatal("final redaction flush never reached service eviction")
+	}
+	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || !result.LogEvidenceIncomplete {
+		t.Fatalf("healthy service under eviction contention = result %#v err=%v, want exit 0 with incomplete output evidence", result, runErr)
+	}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, toL1Result(result), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover service eviction evidence: %v", err) })
+	outbox.scheduleRecovery()
+	select {
+	case tail := <-recoveredTail:
+		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" || tail.Gap != nil {
+			t.Fatalf("recovered service redaction tail = %#v, want stdout sequence 0 with bytes tail", tail)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("eviction-deadline redaction tail was not recovered as late evidence")
+	}
+	select {
+	case completion := <-completionSeen:
+		if completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
+			t.Fatalf("service late-evidence completion = %#v, want exit 0 with incomplete output evidence", completion.Result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("service late-evidence recovery did not deliver completion")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(targetCallOrder, []string{"logs", "completion"}) {
+		t.Fatalf("service eviction recovery order = %v, want logs before completion", targetCallOrder)
+	}
+}
+
+func TestDeadlineExpiredBeforeSpoolAppendRetainsEventForRecovery(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var appendRequest l1.AppendLogsRequest
+		if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		acknowledged := make(map[contract.LogStream]uint64)
+		for _, event := range appendRequest.Events {
+			acknowledged[event.Stream] = eventEndSequence(event)
+		}
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: acknowledged})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "pre-append-deadline-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("pre-append-deadline-attempt")
+	sink, err := outbox.newLogSink(t.Context(), client, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	event := spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "retained")
+	if err := sink.WriteOutput(ctx, event); err != context.DeadlineExceeded {
+		t.Fatalf("pre-append expiry = %v, want exact context deadline", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 1 {
+			if pending[0].AttemptID != event.AttemptID || pending[0].Stream != event.Stream || pending[0].Sequence != event.Sequence || string(pending[0].Bytes) != string(event.Bytes) {
+				t.Fatalf("retained pre-append event = %#v, want %#v", pending[0], event)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("pre-append deadline event was not retained for recovery")
+}
+
+func TestBatchThresholdWakesUploaderBeforeClose(t *testing.T) {
+	uploadStarted := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/logs") {
+			http.NotFound(w, request)
+			return
+		}
+		var appendRequest l1.AppendLogsRequest
+		if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		if len(appendRequest.Events) != 3 {
+			t.Errorf("threshold upload events = %d, want 3", len(appendRequest.Events))
+			return
+		}
+		uploadStarted <- struct{}{}
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 2},
+		})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "threshold-wake-node", 1<<20, systemClock{}, 3, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "threshold-wake-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "threshold-wake-attempt", FencingToken: "threshold-wake-fence"},
+	}
+	sink, err := outbox.newLogSink(t.Context(), client, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	for sequence := uint64(0); sequence < 3; sequence++ {
+		if err := sink.WriteOutput(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, sequence, "threshold")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("batch threshold did not wake the uploader before close")
+	}
+}
+
 type deadlineManagedVolumeRuntime struct {
 	finalizations []workloadrunner.ManagedVolumeFinalizationRequest
 }
