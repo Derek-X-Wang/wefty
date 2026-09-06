@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/internal/naming"
@@ -23,15 +24,40 @@ import (
 // Fabric instances. Tests should create a fresh Network to avoid shared state.
 type Network struct {
 	mu       sync.RWMutex
-	names    map[string]string
+	names    map[string]*nameRegistration
 	peers    map[string]fabric.Identity
 	fabricID string
+	// listenFn is a test-only seam for controlling localhost bind completion.
+	// Access it through listen and setListenFuncForTest so concurrent tests do
+	// not race with listener creation.
+	listenFn func(network, address string) (net.Listener, error)
 }
 
 const (
 	identityMagic   = "WEFTYPLAIN1"
 	maxIdentitySize = 64 << 10
+	// logicalRegistrationWait spends at most 5% of the service-acceptance
+	// harness's 5-second Fabric dial budget waiting for an in-process loopback
+	// bind, leaving 4.75 seconds for the connection and request itself.
+	logicalRegistrationWait = 250 * time.Millisecond
 )
+
+type nameRegistration struct {
+	ready   chan struct{}
+	address string
+	err     error
+}
+
+// LogicalRegistrationTimeoutError reports that a claimed logical address did
+// not finish its localhost bind within the plain Fabric registration ceiling.
+type LogicalRegistrationTimeoutError struct {
+	Address string
+	Timeout time.Duration
+}
+
+func (e *LogicalRegistrationTimeoutError) Error() string {
+	return fmt.Sprintf("plain fabric: logical address %q registration did not complete within %s", e.Address, e.Timeout)
+}
 
 // NewNetwork creates an isolated localhost fabric network.
 func NewNetwork() *Network {
@@ -40,7 +66,7 @@ func NewNetwork() *Network {
 		panic(fmt.Sprintf("plain fabric: generate network identity: %v", err))
 	}
 	return &Network{
-		names:    make(map[string]string),
+		names:    make(map[string]*nameRegistration),
 		peers:    make(map[string]fabric.Identity),
 		fabricID: "plain-" + hex.EncodeToString(identity),
 	}
@@ -53,7 +79,7 @@ func NewNetworkWithID(fabricID string) (*Network, error) {
 	if !strings.HasPrefix(fabricID, "plain-") || len(fabricID) <= len("plain-") || len(fabricID) > 255 || strings.TrimSpace(fabricID) != fabricID {
 		return nil, errors.New("plain fabric: explicit Fabric ID must use the bounded plain- prefix")
 	}
-	return &Network{names: make(map[string]string), peers: make(map[string]fabric.Identity), fabricID: fabricID}, nil
+	return &Network{names: make(map[string]*nameRegistration), peers: make(map[string]fabric.Identity), fabricID: fabricID}, nil
 }
 
 // Fabric is one identity-bearing participant in a plain Network.
@@ -82,15 +108,25 @@ func (f *Fabric) Listen(network, address string) (net.Listener, error) {
 	} else if listenAddress, err = localAddress(address, true); err != nil {
 		return nil, err
 	}
+	var registration *nameRegistration
+	if logical {
+		registration, err = f.network.beginNameRegistration(name.String())
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	ln, err := net.Listen(network, listenAddress)
+	ln, err := f.network.listen(network, listenAddress)
 	if err != nil {
+		if registration != nil {
+			f.network.failNameRegistration(name.String(), registration, err)
+		}
 		return nil, err
 	}
-	l := &listener{Listener: ln, network: f.network}
+	l := &listener{Listener: ln, network: f.network, registration: registration}
 	if logical {
 		l.name = name.String()
-		if err := f.network.registerName(l.name, ln.Addr().String()); err != nil {
+		if err := f.network.completeNameRegistration(l.name, registration, ln.Addr().String()); err != nil {
 			_ = ln.Close()
 			return nil, err
 		}
@@ -106,7 +142,7 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, err
 	}
 	if logical {
-		address, err = f.network.resolveName(name.String())
+		address, err = f.network.resolveName(ctx, name.String())
 	} else {
 		address, err = localAddress(address, false)
 	}
@@ -149,24 +185,94 @@ func (f *Fabric) PersonIdentityTrust() fabric.PersonIdentityTrust {
 // localhost-only Fabric.
 func (f *Fabric) ConnectHost() string { return "127.0.0.1" }
 
-func (n *Network) registerName(name, address string) error {
+func (n *Network) beginNameRegistration(name string) (*nameRegistration, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if _, exists := n.names[name]; exists {
-		return fmt.Errorf("plain fabric: logical address %q is already listening", name)
+	if n.names[name] != nil {
+		return nil, fmt.Errorf("plain fabric: logical address %q is already listening", name)
 	}
-	n.names[name] = address
+	registration := &nameRegistration{ready: make(chan struct{})}
+	n.names[name] = registration
+	return registration, nil
+}
+
+func (n *Network) listen(network, address string) (net.Listener, error) {
+	n.mu.RLock()
+	listen := n.listenFn
+	n.mu.RUnlock()
+	if listen == nil {
+		listen = net.Listen
+	}
+	return listen(network, address)
+}
+
+func (n *Network) setListenFuncForTest(listen func(network, address string) (net.Listener, error)) {
+	n.mu.Lock()
+	n.listenFn = listen
+	n.mu.Unlock()
+}
+
+func (n *Network) completeNameRegistration(name string, registration *nameRegistration, address string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.names[name] != registration {
+		return fmt.Errorf("plain fabric: logical address %q registration lost ownership", name)
+	}
+	registration.address = address
+	close(registration.ready)
 	return nil
 }
 
-func (n *Network) resolveName(name string) (string, error) {
+func (n *Network) failNameRegistration(name string, registration *nameRegistration, err error) {
+	n.mu.Lock()
+	if n.names[name] == registration {
+		registration.err = err
+		close(registration.ready)
+		delete(n.names, name)
+	}
+	n.mu.Unlock()
+}
+
+func (n *Network) resolveName(ctx context.Context, name string) (string, error) {
 	n.mu.RLock()
-	address, ok := n.names[name]
-	n.mu.RUnlock()
-	if !ok {
+	registration := n.names[name]
+	if registration == nil {
+		n.mu.RUnlock()
 		return "", fmt.Errorf("plain fabric: logical address %q is not listening", name)
 	}
-	return address, nil
+	if registration.address != "" {
+		address := registration.address
+		n.mu.RUnlock()
+		return address, nil
+	}
+	n.mu.RUnlock()
+
+	timer := time.NewTimer(logicalRegistrationWait)
+	defer timer.Stop()
+	var waitErr error
+	select {
+	case <-registration.ready:
+	case <-ctx.Done():
+		waitErr = fmt.Errorf("plain fabric: logical address %q registration wait: %w", name, ctx.Err())
+	case <-timer.C:
+		waitErr = &LogicalRegistrationTimeoutError{Address: name, Timeout: logicalRegistrationWait}
+	}
+
+	n.mu.RLock()
+	address, registrationErr := registration.address, registration.err
+	n.mu.RUnlock()
+	// Publication is authoritative even if cancellation or the ceiling became
+	// selectable in the same scheduler turn as ready.
+	if address != "" {
+		return address, nil
+	}
+	if registrationErr != nil {
+		return "", fmt.Errorf("plain fabric: logical address %q failed to listen: %w", name, registrationErr)
+	}
+	if waitErr != nil {
+		return "", waitErr
+	}
+	return "", fmt.Errorf("plain fabric: logical address %q is not listening", name)
 }
 
 func (n *Network) registerPeer(address string, identity fabric.Identity) error {
@@ -187,9 +293,11 @@ func (n *Network) unregisterPeer(address string) {
 	n.mu.Unlock()
 }
 
-func (n *Network) unregisterName(name string) {
+func (n *Network) unregisterName(name string, registration *nameRegistration) {
 	n.mu.Lock()
-	delete(n.names, name)
+	if n.names[name] == registration {
+		delete(n.names, name)
+	}
 	n.mu.Unlock()
 }
 
@@ -213,9 +321,10 @@ func localAddress(address string, listen bool) (string, error) {
 
 type listener struct {
 	net.Listener
-	network *Network
-	name    string
-	once    sync.Once
+	network      *Network
+	name         string
+	registration *nameRegistration
+	once         sync.Once
 }
 
 type peerAddress struct {
@@ -254,7 +363,7 @@ func (l *listener) Accept() (net.Conn, error) {
 func (l *listener) Close() error {
 	l.once.Do(func() {
 		if l.name != "" {
-			l.network.unregisterName(l.name)
+			l.network.unregisterName(l.name, l.registration)
 		}
 	})
 	return l.Listener.Close()
