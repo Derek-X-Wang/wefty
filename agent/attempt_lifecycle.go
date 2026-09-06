@@ -504,12 +504,13 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 				return destinationError{destination: errorDestinationUnclassified, err: intentErr}
 			}
 			if !lifecycle.dependencies.ociIntentGate.allows(observation) {
-				releaseIntent()
 				if lifecycle.dependencies.outbox != nil {
 					if err := lifecycle.dependencies.outbox.suppressCompletion(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); err != nil {
+						releaseIntent()
 						return destinationError{destination: errorDestinationUnclassified, err: err}
 					}
 				}
+				releaseIntent()
 				return destinationError{destination: errorDestinationUnclassified, err: errOCIIntentDisabled}
 			}
 		}

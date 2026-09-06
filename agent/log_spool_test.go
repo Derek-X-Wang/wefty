@@ -448,6 +448,93 @@ VALUES(?, 'delivered', 'test', ?)`, fmt.Sprintf("newer-%04d", index), newerObser
 	}
 }
 
+func TestLogSpoolBoundsFullSuppressedPayloadsPerJob(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "suppression-bound-node", 1<<20)
+	defer spool.Close()
+	const retainedPayloadLimit = 16
+	for index := range retainedPayloadLimit + 2 {
+		attemptID := fmt.Sprintf("suppression-bound-%02d", index)
+		claim := serviceSpoolTestClaim(attemptID)
+		claim.Job.JobID = "restart-always-service"
+		claim.Job.Spec.Kind = contract.JobKindOCI
+		if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+			t.Fatal(err)
+		}
+		exitCode := index
+		if err := spool.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Unix(int64(index+1), 0)); err != nil {
+			t.Fatal(err)
+		}
+		if err := spool.recordCompletionDisposition(t.Context(), attemptID, "suppressed", "service_intent_stop", uint64(index+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var retainedPayloads int
+	if err := spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM spool_attempts
+WHERE job_id='restart-always-service' AND result_json IS NOT NULL`).Scan(&retainedPayloads); err != nil {
+		t.Fatal(err)
+	}
+	if retainedPayloads != retainedPayloadLimit {
+		t.Fatalf("full suppressed payloads=%d, want bounded %d", retainedPayloads, retainedPayloadLimit)
+	}
+	oldest := spool.inspectCompletion(t.Context(), "suppression-bound-00")
+	if oldest.State != "suppressed" || oldest.Reason != "service_intent_stop" || oldest.IntentRevision != 1 ||
+		oldest.TerminalAudit == nil || oldest.TerminalAudit.ExitCode == nil || *oldest.TerminalAudit.ExitCode != 0 || oldest.FinishedAt.Unix() != 1 {
+		t.Fatalf("compacted oldest suppression audit=%+v", oldest)
+	}
+	if err := spool.purgeJob(t.Context(), "restart-always-service"); err != nil {
+		t.Fatal(err)
+	}
+	if purged := spool.inspectCompletion(t.Context(), "suppression-bound-00"); purged.State != "never_persisted" {
+		t.Fatalf("job removal retained compact suppression audit=%+v", purged)
+	}
+}
+
+func TestSuppressedPayloadCompactionWaitsForLogAcknowledgement(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "suppression-log-bound-node", 1<<20)
+	defer spool.Close()
+	const jobID = "service-with-pending-old-log"
+	for index := range maxSuppressedCompletionPayloadsPerJob + 1 {
+		attemptID := fmt.Sprintf("suppression-log-bound-%02d", index)
+		claim := serviceSpoolTestClaim(attemptID)
+		claim.Job.JobID = jobID
+		claim.Job.Spec.Kind = contract.JobKindOCI
+		if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 {
+			if err := spool.append(t.Context(), spoolTestEvent(attemptID, contract.LogStdout, 0, "last log")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exitCode := index
+		if err := spool.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Unix(int64(index+1), 0)); err != nil {
+			t.Fatal(err)
+		}
+		if err := spool.recordCompletionDisposition(t.Context(), attemptID, "suppressed", "service_intent_stop", uint64(index+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var retained int
+	if err := spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM spool_attempts WHERE job_id=? AND result_json IS NOT NULL`, jobID).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != maxSuppressedCompletionPayloadsPerJob+1 {
+		t.Fatalf("pending-log suppressed payloads=%d, want %d", retained, maxSuppressedCompletionPayloadsPerJob+1)
+	}
+	if err := spool.acknowledge(t.Context(), "suppression-log-bound-00", map[contract.LogStream]uint64{contract.LogStdout: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM spool_attempts WHERE job_id=? AND result_json IS NOT NULL`, jobID).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != maxSuppressedCompletionPayloadsPerJob {
+		t.Fatalf("drained suppressed payloads=%d, want %d", retained, maxSuppressedCompletionPayloadsPerJob)
+	}
+	if compacted := spool.inspectCompletion(t.Context(), "suppression-log-bound-00"); compacted.TerminalAudit == nil {
+		t.Fatalf("drained oldest payload was not compacted into terminal audit=%+v", compacted)
+	}
+}
+
 func TestLogSpoolDeletesDeliveredAttemptWhenLastEventDrains(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "node-delivered-backlog", 1024)
 	defer spool.Close()

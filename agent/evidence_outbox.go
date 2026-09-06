@@ -414,8 +414,9 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 				return intentErr
 			}
 			if !outbox.ociIntentGate.allows(observation) {
+				err := outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID, observation.Revision)
 				releaseIntent()
-				return outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID, observation.Revision)
+				return err
 			}
 		}
 	}

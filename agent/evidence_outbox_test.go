@@ -1715,6 +1715,133 @@ FROM spool_attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&eventCount
 	}
 }
 
+func TestLiveOCIServiceCompletionWithoutApplicableAuthorityPublishes(t *testing.T) {
+	completionCalls := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		completionCalls++
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "live-nil-intent-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "live-nil-intent-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "live-nil-intent-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	result := l1.ProcessResult{ExitCode: &exitCode}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
+	})
+	failure := lifecycle.completeWithRetry(t.Context(), claim, l1.CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: result,
+	})
+	if failure.err != nil || completionCalls != 1 {
+		t.Fatalf("nil-authority live completion failure=%v calls=%d", failure.err, completionCalls)
+	}
+	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "delivered" {
+		t.Fatalf("nil-authority live completion receipt=%+v", receipt)
+	}
+}
+
+func TestIntentStopDrainWaitsForLiveSuppressionDisposition(t *testing.T) {
+	client, stopServer := startEvidenceReplayServer(t, http.NotFoundHandler(), time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "suppression-drain-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "suppression-drain-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "suppression-drain-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	result := l1.ProcessResult{ExitCode: &exitCode}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentObserved := make(chan struct{})
+	gate := &ociIntentCompletionGate{
+		observe: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
+		},
+		observed: func(OCIIntentObservation) { close(intentObserved) },
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+	})
+	writeLock, err := outbox.spool.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeLock.ExecContext(t.Context(), `UPDATE spool_attempts SET job_id=job_id WHERE attempt_id=?`, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	completionDone := make(chan destinationError, 1)
+	go func() {
+		completionDone <- lifecycle.completeWithRetry(t.Context(), claim, l1.CompletionRequest{
+			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: result,
+		})
+	}()
+	select {
+	case <-intentObserved:
+	case <-time.After(time.Second):
+		_ = writeLock.Rollback()
+		t.Fatal("live completion did not observe disabled intent")
+	}
+	stopDone := make(chan error, 1)
+	go func() {
+		release, stopErr := gate.beginStop(t.Context(), 2)
+		if stopErr == nil {
+			release()
+		}
+		stopDone <- stopErr
+	}()
+	stopReturnedBeforeDisposition := false
+	select {
+	case <-stopDone:
+		stopReturnedBeforeDisposition = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := writeLock.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if failure := <-completionDone; !errors.Is(failure.err, errOCIIntentDisabled) {
+		t.Fatalf("disabled live completion failure=%v", failure.err)
+	}
+	if !stopReturnedBeforeDisposition {
+		if err := <-stopDone; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stopReturnedBeforeDisposition {
+		t.Fatal("intent-stop drain returned before the suppressed disposition was durable")
+	}
+	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "suppressed" || receipt.IntentRevision != 2 {
+		t.Fatalf("durable suppression receipt=%+v", receipt)
+	}
+}
+
 func assertEvidenceRecoverySealsAuthorityLossIncomplete(t *testing.T) {
 	t.Helper()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

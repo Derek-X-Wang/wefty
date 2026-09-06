@@ -341,6 +341,7 @@ func TestAgentRefusesOCIProbeWithoutBootBarrier(t *testing.T) {
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 		}),
+		OCIIntent: enabledTestOCIIntent,
 	})
 	if err == nil || err.Error() != "agent: OCI capability probe requires a boot barrier" {
 		t.Fatalf("agent construction error = %v", err)

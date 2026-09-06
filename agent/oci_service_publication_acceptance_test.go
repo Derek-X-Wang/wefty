@@ -345,11 +345,7 @@ while :; do sleep 1; done
 	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != firstAttempt || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
 		t.Fatalf("intent-stop expiry evidence=%+v err=%v", attempts, err)
 	}
-	intentStopReceipt := nodeAgent.logSpool.inspectCompletion(t.Context(), firstAttempt)
-	if intentStopReceipt.State != "suppressed" || intentStopReceipt.Reason != "service_intent_stop" ||
-		intentStopReceipt.IntentRevision != stopResponse.Intent.Revision || intentStopReceipt.Result == (l1.ProcessResult{}) {
-		t.Fatalf("intent-stop spool disposition=%+v stop=%+v", intentStopReceipt, stopResponse)
-	}
+	inspectNativeIntentStopCompletion(t, nodeAgent, firstAttempt, stopResponse.Intent.Revision)
 	pinsAfterStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
 	bindingPinBefore := containsBindingPin(pinsBeforeStop, primary.JobID, digest)
 	bindingPinAfter := containsBindingPin(pinsAfterStop, primary.JobID, digest)
@@ -986,6 +982,18 @@ func waitNativeServiceAttempt(t *testing.T, store *l1.Store, nodeAgent *Agent, b
 	t.Fatalf("service %s did not reach a fresh running attempt after %s: job=%+v attempts=%+v attempts_err=%v agent_status=%+v capability=%+v helper_generation=%+v helper_ready=%t sweep=%+v sweep_ready=%t",
 		jobID, priorAttemptID, job, attempts, attemptsErr, nodeAgent.Status(), nodeAgent.CapabilitySnapshot(), generation, generationReady, sweep, sweepReady)
 	return l1.Job{}
+}
+
+func inspectNativeIntentStopCompletion(t *testing.T, nodeAgent *Agent, attemptID string, intentRevision uint64) completionInspectionReceipt {
+	t.Helper()
+	// Controller.Stop cannot return until the completion-gate writer has
+	// crossed any suppressing reader's durable disposition transaction.
+	receipt := nodeAgent.logSpool.inspectCompletion(t.Context(), attemptID)
+	if receipt.State != "suppressed" || receipt.Reason != "service_intent_stop" ||
+		receipt.IntentRevision != intentRevision || receipt.Result == (l1.ProcessResult{}) {
+		t.Fatalf("intent-stop spool disposition=%+v revision=%d", receipt, intentRevision)
+	}
+	return receipt
 }
 
 func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attemptID string, anchor time.Time, timeout time.Duration) (l1.Attempt, time.Duration, bool, string, bool) {
