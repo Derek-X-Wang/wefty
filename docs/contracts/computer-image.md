@@ -376,7 +376,7 @@ asserts `/dev/shm` mode, flags, size, and a rising cgroup `memory.current` after
 a guest write. The optional `examples/computer/` XFCE image and
 `examples/computer-wayland/` GPU-free Wayland image independently implement
 this minimum contract as image-author and acceptance examples. Each exact
-platform digest runs the same checker and 20-row broken-image matrix before a
+platform digest runs the same checker and 21-row broken-image matrix before a
 main-only publisher promotes those executed archives into its own immutable
 multi-platform index; neither image is a required base or compatibility target.
 
@@ -394,18 +394,24 @@ containerd acceptance owns those assertions.
 Every `FAIL` cell also carries a machine-readable `failure_reason`:
 `mutation_detected`, `readiness_timeout`, or `assertion_failed`. A readiness
 timeout names the exact missing `readiness_event`, such as endpoint readiness,
-the first RFB frame, or key-observer advancement. The broken-image matrix may
-retain unrelated `readiness_timeout` cells only after its exact expected cell
-is present with `mutation_detected` and the expected detail. An absent expected
-cell or any extra `assertion_failed` cell remains a fail-set failure; the
-positive reference-image run never ignores a readiness timeout.
+the first RFB frame, or key-observer advancement, and records both the applied
+observation window and elapsed observation. Check and event are validated as a
+closed pairing rather than as independent vocabularies. The broken-image matrix
+may retain unrelated `readiness_timeout` cells only after its exact expected
+cell is present once with `mutation_detected` and the expected detail. An input
+timeout additionally requires later success for the same event and an executed
+`input.control-accepted` cell. An absent or duplicate expected cell, a missing
+input-adjacent cell, or any extra `assertion_failed` cell remains a fail-set
+failure; the positive reference-image run never ignores a readiness timeout.
 
-The emulated arm64 input-event observation window is derived from that
-container's observed first-boot endpoint readiness, with one additional full
-startup interval for the dependent event to arrive. amd64 polling remains
-unchanged. TCP acceptance before the first RFB frame is an incomplete
-readiness event, not proof that plain TCP or non-upgrade HTTP was accepted;
-an observed non-upgrade HTTP response remains a protocol failure.
+The emulated arm64 input-event observation window is the greater of the legacy
+1.5-second window and twice that container's observed first-boot endpoint
+readiness. amd64 retains the same 1.5-second, 12-poll behavior through the
+shared polling loop. A successful WebSocket upgrade waiting for the first RFB
+frame is an incomplete readiness event, not proof that plain TCP was accepted.
+A separate post-upgrade-attempt dial preserves raw-RFB, silent-accept, and
+accept-then-close detection; an observed non-upgrade HTTP response remains a
+protocol failure.
 
 Checker teardown asks Docker to stop the container and then removes it so every
 bind mount is detached before the checker-owned temporary root is removed. The
