@@ -143,6 +143,8 @@ type ContainerdEngine struct {
 	computerReadDir             func(string) ([]os.DirEntry, error)
 	computerDiskSweepMu         sync.Mutex
 	computerDiskSweepEvidence   []SweepEvidence
+	computerQuarantineGCMu      sync.Mutex
+	computerQuarantineGC        map[string]computerDiskQuarantineReceipt
 	computerRecoveryMu          sync.Mutex
 	computerOperationalDeferred map[string]ComputerStorageRecoveryInventoryEntry
 	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)

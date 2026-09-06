@@ -25,6 +25,42 @@ func TestDigestFileHonorsRPCCancellation(t *testing.T) {
 	}
 }
 
+type cancelAfterChecksContext struct {
+	context.Context
+	cancelAt int
+	checks   int
+}
+
+func (ctx *cancelAfterChecksContext) Err() error {
+	ctx.checks++
+	if ctx.checks >= ctx.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestComputerStorageDigestsHonorCancellationAfterMultipleChunks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disk.ext4")
+	payload := make([]byte, 4*256*1024)
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, digest := range map[string]func(context.Context) (string, error){
+		"full file": func(ctx context.Context) (string, error) { return digestFile(ctx, path) },
+		"prefix":    func(ctx context.Context) (string, error) { return digestFilePrefix(ctx, path, int64(len(payload))) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := &cancelAfterChecksContext{Context: t.Context(), cancelAt: 3}
+			if _, err := digest(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("multi-chunk digest error = %v, want context cancellation after %d checks", err, ctx.checks)
+			}
+			if ctx.checks != ctx.cancelAt {
+				t.Fatalf("context checks = %d, want cancellation on check %d", ctx.checks, ctx.cancelAt)
+			}
+		})
+	}
+}
+
 type zeroProgressReader struct{}
 
 func (zeroProgressReader) Read([]byte) (int, error) { return 0, nil }

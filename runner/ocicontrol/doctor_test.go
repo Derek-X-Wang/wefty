@@ -261,19 +261,26 @@ func TestDoctorReportsNonzeroNativeHelperHandshakeStallCount(t *testing.T) {
 	}
 }
 
-func TestDoctorReportsQuarantinePayloadDropTimestamp(t *testing.T) {
+func TestDoctorReportsQuarantineGCAndPayloadDropFacts(t *testing.T) {
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	droppedAt := now.Add(-time.Hour)
+	firstFailedAt := now.Add(-2 * time.Hour)
+	escalatedAt := now.Add(-90 * time.Minute)
 	config := healthyDoctorConfig(now, "")
 	mutateHelper(&config, func(snapshot *HelperDoctorSnapshot) {
-		droppedAt := now.Add(-time.Hour)
 		snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined = []ocihelper.ComputerStorageRecoveryInventoryEntry{{
 			DiskName: "wefty-computer-disk-example", Operation: "quarantine", Reason: "allocation_mismatch", PayloadDroppedAt: &droppedAt,
+			GCFailures: 3, GCFirstFailedAt: firstFailedAt, GCEscalatedAt: escalatedAt, GCLastFailure: "remove_payload",
+			GCEvidenceStorage: ocihelper.ComputerDiskQuarantineGCEvidenceMirror,
 		}}
 		snapshot.SweepReceipt.ComputerStorageQuarantinedCount = 1
 	})
 	report := BuildDoctor(t.Context(), config)
-	if len(report.ComputerStorageRecovery.Quarantined) != 1 || !report.ComputerStorageRecovery.Quarantined[0].PayloadDroppedAt.Equal(now.Add(-time.Hour)) {
-		t.Fatalf("payload drop doctor facts=%+v", report.ComputerStorageRecovery)
+	if len(report.ComputerStorageRecovery.Quarantined) != 1 || report.ComputerStorageRecovery.GCEscalatedCount != 1 ||
+		!report.ComputerStorageRecovery.Quarantined[0].PayloadDroppedAt.Equal(droppedAt) ||
+		!report.ComputerStorageRecovery.Quarantined[0].GCEscalatedAt.Equal(escalatedAt) ||
+		report.ComputerStorageRecovery.Quarantined[0].GCEvidenceStorage != ocihelper.ComputerDiskQuarantineGCEvidenceMirror {
+		t.Fatalf("quarantine GC doctor facts=%+v", report.ComputerStorageRecovery)
 	}
 }
 

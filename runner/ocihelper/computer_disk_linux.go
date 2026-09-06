@@ -940,15 +940,8 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 				result.ComputerDiskAnomalies = append(result.ComputerDiskAnomalies, entry.Name()+":quarantine_authority_invalid")
 			} else {
 				result.ComputerQuarantines = append(result.ComputerQuarantines, entry.Name())
-				recovery := recoveryInventoryEntry(entry.Name(), "quarantine", receipt.Storage, computerStorageRecoveryDeferral{
-					Attempts: receipt.RecoveryAttempts, Reason: receipt.Reason, FirstDeferredAt: receipt.FirstDeferredAt,
-				})
-				recovery.DeferredReason = receipt.DeferredReason
-				if receipt.PayloadDroppedAt != nil {
-					droppedAt := receipt.PayloadDroppedAt.UTC()
-					recovery.PayloadDroppedAt = &droppedAt
-				}
-				result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined, recovery)
+				result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined,
+					engine.quarantineRecoveryInventoryEntry(root, entry.Name(), receipt))
 			}
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -1108,13 +1101,8 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 				valid = entryName == receipt.DiskName+"-anomaly-"+receipt.ReceiptID
 				name = receipt.DiskName
 				if valid {
-					recovery := recoveryInventoryEntry(name, "quarantine", receipt.Storage, computerStorageRecoveryDeferral{Attempts: receipt.RecoveryAttempts, Reason: receipt.Reason, FirstDeferredAt: receipt.FirstDeferredAt})
-					recovery.DeferredReason = receipt.DeferredReason
-					if receipt.PayloadDroppedAt != nil {
-						droppedAt := receipt.PayloadDroppedAt.UTC()
-						recovery.PayloadDroppedAt = &droppedAt
-					}
-					result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined, recovery)
+					result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined,
+						engine.quarantineRecoveryInventoryEntry(path, name, receipt))
 				}
 			}
 		} else if strings.HasSuffix(entryName, ".json") {
@@ -1429,7 +1417,9 @@ diskLoop:
 				method += ":deferral_record_unreadable"
 			}
 			quarantineErr := error(nil)
-			if deferredPresent {
+			if deferredPresent && deferred.Storage.ComputerID != "" {
+				quarantineErr = engine.quarantineComputerDiskAnomalyWithDeferral(root, entry.Name(), deferred.Storage, "manifest_missing", deferred.Recovery)
+			} else if deferredPresent {
 				quarantineErr = engine.quarantineComputerDiskAuthorityFailureWithDeferral(root, entry.Name(), "manifest_missing", deferred.Recovery)
 			} else {
 				quarantineErr = engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), "manifest_missing")

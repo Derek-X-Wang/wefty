@@ -188,6 +188,7 @@ type ComputerStorageRecoveryFacts struct {
 	Outcome          DiagnosticOutcome                                 `json:"outcome"`
 	DeferredCount    int                                               `json:"deferred_count"`
 	QuarantinedCount int                                               `json:"quarantined_count"`
+	GCEscalatedCount int                                               `json:"gc_escalated_count"`
 	Deferred         []ocihelper.ComputerStorageRecoveryInventoryEntry `json:"deferred"`
 	Quarantined      []ocihelper.ComputerStorageRecoveryInventoryEntry `json:"quarantined"`
 }
@@ -560,8 +561,14 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		if sweepOK {
 			deferred := slices.Clone(snapshot.SweepReceipt.VerifiedRetained.ComputerStorageDeferred)
 			quarantined := slices.Clone(snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined)
+			gcEscalatedCount := 0
+			for _, entry := range quarantined {
+				if !entry.GCEscalatedAt.IsZero() {
+					gcEscalatedCount++
+				}
+			}
 			clear := len(deferred) == 0 && len(quarantined) == 0
-			report.ComputerStorageRecovery = ComputerStorageRecoveryFacts{Outcome: outcomeFor(true, clear), DeferredCount: len(deferred), QuarantinedCount: len(quarantined), Deferred: deferred, Quarantined: quarantined}
+			report.ComputerStorageRecovery = ComputerStorageRecoveryFacts{Outcome: outcomeFor(true, clear), DeferredCount: len(deferred), QuarantinedCount: len(quarantined), GCEscalatedCount: gcEscalatedCount, Deferred: deferred, Quarantined: quarantined}
 			code := "oci_computer_storage_recovery_clear"
 			if !clear {
 				code = "oci_computer_storage_recovery_retained"

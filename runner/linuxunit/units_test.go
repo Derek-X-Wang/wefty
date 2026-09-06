@@ -1,6 +1,7 @@
 package linuxunit
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,8 +110,24 @@ func TestSystemd252LaneValidatesLegacyHelperPolicy(t *testing.T) {
 	}
 	command := exec.Command("systemd-analyze", "verify", path)
 	command.Env = append(os.Environ(), "SYSTEMD_UNIT_PATH="+working)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("systemd 252 rejected rendered legacy policy: %v\n%s", err, output)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("systemd 252 rejected rendered legacy policy: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Unknown key") {
+		t.Fatalf("systemd 252 ignored a rendered helper directive:\n%s", stderr.String())
+	}
+	for _, directive := range []string{"Restart=on-failure", "RestartSec=1s"} {
+		if !strings.Contains(string(units.HelperService), directive) {
+			t.Fatalf("systemd 252 helper policy omitted effective directive %q:\n%s", directive, units.HelperService)
+		}
+	}
+	for _, unsupported := range []string{"RestartSteps=", "RestartMaxDelaySec="} {
+		if strings.Contains(string(units.HelperService), unsupported) {
+			t.Fatalf("systemd 252 helper policy retained unsupported directive %q:\n%s", unsupported, units.HelperService)
+		}
 	}
 }
 

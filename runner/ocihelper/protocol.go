@@ -1380,13 +1380,15 @@ const (
 // lost Attempt resource. It does not grant ownership; the durable Attempt
 // record and the helper's live-attempt registry do that before any mutation.
 type SweepEvidence struct {
-	Class     RemovalResourceClass `json:"class"`
-	ID        string               `json:"id"`
-	AttemptID string               `json:"attempt_id"`
-	Action    SweepAction          `json:"action"`
-	Method    string               `json:"method,omitempty"`
-	PIDs      []int                `json:"pids,omitempty"`
-	Duration  time.Duration        `json:"duration"`
+	Class             RemovalResourceClass                    `json:"class"`
+	ID                string                                  `json:"id"`
+	AttemptID         string                                  `json:"attempt_id"`
+	Action            SweepAction                             `json:"action"`
+	Method            string                                  `json:"method,omitempty"`
+	PIDs              []int                                   `json:"pids,omitempty"`
+	Duration          time.Duration                           `json:"duration"`
+	GCEvidenceStorage ComputerDiskQuarantineGCEvidenceStorage `json:"gc_evidence_storage,omitempty"`
+	GCStopReason      ComputerDiskQuarantineGCStopReason      `json:"gc_stop_reason,omitempty"`
 }
 
 // SweepRequest is intentionally empty: the boot barrier always sweeps the
@@ -1443,20 +1445,38 @@ type ResourceInventory struct {
 	ComputerFirewallRules []string `json:"computer_firewall_rules"`
 }
 
+type ComputerDiskQuarantineGCEvidenceStorage string
+type ComputerDiskQuarantineGCStopReason string
+
+const (
+	ComputerDiskQuarantineGCEvidencePrimary      ComputerDiskQuarantineGCEvidenceStorage = "primary_receipt"
+	ComputerDiskQuarantineGCEvidenceMirror       ComputerDiskQuarantineGCEvidenceStorage = "mirror_receipt"
+	ComputerDiskQuarantineGCEvidenceMemory       ComputerDiskQuarantineGCEvidenceStorage = "memory_only_both_writes_failed"
+	ComputerDiskQuarantineGCStopFailureLimit     ComputerDiskQuarantineGCStopReason      = "failure_limit"
+	ComputerDiskQuarantineGCStopUnrecordedWindow ComputerDiskQuarantineGCStopReason      = "unrecorded_retry_window_elapsed"
+)
+
 // ComputerStorageRecoveryInventoryEntry gives deferred and quarantined disk
 // generations a typed operator surface. DiskName remains corroborating
 // physical custody and Storage is the generation authority when readable; an
 // operational record-read deferral leaves Storage zero rather than inventing
 // identity from the directory name.
 type ComputerStorageRecoveryInventoryEntry struct {
-	Storage          ComputerStorageReference `json:"storage"`
-	DiskName         string                   `json:"disk_name"`
-	Operation        string                   `json:"operation"`
-	Reason           string                   `json:"reason"`
-	DeferredReason   string                   `json:"deferred_reason,omitempty"`
-	Attempts         int                      `json:"attempts"`
-	FirstDeferredAt  time.Time                `json:"first_deferred_at,omitempty"`
-	PayloadDroppedAt *time.Time               `json:"payload_dropped_at,omitempty"`
+	Storage           ComputerStorageReference                `json:"storage"`
+	DiskName          string                                  `json:"disk_name"`
+	Operation         string                                  `json:"operation"`
+	Reason            string                                  `json:"reason"`
+	DeferredReason    string                                  `json:"deferred_reason,omitempty"`
+	Attempts          int                                     `json:"attempts"`
+	FirstDeferredAt   time.Time                               `json:"first_deferred_at,omitempty"`
+	PayloadDroppedAt  *time.Time                              `json:"payload_dropped_at,omitempty"`
+	GCFailures        int                                     `json:"gc_failures,omitempty"`
+	GCFirstFailedAt   time.Time                               `json:"gc_first_failed_at,omitempty"`
+	GCEscalatedAt     time.Time                               `json:"gc_escalated_at,omitempty"`
+	GCLastFailure     string                                  `json:"gc_last_failure,omitempty"`
+	GCEvidenceStorage ComputerDiskQuarantineGCEvidenceStorage `json:"gc_evidence_storage,omitempty"`
+	GCRetryStoppedAt  time.Time                               `json:"gc_retry_stopped_at,omitempty"`
+	GCRetryStopReason ComputerDiskQuarantineGCStopReason      `json:"gc_retry_stop_reason,omitempty"`
 }
 
 type ComputerStorageResumeDeferredError struct{ Storage ComputerStorageReference }
@@ -1476,7 +1496,21 @@ func recoveryInventoryEntryKey(entry ComputerStorageRecoveryInventoryEntry) stri
 	if entry.PayloadDroppedAt != nil {
 		payloadDroppedAt = entry.PayloadDroppedAt.UTC().Format(time.RFC3339Nano)
 	}
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d\x00%s", entry.DiskName, entry.Operation, entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts, payloadDroppedAt)
+	gcFirstFailedAt := ""
+	if !entry.GCFirstFailedAt.IsZero() {
+		gcFirstFailedAt = entry.GCFirstFailedAt.UTC().Format(time.RFC3339Nano)
+	}
+	gcEscalatedAt := ""
+	if !entry.GCEscalatedAt.IsZero() {
+		gcEscalatedAt = entry.GCEscalatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	gcRetryStoppedAt := ""
+	if !entry.GCRetryStoppedAt.IsZero() {
+		gcRetryStoppedAt = entry.GCRetryStoppedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d\x00%s\x00%020d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", entry.DiskName, entry.Operation,
+		entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts, payloadDroppedAt, entry.GCFailures,
+		gcFirstFailedAt, gcEscalatedAt, entry.GCLastFailure, entry.GCEvidenceStorage, gcRetryStoppedAt, entry.GCRetryStopReason)
 }
 
 // SweptAttemptAuthority is the immutable removal-validation subset recovered

@@ -63,6 +63,12 @@ start-limit interval prevents service exhaustion from failing the triggering
 socket with `service-start-limit-hit`. The socket retains systemd's default
 trigger-limit policy; the current lane proves service recovery and active
 socket topology, but does not claim a separate trigger-limit proof. The lane
+on Debian 12/systemd 252 rejects any `Unknown key` diagnostic from
+`systemd-analyze verify` and asserts the effective fixed-delay directives, so
+modern-only restart keys cannot be silently ignored. Fault actions publish a
+`.failed` verdict only through a completed temporary file rename; redirect,
+`cp`, and `tee` publication directly to the verdict path are contract drift.
+The lane
 records the exact helper-kill action-name set
 `{native-computer-helper-death,native-lost-attempt-sweep,service-reconfiguration-reset,service-restart-survival}`
 from the root fault-action journal. When
@@ -973,7 +979,15 @@ payload for 24 hours. GC revalidates the complete receipt under the generation
 flock, records typed `payload_dropped_at` evidence, and keeps the receipt and
 lock tombstone until authorized removal. Tombstones have no autonomous age
 bound. Three authority-valid payload-GC failures record
-`quarantine_gc_escalated` and stop automatic retry; legacy `-reset-N`
+`quarantine_gc_escalated` and stop automatic retry. GC failure evidence is
+written to both the mirrored sidecar and primary receipt when possible; either
+readable copy preserves the bound. If neither location accepts the update, the
+helper retains a typed `memory_only_both_writes_failed` record and stops after
+three process-local failures. Helper replacement also cannot authorize retries
+forever: the durable retention deadline plus a 24-hour unrecorded-retry window
+is the absolute wall-clock stop. Operator inventory carries the GC failure
+count, first/last failure facts, escalation timestamp, and evidence location;
+doctor reports the number of escalated quarantines. Legacy `-reset-N`
 quarantines are first normalized into the same receipt-backed retention and GC
 path. Invalid authority never permits byte deletion, and a per-generation GC
 failure does not fail helper startup, so generation N is never admissible
@@ -1121,7 +1135,8 @@ bytes, whereas Backup `available` means a verified wefty-managed copy.
 digest and reopens the external disk without following links to verify the full
 disk digest before creating a managed destination. Those post-copy and import
 digest reads are load-bearing because path-derived ownership is not identity
-authority. Import then applies
+authority. Full-file and prefix hashing check caller cancellation between every
+256 KiB chunk, including after hashing has already begun. Import then applies
 the same narrow OS machine-ID rekey and optional filesystem expansion as clone.
 Successful receipts record distinct well-formed pre/post identity digests,
 unchanged source bytes, and the prepared/no-freshness/no-chown destination
