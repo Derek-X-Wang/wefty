@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -36,7 +37,11 @@ type logSpoolAttempt struct {
 	kind         string
 }
 
-const legacyUnclassifiedKind = "unclassified"
+const (
+	legacyUnclassifiedKind                = "unclassified"
+	maxSuppressedCompletionPayloadsPerJob = 16
+	maxCompletionInspectionReceipts       = 1024
+)
 
 type durableSpoolEvent struct {
 	ordinal int64
@@ -58,6 +63,11 @@ type logSpool struct {
 	db              *sql.DB
 	maxOneShotBytes int64
 	maxServiceBytes int64
+	dispositionMu   sync.Mutex
+	dispositionNext chan struct{}
+	// dispositionWaitCheckpoint is a test-only scheduling seam that proves a
+	// waiter reached the pre-commit edge; production construction leaves it nil.
+	dispositionWaitCheckpoint func()
 	// runtimeRemovalCheckpoint is a test-only crash seam exercised at durable
 	// manifest state boundaries; production construction always leaves it nil.
 	runtimeRemovalCheckpoint func(runtimeRemovalCheckpoint) error
@@ -91,7 +101,10 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 		return nil, fmt.Errorf("agent: open log spool: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	spool := &logSpool{db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes}
+	spool := &logSpool{
+		db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes,
+		dispositionNext: make(chan struct{}),
+	}
 	if err := spool.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -176,7 +189,10 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
   disposition TEXT NOT NULL CHECK (disposition IN ('delivered', 'suppressed', 'withheld')),
   reason TEXT NOT NULL,
   observed_ns INTEGER NOT NULL,
-  intent_revision INTEGER
+  intent_revision INTEGER,
+	job_id TEXT,
+	finished_ns INTEGER,
+	terminal_audit_json BLOB
 );
 	CREATE TABLE IF NOT EXISTS agent_secrets (
 	  name TEXT PRIMARY KEY,
@@ -246,6 +262,9 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		{table: "spool_attempts", column: "completion_reason", definition: "TEXT"},
 		{table: "spool_attempts", column: "intent_revision", definition: "INTEGER"},
 		{table: "spool_completion_receipts", column: "intent_revision", definition: "INTEGER"},
+		{table: "spool_completion_receipts", column: "job_id", definition: "TEXT"},
+		{table: "spool_completion_receipts", column: "finished_ns", definition: "INTEGER"},
+		{table: "spool_completion_receipts", column: "terminal_audit_json", definition: "BLOB"},
 		{table: "runtime_removal_manifests", column: "absence_attestation_json", definition: "BLOB"},
 		{table: "runtime_removal_manifests", column: "attested_ns", definition: "INTEGER"},
 	} {
@@ -295,6 +314,9 @@ WHERE runtime_kind IS NULL OR runtime_kind=''`, contract.JobKindOCI, contract.Jo
 SET phase=?, completed_ns=NULL
 WHERE phase=? AND absence_attestation_json IS NULL`, runtimeRemovalQuarantined, runtimeRemovalComplete); err != nil {
 		return fmt.Errorf("agent: migrate pre-attestation runtime removals: %w", err)
+	}
+	if err := spool.compactExistingSuppressedCompletionPayloads(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -502,8 +524,19 @@ FROM spool_removals WHERE job_id=?`, removal.jobID).Scan(&kind, &generation, &cl
 }
 
 func (spool *logSpool) purgeJob(ctx context.Context, jobID string) error {
-	if _, err := spool.db.ExecContext(ctx, "DELETE FROM spool_attempts WHERE job_id=?", jobID); err != nil {
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin service spool metadata purge: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM spool_attempts WHERE job_id=?", jobID); err != nil {
 		return fmt.Errorf("agent: purge service spool metadata: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM spool_completion_receipts WHERE job_id=?", jobID); err != nil {
+		return fmt.Errorf("agent: purge compact service completion audit: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit service spool metadata purge: %w", err)
 	}
 	return nil
 }
@@ -808,6 +841,10 @@ func (spool *logSpool) acknowledge(ctx context.Context, attemptID string, acknow
 		return fmt.Errorf("agent: begin log spool acknowledgement: %w", err)
 	}
 	defer tx.Rollback()
+	var jobID string
+	if err := tx.QueryRowContext(ctx, "SELECT job_id FROM spool_attempts WHERE attempt_id=?", attemptID).Scan(&jobID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent: read acknowledged attempt job: %w", err)
+	}
 	for stream, sequence := range acknowledged {
 		if sequence > math.MaxInt64 {
 			return fmt.Errorf("agent: log acknowledgement %d exceeds durable spool range", sequence)
@@ -827,6 +864,11 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
   AND NOT EXISTS (SELECT 1 FROM spool_events WHERE attempt_id=?)
   AND EXISTS (SELECT 1 FROM spool_completion_receipts WHERE attempt_id=? AND disposition='delivered')`, attemptID, attemptID, attemptID); err != nil {
 		return fmt.Errorf("agent: clean drained delivered spool attempt: %w", err)
+	}
+	if jobID != "" {
+		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit log spool acknowledgement: %w", err)
@@ -864,6 +906,54 @@ type durableCompletion struct {
 	RuntimeQuiescenceEvidence l1.RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
 }
 
+// terminalCompletionAudit is the bounded, diagnostic-free terminal shape kept
+// after a full suppressed payload ages out of its per-job window.
+type terminalCompletionAudit struct {
+	SpawnFailureCode      contract.SpawnFailureCode    `json:"spawn_failure_code,omitempty"`
+	RuntimeFailureCode    contract.RuntimeFailureCode  `json:"runtime_failure_code,omitempty"`
+	OutputError           bool                         `json:"output_error,omitempty"`
+	ExitCode              *int                         `json:"exit_code,omitempty"`
+	Signal                string                       `json:"signal,omitempty"`
+	TerminationCause      contract.TerminationCause    `json:"termination_cause,omitempty"`
+	OOM                   bool                         `json:"oom,omitempty"`
+	DiskExhausted         bool                         `json:"disk_exhausted,omitempty"`
+	LogEvidenceIncomplete bool                         `json:"log_evidence_incomplete,omitempty"`
+	QuiescenceEvidence    l1.RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
+}
+
+func newTerminalCompletionAudit(completion durableCompletion) terminalCompletionAudit {
+	audit := terminalCompletionAudit{
+		OutputError: completion.Result.OutputError != "", ExitCode: completion.Result.ExitCode,
+		Signal: completion.Result.Signal, TerminationCause: completion.Result.TerminationCause,
+		OOM: completion.Result.OOM, DiskExhausted: completion.Result.DiskExhausted,
+		LogEvidenceIncomplete: completion.Result.LogEvidenceIncomplete,
+		QuiescenceEvidence:    completion.RuntimeQuiescenceEvidence,
+	}
+	if completion.Result.SpawnError != nil {
+		audit.SpawnFailureCode = completion.Result.SpawnError.Code
+	}
+	if completion.Result.RuntimeFailure != nil {
+		audit.RuntimeFailureCode = completion.Result.RuntimeFailure.Code
+	}
+	return audit
+}
+
+func encodeTerminalCompletionAudit(resultJSON []byte) ([]byte, error) {
+	if len(resultJSON) == 0 {
+		return nil, nil
+	}
+	var completion durableCompletion
+	if err := json.Unmarshal(resultJSON, &completion); err != nil {
+		return nil, err
+	}
+	if completion.Result == (l1.ProcessResult{}) {
+		if err := json.Unmarshal(resultJSON, &completion.Result); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(newTerminalCompletionAudit(completion))
+}
+
 type completionInspectionReceipt struct {
 	State              string
 	Result             l1.ProcessResult
@@ -873,23 +963,24 @@ type completionInspectionReceipt struct {
 	EventCount         int64
 	Reason             string
 	IntentRevision     uint64
+	TerminalAudit      *terminalCompletionAudit
 	InspectionError    string
 }
 
 func (spool *logSpool) inspectCompletion(ctx context.Context, attemptID string) completionInspectionReceipt {
-	var resultJSON, incompleteJSON []byte
-	var finishedNS sql.NullInt64
+	var resultJSON, incompleteJSON, terminalAuditJSON []byte
+	var finishedNS, receiptFinishedNS sql.NullInt64
 	var disposition, dispositionReason sql.NullString
 	var intentRevision sql.NullInt64
 	var eventCount int64
 	err := spool.db.QueryRowContext(ctx, `SELECT a.result_json, a.finished_ns, a.incomplete_json,
   (SELECT COUNT(*) FROM spool_events WHERE attempt_id=?),
   COALESCE(a.completion_disposition, r.disposition), COALESCE(a.completion_reason, r.reason),
-  COALESCE(a.intent_revision, r.intent_revision)
+  COALESCE(a.intent_revision, r.intent_revision), r.finished_ns, r.terminal_audit_json
 FROM (SELECT 1) seed
 LEFT JOIN spool_attempts a ON a.attempt_id=?
 LEFT JOIN spool_completion_receipts r ON r.attempt_id=?`, attemptID, attemptID, attemptID).
-		Scan(&resultJSON, &finishedNS, &incompleteJSON, &eventCount, &disposition, &dispositionReason, &intentRevision)
+		Scan(&resultJSON, &finishedNS, &incompleteJSON, &eventCount, &disposition, &dispositionReason, &intentRevision, &receiptFinishedNS, &terminalAuditJSON)
 	if err != nil {
 		return completionInspectionReceipt{State: "inspection_error", InspectionError: err.Error()}
 	}
@@ -934,10 +1025,53 @@ LEFT JOIN spool_completion_receipts r ON r.attempt_id=?`, attemptID, attemptID, 
 		if intentRevision.Valid {
 			receipt.IntentRevision = uint64(intentRevision.Int64)
 		}
+		if len(terminalAuditJSON) != 0 {
+			var audit terminalCompletionAudit
+			if err := json.Unmarshal(terminalAuditJSON, &audit); err != nil {
+				return completionInspectionReceipt{State: "inspection_error", InspectionError: err.Error()}
+			}
+			receipt.TerminalAudit = &audit
+			if receiptFinishedNS.Valid {
+				receipt.FinishedAt = time.Unix(0, receiptFinishedNS.Int64).UTC()
+			}
+		}
 		return receipt
 	}
 	receipt.State, receipt.Reason = "never_persisted", "no durable completion, tombstone, or delivery marker"
 	return receipt
+}
+
+// waitCompletionDisposition observes the commit edge shared by live completion
+// and process-lifetime recovery. Capturing the notification channel before the
+// read prevents a commit between inspection and waiting from being missed.
+func (spool *logSpool) waitCompletionDisposition(ctx context.Context, attemptID, disposition string, intentRevision uint64) (completionInspectionReceipt, error) {
+	for {
+		spool.dispositionMu.Lock()
+		changed := spool.dispositionNext
+		spool.dispositionMu.Unlock()
+		receipt := spool.inspectCompletion(ctx, attemptID)
+		if receipt.State == disposition && receipt.IntentRevision == intentRevision {
+			return receipt, nil
+		}
+		if receipt.State == "inspection_error" {
+			return receipt, fmt.Errorf("agent: inspect completion disposition: %s", receipt.InspectionError)
+		}
+		if spool.dispositionWaitCheckpoint != nil {
+			spool.dispositionWaitCheckpoint()
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return receipt, fmt.Errorf("agent: wait for %s completion disposition at intent revision %d: %w", disposition, intentRevision, ctx.Err())
+		}
+	}
+}
+
+func (spool *logSpool) notifyCompletionDisposition() {
+	spool.dispositionMu.Lock()
+	close(spool.dispositionNext)
+	spool.dispositionNext = make(chan struct{})
+	spool.dispositionMu.Unlock()
 }
 
 func (spool *logSpool) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
@@ -1006,10 +1140,18 @@ func (spool *logSpool) completionDelivered(ctx context.Context, attemptID string
 		return fmt.Errorf("agent: begin durable completion acknowledgement: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns, intent_revision)
-VALUES(?, 'delivered', 'acknowledged_by_l1', ?, ?)
+	var jobID sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT job_id FROM spool_attempts WHERE attempt_id=?", attemptID).Scan(&jobID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent: read delivered completion job: %w", err)
+	}
+	var storedJobID any
+	if jobID.Valid {
+		storedJobID = jobID.String
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns, intent_revision, job_id)
+VALUES(?, 'delivered', 'acknowledged_by_l1', ?, ?, ?)
 ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, observed_ns=excluded.observed_ns, intent_revision=excluded.intent_revision`,
-		attemptID, time.Now().UTC().UnixNano(), revision); err != nil {
+		attemptID, time.Now().UTC().UnixNano(), revision, storedJobID); err != nil {
 		return fmt.Errorf("agent: record delivered completion receipt: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL,
@@ -1025,12 +1167,13 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
 		return fmt.Errorf("agent: clean delivered spool attempt: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_completion_receipts WHERE attempt_id IN (
-SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET 1024)`); err != nil {
+SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET ?)`, maxCompletionInspectionReceipts); err != nil {
 		return fmt.Errorf("agent: bound delivered completion receipts: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit durable completion acknowledgement: %w", err)
 	}
+	spool.notifyCompletionDisposition()
 	return nil
 }
 
@@ -1047,10 +1190,30 @@ func (spool *logSpool) recordCompletionDisposition(ctx context.Context, attemptI
 	if revision > 0 {
 		storedRevision = int64(revision)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns, intent_revision)
-VALUES(?, ?, ?, ?, ?)
-ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, observed_ns=excluded.observed_ns, intent_revision=excluded.intent_revision`,
-		attemptID, disposition, reason, time.Now().UTC().UnixNano(), storedRevision); err != nil {
+	var jobID sql.NullString
+	var resultJSON []byte
+	var finishedNS sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT job_id, result_json, finished_ns FROM spool_attempts WHERE attempt_id=?`, attemptID).
+		Scan(&jobID, &resultJSON, &finishedNS)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent: read completion evidence for disposition: %w", err)
+	}
+	var terminalAuditJSON []byte
+	if len(resultJSON) != 0 {
+		terminalAuditJSON, err = encodeTerminalCompletionAudit(resultJSON)
+		if err != nil {
+			return fmt.Errorf("agent: decode completion audit for disposition: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(
+attempt_id, disposition, reason, observed_ns, intent_revision, job_id, finished_ns, terminal_audit_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason,
+observed_ns=excluded.observed_ns, intent_revision=excluded.intent_revision,
+job_id=COALESCE(excluded.job_id, spool_completion_receipts.job_id),
+finished_ns=COALESCE(excluded.finished_ns, spool_completion_receipts.finished_ns),
+terminal_audit_json=COALESCE(excluded.terminal_audit_json, spool_completion_receipts.terminal_audit_json)`,
+		attemptID, disposition, reason, time.Now().UTC().UnixNano(), storedRevision, jobID, finishedNS, terminalAuditJSON); err != nil {
 		return fmt.Errorf("agent: record completion disposition: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts
@@ -1058,12 +1221,120 @@ SET completion_disposition=?, completion_reason=?, intent_revision=? WHERE attem
 		disposition, reason, storedRevision, attemptID); err != nil {
 		return fmt.Errorf("agent: join completion disposition to payload: %w", err)
 	}
+	if disposition == "suppressed" && jobID.Valid {
+		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID.String); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_completion_receipts WHERE attempt_id IN (
-SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET 1024)`); err != nil {
+SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET ?)`, maxCompletionInspectionReceipts); err != nil {
 		return fmt.Errorf("agent: bound completion dispositions: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit durable completion disposition: %w", err)
+	}
+	spool.notifyCompletionDisposition()
+	return nil
+}
+
+func compactSuppressedCompletionPayloads(ctx context.Context, tx *sql.Tx, jobID string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT attempt_id FROM spool_attempts
+WHERE job_id=? AND completion_disposition='suppressed' AND result_json IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM spool_events WHERE spool_events.attempt_id=spool_attempts.attempt_id)
+ORDER BY finished_ns DESC, created_ns DESC, attempt_id DESC LIMIT -1 OFFSET ?`, jobID, maxSuppressedCompletionPayloadsPerJob)
+	if err != nil {
+		return fmt.Errorf("agent: select suppressed payloads for compaction: %w", err)
+	}
+	var compacted []string
+	for rows.Next() {
+		var attemptID string
+		if err := rows.Scan(&attemptID); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("agent: scan suppressed payload for compaction: %w", err)
+		}
+		compacted = append(compacted, attemptID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("agent: iterate suppressed payloads for compaction: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("agent: close suppressed payload compaction scan: %w", err)
+	}
+	for _, attemptID := range compacted {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM runtime_attempt_manifests WHERE attempt_id=?", attemptID); err != nil {
+			return fmt.Errorf("agent: compact suppressed runtime attempt manifest: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM spool_attempts WHERE attempt_id=?", attemptID); err != nil {
+			return fmt.Errorf("agent: compact suppressed completion payload: %w", err)
+		}
+	}
+	return nil
+}
+
+func (spool *logSpool) compactExistingSuppressedCompletionPayloads(ctx context.Context) error {
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin existing suppressed payload compaction: %w", err)
+	}
+	defer tx.Rollback()
+	type existingSuppression struct {
+		attemptID, jobID, reason string
+		resultJSON               []byte
+		finishedNS, observedNS   int64
+		intentRevision           sql.NullInt64
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.attempt_id, a.job_id, a.result_json, a.finished_ns,
+COALESCE(a.completion_reason, 'service_intent_stop'), a.intent_revision, COALESCE(r.observed_ns, a.finished_ns)
+FROM spool_attempts a LEFT JOIN spool_completion_receipts r ON r.attempt_id=a.attempt_id
+WHERE a.completion_disposition='suppressed' AND a.result_json IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("agent: scan existing suppressed payloads: %w", err)
+	}
+	var existing []existingSuppression
+	jobIDs := make(map[string]struct{})
+	for rows.Next() {
+		var suppression existingSuppression
+		if err := rows.Scan(&suppression.attemptID, &suppression.jobID, &suppression.resultJSON, &suppression.finishedNS,
+			&suppression.reason, &suppression.intentRevision, &suppression.observedNS); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("agent: read existing suppressed payload: %w", err)
+		}
+		existing = append(existing, suppression)
+		jobIDs[suppression.jobID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("agent: iterate existing suppressed payloads: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("agent: close existing suppressed payload scan: %w", err)
+	}
+	for _, suppression := range existing {
+		auditJSON, err := encodeTerminalCompletionAudit(suppression.resultJSON)
+		if err != nil {
+			return fmt.Errorf("agent: decode existing suppressed completion audit: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(
+attempt_id, disposition, reason, observed_ns, intent_revision, job_id, finished_ns, terminal_audit_json)
+VALUES(?, 'suppressed', ?, ?, ?, ?, ?, ?)
+ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, finished_ns=excluded.finished_ns,
+terminal_audit_json=excluded.terminal_audit_json`, suppression.attemptID, suppression.reason,
+			suppression.observedNS, suppression.intentRevision, suppression.jobID, suppression.finishedNS, auditJSON); err != nil {
+			return fmt.Errorf("agent: backfill compact suppressed completion audit: %w", err)
+		}
+	}
+	for jobID := range jobIDs {
+		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_completion_receipts WHERE attempt_id IN (
+SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET ?)`, maxCompletionInspectionReceipts); err != nil {
+		return fmt.Errorf("agent: bound migrated completion dispositions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit existing suppressed payload compaction: %w", err)
 	}
 	return nil
 }

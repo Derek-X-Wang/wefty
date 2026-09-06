@@ -1715,6 +1715,391 @@ FROM spool_attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&eventCount
 	}
 }
 
+func TestLiveOCIServiceCompletionWithoutApplicableAuthorityPublishes(t *testing.T) {
+	completionCalls := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		completionCalls++
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "live-nil-intent-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "live-nil-intent-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "live-nil-intent-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	result := l1.ProcessResult{ExitCode: &exitCode}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
+	})
+	failure := lifecycle.completeWithRetry(t.Context(), claim, l1.CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: result,
+	})
+	if failure.err != nil || completionCalls != 1 {
+		t.Fatalf("nil-authority live completion failure=%v calls=%d", failure.err, completionCalls)
+	}
+	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "delivered" {
+		t.Fatalf("nil-authority live completion receipt=%+v", receipt)
+	}
+}
+
+func TestIntentStopDrainWaitsForLiveSuppressionDisposition(t *testing.T) {
+	client, stopServer := startEvidenceReplayServer(t, http.NotFoundHandler(), time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "suppression-drain-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "suppression-drain-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "suppression-drain-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	result := l1.ProcessResult{ExitCode: &exitCode}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentObserved := make(chan struct{})
+	gate := &ociIntentCompletionGate{
+		observe: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
+		},
+		observed: func(OCIIntentObservation) { close(intentObserved) },
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+	})
+	writeLock, err := outbox.spool.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeLock.ExecContext(t.Context(), `UPDATE spool_attempts SET job_id=job_id WHERE attempt_id=?`, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	completionDone := make(chan destinationError, 1)
+	go func() {
+		completionDone <- lifecycle.completeWithRetry(t.Context(), claim, l1.CompletionRequest{
+			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: result,
+		})
+	}()
+	select {
+	case <-intentObserved:
+	case <-time.After(time.Second):
+		_ = writeLock.Rollback()
+		t.Fatal("live completion did not observe disabled intent")
+	}
+	stopDone := make(chan error, 1)
+	go func() {
+		release, stopErr := gate.beginStop(t.Context(), 2)
+		if stopErr == nil {
+			release()
+		}
+		stopDone <- stopErr
+	}()
+	stopReturnedBeforeDisposition := false
+	select {
+	case <-stopDone:
+		stopReturnedBeforeDisposition = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := writeLock.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if failure := <-completionDone; !errors.Is(failure.err, errOCIIntentDisabled) {
+		t.Fatalf("disabled live completion failure=%v", failure.err)
+	}
+	if !stopReturnedBeforeDisposition {
+		if err := <-stopDone; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stopReturnedBeforeDisposition {
+		t.Fatal("intent-stop drain returned before the suppressed disposition was durable")
+	}
+	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "suppressed" || receipt.IntentRevision != 2 {
+		t.Fatalf("durable suppression receipt=%+v", receipt)
+	}
+}
+
+func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.T) {
+	client, stopServer := startEvidenceReplayServer(t, http.NotFoundHandler(), time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "suppression-failure-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "suppression-failure-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "suppression-failure-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	result := l1.ProcessResult{ExitCode: &exitCode}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	const suppressionBudget = time.Second
+	intentObserved := make(chan struct{})
+	gate := &ociIntentCompletionGate{
+		observe: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
+		},
+		observed:           func(OCIIntentObservation) { close(intentObserved) },
+		suppressionTimeout: suppressionBudget,
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+	})
+	connectionBlocker, err := outbox.spool.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connectionBlocker.ExecContext(t.Context(), `UPDATE spool_attempts SET job_id=job_id WHERE attempt_id=?`, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	completionDone := make(chan destinationError, 1)
+	go func() {
+		completionDone <- lifecycle.completeWithRetry(t.Context(), claim, l1.CompletionRequest{
+			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: result,
+		})
+	}()
+	select {
+	case <-intentObserved:
+	case <-time.After(time.Second):
+		_ = connectionBlocker.Rollback()
+		t.Fatal("live completion did not observe disabled intent")
+	}
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStop()
+	started := time.Now()
+	release, stopErr := gate.beginStop(stopContext, 2)
+	if release != nil {
+		release()
+	}
+	elapsed := time.Since(started)
+	var persistenceErr *OCIIntentSuppressionPersistenceError
+	if !errors.As(stopErr, &persistenceErr) || persistenceErr.AttemptID != claim.Lease.AttemptID || persistenceErr.IntentRevision != 2 {
+		_ = connectionBlocker.Rollback()
+		t.Fatalf("intent-stop drain error=%T %v, want typed suppression failure for %s at revision 2", stopErr, stopErr, claim.Lease.AttemptID)
+	}
+	if !errors.Is(persistenceErr, context.DeadlineExceeded) {
+		_ = connectionBlocker.Rollback()
+		t.Fatalf("suppression persistence failure=%v, want deadline exhaustion", persistenceErr)
+	}
+	if elapsed < suppressionBudget-100*time.Millisecond || elapsed >= suppressionBudget+500*time.Millisecond {
+		_ = connectionBlocker.Rollback()
+		t.Fatalf("intent-stop drain elapsed=%s, want suppression budget %s honored within [-100ms,+500ms]", elapsed, suppressionBudget)
+	}
+	t.Logf("suppression persistence deadline: configured=%s observed=%s tolerance=[-100ms,+500ms]", suppressionBudget, elapsed)
+	failure := <-completionDone
+	if !errors.As(failure.err, &persistenceErr) {
+		_ = connectionBlocker.Rollback()
+		t.Fatalf("completion failure=%T %v, want typed suppression persistence failure", failure.err, failure.err)
+	}
+	if err := connectionBlocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "durable_completion" || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
+		t.Fatalf("blocked suppression did not retain unsuppressed completion evidence=%+v", receipt)
+	}
+}
+
+func TestRecoveryIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.T) {
+	client, stopServer := startEvidenceReplayServer(t, http.NotFoundHandler(), time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "recovery-suppression-failure-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{Job: l1.Job{JobID: "recovery-suppression-failure-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "recovery-suppression-failure-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentObserved := make(chan struct{})
+	allowSuppression := make(chan struct{})
+	gate := &ociIntentCompletionGate{
+		observe: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
+		},
+		observed: func(OCIIntentObservation) {
+			close(intentObserved)
+			<-allowSuppression
+		},
+		suppressionTimeout: time.Second,
+	}
+	outbox.ociIntentGate = gate
+	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
+		class: contract.JobClassService, kind: contract.JobKindOCI}
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- outbox.recoverCompletion(t.Context(), client, attempt) }()
+	select {
+	case <-intentObserved:
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not observe disabled intent")
+	}
+	connectionBlocker, err := outbox.spool.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connectionBlocker.ExecContext(t.Context(), `UPDATE spool_attempts SET job_id=job_id WHERE attempt_id=?`, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	close(allowSuppression)
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStop()
+	release, stopErr := gate.beginStop(stopContext, 2)
+	if release != nil {
+		release()
+	}
+	var persistenceErr *OCIIntentSuppressionPersistenceError
+	if !errors.As(stopErr, &persistenceErr) || persistenceErr.AttemptID != claim.Lease.AttemptID || !errors.Is(persistenceErr, context.DeadlineExceeded) {
+		_ = connectionBlocker.Rollback()
+		t.Fatalf("recovery drain error=%T %v, want typed bounded suppression failure", stopErr, stopErr)
+	}
+	if err := <-recoveryDone; !errors.As(err, &persistenceErr) {
+		_ = connectionBlocker.Rollback()
+		t.Fatalf("recovery suppression error=%T %v, want typed suppression failure", err, err)
+	}
+	if err := connectionBlocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompletionDispositionWaitObservesRecoverySuppression(t *testing.T) {
+	client, stopServer := startEvidenceReplayServer(t, http.NotFoundHandler(), time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "recovery-suppression-observation-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
+		return OCIIntentObservation{Enabled: false, Revision: 2}, nil
+	}}
+	claim := l1.Claim{Job: l1.Job{JobID: "recovery-suppression-observation-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "recovery-suppression-observation-attempt", FencingToken: "fence"}}
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
+	defer cancelWait()
+	waitParked := make(chan struct{})
+	var waitOnce sync.Once
+	outbox.spool.dispositionWaitCheckpoint = func() {
+		waitOnce.Do(func() { close(waitParked) })
+	}
+	receiptDone := make(chan completionInspectionReceipt, 1)
+	errDone := make(chan error, 1)
+	go func() {
+		receipt, waitErr := outbox.spool.waitCompletionDisposition(waitContext, claim.Lease.AttemptID, "suppressed", 2)
+		receiptDone <- receipt
+		errDone <- waitErr
+	}()
+	select {
+	case <-waitParked:
+	case <-time.After(time.Second):
+		t.Fatal("completion disposition waiter did not reach the pre-commit edge")
+	}
+	observationStarted := time.Now()
+	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
+		class: contract.JobClassService, kind: contract.JobKindOCI}
+	if err := outbox.recoverCompletion(t.Context(), client, attempt); err != nil {
+		t.Fatal(err)
+	}
+	receipt := <-receiptDone
+	if err := <-errDone; err != nil {
+		t.Fatal(err)
+	}
+	if receipt.State != "suppressed" || receipt.IntentRevision != 2 || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
+		t.Fatalf("recovery suppression observation=%+v", receipt)
+	}
+	t.Logf("checkpointed recovery disposition observation=%s acceptance_bound=%s", time.Since(observationStarted), time.Second)
+}
+
+func TestCompletionDispositionWaitObservesDeliveredCompletion(t *testing.T) {
+	outbox, err := newEvidenceOutbox(t.TempDir(), "delivered-observation-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("delivered-observation-attempt")
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitParked := make(chan struct{})
+	var waitOnce sync.Once
+	outbox.spool.dispositionWaitCheckpoint = func() {
+		waitOnce.Do(func() { close(waitParked) })
+	}
+	waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
+	defer cancelWait()
+	receiptDone := make(chan completionInspectionReceipt, 1)
+	errDone := make(chan error, 1)
+	go func() {
+		receipt, waitErr := outbox.spool.waitCompletionDisposition(waitContext, claim.Lease.AttemptID, "delivered", 3)
+		receiptDone <- receipt
+		errDone <- waitErr
+	}()
+	select {
+	case <-waitParked:
+	case <-time.After(time.Second):
+		t.Fatal("delivered disposition waiter did not reach the pre-commit edge")
+	}
+	if err := outbox.completionDelivered(t.Context(), claim.Lease.AttemptID, 3); err != nil {
+		t.Fatal(err)
+	}
+	receipt := <-receiptDone
+	if err := <-errDone; err != nil {
+		t.Fatal(err)
+	}
+	if receipt.State != "delivered" || receipt.Reason != "acknowledged_by_l1" || receipt.IntentRevision != 3 {
+		t.Fatalf("delivered completion observation=%+v", receipt)
+	}
+}
+
 func assertEvidenceRecoverySealsAuthorityLossIncomplete(t *testing.T) {
 	t.Helper()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

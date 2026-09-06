@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -341,6 +342,7 @@ func TestAgentRefusesOCIProbeWithoutBootBarrier(t *testing.T) {
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 		}),
+		OCIIntent: enabledTestOCIIntent,
 	})
 	if err == nil || err.Error() != "agent: OCI capability probe requires a boot barrier" {
 		t.Fatalf("agent construction error = %v", err)
@@ -352,18 +354,19 @@ func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
 		name   string
 		config Config
 	}{
-		{name: "raw capability", config: Config{Capabilities: map[string]bool{"kind:oci": true}}},
+		{name: "raw capability", config: Config{Capabilities: map[string]bool{"kind:oci": true}, OCIIntent: nil}},
 		{name: "probe only", config: Config{
 			CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 				return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 			}),
 			OCIBootBarrier: readyOCIBootBarrier{},
+			OCIIntent:      nil,
 		}},
-		{name: "normalized capability", config: Config{Capabilities: map[string]bool{"  KiNd:OcI  ": true}}},
-		{name: "bare job kind", config: Config{Capabilities: map[string]bool{contract.JobKindOCI: true}}},
+		{name: "normalized capability", config: Config{Capabilities: map[string]bool{"  KiNd:OcI  ": true}, OCIIntent: nil}},
+		{name: "bare job kind", config: Config{Capabilities: map[string]bool{contract.JobKindOCI: true}, OCIIntent: nil}},
 		{name: "runtime only", config: Config{WorkloadRuntimes: map[string]WorkloadRuntime{
 			contract.JobKindOCI: instantWorkloadRuntime{},
-		}}},
+		}, OCIIntent: nil}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -376,6 +379,23 @@ func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
 				t.Fatalf("agent construction error = %T %v", err, err)
 			}
 		})
+	}
+}
+
+func TestAgentClampsSuppressionPersistenceToControlDrainBudget(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "suppression-clamp-agent"})
+	nodeAgent, err := New(Config{
+		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "suppression-clamp-node", BootSessionID: "suppression-clamp-boot", Version: "test",
+		OCIIntent: enabledTestOCIIntent, OperationTimeout: ocicontrol.ControlShutdownDrainTimeout + time.Hour,
+		LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	if got := nodeAgent.ociIntentGate.suppressionTimeout; got != ocicontrol.ControlShutdownDrainTimeout {
+		t.Fatalf("suppression timeout=%s, want control drain clamp %s", got, ocicontrol.ControlShutdownDrainTimeout)
 	}
 }
 

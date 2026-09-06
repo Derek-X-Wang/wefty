@@ -244,11 +244,27 @@ publishes the positive Capability revision.
 
 The durable marker also fences terminal evidence for a resident OCI service.
 The live completion path and process-lifetime outbox take the shared read side
-from their final marker observation through one L1 response; after persisting
-disable, the controller publishes that revision to the gate, takes the write
-side, and only then stops the runtime. An enabled completion that linearized
-before the stop may land; every later completion observes the disabled revision
-and is suppressed. The receipt retains the observed intent revision.
+from their final marker observation through one L1 response or one suppression
+transaction; after persisting disable, the controller publishes that revision
+to the gate, takes the write side, and only then stops the runtime. An enabled
+completion that linearized before the stop may land; every later completion
+observes the disabled revision and is suppressed. A suppressing reader holds
+the read side until its local disposition is durable. If that persistence
+budget expires, the reader registers a typed
+`OCIIntentSuppressionPersistenceError` before release. Within one agent process
+lifetime, either the waiting writer or the resident-teardown join returns that
+failure instead of allowing `Controller.Stop` to report runtime quiescence. A
+successful controller stop is therefore also a same-process observation barrier
+for the suppression receipt. The receipt retains the observed intent revision.
+
+The suppression lock order is completion-gate read side, then the spool's sole
+database connection. The database transaction, including any retention
+compaction, uses the lesser of the configured agent operation timeout (ten
+seconds by default) and the OCI control server's 10m5s response-drain budget,
+and retries only within that window. Database connection contention therefore
+cannot outlive the control drain. The same committed disposition notification
+is emitted by live completion and process-lifetime recovery so bounded
+acceptance observation covers either path.
 
 Only an authoritative `enabled=false` suppresses a payload. On a node with an
 intent authority, an unavailable or malformed marker withholds publication,
@@ -266,11 +282,27 @@ unclassifiable legacy service spool row is fenced by the same durable marker
 rather than allowed to bypass it: enabled intent permits publication, disabled
 intent suppresses it, and unavailable authority withholds it.
 
+Suppressed terminal retention has two bounded tiers. Per service Job, the agent
+keeps the newest 16 drained attempts as full serialized payloads. Once an older
+suppressed attempt has no pending log events, it is compacted into the node's
+completion-receipt ledger as a diagnostic-free terminal summary: typed
+disposition and reason, intent revision, finish time, terminal arm and stable
+failure code, additive resource flags, and runtime-quiescence evidence. The
+receipt ledger keeps the newest 1,024 entries node-wide; service Job removal
+purges both full and compact local evidence for that Job. An attempt with
+unacknowledged logs is never compacted merely to satisfy the 16-payload window.
+
 A suppressed attempt drains retained logs under the same policy as other
 evidence: while L1 reports the attempt live, logs remain strictly before
 completion and drain before recovery advances; after L1 reports the attempt
 lost, each recovery pass is bounded by the configured lost-log batch limit.
-Suppression does not introduce a separate live-drain bound.
+Suppression uses the bounded persistence window above; it does not widen the
+live log-drain or L1 request budgets.
+
+Every syntactically OCI-capable `agent.Config` literal must declare its
+`OCIIntent` authority. The source contract scans all Go files independently of
+host platform and build tags; runtime construction refusal remains the
+fail-closed backstop for dynamic configurations and explicitly nil authority.
 
 Linux privileged `setup-oci` renders and writes one unprivileged `wefty-agent.service` with
 `SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The

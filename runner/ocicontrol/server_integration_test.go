@@ -55,7 +55,9 @@ func TestControlResponsePreservesSanitizedHelperMechanics(t *testing.T) {
 }
 
 // TestOperatorControlSocketUsesARealProcess self-reexecutes the test binary.
-// Run it with -count=1; it is not a valid repeated-sample test harness.
+// Parent repetitions are independent because every run owns a unique temporary
+// directory. The child is explicitly single-shot so an inherited or future
+// test flag cannot recursively repeat the socket server lifecycle.
 func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	if os.Getenv(controlChildEnvironment) == "1" {
 		runControlChild(t)
@@ -68,7 +70,7 @@ func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	socket := filepath.Join(root, "control.sock")
 	intentPath := filepath.Join(root, "intent.json")
-	command := exec.Command(os.Args[0], "-test.run=^TestOperatorControlSocketUsesARealProcess$")
+	command := exec.Command(os.Args[0], "-test.run=^TestOperatorControlSocketUsesARealProcess$", "-test.count=1")
 	var childOutput bytes.Buffer
 	command.Stdout = &childOutput
 	command.Stderr = &childOutput

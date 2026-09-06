@@ -28,7 +28,9 @@ const (
 	// Offline image import is the longest control response and owns the same
 	// ten-minute operation budget. Keep that full window plus the existing
 	// header allowance so a completed response has time to flush.
-	controlShutdownDrainTimeout = controlRequestReadTimeout + controlReadHeaderTimeout
+	// ControlShutdownDrainTimeout is also the maximum suppression-persistence
+	// window held beneath an intent-stop request.
+	ControlShutdownDrainTimeout = controlRequestReadTimeout + controlReadHeaderTimeout
 )
 
 type SocketPathLengthError struct {
@@ -70,7 +72,7 @@ func NewServer(path string, service Service, allowedUIDs ...uint32) (*Server, er
 	}
 	return &Server{
 		path: path, service: service, allowedUIDs: allowlist,
-		shutdownDrainTimeout: controlShutdownDrainTimeout, logf: log.Printf,
+		shutdownDrainTimeout: ControlShutdownDrainTimeout, logf: log.Printf,
 	}, nil
 }
 

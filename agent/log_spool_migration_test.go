@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -83,6 +84,52 @@ INSERT INTO spool_completion_receipts VALUES('attempt','suppressed','service_int
 	}
 	if attempts, err := spool.pendingAttempts(t.Context()); err != nil || len(attempts) != 0 {
 		t.Fatalf("legacy suppressed payload became replayable=%+v err=%v", attempts, err)
+	}
+}
+
+func TestLogSpoolCompactsExistingSuppressedPayloadsOnOpen(t *testing.T) {
+	directory := t.TempDir()
+	const nodeID = "existing-suppression-bound-node"
+	spool := openTestLogSpool(t, directory, nodeID, 1<<20)
+	for index := range maxSuppressedCompletionPayloadsPerJob + 2 {
+		attemptID := fmt.Sprintf("existing-suppression-%02d", index)
+		claim := serviceSpoolTestClaim(attemptID)
+		claim.Job.JobID = "existing-restart-always-service"
+		claim.Job.Spec.Kind = contract.JobKindOCI
+		if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+			t.Fatal(err)
+		}
+		exitCode := index
+		finishedAt := time.Unix(int64(index+1), 0)
+		if err := spool.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, finishedAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := spool.db.ExecContext(t.Context(), `UPDATE spool_attempts SET
+completion_disposition='suppressed', completion_reason='service_intent_stop', intent_revision=? WHERE attempt_id=?`, index+1, attemptID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := spool.db.ExecContext(t.Context(), `INSERT INTO spool_completion_receipts(
+attempt_id, disposition, reason, observed_ns, intent_revision) VALUES(?, 'suppressed', 'service_intent_stop', ?, ?)`,
+			attemptID, finishedAt.UnixNano(), index+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spool = openTestLogSpool(t, directory, nodeID, 1<<20)
+	defer spool.Close()
+	var retained int
+	if err := spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM spool_attempts
+WHERE job_id='existing-restart-always-service' AND result_json IS NOT NULL`).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != maxSuppressedCompletionPayloadsPerJob {
+		t.Fatalf("existing full suppressed payloads=%d, want %d", retained, maxSuppressedCompletionPayloadsPerJob)
+	}
+	oldest := spool.inspectCompletion(t.Context(), "existing-suppression-00")
+	if oldest.State != "suppressed" || oldest.TerminalAudit == nil || oldest.TerminalAudit.ExitCode == nil || *oldest.TerminalAudit.ExitCode != 0 {
+		t.Fatalf("existing compacted suppression audit=%+v", oldest)
 	}
 }
 

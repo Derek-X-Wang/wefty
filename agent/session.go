@@ -90,6 +90,7 @@ type residentAttempt struct {
 	cancel        context.CancelCauseFunc
 	done          chan struct{}
 	runtimeReaped chan runtimeReapOutcome
+	completionErr error
 }
 
 type runtimeReapOutcome struct {
@@ -928,7 +929,7 @@ func (session *agentSession) executeResident(
 	claim l1.Claim,
 	claimStarted time.Time,
 	execute sessionAttemptExecution,
-) (errorDestination, error) {
+) (destination errorDestination, executeErr error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
 	resident := &residentAttempt{
 		class: claim.Job.Spec.Class, kind: claim.Job.Spec.Kind, cancel: cancelAttempt,
@@ -947,6 +948,7 @@ func (session *agentSession) executeResident(
 	defer session.gates[gateKey].release()
 	defer func() {
 		session.claimMu.Lock()
+		resident.completionErr = executeErr
 		delete(session.resident, claim.Job.JobID)
 		delete(session.residentJobID, claim.Job.JobID)
 		delete(session.residentKind, claim.Job.JobID)
@@ -1023,6 +1025,10 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-resident.done:
+			}
+			var persistenceErr *OCIIntentSuppressionPersistenceError
+			if errors.As(resident.completionErr, &persistenceErr) {
+				return persistenceErr
 			}
 		}
 		if !pending {

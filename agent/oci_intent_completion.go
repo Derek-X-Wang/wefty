@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -38,16 +39,37 @@ func (*OCIIntentAuthorityRequiredError) Error() string {
 	return "agent: OCI runtime or capability requires an OCI intent authority"
 }
 
+// OCIIntentSuppressionPersistenceError means a disabled completion could not
+// be durably classified before the bounded storage window closed. The stop
+// barrier reports this error instead of claiming runtime quiescence.
+type OCIIntentSuppressionPersistenceError struct {
+	AttemptID      string
+	IntentRevision uint64
+	Err            error
+}
+
+func (err *OCIIntentSuppressionPersistenceError) Error() string {
+	return fmt.Sprintf("agent: persist OCI intent suppression for attempt %q at revision %d: %v", err.AttemptID, err.IntentRevision, err.Err)
+}
+
+func (err *OCIIntentSuppressionPersistenceError) Unwrap() error { return err.Err }
+
 // ociIntentCompletionGate orders same-process completion publication against
-// the node-local stop controller. Readers hold the gate only across one final
-// durable observation and one L1 response; retries release it between calls.
+// the node-local stop controller. Readers hold the gate across one final
+// durable observation and either one L1 response or one bounded suppression
+// transaction; retries release it between calls. The suppression path's lock
+// order is gate read side, then the spool's sole database connection. Its own
+// deadline keeps that ordering within the operator-control drain budget.
 type ociIntentCompletionGate struct {
-	mu      sync.RWMutex
-	observe func(context.Context) (OCIIntentObservation, error)
+	mu                 sync.RWMutex
+	observe            func(context.Context) (OCIIntentObservation, error)
+	suppressionTimeout time.Duration
 	// disabledRevision is published immediately after the controller's durable
 	// marker write, before it waits for pre-existing readers to drain.
 	disabledRevision atomic.Uint64
 	observed         func(OCIIntentObservation)
+	failureMu        sync.Mutex
+	failures         map[string]*OCIIntentSuppressionPersistenceError
 }
 
 func (gate *ociIntentCompletionGate) beginCompletion(ctx context.Context) (OCIIntentObservation, func(), error) {
@@ -77,13 +99,50 @@ func (gate *ociIntentCompletionGate) allows(observation OCIIntentObservation) bo
 	return observation.Enabled && observation.Revision > gate.disabledRevision.Load()
 }
 
+func (gate *ociIntentCompletionGate) beginSuppression(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := gate.suppressionTimeout
+	if timeout <= 0 {
+		timeout = DefaultOperationTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
+func (gate *ociIntentCompletionGate) finishSuppression(attemptID string, observation OCIIntentObservation, persistenceErr error) error {
+	gate.failureMu.Lock()
+	defer gate.failureMu.Unlock()
+	if persistenceErr == nil {
+		delete(gate.failures, attemptID)
+		return nil
+	}
+	typed := &OCIIntentSuppressionPersistenceError{
+		AttemptID: attemptID, IntentRevision: observation.Revision, Err: persistenceErr,
+	}
+	if gate.failures == nil {
+		gate.failures = make(map[string]*OCIIntentSuppressionPersistenceError)
+	}
+	gate.failures[attemptID] = typed
+	return typed
+}
+
+func (gate *ociIntentCompletionGate) suppressionFailure(revision uint64) error {
+	gate.failureMu.Lock()
+	defer gate.failureMu.Unlock()
+	var failures []error
+	for _, failure := range gate.failures {
+		if failure.IntentRevision <= revision {
+			failures = append(failures, failure)
+		}
+	}
+	return errors.Join(failures...)
+}
+
 func (gate *ociIntentCompletionGate) beginStop(ctx context.Context, revision uint64) (func(), error) {
 	gate.disabledRevision.Store(revision)
 	acquired := make(chan struct{})
 	canceled := make(chan struct{})
 	go func() {
 		// A queued writer prevents new readers from overtaking the drain. The
-		// only existing readers span an operation-timeout-bounded L1 request.
+		// only existing readers span a bounded L1 request or suppression write.
 		gate.mu.Lock()
 		select {
 		case acquired <- struct{}{}:
@@ -93,6 +152,10 @@ func (gate *ociIntentCompletionGate) beginStop(ctx context.Context, revision uin
 	}()
 	select {
 	case <-acquired:
+		if err := gate.suppressionFailure(revision); err != nil {
+			gate.mu.Unlock()
+			return nil, err
+		}
 		return gate.mu.Unlock, nil
 	case <-ctx.Done():
 		close(canceled)
