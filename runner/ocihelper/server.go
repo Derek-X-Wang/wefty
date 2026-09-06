@@ -1736,11 +1736,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		body.Port = port
 		body.CgroupID = attempt.cgroupID
-		stream := &attemptPortOperationStream{
+		stream := &backendReadyOperationStream{
 			operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel},
 			wire:            wire,
 			acknowledged:    operation.monitorAcknowledgement(),
 			ctx:             operation.ctx,
+			method:          request.Method,
+			marker:          attemptPortBackendReady,
 			writeSetup:      func() error { return writeSuccess(wire, struct{}{}) },
 		}
 		err := server.engine.DialAttemptPort(operation.ctx, body, stream)
@@ -1757,34 +1759,45 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			_ = writeFailure(wire, CodeUnauthorizedBridge, "bridge fallback is not authorized for this live attempt")
 			return
 		}
-		if err := writeSuccess(wire, struct{}{}); err != nil || !readStreamAcknowledgement(operation.conn) {
-			return
+		stream := &backendReadyOperationStream{
+			operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel},
+			wire:            wire,
+			acknowledged:    operation.monitorAcknowledgement(),
+			ctx:             operation.ctx,
+			method:          request.Method,
+			marker:          hostBridgeBackendReady,
+			writeSetup:      func() error { return writeSuccess(wire, struct{}{}) },
 		}
-		_ = server.engine.DialHostBridge(operation.ctx, body, &operationStream{Conn: operation.conn, cancel: operation.cancel})
+		err := server.engine.DialHostBridge(operation.ctx, body, stream)
+		if err != nil && !stream.ready {
+			_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
+		}
 	default:
 		_ = writeFailure(wire, CodeUnsupportedOperation, "unknown OCI helper method")
 	}
 }
 
-// attemptPortOperationStream withholds the RPC success frame until the engine
-// has connected the attempt backend and emits its ready marker. A refused
-// payload listener therefore remains a typed, attempt-scoped engine error
-// instead of looking like helper-stream EOF and invalidating the whole session.
-type attemptPortOperationStream struct {
+// backendReadyOperationStream withholds the RPC success frame until the engine
+// has connected the authorized backend and emits its ready marker. A refused
+// backend therefore remains a typed, attempt-scoped engine error instead of
+// looking like helper-stream EOF and invalidating the whole session.
+type backendReadyOperationStream struct {
 	*operationStream
 	wire         *framedConn
 	acknowledged <-chan error
 	ctx          context.Context
+	method       Method
+	marker       byte
 	setupOnce    sync.Once
 	setupErr     error
 	writeSetup   func() error
 	ready        bool
 }
 
-func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
+func (stream *backendReadyOperationStream) Write(payload []byte) (int, error) {
 	if !stream.ready {
-		if len(payload) == 0 || payload[0] != attemptPortBackendReady {
-			return 0, errors.New("attempt-port stream omitted the backend-ready marker")
+		if len(payload) == 0 || payload[0] != stream.marker {
+			return 0, fmt.Errorf("%s stream omitted the backend-ready marker", stream.method)
 		}
 		stream.setupOnce.Do(func() {
 			if err := stream.writeSetup(); err != nil {
@@ -1794,10 +1807,10 @@ func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
 			select {
 			case err := <-stream.acknowledged:
 				if err != nil {
-					stream.setupErr = fmt.Errorf("attempt-port client did not acknowledge stream setup: %w", err)
+					stream.setupErr = fmt.Errorf("%s client did not acknowledge stream setup: %w", stream.method, err)
 				}
 			case <-stream.ctx.Done():
-				stream.setupErr = fmt.Errorf("attempt-port client acknowledgement: %w", context.Cause(stream.ctx))
+				stream.setupErr = fmt.Errorf("%s client acknowledgement: %w", stream.method, context.Cause(stream.ctx))
 			}
 		})
 		if stream.setupErr != nil {

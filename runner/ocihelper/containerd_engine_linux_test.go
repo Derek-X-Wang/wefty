@@ -2384,7 +2384,7 @@ func TestDialHostBridgePairsOnlyTheAttemptsGuestListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := []byte{0}
-	if _, err := io.ReadFull(host, marker); err != nil || marker[0] != HostBridgeBackendReadyMarker {
+	if _, err := io.ReadFull(host, marker); err != nil || marker[0] != hostBridgeBackendReady {
 		t.Fatalf("host bridge ready marker = %d, %v", marker[0], err)
 	}
 	payload := make([]byte, 5)
@@ -2402,5 +2402,150 @@ func TestDialHostBridgePairsOnlyTheAttemptsGuestListener(t *testing.T) {
 	_ = host.Close()
 	if err := <-engineDone; err != nil && err != context.Canceled {
 		t.Fatal(err)
+	}
+}
+
+func TestDialHostBridgeCancellationDrainsFourAcceptsAfterOneGuest(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpListener := listener.(*net.TCPListener)
+	defer tcpListener.Close()
+	listenerAddress := tcpListener.Addr().String()
+	authority := AttemptAuthority{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", BootSessionID: "boot", Class: "one-shot", RemovalGeneration: "attempt"}
+	engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): {authority: authority, hostBridge: tcpListener}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const bridgeConcurrency = 4
+	hosts := make([]net.Conn, 0, bridgeConcurrency)
+	results := make(chan error, bridgeConcurrency)
+	for range bridgeConcurrency {
+		host, helper := net.Pipe()
+		hosts = append(hosts, host)
+		go func() {
+			results <- engine.DialHostBridge(ctx, DialHostBridgeRequest{Authority: authority}, helper)
+		}()
+	}
+	defer func() {
+		for _, host := range hosts {
+			_ = host.Close()
+		}
+	}()
+	waitForHostBridgePumps(t, bridgeConcurrency, time.Second)
+
+	guest, err := net.Dial("tcp4", tcpListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	ready := make(chan error, bridgeConcurrency)
+	for _, host := range hosts {
+		if err := host.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		go func(connection net.Conn) {
+			var marker [1]byte
+			_, err := io.ReadFull(connection, marker[:])
+			if err == nil && marker[0] != hostBridgeBackendReady {
+				err = fmt.Errorf("host-bridge marker = %d", marker[0])
+			}
+			ready <- err
+		}(host)
+	}
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("one guest did not release a host-bridge pump: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("one guest did not release a host-bridge pump")
+	}
+
+	cancel()
+	finished := 0
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for finished < bridgeConcurrency {
+		select {
+		case <-results:
+			finished++
+		case <-timer.C:
+			_ = tcpListener.Close()
+			t.Fatalf("host-bridge cancellation returned %d/%d pumps before the listener was reaped", finished, bridgeConcurrency)
+		}
+	}
+	if err := tcpListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+	if connection, err := net.DialTimeout("tcp4", listenerAddress, time.Second); err == nil {
+		_ = connection.Close()
+		t.Fatal("host-bridge listener accepted a connection after reap close")
+	}
+}
+
+func TestDialHostBridgeMarkerFailureClosesAcceptedGuest(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpListener := listener.(*net.TCPListener)
+	defer tcpListener.Close()
+	authority := AttemptAuthority{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", BootSessionID: "boot", Class: "one-shot", RemovalGeneration: "attempt"}
+	engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): {authority: authority, hostBridge: tcpListener}}}
+	host, helper := net.Pipe()
+	_ = host.Close()
+	engineDone := make(chan error, 1)
+	go func() {
+		engineDone <- engine.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: authority}, helper)
+	}()
+	guest, err := net.Dial("tcp4", tcpListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	select {
+	case err := <-engineDone:
+		if err == nil {
+			t.Fatal("closed helper stream accepted a host-bridge marker")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("host-bridge marker failure did not return")
+	}
+	if err := guest.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var value [1]byte
+	if _, err := guest.Read(value[:]); err == nil {
+		t.Fatal("accepted guest remained open after marker failure")
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("accepted guest leaked after marker failure")
+	}
+}
+
+func waitForHostBridgePumps(t *testing.T, count int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		stacks := make([]byte, 1<<20)
+		stackCount := runtime.Stack(stacks, true)
+		pumps := 0
+		accepts := 0
+		for _, stack := range bytes.Split(stacks[:stackCount], []byte("\n\n")) {
+			if bytes.Contains(stack, []byte("(*ContainerdEngine).DialHostBridge")) {
+				pumps++
+			}
+			if bytes.Contains(stack, []byte("(*ContainerdEngine).DialHostBridge")) && bytes.Contains(stack, []byte("(*TCPListener).Accept")) {
+				accepts++
+			}
+		}
+		if pumps >= count && accepts >= 1 {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("observed %d/%d host-bridge pumps with %d blocked in Accept", pumps, count, accepts)
+		}
+		runtime.Gosched()
 	}
 }

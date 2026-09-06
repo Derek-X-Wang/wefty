@@ -2701,10 +2701,12 @@ func TestAttemptPortSetupCancellationDoesNotDelayListenerRepublication(t *testin
 func TestAttemptPortAcknowledgementWaitIsContextBoundAndIdempotent(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	stream := &attemptPortOperationStream{
+	stream := &backendReadyOperationStream{
 		operationStream: &operationStream{},
 		acknowledged:    make(chan error),
 		ctx:             ctx,
+		method:          MethodDialAttemptPort,
+		marker:          attemptPortBackendReady,
 		writeSetup:      func() error { return nil },
 	}
 	payload := []byte{attemptPortBackendReady}
@@ -3008,6 +3010,10 @@ func TestHostBridgeClientWaitsForBackendReady(t *testing.T) {
 	engine := newFakeEngine()
 	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42002/l3"}
 	engine.dialHostBridgeReady = make(chan struct{})
+	engine.dialHostBridgeEntered = make(chan struct{})
+	var releaseReady sync.Once
+	releaseBridgeReady := func() { releaseReady.Do(func() { close(engine.dialHostBridgeReady) }) }
+	t.Cleanup(releaseBridgeReady)
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -3033,14 +3039,19 @@ func TestHostBridgeClientWaitsForBackendReady(t *testing.T) {
 		resultCh <- result{stream: stream, err: err}
 	}()
 	select {
+	case <-engine.dialHostBridgeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("host-bridge engine did not reach its backend-readiness wait")
+	}
+	select {
 	case result := <-resultCh:
 		if result.stream != nil {
 			_ = result.stream.Close()
 		}
 		t.Fatal("DialHostBridge returned before the helper emitted backend readiness")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
-	close(engine.dialHostBridgeReady)
+	releaseBridgeReady()
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
@@ -3049,6 +3060,93 @@ func TestHostBridgeClientWaitsForBackendReady(t *testing.T) {
 		_ = result.stream.Close()
 	case <-time.After(time.Second):
 		t.Fatal("DialHostBridge did not return after backend readiness")
+	}
+}
+
+func TestHostBridgeBackendFailureRemainsAttemptScoped(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42002/l3"}
+	engine.dialHostBridgeErr = errors.New("guest bridge listener closed")
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.EnableHostBridgeFallback = true
+	run, err := session.Run(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = session.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: request.Authority, BridgeCapability: run.BridgeCapability})
+	if err == nil {
+		t.Fatal("host-bridge backend failure returned nil error")
+	}
+	var runtimeLoss *RuntimeLossError
+	if errors.As(err, &runtimeLoss) {
+		t.Fatalf("attempt-scoped host-bridge failure became runtime loss: %v", err)
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil || rpcErr.EngineFailure.Operation != MethodDialHostBridge {
+		t.Fatalf("host-bridge backend failure = %T %v, want typed %s engine failure", err, err, MethodDialHostBridge)
+	}
+	if err := session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Platform: testImagePlatform}, nil); err != nil {
+		t.Fatalf("host-bridge backend failure invalidated the helper session: %v", err)
+	}
+}
+
+func TestHostBridgePeerCancellationCancelsEngineContext(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42002/l3"}
+	engine.dialHostBridgeEntered = make(chan struct{})
+	engine.dialHostBridgeDone = make(chan struct{})
+	engine.dialHostBridgeWaitForCancel = true
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.EnableHostBridgeFallback = true
+	run, err := session.Run(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dialContext, cancel := context.WithCancel(t.Context())
+	dialDone := make(chan error, 1)
+	go func() {
+		stream, err := session.DialHostBridge(dialContext, DialHostBridgeRequest{Authority: request.Authority, BridgeCapability: run.BridgeCapability})
+		if stream != nil {
+			_ = stream.Close()
+		}
+		dialDone <- err
+	}()
+	select {
+	case <-engine.dialHostBridgeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("host-bridge engine did not begin waiting for a guest")
+	}
+	cancel()
+	select {
+	case err := <-dialDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled host-bridge dial = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled host-bridge client did not return")
+	}
+	select {
+	case <-engine.dialHostBridgeDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer cancellation did not cancel the host-bridge engine context")
 	}
 }
 
@@ -3968,39 +4066,42 @@ func assertStreamPayload(t *testing.T, connection net.Conn, expected string) {
 }
 
 type fakeEngine struct {
-	mu                       sync.Mutex
-	calls                    []string
-	sessionReaps             []SessionIdentity
-	attemptReaps             []AttemptAuthority
-	runResponse              RunResponse
-	lastRunRequest           RunRequest
-	runErr                   error
-	deleteErr                error
-	attemptReapErr           error
-	managedVolumeErr         error
-	runEntered               chan struct{}
-	releaseRun               chan struct{}
-	sweepEntered             chan struct{}
-	releaseSweep             chan struct{}
-	signalEntered            chan struct{}
-	releaseSignal            chan struct{}
-	signalErr                error
-	sessionReapErr           error
-	sessionReapResponse      SweepResponse
-	sweepResponses           []SweepResponse
-	verifyResponses          []VerifyResponse
-	dialAttemptWithoutMarker bool
-	dialAttemptErr           error
-	dialHostBridgeRead       bool
-	dialHostBridgeReady      chan struct{}
-	dialHostBridgeDone       chan struct{}
-	lastDialAttemptRequest   DialAttemptPortRequest
-	controlWrites            []SetComputerControlStateRequest
-	createBackupResponse     CreateComputerBackupResponse
-	deleteBackupResponse     DeleteComputerBackupCopyResponse
-	copyStorageResponse      CopyComputerStorageResponse
-	copyStorageErr           error
-	exportCustodyResponse    ExportComputerCustodyResponse
+	mu                          sync.Mutex
+	calls                       []string
+	sessionReaps                []SessionIdentity
+	attemptReaps                []AttemptAuthority
+	runResponse                 RunResponse
+	lastRunRequest              RunRequest
+	runErr                      error
+	deleteErr                   error
+	attemptReapErr              error
+	managedVolumeErr            error
+	runEntered                  chan struct{}
+	releaseRun                  chan struct{}
+	sweepEntered                chan struct{}
+	releaseSweep                chan struct{}
+	signalEntered               chan struct{}
+	releaseSignal               chan struct{}
+	signalErr                   error
+	sessionReapErr              error
+	sessionReapResponse         SweepResponse
+	sweepResponses              []SweepResponse
+	verifyResponses             []VerifyResponse
+	dialAttemptWithoutMarker    bool
+	dialAttemptErr              error
+	dialHostBridgeRead          bool
+	dialHostBridgeReady         chan struct{}
+	dialHostBridgeEntered       chan struct{}
+	dialHostBridgeDone          chan struct{}
+	dialHostBridgeErr           error
+	dialHostBridgeWaitForCancel bool
+	lastDialAttemptRequest      DialAttemptPortRequest
+	controlWrites               []SetComputerControlStateRequest
+	createBackupResponse        CreateComputerBackupResponse
+	deleteBackupResponse        DeleteComputerBackupCopyResponse
+	copyStorageResponse         CopyComputerStorageResponse
+	copyStorageErr              error
+	exportCustodyResponse       ExportComputerCustodyResponse
 }
 
 type delayedFirstResponseConn struct {
@@ -4659,12 +4760,23 @@ func (engine *fakeEngine) DialAttemptPort(_ context.Context, request DialAttempt
 	_, err = stream.Write(append([]byte{attemptPortBackendReady}, []byte("attempt-port")...))
 	return err
 }
-func (engine *fakeEngine) DialHostBridge(_ context.Context, _ DialHostBridgeRequest, stream io.ReadWriteCloser) error {
+func (engine *fakeEngine) DialHostBridge(ctx context.Context, _ DialHostBridgeRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialHostBridge")
+	if engine.dialHostBridgeEntered != nil {
+		close(engine.dialHostBridgeEntered)
+	}
+	if engine.dialHostBridgeWaitForCancel {
+		<-ctx.Done()
+		close(engine.dialHostBridgeDone)
+		return ctx.Err()
+	}
+	if engine.dialHostBridgeErr != nil {
+		return engine.dialHostBridgeErr
+	}
 	if engine.dialHostBridgeReady != nil {
 		<-engine.dialHostBridgeReady
 	}
-	if _, err := stream.Write([]byte{HostBridgeBackendReadyMarker}); err != nil {
+	if _, err := stream.Write([]byte{hostBridgeBackendReady}); err != nil {
 		return err
 	}
 	if engine.dialHostBridgeRead {

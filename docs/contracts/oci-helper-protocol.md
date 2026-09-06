@@ -107,8 +107,10 @@ pre-verification authority. Partial authority is always invalid. A new helper
 always emits the authority-free preface followed by admission. Rollout is
 client-first: the dual-form client must be installed before replacing the
 helper. An old client rejects a new helper's authority-free first frame, while a
-new client can safely operate either helper form and therefore permits helper
-rollback without weakening authority ordering.
+new client can safely interpret either session-admission form without weakening
+authority ordering. That compatibility is limited to admission framing; stream
+semantics introduced within major 2 require the agent client and helper to be
+installed or rolled back together as a checksum-matched pair.
 
 Wire major `2` is carried on every request and response. It is the first major
 that carries the complete Computer endpoint, control-state, and attachment
@@ -403,12 +405,17 @@ Neither direction accepts a caller-supplied network destination.
 The OCI adapter runs exactly four `DialHostBridge` pumps per Computer attempt;
 that fixed bound is the only Computer submission path on every platform, and
 additional guest connections wait for one of those pumps.
-The helper sends the `HostBridgeBackendReadyMarker` as the first raw byte only
+The helper sends an internal backend-ready marker as the first raw byte only
 after it has accepted the guest connection and cleared the listener deadline.
 The host-side client consumes that marker before dialing the loopback bridge;
 the authorization success frame alone is not permission to create a host
 connection. This prevents zero-byte host preconnections from occupying the
 four fixed pumps while a guest is still attaching.
+The marker is a lockstep stream semantic within wire major 2, not a separately
+negotiated capability. The deployed agent and helper are the same verified
+build pair, and session acquisition checks the expected helper checksum before
+any stream is interpreted. Independently rolling the helper across the marker
+boundary is unsupported; rollback replaces both sides together.
 
 For service stop, the agent keeps `Watch` independent from execution-context
 cancellation, sends `TERM`, waits the configured grace, and escalates to
