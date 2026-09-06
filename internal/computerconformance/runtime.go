@@ -339,17 +339,14 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 
 func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, restart bool) error {
 	viewReady, controlReady := false, false
-	viewPlainTCP, controlPlainTCP := false, false
 	viewEvent, controlEvent := ReadinessEventViewEndpointReady, ReadinessEventControlEndpointReady
 	var viewProbeErr, controlProbeErr error
 	for BeforeReadinessDeadline(r.config.Now(), startedAt) {
 		if !viewReady {
-			viewReady, viewEvent, viewProbeErr = r.probeReady(ctx, r.viewPort, viewEvent)
-			viewPlainTCP = viewPlainTCP || probeProvesPlainTCP(ctx, r.viewPort, viewProbeErr)
+			viewReady, viewEvent, viewProbeErr = r.probeReady(ctx, r.viewPort, ReadinessEventViewEndpointReady)
 		}
 		if !controlReady {
-			controlReady, controlEvent, controlProbeErr = r.probeReady(ctx, r.controlPort, controlEvent)
-			controlPlainTCP = controlPlainTCP || probeProvesPlainTCP(ctx, r.controlPort, controlProbeErr)
+			controlReady, controlEvent, controlProbeErr = r.probeReady(ctx, r.controlPort, ReadinessEventControlEndpointReady)
 		}
 		if viewReady && controlReady {
 			r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
@@ -366,13 +363,15 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= missingEndpointObservationWindow {
 			break
 		}
-		if viewPlainTCP || controlPlainTCP || probeAssertionFailed(viewProbeErr) || probeAssertionFailed(controlProbeErr) {
+		if probeAssertionFailed(viewProbeErr) || probeAssertionFailed(controlProbeErr) {
 			break
 		}
 		if err := r.config.Sleep(ctx, 250*time.Millisecond); err != nil {
 			return err
 		}
 	}
+	viewPlainTCP := !viewReady && terminalProbeProvesPlainTCP(ctx, r.viewPort, viewProbeErr)
+	controlPlainTCP := !controlReady && terminalProbeProvesPlainTCP(ctx, r.controlPort, controlProbeErr)
 	if viewPlainTCP || controlPlainTCP {
 		r.record("transport.plain-tcp-rejected", StatusFail, "endpoint accepted TCP but did not complete the required WebSocket upgrade")
 		return errors.New("plain TCP is not rfb-websocket-v1 readiness")
@@ -415,19 +414,19 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 	return errors.New("Computer startup readiness timeout")
 }
 
-func (r *runtimeRunner) probeReady(ctx context.Context, port int, pendingEvent ReadinessEvent) (bool, ReadinessEvent, error) {
+func (r *runtimeRunner) probeReady(ctx context.Context, port int, endpointEvent ReadinessEvent) (bool, ReadinessEvent, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	connection, err := OpenRFB(probeCtx, port, contract.ComputerDisplayWebSocketPath)
 	if err == nil {
 		connection.close()
-		return true, pendingEvent, nil
+		return true, endpointEvent, nil
 	}
 	var firstFrame *rfbFirstFrameReadError
 	if errors.As(err, &firstFrame) {
-		pendingEvent = ReadinessEventFirstRFBFrame
+		return false, ReadinessEventFirstRFBFrame, err
 	}
-	return false, pendingEvent, err
+	return false, endpointEvent, err
 }
 
 func probeAssertionFailed(err error) bool {
@@ -441,7 +440,7 @@ func probeProtocolFailed(err error) bool {
 	return errors.As(err, &protocol)
 }
 
-func probeProvesPlainTCP(ctx context.Context, port int, err error) bool {
+func terminalProbeProvesPlainTCP(ctx context.Context, port int, err error) bool {
 	var rejected *rfbUpgradeRejectedError
 	if errors.As(err, &rejected) {
 		return true
@@ -1132,6 +1131,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	r.observeReadinessEvent(ReadinessEventInputOracleReady)
 	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
 		if !r.checkHasReadinessTimeout(ids[0]) {
+			r.failed = true
 			return
 		}
 	}
@@ -1143,6 +1143,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	}
 	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 477) {
 		if !r.checkHasReadinessTimeout(ids[1]) {
+			r.failed = true
 			_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 			return
 		}
@@ -1450,6 +1451,9 @@ func (r *runtimeRunner) finalizeInputReadinessTimeouts() {
 		index := r.recorder.index[id]
 		check := r.recorder.receipt.Checks[index]
 		if check.FailureReason == FailureReadinessTimeout && !check.ReadinessObservedLater {
+			if err := r.recorder.RecordFailure(id, StatusFail, check.Detail, FailureAssertionFailed, ""); err != nil {
+				panic(err)
+			}
 			r.failed = true
 		}
 	}
