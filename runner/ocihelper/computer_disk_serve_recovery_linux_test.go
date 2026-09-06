@@ -186,6 +186,65 @@ func TestServeQuarantinesNonRegularRecoveryRecordsAndAdmitsBarrier(t *testing.T)
 	}
 }
 
+func TestServeAdmitsAfterSweepAndVerifyDeferUnreadableQuarantineRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denial recovery proof requires the non-root helper test lane")
+	}
+	root := t.TempDir()
+	quarantineRoot := filepath.Join(root, "computer-disk-quarantine")
+	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(quarantineRoot, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(quarantineRoot, 0o700) })
+	disk := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
+		attempts: make(map[string]*containerdAttempt), capacityReservations: make(map[string]*capacityReservation)}
+	serverEngine := &serveRecoveryEngine{fakeEngine: newFakeEngine(), disk: disk}
+	server, err := NewServer(serverEngine, ServerConfig{HelperVersion: "test", HelperChecksum: "checksum", AllowedUIDs: []uint32{uint32(os.Getuid())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(t.TempDir(), "helper.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	})
+	client := NewUnixClient(socket, "checksum")
+	barrier, err := NewBootBarrierWithConfig(client, AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, BootBarrierConfig{
+		TakeoverTimeout: time.Second, TakeoverRetry: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		select {
+		case serveErr := <-done:
+			t.Fatalf("Serve failed after quarantine-root deferral: %v (barrier: %v)", serveErr, err)
+		default:
+			t.Fatalf("barrier not admitted: %v", err)
+		}
+	}
+	receipt, ok := barrier.SweepReceipt()
+	if !ok || receipt.ComputerStorageDeferredCount != 1 || len(receipt.VerifiedRetained.ComputerStorageDeferred) != 1 ||
+		receipt.VerifiedRetained.ComputerStorageDeferred[0].Operation != "quarantine_root_inventory" {
+		t.Fatalf("quarantine-root retained evidence = %+v, ok=%t", receipt, ok)
+	}
+}
+
 func assertServeQuarantinesAndAdmits(t *testing.T, root string, storage ComputerStorageReference, name, wantReason string) {
 	t.Helper()
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
