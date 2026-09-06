@@ -82,9 +82,11 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	go func() { served <- l1Server.Serve(ctx, l1Listener) }()
 	go func() { served <- l3Server.Serve(ctx, l3Listener) }()
 
+	deadman := newRecordingDeadmanRenewer()
 	runtime := &ociOneshotAcceptanceRuntime{
 		firstReapUnavailable: make(chan struct{}),
 		recoveryReady:        make(chan struct{}),
+		deadmanRenewed:       deadman.renewed,
 	}
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -100,7 +102,7 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 		OCIIntent:         enabledTestOCIIntent,
 		OCIBootBarrier:    readyOCIBootBarrier{},
 		WorkloadRuntimes:  map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
-		AttemptDeadman:    &recordingDeadmanRenewer{},
+		AttemptDeadman:    deadman,
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: managedRoot,
 	})
@@ -185,6 +187,9 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	if !slices.Equal(finalizedOwners, []string{accepted.RunID}) {
 		t.Fatalf("finalized handoff owners = %v, want deletion only after accepted success", finalizedOwners)
 	}
+	if calls, _, generation := deadman.snapshot(); calls < 1 || generation != readyOCIHelperGeneration() {
+		t.Fatalf("ordinary L3 OCI deadman renewals=%d generation=%+v, want at least one renewal for %+v", calls, generation, readyOCIHelperGeneration())
+	}
 
 	cancel()
 	if err := <-agentDone; err != nil {
@@ -211,6 +216,7 @@ type ociOneshotAcceptanceRuntime struct {
 	reapCalls            int
 	firstReapUnavailable chan struct{}
 	recoveryReady        chan struct{}
+	deadmanRenewed       <-chan struct{}
 }
 
 func (runtime *ociOneshotAcceptanceRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -266,13 +272,14 @@ func (runtime *ociOneshotAcceptanceRuntime) Run(ctx context.Context, request wor
 	if err := request.OCIStarted(ctx, observation); err != nil {
 		return workloadrunner.Result{}, err
 	}
-	if request.OCIHelperAdmitted != nil {
-		helperSession, _ := (readyOCIBootBarrier{}).Generation()
-		generation := workloadrunner.RuntimeGeneration{
-			InstanceID: helperSession.HelperInstanceID, Generation: helperSession.SessionGeneration,
-		}
-		if err := request.OCIHelperAdmitted(generation); err != nil {
-			return workloadrunner.Result{}, err
+	if err := admitReadyOCIHelper(request); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if call == 2 {
+		select {
+		case <-runtime.deadmanRenewed:
+		case <-ctx.Done():
+			return workloadrunner.Result{}, context.Cause(ctx)
 		}
 	}
 	runtime.mu.Lock()
