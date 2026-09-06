@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -32,6 +34,41 @@ type workflowBridgeBinderFunc func(context.Context) (workloadrunner.WorkflowBrid
 
 func (bind workflowBridgeBinderFunc) Bind(ctx context.Context) (workloadrunner.WorkflowBridgeBinding, error) {
 	return bind(ctx)
+}
+
+type readObservedListener struct {
+	net.Listener
+	readStarted chan struct{}
+	readBytes   chan struct{}
+	once        sync.Once
+	bytesOnce   sync.Once
+}
+
+func (listener *readObservedListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &readObservedConnection{Conn: connection, observe: func() {
+		listener.once.Do(func() { close(listener.readStarted) })
+	}, observeBytes: func() {
+		listener.bytesOnce.Do(func() { close(listener.readBytes) })
+	}}, nil
+}
+
+type readObservedConnection struct {
+	net.Conn
+	observe      func()
+	observeBytes func()
+}
+
+func (connection *readObservedConnection) Read(buffer []byte) (int, error) {
+	connection.observe()
+	count, err := connection.Conn.Read(buffer)
+	if count > 0 && connection.observeBytes != nil {
+		connection.observeBytes()
+	}
+	return count, err
 }
 
 func TestComputerAttemptBridgeAllowlistExactlyMirrorsL3ComputerRoutes(t *testing.T) {
@@ -574,6 +611,83 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	cancel()
 	if err := <-syncDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestComputerSubmissionPolicyRemintClosesUnusedHelperPreconnection(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &readObservedListener{Listener: tcpListener, readStarted: make(chan struct{}), readBytes: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBindingAndSurface(t.Context(), participant, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	}, workflowBridgeSurfaceComputer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	select {
+	case <-listener.readStarted:
+	case <-t.Context().Done():
+		t.Fatal("bridge did not begin reading the incomplete guest request")
+	}
+	// The helper pump connects this host side before a guest has connected to
+	// its namespace listener, so no HTTP bytes exist to create a request context.
+	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); err != nil {
+		t.Fatalf("policy remint ended the Computer attempt while closing an unused helper preconnection: %v", err)
+	}
+	if err := guest.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guest.Read(make([]byte, 1)); err == nil {
+		t.Fatal("unused helper preconnection remained open after policy remint")
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("unused helper preconnection was not closed before the read deadline")
+	}
+}
+
+func TestComputerSubmissionPolicyRemintPreservesStartedGuestTransport(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &readObservedListener{Listener: tcpListener, readStarted: make(chan struct{}), readBytes: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBindingAndSurface(t.Context(), participant, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	}, workflowBridgeSurfaceComputer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	if _, err := guest.Write([]byte("G")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-listener.readBytes:
+	case <-t.Context().Done():
+		t.Fatal("bridge did not observe the started guest request")
+	}
+	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); err != nil {
+		t.Fatalf("policy remint ended the Computer attempt while preserving a started guest transport: %v", err)
+	}
+	if err := guest.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guest.Read(make([]byte, 1)); err == nil {
+		t.Fatal("incomplete guest request unexpectedly produced a response")
+	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatalf("policy remint force-closed a started guest transport: %v", err)
 	}
 }
 

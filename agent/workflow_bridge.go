@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -46,6 +47,35 @@ type workflowBridge struct {
 	reachability       context.Context
 	cancelReachability context.CancelCauseFunc
 	closed             bool
+	connections        sync.Map
+}
+
+type workflowBridgeListener struct {
+	net.Listener
+	bridge *workflowBridge
+}
+
+func (listener workflowBridgeListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	tracked := &workflowBridgeConnection{Conn: connection}
+	listener.bridge.connections.Store(tracked, struct{}{})
+	return tracked, nil
+}
+
+type workflowBridgeConnection struct {
+	net.Conn
+	read atomic.Bool
+}
+
+func (connection *workflowBridgeConnection) Read(buffer []byte) (int, error) {
+	count, err := connection.Conn.Read(buffer)
+	if count > 0 {
+		connection.read.Store(true)
+	}
+	return count, err
 }
 
 func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec) (*workflowBridge, error) {
@@ -157,11 +187,19 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		mux.Handle("/l3/", l3Proxy)
 		handler = mux
 	}
-	bridge.server = &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return ctx }}
+	bridge.server = &http.Server{
+		Handler:     handler,
+		BaseContext: func(net.Listener) context.Context { return ctx },
+		ConnState: func(connection net.Conn, state http.ConnState) {
+			if state == http.StateClosed || state == http.StateHijacked {
+				bridge.connections.Delete(connection)
+			}
+		},
+	}
 	baseURL := "http://" + net.JoinHostPort(binding.AdvertiseHost, strconv.Itoa(tcpAddress.Port))
 	bridge.l3Endpoint = baseURL + "/l3"
 	go func() {
-		_ = bridge.server.Serve(binding.Listener)
+		_ = bridge.server.Serve(workflowBridgeListener{Listener: binding.Listener, bridge: bridge})
 	}()
 	return bridge, nil
 }
@@ -304,7 +342,19 @@ func (b *workflowBridge) closeWithCause(cause error) error {
 	err := b.server.Shutdown(closeContext)
 	b.l3.CloseIdleConnections()
 	if errors.Is(err, context.DeadlineExceeded) {
-		_ = b.listener.Close()
+		// The helper pump preconnects its host side before a guest arrives. That
+		// zero-byte connection has no request context for revocation to cancel,
+		// so graceful shutdown cannot drain it. Close only that unused transport:
+		// a connection that carried guest bytes must survive long enough to
+		// receive the typed revocation outcome.
+		b.connections.Range(func(key, _ any) bool {
+			connection, ok := key.(*workflowBridgeConnection)
+			if ok && !connection.read.Load() {
+				_ = connection.Close()
+			}
+			return true
+		})
+		return nil
 	}
 	return err
 }
