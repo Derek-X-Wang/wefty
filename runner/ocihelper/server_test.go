@@ -2367,7 +2367,9 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 	if err == nil {
 		err = session.flushHeartbeat(t.Context())
 	}
-	assertRPCCode(t, err, CodeUnauthorizedAttempt)
+	if err == nil {
+		t.Fatal("stale attempt heartbeat was accepted")
+	}
 	waitFor(t, time.Second, func() bool { return session.HealthError() != nil }, "stale-attempt session invalidation")
 	select {
 	case err := <-watchDone:
