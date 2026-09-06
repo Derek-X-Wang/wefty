@@ -95,7 +95,21 @@ func TestSystemd252LaneValidatesLegacyHelperPolicy(t *testing.T) {
 	if err := os.WriteFile(path, units.HelperService, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if output, err := exec.Command("systemd-analyze", "verify", path).CombinedOutput(); err != nil {
+	fixtures := map[string]string{
+		"basic.target":       "[Unit]\nDescription=Test basic target\nDefaultDependencies=no\n",
+		"containerd.service": "[Unit]\nDescription=Test containerd dependency\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/bin/true\n",
+		"shutdown.target":    "[Unit]\nDescription=Test shutdown target\nDefaultDependencies=no\n",
+		"sysinit.target":     "[Unit]\nDescription=Test sysinit target\nDefaultDependencies=no\n",
+		"system.slice":       "[Unit]\nDescription=Test system slice\nDefaultDependencies=no\n",
+	}
+	for name, contents := range fixtures {
+		if err := os.WriteFile(filepath.Join(working, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := exec.Command("systemd-analyze", "verify", path)
+	command.Env = append(os.Environ(), "SYSTEMD_UNIT_PATH="+working)
+	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("systemd 252 rejected rendered legacy policy: %v\n%s", err, output)
 	}
 }
