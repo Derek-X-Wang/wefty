@@ -1411,13 +1411,18 @@ diskLoop:
 			}
 			deferred, deferredPresent, deferredReadErr := engine.inspectOperationalComputerRecoveryDeferral(root, entry.Name())
 			method := "manifest_missing"
-			if deferredReadErr != nil {
+			var structuralErr *computerDiskRecoveryStructuralError
+			deferralIdentityMismatch := errors.As(deferredReadErr, &structuralErr) && structuralErr.Reason == "deferral_record_identity_mismatch"
+			if deferredReadErr != nil && !deferralIdentityMismatch {
 				deferred.Recovery.Reason = "deferral_record_unreadable"
 				deferredPresent = true
 				method += ":deferral_record_unreadable"
 			}
 			quarantineErr := error(nil)
-			if deferredPresent && deferred.Storage.ComputerID != "" {
+			if deferralIdentityMismatch {
+				method = structuralErr.Reason
+				quarantineErr = engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), structuralErr.Reason)
+			} else if deferredPresent && deferred.Storage.ComputerID != "" {
 				quarantineErr = engine.quarantineComputerDiskAnomalyWithDeferral(root, entry.Name(), deferred.Storage, "manifest_missing", deferred.Recovery)
 			} else if deferredPresent {
 				quarantineErr = engine.quarantineComputerDiskAuthorityFailureWithDeferral(root, entry.Name(), "manifest_missing", deferred.Recovery)

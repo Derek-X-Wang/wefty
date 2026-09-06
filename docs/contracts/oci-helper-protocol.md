@@ -64,8 +64,11 @@ socket with `service-start-limit-hit`. The socket retains systemd's default
 trigger-limit policy; the current lane proves service recovery and active
 socket topology, but does not claim a separate trigger-limit proof. The lane
 on Debian 12/systemd 252 rejects any `Unknown key` diagnostic from
-`systemd-analyze verify` and asserts the effective fixed-delay directives, so
-modern-only restart keys cannot be silently ignored. Fault actions publish a
+`systemd-analyze verify`, proving parse compatibility rather than the installed
+unit's effective configuration; the render unit test separately asserts the
+fixed-delay source directives. Modern-only restart keys therefore cannot be
+silently ignored, but this lane does not reject a later valid override. Fault
+actions publish a
 `.failed` verdict only through a completed temporary file rename; redirect,
 `cp`, and `tee` publication directly to the verdict path are contract drift.
 The lane

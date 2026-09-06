@@ -119,16 +119,6 @@ func TestSystemd252LaneValidatesLegacyHelperPolicy(t *testing.T) {
 	if strings.Contains(stderr.String(), "Unknown key") {
 		t.Fatalf("systemd 252 ignored a rendered helper directive:\n%s", stderr.String())
 	}
-	for _, directive := range []string{"Restart=on-failure", "RestartSec=1s"} {
-		if !strings.Contains(string(units.HelperService), directive) {
-			t.Fatalf("systemd 252 helper policy omitted effective directive %q:\n%s", directive, units.HelperService)
-		}
-	}
-	for _, unsupported := range []string{"RestartSteps=", "RestartMaxDelaySec="} {
-		if strings.Contains(string(units.HelperService), unsupported) {
-			t.Fatalf("systemd 252 helper policy retained unsupported directive %q:\n%s", unsupported, units.HelperService)
-		}
-	}
 }
 
 func TestSupplementaryGroupAdditionForcesOneAgentRestart(t *testing.T) {

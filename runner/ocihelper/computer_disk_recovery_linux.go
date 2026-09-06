@@ -23,9 +23,9 @@ const (
 	// floor prevents rapid barrier retries from abandoning live tenant bytes.
 	defaultComputerStorageRecoveryAttempts  = 24
 	defaultComputerDiskQuarantineGCFailures = 3
-	// When neither GC evidence location is writable, the in-memory failure
-	// bound is backed by an absolute window derived from the durable retention
-	// deadline so helper replacement cannot authorize retries forever.
+	// When neither GC evidence location is writable, an observed in-memory
+	// failure is bounded by an absolute window derived from the durable
+	// retention deadline.
 	defaultComputerDiskQuarantineGCUnrecordedRetryWindow = 24 * time.Hour
 	computerOperationalDeferralRecordName                = "recovery-deferral.json"
 	computerOperationalDeferralFaultSuffix               = "-recovery-deferral-fault.json"
@@ -185,6 +185,14 @@ func mergeOperationalComputerRecoveryDeferrals(primary computerOperationalRecove
 func (engine *ContainerdEngine) inspectOperationalComputerRecoveryDeferral(root, name string) (computerOperationalRecoveryDeferral, bool, error) {
 	_, rootErr := engine.lstatComputerDisk(root)
 	primary, primaryPresent, primaryErr := readOperationalComputerRecoveryDeferral(root)
+	if primaryErr == nil && primaryPresent && primary.DiskName != name {
+		primary = computerOperationalRecoveryDeferral{}
+		primaryPresent = false
+		primaryErr = &computerDiskRecoveryStructuralError{
+			Reason: "deferral_record_identity_mismatch",
+			Cause:  errors.New("Computer operational recovery deferral belongs to another disk directory"),
+		}
+	}
 	fallback, fallbackPresent, fallbackErr := readOperationalComputerRecoveryDeferralFault(root, name)
 	if primaryErr == nil && primaryPresent && (fallbackErr != nil || !fallbackPresent) {
 		return primary, true, nil
@@ -448,7 +456,7 @@ func (engine *ContainerdEngine) quarantineRecoveryInventoryEntry(root, name stri
 	if engine.config.Clock != nil {
 		now = engine.config.Clock.Now()
 	}
-	if reason, stoppedAt, stopped := computerDiskQuarantineGCStop(receipt, now); stopped {
+	if reason, stoppedAt, stopped := computerDiskQuarantineGCStop(receipt, evidenceStorage, now); stopped {
 		recovery.GCRetryStopReason = reason
 		recovery.GCRetryStoppedAt = stoppedAt
 	}
@@ -971,7 +979,8 @@ func validComputerDiskAuthorityFailureReason(reason string) bool {
 	return reason == "manifest_invalid" || reason == "quarantine_authority_invalid" ||
 		reason == "copy_recovery_authority_invalid" || reason == "grow_recovery_authority_invalid" ||
 		reason == "identity_mismatch" || reason == "record_not_regular" || reason == "resume_abandoned" ||
-		reason == "legacy_reset_quarantine" || reason == "recovery_deferral_invalid" || reason == "manifest_missing"
+		reason == "legacy_reset_quarantine" || reason == "recovery_deferral_invalid" || reason == "manifest_missing" ||
+		reason == "deferral_record_identity_mismatch"
 }
 
 func validateComputerDiskQuarantineReceipt(receipt computerDiskQuarantineReceipt) error {
@@ -1082,11 +1091,11 @@ func (engine *ContainerdEngine) mergeComputerDiskQuarantineGC(root string, recei
 	return receipt, storage
 }
 
-func computerDiskQuarantineGCStop(receipt computerDiskQuarantineReceipt, now time.Time) (ComputerDiskQuarantineGCStopReason, time.Time, bool) {
+func computerDiskQuarantineGCStop(receipt computerDiskQuarantineReceipt, evidenceStorage ComputerDiskQuarantineGCEvidenceStorage, now time.Time) (ComputerDiskQuarantineGCStopReason, time.Time, bool) {
 	if receipt.GCEscalatedAt != nil {
 		return ComputerDiskQuarantineGCStopFailureLimit, receipt.GCEscalatedAt.UTC(), true
 	}
-	if receipt.PayloadDroppedAt == nil {
+	if receipt.PayloadDroppedAt == nil && receipt.GCFailures > 0 && evidenceStorage == ComputerDiskQuarantineGCEvidenceMemory {
 		stopAt := receipt.RetainUntil.Add(defaultComputerDiskQuarantineGCUnrecordedRetryWindow).UTC()
 		if !now.Before(stopAt) {
 			return ComputerDiskQuarantineGCStopUnrecordedWindow, stopAt, true
@@ -1274,7 +1283,11 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 			continue
 		}
 		receipt, gcEvidenceStorage := engine.mergeComputerDiskQuarantineGC(root, receipt)
-		if stopReason, _, stopped := computerDiskQuarantineGCStop(receipt, now); stopped {
+		if now.Before(receipt.RetainUntil) || receipt.PayloadDroppedAt != nil {
+			closeComputerDiskLock(lock)
+			continue
+		}
+		if stopReason, _, stopped := computerDiskQuarantineGCStop(receipt, gcEvidenceStorage, now); stopped {
 			method := "quarantine_gc_escalated"
 			if stopReason == ComputerDiskQuarantineGCStopUnrecordedWindow {
 				method = "quarantine_gc_unrecorded_retry_window_elapsed"
@@ -1283,10 +1296,6 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 				Class: RemovalResourceComputerQuarantine, ID: receipt.DiskName, Action: SweepActionRetained, Method: method,
 				GCEvidenceStorage: gcEvidenceStorage, GCStopReason: stopReason,
 			})
-			closeComputerDiskLock(lock)
-			continue
-		}
-		if now.Before(receipt.RetainUntil) || receipt.PayloadDroppedAt != nil {
 			closeComputerDiskLock(lock)
 			continue
 		}
@@ -1335,6 +1344,7 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 			closeComputerDiskLock(lock)
 			continue
 		}
+		engine.forgetComputerDiskQuarantineGC(root)
 		_ = removeComputerDiskQuarantineGCFailure(root)
 		method := "remove_payload"
 		if receipt.Reason == "legacy_reset_quarantine" {

@@ -19,12 +19,15 @@ sweeps do not. Recovery terminates as `resume_abandoned` only after both
 twenty-four failed agent boot-barrier sweeps and 24 elapsed hours, so a helper
 restart storm cannot consume the bound in minutes. Structural image/record
 mismatch and invalid authority quarantine immediately. Quarantine retains its
-payload for 24 hours and its typed tombstone thereafter without an autonomous
-age bound, so N is never admissible again; three authority-valid payload-GC
+payload for 24 hours; a quarantine whose payload GC has never failed is
+collected by the first sweep after that deadline, however late. Its typed
+tombstone remains thereafter without an autonomous age bound, so N is never
+admissible again; three authority-valid payload-GC
 failures escalate and stop automatic retries. The helper tries both the mirror
 and primary receipt for each failure update. If neither is writable, typed
-in-memory evidence enforces the three-failure bound and the retention deadline
-plus 24 hours supplies an absolute wall-clock stop across helper replacement.
+in-memory evidence enforces the three-failure bound, and only an observed
+memory-only failure may stop at the retention deadline plus 24 hours. A helper
+that has no failure evidence attempts GC rather than treating age as evidence.
 Inventory and doctor surface the GC count, timestamps, last failure, evidence
 location, and escalation count. The supported recovery path
 prepares and admits reset generation N+1 and clears N only through authorized
