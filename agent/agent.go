@@ -630,6 +630,7 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	if a == nil || a.capabilities == nil || a.session == nil {
 		return nil
 	}
+	a.capabilities.allowOCIIntent()
 	if a.session.ociBootBarrier == nil {
 		return a.capabilities.refresh(ctx)
 	}
@@ -660,6 +661,10 @@ func (a *Agent) FenceOCIIntentStop(ctx context.Context, revision uint64) (func()
 	if a == nil || a.ociIntentGate == nil {
 		return func() {}, nil
 	}
+	// The durable disabled marker is already authoritative at this boundary.
+	// Close local admission before waiting for an enabled completion reader so
+	// lease expiry cannot admit a replacement OCI attempt during the drain.
+	a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
 	return a.ociIntentGate.beginStop(ctx, revision)
 }
 

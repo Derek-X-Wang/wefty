@@ -1193,10 +1193,20 @@ func (spool *logSpool) recordCompletionDisposition(ctx context.Context, attemptI
 	var jobID sql.NullString
 	var resultJSON []byte
 	var finishedNS sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT job_id, result_json, finished_ns FROM spool_attempts WHERE attempt_id=?`, attemptID).
-		Scan(&jobID, &resultJSON, &finishedNS)
+	var existingDisposition sql.NullString
+	var existingRevision sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT job_id, result_json, finished_ns, completion_disposition, intent_revision
+FROM spool_attempts WHERE attempt_id=?`, attemptID).
+		Scan(&jobID, &resultJSON, &finishedNS, &existingDisposition, &existingRevision)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("agent: read completion evidence for disposition: %w", err)
+	}
+	// Concurrent suppression readers can commit out of order. Retain the
+	// earliest observed durable intent revision while still running the normal
+	// receipt refresh, compaction, and pruning path below.
+	if disposition == "suppressed" && existingDisposition.String == "suppressed" && existingRevision.Valid &&
+		(revision == 0 || existingRevision.Int64 < int64(revision)) {
+		storedRevision = existingRevision.Int64
 	}
 	var terminalAuditJSON []byte
 	if len(resultJSON) != 0 {
@@ -1217,7 +1227,8 @@ terminal_audit_json=COALESCE(excluded.terminal_audit_json, spool_completion_rece
 		return fmt.Errorf("agent: record completion disposition: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts
-SET completion_disposition=?, completion_reason=?, intent_revision=? WHERE attempt_id=? AND result_json IS NOT NULL`,
+SET completion_disposition=?, completion_reason=?, intent_revision=?
+WHERE attempt_id=? AND result_json IS NOT NULL`,
 		disposition, reason, storedRevision, attemptID); err != nil {
 		return fmt.Errorf("agent: join completion disposition to payload: %w", err)
 	}

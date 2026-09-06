@@ -87,6 +87,7 @@ type capabilityState struct {
 	lastProbe                  *contract.CapabilityObservation
 	pendingPublicationRevision int64
 	ociSuppressionSequence     atomic.Uint64
+	ociIntentDisabled          atomic.Bool
 }
 
 func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock Clock, timeout time.Duration) *capabilityState {
@@ -121,6 +122,9 @@ func (state *capabilityState) refresh(ctx context.Context) error {
 // observed and converted to a restrictive result.
 func (state *capabilityState) refreshValidated(ctx context.Context, validate func() error) error {
 	if state == nil || state.probe == nil {
+		return nil
+	}
+	if state.ociIntentDisabled.Load() {
 		return nil
 	}
 	state.probeMu.Lock()
@@ -184,8 +188,24 @@ func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReason
 	if err == nil {
 		err = errors.New("OCI runtime is not admitted")
 	}
+	if reason == contract.CapabilityReasonOCIIntentDisabled {
+		state.ociIntentDisabled.Store(true)
+	}
 	state.ociSuppressionSequence.Add(1)
 	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err, false)
+}
+
+// allowOCIIntent opens positive observation only after the operator has
+// durably enabled OCI and entered the explicit recovery transaction. Routine
+// heartbeat probes must not reverse a durable disabled intent.
+func (state *capabilityState) allowOCIIntent() {
+	if state == nil {
+		return
+	}
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	state.ociIntentDisabled.Store(false)
+	state.ociSuppressionSequence.Add(1)
 }
 
 // recordProbeResult discards a positive result that began before a concurrent
@@ -200,6 +220,9 @@ func (state *capabilityState) recordProbeResult(
 ) error {
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()
+	if probeErr == nil && state.ociIntentDisabled.Load() {
+		return errors.New("capability probe cannot supersede disabled OCI intent")
+	}
 	if probeErr == nil && state.ociSuppressionSequence.Load() != suppressionSequence {
 		return errors.New("capability probe was superseded by OCI runtime suppression")
 	}

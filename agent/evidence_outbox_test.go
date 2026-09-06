@@ -1629,7 +1629,7 @@ func assertEvidenceRecoveryIsolatesTransientPoisonAttempt(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: acknowledged})
 	})
-	client, stopServer := startEvidenceReplayServer(t, handler, 50*time.Millisecond)
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
 	defer stopServer()
 	defer client.Close()
 	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)

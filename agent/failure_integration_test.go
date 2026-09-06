@@ -496,7 +496,8 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 
 func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+	clock := newManualClock(time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC))
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"intent-marker-node": {Tags: []string{"intent-marker"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, 500*time.Millisecond)
 	defer stopServer()
@@ -620,6 +621,7 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		}
 	}
 	var queued l1.Job
+	clock.Advance(time.Second)
 	deadline = time.Now().Add(3 * time.Second)
 	for {
 		if _, err := store.Reconcile(t.Context()); err != nil {
@@ -1083,7 +1085,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
-		Logf: t.Logf,
+		AttemptDeadman: &recordingDeadmanRenewer{}, Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3046,6 +3048,15 @@ func (runtime *oneShotIntentRuntime) Run(ctx context.Context, request workloadru
 	}
 	if err := request.OCIStarted(ctx, observation); err != nil {
 		return workloadrunner.Result{}, err
+	}
+	if request.OCIHelperAdmitted != nil {
+		helperSession, _ := (readyOCIBootBarrier{}).Generation()
+		generation := workloadrunner.RuntimeGeneration{
+			InstanceID: helperSession.HelperInstanceID, Generation: helperSession.SessionGeneration,
+		}
+		if err := request.OCIHelperAdmitted(generation); err != nil {
+			return workloadrunner.Result{}, err
+		}
 	}
 	runtime.started <- request.Authority.AttemptID
 	<-ctx.Done()

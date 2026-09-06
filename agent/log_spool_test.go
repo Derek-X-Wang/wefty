@@ -448,6 +448,48 @@ VALUES(?, 'delivered', 'test', ?)`, fmt.Sprintf("newer-%04d", index), newerObser
 	}
 }
 
+func TestSuppressedCompletionKeepsEarliestIntentRevision(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "suppression-revision-node", 1024)
+	defer spool.Close()
+	claim := serviceSpoolTestClaim("suppression-revision")
+	claim.Job.Spec.Kind = contract.JobKindOCI
+	if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	inspection := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if inspection.State != "suppressed" || inspection.Reason != "service_intent_stop" || inspection.IntentRevision != 1 ||
+		inspection.Result.ExitCode == nil || *inspection.Result.ExitCode != exitCode {
+		t.Fatalf("suppression revision was rewritten after its durable decision: %+v", inspection)
+	}
+	second := serviceSpoolTestClaim("suppression-revision-reversed")
+	second.Job.Spec.Kind = contract.JobKindOCI
+	if err := spool.ensureAttempt(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.storeCompletion(t.Context(), second.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), second.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), second.Lease.AttemptID, "suppressed", "service_intent_stop", 1); err != nil {
+		t.Fatal(err)
+	}
+	if reversed := spool.inspectCompletion(t.Context(), second.Lease.AttemptID); reversed.IntentRevision != 1 {
+		t.Fatalf("earlier suppression revision lost to commit order: %+v", reversed)
+	}
+}
+
 func TestLogSpoolBoundsFullSuppressedPayloadsPerJob(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "suppression-bound-node", 1<<20)
 	defer spool.Close()

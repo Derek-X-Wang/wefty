@@ -142,6 +142,37 @@ func TestRestrictiveObservationDoesNotFabricateProbeReceipt(t *testing.T) {
 	}
 }
 
+func TestDisabledOCIIntentRequiresExplicitRecoveryBeforeProbe(t *testing.T) {
+	var calls atomic.Int32
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		calls.Add(1)
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	state := newCapabilityState(map[string]bool{"kind:oci": true}, probe, systemClock{}, 0)
+	state.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+
+	if err := state.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("routine refresh probed disabled OCI intent %d times", got)
+	}
+	if snapshot := state.snapshot(); snapshot.Capabilities["kind:oci"] || snapshot.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("routine refresh reopened disabled OCI intent: %+v", snapshot)
+	}
+
+	state.allowOCIIntent()
+	if err := state.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("explicit recovery probe calls = %d, want 1", got)
+	}
+	if snapshot := state.snapshot(); !snapshot.Capabilities["kind:oci"] {
+		t.Fatalf("explicit recovery did not reopen OCI intent: %+v", snapshot)
+	}
+}
+
 func TestLegacyConfiguredProcessCapabilityAllowsProcess(t *testing.T) {
 	state := newCapabilityState(map[string]bool{" Process ": true}, nil, systemClock{}, 0)
 	processSpec := contract.JobSpec{Kind: contract.JobKindProcess}
