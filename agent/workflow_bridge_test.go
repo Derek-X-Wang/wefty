@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -60,6 +61,59 @@ type readObservedConnection struct {
 	net.Conn
 	observe      func()
 	observeBytes func()
+}
+
+type closeErrorListener struct {
+	net.Listener
+	err           error
+	acceptStarted chan struct{}
+	once          sync.Once
+}
+
+func (listener *closeErrorListener) Accept() (net.Conn, error) {
+	listener.once.Do(func() { close(listener.acceptStarted) })
+	return listener.Listener.Accept()
+}
+
+func (listener *closeErrorListener) Close() error {
+	return errors.Join(listener.Listener.Close(), listener.err)
+}
+
+type acceptedCloseErrorListener struct {
+	net.Listener
+	err         error
+	readStarted chan struct{}
+	once        sync.Once
+}
+
+func (listener *acceptedCloseErrorListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &acceptedCloseErrorConnection{Conn: connection, err: listener.err, observeRead: func() {
+		listener.once.Do(func() { close(listener.readStarted) })
+	}}, nil
+}
+
+type acceptedCloseErrorConnection struct {
+	net.Conn
+	err         error
+	observeRead func()
+}
+
+func (connection *acceptedCloseErrorConnection) Read(buffer []byte) (int, error) {
+	connection.observeRead()
+	return connection.Conn.Read(buffer)
+}
+
+func (connection *acceptedCloseErrorConnection) Close() error {
+	return errors.Join(connection.Conn.Close(), connection.err)
+}
+
+type workflowBridgeDrainFailure interface {
+	error
+	ActiveConnectionCount() int
 }
 
 func (connection *readObservedConnection) Read(buffer []byte) (int, error) {
@@ -652,7 +706,132 @@ func TestComputerSubmissionPolicyRemintClosesUnusedHelperPreconnection(t *testin
 	}
 }
 
-func TestComputerSubmissionPolicyRemintPreservesStartedGuestTransport(t *testing.T) {
+func TestWorkflowBridgeUntracksClosedConnections(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &readObservedListener{Listener: tcpListener, readStarted: make(chan struct{}), readBytes: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBindingAndSurface(t.Context(), participant, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	}, workflowBridgeSurfaceComputer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	select {
+	case <-listener.readStarted:
+	case <-t.Context().Done():
+		t.Fatal("bridge did not begin reading the inactive connection")
+	}
+	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for trackedWorkflowBridgeConnectionCount(bridge) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if count := trackedWorkflowBridgeConnectionCount(bridge); count != 0 {
+		t.Fatalf("closed workflow bridge retained %d tracked connection(s)", count)
+	}
+}
+
+func trackedWorkflowBridgeConnectionCount(bridge *workflowBridge) int {
+	count := 0
+	bridge.connections.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func TestComputerBridgeClosePreservesNonDeadlineShutdownError(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeFailure := errors.New("close listener failed")
+	listener := &closeErrorListener{Listener: tcpListener, err: closeFailure, acceptStarted: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBindingAndSurface(t.Context(), participant, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	}, workflowBridgeSurfaceComputer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-listener.acceptStarted:
+	case <-t.Context().Done():
+		t.Fatal("bridge did not begin accepting connections")
+	}
+	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); !errors.Is(err, closeFailure) {
+		t.Fatalf("Computer bridge close error = %v, want listener failure", err)
+	}
+}
+
+func TestComputerSubmissionPolicyRemintSurfacesInactiveConnectionCloseError(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeFailure := errors.New("close inactive connection failed")
+	listener := &acceptedCloseErrorListener{Listener: tcpListener, err: closeFailure, readStarted: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBindingAndSurface(t.Context(), participant, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	}, workflowBridgeSurfaceComputer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	select {
+	case <-listener.readStarted:
+	case <-t.Context().Done():
+		t.Fatal("bridge did not begin reading the inactive connection")
+	}
+	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); !errors.Is(err, closeFailure) {
+		t.Fatalf("inactive connection close error = %v, want surfaced close failure", err)
+	}
+}
+
+func TestWorkflowBridgeDrainTimeoutRemainsObservable(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &readObservedListener{Listener: tcpListener, readStarted: make(chan struct{}), readBytes: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBinding(t.Context(), participant, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	select {
+	case <-listener.readStarted:
+	case <-t.Context().Done():
+		t.Fatal("workflow bridge did not begin reading the incomplete request")
+	}
+	if err := bridge.close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ordinary workflow bridge close error = %v, want bounded drain timeout", err)
+	}
+}
+
+func TestComputerSubmissionPolicyRemintClosesPartialHeaderConnection(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
 	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -679,15 +858,172 @@ func TestComputerSubmissionPolicyRemintPreservesStartedGuestTransport(t *testing
 		t.Fatal("bridge did not observe the started guest request")
 	}
 	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); err != nil {
-		t.Fatalf("policy remint ended the Computer attempt while preserving a started guest transport: %v", err)
+		t.Fatalf("policy remint ended the Computer attempt while closing a partial-header connection: %v", err)
 	}
-	if err := guest.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+	if err := guest.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := guest.Read(make([]byte, 1)); err == nil {
-		t.Fatal("incomplete guest request unexpectedly produced a response")
-	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
-		t.Fatalf("policy remint force-closed a started guest transport: %v", err)
+		t.Fatal("partial-header connection remained open after policy remint")
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("partial-header connection was not closed before the read deadline")
+	}
+}
+
+func TestComputerSubmissionPolicyRemintReturnsTypedFailureToActiveRequest(t *testing.T) {
+	network := plain.NewNetwork()
+	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	l3Listener, err := l3Fabric.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := make(chan struct{})
+	canceled := make(chan struct{})
+	bodyRead := make(chan error, 1)
+	l3Server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.WriteHeader(http.StatusContinue)
+		close(admitted)
+		go func() {
+			<-request.Context().Done()
+			close(canceled)
+		}()
+		_, readErr := io.ReadAll(request.Body)
+		bodyRead <- readErr
+		panic(http.ErrAbortHandler)
+	})}
+	go func() { _ = l3Server.Serve(l3Listener) }()
+	defer l3Server.Close()
+	bridge, err := newComputerAttemptBridge(t.Context(), agentFabric, "wefty://run-ledger", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	request, err := http.NewRequest(http.MethodPost, bridge.l3Endpoint+"/v1/runs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-admitted:
+	case <-t.Context().Done():
+		t.Fatal("paused request did not reach upstream admission")
+	}
+	reader := bufio.NewReader(guest)
+	interim, err := http.ReadResponse(reader, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interim.Body.Close()
+	if interim.StatusCode != http.StatusContinue {
+		t.Fatalf("paused request acknowledgement status=%d, want 100", interim.StatusCode)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- bridge.closeWithCause(errComputerSubmissionPolicyReminted) }()
+	select {
+	case <-canceled:
+	case <-t.Context().Done():
+		t.Fatal("policy remint did not cancel the admitted upstream request")
+	}
+	if _, err := io.WriteString(guest, "x"); err != nil {
+		t.Fatalf("release paused request body after policy remint: %v", err)
+	}
+	var response *http.Response
+	for {
+		response, err = http.ReadResponse(reader, request)
+		if err != nil {
+			t.Fatalf("active request received EOF instead of typed policy-remint response: %v", err)
+		}
+		if response.StatusCode != http.StatusContinue {
+			break
+		}
+		response.Body.Close()
+	}
+	defer response.Body.Close()
+	var typed contract.ErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&typed); err != nil {
+		t.Fatalf("decode policy-remint response status=%d headers=%v: %v", response.StatusCode, response.Header, err)
+	}
+	if response.StatusCode != http.StatusBadGateway || typed.Error.Code != contract.ErrorPassUnavailable ||
+		typed.Error.Message != errComputerSubmissionPolicyReminted.Error() {
+		t.Fatalf("policy-remint response = status %d error %#v, want typed 502", response.StatusCode, typed.Error)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("drained active request ended Computer rotation: %v", err)
+	}
+	select {
+	case <-bodyRead:
+	case <-t.Context().Done():
+		t.Fatal("upstream body reader did not drain after request cancellation")
+	}
+}
+
+func TestComputerSubmissionPolicyRemintReportsUndrainedActiveRequest(t *testing.T) {
+	network := plain.NewNetwork()
+	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	l3Listener, err := l3Fabric.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := make(chan struct{})
+	bodyRead := make(chan struct{})
+	l3Server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.WriteHeader(http.StatusContinue)
+		close(admitted)
+		_, _ = io.ReadAll(request.Body)
+		close(bodyRead)
+		panic(http.ErrAbortHandler)
+	})}
+	go func() { _ = l3Server.Serve(l3Listener) }()
+	defer l3Server.Close()
+	bridge, err := newComputerAttemptBridge(t.Context(), agentFabric, "wefty://run-ledger", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, bridge.l3Endpoint+"/v1/runs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-admitted:
+	case <-t.Context().Done():
+		t.Fatal("paused request did not reach upstream admission")
+	}
+	interim, err := http.ReadResponse(bufio.NewReader(guest), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interim.Body.Close()
+	if interim.StatusCode != http.StatusContinue {
+		t.Fatalf("paused request acknowledgement status=%d, want 100", interim.StatusCode)
+	}
+	drainErr := bridge.closeWithCause(errComputerSubmissionPolicyReminted)
+	if err := guest.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+	select {
+	case <-bodyRead:
+	case <-t.Context().Done():
+		t.Fatal("closing the paused guest did not release the upstream body reader")
+	}
+	var typed workflowBridgeDrainFailure
+	if !errors.As(drainErr, &typed) || typed.ActiveConnectionCount() != 1 ||
+		drainErr.Error() != "bridge drain incomplete: 1 active connection" {
+		t.Fatalf("undrained active request error = %v, want typed one-connection failure", drainErr)
 	}
 }
 

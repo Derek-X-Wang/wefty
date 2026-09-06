@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -36,7 +37,6 @@ const (
 
 type workflowBridge struct {
 	l3Endpoint         string
-	listener           net.Listener
 	server             *http.Server
 	l3                 *http.Transport
 	hostBridgeFallback bool
@@ -67,15 +67,22 @@ func (listener workflowBridgeListener) Accept() (net.Conn, error) {
 
 type workflowBridgeConnection struct {
 	net.Conn
-	read atomic.Bool
+	reachedActive atomic.Bool
 }
 
-func (connection *workflowBridgeConnection) Read(buffer []byte) (int, error) {
-	count, err := connection.Conn.Read(buffer)
-	if count > 0 {
-		connection.read.Store(true)
+type workflowBridgeDrainError struct {
+	activeConnections int
+}
+
+func (e *workflowBridgeDrainError) Error() string {
+	if e.activeConnections == 1 {
+		return "bridge drain incomplete: 1 active connection"
 	}
-	return count, err
+	return fmt.Sprintf("bridge drain incomplete: %d active connections", e.activeConnections)
+}
+
+func (e *workflowBridgeDrainError) ActiveConnectionCount() int {
+	return e.activeConnections
 }
 
 func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec) (*workflowBridge, error) {
@@ -145,7 +152,6 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	dialer := &net.Dialer{}
 	dialAddress := binding.Listener.Addr().String()
 	bridge := &workflowBridge{
-		listener:           binding.Listener,
 		l3:                 workflowBridgeTransport(participant, l3Address),
 		hostBridgeFallback: binding.HostBridgeFallback,
 		surface:            surface,
@@ -191,6 +197,11 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		Handler:     handler,
 		BaseContext: func(net.Listener) context.Context { return ctx },
 		ConnState: func(connection net.Conn, state http.ConnState) {
+			if state == http.StateActive {
+				if tracked, ok := connection.(*workflowBridgeConnection); ok {
+					tracked.reachedActive.Store(true)
+				}
+			}
 			if state == http.StateClosed || state == http.StateHijacked {
 				bridge.connections.Delete(connection)
 			}
@@ -341,20 +352,31 @@ func (b *workflowBridge) closeWithCause(cause error) error {
 	defer cancel()
 	err := b.server.Shutdown(closeContext)
 	b.l3.CloseIdleConnections()
-	if errors.Is(err, context.DeadlineExceeded) {
+	if b.surface == workflowBridgeSurfaceComputer && errors.Is(err, context.DeadlineExceeded) {
 		// The helper pump preconnects its host side before a guest arrives. That
-		// zero-byte connection has no request context for revocation to cancel,
-		// so graceful shutdown cannot drain it. Close only that unused transport:
-		// a connection that carried guest bytes must survive long enough to
-		// receive the typed revocation outcome.
+		// connection has no request context for revocation to cancel, so graceful
+		// shutdown cannot drain it. Close every transport that never reached an
+		// active request; parsed requests keep draining through typed cancellation.
+		var closeErrors []error
+		activeConnections := 0
 		b.connections.Range(func(key, _ any) bool {
 			connection, ok := key.(*workflowBridgeConnection)
-			if ok && !connection.read.Load() {
-				_ = connection.Close()
+			if !ok {
+				return true
+			}
+			if connection.reachedActive.Load() {
+				activeConnections++
+				return true
+			}
+			if closeErr := connection.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				closeErrors = append(closeErrors, fmt.Errorf("close inactive bridge connection: %w", closeErr))
 			}
 			return true
 		})
-		return nil
+		if activeConnections > 0 {
+			closeErrors = append(closeErrors, &workflowBridgeDrainError{activeConnections: activeConnections})
+		}
+		return errors.Join(closeErrors...)
 	}
 	return err
 }
