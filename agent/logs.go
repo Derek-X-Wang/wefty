@@ -107,12 +107,8 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 	if err := sink.spool.append(ctx, event); err != nil {
 		return err
 	}
-	sink.pendingEvents.Add(1)
-	pending, err := sink.spool.pendingCount(ctx, event.AttemptID)
-	if err != nil {
-		return err
-	}
-	if pending < sink.batchSize {
+	pending := sink.pendingEvents.Add(1)
+	if pending < int64(sink.batchSize) {
 		return nil
 	}
 	select {

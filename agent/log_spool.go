@@ -63,8 +63,11 @@ type logSpool struct {
 	db              *sql.DB
 	maxOneShotBytes int64
 	maxServiceBytes int64
-	dispositionMu   sync.Mutex
-	dispositionNext chan struct{}
+	// pendingCountCheckpoint is a test-only scheduling seam for contention at
+	// the pending-count query; production construction always leaves it nil.
+	pendingCountCheckpoint func(context.Context)
+	dispositionMu          sync.Mutex
+	dispositionNext        chan struct{}
 	// dispositionWaitCheckpoint is a test-only scheduling seam that proves a
 	// waiter reached the pre-commit edge; production construction leaves it nil.
 	dispositionWaitCheckpoint func()
@@ -781,6 +784,9 @@ WHERE ordinal=? AND attempt_id=? AND stream=?`, gapJSON, first.ordinal, first.at
 }
 
 func (spool *logSpool) pendingCount(ctx context.Context, attemptID string) (int, error) {
+	if spool.pendingCountCheckpoint != nil {
+		spool.pendingCountCheckpoint(ctx)
+	}
 	var count int
 	if err := spool.db.QueryRowContext(ctx, "SELECT count(*) FROM spool_events WHERE attempt_id=?", attemptID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("agent: count pending log spool: %w", err)

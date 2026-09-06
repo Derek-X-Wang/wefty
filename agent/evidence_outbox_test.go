@@ -540,6 +540,64 @@ func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
 	}
 }
 
+func TestHealthyAttemptPendingCountContentionDoesNotBecomeOutputError(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/logs") {
+			http.NotFound(w, request)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
+		})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "pending-count-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+
+	countStarted := make(chan struct{}, 1)
+	outbox.spool.pendingCountCheckpoint = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); !bounded {
+			return
+		}
+		countStarted <- struct{}{}
+		<-ctx.Done()
+	}
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "pending-count-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{
+				contract.EnvRunToken: "tail-secret",
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "pending-count-attempt", FencingToken: "pending-count-fence"},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, runtimes: testRuntimeSet(bufferedOutputRunner{}),
+		clock: systemClock{}, nodeID: "pending-count-node", bootSessionID: "pending-count-boot",
+		finalizationTimeout: 25 * time.Millisecond,
+		observer:            newLifecycleObserver(systemClock{}),
+	})
+
+	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	countWasContended := false
+	select {
+	case <-countStarted:
+		countWasContended = true
+	default:
+	}
+	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || result.LogEvidenceIncomplete {
+		t.Fatalf("healthy attempt under pending-count contention = result %#v err=%v, want exit 0 with complete output evidence", result, runErr)
+	}
+	if countWasContended {
+		t.Fatal("final redaction flush synchronously recounted pending spool events")
+	}
+}
+
 type deadlineManagedVolumeRuntime struct {
 	finalizations []workloadrunner.ManagedVolumeFinalizationRequest
 }
