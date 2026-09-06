@@ -5,6 +5,7 @@ package tsnet
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -69,8 +70,9 @@ func TestTSNetSmoke(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		if identity.NodeID == "" || identity.UserID == "" || identity.DeviceID == "" {
-			serverErr <- fmt.Errorf("WhoIs returned incomplete node/person/device identity")
+		if identity.NodeID == "" || identity.DeviceID == "" || identity.FabricID == "" ||
+			identity.Kind != fabric.IdentityKindMachine || identity.UserID != "" {
+			serverErr <- fmt.Errorf("WhoIs returned invalid machine identity")
 			return
 		}
 		_, err = io.Copy(conn, conn)
@@ -82,6 +84,11 @@ func TestTSNetSmoke(t *testing.T) {
 	conn, err := client.Dial(ctx, "tcp", serverName)
 	if err != nil {
 		t.Fatal(err)
+	}
+	localPeerAddress := conn.LocalAddr().String()
+	reachedPeerAddress := conn.RemoteAddr().String()
+	if localPeerAddress == "" || reachedPeerAddress == "" || localPeerAddress == reachedPeerAddress {
+		t.Fatalf("dial endpoints local=%q remote=%q, want two measured peer addresses", localPeerAddress, reachedPeerAddress)
 	}
 	if _, err := io.WriteString(conn, "tsnet smoke\n"); err != nil {
 		t.Fatal(err)
@@ -97,6 +104,69 @@ func TestTSNetSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	serverConnectHost := server.ConnectHost()
+	clientConnectHost := client.ConnectHost()
+	if serverConnectHost == "" || clientConnectHost == "" {
+		t.Fatalf("ConnectHost server=%q client=%q, want non-empty Fabric presentation addresses", serverConnectHost, clientConnectHost)
+	}
+	writeFabricIdentitySmokeReceipt(t, os.Getenv("WEFTY_FABRIC_MACHINE_RECEIPT"), map[string]fabricIdentitySmokeRow{
+		"fabric.machine_dns_acl": {
+			Status: "PASS",
+			Assertions: map[string]bool{
+				"dns_resolved":                     true,
+				"machine_identity_authenticated":   true,
+				"shared_tagged_key_dial_succeeded": true,
+			},
+			Evidence: map[string]string{"listener_connect_host": serverConnectHost, "peer_connect_host": clientConnectHost},
+		},
+		"fabric.machine_second_peer_reachability": {
+			Status: "PASS",
+			Assertions: map[string]bool{
+				"echo_round_trip":       true,
+				"peer_address_distinct": true,
+			},
+			Evidence: map[string]string{"listener_connect_host": serverConnectHost, "peer_connect_host": clientConnectHost},
+		},
+	})
+}
+
+type fabricIdentitySmokeRow struct {
+	Status     string            `json:"status"`
+	Assertions map[string]bool   `json:"assertions"`
+	Evidence   map[string]string `json:"evidence"`
+	Deviations []any             `json:"deviations"`
+}
+
+func writeFabricIdentitySmokeReceipt(t *testing.T, output string, rows map[string]fabricIdentitySmokeRow) {
+	t.Helper()
+	if output == "" {
+		return
+	}
+	for id, row := range rows {
+		if row.Deviations == nil {
+			row.Deviations = []any{}
+			rows[id] = row
+		}
+	}
+	candidate := os.Getenv("CANDIDATE_SHA")
+	if len(candidate) != 40 {
+		t.Fatalf("CANDIDATE_SHA = %q, want 40 lowercase hexadecimal characters", candidate)
+	}
+	for _, character := range candidate {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				t.Fatalf("CANDIDATE_SHA = %q, want 40 lowercase hexadecimal characters", candidate)
+			}
+		}
+	}
+	payload, err := json.MarshalIndent(map[string]any{"version": 1, "candidate_sha": candidate, "rows": rows}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = append(payload, '\n')
+	if err := os.WriteFile(output, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

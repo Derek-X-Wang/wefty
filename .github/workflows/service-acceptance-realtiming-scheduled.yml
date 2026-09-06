@@ -70,6 +70,96 @@ jobs:
           case "$candidate_sha" in *[!0-9a-f]*|'') exit 64 ;; esac
           printf 'available=true\ncandidate_sha=%s\nrun_id=%s\n' "$candidate_sha" "$run_id" >> "$GITHUB_OUTPUT"
 
+  fabric-machine-identity:
+    name: fabric-identity / machine
+    needs: [resolve-published-artifact]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted main history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detach to the validated artifact-producing commit
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+        run: |
+          set -euo pipefail
+          case "$EXPECTED_SHA" in *[!0-9a-f]*|'') exit 64 ;; esac
+          git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
+          git checkout --detach "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Require the tagged machine credential
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: test -n "$TS_AUTHKEY" || { echo "TS_AUTHKEY is required for armed machine Fabric identity rows" >&2; exit 1; }
+      - name: Run machine Fabric identity rows
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          WEFTY_FABRIC_MACHINE_RECEIPT: ${{ runner.temp }}/fabric-machine-identity.json
+        run: go test -count=1 -timeout=5m -v -tags=tsnet_smoke ./fabric/tsnet -run '^TestTSNetSmoke$'
+      - name: Upload machine Fabric identity receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fabric-machine-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/fabric-machine-identity.json
+          if-no-files-found: error
+
+  fabric-person-identity:
+    name: fabric-identity / person-whoami
+    needs: [resolve-published-artifact]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted main history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detach to the validated artifact-producing commit
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+        run: |
+          set -euo pipefail
+          case "$EXPECTED_SHA" in *[!0-9a-f]*|'') exit 64 ;; esac
+          git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
+          git checkout --detach "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Require the machine and dedicated test-person credentials
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          TS_AUTHKEY_CI_TESTER: ${{ secrets.TS_AUTHKEY_CI_TESTER }}
+        run: |
+          test -n "$TS_AUTHKEY" || { echo "TS_AUTHKEY is required for the Fabric listener" >&2; exit 1; }
+          test -n "$TS_AUTHKEY_CI_TESTER" || { echo "TS_AUTHKEY_CI_TESTER is required when TSNET_CI_TESTER_REQUIRED=true" >&2; exit 1; }
+      - name: Run person whoami Fabric identity row
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          TS_AUTHKEY_CI_TESTER: ${{ secrets.TS_AUTHKEY_CI_TESTER }}
+          WEFTY_FABRIC_PERSON_RECEIPT: ${{ runner.temp }}/fabric-person-identity.json
+        run: go test -count=1 -timeout=5m -v -tags=tsnet_smoke ./fabric/tsnet -run '^TestTSNetPersonWhoAmI$'
+      - name: Upload person Fabric identity receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fabric-person-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/fabric-person-identity.json
+          if-no-files-found: error
+
   service-acceptance-realtiming:
     name: service-acceptance-realtiming / ${{ matrix.os }} / ${{ matrix.image }}
     needs: [resolve-published-artifact]
@@ -635,7 +725,7 @@ jobs:
 
   realtiming-result:
     name: realtiming-result
-    needs: [resolve-published-artifact, service-acceptance-realtiming]
+    needs: [resolve-published-artifact, fabric-machine-identity, fabric-person-identity, service-acceptance-realtiming]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -646,6 +736,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Detach the receipt gate to the validated publishing commit
+        if: needs.resolve-published-artifact.outputs.available == 'true'
         env:
           EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
         run: |
@@ -669,11 +760,43 @@ jobs:
         with:
           name: service-acceptance-realtiming-ubuntu-latest-wayland-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/linux-computer-receipt-wayland
+      - name: Download the machine Fabric identity receipt
+        if: needs.fabric-machine-identity.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fabric-machine-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/fabric-machine-identity
+      - name: Download the person Fabric identity receipt
+        if: needs.fabric-person-identity.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fabric-person-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/fabric-person-identity
+      - name: Assemble the typed Fabric identity receipt
+        if: needs.resolve-published-artifact.outputs.available == 'true'
+        env:
+          TRUST_DOMAIN: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || 'trusted' }}
+          MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}
+          PERSON_RESULT: ${{ needs.fabric-person-identity.result }}
+          MACHINE_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' }}
+          PERSON_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+        run: |
+          scripts/assemble-fabric-identity-receipt.sh \
+            "$RUNNER_TEMP/fabric-identity-receipt.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
+            "$TRUST_DOMAIN" "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED" \
+            "$RUNNER_TEMP/fabric-machine-identity/fabric-machine-identity.json" \
+            "$RUNNER_TEMP/fabric-person-identity/fabric-person-identity.json"
       - name: Fail closed unless the published lane executed and passed
         env:
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
           ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}
           REALTIMING_RESULT: ${{ needs.service-acceptance-realtiming.result }}
+          TRUST_DOMAIN: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || 'trusted' }}
+          MACHINE_RESULT: ${{ needs.fabric-machine-identity.result }}
+          PERSON_RESULT: ${{ needs.fabric-person-identity.result }}
+          MACHINE_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' }}
+          PERSON_ARMED: ${{ vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
         run: |
           set -eu
           printf '%s\n' \
@@ -683,6 +806,10 @@ jobs:
           test "$RESOLVE_RESULT" = success
           test "$ARTIFACT_AVAILABLE" = true
           test "$REALTIMING_RESULT" = success
+          scripts/check-fabric-identity-receipt.sh \
+            "$RUNNER_TEMP/fabric-identity-receipt.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
+            "$TRUST_DOMAIN" "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED"
           scripts/check-linux-computer-receipt.sh \
             "$RUNNER_TEMP/linux-computer-receipt-xfce/linux-computer-matrix.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" xfce \
@@ -727,3 +854,10 @@ jobs:
               END { exit !(elapsed > 0 && bound > 0 && elapsed <= bound) }
             ' "$timeline"
           done
+      - name: Upload the combined Fabric identity receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fabric-identity-receipt-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/fabric-identity-receipt.json
+          if-no-files-found: warn

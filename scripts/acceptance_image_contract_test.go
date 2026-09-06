@@ -40,6 +40,8 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
+	Name string         `yaml:"name"`
+	If   string         `yaml:"if"`
 	Uses string         `yaml:"uses"`
 	Run  string         `yaml:"run"`
 	With map[string]any `yaml:"with"`
@@ -291,7 +293,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		text     string
 	}{"workflow-run": {realtiming, realtimeText}, "scheduled": {scheduled, scheduledText}} {
 		jobTimeout := fixture.workflow.Jobs["service-acceptance-realtiming"].TimeoutMinutes
-		goTimeout := workflowGoTestTimeoutMinutes(t, name, fixture.text)
+		goTimeout := workflowGoTestTimeoutMinutes(t, name, fixture.text, "service_acceptance_realtiming")
 		if jobTimeout != 100 || jobTimeout < goTimeout+15 {
 			t.Fatalf("%s realtiming timeouts: job=%dm go=%dm, want job=100m and at least 15m outer margin", name, jobTimeout, goTimeout)
 		}
@@ -371,12 +373,14 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		needs := stringSlice(t, result.Needs)
 		if !slices.Contains(needs, "resolve-published-artifact") || !slices.Contains(needs, "service-acceptance-realtiming") ||
+			!slices.Contains(needs, "fabric-machine-identity") || !slices.Contains(needs, "fabric-person-identity") ||
 			!strings.Contains(result.If, "always()") {
 			t.Fatalf("%s realtiming result dependencies/guard = %#v if=%q", name, needs, result.If)
 		}
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
 			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
+			"check-fabric-identity-receipt.sh", "fabric-identity-receipt.json", "MACHINE_RESULT", "PERSON_RESULT",
 			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland",
 			"helper-restart-timeline.txt", "observed_startup_failures=6", "startup_failure_arm=6", "fault_1_kill_to_verified_ready_elapsed_ns", "fault_1_kill_to_verified_ready_bound_ns",
 			"capability_reason=helper_unit_unavailable", "lane_helper_kill_action_set", "lane_product_path_fault_actions=1", "disk_quarantine_action=quarantined", "elapsed <= bound"} {
@@ -730,9 +734,9 @@ func assertAllPort443RulesOwnerScoped(t *testing.T, workflowName, workflowText s
 	}
 }
 
-func workflowGoTestTimeoutMinutes(t *testing.T, workflowName, workflowText string) int {
+func workflowGoTestTimeoutMinutes(t *testing.T, workflowName, workflowText, buildTag string) int {
 	t.Helper()
-	matches := regexp.MustCompile(`(?m)\bgo test [^\n]*-timeout=([0-9]+)m\b`).FindAllStringSubmatch(workflowText, -1)
+	matches := regexp.MustCompile(`(?m)\bgo test [^\n]*-timeout=([0-9]+)m[^\n]*-tags=`+regexp.QuoteMeta(buildTag)+`\b`).FindAllStringSubmatch(workflowText, -1)
 	if len(matches) != 1 {
 		t.Fatalf("%s realtiming go test timeout count = %d, want 1", workflowName, len(matches))
 	}
