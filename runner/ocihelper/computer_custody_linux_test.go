@@ -91,7 +91,7 @@ func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *tes
 		completed.Receipt.ManifestDigest == "" || completed.Receipt.ContentDigest != request.SourceDigest {
 		t.Fatalf("resumed Custody export = %+v err=%v", completed, err)
 	}
-	if digest, err := digestFile(filepath.Join(externalRoot, "storage.ext4")); err != nil || digest != request.SourceDigest {
+	if digest, err := digestFile(t.Context(), filepath.Join(externalRoot, "storage.ext4")); err != nil || digest != request.SourceDigest {
 		t.Fatalf("resumed Custody bytes digest = %s err=%v", digest, err)
 	}
 	wantUID, wantGID := custodyFileOwner(t, externalRoot)
@@ -360,7 +360,7 @@ func TestStartupPublishesDurableComputerCopyAfterImageRename(t *testing.T) {
 	if err := fullyAllocateComputerDisk(published, request.Destination.DiskBytes); err != nil {
 		t.Fatal(err)
 	}
-	digest, err := digestFile(published)
+	digest, err := digestFile(t.Context(), published)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestStartupCopyDigestHonorsSweepContextAndDefers(t *testing.T) {
 	if err := fullyAllocateComputerDisk(published, request.Destination.DiskBytes); err != nil {
 		t.Fatal(err)
 	}
-	digest, err := digestFile(published)
+	digest, err := digestFile(t.Context(), published)
 	if err != nil {
 		t.Fatal(err)
 	}

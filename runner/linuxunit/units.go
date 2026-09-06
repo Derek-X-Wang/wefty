@@ -9,9 +9,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
 const (
@@ -21,11 +21,11 @@ const (
 	HelperSocketPath  = "/run/wefty-oci/oci-helper.sock"
 	HelperGroup       = "wefty-oci"
 
-	HelperRestartInitialDelay      = 250 * time.Millisecond
-	HelperRestartSteps             = 6
-	HelperStartupFailureBurst      = 6
-	HelperRestartMaximumDelay      = time.Second
-	HelperRestartTakeoverMargin    = 2 * time.Second
+	HelperRestartInitialDelay      = systemdpolicy.InitialDelay
+	HelperRestartSteps             = systemdpolicy.RestartSteps
+	HelperStartupFailureBurst      = systemdpolicy.FailureBurst
+	HelperRestartMaximumDelay      = systemdpolicy.MaximumDelay
+	HelperRestartTakeoverMargin    = systemdpolicy.TakeoverMargin
 	HelperSaturatedRestartDelaySum = (HelperStartupFailureBurst + 1) * HelperRestartMaximumDelay
 )
 
@@ -58,20 +58,17 @@ type Units struct {
 // HelperRestartPolicy returns the bounded service policy supported by the
 // installed systemd. Debian 12's systemd 252 lacks the geometric directives.
 func HelperRestartPolicy(systemdVersion int) string {
-	if systemdVersion >= 254 {
-		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
-	}
-	return "RestartSec=1s\n"
+	return systemdpolicy.Render(systemdVersion)
+}
+
+// HelperRestartPolicyDirectives is the single versioned policy authority used
+// by both renderers and by doctor when it interprets systemd's effective unit.
+func HelperRestartPolicyDirectives(systemdVersion int) map[string]string {
+	return systemdpolicy.Directives(systemdVersion)
 }
 
 func HelperRestartPolicyName(systemdVersion int) string {
-	if systemdVersion == 0 {
-		return "conservative_fixed_1s"
-	}
-	if systemdVersion >= 254 {
-		return "geometric_capped_1s"
-	}
-	return "legacy_fixed_1s"
+	return systemdpolicy.Name(systemdVersion)
 }
 
 func Render(config Config) (Units, error) {

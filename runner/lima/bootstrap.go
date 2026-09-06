@@ -7,13 +7,15 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
 const (
@@ -299,20 +301,11 @@ func RenderGuestHelperServiceUnit(config GuestHelperInstallConfig) []byte {
 }
 
 func guestHelperRestartPolicy(systemdVersion int) string {
-	if systemdVersion >= 254 {
-		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
-	}
-	return "RestartSec=1s\n"
+	return systemdpolicy.Render(systemdVersion)
 }
 
 func GuestHelperRestartPolicyName(systemdVersion int) string {
-	if systemdVersion == 0 {
-		return "conservative_fixed_1s"
-	}
-	if systemdVersion >= 254 {
-		return "geometric_capped_1s"
-	}
-	return "legacy_fixed_1s"
+	return systemdpolicy.Name(systemdVersion)
 }
 
 func systemdQuote(value string) string {

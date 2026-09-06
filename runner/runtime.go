@@ -714,7 +714,7 @@ type ComputerStoragePreparationOutcome struct {
 	DeferredReason   string
 	Attempts         int
 	FirstDeferredAt  *time.Time
-	PayloadDroppedAt string
+	PayloadDroppedAt *time.Time
 	RecordedAt       time.Time
 }
 

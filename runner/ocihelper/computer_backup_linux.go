@@ -268,20 +268,39 @@ func sameComputerBackupRemovalSupersession(supersession computerBackupSupersessi
 		supersession.OperationRevision == request.Authority.OperationRevision && supersession.L1OperationState == wantState
 }
 
-func digestFile(path string) (string, error) {
+func digestFile(ctx context.Context, path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
+	digest, readErr := digestReader(ctx, file)
+	if err := errors.Join(readErr, file.Close()); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func digestReader(ctx context.Context, reader io.Reader) (string, error) {
 	hash := sha256.New()
-	_, copyErr := io.Copy(hash, file)
-	if closeErr := file.Close(); copyErr == nil {
-		copyErr = closeErr
+	buffer := make([]byte, 256*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		read, readErr := reader.Read(buffer)
+		if read > 0 {
+			_, _ = hash.Write(buffer[:read])
+		}
+		if errors.Is(readErr, io.EOF) {
+			return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+		}
+		if readErr != nil {
+			return "", readErr
+		}
+		if read == 0 {
+			return "", io.ErrNoProgress
+		}
 	}
-	if copyErr != nil {
-		return "", copyErr
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func removeComputerBackupRoot(root string) error {
@@ -378,7 +397,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 			if err := verifyComputerDiskAllocation(published, request.Storage.DiskBytes); err != nil {
 				return CreateComputerBackupResponse{}, err
 			}
-			digest, err := digestFile(published)
+			digest, err := digestFile(ctx, published)
 			if err != nil || digest != manifest.ContentDigest {
 				return CreateComputerBackupResponse{}, errors.New("published Computer Backup digest no longer matches its manifest")
 			}
@@ -466,7 +485,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 		}
 	}
 
-	sourceDigest, err := digestFile(sourcePath)
+	sourceDigest, err := digestFile(ctx, sourcePath)
 	if err != nil {
 		return CreateComputerBackupResponse{}, err
 	}
@@ -477,7 +496,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 	if _, err := os.Lstat(publishedPath); err == nil {
 		targetPath = publishedPath
 	}
-	destinationDigest, err := digestFile(targetPath)
+	destinationDigest, err := digestFile(ctx, targetPath)
 	if err != nil {
 		return CreateComputerBackupResponse{}, err
 	}

@@ -138,6 +138,7 @@ type ContainerdEngine struct {
 	computerRecoveryDigest      func(context.Context, string) (string, error)
 	computerQuarantineHook      func(computerDiskQuarantinePhase) error
 	computerQuarantineRemoveAll func(string) error
+	computerQuarantineWrite     func(string, string, string, []byte, os.FileMode) error
 	computerLstat               func(string) (os.FileInfo, error)
 	computerReadDir             func(string) ([]os.DirEntry, error)
 	computerDiskSweepMu         sync.Mutex

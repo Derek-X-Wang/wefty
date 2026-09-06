@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/Derek-X-Wang/wefty/runner/lima"
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
 // SetupState is the durable, explicit node-local configuration compared by
@@ -122,12 +123,8 @@ func validateSetupState(state SetupState) error {
 }
 
 func setupStateRestartPolicy(systemdVersion int) string {
-	switch {
-	case systemdVersion == 0:
+	if systemdVersion == 0 {
 		return ""
-	case systemdVersion >= 254:
-		return "geometric_capped_1s"
-	default:
-		return "legacy_fixed_1s"
 	}
+	return systemdpolicy.Name(systemdVersion)
 }
