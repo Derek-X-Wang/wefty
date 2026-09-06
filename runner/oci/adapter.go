@@ -1069,12 +1069,6 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		}
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
-	if request.OCIHelperAdmitted != nil {
-		if err := request.OCIHelperAdmitted(); err != nil {
-			_ = reapAfterFailedStart(session, authority)
-			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
-		}
-	}
 	if runResponse.Image == nil {
 		err := errors.New("OCI helper Started response omitted image evidence")
 		_ = reapAfterFailedStart(session, authority)
@@ -1149,6 +1143,13 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		// A fencing/authority refusal is a terminal fact about this attempt, not
 		// infrastructure loss eligible for the OCI pre-start retry budget.
 		return spawnResult(contract.SpawnFailureProcessRequest, err), err
+	}
+	if request.OCIHelperAdmitted != nil {
+		admitted := helperSession(session)
+		if err := request.OCIHelperAdmitted(workloadrunner.RuntimeGeneration{InstanceID: admitted.HelperInstanceID, Generation: admitted.SessionGeneration}); err != nil {
+			_ = reapAfterFailedStart(session, authority)
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
 	}
 	if request.Started != nil {
 		request.Started()

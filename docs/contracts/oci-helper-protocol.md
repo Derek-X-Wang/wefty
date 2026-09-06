@@ -142,7 +142,11 @@ heartbeats refresh a deadline measured only from the helper's monotonic clock.
 Control EOF invalidates the session immediately, while an open but blackholed
 connection is invalidated when that deadline expires. Invalid version,
 capability, sequence, or deadman content on the control stream also invalidates
-the session. Invalidation revokes RPC authority first, cancels in-flight
+the session. A rejected heartbeat emits one typed helper log carrying the
+session generation, attempt ID when present, and rejection code. The helper
+retains that closed receipt across replacement-session acquisition and exposes
+it through `DoctorStatus`; it contains no capability or raw privileged error.
+Invalidation revokes RPC authority first, cancels in-flight
 operations and connections, joins them, takes the exclusive create/sweep gate,
 then calls the engine's boot-session reap. A new session is not issued until
 that reap succeeds. If reap fails, the listener closes and `Serve` fails so
@@ -314,9 +318,14 @@ losing attempt has no remaining runtime.
 `Run` establishes an initial attempt deadman within the helper's configured
 maximum. The control heartbeat may carry exact attempt renewals, each with a
 bounded TTL; the agent emits one only after the matching L1 lease renewal has
-succeeded and helper `Run` has admitted that exact attempt. Successful L1
+succeeded, all Started evidence has been accepted, and helper `Run` has admitted
+that exact attempt in the same helper session generation. Successful L1
 renewals that arrive during image delivery remain agent-local; the first such
-renewal is queued only after `Run` returns authoritative `Started` evidence.
+renewal is queued only after the full Started path succeeds. The retained value
+is an absolute L1 expiry, and the TTL sent at admission is only its remaining
+monotonic lifetime. Terminal authority or reap closes the gate; a late flush is
+a no-op, and a replacement helper generation drops the renewal with typed
+evidence rather than targeting the replacement session.
 Receipt sets an absolute deadline from the helper's monotonic clock.
 Timer wakeups re-read that deadline before expiring authority, so a superseded
 timer cannot reap a renewed attempt. A missing renewal reaps that attempt even
@@ -331,7 +340,7 @@ heartbeats.
 | --- | --- |
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. The agent supplies the canonical platform retained from the successful probe for this helper generation; manifest selection and image singleflight are keyed by it. The sole offline-bootstrap exception is the clean-cache `node load-image` archive import that must precede that probe: it may use the current helper diagnostic OS/architecture after OCI default-variant normalization, but it does not retain or promote that diagnostic fact as probe evidence. Every registry delivery, binding pin, and other caller remains gated on the probe-retained canonical platform, and later probe evidence must select the same archived platform digest. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks that platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly that platform, and imports/unpacks it. Both modes return the same complete image evidence used by `Run`, including top-level/platform digests, platform, runtime handler, and snapshotter; no containerd type, private registry credential, or retry policy crosses the boundary. |
 | `ImageCacheStatus` | Session-authorized read of namespace content bytes, applied cap, and the last completed eviction. It never enforces the cap or changes a pin. |
-| `DoctorStatus` | Session-authorized read of runtime platform, containerd/runc versions, allowed mount roots, bounded `ImageCacheStatus`, and the actually observed IPv4/IPv6 Computer firewall attachment state. Each sub-read carries its own assertion-derived receipt, so a partial failure does not erase the authenticated handshake or successful siblings. A failed firewall read fails closed, and a missing chain or jump while a Computer attempt is live is a typed `FAILED` screen-isolation finding. Runc comes only from containerd runtime info or a setup-resolved absolute executable path; the privileged helper never performs an operator-triggered PATH lookup. A whole-RPC failure uses `diagnostic_failure`, which is explicitly not runtime-loss evidence: the client does not invalidate the session, reap attempts, or withdraw capability. It never acquires a session, probes, sweeps, starts a task, mutates policy, or evicts content. |
+| `DoctorStatus` | Session-authorized read of runtime platform, containerd/runc versions, allowed mount roots, bounded `ImageCacheStatus`, the actually observed IPv4/IPv6 Computer firewall attachment state, and the latest typed rejected-heartbeat session-invalidation receipt. Each sub-read carries its own assertion-derived receipt, so a partial failure does not erase the authenticated handshake or successful siblings. A failed firewall read fails closed, and a missing chain or jump while a Computer attempt is live is a typed `FAILED` screen-isolation finding. Runc comes only from containerd runtime info or a setup-resolved absolute executable path; the privileged helper never performs an operator-triggered PATH lookup. A whole-RPC failure uses `diagnostic_failure`, which is explicitly not runtime-loss evidence: the client does not invalidate the session, reap attempts, or withdraw capability. It never acquires a session, probes, sweeps, starts a task, mutates policy, or evicts content. |
 | `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started`, the helper-captured `started_at` timestamp from that exact edge, assertion-derived profile evidence, helper-observed image evidence, and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. Before a Computer starts, the helper brings up its private network namespace's loopback interface and transfers the held view, control, and submission listeners into it. A live Computer Storage attachment refuses a different attempt with `computer_storage_busy`; this is definitive no-runtime evidence for only the losing attempt and never changes the live owner's authority. An ordinary OCI Mac bridge-fallback preparation creates a separate guest loopback listener and capability; every Computer instead uses the same constrained bridge shape as its only agent submission path. Default-off exposes no endpoint file while retaining the private listener for a later policy enable. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. A containerd `NotFound` after authorization is the closed `task already terminated` mechanics fact: the helper returns `already_terminated=true` without recording delivery of that signal, and `Watch` remains authoritative for the terminal arm. This race alone is not `engine_failure` or runtime-loss evidence; if `Watch` then cannot publish terminal evidence inside the fixed post-KILL release bound, the positive reaped-task fact makes the missing Wait confirmation typed runtime loss. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
@@ -1221,9 +1230,12 @@ The client owns the control-stream heartbeat pump and its strictly monotonic
 sequence counter. Ordinary callers cannot submit arbitrary heartbeat renewal
 lists. The agent queues one attempt renewal only on the successful L1 renewal
 path, only when the returned directive is empty, and only after helper `Run`
-has admitted that exact tuple. A pre-admission renewal is retained locally and
-the latest one is queued after authoritative `Started`; failed, timed-out,
-stale, `stop`, and `restart` responses never refresh the helper deadman. The pump uses
+has admitted that exact tuple and its full Started evidence has reached L1. A
+pre-admission renewal is retained as an absolute expiry and the latest one is
+queued with only its remaining lifetime after authoritative `Started`; failed,
+timed-out, stale, `stop`, and `restart` responses never refresh the helper
+deadman. The retained generation must equal the session that admitted the
+attempt, and terminal paths discard it before reap. The pump uses
 separate operation connections for image/watch streams so backpressure cannot
 starve session authority, and it locally verifies the returned helper checksum
 against a non-empty installed expectation before exposing the session.

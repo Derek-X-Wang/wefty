@@ -946,10 +946,15 @@ func writeMinimalDoctorFactsLoop(
 	}
 }
 
-func (renewer ociAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration) error {
+func (renewer ociAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration, expected workloadrunner.RuntimeGeneration) error {
 	session, err := renewer.barrier.Session()
 	if err != nil {
 		return err
+	}
+	handshake := session.Handshake()
+	observed := workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration}
+	if observed != expected {
+		return &agent.AttemptDeadmanGenerationMismatchError{Expected: expected, Observed: observed}
 	}
 	removalGeneration := "attempt"
 	if claim.Job.Spec.Class == contract.JobClassService {

@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -36,6 +37,7 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	engine := newPreAdmissionRenewalEngine()
 	barrier, stopHelper := startPreAdmissionHelper(t, engine)
 	defer stopHelper()
+	helperRenewals := make(chan struct{}, 8)
 	adapter := ocirunner.NewAdapter(barrier)
 	clock := newManualClock(time.Unix(10_000, 0))
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "pre-admission-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
@@ -60,6 +62,7 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: adapter},
 		AttemptDeadman: preAdmissionDeadman{
 			barrier: barrier, nodeID: "pre-admission-node", bootSessionID: "pre-admission-boot",
+			observe: func() { helperRenewals <- struct{}{} },
 		},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
 		RenewalInterval: 200 * time.Millisecond, Clock: clock, Logf: t.Logf,
@@ -131,6 +134,18 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doctor, err := session.DoctorStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence := doctor.LastSessionInvalidation; evidence != nil && evidence.AttemptID == claim.Lease.AttemptID {
+		t.Fatalf("pre-admission renewal invalidated helper session: attempt=%s code=%s generation=%d",
+			evidence.AttemptID, evidence.RejectionCode, evidence.SessionGeneration)
+	}
 	close(engine.releaseImage)
 
 	select {
@@ -141,6 +156,93 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("original attempt did not reach helper Run admission")
 	}
+	select {
+	case <-engine.watchEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("original attempt did not continue through Started into Watch")
+	}
+	select {
+	case <-helperRenewals:
+	case <-time.After(time.Second):
+		t.Fatal("admission did not flush the retained helper renewal")
+	}
+
+	// A later admitted renewal must move the helper deadline. Waiting before
+	// this renewal gives a stuck-closed gate enough separation for the original
+	// InitialDeadman edge to be observed independently.
+	time.Sleep(time.Second)
+	beforeRenewal, err := store.ListJobAttempts(t.Context(), job.JobID)
+	if err != nil || len(beforeRenewal) != 1 {
+		t.Fatalf("attempt before admitted renewal = %+v err=%v", beforeRenewal, err)
+	}
+	clock.Advance(200 * time.Millisecond)
+	admittedRenewalDeadline := time.Now().Add(time.Second)
+	for {
+		afterRenewal, listErr := store.ListJobAttempts(t.Context(), job.JobID)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(afterRenewal) == 1 && afterRenewal[0].LeaseExpiresAt.After(beforeRenewal[0].LeaseExpiresAt) {
+			break
+		}
+		if time.Now().After(admittedRenewalDeadline) {
+			t.Fatalf("post-admission L1 renewal did not land: before=%+v after=%+v", beforeRenewal, afterRenewal)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-helperRenewals:
+	case <-time.After(time.Second):
+		t.Fatal("post-admission renewal did not reach the helper session")
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if reaps := engine.attemptReapCount(); reaps != 0 {
+		t.Fatalf("helper attempt did not outlive its original InitialDeadman: reaps=%d", reaps)
+	}
+	close(engine.releaseWatch)
+	select {
+	case <-engine.deleteEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal attempt did not enter helper reap")
+	}
+	beforeTerminalRenewal, err := store.ListJobAttempts(t.Context(), job.JobID)
+	if err != nil || len(beforeTerminalRenewal) != 1 {
+		t.Fatalf("attempt before terminal renewal = %+v err=%v", beforeTerminalRenewal, err)
+	}
+	clock.Advance(200 * time.Millisecond)
+	terminalRenewalDeadline := time.Now().Add(time.Second)
+	for {
+		afterTerminalRenewal, listErr := store.ListJobAttempts(t.Context(), job.JobID)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(afterTerminalRenewal) == 1 && afterTerminalRenewal[0].LeaseExpiresAt.After(beforeTerminalRenewal[0].LeaseExpiresAt) {
+			break
+		}
+		if time.Now().After(terminalRenewalDeadline) {
+			t.Fatalf("terminal L1 renewal did not land: before=%+v after=%+v", beforeTerminalRenewal, afterTerminalRenewal)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-helperRenewals:
+		t.Fatal("terminal L1 renewal reached the helper while reap was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	session, err = barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doctor, err = session.DoctorStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence := doctor.LastSessionInvalidation; evidence != nil && evidence.AttemptID == claim.Lease.AttemptID {
+		t.Fatalf("terminal renewal invalidated helper session during reap: attempt=%s code=%s generation=%d",
+			evidence.AttemptID, evidence.RejectionCode, evidence.SessionGeneration)
+	}
+	close(engine.releaseDelete)
+
 	select {
 	case err := <-executionDone:
 		if err != nil {
@@ -160,32 +262,52 @@ func preAdmissionString(value string) *string { return &value }
 type preAdmissionDeadman struct {
 	barrier               *ocihelper.BootBarrier
 	nodeID, bootSessionID string
+	observe               func()
 }
 
-func (renewer preAdmissionDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration) error {
+func (renewer preAdmissionDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration, expected workloadrunner.RuntimeGeneration) error {
 	session, err := renewer.barrier.Session()
 	if err != nil {
 		return err
 	}
-	return session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
+	handshake := session.Handshake()
+	observed := workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration}
+	if observed != expected {
+		return &AttemptDeadmanGenerationMismatchError{Expected: expected, Observed: observed}
+	}
+	err = session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID,
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: fmt.Sprint(l1.InitialServiceRemovalGeneration),
 	}, ttl)
+	if err == nil && renewer.observe != nil {
+		renewer.observe()
+	}
+	return err
 }
 
 type preAdmissionRenewalEngine struct {
 	ocihelper.UnavailableEngine
-	imageEntered chan ocihelper.AttemptAuthority
-	releaseImage chan struct{}
-	runEntered   chan ocihelper.AttemptAuthority
-	imageOnce    sync.Once
+	imageEntered  chan ocihelper.AttemptAuthority
+	releaseImage  chan struct{}
+	runEntered    chan ocihelper.AttemptAuthority
+	watchEntered  chan struct{}
+	releaseWatch  chan struct{}
+	deleteEntered chan struct{}
+	releaseDelete chan struct{}
+	imageOnce     sync.Once
+	watchOnce     sync.Once
+	deleteOnce    sync.Once
+	mu            sync.Mutex
+	attemptReaps  int
 }
 
 func newPreAdmissionRenewalEngine() *preAdmissionRenewalEngine {
 	return &preAdmissionRenewalEngine{
 		imageEntered: make(chan ocihelper.AttemptAuthority, 1),
 		releaseImage: make(chan struct{}), runEntered: make(chan ocihelper.AttemptAuthority, 1),
+		watchEntered: make(chan struct{}), releaseWatch: make(chan struct{}),
+		deleteEntered: make(chan struct{}), releaseDelete: make(chan struct{}),
 	}
 }
 
@@ -210,12 +332,44 @@ func (engine *preAdmissionRenewalEngine) Run(_ context.Context, request ocihelpe
 	return ocihelper.RunResponse{Started: true, StartedAt: time.Now().UTC(), Image: &evidence}, nil
 }
 
-func (*preAdmissionRenewalEngine) Watch(_ context.Context, _ ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+func (engine *preAdmissionRenewalEngine) Watch(ctx context.Context, request ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+	if request.Authority.JobID[:min(len(request.Authority.JobID), len("probe-"))] != "probe-" {
+		engine.watchOnce.Do(func() { close(engine.watchEntered) })
+		select {
+		case <-engine.releaseWatch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	exitCode := 0
 	return emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &ocihelper.WatchResponse{ExitCode: &exitCode}})
 }
 
-func (*preAdmissionRenewalEngine) Delete(context.Context, ocihelper.DeleteRequest) (ocihelper.DeleteResponse, error) {
+func (engine *preAdmissionRenewalEngine) ReapAttempt(_ context.Context, authority ocihelper.AttemptAuthority) error {
+	if authority.JobID[:min(len(authority.JobID), len("probe-"))] == "probe-" {
+		return nil
+	}
+	engine.mu.Lock()
+	engine.attemptReaps++
+	engine.mu.Unlock()
+	return nil
+}
+
+func (engine *preAdmissionRenewalEngine) attemptReapCount() int {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return engine.attemptReaps
+}
+
+func (engine *preAdmissionRenewalEngine) Delete(ctx context.Context, request ocihelper.DeleteRequest) (ocihelper.DeleteResponse, error) {
+	if request.Authority.JobID[:min(len(request.Authority.JobID), len("probe-"))] != "probe-" {
+		engine.deleteOnce.Do(func() { close(engine.deleteEntered) })
+		select {
+		case <-engine.releaseDelete:
+		case <-ctx.Done():
+			return ocihelper.DeleteResponse{}, ctx.Err()
+		}
+	}
 	return ocihelper.DeleteResponse{Deleted: true}, nil
 }
 
@@ -245,6 +399,10 @@ func (*preAdmissionRenewalEngine) ReleaseAttemptImagePin(context.Context, ocihel
 
 func (*preAdmissionRenewalEngine) ImageCacheStatus(context.Context) (ocihelper.ImageCacheStatus, error) {
 	return ocihelper.ImageCacheStatus{}, nil
+}
+
+func (*preAdmissionRenewalEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
+	return ocihelper.DoctorStatus{}, nil
 }
 
 func preAdmissionImageResponse() ocihelper.EnsureImageResponse {

@@ -680,8 +680,14 @@ For `kind=oci`, the privileged helper provides the Guardian-equivalent second
 boundary described in [OCI helper protocol](oci-helper-protocol.md). The agent
 refreshes an attempt's helper deadman only after the matching L1 lease renewal
 succeeds and helper `Run` has admitted that exact attempt. Renewals during image
-delivery remain pending in the agent and the latest is queued after helper
-`Started`, while `Run`'s initial deadman covers helper-side starting. Agent-helper
+delivery remain pending in the agent and the latest is queued only after every
+helper Started-evidence check and the fenced L1 `StartAttempt` succeed. The
+queued value retains its absolute monotonic L1 expiry, so admission sends only
+the remaining lifetime and never extends helper authority beyond L1. It is
+bound to the helper session generation that admitted the attempt; a replacement
+generation drops it with typed local evidence. Stop, restart, authority loss,
+and every terminal/reap path close the gate and discard pending evidence, while
+`Run`'s initial deadman covers helper-side starting. Agent-helper
 control EOF, a helper-clock heartbeat blackhole, or an
 expired per-attempt deadman therefore reaps runtime-owned state independently
 of the agent's own authority watchdog.
