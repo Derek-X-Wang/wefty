@@ -618,14 +618,44 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 }
 
 func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
+	var mu sync.Mutex
+	var callOrder []string
+	recoveredTail := make(chan contract.LogEvent, 1)
+	completionSeen := make(chan l1.CompletionRequest, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if !strings.HasSuffix(request.URL.Path, "/logs") {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/logs"):
+			var appendRequest l1.AppendLogsRequest
+			if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+				t.Error(err)
+				return
+			}
+			if len(appendRequest.Events) != 1 {
+				t.Errorf("late append recovery events = %d, want 1", len(appendRequest.Events))
+				return
+			}
+			mu.Lock()
+			callOrder = append(callOrder, "logs")
+			mu.Unlock()
+			recoveredTail <- appendRequest.Events[0]
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+				Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
+				AttemptState: contract.AttemptRunning,
+			})
+		case strings.HasSuffix(request.URL.Path, "/complete"):
+			var completion l1.CompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			callOrder = append(callOrder, "completion")
+			mu.Unlock()
+			completionSeen <- completion
+			_ = json.NewEncoder(w).Encode(l1.Job{})
+		default:
 			http.NotFound(w, request)
-			return
 		}
-		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
-			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
-		})
 	})
 	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
 	defer stopServer()
@@ -635,6 +665,7 @@ func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover late append evidence: %v", err) })
 
 	appendStarted := make(chan struct{}, 1)
 	outbox.spool.appendCheckpoint = func(ctx context.Context) {
@@ -668,6 +699,31 @@ func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
 	}
 	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || !result.LogEvidenceIncomplete {
 		t.Fatalf("healthy attempt under append contention = result %#v err=%v, want exit 0 with incomplete output evidence", result, runErr)
+	}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, toL1Result(result), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	outbox.scheduleRecovery()
+	select {
+	case tail := <-recoveredTail:
+		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" {
+			t.Fatalf("recovered redaction tail = %#v, want stdout sequence 0 with bytes tail", tail)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline-interrupted redaction tail was not recovered as late evidence")
+	}
+	select {
+	case completion := <-completionSeen:
+		if completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
+			t.Fatalf("late-evidence completion = %#v, want exit 0 with incomplete output evidence", completion.Result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-evidence recovery did not deliver completion")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(callOrder, []string{"logs", "completion"}) {
+		t.Fatalf("late append recovery order = %v, want logs before completion", callOrder)
 	}
 }
 
