@@ -139,7 +139,10 @@ func readOperationalComputerRecoveryDeferral(root string) (computerOperationalRe
 	if record.Storage.ComputerID != "" {
 		expected, identityErr := deterministicComputerDiskName(record.Storage)
 		if identityErr != nil || expected != record.DiskName {
-			return computerOperationalRecoveryDeferral{}, false, errors.New("Computer operational recovery deferral identity is invalid")
+			return computerOperationalRecoveryDeferral{}, false, &computerDiskRecoveryStructuralError{
+				Reason: "deferral_record_identity_mismatch",
+				Cause:  errors.Join(identityErr, errors.New("Computer operational recovery deferral Storage does not match its disk name")),
+			}
 		}
 	}
 	return record, true, nil
@@ -166,7 +169,10 @@ func readOperationalComputerRecoveryDeferralAt(path, name string) (computerOpera
 	if record.Storage.ComputerID != "" {
 		expected, identityErr := deterministicComputerDiskName(record.Storage)
 		if identityErr != nil || expected != record.DiskName {
-			return computerOperationalRecoveryDeferral{}, false, errors.New("Computer operational recovery fault deferral identity is invalid")
+			return computerOperationalRecoveryDeferral{}, false, &computerDiskRecoveryStructuralError{
+				Reason: "deferral_record_identity_mismatch",
+				Cause:  errors.Join(identityErr, errors.New("Computer operational recovery fault deferral Storage does not match its disk name")),
+			}
 		}
 	}
 	return record, true, nil
@@ -322,6 +328,12 @@ func (engine *ContainerdEngine) clearOperationalComputerRecoveryDeferral(root, n
 	record, present, err := readOperationalComputerRecoveryDeferral(root)
 	if err != nil {
 		return err
+	}
+	if present && record.DiskName != name {
+		return &computerDiskRecoveryStructuralError{
+			Reason: "deferral_record_identity_mismatch",
+			Cause:  errors.New("Computer operational recovery deferral belongs to another disk directory"),
+		}
 	}
 	removedPrimary := false
 	if present && record.Operation == operation {

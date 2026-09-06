@@ -1054,6 +1054,14 @@ func TestComputerDiskSweepPreservesReadablePrimaryDeferralWhenManifestIsMissing(
 }
 
 func TestComputerDiskSweepQuarantinesForeignDeferralRecordWhenManifestIsMissing(t *testing.T) {
+	for _, operation := range []string{"computer_disk_manifest", "computer_storage_copy"} {
+		t.Run(operation, func(t *testing.T) {
+			testComputerDiskSweepQuarantinesForeignDeferralRecordWhenManifestIsMissing(t, operation)
+		})
+	}
+}
+
+func testComputerDiskSweepQuarantinesForeignDeferralRecordWhenManifestIsMissing(t *testing.T, operation string) {
 	root := t.TempDir()
 	targetStorage := testComputerStorage()
 	targetName, _ := deterministicComputerDiskName(targetStorage)
@@ -1074,11 +1082,16 @@ func TestComputerDiskSweepQuarantinesForeignDeferralRecordWhenManifestIsMissing(
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
 	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
 	seed.resolveOperationalComputerRecoveryFailure(foreignRoot, foreignName, "computer_disk_manifest", foreignStorage, syscall.EIO, true)
-	foreignRecord, err := os.ReadFile(filepath.Join(foreignRoot, computerOperationalDeferralRecordName))
+	foreignRecord, present, err := readOperationalComputerRecoveryDeferral(foreignRoot)
+	if err != nil || !present {
+		t.Fatalf("read foreign recovery deferral present=%t err=%v", present, err)
+	}
+	foreignRecord.Operation = operation
+	foreignPayload, err := json.Marshal(foreignRecord)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(targetRoot, computerOperationalDeferralRecordName), foreignRecord, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(targetRoot, computerOperationalDeferralRecordName), foreignPayload, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1197,6 +1210,48 @@ func TestOperationalComputerRecoveryDeferralKeepsIdentityMismatchReason(t *testi
 	}
 	if fallback.Recovery.Reason != "deferral_record_identity_mismatch" {
 		t.Fatalf("identity mismatch fallback reason = %q", fallback.Recovery.Reason)
+	}
+}
+
+func TestOperationalComputerRecoveryDeferralTypesSameNameForeignStorageAsIdentityMismatch(t *testing.T) {
+	root := t.TempDir()
+	targetStorage := testComputerStorage()
+	targetName, _ := deterministicComputerDiskName(targetStorage)
+	foreignStorage := targetStorage
+	foreignStorage.ComputerID = "computer-foreign"
+	foreignStorage.StorageID = "storage-foreign"
+	foreignName, _ := deterministicComputerDiskName(foreignStorage)
+	targetRoot := filepath.Join(root, "computer-disks", targetName)
+	foreignRoot := filepath.Join(root, "computer-disks", foreignName)
+	for _, diskRoot := range []string{targetRoot, foreignRoot} {
+		if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
+	seed.resolveOperationalComputerRecoveryFailure(foreignRoot, foreignName, "computer_disk_manifest", foreignStorage, syscall.EIO, true)
+	foreignRecord, present, err := readOperationalComputerRecoveryDeferral(foreignRoot)
+	if err != nil || !present {
+		t.Fatalf("read foreign recovery deferral present=%t err=%v", present, err)
+	}
+	foreignRecord.DiskName = targetName
+	foreignPayload, err := json.Marshal(foreignRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, computerOperationalDeferralRecordName), foreignPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now.Add(time.Minute))}}
+	engine.resolveOperationalComputerRecoveryFailure(targetRoot, targetName, "computer_disk_image", targetStorage, syscall.EIO, true)
+	fallback, present, err := readOperationalComputerRecoveryDeferralFault(targetRoot, targetName)
+	if err != nil || !present {
+		t.Fatalf("read identity mismatch fallback present=%t err=%v", present, err)
+	}
+	if fallback.Recovery.Reason != "deferral_record_identity_mismatch" {
+		t.Fatalf("same-name foreign Storage fallback reason = %q", fallback.Recovery.Reason)
 	}
 }
 
