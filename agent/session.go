@@ -1075,7 +1075,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 		case <-timer.C():
 			var pinned *ocihelper.HelperSession
 			if session.ociBootBarrier == nil {
-				if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+				if err := session.capabilities.refresh(ctx); err != nil && !capabilityProbeWasSkipped(err) && session.logf != nil {
 					session.logf("agent: capability probe before heartbeat: %v", err)
 				}
 			} else if generation, ready := session.ociBootBarrier.Generation(); ready {
