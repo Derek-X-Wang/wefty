@@ -153,6 +153,7 @@ jobs:
     needs:
       - acceptance-image
       - unit
+      - debian-systemd-252
       - sqlite-integration
       - mac-linux-runner
       - service-acceptance
@@ -167,6 +168,7 @@ jobs:
         env:
           ACCEPTANCE_IMAGE_RESULT: ${{ needs['acceptance-image'].result }}
           UNIT_RESULT: ${{ needs.unit.result }}
+          DEBIAN_SYSTEMD_252_RESULT: ${{ needs['debian-systemd-252'].result }}
           SQLITE_RESULT: ${{ needs['sqlite-integration'].result }}
           MAC_LINUX_RESULT: ${{ needs['mac-linux-runner'].result }}
           SERVICE_ACCEPTANCE_RESULT: ${{ needs['service-acceptance'].result }}
@@ -176,12 +178,14 @@ jobs:
           printf '%s\n' \
             "acceptance-image=$ACCEPTANCE_IMAGE_RESULT" \
             "unit=$UNIT_RESULT" \
+            "debian-systemd-252=$DEBIAN_SYSTEMD_252_RESULT" \
             "sqlite-integration=$SQLITE_RESULT" \
             "mac-linux-runner=$MAC_LINUX_RESULT" \
             "service-acceptance=$SERVICE_ACCEPTANCE_RESULT" \
             "dogfood-workflow=$DOGFOOD_RESULT"
           test "$ACCEPTANCE_IMAGE_RESULT" = success
           test "$UNIT_RESULT" = success
+          test "$DEBIAN_SYSTEMD_252_RESULT" = success
           test "$SQLITE_RESULT" = success
           test "$MAC_LINUX_RESULT" = success
           test "$SERVICE_ACCEPTANCE_RESULT" = success

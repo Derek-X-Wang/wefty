@@ -537,10 +537,15 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		_, runErr := adapter.Run(ctx, activeRequest, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
 		activeDone <- runErr
 	}()
+	activeReadinessBudget := activeRequest.InitialDeadman
+	activeReadinessDeadline := time.NewTimer(activeReadinessBudget)
+	defer activeReadinessDeadline.Stop()
 	select {
 	case <-activeStarted:
 	case err := <-activeDone:
 		t.Fatalf("active cache-pressure attempt ended early: %v", err)
+	case <-activeReadinessDeadline.C:
+		t.Fatalf("active cache-pressure attempt did not report OCIStarted within derived readiness budget %s", activeReadinessBudget)
 	case <-ctx.Done():
 		t.Fatalf("active cache-pressure attempt did not report OCIStarted: %v", ctx.Err())
 	}

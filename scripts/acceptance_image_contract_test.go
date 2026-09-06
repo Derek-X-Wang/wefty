@@ -173,6 +173,36 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if !slices.Contains(needs, "acceptance-image") || !strings.Contains(string(gateBytes), "ACCEPTANCE_IMAGE_RESULT") {
 		t.Fatal("all-tests-pass does not fail closed on acceptance-image")
 	}
+	validateDebian252Required := func(payload []byte) error {
+		var candidate workflowContract
+		if err := yaml.Unmarshal(payload, &candidate); err != nil {
+			return err
+		}
+		job := candidate.Jobs["all-tests-pass"]
+		values, ok := job.Needs.([]any)
+		if !ok || !slices.ContainsFunc(values, func(value any) bool { return value == "debian-systemd-252" }) {
+			return errors.New("all-tests-pass does not depend on debian-systemd-252")
+		}
+		encoded, err := yaml.Marshal(job)
+		if err != nil {
+			return err
+		}
+		text := string(encoded)
+		if !strings.Contains(text, "DEBIAN_SYSTEMD_252_RESULT") || !strings.Contains(text, `test "$DEBIAN_SYSTEMD_252_RESULT" = success`) {
+			return errors.New("all-tests-pass does not fail closed on the debian-systemd-252 result")
+		}
+		return nil
+	}
+	if err := validateDebian252Required(gateBytes); err != nil {
+		t.Fatal(err)
+	}
+	mutatedGate := bytes.Replace(gateBytes, []byte("      - debian-systemd-252\n"), nil, 1)
+	if bytes.Equal(mutatedGate, gateBytes) {
+		t.Fatal("Debian 252 dependency mutation did not apply")
+	}
+	if err := validateDebian252Required(mutatedGate); err == nil {
+		t.Fatal("contract accepted aggregate without the Debian 252 dependency")
+	}
 
 	if _, ok := realtiming.On["workflow_run"]; !ok {
 		t.Fatal("realtiming must be causally downstream of acceptance-image")
@@ -303,6 +333,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("shared realtiming fault supervisor is missing its version authority")
 	}
 	assertAtomicFaultFailurePublications(t, faultSupervisorText)
+	modernHelperPolicy := systemdpolicy.UnitPolicy(255)
 	const faultSupervisorInstall = "sudo install --owner=root --group=root --mode=0755 scripts/oci-realtiming-fault-supervisor-v1.sh /usr/local/libexec/wefty-oci-fault-supervisor"
 	for name, fixture := range map[string]struct {
 		workflow workflowContract
@@ -319,11 +350,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		for _, required := range []string{
 			"StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr",
-			"StartLimitIntervalSec=0",
-			"Restart=on-failure",
-			"RestartSec=250ms",
-			"RestartSteps=6",
-			"RestartMaxDelaySec=1s",
+			"StartLimitIntervalSec=" + modernHelperPolicy["Unit.StartLimitIntervalSec"],
+			"Restart=" + modernHelperPolicy["Service.Restart"],
+			"RestartSec=" + modernHelperPolicy["Service.RestartSec"],
+			"RestartSteps=" + modernHelperPolicy["Service.RestartSteps"],
+			"RestartMaxDelaySec=" + modernHelperPolicy["Service.RestartMaxDelaySec"],
 			"if: ${{ always() && runner.os == 'Linux' }}",
 			"journalctl --boot --no-pager --utc --output=short-precise",
 			"-u wefty-oci-helper-realtiming.service",
@@ -493,7 +524,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	}
 	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "wefty-computer-conformance", "--repair-image", "GPU-free Wayland")
 	assertFileContains(t, "../docs/guides/computer-images.md", "docker buildx create", "tonistiigi/binfmt@sha256:", "--input-oracle-path", "NOT-RUN", "operator-owned")
-	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t", "activeReadinessBudget := activeRequest.InitialDeadman", "time.NewTimer(activeReadinessBudget)")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
 }
@@ -524,21 +555,17 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
-			wantService := map[string]string{"Restart": "on-failure", "RestartSec": "1s"}
-			if version >= 254 {
-				wantService = modernWant["Service"]
-			}
-			if !maps.Equal(got["Unit"], modernWant["Unit"]) || !maps.Equal(got["Service"], wantService) {
+			want := splitQualifiedPolicy(systemdpolicy.UnitPolicy(version))
+			if !maps.Equal(got["Unit"], want["Unit"]) || !maps.Equal(got["Service"], want["Service"]) {
 				t.Fatalf("%s policy=%#v", name, got)
 			}
 			assertHelperPolicyMutationRejected(t, name, text)
 		}
 	}
-	if got := linuxunit.HelperRestartPolicy(255); got != "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n" {
-		t.Fatalf("modern systemd helper policy = %q", got)
-	}
-	if got := linuxunit.HelperRestartPolicy(252); got != "RestartSec=1s\n" || strings.Contains(got, "RestartSteps") {
-		t.Fatalf("legacy systemd helper policy = %q", got)
+	for _, version := range []int{255, 252} {
+		if got, want := linuxunit.HelperRestartPolicy(version), systemdpolicy.Render(version); got != want {
+			t.Fatalf("systemd %d helper policy = %q, want shared authority %q", version, got, want)
+		}
 	}
 	takeover := ocihelper.TakeoverTimeoutForReap(ocihelper.DefaultReapTimeout)
 	composed := linuxunit.HelperSaturatedRestartDelaySum + ocihelper.DefaultReapTimeout + linuxunit.HelperRestartTakeoverMargin
@@ -553,7 +580,8 @@ func assertAtomicFaultFailurePublications(t *testing.T, text string) {
 	validate := func(candidate string) error {
 		for lineNumber, raw := range strings.Split(candidate, "\n") {
 			line := strings.TrimSpace(raw)
-			if strings.Contains(line, "$action.failed\"") && (strings.Contains(line, ">") || strings.Contains(line, ">>")) {
+			if (strings.Contains(line, "$action.failed\"") || strings.Contains(line, "${action}.failed\"")) &&
+				(strings.Contains(line, ">") || strings.Contains(line, ">>")) {
 				return fmt.Errorf("line %d writes .failed directly: %s", lineNumber+1, line)
 			}
 		}
@@ -571,6 +599,10 @@ func assertAtomicFaultFailurePublications(t *testing.T, text string) {
 	}
 	if err := validate(mutated); err == nil {
 		t.Fatal("direct .failed publication mutation was accepted")
+	}
+	bracedMutation := strings.Replace(mutated, "$action.failed\"", "${action}.failed\"", 1)
+	if bracedMutation == mutated || validate(bracedMutation) == nil {
+		t.Fatal("braced direct .failed publication mutation was accepted")
 	}
 }
 
