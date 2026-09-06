@@ -27,12 +27,18 @@ type Network struct {
 	names    map[string]*nameRegistration
 	peers    map[string]fabric.Identity
 	fabricID string
+	// listenFn is a test-only seam for controlling localhost bind completion.
+	// Access it through listen and setListenFuncForTest so concurrent tests do
+	// not race with listener creation.
 	listenFn func(network, address string) (net.Listener, error)
 }
 
 const (
-	identityMagic           = "WEFTYPLAIN1"
-	maxIdentitySize         = 64 << 10
+	identityMagic   = "WEFTYPLAIN1"
+	maxIdentitySize = 64 << 10
+	// logicalRegistrationWait spends at most 5% of the service-acceptance
+	// harness's 5-second Fabric dial budget waiting for an in-process loopback
+	// bind, leaving 4.75 seconds for the connection and request itself.
 	logicalRegistrationWait = 250 * time.Millisecond
 )
 
@@ -40,7 +46,17 @@ type nameRegistration struct {
 	ready   chan struct{}
 	address string
 	err     error
-	waiters int
+}
+
+// LogicalRegistrationTimeoutError reports that a claimed logical address did
+// not finish its localhost bind within the plain Fabric registration ceiling.
+type LogicalRegistrationTimeoutError struct {
+	Address string
+	Timeout time.Duration
+}
+
+func (e *LogicalRegistrationTimeoutError) Error() string {
+	return fmt.Sprintf("plain fabric: logical address %q registration did not complete within %s", e.Address, e.Timeout)
 }
 
 // NewNetwork creates an isolated localhost fabric network.
@@ -100,11 +116,7 @@ func (f *Fabric) Listen(network, address string) (net.Listener, error) {
 		}
 	}
 
-	listen := net.Listen
-	if f.network.listenFn != nil {
-		listen = f.network.listenFn
-	}
-	ln, err := listen(network, listenAddress)
+	ln, err := f.network.listen(network, listenAddress)
 	if err != nil {
 		if registration != nil {
 			f.network.failNameRegistration(name.String(), registration, err)
@@ -184,6 +196,22 @@ func (n *Network) beginNameRegistration(name string) (*nameRegistration, error) 
 	return registration, nil
 }
 
+func (n *Network) listen(network, address string) (net.Listener, error) {
+	n.mu.RLock()
+	listen := n.listenFn
+	n.mu.RUnlock()
+	if listen == nil {
+		listen = net.Listen
+	}
+	return listen(network, address)
+}
+
+func (n *Network) setListenFuncForTest(listen func(network, address string) (net.Listener, error)) {
+	n.mu.Lock()
+	n.listenFn = listen
+	n.mu.Unlock()
+}
+
 func (n *Network) completeNameRegistration(name string, registration *nameRegistration, address string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -206,19 +234,18 @@ func (n *Network) failNameRegistration(name string, registration *nameRegistrati
 }
 
 func (n *Network) resolveName(ctx context.Context, name string) (string, error) {
-	n.mu.Lock()
+	n.mu.RLock()
 	registration := n.names[name]
 	if registration == nil {
-		n.mu.Unlock()
+		n.mu.RUnlock()
 		return "", fmt.Errorf("plain fabric: logical address %q is not listening", name)
 	}
 	if registration.address != "" {
 		address := registration.address
-		n.mu.Unlock()
+		n.mu.RUnlock()
 		return address, nil
 	}
-	registration.waiters++
-	n.mu.Unlock()
+	n.mu.RUnlock()
 
 	timer := time.NewTimer(logicalRegistrationWait)
 	defer timer.Stop()
@@ -226,25 +253,26 @@ func (n *Network) resolveName(ctx context.Context, name string) (string, error) 
 	select {
 	case <-registration.ready:
 	case <-ctx.Done():
-		waitErr = ctx.Err()
+		waitErr = fmt.Errorf("plain fabric: logical address %q registration wait: %w", name, ctx.Err())
 	case <-timer.C:
-		waitErr = fmt.Errorf("logical address %q is not listening", name)
+		waitErr = &LogicalRegistrationTimeoutError{Address: name, Timeout: logicalRegistrationWait}
 	}
 
-	n.mu.Lock()
+	n.mu.RLock()
 	address, registrationErr := registration.address, registration.err
-	registration.waiters--
-	n.mu.Unlock()
-	if waitErr != nil {
-		return "", fmt.Errorf("plain fabric: %w", waitErr)
+	n.mu.RUnlock()
+	// Publication is authoritative even if cancellation or the ceiling became
+	// selectable in the same scheduler turn as ready.
+	if address != "" {
+		return address, nil
 	}
 	if registrationErr != nil {
 		return "", fmt.Errorf("plain fabric: logical address %q failed to listen: %w", name, registrationErr)
 	}
-	if address == "" {
-		return "", fmt.Errorf("plain fabric: logical address %q is not listening", name)
+	if waitErr != nil {
+		return "", waitErr
 	}
-	return address, nil
+	return "", fmt.Errorf("plain fabric: logical address %q is not listening", name)
 }
 
 func (n *Network) registerPeer(address string, identity fabric.Identity) error {

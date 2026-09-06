@@ -3,11 +3,14 @@ package plain
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,16 +84,12 @@ func TestDialWaitsForConcurrentLogicalListenerRegistration(t *testing.T) {
 	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
 	bindStarted := make(chan struct{})
 	releaseBind := make(chan struct{})
-	network.listenFn = func(network, address string) (net.Listener, error) {
+	network.setListenFuncForTest(func(network, address string) (net.Listener, error) {
 		close(bindStarted)
 		<-releaseBind
 		return net.Listen(network, address)
-	}
+	})
 
-	type listenResult struct {
-		listener net.Listener
-		err      error
-	}
 	listening := make(chan listenResult, 1)
 	go func() {
 		listener, err := server.Listen("tcp", "wefty://run-ledger")
@@ -100,37 +99,26 @@ func TestDialWaitsForConcurrentLogicalListenerRegistration(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
+	observedContext := &doneObservedContext{Context: ctx, observed: make(chan struct{})}
 	type dialResult struct {
 		connection net.Conn
 		err        error
 	}
 	dialed := make(chan dialResult, 1)
 	go func() {
-		connection, err := client.Dial(ctx, "tcp", "wefty://run-ledger")
+		connection, err := client.Dial(observedContext, "tcp", "wefty://run-ledger")
 		dialed <- dialResult{connection: connection, err: err}
 	}()
-	deadline := time.NewTimer(time.Second)
-	defer deadline.Stop()
-	for {
-		select {
-		case result := <-dialed:
-			close(releaseBind)
-			t.Fatalf("Dial() returned before listener registration completed: %v", result.err)
-		case <-deadline.C:
-			close(releaseBind)
-			t.Fatal("Dial() did not observe the in-progress listener registration")
-		default:
-		}
-		network.mu.RLock()
-		registration := network.names["wefty://run-ledger"]
-		waiting := registration != nil && registration.waiters > 0
-		network.mu.RUnlock()
-		if waiting {
-			close(releaseBind)
-			break
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case result := <-dialed:
+		close(releaseBind)
+		t.Fatalf("Dial() returned before listener registration completed: %v", result.err)
+	case <-observedContext.observed:
+	case <-ctx.Done():
+		close(releaseBind)
+		t.Fatal("Dial() did not enter the logical registration wait")
 	}
+	close(releaseBind)
 
 	listen := <-listening
 	if listen.err != nil {
@@ -144,6 +132,194 @@ func TestDialWaitsForConcurrentLogicalListenerRegistration(t *testing.T) {
 	connection := result.connection
 	defer connection.Close()
 }
+
+func TestDialOfNeverRegisteredLogicalNameFailsImmediately(t *testing.T) {
+	client := NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	started := time.Now()
+	_, err := client.Dial(t.Context(), "tcp", "wefty://run-ledger")
+	elapsed := time.Since(started)
+	if err == nil || !strings.Contains(err.Error(), `logical address "wefty://run-ledger" is not listening`) {
+		t.Fatalf("Dial() error = %v, want not-listening error", err)
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("Dial() of never-registered name took %s, want immediate failure under 100ms", elapsed)
+	}
+}
+
+func TestLogicalListenerBindFailureReleasesClaim(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	bindStarted := make(chan struct{})
+	releaseBind := make(chan struct{})
+	releaseOnce := sync.Once{}
+	release := func() { releaseOnce.Do(func() { close(releaseBind) }) }
+	defer release()
+	bindErr := errors.New("injected bind failure")
+	network.setListenFuncForTest(func(_, _ string) (net.Listener, error) {
+		close(bindStarted)
+		<-releaseBind
+		return nil, bindErr
+	})
+
+	listening := make(chan error, 1)
+	go func() {
+		_, err := server.Listen("tcp", "wefty://run-ledger")
+		listening <- err
+	}()
+	<-bindStarted
+	observedContext := &doneObservedContext{Context: t.Context(), observed: make(chan struct{})}
+	dialed := make(chan error, 1)
+	go func() {
+		_, err := client.Dial(observedContext, "tcp", "wefty://run-ledger")
+		dialed <- err
+	}()
+	select {
+	case <-observedContext.observed:
+	case <-time.After(time.Second):
+		t.Fatal("Dial() did not enter the logical registration wait")
+	}
+	release()
+	if err := <-listening; !errors.Is(err, bindErr) {
+		t.Fatalf("Listen() error = %v, want %v", err, bindErr)
+	}
+	if err := <-dialed; !errors.Is(err, bindErr) {
+		t.Fatalf("Dial() error = %v, want bind failure", err)
+	}
+
+	network.setListenFuncForTest(nil)
+	replacement, err := server.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatalf("Listen() after bind failure = %v", err)
+	}
+	defer replacement.Close()
+}
+
+func TestDialCancellationWhileLogicalListenerRegisters(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	bindStarted := make(chan struct{})
+	releaseBind := make(chan struct{})
+	network.setListenFuncForTest(func(network, address string) (net.Listener, error) {
+		close(bindStarted)
+		<-releaseBind
+		return net.Listen(network, address)
+	})
+
+	listening := make(chan listenResult, 1)
+	go func() {
+		listener, err := server.Listen("tcp", "wefty://run-ledger")
+		listening <- listenResult{listener: listener, err: err}
+	}()
+	<-bindStarted
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := client.Dial(ctx, "tcp", "wefty://run-ledger"); !errors.Is(err, context.Canceled) {
+		close(releaseBind)
+		t.Fatalf("Dial() error = %v, want context canceled", err)
+	}
+	close(releaseBind)
+	result := <-listening
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	defer result.listener.Close()
+}
+
+func TestDialTimesOutWhenLogicalRegistrationDoesNotComplete(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	bindStarted := make(chan struct{})
+	releaseBind := make(chan struct{})
+	network.setListenFuncForTest(func(network, address string) (net.Listener, error) {
+		close(bindStarted)
+		<-releaseBind
+		return net.Listen(network, address)
+	})
+
+	listening := make(chan listenResult, 1)
+	go func() {
+		listener, err := server.Listen("tcp", "wefty://run-ledger")
+		listening <- listenResult{listener: listener, err: err}
+	}()
+	<-bindStarted
+	started := time.Now()
+	_, err := client.Dial(t.Context(), "tcp", "wefty://run-ledger")
+	elapsed := time.Since(started)
+	var timeoutErr *LogicalRegistrationTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		close(releaseBind)
+		t.Fatalf("Dial() error = %v, want *LogicalRegistrationTimeoutError", err)
+	}
+	if timeoutErr.Address != "wefty://run-ledger" || timeoutErr.Timeout != logicalRegistrationWait {
+		close(releaseBind)
+		t.Fatalf("timeout error = %#v", timeoutErr)
+	}
+	if elapsed < logicalRegistrationWait {
+		close(releaseBind)
+		t.Fatalf("Dial() returned after %s, before %s ceiling", elapsed, logicalRegistrationWait)
+	}
+	close(releaseBind)
+	result := <-listening
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	defer result.listener.Close()
+}
+
+func TestResolveNamePrefersAddressPublishedAsWaitEnds(t *testing.T) {
+	network := NewNetwork()
+	registration := &nameRegistration{ready: make(chan struct{})}
+	network.names["wefty://run-ledger"] = registration
+	ctx := &publishOnDoneContext{
+		Context: context.Background(),
+		publish: func() {
+			network.mu.Lock()
+			registration.address = "127.0.0.1:1234"
+			network.mu.Unlock()
+		},
+	}
+	address, err := network.resolveName(ctx, "wefty://run-ledger")
+	if err != nil || address != "127.0.0.1:1234" {
+		t.Fatalf("resolveName() = %q, %v, want published address", address, err)
+	}
+}
+
+type listenResult struct {
+	listener net.Listener
+	err      error
+}
+
+type doneObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *doneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
+type publishOnDoneContext struct {
+	context.Context
+	publish func()
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (c *publishOnDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() {
+		c.publish()
+		c.done = make(chan struct{})
+		close(c.done)
+	})
+	return c.done
+}
+
+func (*publishOnDoneContext) Err() error { return context.DeadlineExceeded }
 
 func TestLogicalListenerTeardownPreservesCurrentOwner(t *testing.T) {
 	network := NewNetwork()
@@ -175,6 +351,69 @@ func TestLogicalListenerTeardownPreservesCurrentOwner(t *testing.T) {
 		t.Fatalf("Dial() after stale listener teardown = %v", err)
 	}
 	defer connection.Close()
+}
+
+func TestConcurrentCloseAllowsReplacementListenerToStayDialable(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	listenCalls := 0
+	network.setListenFuncForTest(func(network, address string) (net.Listener, error) {
+		underlying, err := net.Listen(network, address)
+		if err != nil {
+			return nil, err
+		}
+		listenCalls++
+		if listenCalls == 1 {
+			return &closeBlockedListener{Listener: underlying, started: closeStarted, release: releaseClose}, nil
+		}
+		return underlying, nil
+	})
+
+	first, err := server.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- first.Close() }()
+	<-closeStarted
+
+	replacement, err := server.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		close(releaseClose)
+		t.Fatalf("replacement Listen() during prior Close() = %v", err)
+	}
+	defer replacement.Close()
+	connection, err := client.Dial(t.Context(), "tcp", "wefty://run-ledger")
+	if err != nil {
+		close(releaseClose)
+		t.Fatalf("Dial() to replacement during prior Close() = %v", err)
+	}
+	_ = connection.Close()
+
+	close(releaseClose)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	connection, err = client.Dial(t.Context(), "tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatalf("Dial() after prior Close() completed = %v", err)
+	}
+	_ = connection.Close()
+}
+
+type closeBlockedListener struct {
+	net.Listener
+	started chan struct{}
+	release chan struct{}
+}
+
+func (l *closeBlockedListener) Close() error {
+	close(l.started)
+	<-l.release
+	return l.Listener.Close()
 }
 
 func TestExplicitFabricIDJoinsSeparateProcessNetworks(t *testing.T) {
