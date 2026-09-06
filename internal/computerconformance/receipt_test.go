@@ -93,6 +93,9 @@ func TestUnknownCheckAndStatusFailClosed(t *testing.T) {
 	if err := recorder.Record(CheckCatalog[0].ID, Status("UNKNOWN"), ""); err == nil {
 		t.Fatal("unknown status was accepted")
 	}
+	if err := recorder.RecordFailure(CheckCatalog[0].ID, StatusFail, "late", FailureReadinessTimeout, ReadinessEvent("eventually")); err == nil {
+		t.Fatal("unknown readiness event was accepted")
+	}
 	if Aggregate([]Check{{Status: Status("UNKNOWN")}}) != StatusFail {
 		t.Fatal("unknown aggregate status did not fail closed")
 	}

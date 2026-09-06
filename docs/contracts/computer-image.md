@@ -391,6 +391,22 @@ cgroup/OOM/swap read-backs remain explicit `NOT-RUN` cells with the stable
 reason `harness profile is not the containerd wefty-v1 profile`; native
 containerd acceptance owns those assertions.
 
+Every `FAIL` cell also carries a machine-readable `failure_reason`:
+`mutation_detected`, `readiness_timeout`, or `assertion_failed`. A readiness
+timeout names the exact missing `readiness_event`, such as endpoint readiness,
+the first RFB frame, or key-observer advancement. The broken-image matrix may
+retain unrelated `readiness_timeout` cells only after its exact expected cell
+is present with `mutation_detected` and the expected detail. An absent expected
+cell or any extra `assertion_failed` cell remains a fail-set failure; the
+positive reference-image run never ignores a readiness timeout.
+
+The emulated arm64 input-event observation window is derived from that
+container's observed first-boot endpoint readiness, with one additional full
+startup interval for the dependent event to arrive. amd64 polling remains
+unchanged. TCP acceptance before the first RFB frame is an incomplete
+readiness event, not proof that plain TCP or non-upgrade HTTP was accepted;
+an observed non-upgrade HTTP response remains a protocol failure.
+
 Checker teardown asks Docker to stop the container and then removes it so every
 bind mount is detached before the checker-owned temporary root is removed. The
 pre-stop in-container chmod can race a desktop process creating a later path;

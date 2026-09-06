@@ -91,6 +91,7 @@ type runtimeRunner struct {
 	containerID                              string
 	containerLeftoverConfirmed               bool
 	viewPort, controlPort, attempt           int
+	firstBootReadiness                       time.Duration
 	tools                                    map[string]bool
 	failed                                   bool
 	readDriverObservationHook                func(context.Context) (driverObservation, error)
@@ -215,6 +216,29 @@ func (r *runtimeRunner) mutationFailed() bool {
 	return r.config.MutationProfile != "" && r.failed
 }
 
+var mutationFailureCells = map[string]string{
+	"missing-control-endpoint":        "transport.control-ready",
+	"missing-view-endpoint":           "transport.view-ready",
+	"duplicate-endpoint":              "endpoints.distinct",
+	"plain-tcp-control":               "transport.plain-tcp-rejected",
+	"view-accepts-input":              "input.view-isolated",
+	"text-frames-accepted":            "transport.text-frame-rejected",
+	"driver-json-ignored":             "driver.true-consumed",
+	"malformed-driver-accepted":       "driver.malformed-fails-closed",
+	"unknown-driver-version-accepted": "driver.unknown-version-fails-closed",
+	"writable-driver":                 "driver.read-only",
+	"reserved-env-shadowed":           "environment.view-port",
+	"forbidden-privilege":             "harness.forbidden-privilege",
+	"readiness-over-60s":              "readiness.before-deadline",
+	"shm-too-small":                   "harness.shm-size",
+	"writable-rootfs":                 "harness.rootfs-read-only",
+	"view-wildcard-bind":              "endpoints.view-loopback",
+	"control-wildcard-bind":           "endpoints.control-loopback",
+	"profile-state-lost":              "persistence.profile-survives",
+	"sign-in-state-lost":              "persistence.sign-in-survives",
+	"edge-does-not-recover":           "persistence.edge-recovers",
+}
+
 func (r *runtimeRunner) withStartupLogs(ctx context.Context, readinessErr error) error {
 	// A readiness receipt deliberately records only contract assertions, but an
 	// operator still needs the tenant's bounded startup diagnostics to repair an
@@ -326,7 +350,11 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 			r.record("transport.control-ready", StatusPass, "binary RFB greeting observed")
 			r.record("transport.plain-tcp-rejected", StatusPass, "both endpoints required the exact WebSocket upgrade")
 			r.record("readiness.before-deadline", StatusPass, "both exact endpoints became ready before t0 + 60s")
-			r.recorder.RecordReadiness(restart, r.config.Now().Sub(startedAt))
+			readiness := r.config.Now().Sub(startedAt)
+			r.recorder.RecordReadiness(restart, readiness)
+			if !restart {
+				r.firstBootReadiness = readiness
+			}
 			return nil
 		}
 		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= missingEndpointObservationWindow {
@@ -348,7 +376,7 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 		return errors.New("Computer startup readiness timeout")
 	}
 	if !viewReady {
-		r.record("transport.view-ready", StatusFail, "view never completed rfb-websocket-v1")
+		r.recordReadinessTimeout("transport.view-ready", "view never completed rfb-websocket-v1", ReadinessEventViewEndpointReady)
 		if viewProbeErr != nil {
 			return fmt.Errorf("view endpoint readiness timeout: %w", viewProbeErr)
 		}
@@ -356,7 +384,7 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 	}
 	r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
 	if !controlReady {
-		r.record("transport.control-ready", StatusFail, "control never completed rfb-websocket-v1")
+		r.recordReadinessTimeout("transport.control-ready", "control never completed rfb-websocket-v1", ReadinessEventControlEndpointReady)
 		if controlProbeErr != nil {
 			return fmt.Errorf("control endpoint readiness timeout: %w", controlProbeErr)
 		}
@@ -373,12 +401,8 @@ func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool
 		connection.close()
 		return true, plainSeen, nil
 	}
-	dialer := net.Dialer{Timeout: 250 * time.Millisecond}
-	tcp, tcpErr := dialer.DialContext(probeCtx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	if tcpErr == nil {
-		plainSeen = true
-		_ = tcp.Close()
-	}
+	var rejected *rfbUpgradeRejectedError
+	plainSeen = plainSeen || errors.As(err, &rejected)
 	return false, plainSeen, err
 }
 
@@ -826,6 +850,27 @@ func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inp
 	// wayvnc can create a new client's virtual keyboard after its first RFB
 	// messages arrive. Reuse that established client while proving liveness so
 	// a cold-start discard cannot look like a dead guest observer.
+	if budget, dynamic := r.readinessEventObservationBudget(); dynamic {
+		deadline := r.config.Now().Add(budget)
+		for dispatch := 0; r.config.Now().Before(deadline); dispatch++ {
+			for poll := 0; poll < 4 && r.config.Now().Before(deadline); poll++ {
+				value, err := r.readInputObservation(ctx)
+				if err == nil {
+					last = value
+					if inputObserverAdvanced(before, value) {
+						return value, true
+					}
+				}
+				if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+					return last, false
+				}
+			}
+			if r.config.Now().Before(deadline) && session.SendKey() != nil {
+				return last, false
+			}
+		}
+		return last, false
+	}
 	for dispatch := 0; dispatch < 3; dispatch++ {
 		for poll := 0; poll < 4; poll++ {
 			value, err := r.readInputObservation(ctx)
@@ -844,6 +889,17 @@ func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inp
 		}
 	}
 	return last, false
+}
+
+func (r *runtimeRunner) readinessEventObservationBudget() (time.Duration, bool) {
+	if r.config.Platform != "linux/arm64" || r.firstBootReadiness <= 0 {
+		return 0, false
+	}
+	// The current arm64/QEMU run supplies the measurement. Two observed startup
+	// intervals give an event that lags endpoint publication one full startup
+	// cycle to arrive, without changing native/amd64 polling or using a fixed
+	// emulation timeout.
+	return 2 * r.firstBootReadiness, true
 }
 
 func (r *runtimeRunner) sendControlInput(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
@@ -906,13 +962,13 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 			if observerSession != nil {
 				observerSession.Close()
 			}
-			r.record(id, StatusFail, "key observer liveness control keystroke could not be sent")
+			r.recordReadinessTimeout(id, "key observer liveness control keystroke could not be sent", ReadinessEventKeyObserverAdvanced)
 			return false
 		}
 		observer, observerLive := r.waitInputObserverAdvance(ctx, before, observerSession)
 		observerSession.Close()
 		if !observerLive {
-			r.record(id, StatusFail, fmt.Sprintf("key observer did not advance after the control liveness keystroke (key_events=%d observer_lines=%d)", observer.KeyEvents, inputObserverLines(observer)))
+			r.recordReadinessTimeout(id, fmt.Sprintf("key observer did not advance after the control liveness keystroke (key_events=%d observer_lines=%d)", observer.KeyEvents, inputObserverLines(observer)), ReadinessEventKeyObserverAdvanced)
 			return false
 		}
 		before = observer
@@ -989,7 +1045,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		return
 	}
 	if !r.waitInputReady(ctx) {
-		r.record(ids[0], StatusFail, "guest input observer did not become ready")
+		r.recordReadinessTimeout(ids[0], "guest input observer did not become ready", ReadinessEventInputOracleReady)
 		return
 	}
 	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
@@ -1267,11 +1323,28 @@ func errWithOutput(err error, output commandResult) error {
 	return fmt.Errorf("%w: %s", err, strings.TrimSpace(output.stderr))
 }
 func (r *runtimeRunner) record(id string, status Status, detail string) {
-	if err := r.recorder.Record(id, status, detail); err != nil {
+	reason := FailureReason("")
+	if status == StatusFail {
+		reason = FailureAssertionFailed
+		if mutationFailureCells[r.config.MutationProfile] == id {
+			reason = FailureMutationDetected
+		}
+	}
+	if err := r.recorder.RecordFailure(id, status, detail, reason, ""); err != nil {
 		panic(err)
 	}
 	if status == StatusFail {
 		r.failed = true
+	}
+}
+
+func (r *runtimeRunner) recordReadinessTimeout(id, detail string, event ReadinessEvent) {
+	if mutationFailureCells[r.config.MutationProfile] == id {
+		r.record(id, StatusFail, detail)
+		return
+	}
+	if err := r.recorder.RecordFailure(id, StatusFail, detail, FailureReadinessTimeout, event); err != nil {
+		panic(err)
 	}
 }
 

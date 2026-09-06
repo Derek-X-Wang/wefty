@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -97,6 +99,177 @@ func TestMutationFailureStopsAfterOwningCell(t *testing.T) {
 	if !runner.mutationFailed() {
 		t.Fatal("mutation continued after its first failed assertion")
 	}
+}
+
+func TestMutationReadinessTimeoutContinuesUntilOwningCell(t *testing.T) {
+	runner := runtimeRunner{
+		config:   RuntimeConfig{MutationProfile: "edge-does-not-recover"},
+		recorder: NewRecorder("broken", "docker", "linux/arm64", time.Unix(100, 0)),
+	}
+	runner.recordReadinessTimeout("input.view-isolated-during-tenure", "key observer did not advance", ReadinessEventKeyObserverAdvanced)
+	if runner.mutationFailed() {
+		t.Fatal("typed readiness timeout short-circuited the mutation before its owning cell")
+	}
+	runner.record("persistence.edge-recovers", StatusFail, "both endpoints did not recover after edge withdrawal")
+	if !runner.mutationFailed() {
+		t.Fatal("owning mutation cell did not stop the broken-image row")
+	}
+
+	receipt := runner.recorder.Finish(time.Unix(101, 0))
+	assertion := func(id string) Check {
+		t.Helper()
+		for _, check := range receipt.Checks {
+			if check.ID == id {
+				return check
+			}
+		}
+		t.Fatalf("missing receipt check %q", id)
+		return Check{}
+	}
+	if got := assertion("input.view-isolated-during-tenure"); got.FailureReason != FailureReadinessTimeout || got.ReadinessEvent != ReadinessEventKeyObserverAdvanced {
+		t.Fatalf("readiness timeout evidence = %+v", got)
+	}
+	if got := assertion("persistence.edge-recovers"); got.FailureReason != FailureMutationDetected || got.ReadinessEvent != "" {
+		t.Fatalf("mutation evidence = %+v", got)
+	}
+}
+
+func TestMutationUnrelatedAssertionStillStopsFailClosed(t *testing.T) {
+	runner := runtimeRunner{
+		config:   RuntimeConfig{MutationProfile: "profile-state-lost"},
+		recorder: NewRecorder("broken", "docker", "linux/arm64", time.Unix(100, 0)),
+	}
+	runner.record("harness.rootfs-read-only", StatusFail, "write failed with EACCES, not EROFS")
+	if !runner.mutationFailed() {
+		t.Fatal("unrelated assertion failure did not stop the mutation row")
+	}
+	for _, check := range runner.recorder.Finish(time.Unix(101, 0)).Checks {
+		if check.ID == "harness.rootfs-read-only" && check.FailureReason != FailureAssertionFailed {
+			t.Fatalf("unrelated failure reason = %q", check.FailureReason)
+		}
+	}
+}
+
+func TestArm64ReadinessEventBudgetTracksObservedStartupWithoutChangingAMD64(t *testing.T) {
+	const measuredArm64Startup = 9*time.Second + 293967534*time.Nanosecond
+	arm64 := runtimeRunner{
+		config:             RuntimeConfig{Platform: "linux/arm64"},
+		firstBootReadiness: measuredArm64Startup,
+	}
+	if got, dynamic := arm64.readinessEventObservationBudget(); !dynamic || got != 2*measuredArm64Startup {
+		t.Fatalf("arm64 readiness-event budget = %s, %t; want %s, true", got, dynamic, 2*measuredArm64Startup)
+	}
+	amd64 := runtimeRunner{
+		config:             RuntimeConfig{Platform: "linux/amd64"},
+		firstBootReadiness: measuredArm64Startup,
+	}
+	if got, dynamic := amd64.readinessEventObservationBudget(); dynamic || got != 0 {
+		t.Fatalf("amd64 readiness-event budget = %s, %t; want unchanged fixed polling", got, dynamic)
+	}
+}
+
+func TestArm64KeyObserverWaitUsesMeasuredEventBudget(t *testing.T) {
+	before := inputObservation{KeyEvents: 2}
+	run := func(platform string) (bool, int) {
+		t.Helper()
+		clock := time.Unix(100, 0)
+		reads := 0
+		runner := runtimeRunner{
+			config: RuntimeConfig{
+				Platform:        platform,
+				InputOraclePath: "/oracle",
+				Now:             func() time.Time { return clock },
+				Sleep: func(_ context.Context, duration time.Duration) error {
+					clock = clock.Add(duration)
+					return nil
+				},
+			},
+			firstBootReadiness: time.Second,
+		}
+		runner.runCommandHook = func(context.Context, ...string) (commandResult, error) {
+			reads++
+			if reads == 13 {
+				return commandResult{stdout: `{"version":1,"generation":0,"key_events":3,"x":0,"y":0,"pointer_history":[]}`}, nil
+			}
+			return commandResult{stdout: `{"version":1,"generation":0,"key_events":2,"x":0,"y":0,"pointer_history":[]}`}, nil
+		}
+		client, server := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, server)
+			_ = server.Close()
+			close(done)
+		}()
+		session := &InputSession{connection: &websocketConnection{connection: client}}
+		_, observed := runner.waitInputObserverAdvance(context.Background(), before, session)
+		session.Close()
+		<-done
+		return observed, reads
+	}
+
+	if observed, reads := run("linux/arm64"); !observed || reads != 13 {
+		t.Fatalf("arm64 observed=%t reads=%d, want true after the legacy 12 polls", observed, reads)
+	}
+	if observed, reads := run("linux/amd64"); observed || reads != 12 {
+		t.Fatalf("amd64 observed=%t reads=%d, want unchanged 12-poll behavior", observed, reads)
+	}
+}
+
+func TestReadinessProbeDoesNotCallFirstFrameDelayPlainTCP(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for accepted := 0; accepted < 2; accepted++ {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			if accepted == 0 {
+				_, _ = fmt.Fprintf(connection, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\nSec-WebSocket-Protocol: %s\r\n\r\n", expectedWebSocketAccept(), contract.ComputerDisplayWebSocketSubprotocol)
+			}
+			_ = connection.Close()
+		}
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ready, plainTCP, err := (&runtimeRunner{}).probeReady(ctx, port, false)
+	if ready || plainTCP || err == nil {
+		t.Fatalf("first-frame delay probe = ready %t plain-tcp %t err %v", ready, plainTCP, err)
+	}
+	_ = listener.Close()
+	<-done
+}
+
+func TestReadinessProbeStillCallsNonUpgradeHTTPPlainTCP(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		_, _ = fmt.Fprint(connection, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+		_ = connection.Close()
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ready, plainTCP, err := (&runtimeRunner{}).probeReady(ctx, port, false)
+	if ready || !plainTCP || err == nil {
+		t.Fatalf("non-upgrade HTTP probe = ready %t plain-tcp %t err %v", ready, plainTCP, err)
+	}
+	<-done
 }
 
 func TestConformantSubjectNeverUsesMutationShortCircuit(t *testing.T) {

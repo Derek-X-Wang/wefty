@@ -13,7 +13,24 @@ require_receipt() {
     return 1
   fi
   if ! jq -e '
-    type == "object" and .version == 2 and (.checks | type == "array") and
+    type == "object" and .version == 2 and
+    (.checks | type == "array" and all(.[];
+      type == "object" and (.id | type == "string") and
+      (.status == "PASS" or .status == "FAIL" or .status == "NOT-RUN") and
+      ((.detail // "") | type == "string") and
+      if .status == "FAIL" then
+        (.failure_reason == "assertion_failed" or .failure_reason == "mutation_detected" or .failure_reason == "readiness_timeout") and
+        if .failure_reason == "readiness_timeout" then
+          (.readiness_event == "input_oracle_ready" or .readiness_event == "key_observer_advanced" or
+           .readiness_event == "view_endpoint_ready" or .readiness_event == "control_endpoint_ready" or
+           .readiness_event == "first_rfb_frame")
+        else
+          has("readiness_event") | not
+        end
+      else
+        (has("failure_reason") | not) and (has("readiness_event") | not)
+      end
+    )) and
     (.teardown | type == "object") and
     (.teardown.retries_used | type == "number" and . >= 0 and floor == .) and
     (.teardown.permission_repair_performed | type == "boolean") and
@@ -78,12 +95,22 @@ case ${1:-} in
     fi
     if ! jq -e --arg cell "$cell" --arg detail "$detail" '
       [.checks[] | select(.status == "FAIL")] as $failed |
-      ($failed | length) == 1 and $failed[0].id == $cell and $failed[0].detail == $detail
+      [$failed[] | select(.id == $cell and .detail == $detail and .failure_reason == "mutation_detected")] as $mutation |
+      [$failed[] | select(.id != $cell or .detail != $detail) | select(.failure_reason != "readiness_timeout" or ((.readiness_event // "") | length) == 0)] as $unrelated |
+      ($mutation | length) == 1 and ($unrelated | length) == 0
     ' "$receipt" >/dev/null; then
       error "fail-set/$mutation" "unexpected FAIL rows after ${checker_wall_seconds}s checker wall time; expected exactly $cell"
-      jq -c '[.checks[] | select(.status == "FAIL") | {id,detail}]' "$receipt" >&2 || \
+      jq -c '[.checks[] | select(.status == "FAIL") | {id,detail,failure_reason,readiness_event}]' "$receipt" >&2 || \
         error "receipt-jq/$mutation" 'could not render unexpected FAIL rows'
       exit 1
+    fi
+    readiness_timeouts=$(jq -c '[.checks[] | select(.status == "FAIL" and .failure_reason == "readiness_timeout") | {id,readiness_event}]' "$receipt") || {
+      error "receipt-jq/$mutation" 'could not render readiness timeout rows'
+      exit 1
+    }
+    if [[ $readiness_timeouts != '[]' ]]; then
+      printf '::notice title=computer runtime conformance::readiness-timeout/%s: mutation detected with unrelated typed readiness rows %s\n' \
+        "$mutation" "$readiness_timeouts" >&2
     fi
     ;;
   summary)

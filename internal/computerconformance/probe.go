@@ -27,6 +27,14 @@ type websocketConnection struct {
 	banner     []byte
 }
 
+type rfbUpgradeRejectedError struct {
+	status string
+}
+
+func (e *rfbUpgradeRejectedError) Error() string {
+	return "upgrade failed: " + e.status
+}
+
 func dialWebSocket(ctx context.Context, port int, path string, protocol *string) (*websocketConnection, string, textproto.MIMEHeader, error) {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	connection, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
@@ -128,7 +136,8 @@ func OpenRFB(ctx context.Context, port int, path string) (*websocketConnection, 
 		return nil, fmt.Errorf(format, args...)
 	}
 	if !strings.HasPrefix(status, "HTTP/1.1 101 ") {
-		return fail("upgrade failed: %s", status)
+		connection.close()
+		return nil, &rfbUpgradeRejectedError{status: status}
 	}
 	if headers.Get("Sec-WebSocket-Accept") != expectedWebSocketAccept() {
 		return fail("invalid Sec-WebSocket-Accept")

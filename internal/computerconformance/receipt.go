@@ -28,12 +28,32 @@ const (
 	ScopeProfile Scope = "containerd-profile"
 )
 
+type FailureReason string
+
+const (
+	FailureAssertionFailed  FailureReason = "assertion_failed"
+	FailureMutationDetected FailureReason = "mutation_detected"
+	FailureReadinessTimeout FailureReason = "readiness_timeout"
+)
+
+type ReadinessEvent string
+
+const (
+	ReadinessEventInputOracleReady     ReadinessEvent = "input_oracle_ready"
+	ReadinessEventKeyObserverAdvanced  ReadinessEvent = "key_observer_advanced"
+	ReadinessEventViewEndpointReady    ReadinessEvent = "view_endpoint_ready"
+	ReadinessEventControlEndpointReady ReadinessEvent = "control_endpoint_ready"
+	ReadinessEventFirstRFBFrame        ReadinessEvent = "first_rfb_frame"
+)
+
 type Check struct {
-	ID      string `json:"id"`
-	Scope   Scope  `json:"scope"`
-	Status  Status `json:"status"`
-	Summary string `json:"summary"`
-	Detail  string `json:"detail,omitempty"`
+	ID             string         `json:"id"`
+	Scope          Scope          `json:"scope"`
+	Status         Status         `json:"status"`
+	Summary        string         `json:"summary"`
+	Detail         string         `json:"detail,omitempty"`
+	FailureReason  FailureReason  `json:"failure_reason,omitempty"`
+	ReadinessEvent ReadinessEvent `json:"readiness_event,omitempty"`
 }
 
 type Receipt struct {
@@ -129,15 +149,47 @@ func NewRecorder(image, runtimeName, platform string, startedAt time.Time) *Reco
 }
 
 func (r *Recorder) Record(id string, status Status, detail string) error {
+	reason := FailureReason("")
+	if status == StatusFail {
+		reason = FailureAssertionFailed
+	}
+	return r.RecordFailure(id, status, detail, reason, "")
+}
+
+func (r *Recorder) RecordFailure(id string, status Status, detail string, reason FailureReason, event ReadinessEvent) error {
 	if status != StatusPass && status != StatusFail && status != StatusNotRun {
 		return fmt.Errorf("invalid conformance status %q", status)
+	}
+	if status == StatusFail {
+		if reason != FailureAssertionFailed && reason != FailureMutationDetected && reason != FailureReadinessTimeout {
+			return fmt.Errorf("invalid conformance failure reason %q", reason)
+		}
+		if reason == FailureReadinessTimeout && !validReadinessEvent(event) {
+			return fmt.Errorf("readiness timeout for %q has invalid event %q", id, event)
+		}
+	} else if reason != "" || event != "" {
+		return fmt.Errorf("non-FAIL conformance check %q cannot carry failure evidence", id)
 	}
 	i, ok := r.index[id]
 	if !ok {
 		return fmt.Errorf("unknown Computer conformance check %q", id)
 	}
 	r.receipt.Checks[i].Status, r.receipt.Checks[i].Detail = status, detail
+	r.receipt.Checks[i].FailureReason, r.receipt.Checks[i].ReadinessEvent = reason, event
 	return nil
+}
+
+func validReadinessEvent(event ReadinessEvent) bool {
+	switch event {
+	case ReadinessEventInputOracleReady,
+		ReadinessEventKeyObserverAdvanced,
+		ReadinessEventViewEndpointReady,
+		ReadinessEventControlEndpointReady,
+		ReadinessEventFirstRFBFrame:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Recorder) Finish(finishedAt time.Time) Receipt {
