@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1000,7 +1001,7 @@ func TestComputerDiskSweepQuarantinesMissingManifestAfterOperationalDeferral(t *
 	}
 }
 
-func TestComputerDiskSweepSurfacesUnreadableDeferralWhenManifestIsMissing(t *testing.T) {
+func TestComputerDiskSweepPreservesReadablePrimaryDeferralWhenManifestIsMissing(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("permission-denial recovery proof requires the non-root helper test lane")
 	}
@@ -1040,14 +1041,222 @@ func TestComputerDiskSweepSurfacesUnreadableDeferralWhenManifestIsMissing(t *tes
 		t.Fatal(err)
 	}
 	if !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(item ComputerStorageRecoveryInventoryEntry) bool {
-		return item.DiskName == name && item.Reason == "manifest_missing" && item.DeferredReason == "deferral_record_unreadable"
+		return item.DiskName == name && item.Reason == "manifest_missing" && item.DeferredReason == "operational_failure" &&
+			item.Storage == storage && item.Attempts == 1 && item.FirstDeferredAt.Equal(now)
 	}) {
-		t.Fatalf("missing-manifest quarantine lost unreadable deferral classification: %+v", inventory.ComputerStorageQuarantined)
+		t.Fatalf("missing-manifest quarantine lost readable primary deferral evidence: %+v", inventory.ComputerStorageQuarantined)
 	}
 	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-		return item.ID == name && item.Method == "manifest_missing:deferral_record_unreadable"
+		return item.ID == name && item.Method == "manifest_missing"
 	}) {
-		t.Fatalf("missing-manifest sweep evidence lost unreadable deferral: %+v", engine.computerDiskSweepEvidence)
+		t.Fatalf("missing-manifest sweep evidence lost readable primary deferral: %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestComputerDiskSweepQuarantinesForeignDeferralRecordWhenManifestIsMissing(t *testing.T) {
+	root := t.TempDir()
+	targetStorage := testComputerStorage()
+	targetName, _ := deterministicComputerDiskName(targetStorage)
+	foreignStorage := targetStorage
+	foreignStorage.ComputerID = "computer-foreign"
+	foreignStorage.StorageID = "storage-foreign"
+	foreignName, _ := deterministicComputerDiskName(foreignStorage)
+	targetRoot := filepath.Join(root, "computer-disks", targetName)
+	foreignRoot := filepath.Join(root, "computer-disks", foreignName)
+	for _, diskRoot := range []string{targetRoot, foreignRoot} {
+		if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
+	seed.resolveOperationalComputerRecoveryFailure(foreignRoot, foreignName, "computer_disk_manifest", foreignStorage, syscall.EIO, true)
+	foreignRecord, err := os.ReadFile(filepath.Join(foreignRoot, computerOperationalDeferralRecordName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, computerOperationalDeferralRecordName), foreignRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now.Add(time.Minute))}, diskSystem: newFakeComputerDiskSystem()}
+	if err := engine.sweepComputerDisks(t.Context(), "foreign-deferral-record"); err != nil {
+		t.Fatalf("foreign deferral record failed node sweep: %v", err)
+	}
+	var inventory ResourceInventory
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(item ComputerStorageRecoveryInventoryEntry) bool {
+		return item.DiskName == targetName && item.Reason == "deferral_record_identity_mismatch" &&
+			item.Storage == (ComputerStorageReference{})
+	}) {
+		t.Fatalf("foreign deferral record did not quarantine as an authority failure: %+v", inventory.ComputerStorageQuarantined)
+	}
+	if !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(item ComputerStorageRecoveryInventoryEntry) bool {
+		return item.DiskName == foreignName && item.Reason == "manifest_missing" && item.Storage == foreignStorage
+	}) {
+		t.Fatalf("sweep did not continue after foreign deferral record: %+v", inventory.ComputerStorageQuarantined)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == targetName && item.Action == SweepActionQuarantined && item.Method == "deferral_record_identity_mismatch"
+	}) {
+		t.Fatalf("foreign deferral mismatch evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestComputerDiskSweepQuarantinesForeignPrimaryWithValidFallback(t *testing.T) {
+	root := t.TempDir()
+	targetStorage := testComputerStorage()
+	targetName, _ := deterministicComputerDiskName(targetStorage)
+	foreignStorage := targetStorage
+	foreignStorage.ComputerID = "computer-foreign"
+	foreignStorage.StorageID = "storage-foreign"
+	foreignName, _ := deterministicComputerDiskName(foreignStorage)
+	targetRoot := filepath.Join(root, "computer-disks", targetName)
+	foreignRoot := filepath.Join(root, "computer-disks", foreignName)
+	for _, diskRoot := range []string{targetRoot, foreignRoot} {
+		if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
+	seed.resolveOperationalComputerRecoveryFailure(targetRoot, targetName, "computer_disk_manifest", targetStorage, syscall.EIO, true)
+	seed.resolveOperationalComputerRecoveryFailure(foreignRoot, foreignName, "computer_disk_manifest", foreignStorage, syscall.EIO, true)
+	foreignRecord, err := os.ReadFile(filepath.Join(foreignRoot, computerOperationalDeferralRecordName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, computerOperationalDeferralRecordName), foreignRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now.Add(time.Minute))}, diskSystem: newFakeComputerDiskSystem()}
+	if err := engine.sweepComputerDisks(t.Context(), "foreign-primary-valid-fallback"); err != nil {
+		t.Fatalf("foreign primary deferral failed node sweep: %v", err)
+	}
+	var inventory ResourceInventory
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(item ComputerStorageRecoveryInventoryEntry) bool {
+		return item.DiskName == targetName && item.Reason == "deferral_record_identity_mismatch" &&
+			item.Storage == (ComputerStorageReference{})
+	}) {
+		t.Fatalf("foreign primary with valid fallback did not quarantine as an authority failure: %+v", inventory.ComputerStorageQuarantined)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == targetName && item.Action == SweepActionQuarantined && item.Method == "deferral_record_identity_mismatch"
+	}) {
+		t.Fatalf("foreign primary with valid fallback evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestOperationalComputerRecoveryDeferralKeepsIdentityMismatchReason(t *testing.T) {
+	root := t.TempDir()
+	targetStorage := testComputerStorage()
+	targetName, _ := deterministicComputerDiskName(targetStorage)
+	foreignStorage := targetStorage
+	foreignStorage.ComputerID = "computer-foreign"
+	foreignStorage.StorageID = "storage-foreign"
+	foreignName, _ := deterministicComputerDiskName(foreignStorage)
+	targetRoot := filepath.Join(root, "computer-disks", targetName)
+	foreignRoot := filepath.Join(root, "computer-disks", foreignName)
+	for _, diskRoot := range []string{targetRoot, foreignRoot} {
+		if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
+	seed.resolveOperationalComputerRecoveryFailure(targetRoot, targetName, "computer_disk_manifest", targetStorage, syscall.EIO, true)
+	seed.resolveOperationalComputerRecoveryFailure(foreignRoot, foreignName, "computer_disk_manifest", foreignStorage, syscall.EIO, true)
+	foreignRecord, err := os.ReadFile(filepath.Join(foreignRoot, computerOperationalDeferralRecordName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, computerOperationalDeferralRecordName), foreignRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now.Add(time.Minute))}}
+	evidence := engine.resolveOperationalComputerRecoveryFailure(targetRoot, targetName, "computer_disk_image", targetStorage, syscall.EIO, true)
+	if evidence.Method != "computer_disk_image" {
+		t.Fatalf("identity mismatch deferral evidence = %+v", evidence)
+	}
+	fallback, present, err := readOperationalComputerRecoveryDeferralFault(targetRoot, targetName)
+	if err != nil || !present {
+		t.Fatalf("read identity mismatch fallback present=%t err=%v", present, err)
+	}
+	if fallback.Recovery.Reason != "deferral_record_identity_mismatch" {
+		t.Fatalf("identity mismatch fallback reason = %q", fallback.Recovery.Reason)
+	}
+}
+
+func TestComputerDiskSweepSurfacesUnreadableDeferralWhenManifestIsMissing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denial recovery proof requires the non-root helper test lane")
+	}
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
+	seed.resolveOperationalComputerRecoveryFailure(diskRoot, name, "computer_disk_manifest", storage, syscall.EIO, true)
+	primaryPath := filepath.Join(diskRoot, computerOperationalDeferralRecordName)
+	fallbackPath := operationalComputerRecoveryDeferralFaultPath(diskRoot, name)
+	t.Cleanup(func() {
+		_ = os.Chmod(primaryPath, 0o600)
+		_ = os.Chmod(fallbackPath, 0o600)
+	})
+
+	rootInspections := 0
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now.Add(time.Minute))}, diskSystem: newFakeComputerDiskSystem()}
+	engine.computerLstat = func(path string) (os.FileInfo, error) {
+		if path == diskRoot {
+			rootInspections++
+			if rootInspections == 3 {
+				for _, recordPath := range []string{primaryPath, fallbackPath} {
+					if err := os.Chmod(recordPath, 0); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return nil, &os.PathError{Op: "lstat", Path: path, Err: syscall.EIO}
+			}
+		}
+		return os.Lstat(path)
+	}
+	if err := engine.sweepComputerDisks(t.Context(), "missing-manifest-unreadable-deferral"); err != nil {
+		t.Fatalf("unreadable recovery evidence failed node sweep: %v", err)
+	}
+	var inventory ResourceInventory
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(item ComputerStorageRecoveryInventoryEntry) bool {
+		return item.DiskName == name && item.Reason == "manifest_missing" && item.DeferredReason == "deferral_record_unreadable" &&
+			item.Storage == (ComputerStorageReference{}) && item.Attempts == 0 && item.FirstDeferredAt.IsZero()
+	}) {
+		t.Fatalf("both-unreadable deferral evidence was not preserved with zero identity: %+v", inventory.ComputerStorageQuarantined)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "manifest_missing:deferral_record_unreadable"
+	}) {
+		t.Fatalf("both-unreadable deferral sweep evidence = %+v", engine.computerDiskSweepEvidence)
 	}
 }
 
@@ -1786,6 +1995,39 @@ func TestComputerDiskConsumersFailClosedOnTypedQuarantineAndRemovalClears(t *tes
 	}
 }
 
+func TestComputerDiskAuthorizedRemovalForgetsQuarantineGCMemory(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	if err := engine.quarantineComputerDiskAnomaly(diskRoot, name, storage, "allocation_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "computer-disk-quarantine"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine entries=%d err=%v", len(entries), err)
+	}
+	quarantineRoot := filepath.Join(root, "computer-disk-quarantine", entries[0].Name())
+	receipt, err := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(quarantineRoot, "quarantine.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.rememberComputerDiskQuarantineGC(quarantineRoot, receipt)
+	if err := engine.deleteComputerDisk(storage, ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: "job", PriorJobID: "prior", RemovalGeneration: 1, CleanupFence: "fence"}); err != nil {
+		t.Fatal(err)
+	}
+	engine.computerQuarantineGCMu.Lock()
+	_, remembered := engine.computerQuarantineGC[quarantineRoot]
+	engine.computerQuarantineGCMu.Unlock()
+	if remembered {
+		t.Fatal("authorized whole-disk removal retained stale in-memory GC evidence")
+	}
+}
+
 func TestComputerDiskQuarantineExpiryDropsPayloadButKeepsGenerationTombstone(t *testing.T) {
 	root := t.TempDir()
 	storage := testComputerStorage()
@@ -1913,9 +2155,11 @@ func TestComputerDiskQuarantineGCFailureIsEvidenceNotSweepFailure(t *testing.T) 
 		t.Fatalf("bounded GC receipt = %+v err=%v", updated, err)
 	}
 	if removeAttempts != defaultComputerDiskQuarantineGCFailures || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-		return item.Action == SweepActionQuarantineGCEscalated && item.Method == "remove_payload"
+		return item.Action == SweepActionQuarantineGCEscalated && item.Method == "remove_payload" &&
+			item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidencePrimary
 	}) || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-		return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated"
+		return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated" &&
+			item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidencePrimary && item.GCStopReason == ComputerDiskQuarantineGCStopFailureLimit
 	}) {
 		t.Fatalf("GC failure evidence = %+v", engine.computerDiskSweepEvidence)
 	}
@@ -1964,12 +2208,14 @@ func TestComputerDiskQuarantineGCReceiptPublicationFailureReachesDurableBound(t 
 			t.Fatalf("GC publication attempt %d failed whole sweep: %v", attempt, err)
 		}
 		if attempt == defaultComputerDiskQuarantineGCFailures && !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-			return item.Action == SweepActionQuarantineGCEscalated && item.Method == "record_payload_drop"
+			return item.Action == SweepActionQuarantineGCEscalated && item.Method == "record_payload_drop" &&
+				item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidenceMirror
 		}) {
 			t.Fatalf("GC publication attempt %d did not escalate: %+v", attempt, engine.computerDiskSweepEvidence)
 		}
 		if attempt == defaultComputerDiskQuarantineGCFailures+1 && !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-			return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated"
+			return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated" &&
+				item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidenceMirror && item.GCStopReason == ComputerDiskQuarantineGCStopFailureLimit
 		}) {
 			t.Fatalf("GC publication failure was retried past its bound: %+v", engine.computerDiskSweepEvidence)
 		}
@@ -1981,12 +2227,325 @@ func TestComputerDiskQuarantineGCReceiptPublicationFailureReachesDurableBound(t 
 	if err != nil || mirrored.GCFailures != defaultComputerDiskQuarantineGCFailures || mirrored.GCEscalatedAt == nil {
 		t.Fatalf("durable mirrored GC bound = %+v err=%v", mirrored, err)
 	}
+	observer := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	var inventory ResourceInventory
+	if err := observer.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	inventoryJSON, err := json.Marshal(inventory.ComputerStorageQuarantined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(inventoryJSON, []byte(`"gc_failures":3`)) || !bytes.Contains(inventoryJSON, []byte(`"gc_escalated_at":`)) ||
+		!bytes.Contains(inventoryJSON, []byte(`"gc_evidence_storage":"mirror_receipt"`)) {
+		t.Fatalf("operator inventory omitted mirrored GC escalation: %s", inventoryJSON)
+	}
 	remover := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
 	if err := remover.deleteComputerDisk(storage, ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: "job", PriorJobID: "prior", RemovalGeneration: 1, CleanupFence: "fence"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(computerDiskQuarantineGCFailurePath(quarantineRoot)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("authorized removal left mirrored GC evidence: %v", err)
+	}
+}
+
+func TestComputerDiskQuarantineGCMirrorPublicationFailureUsesPrimaryReceipt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denial GC proof requires the non-root helper test lane")
+	}
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+	if err := seed.quarantineComputerDiskAnomaly(diskRoot, name, storage, "allocation_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	quarantineParent := filepath.Join(root, "computer-disk-quarantine")
+	entries, err := os.ReadDir(quarantineParent)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine entries=%v err=%v", entries, err)
+	}
+	quarantineRoot := filepath.Join(quarantineParent, entries[0].Name())
+	receiptPath := filepath.Join(quarantineRoot, "quarantine.json")
+	receipt, err := readAndValidateComputerDiskQuarantineReceipt(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	receipt.CreatedAt = now.Add(-defaultComputerDiskQuarantineRetention - time.Hour)
+	receipt.RetainUntil = receipt.CreatedAt.Add(defaultComputerDiskQuarantineRetention)
+	payload, _ := json.Marshal(receipt)
+	if err := os.WriteFile(receiptPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(quarantineParent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(quarantineParent, 0o700) })
+
+	removeAttempts := 0
+	for attempt := 1; attempt <= defaultComputerDiskQuarantineGCFailures+1; attempt++ {
+		engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now.Add(time.Duration(attempt) * time.Minute))}}
+		engine.computerQuarantineRemoveAll = func(string) error {
+			removeAttempts++
+			return errors.New("injected remove failure")
+		}
+		if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+			t.Fatalf("GC attempt %d failed whole sweep: %v", attempt, err)
+		}
+		if attempt == defaultComputerDiskQuarantineGCFailures+1 && !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+			return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated" &&
+				item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidencePrimary && item.GCStopReason == ComputerDiskQuarantineGCStopFailureLimit
+		}) {
+			t.Fatalf("primary receipt did not retain after mirror failure: %+v", engine.computerDiskSweepEvidence)
+		}
+	}
+	updated, err := readAndValidateComputerDiskQuarantineReceipt(receiptPath)
+	if err != nil || updated.GCFailures != defaultComputerDiskQuarantineGCFailures || updated.GCEscalatedAt == nil {
+		t.Fatalf("primary GC receipt = %+v err=%v", updated, err)
+	}
+	if removeAttempts != defaultComputerDiskQuarantineGCFailures {
+		t.Fatalf("payload removal attempts = %d, want %d", removeAttempts, defaultComputerDiskQuarantineGCFailures)
+	}
+}
+
+func TestComputerDiskQuarantineGCStopsInMemoryWhenNeitherReceiptIsWritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denial GC proof requires the non-root helper test lane")
+	}
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: newManualClock(now)}}
+	if err := engine.quarantineComputerDiskAnomaly(diskRoot, name, storage, "allocation_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	quarantineParent := filepath.Join(root, "computer-disk-quarantine")
+	entries, err := os.ReadDir(quarantineParent)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine entries=%v err=%v", entries, err)
+	}
+	quarantineRoot := filepath.Join(quarantineParent, entries[0].Name())
+	receiptPath := filepath.Join(quarantineRoot, "quarantine.json")
+	receipt, err := readAndValidateComputerDiskQuarantineReceipt(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.CreatedAt = now.Add(-defaultComputerDiskQuarantineRetention - time.Hour)
+	receipt.RetainUntil = receipt.CreatedAt.Add(defaultComputerDiskQuarantineRetention)
+	payload, _ := json.Marshal(receipt)
+	if err := os.WriteFile(receiptPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(quarantineParent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(quarantineParent, 0o700) })
+	engine.computerQuarantineWrite = func(string, string, string, []byte, os.FileMode) error {
+		return errors.New("injected primary receipt failure")
+	}
+	removeAttempts := 0
+	engine.computerQuarantineRemoveAll = func(string) error {
+		removeAttempts++
+		return errors.New("injected remove failure")
+	}
+	for attempt := 1; attempt <= defaultComputerDiskQuarantineGCFailures+1; attempt++ {
+		if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+			t.Fatalf("GC attempt %d failed whole sweep: %v", attempt, err)
+		}
+	}
+	if removeAttempts != defaultComputerDiskQuarantineGCFailures {
+		t.Fatalf("payload removal attempts = %d, want in-memory bound %d; evidence=%+v", removeAttempts, defaultComputerDiskQuarantineGCFailures, engine.computerDiskSweepEvidence)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionQuarantineGCEscalated && item.Method == "remove_payload" &&
+			item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidenceMemory
+	}) || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionRetained && item.Method == "quarantine_gc_escalated" &&
+			item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidenceMemory && item.GCStopReason == ComputerDiskQuarantineGCStopFailureLimit
+	}) {
+		t.Fatalf("in-memory GC escalation evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+	var inventory ResourceInventory
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil || len(inventory.ComputerStorageQuarantined) != 1 {
+		t.Fatalf("in-memory GC inventory=%+v err=%v", inventory.ComputerStorageQuarantined, err)
+	}
+	gc := inventory.ComputerStorageQuarantined[0]
+	if gc.GCFailures != defaultComputerDiskQuarantineGCFailures || gc.GCFirstFailedAt.IsZero() || gc.GCEscalatedAt.IsZero() ||
+		gc.GCLastFailure != "remove_payload" || gc.GCEvidenceStorage != ComputerDiskQuarantineGCEvidenceMemory ||
+		gc.GCRetryStopReason != ComputerDiskQuarantineGCStopFailureLimit || !gc.GCRetryStoppedAt.Equal(gc.GCEscalatedAt) {
+		t.Fatalf("in-memory GC facts = %+v", gc)
+	}
+}
+
+func TestComputerDiskQuarantineGCCollectsHealthyPayloadOnFirstLateSweep(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	name := "wefty-computer-disk-example"
+	quarantineRoot := filepath.Join(runtimeRoot, "computer-disk-quarantine", name+"-anomaly-receipt")
+	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantineRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	receipt := computerDiskQuarantineReceipt{
+		Kind: computerDiskQuarantineKindAuthority, ReceiptID: "receipt", DiskName: name,
+		Reason: "manifest_missing", CreatedAt: now.Add(-5 * 24 * time.Hour),
+		RetainUntil: now.Add(-4 * 24 * time.Hour),
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantineRoot, "quarantine.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removeAttempts := 0
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, Clock: newManualClock(now)}, diskSystem: newFakeComputerDiskSystem()}
+	engine.computerQuarantineRemoveAll = func(path string) error {
+		removeAttempts++
+		return os.RemoveAll(path)
+	}
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if removeAttempts != 1 || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionQuarantinePayloadDropped && item.Method == "remove_payload"
+	}) {
+		t.Fatalf("healthy late GC attempted removal=%d evidence=%+v", removeAttempts, engine.computerDiskSweepEvidence)
+	}
+	if _, err := os.Stat(filepath.Join(quarantineRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("healthy late GC retained payload: %v", err)
+	}
+	updated, err := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(quarantineRoot, "quarantine.json"))
+	if err != nil || updated.PayloadDroppedAt == nil || !updated.PayloadDroppedAt.Equal(now) {
+		t.Fatalf("healthy late GC receipt = %+v err=%v", updated, err)
+	}
+}
+
+func TestComputerDiskQuarantineGCUnrecordedFailureHasAbsoluteWallClockBound(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denial GC proof requires the non-root helper test lane")
+	}
+	runtimeRoot := t.TempDir()
+	name := "wefty-computer-disk-example"
+	quarantineParent := filepath.Join(runtimeRoot, "computer-disk-quarantine")
+	quarantineRoot := filepath.Join(quarantineParent, name+"-anomaly-receipt")
+	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantineRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	windowStart := now.Add(-time.Hour)
+	receipt := computerDiskQuarantineReceipt{
+		Kind: computerDiskQuarantineKindAuthority, ReceiptID: "receipt", DiskName: name,
+		Reason: "manifest_missing", CreatedAt: windowStart.Add(-defaultComputerDiskQuarantineRetention), RetainUntil: windowStart,
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantineRoot, "quarantine.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(quarantineParent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(quarantineParent, 0o700) })
+	clock := newManualClock(now)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, Clock: clock}, diskSystem: newFakeComputerDiskSystem()}
+	engine.computerQuarantineWrite = func(string, string, string, []byte, os.FileMode) error {
+		return errors.New("injected primary receipt failure")
+	}
+	removeAttempts := 0
+	engine.computerQuarantineRemoveAll = func(string) error {
+		removeAttempts++
+		return errors.New("injected remove failure")
+	}
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = windowStart.Add(defaultComputerDiskQuarantineGCUnrecordedRetryWindow)
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if removeAttempts != 1 || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionRetained && item.Method == "quarantine_gc_unrecorded_retry_window_elapsed" &&
+			item.GCEvidenceStorage == ComputerDiskQuarantineGCEvidenceMemory && item.GCStopReason == ComputerDiskQuarantineGCStopUnrecordedWindow
+	}) {
+		t.Fatalf("unrecorded GC failure bound attempted removal=%d evidence=%+v", removeAttempts, engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestComputerDiskQuarantineGCForgetsMemoryAfterPayloadRemoval(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denial GC proof requires the non-root helper test lane")
+	}
+	runtimeRoot := t.TempDir()
+	name := "wefty-computer-disk-example"
+	quarantineParent := filepath.Join(runtimeRoot, "computer-disk-quarantine")
+	quarantineRoot := filepath.Join(quarantineParent, name+"-anomaly-receipt")
+	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantineRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	receipt := computerDiskQuarantineReceipt{
+		Kind: computerDiskQuarantineKindAuthority, ReceiptID: "receipt", DiskName: name,
+		Reason: "manifest_missing", CreatedAt: now.Add(-defaultComputerDiskQuarantineRetention - time.Hour), RetainUntil: now.Add(-time.Hour),
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantineRoot, "quarantine.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(quarantineParent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(quarantineParent, 0o700) })
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, Clock: newManualClock(now)}, diskSystem: newFakeComputerDiskSystem()}
+	engine.computerQuarantineWrite = func(string, string, string, []byte, os.FileMode) error {
+		return errors.New("injected primary receipt failure")
+	}
+	engine.computerQuarantineRemoveAll = func(string) error { return errors.New("injected remove failure") }
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(quarantineParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	engine.computerQuarantineWrite = nil
+	engine.computerQuarantineRemoveAll = os.RemoveAll
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	engine.computerQuarantineGCMu.Lock()
+	_, remembered := engine.computerQuarantineGC[quarantineRoot]
+	engine.computerQuarantineGCMu.Unlock()
+	if remembered {
+		t.Fatal("successful payload removal retained stale in-memory GC evidence")
 	}
 }
 

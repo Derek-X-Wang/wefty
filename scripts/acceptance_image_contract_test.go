@@ -32,6 +32,7 @@ type workflowContract struct {
 type workflowJob struct {
 	If             string            `yaml:"if"`
 	Needs          any               `yaml:"needs"`
+	Container      string            `yaml:"container"`
 	Permissions    map[string]string `yaml:"permissions"`
 	Uses           string            `yaml:"uses"`
 	With           map[string]any    `yaml:"with"`
@@ -54,14 +55,33 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	gate, gateBytes := readWorkflow(t, "../.github/workflows/contract-gate.yml")
 	realtiming, realtimingBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming.yml")
 	scheduled, scheduledBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming-scheduled.yml")
-	debian252, ok := gate.Jobs["debian-systemd-252"]
-	if !ok || !strings.Contains(string(gateBytes), "container: debian:12") {
-		t.Fatal("contract gate is missing its Debian 12 systemd 252 lane")
+	validateDebian252Lane := func(payload []byte) error {
+		var candidate workflowContract
+		if err := yaml.Unmarshal(payload, &candidate); err != nil {
+			return err
+		}
+		debian252, ok := candidate.Jobs["debian-systemd-252"]
+		if !ok || debian252.Container != "debian:12" {
+			return errors.New("contract gate is missing its exact Debian 12 systemd 252 lane")
+		}
+		matches := 0
+		for _, step := range debian252.Steps {
+			if step.Name == "Verify the Debian 12 helper unit with systemd 252" && step.Env["WEFTY_REQUIRE_SYSTEMD_252"] == "1" &&
+				strings.TrimSpace(step.Run) == "go test ./runner/linuxunit -run '^TestSystemd252LaneValidatesLegacyHelperPolicy$' -count=1" {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return fmt.Errorf("Debian 12 lane executes the exact systemd 252 guard %d times", matches)
+		}
+		return nil
 	}
-	if !slices.ContainsFunc(debian252.Steps, func(step workflowStep) bool {
-		return step.Env["WEFTY_REQUIRE_SYSTEMD_252"] == "1" && strings.Contains(step.Run, "TestSystemd252LaneValidatesLegacyHelperPolicy")
-	}) {
-		t.Fatal("Debian 12 lane does not require execution of the systemd 252 guard")
+	if err := validateDebian252Lane(gateBytes); err != nil {
+		t.Fatal(err)
+	}
+	mutatedLane := bytes.Replace(gateBytes, []byte("    container: debian:12\n"), []byte("    container: ubuntu:24.04\n    # decoy container: debian:12\n"), 1)
+	if bytes.Equal(mutatedLane, gateBytes) || validateDebian252Lane(mutatedLane) == nil {
+		t.Fatal("Debian 12 lane container drift mutation was accepted")
 	}
 
 	if _, ok := build.On["workflow_call"]; !ok {
@@ -577,11 +597,12 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 
 func assertAtomicFaultFailurePublications(t *testing.T, text string) {
 	t.Helper()
+	failureTarget := regexp.MustCompile(`(?:\$action|\$\{action\})\.failed(?:["'[:space:]]|$)`)
+	directFailurePublisher := regexp.MustCompile(`(?:^|[[:space:];|&])(?:[^[:space:];|&]*/)?(cp|tee)(?:[[:space:]]|$)`)
 	validate := func(candidate string) error {
 		for lineNumber, raw := range strings.Split(candidate, "\n") {
 			line := strings.TrimSpace(raw)
-			if (strings.Contains(line, "$action.failed\"") || strings.Contains(line, "${action}.failed\"")) &&
-				(strings.Contains(line, ">") || strings.Contains(line, ">>")) {
+			if failureTarget.MatchString(line) && (strings.Contains(line, ">") || directFailurePublisher.MatchString(line)) {
 				return fmt.Errorf("line %d writes .failed directly: %s", lineNumber+1, line)
 			}
 		}
@@ -603,6 +624,20 @@ func assertAtomicFaultFailurePublications(t *testing.T, text string) {
 	bracedMutation := strings.Replace(mutated, "$action.failed\"", "${action}.failed\"", 1)
 	if bracedMutation == mutated || validate(bracedMutation) == nil {
 		t.Fatal("braced direct .failed publication mutation was accepted")
+	}
+	for name, command := range map[string]string{
+		"cp":  `cp /tmp/injected-failure "/tmp/wefty-oci-faults/$action.failed"`,
+		"tee": `printf '%s\n' injected-failure | tee "/tmp/wefty-oci-faults/${action}.failed"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutation := strings.Replace(text, "record_action_failure 'kill-shim requires an exact workload Job binding'", command, 1)
+			if mutation == text {
+				t.Fatal("direct .failed publication mutation control did not apply")
+			}
+			if err := validate(mutation); err == nil {
+				t.Fatalf("direct %s .failed publication was accepted", name)
+			}
+		})
 	}
 }
 

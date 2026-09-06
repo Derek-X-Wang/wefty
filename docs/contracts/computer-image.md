@@ -6,20 +6,33 @@ grow or copy record that cannot yet resume remains in place as
 Operational recovery deferral belongs to the Storage generation rather than
 one recovery operation: a later failure updates the live operation while
 preserving the generation's first-deferred time and accumulated attempt count.
-The helper mirrors that record beside the generation so an unreadable disk
-directory or deferral record remains countable as `deferral_record_unreadable`
-across helper replacement. A missing attachment manifest never authorizes
-deleting an existing image; it quarantines the bytes unless a valid matching
-pre-publication copy record proves that its staged destination was never
-published and can be rolled back.
+The helper mirrors that record beside the generation and prefers whichever
+primary or mirror copy remains readable, so a one-sided read failure does not
+erase Storage identity, attempts, or `first_deferred_at`. When neither copy is
+readable, the generation remains countable as `deferral_record_unreadable`
+across helper replacement. A primary record bound to a foreign disk is instead
+a structural `deferral_record_identity_mismatch` even when the name-bound
+mirror is valid; the generation quarantines without Storage authority and the
+helper emits the typed mismatch on that sweep. A missing attachment manifest
+never authorizes deleting an existing image; it quarantines the bytes unless a
+valid matching pre-publication copy record proves that its staged destination
+was never published and can be rolled back.
 Only boot-barrier startup sweeps increment the attempt count; in-session reap
 sweeps do not. Recovery terminates as `resume_abandoned` only after both
 twenty-four failed agent boot-barrier sweeps and 24 elapsed hours, so a helper
 restart storm cannot consume the bound in minutes. Structural image/record
 mismatch and invalid authority quarantine immediately. Quarantine retains its
-payload for 24 hours and its typed tombstone thereafter without an autonomous
-age bound, so N is never admissible again; three authority-valid payload-GC
-failures escalate and stop automatic retries. The supported recovery path
+payload for 24 hours; a quarantine whose payload GC has never failed is
+collected by the first sweep after that deadline, however late. Its typed
+tombstone remains thereafter without an autonomous age bound, so N is never
+admissible again; three authority-valid payload-GC
+failures escalate and stop automatic retries. The helper tries both the mirror
+and primary receipt for each failure update. If neither is writable, typed
+in-memory evidence enforces the three-failure bound, and only an observed
+memory-only failure may stop at the retention deadline plus 24 hours. A helper
+that has no failure evidence attempts GC rather than treating age as evidence.
+Inventory and doctor surface the GC count, timestamps, last failure, evidence
+location, and escalation count. The supported recovery path
 prepares and admits reset generation N+1 and clears N only through authorized
 removal. A legacy `-reset-N` directory is only a retained
 `legacy_reset_quarantine` tombstone when it lacks a validated historical reset
