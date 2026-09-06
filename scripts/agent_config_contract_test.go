@@ -38,6 +38,11 @@ func TestOCICapableAgentConfigFixturesRequireIntentAuthority(t *testing.T) {
 			want:       1,
 		},
 		{
+			name:       "OCI capability probe",
+			configBody: `CapabilityProbe: probe`,
+			want:       1,
+		},
+		{
 			name:       "legitimate process-only configuration",
 			configBody: `Capabilities: map[string]bool{"process": true}, WorkloadRuntimes: map[string]WorkloadRuntime{JobKindProcess: adapter}`,
 			want:       0,

@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -70,8 +71,9 @@ type Config struct {
 	RenewalInterval   time.Duration
 	MaxOneshotSlots   int
 	MaxServiceSlots   int
-	// OperationTimeout bounds one L1 request and the suppression transaction
-	// held under the OCI intent completion gate. Zero uses ten seconds.
+	// OperationTimeout bounds one L1 request. It also bounds a suppression
+	// transaction held under the OCI intent completion gate, clamped to the OCI
+	// control server's response-drain budget. Zero uses ten seconds.
 	OperationTimeout     time.Duration
 	FinalizationTimeout  time.Duration
 	LogBatchSize         int
@@ -253,7 +255,9 @@ func New(config Config) (*Agent, error) {
 	}
 	var intentGate *ociIntentCompletionGate
 	if config.OCIIntent != nil {
-		intentGate = &ociIntentCompletionGate{observe: config.OCIIntent, suppressionTimeout: operationTimeout}
+		intentGate = &ociIntentCompletionGate{
+			observe: config.OCIIntent, suppressionTimeout: min(operationTimeout, ocicontrol.ControlShutdownDrainTimeout),
+		}
 	}
 	outbox.ociIntentGate = intentGate
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)

@@ -1862,7 +1862,7 @@ func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.
 	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	const suppressionBudget = 40 * time.Millisecond
+	const suppressionBudget = time.Second
 	intentObserved := make(chan struct{})
 	gate := &ociIntentCompletionGate{
 		observe: func(context.Context) (OCIIntentObservation, error) {
@@ -1893,7 +1893,7 @@ func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.
 		_ = connectionBlocker.Rollback()
 		t.Fatal("live completion did not observe disabled intent")
 	}
-	stopContext, cancelStop := context.WithTimeout(t.Context(), time.Second)
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancelStop()
 	started := time.Now()
 	release, stopErr := gate.beginStop(stopContext, 2)
@@ -1910,10 +1910,11 @@ func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.
 		_ = connectionBlocker.Rollback()
 		t.Fatalf("suppression persistence failure=%v, want deadline exhaustion", persistenceErr)
 	}
-	if elapsed >= 500*time.Millisecond {
+	if elapsed < suppressionBudget-100*time.Millisecond || elapsed >= suppressionBudget+500*time.Millisecond {
 		_ = connectionBlocker.Rollback()
-		t.Fatalf("intent-stop drain elapsed=%s, want suppression budget %s honored below 500ms", elapsed, suppressionBudget)
+		t.Fatalf("intent-stop drain elapsed=%s, want suppression budget %s honored within [-100ms,+500ms]", elapsed, suppressionBudget)
 	}
+	t.Logf("suppression persistence deadline: configured=%s observed=%s tolerance=[-100ms,+500ms]", suppressionBudget, elapsed)
 	failure := <-completionDone
 	if !errors.As(failure.err, &persistenceErr) {
 		_ = connectionBlocker.Rollback()
@@ -1957,7 +1958,7 @@ func TestRecoveryIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *
 			close(intentObserved)
 			<-allowSuppression
 		},
-		suppressionTimeout: 40 * time.Millisecond,
+		suppressionTimeout: time.Second,
 	}
 	outbox.ociIntentGate = gate
 	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
@@ -1977,7 +1978,7 @@ func TestRecoveryIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *
 		t.Fatal(err)
 	}
 	close(allowSuppression)
-	stopContext, cancelStop := context.WithTimeout(t.Context(), time.Second)
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancelStop()
 	release, stopErr := gate.beginStop(stopContext, 2)
 	if release != nil {
@@ -2021,6 +2022,11 @@ func TestCompletionDispositionWaitObservesRecoverySuppression(t *testing.T) {
 	}
 	waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
 	defer cancelWait()
+	waitParked := make(chan struct{})
+	var waitOnce sync.Once
+	outbox.spool.dispositionWaitCheckpoint = func() {
+		waitOnce.Do(func() { close(waitParked) })
+	}
 	receiptDone := make(chan completionInspectionReceipt, 1)
 	errDone := make(chan error, 1)
 	go func() {
@@ -2028,6 +2034,12 @@ func TestCompletionDispositionWaitObservesRecoverySuppression(t *testing.T) {
 		receiptDone <- receipt
 		errDone <- waitErr
 	}()
+	select {
+	case <-waitParked:
+	case <-time.After(time.Second):
+		t.Fatal("completion disposition waiter did not reach the pre-commit edge")
+	}
+	observationStarted := time.Now()
 	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
 		class: contract.JobClassService, kind: contract.JobKindOCI}
 	if err := outbox.recoverCompletion(t.Context(), client, attempt); err != nil {
@@ -2039,6 +2051,52 @@ func TestCompletionDispositionWaitObservesRecoverySuppression(t *testing.T) {
 	}
 	if receipt.State != "suppressed" || receipt.IntentRevision != 2 || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
 		t.Fatalf("recovery suppression observation=%+v", receipt)
+	}
+	t.Logf("checkpointed recovery disposition observation=%s acceptance_bound=%s", time.Since(observationStarted), time.Second)
+}
+
+func TestCompletionDispositionWaitObservesDeliveredCompletion(t *testing.T) {
+	outbox, err := newEvidenceOutbox(t.TempDir(), "delivered-observation-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("delivered-observation-attempt")
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitParked := make(chan struct{})
+	var waitOnce sync.Once
+	outbox.spool.dispositionWaitCheckpoint = func() {
+		waitOnce.Do(func() { close(waitParked) })
+	}
+	waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
+	defer cancelWait()
+	receiptDone := make(chan completionInspectionReceipt, 1)
+	errDone := make(chan error, 1)
+	go func() {
+		receipt, waitErr := outbox.spool.waitCompletionDisposition(waitContext, claim.Lease.AttemptID, "delivered", 3)
+		receiptDone <- receipt
+		errDone <- waitErr
+	}()
+	select {
+	case <-waitParked:
+	case <-time.After(time.Second):
+		t.Fatal("delivered disposition waiter did not reach the pre-commit edge")
+	}
+	if err := outbox.completionDelivered(t.Context(), claim.Lease.AttemptID, 3); err != nil {
+		t.Fatal(err)
+	}
+	receipt := <-receiptDone
+	if err := <-errDone; err != nil {
+		t.Fatal(err)
+	}
+	if receipt.State != "delivered" || receipt.Reason != "acknowledged_by_l1" || receipt.IntentRevision != 3 {
+		t.Fatalf("delivered completion observation=%+v", receipt)
 	}
 }
 

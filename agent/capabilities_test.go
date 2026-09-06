@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -378,6 +379,23 @@ func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
 				t.Fatalf("agent construction error = %T %v", err, err)
 			}
 		})
+	}
+}
+
+func TestAgentClampsSuppressionPersistenceToControlDrainBudget(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "suppression-clamp-agent"})
+	nodeAgent, err := New(Config{
+		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "suppression-clamp-node", BootSessionID: "suppression-clamp-boot", Version: "test",
+		OCIIntent: enabledTestOCIIntent, OperationTimeout: ocicontrol.ControlShutdownDrainTimeout + time.Hour,
+		LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	if got := nodeAgent.ociIntentGate.suppressionTimeout; got != ocicontrol.ControlShutdownDrainTimeout {
+		t.Fatalf("suppression timeout=%s, want control drain clamp %s", got, ocicontrol.ControlShutdownDrainTimeout)
 	}
 }
 

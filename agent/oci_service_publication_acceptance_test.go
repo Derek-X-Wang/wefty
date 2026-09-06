@@ -39,6 +39,10 @@ const (
 	nativeOCIReadinessProbeInterval    = 50 * time.Millisecond
 	nativeOCIReadinessConnectTimeout   = 200 * time.Millisecond
 	nativeOCIPayloadListenerRestartGap = time.Second
+	// The checkpointed recovery-disposition regression measures this commit
+	// edge locally. Its round-2 maximum is reported with the exact head; one
+	// second retains a wide scheduler margin while avoiding a bare allowance.
+	nativeOCICompletionDispositionObservationBound = time.Second
 	// Round-4 #304 measured cleanup below 600 ms. A one-second cleanup ceiling
 	// plus a one-second preface/admission ceiling reserves two seconds of the
 	// production lease instead of accepting admission at its expiry instant.
@@ -986,7 +990,7 @@ func waitNativeServiceAttempt(t *testing.T, store *l1.Store, nodeAgent *Agent, b
 
 func inspectNativeIntentStopCompletion(t *testing.T, nodeAgent *Agent, attemptID string, intentRevision uint64) completionInspectionReceipt {
 	t.Helper()
-	observationContext, cancelObservation := context.WithTimeout(t.Context(), 5*time.Second)
+	observationContext, cancelObservation := context.WithTimeout(t.Context(), nativeOCICompletionDispositionObservationBound)
 	defer cancelObservation()
 	receipt, err := nodeAgent.logSpool.waitCompletionDisposition(observationContext, attemptID, "suppressed", intentRevision)
 	if err != nil {

@@ -65,6 +65,9 @@ type logSpool struct {
 	maxServiceBytes int64
 	dispositionMu   sync.Mutex
 	dispositionNext chan struct{}
+	// dispositionWaitCheckpoint is a test-only scheduling seam that proves a
+	// waiter reached the pre-commit edge; production construction leaves it nil.
+	dispositionWaitCheckpoint func()
 	// runtimeRemovalCheckpoint is a test-only crash seam exercised at durable
 	// manifest state boundaries; production construction always leaves it nil.
 	runtimeRemovalCheckpoint func(runtimeRemovalCheckpoint) error
@@ -1052,6 +1055,9 @@ func (spool *logSpool) waitCompletionDisposition(ctx context.Context, attemptID,
 		}
 		if receipt.State == "inspection_error" {
 			return receipt, fmt.Errorf("agent: inspect completion disposition: %s", receipt.InspectionError)
+		}
+		if spool.dispositionWaitCheckpoint != nil {
+			spool.dispositionWaitCheckpoint()
 		}
 		select {
 		case <-changed:
