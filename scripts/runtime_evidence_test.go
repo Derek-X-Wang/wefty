@@ -140,32 +140,37 @@ func TestRuntimeEvidenceReplaysIssue320ReadinessRows(t *testing.T) {
 	}
 	mutation := func(name, expectedID, expectedDetail, readinessID, readinessEvent string, observedLater bool) {
 		t.Helper()
-		recovered := ""
-		if observedLater {
-			recovered = `,"readiness_observed_later":true`
-		}
 		checks := `[` +
-			`{"id":"` + expectedID + `","status":"FAIL","detail":"` + expectedDetail + `","failure_reason":"mutation_detected"},` +
-			`{"id":"` + readinessID + `","status":"FAIL","detail":"readiness event was not observed","failure_reason":"readiness_timeout","readiness_event":"` + readinessEvent + `","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625` + recovered + `},` +
-			`{"id":"input.control-accepted","status":"PASS","detail":"control input observed"}` +
-			`]`
+			`{"id":"` + expectedID + `","status":"FAIL","detail":"` + expectedDetail + `","failure_reason":"mutation_detected"}`
+		if readinessID != "" {
+			recovered := ""
+			if observedLater {
+				recovered = `,"readiness_observed_later":true`
+			}
+			checks += `,` +
+				`{"id":"` + readinessID + `","status":"FAIL","detail":"readiness event was not observed","failure_reason":"readiness_timeout","readiness_event":"` + readinessEvent + `","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625` + recovered + `},` +
+				`{"id":"input.control-accepted","status":"PASS","detail":"control input observed"}`
+		}
+		checks += `]`
 		receipt := write(name, checks)
 		command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", receipt, name, expectedID, expectedDetail, "1", "29")
 		output, err := command.CombinedOutput()
 		if err != nil {
 			t.Fatalf("recorded evidence %s rejected: %v\n%s", name, err, output)
 		}
-		if !strings.Contains(string(output), "readiness-timeout/"+name) {
+		if readinessID != "" && !strings.Contains(string(output), "readiness-timeout/"+name) {
 			t.Fatalf("recorded evidence %s did not surface its typed readiness timeout: %s", name, output)
 		}
 	}
 
-	// These are post-fix projections of the four recorded rows: receipt v1 did
+	// These are post-fix projections of the recorded rows: receipt v1 did
 	// not carry failure reasons, readiness pairings, observation timing, or
 	// later-event recovery evidence, so the literal artifacts remain invalid.
+	// The missing-control classifier emits only its owning mutation failure; it
+	// cannot emit a second readiness row with the same check ID.
 	mutation("profile-state-lost", "persistence.profile-survives", "profile marker under HOME was lost", "input.view-isolated-during-tenure", "key_observer_advanced", true)
 	mutation("edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "input.view-isolated-during-tenure", "key_observer_advanced", true)
-	mutation("missing-control-endpoint", "transport.control-ready", "control never completed rfb-websocket-v1", "transport.control-ready", "first_rfb_frame", false)
+	mutation("missing-control-endpoint", "transport.control-ready", "control never completed rfb-websocket-v1", "", "", false)
 
 	positive := write("pr-323-positive", `[{"id":"input.view-isolated-during-tenure","status":"FAIL","detail":"key observer did not advance after the control liveness keystroke (key_events=2 observer_lines=0)","failure_reason":"readiness_timeout","readiness_event":"key_observer_advanced"}]`)
 	positivePayload, err := os.ReadFile(positive)
@@ -225,6 +230,50 @@ func TestMutationEvidenceClosesEveryReadinessMaskingBranch(t *testing.T) {
 	recovered := strings.Replace(inputTimeout, `}`, `,"readiness_observed_later":true}`, 1)
 	if err := run("recovered-input-timeout", `[`+expected+`,`+recovered+`,`+controlPass+`]`); err != nil {
 		t.Fatalf("closed recovered readiness evidence was rejected: %v", err)
+	}
+}
+
+func TestMutationEvidenceStillRejectsMissingMutationWhenPrimaryCardinalityGuardIsRelaxed(t *testing.T) {
+	script, err := os.ReadFile("check-computer-image-runtime-evidence.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := strings.Replace(string(script), `($mutation | length) == 1`, `($mutation | length) >= 0`, 1)
+	if mutated == string(script) {
+		t.Fatal("mutation cardinality guard was not found")
+	}
+	temp := t.TempDir()
+	mutantPath := filepath.Join(temp, "relaxed-checker.sh")
+	if err := os.WriteFile(mutantPath, []byte(mutated), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	receipt := filepath.Join(temp, "missing-mutation.json")
+	payload := `{"version":2,"checks":[` +
+		`{"id":"input.view-isolated-during-tenure","status":"FAIL","detail":"late","failure_reason":"readiness_timeout","readiness_event":"key_observer_advanced","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625,"readiness_observed_later":true},` +
+		`{"id":"input.control-accepted","status":"PASS","detail":"observed"}],` +
+		`"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}}`
+	if err := os.WriteFile(receipt, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", mutantPath, "mutation", receipt, "edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "1", "29")
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("receipt without mutation passed the relaxed checker: %s", output)
+	}
+}
+
+func TestMutationEvidenceRejectsDuplicateExpectedIDRegardlessOfReason(t *testing.T) {
+	temp := t.TempDir()
+	receipt := filepath.Join(temp, "duplicate-expected-id.json")
+	payload := `{"version":2,"checks":[` +
+		`{"id":"transport.control-ready","status":"FAIL","detail":"control never completed rfb-websocket-v1","failure_reason":"mutation_detected"},` +
+		`{"id":"transport.control-ready","status":"FAIL","detail":"late first frame","failure_reason":"readiness_timeout","readiness_event":"first_rfb_frame","readiness_observation_window_seconds":15,"readiness_observation_elapsed_seconds":15}],` +
+		`"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}}`
+	if err := os.WriteFile(receipt, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", receipt, "missing-control-endpoint", "transport.control-ready", "control never completed rfb-websocket-v1", "1", "29")
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("duplicate expected id passed mutation evidence: %s", output)
 	}
 }
 

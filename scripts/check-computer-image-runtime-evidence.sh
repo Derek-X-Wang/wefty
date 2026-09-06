@@ -109,9 +109,11 @@ case ${1:-} in
     if ! jq -e --arg cell "$cell" --arg detail "$detail" '
       [.checks[] | select(.status == "FAIL")] as $failed |
       [$failed[] | select(.failure_reason == "mutation_detected" and .id == $cell and .detail == $detail)] as $mutation |
+      [.checks[] | select(.id == $cell)] as $expected_id |
       [$failed[] | select(.failure_reason == "readiness_timeout" and (.id | startswith("input.")))] as $input_timeouts |
       [.checks[] | select((.id == "input.view-isolated" or .id == "input.view-isolated-during-tenure") and .status != "NOT-RUN")] as $input_started |
       ($mutation | length) == 1 and
+      ($expected_id | length) == 1 and
       all($failed[];
         (.failure_reason == "mutation_detected" and .id == $cell and .detail == $detail) or
         .failure_reason == "readiness_timeout"
