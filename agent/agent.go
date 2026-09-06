@@ -630,12 +630,26 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	if a == nil || a.capabilities == nil || a.session == nil {
 		return nil
 	}
-	if a.session.ociBootBarrier == nil {
-		return a.capabilities.refresh(ctx)
-	}
-	generation, err := a.session.recoverOCIRuntime(ctx)
+	generation, err := a.session.recoverOCIRuntimeValidated(ctx, func() error {
+		if a.ociIntentGate == nil || a.ociIntentGate.observe == nil {
+			return nil
+		}
+		suppressionSequence := a.capabilities.ociSuppressionSequence.Load()
+		observation, observeErr := a.ociIntentGate.observe(ctx)
+		if observeErr != nil {
+			return fmt.Errorf("agent: validate durable OCI intent before recovery: %w", observeErr)
+		}
+		if !observation.Enabled {
+			a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+			return nil
+		}
+		return a.capabilities.allowOCIIntentIfUnchanged(suppressionSequence)
+	})
 	if err != nil {
 		return err
+	}
+	if a.session.ociBootBarrier == nil {
+		return nil
 	}
 	_, err = a.session.publishCapabilityHeartbeat(ctx, &generation)
 	return err
@@ -660,6 +674,10 @@ func (a *Agent) FenceOCIIntentStop(ctx context.Context, revision uint64) (func()
 	if a == nil || a.ociIntentGate == nil {
 		return func() {}, nil
 	}
+	// The durable disabled marker is already authoritative at this boundary.
+	// Close local admission before waiting for an enabled completion reader so
+	// lease expiry cannot admit a replacement OCI attempt during the drain.
+	a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
 	return a.ociIntentGate.beginStop(ctx, revision)
 }
 

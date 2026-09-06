@@ -61,6 +61,28 @@ type CapabilityProbeResult struct {
 	ReasonCode          contract.CapabilityReasonCode
 }
 
+// CapabilityProbeSkippedError reports that a functional probe was deliberately
+// not run because a restrictive local authority currently forbids it.
+type CapabilityProbeSkippedError struct {
+	ReasonCode contract.CapabilityReasonCode
+}
+
+func (err *CapabilityProbeSkippedError) Error() string {
+	return "agent: capability probe skipped: " + string(err.ReasonCode)
+}
+
+func (err *CapabilityProbeSkippedError) Unwrap() error {
+	if err != nil && err.ReasonCode == contract.CapabilityReasonOCIIntentDisabled {
+		return errOCIIntentDisabled
+	}
+	return nil
+}
+
+func capabilityProbeWasSkipped(err error) bool {
+	var skipped *CapabilityProbeSkippedError
+	return errors.As(err, &skipped)
+}
+
 // CapabilitySnapshot is the immutable agent-local capability view shared by
 // admission, publication, and future doctor output. LastProbe is written only
 // for a completed functional probe, never for a restrictive suppression.
@@ -87,6 +109,7 @@ type capabilityState struct {
 	lastProbe                  *contract.CapabilityObservation
 	pendingPublicationRevision int64
 	ociSuppressionSequence     atomic.Uint64
+	ociIntentDisabled          atomic.Bool
 }
 
 func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock Clock, timeout time.Duration) *capabilityState {
@@ -120,7 +143,13 @@ func (state *capabilityState) refresh(ctx context.Context) error {
 // positive observation private until a helper loss racing the probe has been
 // observed and converted to a restrictive result.
 func (state *capabilityState) refreshValidated(ctx context.Context, validate func() error) error {
-	if state == nil || state.probe == nil {
+	if state == nil {
+		return nil
+	}
+	if state.ociIntentDisabled.Load() {
+		return &CapabilityProbeSkippedError{ReasonCode: contract.CapabilityReasonOCIIntentDisabled}
+	}
+	if state.probe == nil {
 		return nil
 	}
 	state.probeMu.Lock()
@@ -184,8 +213,35 @@ func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReason
 	if err == nil {
 		err = errors.New("OCI runtime is not admitted")
 	}
+	if reason == contract.CapabilityReasonOCIIntentDisabled {
+		state.ociIntentDisabled.Store(true)
+	}
 	state.ociSuppressionSequence.Add(1)
 	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err, false)
+}
+
+// allowOCIIntent opens positive observation only after the operator has
+// durably enabled OCI and entered the explicit recovery transaction. Routine
+// heartbeat probes must not reverse a durable disabled intent.
+func (state *capabilityState) allowOCIIntent() {
+	if state == nil {
+		return
+	}
+	_ = state.allowOCIIntentIfUnchanged(state.ociSuppressionSequence.Load())
+}
+
+func (state *capabilityState) allowOCIIntentIfUnchanged(suppressionSequence uint64) error {
+	if state == nil {
+		return nil
+	}
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	if state.ociSuppressionSequence.Load() != suppressionSequence {
+		return errors.New("capability recovery was superseded by OCI runtime suppression")
+	}
+	state.ociIntentDisabled.Store(false)
+	state.ociSuppressionSequence.Add(1)
+	return nil
 }
 
 // recordProbeResult discards a positive result that began before a concurrent
@@ -200,6 +256,9 @@ func (state *capabilityState) recordProbeResult(
 ) error {
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()
+	if probeErr == nil && state.ociIntentDisabled.Load() {
+		return errors.New("capability probe cannot supersede disabled OCI intent")
+	}
 	if probeErr == nil && state.ociSuppressionSequence.Load() != suppressionSequence {
 		return errors.New("capability probe was superseded by OCI runtime suppression")
 	}

@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -114,15 +116,57 @@ func TestHelperDeadmanAdmissionFailsLoudlyWhenUnwired(t *testing.T) {
 }
 
 type recordingDeadmanRenewer struct {
-	calls      int
-	expiresAt  time.Time
-	generation workloadrunner.RuntimeGeneration
-	err        error
+	mu          sync.Mutex
+	renewed     chan struct{}
+	renewedOnce sync.Once
+	calls       int
+	expiresAt   time.Time
+	generation  workloadrunner.RuntimeGeneration
+	err         error
 }
 
 func (renewer *recordingDeadmanRenewer) QueueSuccessfulRenewal(_ l1.Claim, expiresAt time.Time, generation workloadrunner.RuntimeGeneration) error {
+	renewer.mu.Lock()
+	defer renewer.mu.Unlock()
 	renewer.calls++
 	renewer.expiresAt = expiresAt
 	renewer.generation = generation
+	if renewer.renewed != nil {
+		renewer.renewedOnce.Do(func() { close(renewer.renewed) })
+	}
 	return renewer.err
+}
+
+func newRecordingDeadmanRenewer() *recordingDeadmanRenewer {
+	return &recordingDeadmanRenewer{renewed: make(chan struct{})}
+}
+
+func (renewer *recordingDeadmanRenewer) waitForRenewal(t *testing.T) {
+	t.Helper()
+	select {
+	case <-renewer.renewed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OCI helper admission did not produce a deadman renewal")
+	}
+}
+
+func (renewer *recordingDeadmanRenewer) snapshot() (int, time.Time, workloadrunner.RuntimeGeneration) {
+	renewer.mu.Lock()
+	defer renewer.mu.Unlock()
+	return renewer.calls, renewer.expiresAt, renewer.generation
+}
+
+func readyOCIHelperGeneration() workloadrunner.RuntimeGeneration {
+	helperSession, _ := (readyOCIBootBarrier{}).Generation()
+	return workloadrunner.RuntimeGeneration{
+		InstanceID: helperSession.HelperInstanceID,
+		Generation: helperSession.SessionGeneration,
+	}
+}
+
+func admitReadyOCIHelper(request workloadrunner.Request) error {
+	if request.OCIHelperAdmitted == nil {
+		return errors.New("OCI helper admission callback is not wired")
+	}
+	return request.OCIHelperAdmitted(readyOCIHelperGeneration())
 }

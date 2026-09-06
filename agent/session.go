@@ -403,10 +403,19 @@ func (session *agentSession) resumePendingRemovals(ctx context.Context) error {
 // reconciliation, and the functional probe. Ordinary healthy heartbeats do
 // not scan removals.
 func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.HelperSession, error) {
+	return session.recoverOCIRuntimeValidated(ctx, nil)
+}
+
+func (session *agentSession) recoverOCIRuntimeValidated(ctx context.Context, validateIntent func() error) (ocihelper.HelperSession, error) {
 	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
 		return ocihelper.HelperSession{}, err
 	}
 	defer session.ociRecoveryMu.Unlock()
+	if validateIntent != nil {
+		if err := validateIntent(); err != nil {
+			return ocihelper.HelperSession{}, err
+		}
+	}
 	return session.recoverOCIRuntimeLocked(ctx)
 }
 
@@ -447,19 +456,22 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 	if session.ociBootBarrier == nil {
 		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
 	}
+	intentDisabled := session.capabilities.ociIntentDisabled.Load()
 	if invalidator, ok := session.ociBootBarrier.(ociBootBarrierInvalidator); ok {
 		invalidator.Invalidate()
 	}
-	session.capabilities.suppressOCI(
-		ociBootBarrierReason(session.ociBootBarrier),
-		errors.New("OCI helper session requires a new boot sweep"),
-	)
+	if !intentDisabled {
+		session.capabilities.suppressOCI(
+			ociBootBarrierReason(session.ociBootBarrier),
+			errors.New("OCI helper session requires a new boot sweep"),
+		)
+	}
 	restrictiveResponse, err := session.publishCapabilityHeartbeatResponse(ctx, nil)
 	if err != nil {
 		return ocihelper.HelperSession{}, err
 	}
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
-	if barrierErr != nil {
+	if barrierErr != nil && !intentDisabled {
 		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
 	}
 	removalErr := errors.Join(session.resumePendingRemovals(ctx),
@@ -1067,16 +1079,18 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 					session.logf("agent: capability probe before heartbeat: %v", err)
 				}
 			} else if generation, ready := session.ociBootBarrier.Generation(); ready {
-				pinned = &generation
-				if err := session.capabilities.refreshValidated(ctx, func() error {
+				refreshErr := session.capabilities.refreshValidated(ctx, func() error {
 					return session.validateOCIGeneration(generation)
-				}); err != nil && session.logf != nil {
-					session.logf("agent: OCI capability probe before heartbeat: %v", err)
+				})
+				if refreshErr == nil {
+					pinned = &generation
+				} else if !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
+					session.logf("agent: OCI capability probe before heartbeat: %v", refreshErr)
 				}
 			} else {
 				generation, recoverErr := session.recoverOCIRuntime(ctx)
 				if recoverErr != nil {
-					if session.logf != nil {
+					if !capabilityProbeWasSkipped(recoverErr) && session.logf != nil {
 						session.logf("agent: OCI barrier recovery before heartbeat: %v", recoverErr)
 					}
 				} else {

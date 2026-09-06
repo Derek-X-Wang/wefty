@@ -234,7 +234,10 @@ mechanics never cross this boundary.
 Stop ordering is durable disable → restrictive local Capability observation →
 published-service withdrawal → attempt reap and positive runtime quiescence →
 Mac Lima stop. Durable disable and restrictive local admission prevent recovery
-during quiescence; only after positive reap receipts does the Mac path acquire
+during quiescence; routine heartbeat probes cannot supersede the disabled
+intent, and a serialized recovery transaction reopens positive OCI observation
+only after it re-reads a durable enabled intent. Only after positive reap
+receipts does the Mac path acquire
 the shared recovery-cycle lock for the VM stop. This avoids a lock inversion
 with attempt finalization while preventing the background watchdog from racing
 the final VM transition. Linux leaves containerd running. A failed

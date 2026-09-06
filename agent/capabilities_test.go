@@ -142,6 +142,95 @@ func TestRestrictiveObservationDoesNotFabricateProbeReceipt(t *testing.T) {
 	}
 }
 
+func TestDisabledOCIIntentRequiresExplicitRecoveryBeforeProbe(t *testing.T) {
+	var calls atomic.Int32
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		calls.Add(1)
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	state := newCapabilityState(map[string]bool{"kind:oci": true}, probe, systemClock{}, 0)
+	state.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+
+	refreshErr := state.refresh(t.Context())
+	var skipped *CapabilityProbeSkippedError
+	if !errors.As(refreshErr, &skipped) || skipped.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("routine refresh error = %v, want typed disabled-intent skip", refreshErr)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("routine refresh probed disabled OCI intent %d times", got)
+	}
+	if snapshot := state.snapshot(); snapshot.Capabilities["kind:oci"] || snapshot.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("routine refresh reopened disabled OCI intent: %+v", snapshot)
+	}
+
+	state.allowOCIIntent()
+	if err := state.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("explicit recovery probe calls = %d, want 1", got)
+	}
+	if snapshot := state.snapshot(); !snapshot.Capabilities["kind:oci"] {
+		t.Fatalf("explicit recovery did not reopen OCI intent: %+v", snapshot)
+	}
+}
+
+func TestWatchdogRecoveryCannotReopenDisabledOCIIntent(t *testing.T) {
+	network := plain.NewNetwork()
+	_, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-watchdog-disabled": nil})
+	defer stopServer()
+	var intentEnabled atomic.Bool
+	var probeCalls atomic.Int32
+	barrier := &recordingOCIBootBarrier{ensure: func(context.Context) error { return nil }}
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		probeCalls.Add(1)
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node-watchdog-disabled", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-watchdog-disabled", BootSessionID: "boot-watchdog-disabled",
+		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
+		CapabilityProbe: probe, OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: intentEnabled.Load(), Revision: 2}, nil
+		},
+		OCIBootBarrier: barrier, HeartbeatInterval: time.Hour, ClaimInterval: time.Hour,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	if _, err := nodeAgent.Register(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	initialProbeCalls := probeCalls.Load()
+	nodeAgent.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+
+	recoveryErr := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context())
+	var skipped *CapabilityProbeSkippedError
+	if !errors.As(recoveryErr, &skipped) || skipped.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("watchdog-shaped disabled-intent recovery error = %v, want typed skip", recoveryErr)
+	}
+	if probeCalls.Load() != initialProbeCalls || !nodeAgent.capabilities.ociIntentDisabled.Load() {
+		t.Fatalf("watchdog-shaped recovery reopened disabled intent: calls=%d snapshot=%+v", probeCalls.Load(), nodeAgent.CapabilitySnapshot())
+	}
+	if snapshot := nodeAgent.CapabilitySnapshot(); snapshot.Capabilities["kind:oci"] || snapshot.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("watchdog-shaped recovery replaced restrictive observation: %+v", snapshot)
+	}
+
+	intentEnabled.Store(true)
+	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if probeCalls.Load() != initialProbeCalls+1 || nodeAgent.capabilities.ociIntentDisabled.Load() || !nodeAgent.CapabilitySnapshot().Capabilities["kind:oci"] {
+		t.Fatalf("enabled recovery did not reopen intent transaction: calls=%d snapshot=%+v", probeCalls.Load(), nodeAgent.CapabilitySnapshot())
+	}
+}
+
 func TestLegacyConfiguredProcessCapabilityAllowsProcess(t *testing.T) {
 	state := newCapabilityState(map[string]bool{" Process ": true}, nil, systemClock{}, 0)
 	processSpec := contract.JobSpec{Kind: contract.JobKindProcess}

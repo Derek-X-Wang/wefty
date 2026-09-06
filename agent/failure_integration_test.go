@@ -496,7 +496,8 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 
 func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+	clock := newManualClock(time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC))
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"intent-marker-node": {Tags: []string{"intent-marker"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, 500*time.Millisecond)
 	defer stopServer()
@@ -523,6 +524,7 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
 	}
 	runtime := newIntentMarkerRaceRuntime()
+	deadman := newRecordingDeadmanRenewer()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-marker-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -543,14 +545,17 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
-		Logf: t.Logf,
+		AttemptDeadman: deadman, ComputerTokenMinter: &recordingComputerTokenMinter{}, Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer nodeAgent.Close()
+	t.Cleanup(nodeAgent.Close)
 	intentObserved := make(chan struct{})
 	releaseCompletion := make(chan struct{})
+	var releaseCompletionOnce sync.Once
+	release := func() { releaseCompletionOnce.Do(func() { close(releaseCompletion) }) }
+	t.Cleanup(release)
 	var observeOnce sync.Once
 	nodeAgent.ociIntentGate.observed = func(observation OCIIntentObservation) {
 		if observation.Enabled {
@@ -565,8 +570,19 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	var firstAttempt string
 	select {
 	case firstAttempt = <-runtime.started:
+	case startErr := <-runtime.startFailed:
+		t.Fatalf("intent-marker OCI service start failed: %v", startErr)
+	case runErr := <-runDone:
+		t.Fatalf("intent-marker agent exited before OCI service start: %v", runErr)
 	case <-time.After(5 * time.Second):
-		t.Fatal("intent-marker OCI service did not start")
+		queued, jobErr := store.GetJob(t.Context(), job.JobID)
+		attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
+		t.Fatalf("intent-marker OCI service did not start: job=%+v job_err=%v attempts=%+v attempts_err=%v status=%+v capability=%+v",
+			queued, jobErr, attempts, attemptsErr, nodeAgent.Status(), nodeAgent.CapabilitySnapshot())
+	}
+	deadman.waitForRenewal(t)
+	if calls, _, generation := deadman.snapshot(); calls < 1 || generation != readyOCIHelperGeneration() {
+		t.Fatalf("intent-marker deadman renewals=%d generation=%+v, want at least one renewal for %+v", calls, generation, readyOCIHelperGeneration())
 	}
 	runtime.finishFirst()
 	select {
@@ -598,7 +614,46 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	close(releaseCompletion)
+	clock.Advance(time.Second)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		if _, err := store.Reconcile(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		queued, queueErr := store.GetJob(t.Context(), job.JobID)
+		if queueErr != nil {
+			t.Fatal(queueErr)
+		}
+		if queued.State == contract.JobQueued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("intent-stop job did not reach queued after lease expiry while completion paused: %+v", queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		nodeAgent.capabilities.mu.RLock()
+		pendingRevision := nodeAgent.capabilities.pendingPublicationRevision
+		nodeAgent.capabilities.mu.RUnlock()
+		if pendingRevision == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("intent-stop capability revision %d was not published before replacement check", pendingRevision)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	nodes, err := store.ListNodes(t.Context())
+	if err != nil || len(nodes) != 1 || nodes[0].Capabilities["kind:oci"] {
+		t.Fatalf("replacement OCI admission remained published while intent-stop completion reader was held: nodes=%+v err=%v", nodes, err)
+	}
+	attemptsBeforeRelease, err := store.ListJobAttempts(t.Context(), job.JobID)
+	if err != nil || len(attemptsBeforeRelease) != 1 || attemptsBeforeRelease[0].AttemptID != firstAttempt {
+		t.Fatalf("replacement OCI attempt was admitted before the intent-stop completion reader released: attempts=%+v err=%v", attemptsBeforeRelease, err)
+	}
+	release()
 	if err := <-stopDone; err != nil {
 		t.Fatal(err)
 	}
@@ -1065,6 +1120,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		t.Fatal(err)
 	}
 	runtime := newOneShotIntentRuntime()
+	deadman := newRecordingDeadmanRenewer()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-oneshot-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -1083,7 +1139,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
-		Logf: t.Logf,
+		AttemptDeadman: deadman, Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1100,6 +1156,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	case <-time.After(5 * time.Second):
 		t.Fatal("intent-stop OCI one-shot did not start")
 	}
+	deadman.waitForRenewal(t)
 	if err := nodeAgent.StopOCIRuntime(t.Context()); err != nil {
 		cancelRun()
 		t.Fatal(err)
@@ -1119,6 +1176,9 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		cancelRun()
 		attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
 		t.Fatalf("intent-stop one-shot completion=%+v attempts=%+v attempts_err=%v finalized=%d err=%v", completed, attempts, attemptsErr, runtime.finalized.Load(), err)
+	}
+	if calls, _, generation := deadman.snapshot(); calls < 1 || generation != readyOCIHelperGeneration() {
+		t.Fatalf("intent-stop one-shot deadman renewals=%d generation=%+v, want at least one renewal for %+v", calls, generation, readyOCIHelperGeneration())
 	}
 	cancelRun()
 	if err := <-runDone; err != nil {
@@ -2888,6 +2948,7 @@ type oneShotIntentRuntime struct {
 type intentMarkerRaceRuntime struct {
 	*intentStopRuntime
 	firstFinished chan struct{}
+	startFailed   chan error
 	finishOnce    sync.Once
 }
 
@@ -2993,7 +3054,9 @@ func (runtime *liveIntentAuthorityRuntime) complete() {
 }
 
 func newIntentMarkerRaceRuntime() *intentMarkerRaceRuntime {
-	return &intentMarkerRaceRuntime{intentStopRuntime: newIntentStopRuntime(), firstFinished: make(chan struct{})}
+	return &intentMarkerRaceRuntime{
+		intentStopRuntime: newIntentStopRuntime(), firstFinished: make(chan struct{}), startFailed: make(chan error, 1),
+	}
 }
 
 func (runtime *intentMarkerRaceRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
@@ -3004,10 +3067,12 @@ func (runtime *intentMarkerRaceRuntime) Run(ctx context.Context, request workloa
 		PlatformManifestDigest: digest, PlatformOS: "linux", PlatformArchitecture: "amd64",
 		RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
 	}
-	if err := request.OCIImageResolved(ctx, observation); err != nil {
+	if err := request.OCIStarted(ctx, observation); err != nil {
+		runtime.startFailed <- err
 		return workloadrunner.Result{}, err
 	}
-	if err := request.OCIStarted(ctx, observation); err != nil {
+	if err := admitReadyOCIHelper(request); err != nil {
+		runtime.startFailed <- err
 		return workloadrunner.Result{}, err
 	}
 	started := runtime.starts.Add(1)
@@ -3045,6 +3110,9 @@ func (runtime *oneShotIntentRuntime) Run(ctx context.Context, request workloadru
 		return workloadrunner.Result{}, err
 	}
 	if err := request.OCIStarted(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if err := admitReadyOCIHelper(request); err != nil {
 		return workloadrunner.Result{}, err
 	}
 	runtime.started <- request.Authority.AttemptID
