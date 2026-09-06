@@ -290,6 +290,7 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 					}
 					time.Sleep(5 * time.Millisecond)
 				}
+				lostDeadline := time.Now().Add(3 * time.Second)
 				for {
 					if _, err := store.Reconcile(t.Context()); err != nil {
 						cancelRun()
@@ -299,7 +300,7 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 					if listErr == nil && len(attempts) == 1 && attempts[0].State == contract.AttemptLost && attempts[0].Result == nil {
 						break
 					}
-					if time.Now().After(deadline) {
+					if time.Now().After(lostDeadline) {
 						cancelRun()
 						t.Fatalf("intent-stopped pre-Started attempt did not expire lost with no result: attempts=%+v err=%v", attempts, listErr)
 					}
@@ -327,6 +328,43 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 				t.Fatalf("agent shutdown after pre-Started runtime loss: %v", err)
 			}
 		})
+	}
+}
+
+func TestPreStartedOCIRuntimeLossReturnsAllDiagnostics(t *testing.T) {
+	generation := workloadrunner.RuntimeGeneration{InstanceID: "stage-loss", Generation: 1}
+	runtime := &diagnosticPreStartedRuntimeLossRuntime{intentStopRuntime: newIntentStopRuntime(), generation: generation}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes:            workloadRuntimeSet{contract.JobKindOCI: runtime},
+		clock:               systemClock{},
+		finalizationTimeout: time.Second,
+		currentOCIGeneration: func() (workloadrunner.RuntimeGeneration, bool) {
+			return generation, true
+		},
+		recoverOCIRuntime: func(context.Context, workloadrunner.RuntimeGeneration) error {
+			return errors.New("helper remains unavailable after injected loss")
+		},
+	})
+	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
+		Job: l1.Job{JobID: "prestarted-diagnostics", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+				Image: contract.OCIImageSpec{Reference: "example.invalid/prestarted-diagnostics:v1"},
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "prestarted-diagnostics-attempt"},
+	})
+	if result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable || result.OutputError != "" {
+		t.Fatalf("pre-Started result = %#v, want sole runtime_unavailable spawn failure", result)
+	}
+	for _, diagnostic := range []string{
+		"helper lost during Run before Started",
+		"helper remains unavailable after injected loss",
+		"helper unavailable while reaping pre-Started attempt",
+	} {
+		if err == nil || !strings.Contains(err.Error(), diagnostic) {
+			t.Fatalf("pre-Started lifecycle error = %v, want diagnostic %q", err, diagnostic)
+		}
 	}
 }
 
@@ -2864,6 +2902,26 @@ type preStartedRuntimeLossRuntime struct {
 	entered   chan struct{}
 	release   chan struct{}
 	attemptID string
+}
+
+type diagnosticPreStartedRuntimeLossRuntime struct {
+	*intentStopRuntime
+	generation workloadrunner.RuntimeGeneration
+}
+
+func (runtime *diagnosticPreStartedRuntimeLossRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	err := &workloadrunner.RuntimeLossError{
+		Generation: runtime.generation,
+		Err:        errors.New("helper lost during Run before Started"),
+	}
+	return workloadrunner.Result{Outcome: spawnFailure(contract.SpawnFailureRuntimeUnavailable, err)}, err
+}
+
+func (runtime *diagnosticPreStartedRuntimeLossRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{}, &workloadrunner.RuntimeLossError{
+		Generation: runtime.generation,
+		Err:        errors.New("helper unavailable while reaping pre-Started attempt"),
+	}
 }
 
 func newPreStartedRuntimeLossRuntime(barrier *stageLossBarrier) *preStartedRuntimeLossRuntime {
