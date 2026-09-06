@@ -1053,6 +1053,44 @@ func TestAdapterPreservesImageUnavailableAsPermanentSpawnEvidence(t *testing.T) 
 	}
 }
 
+func TestAdapterAdmitsDeadmanOnlyAfterStartedEvidenceAccepted(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		omitRunImage bool
+		startedErr   error
+	}{
+		{name: "helper Started evidence is incomplete", omitRunImage: true},
+		{name: "L1 Started evidence is refused", startedErr: errors.New("stale L1 attempt authority")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{omitRunImage: test.omitRunImage}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			request := adapterTestRequest()
+			admissions := 0
+			request.OCIHelperAdmitted = func(workloadrunner.RuntimeGeneration) error {
+				admissions++
+				return nil
+			}
+			request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+				return test.startedErr
+			}
+			if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+				t.Fatal("failed Started path unexpectedly succeeded")
+			}
+			if admissions != 0 {
+				t.Fatalf("failed Started path opened deadman admission %d times", admissions)
+			}
+			engine.mu.Lock()
+			deletes := engine.runtimeDeletes
+			engine.mu.Unlock()
+			if deletes != 1 {
+				t.Fatalf("failed Started path helper reaps=%d, want 1", deletes)
+			}
+		})
+	}
+}
+
 func TestAdapterHonorsRetryAfterWithinOneImageBudget(t *testing.T) {
 	engine := &adapterTestEngine{ensureErrors: []error{
 		ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 429, RetryAfter: 2 * time.Second, TopLevelDigest: adapterTestDigest}, errors.New("rate limited")),
@@ -1650,6 +1688,7 @@ type adapterTestEngine struct {
 	runtimeDeletes                int
 	refuseDelete                  bool
 	runErr                        error
+	omitRunImage                  bool
 	startedAt                     time.Time
 	ensureErrors                  []error
 	ensureCalls                   int
@@ -1788,6 +1827,9 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 		PlatformManifestDigest: adapterTestDigest, Platform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler, Snapshotter: ocihelper.DefaultSnapshotter,
 	}}
+	if engine.omitRunImage {
+		response.Image = nil
+	}
 	if request.EnableHostBridgeFallback {
 		response.HostBridgeReady = true
 		response.HostBridgeEndpoint = "http://127.0.0.1:42425/l3"

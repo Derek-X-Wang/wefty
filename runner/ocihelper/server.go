@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net"
 	"os"
@@ -44,6 +45,7 @@ type ServerConfig struct {
 	AllowedUIDs           []uint32
 	AllowedMountRoots     []string
 	Clock                 Clock
+	Logf                  func(string, ...any)
 	beforeRunCreateLock   func()
 }
 
@@ -54,19 +56,25 @@ type Server struct {
 	createSweep sync.RWMutex
 	connections chan struct{}
 
-	sessionMu             sync.Mutex
-	active                *serverSession
-	listener              net.Listener
-	serveCtx              context.Context
-	fatalErr              error
-	fatalOnce             sync.Once
-	startupDone           chan struct{}
-	startupErr            error
-	nextSessionGeneration uint64
-	startupSweep          *SweepResponse
-	sessionReapSweep      *SweepResponse
-	reapedBootSessions    map[SessionIdentity]uint64
-	reapedBootSequence    uint64
+	sessionMu               sync.Mutex
+	active                  *serverSession
+	listener                net.Listener
+	serveCtx                context.Context
+	fatalErr                error
+	fatalOnce               sync.Once
+	startupDone             chan struct{}
+	startupErr              error
+	nextSessionGeneration   uint64
+	startupSweep            *SweepResponse
+	sessionReapSweep        *SweepResponse
+	lastSessionInvalidation *SessionInvalidationReceipt
+	reapedBootSessions      map[SessionIdentity]uint64
+	reapedBootSequence      uint64
+}
+
+type heartbeatRejection struct {
+	rpcErr    *RPCError
+	attemptID string
 }
 
 type attemptState string
@@ -216,6 +224,9 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 	}
 	if config.Clock == nil {
 		config.Clock = systemClock{}
+	}
+	if config.Logf == nil {
+		config.Logf = log.Printf
 	}
 	config.AllowedUIDs = slices.Clone(config.AllowedUIDs)
 	config.AllowedMountRoots = slices.Clone(config.AllowedMountRoots)
@@ -456,8 +467,9 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 			session.invalidate("invalid session heartbeat")
 			return
 		}
-		if rpcErr := session.applyHeartbeat(heartbeat.Body); rpcErr != nil {
-			_ = writeRPCError(wire, rpcErr)
+		if rejection := session.applyHeartbeat(heartbeat.Body); rejection != nil {
+			_ = writeRPCError(wire, rejection.rpcErr)
+			session.recordHeartbeatInvalidation(rejection)
 			session.invalidate("invalid session heartbeat body")
 			return
 		}
@@ -503,27 +515,27 @@ func (session *serverSession) beginOperation(parent context.Context, connection 
 	return operation, nil
 }
 
-func (session *serverSession) applyHeartbeat(raw json.RawMessage) *RPCError {
+func (session *serverSession) applyHeartbeat(raw json.RawMessage) *heartbeatRejection {
 	var heartbeat HeartbeatRequest
 	if err := decodeBody(raw, &heartbeat); err != nil {
-		return &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+		return &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: err.Error()}}
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	now := session.server.config.Clock.Now()
 	if session.closed || !now.Before(session.heartbeatDeadline) || heartbeat.Sequence <= session.sequence {
-		return &RPCError{Code: CodeSessionStale, Message: "heartbeat sequence is stale"}
+		return &heartbeatRejection{rpcErr: &RPCError{Code: CodeSessionStale, Message: "heartbeat sequence is stale"}}
 	}
 	for _, renewal := range heartbeat.RenewedAttempts {
 		if err := renewal.Authority.validate(); err != nil {
-			return &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+			return &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: err.Error()}, attemptID: renewal.Authority.AttemptID}
 		}
 		if renewal.TTL <= 0 || renewal.TTL > session.server.config.MaximumAttemptDeadman {
-			return &RPCError{Code: CodeInvalidRequest, Message: "attempt deadman TTL is outside helper bounds"}
+			return &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: "attempt deadman TTL is outside helper bounds"}, attemptID: renewal.Authority.AttemptID}
 		}
 		attempt := session.attempts[renewal.Authority.key()]
 		if attempt == nil || (attempt.state != attemptStarting && attempt.state != attemptLive) || !now.Before(attempt.deadline) || attempt.authority != renewal.Authority {
-			return &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt renewal is not owned by this session"}
+			return &heartbeatRejection{rpcErr: &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt renewal is not owned by this session"}, attemptID: renewal.Authority.AttemptID}
 		}
 		attempt.deadline = now.Add(renewal.TTL)
 		notify(attempt.deadlineChanged)
@@ -532,6 +544,20 @@ func (session *serverSession) applyHeartbeat(raw json.RawMessage) *RPCError {
 	session.heartbeatDeadline = now.Add(session.server.config.HeartbeatTimeout)
 	notify(session.heartbeatChanged)
 	return nil
+}
+
+func (session *serverSession) recordHeartbeatInvalidation(rejection *heartbeatRejection) {
+	evidence := &SessionInvalidationReceipt{
+		ObservedAt: session.server.config.Clock.Now(), SessionGeneration: session.helper.SessionGeneration,
+		AttemptID: rejection.attemptID, RejectionCode: rejection.rpcErr.Code,
+	}
+	session.server.sessionMu.Lock()
+	session.server.lastSessionInvalidation = evidence
+	session.server.sessionMu.Unlock()
+	session.server.config.Logf(
+		"OCI helper session invalidated reason=heartbeat_rejected session_generation=%d attempt_id=%q rejection_code=%s",
+		evidence.SessionGeneration, evidence.AttemptID, evidence.RejectionCode,
+	)
 }
 
 func notify(channel chan struct{}) {
@@ -1097,6 +1123,12 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		response, err := doctorEngine.DoctorStatus(operation.ctx)
+		server.sessionMu.Lock()
+		if server.lastSessionInvalidation != nil {
+			evidence := *server.lastSessionInvalidation
+			response.LastSessionInvalidation = &evidence
+		}
+		server.sessionMu.Unlock()
 		_ = writeDiagnosticResponse(wire, response, err)
 	case MethodRun:
 		var body RunRequest

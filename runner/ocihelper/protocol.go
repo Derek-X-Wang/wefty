@@ -491,26 +491,37 @@ type DiagnosticReadReceipt struct {
 	ErrorCode string                `json:"error_code,omitempty"`
 }
 
+// SessionInvalidationReceipt preserves the closed cause of the latest helper
+// session invalidated by a rejected control heartbeat. It carries no session
+// capability or raw privileged error text.
+type SessionInvalidationReceipt struct {
+	ObservedAt        time.Time `json:"observed_at"`
+	SessionGeneration uint64    `json:"session_generation"`
+	AttemptID         string    `json:"attempt_id,omitempty"`
+	RejectionCode     ErrorCode `json:"rejection_code"`
+}
+
 // DoctorStatus is the helper's read-only mechanics snapshot. It contains no
 // session capability, raw error, or mutation control and is safe to surface to
 // the operator-only node doctor.
 type DoctorStatus struct {
-	RuntimePlatform         OCIPlatform               `json:"runtime_platform"`
-	ContainerdVersion       string                    `json:"containerd_version"`
-	ContainerdRead          DiagnosticReadReceipt     `json:"containerd_read"`
-	RuncVersion             string                    `json:"runc_version"`
-	RuncVersionSource       string                    `json:"runc_version_source"`
-	RuncRead                DiagnosticReadReceipt     `json:"runc_read"`
-	AllowedMountRoots       []string                  `json:"allowed_mount_roots"`
-	MountRootsRead          DiagnosticReadReceipt     `json:"mount_roots_read"`
-	Cache                   ImageCacheStatus          `json:"cache"`
-	CacheRead               DiagnosticReadReceipt     `json:"cache_read"`
-	CacheLastErrorCode      string                    `json:"cache_last_error_code,omitempty"`
-	ComputerFirewallPresent bool                      `json:"computer_firewall_present"`
-	ComputerAttemptsLive    bool                      `json:"computer_attempts_live"`
-	ComputerFirewallRead    DiagnosticReadReceipt     `json:"computer_firewall_read"`
-	LastProfile             *ProfileReceipt           `json:"last_profile,omitempty"`
-	LastAdmission           *ResourceAdmissionReceipt `json:"last_admission,omitempty"`
+	RuntimePlatform         OCIPlatform                 `json:"runtime_platform"`
+	ContainerdVersion       string                      `json:"containerd_version"`
+	ContainerdRead          DiagnosticReadReceipt       `json:"containerd_read"`
+	RuncVersion             string                      `json:"runc_version"`
+	RuncVersionSource       string                      `json:"runc_version_source"`
+	RuncRead                DiagnosticReadReceipt       `json:"runc_read"`
+	AllowedMountRoots       []string                    `json:"allowed_mount_roots"`
+	MountRootsRead          DiagnosticReadReceipt       `json:"mount_roots_read"`
+	Cache                   ImageCacheStatus            `json:"cache"`
+	CacheRead               DiagnosticReadReceipt       `json:"cache_read"`
+	CacheLastErrorCode      string                      `json:"cache_last_error_code,omitempty"`
+	ComputerFirewallPresent bool                        `json:"computer_firewall_present"`
+	ComputerAttemptsLive    bool                        `json:"computer_attempts_live"`
+	ComputerFirewallRead    DiagnosticReadReceipt       `json:"computer_firewall_read"`
+	LastProfile             *ProfileReceipt             `json:"last_profile,omitempty"`
+	LastAdmission           *ResourceAdmissionReceipt   `json:"last_admission,omitempty"`
+	LastSessionInvalidation *SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1

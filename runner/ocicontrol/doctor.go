@@ -210,25 +210,26 @@ type DoctorLimitation struct {
 }
 
 type DoctorResponse struct {
-	Version                 int                                 `json:"version"`
-	ObservedAt              time.Time                           `json:"observed_at"`
-	HostPlatform            PlatformFacts                       `json:"host_platform"`
-	RuntimePlatform         *PlatformFacts                      `json:"runtime_platform,omitempty"`
-	Agent                   AgentFacts                          `json:"agent"`
-	Lima                    LimaDoctorFacts                     `json:"lima"`
-	Helper                  HelperDoctorFacts                   `json:"helper"`
-	Versions                VersionFacts                        `json:"versions"`
-	Probe                   ProbeDoctorFacts                    `json:"probe"`
-	Intent                  IntentDoctorFacts                   `json:"intent"`
-	Cache                   CacheDoctorFacts                    `json:"cache"`
-	Mounts                  MountDoctorFacts                    `json:"mounts"`
-	Profile                 ProfileDoctorFacts                  `json:"profile"`
-	ComputerScreenIsolation ComputerScreenIsolationDoctorFacts  `json:"computer_screen_isolation"`
-	ResourceAdmission       *ocihelper.ResourceAdmissionReceipt `json:"resource_admission,omitempty"`
-	Convergence             ConvergenceDoctorFacts              `json:"convergence"`
-	ComputerStorageRecovery ComputerStorageRecoveryFacts        `json:"computer_storage_recovery"`
-	Findings                []DiagnosticFinding                 `json:"findings"`
-	Limitations             []DoctorLimitation                  `json:"limitations"`
+	Version                 int                                   `json:"version"`
+	ObservedAt              time.Time                             `json:"observed_at"`
+	HostPlatform            PlatformFacts                         `json:"host_platform"`
+	RuntimePlatform         *PlatformFacts                        `json:"runtime_platform,omitempty"`
+	Agent                   AgentFacts                            `json:"agent"`
+	Lima                    LimaDoctorFacts                       `json:"lima"`
+	Helper                  HelperDoctorFacts                     `json:"helper"`
+	Versions                VersionFacts                          `json:"versions"`
+	Probe                   ProbeDoctorFacts                      `json:"probe"`
+	Intent                  IntentDoctorFacts                     `json:"intent"`
+	Cache                   CacheDoctorFacts                      `json:"cache"`
+	Mounts                  MountDoctorFacts                      `json:"mounts"`
+	Profile                 ProfileDoctorFacts                    `json:"profile"`
+	ComputerScreenIsolation ComputerScreenIsolationDoctorFacts    `json:"computer_screen_isolation"`
+	ResourceAdmission       *ocihelper.ResourceAdmissionReceipt   `json:"resource_admission,omitempty"`
+	LastSessionInvalidation *ocihelper.SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
+	Convergence             ConvergenceDoctorFacts                `json:"convergence"`
+	ComputerStorageRecovery ComputerStorageRecoveryFacts          `json:"computer_storage_recovery"`
+	Findings                []DiagnosticFinding                   `json:"findings"`
+	Limitations             []DoctorLimitation                    `json:"limitations"`
 }
 
 type HelperDoctorSource func(context.Context) (HelperDoctorSnapshot, error)
@@ -576,6 +577,10 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	}
 
 	runtimeStatus := snapshot.Runtime
+	if runtimeStatus.LastSessionInvalidation != nil {
+		evidence := *runtimeStatus.LastSessionInvalidation
+		report.LastSessionInvalidation = &evidence
+	}
 	platform := PlatformFacts{OS: runtimeStatus.RuntimePlatform.OS, Architecture: runtimeStatus.RuntimePlatform.Architecture, Variant: runtimeStatus.RuntimePlatform.Variant}
 	platformOK := snapshot.RuntimePlatformRecorded && platform.OS != "" && platform.Architecture != ""
 	if platformOK {
@@ -998,6 +1003,10 @@ func (report DoctorResponse) Validate() error {
 	if len(report.Limitations) != 1 || report.Limitations[0].Code != DoctorUIDLimitation || report.Limitations[0].Issue != DoctorUIDIssue || report.Limitations[0].Detail == "" {
 		return fmt.Errorf("doctor UID-isolation limitation is missing")
 	}
+	if evidence := report.LastSessionInvalidation; evidence != nil &&
+		(evidence.ObservedAt.IsZero() || evidence.SessionGeneration == 0 || evidence.RejectionCode == "") {
+		return fmt.Errorf("invalid helper session-invalidation receipt")
+	}
 	seen := make(map[string]struct{}, len(report.Findings))
 	stableCodes := make(map[string]struct{}, len(StableDoctorCodes()))
 	for _, code := range StableDoctorCodes() {
@@ -1084,6 +1093,11 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		lines = append(lines, fmt.Sprintf("RESOURCE ADMISSION\tobserved_at=%s admitted=%t failure_code=%s memory_capacity=%d memory_reserve=%d memory_committed_before=%d requested_memory=%d memory_committed_after=%d disk_committed_before=%d requested_disk=%d disk_committed_after=%d mem_total=%d mem_available=%d filesystem_available=%d computer_tmpfs_ceiling=%d warnings=%d", admission.ObservedAt.Format(time.RFC3339Nano), admission.Admitted, admission.FailureCode, admission.MemoryCapacityBytes, admission.MemoryReserveBytes, admission.MemoryCommittedBeforeBytes, admission.RequestedMemoryBytes, admission.MemoryCommittedAfterBytes, admission.DiskCommittedBeforeBytes, admission.RequestedDiskBytes, admission.DiskCommittedAfterBytes, admission.MemTotalBytes, admission.MemAvailableBytes, admission.FilesystemAvailableBytes, admission.ComputerTmpfsCeilingBytes, len(admission.Warnings)))
 	} else {
 		lines = append(lines, "RESOURCE ADMISSION\tNOT-RUN no receipt")
+	}
+	if evidence := report.LastSessionInvalidation; evidence != nil {
+		lines = append(lines, fmt.Sprintf("SESSION INVALIDATION\tobserved_at=%s session_generation=%d attempt_id=%s rejection_code=%s", evidence.ObservedAt.Format(time.RFC3339Nano), evidence.SessionGeneration, evidence.AttemptID, evidence.RejectionCode))
+	} else {
+		lines = append(lines, "SESSION INVALIDATION\tNOT-RUN no receipt")
 	}
 	if report.Lima.Applicable {
 		lines = append(lines, fmt.Sprintf("LIMA\t%s instance=%s state=%s enabled=%t recovering=%t observed_at=%s repair_count=%d reason=%s", report.Lima.Outcome, report.Lima.Facts.Instance, report.Lima.Facts.State, report.Lima.Facts.Enabled, report.Lima.Facts.Recovering, report.Lima.Facts.ObservedAt.Format(time.RFC3339Nano), report.Lima.Facts.RepairCount, report.Lima.Facts.ReasonCode))

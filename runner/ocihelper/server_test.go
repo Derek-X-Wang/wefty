@@ -2328,10 +2328,17 @@ func TestFailedSessionReapStopsHelperForFreshProcessRecovery(t *testing.T) {
 }
 
 func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
-	engine := newFakeEngine()
+	engine := &blockingWatchEngine{fakeEngine: newFakeEngine(), entered: make(chan struct{})}
 	clock := newManualClock(time.Unix(20_000, 0))
+	var logMu sync.Mutex
+	var logs []string
 	client, stop := startTestServer(t, engine, ServerConfig{
 		HeartbeatTimeout: 5 * time.Minute, MaximumAttemptDeadman: 5 * time.Minute, Clock: clock,
+		Logf: func(format string, args ...any) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
 	})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -2358,13 +2365,122 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 	clock.Advance(29 * time.Second)
 	waitFor(t, time.Second, func() bool { return engine.attemptReapCount() == 1 }, "renewed attempt deadman reap")
 
-	stale := authority
+	inflightAuthority := authority
+	inflightAuthority.JobID = "job-2"
+	inflightAuthority.AttemptID = "attempt-2"
+	inflightAuthority.FencingToken = "fence-2"
+	if _, err := session.Run(t.Context(), testRunRequest(inflightAuthority, time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- session.Watch(context.Background(), WatchRequest{Authority: inflightAuthority}, nil)
+	}()
+	<-engine.entered
+
+	stale := inflightAuthority
 	stale.FencingToken = "stale"
 	err = session.QueueAttemptRenewal(stale, time.Second)
 	if err == nil {
 		err = session.flushHeartbeat(t.Context())
 	}
-	assertRPCCode(t, err, CodeUnauthorizedAttempt)
+	if err == nil {
+		t.Fatal("stale attempt heartbeat was accepted")
+	}
+	waitFor(t, time.Second, func() bool { return session.HealthError() != nil }, "stale-attempt session invalidation")
+	select {
+	case err := <-watchDone:
+		if err == nil {
+			t.Fatal("stale attempt heartbeat invalidation closed in-flight Watch with success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale attempt heartbeat invalidation left in-flight Watch open")
+	}
+	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "stale-attempt session reap")
+
+	replacement, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	requireSweep(t, replacement)
+	status, err := replacement.DoctorStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := status.LastSessionInvalidation
+	if evidence == nil || evidence.SessionGeneration != session.Handshake().SessionGeneration ||
+		evidence.AttemptID != stale.AttemptID || evidence.RejectionCode != CodeUnauthorizedAttempt {
+		t.Fatalf("stale-attempt invalidation evidence = %+v", evidence)
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, fmt.Sprintf("session_generation=%d", evidence.SessionGeneration)) ||
+		!strings.Contains(joined, fmt.Sprintf("attempt_id=%q", stale.AttemptID)) ||
+		!strings.Contains(joined, "rejection_code=unauthorized_attempt") {
+		t.Fatalf("typed heartbeat invalidation log missing fields: %q", joined)
+	}
+}
+
+func TestAttemptDeadmanTTLAnchorsAtHeartbeatFlush(t *testing.T) {
+	t.Run("delayed flush clamps to the absolute L1 expiry", func(t *testing.T) {
+		engine := newFakeEngine()
+		clock := newManualClock(time.Unix(22_000, 0))
+		client, stop := startTestServer(t, engine, ServerConfig{
+			Clock: clock, HeartbeatTimeout: 5 * time.Minute, MaximumAttemptDeadman: 5 * time.Minute,
+		})
+		defer stop()
+		client.Now = clock.Now
+		session, err := client.OpenSession(t.Context(), testSessionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		requireSweep(t, session)
+		authority := testAuthority()
+		if _, err := session.Run(t.Context(), testRunRequest(authority, 5*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.QueueAttemptRenewalUntil(authority, clock.Now().Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(20 * time.Second)
+		if err := session.flushHeartbeat(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(40 * time.Second)
+		waitFor(t, time.Second, func() bool { return engine.attemptReapCount() == 1 }, "absolute-expiry attempt deadman reap")
+	})
+
+	t.Run("expired queued renewal is dropped", func(t *testing.T) {
+		engine := newFakeEngine()
+		clock := newManualClock(time.Unix(23_000, 0))
+		client, stop := startTestServer(t, engine, ServerConfig{
+			Clock: clock, HeartbeatTimeout: 5 * time.Minute, MaximumAttemptDeadman: 5 * time.Minute,
+		})
+		defer stop()
+		client.Now = clock.Now
+		session, err := client.OpenSession(t.Context(), testSessionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		requireSweep(t, session)
+		authority := testAuthority()
+		if _, err := session.Run(t.Context(), testRunRequest(authority, 15*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.QueueAttemptRenewalUntil(authority, clock.Now().Add(10*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(10 * time.Second)
+		if err := session.flushHeartbeat(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Second)
+		waitFor(t, time.Second, func() bool { return engine.attemptReapCount() == 1 }, "original attempt deadman reap")
+	})
 }
 
 func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
@@ -3900,6 +4016,10 @@ func (engine *blockingRemovalInventoryEngine) InventoryRemoval(ctx context.Conte
 type blockingWatchEngine struct {
 	*fakeEngine
 	entered chan struct{}
+}
+
+func (engine *blockingWatchEngine) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
+	return (&doctorEngine{fakeEngine: engine.fakeEngine}).DoctorStatus(ctx)
 }
 
 type listenerRestartEngine struct {

@@ -1144,6 +1144,13 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		// infrastructure loss eligible for the OCI pre-start retry budget.
 		return spawnResult(contract.SpawnFailureProcessRequest, err), err
 	}
+	if request.OCIHelperAdmitted != nil {
+		admitted := helperSession(session)
+		if err := request.OCIHelperAdmitted(workloadrunner.RuntimeGeneration{InstanceID: admitted.HelperInstanceID, Generation: admitted.SessionGeneration}); err != nil {
+			_ = reapAfterFailedStart(session, authority)
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+	}
 	if request.Started != nil {
 		request.Started()
 	}

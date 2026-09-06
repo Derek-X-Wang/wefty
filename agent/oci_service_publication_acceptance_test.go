@@ -853,20 +853,23 @@ type nativeAcceptanceDeadman struct {
 	observe               func(l1.Claim)
 }
 
-func (renewer nativeAcceptanceDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration) error {
+func (renewer nativeAcceptanceDeadman) QueueSuccessfulRenewal(claim l1.Claim, expiresAt time.Time, expected workloadrunner.RuntimeGeneration) error {
 	session, err := renewer.barrier.Session()
 	if err != nil {
+		return err
+	}
+	if err := ValidateAttemptDeadmanSessionGeneration(session, expected); err != nil {
 		return err
 	}
 	removalGeneration := "attempt"
 	if claim.Job.Spec.Class == contract.JobClassService {
 		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
 	}
-	err = session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
+	err = session.QueueAttemptRenewalUntil(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID, JobID: claim.Job.JobID,
 		AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
-	}, ttl)
+	}, expiresAt)
 	if err == nil && renewer.observe != nil {
 		renewer.observe(claim)
 	}

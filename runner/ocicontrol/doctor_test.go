@@ -62,7 +62,8 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 						ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", ComputerResolverAddress: "127.0.0.53",
 						ComputerDNSProxyUDP: true, ComputerDNSProxyTCP: true, ComputerDNSUpstreamAddress: "168.63.129.16", ComputerDNSUpstreamSource: "systemd_uplink", ComputerDNSUpstreamReachable: true, ComputerIPv6NATState: ocihelper.ComputerIPv6NATConfigured,
 						MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
-					LastAdmission: &ocihelper.ResourceAdmissionReceipt{ObservedAt: now.Add(-30 * time.Second), Admitted: true, MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30, MemoryCommittedBeforeBytes: 1 << 30, RequestedMemoryBytes: 1 << 30, MemoryCommittedAfterBytes: 2 << 30, MemTotalBytes: 4 << 30, MemAvailableBytes: 64 << 20, RequestedDiskBytes: 8 << 30, FilesystemAvailableBytes: 12 << 30, ComputerTmpfsCeilingBytes: 1600 << 20},
+					LastAdmission:           &ocihelper.ResourceAdmissionReceipt{ObservedAt: now.Add(-30 * time.Second), Admitted: true, MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30, MemoryCommittedBeforeBytes: 1 << 30, RequestedMemoryBytes: 1 << 30, MemoryCommittedAfterBytes: 2 << 30, MemTotalBytes: 4 << 30, MemAvailableBytes: 64 << 20, RequestedDiskBytes: 8 << 30, FilesystemAvailableBytes: 12 << 30, ComputerTmpfsCeilingBytes: 1600 << 20},
+					LastSessionInvalidation: &ocihelper.SessionInvalidationReceipt{ObservedAt: now.Add(-time.Minute), SessionGeneration: 6, AttemptID: "attempt-stale", RejectionCode: ocihelper.CodeUnauthorizedAttempt},
 				},
 				SweepReceiptRecorded: true,
 				SweepReceipt: ocihelper.VerifiedSweepReceipt{SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{
@@ -113,6 +114,9 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 		report.ComputerScreenIsolation.ComputerIPv6NATState != ocihelper.ComputerIPv6NATConfigured {
 		t.Fatalf("screen isolation fact was not receipt-derived: %+v", report.ComputerScreenIsolation)
 	}
+	if evidence := report.LastSessionInvalidation; evidence == nil || evidence.SessionGeneration != 6 || evidence.AttemptID != "attempt-stale" || evidence.RejectionCode != ocihelper.CodeUnauthorizedAttempt {
+		t.Fatalf("session invalidation fact was not receipt-derived: %+v", evidence)
+	}
 	if !slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool {
 		return item.Check == "computer-screen-isolation" && item.Code == "oci_computer_screen_isolation_enforced" && item.Outcome == DiagnosticOK
 	}) {
@@ -124,6 +128,9 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	}
 	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1 resolver=127.0.0.53 dns_proxy_udp=true dns_proxy_tcp=true dns_upstream=168.63.129.16 dns_source=systemd_uplink dns_reachable=true ipv6_nat=configured computer_firewall_present=true computer_attempts_live=true") {
 		t.Fatalf("human doctor omitted screen isolation fact:\n%s", human.String())
+	}
+	if !strings.Contains(human.String(), "SESSION INVALIDATION\tobserved_at=2026-09-04T11:59:00Z session_generation=6 attempt_id=attempt-stale rejection_code=unauthorized_attempt") {
+		t.Fatalf("human doctor omitted session invalidation fact:\n%s", human.String())
 	}
 }
 
