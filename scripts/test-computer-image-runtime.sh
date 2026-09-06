@@ -125,6 +125,7 @@ run_mutation missing-control-endpoint transport.control-ready 'control never com
 run_mutation missing-view-endpoint transport.view-ready 'view never completed rfb-websocket-v1'
 run_mutation duplicate-endpoint endpoints.distinct 'view and control received the same attempt-local port'
 run_mutation plain-tcp-control transport.plain-tcp-rejected 'endpoint accepted TCP but did not complete the required WebSocket upgrade'
+run_mutation plain-rfb-control transport.plain-tcp-rejected 'endpoint accepted TCP but did not complete the required WebSocket upgrade'
 run_mutation view-accepts-input input.view-isolated 'view pointer or key input reached the guest before the control sentinel'
 run_mutation text-frames-accepted transport.text-frame-rejected 'one endpoint violated the negative wire assertion'
 run_mutation driver-json-ignored driver.true-consumed 'tenant ignored the true driver generation'
@@ -146,4 +147,4 @@ jq -n --arg platform "linux/$arch" --argjson executed_rows "$executed_rows" \
     stage_error summary-write 'could not write mutation summary receipt'
     exit 1
   }
-"$diagnostics" summary "$mutations/summary.json" "linux/$arch" 20
+"$diagnostics" summary "$mutations/summary.json" "linux/$arch" 21

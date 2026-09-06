@@ -128,15 +128,17 @@ if [ "$mutation" != missing-view-endpoint ]; then
 fi
 if [ "$mutation" = plain-tcp-control ]; then
   start python3 -m http.server "$control_port" --bind 127.0.0.1
+elif [ "$mutation" = plain-rfb-control ]; then
+  start /usr/local/libexec/wefty-raw-rfb-listener "$control_port"
 elif [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != duplicate-endpoint ]; then
   start supervise_edge control "$control_port" "$control_socket"
 fi
 while [ "$startup_remaining" -gt 0 ]; do
-  if { [ -S "$view_socket" ] || [ "$mutation" = missing-view-endpoint ]; } && { [ -S "$control_socket" ] || [ "$mutation" = plain-tcp-control ] || [ "$mutation" = missing-control-endpoint ] || [ "$mutation" = duplicate-endpoint ]; }; then break; fi
+  if { [ -S "$view_socket" ] || [ "$mutation" = missing-view-endpoint ]; } && { [ -S "$control_socket" ] || [ "$mutation" = plain-tcp-control ] || [ "$mutation" = plain-rfb-control ] || [ "$mutation" = missing-control-endpoint ] || [ "$mutation" = duplicate-endpoint ]; }; then break; fi
   sleep 1
   startup_remaining=$((startup_remaining - 1))
 done
-if [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != missing-view-endpoint ] && [ "$mutation" != duplicate-endpoint ] && { [ ! -S "$view_socket" ] || { [ ! -S "$control_socket" ] && [ "$mutation" != plain-tcp-control ]; }; }; then
+if [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != missing-view-endpoint ] && [ "$mutation" != duplicate-endpoint ] && { [ ! -S "$view_socket" ] || { [ ! -S "$control_socket" ] && [ "$mutation" != plain-tcp-control ] && [ "$mutation" != plain-rfb-control ]; }; }; then
   echo 'RFB backends did not become ready within the 60 second startup budget' >&2
   exit 1
 fi

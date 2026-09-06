@@ -28,12 +28,35 @@ const (
 	ScopeProfile Scope = "containerd-profile"
 )
 
+type FailureReason string
+
+const (
+	FailureAssertionFailed  FailureReason = "assertion_failed"
+	FailureMutationDetected FailureReason = "mutation_detected"
+	FailureReadinessTimeout FailureReason = "readiness_timeout"
+)
+
+type ReadinessEvent string
+
+const (
+	ReadinessEventInputOracleReady     ReadinessEvent = "input_oracle_ready"
+	ReadinessEventKeyObserverAdvanced  ReadinessEvent = "key_observer_advanced"
+	ReadinessEventViewEndpointReady    ReadinessEvent = "view_endpoint_ready"
+	ReadinessEventControlEndpointReady ReadinessEvent = "control_endpoint_ready"
+	ReadinessEventFirstRFBFrame        ReadinessEvent = "first_rfb_frame"
+)
+
 type Check struct {
-	ID      string `json:"id"`
-	Scope   Scope  `json:"scope"`
-	Status  Status `json:"status"`
-	Summary string `json:"summary"`
-	Detail  string `json:"detail,omitempty"`
+	ID                                 string         `json:"id"`
+	Scope                              Scope          `json:"scope"`
+	Status                             Status         `json:"status"`
+	Summary                            string         `json:"summary"`
+	Detail                             string         `json:"detail,omitempty"`
+	FailureReason                      FailureReason  `json:"failure_reason,omitempty"`
+	ReadinessEvent                     ReadinessEvent `json:"readiness_event,omitempty"`
+	ReadinessObservationWindowSeconds  float64        `json:"readiness_observation_window_seconds,omitempty"`
+	ReadinessObservationElapsedSeconds float64        `json:"readiness_observation_elapsed_seconds,omitempty"`
+	ReadinessObservedLater             bool           `json:"readiness_observed_later,omitempty"`
 }
 
 type Receipt struct {
@@ -129,15 +152,73 @@ func NewRecorder(image, runtimeName, platform string, startedAt time.Time) *Reco
 }
 
 func (r *Recorder) Record(id string, status Status, detail string) error {
+	reason := FailureReason("")
+	if status == StatusFail {
+		reason = FailureAssertionFailed
+	}
+	return r.RecordFailure(id, status, detail, reason, "")
+}
+
+func (r *Recorder) RecordFailure(id string, status Status, detail string, reason FailureReason, event ReadinessEvent) error {
 	if status != StatusPass && status != StatusFail && status != StatusNotRun {
 		return fmt.Errorf("invalid conformance status %q", status)
+	}
+	if status == StatusFail {
+		if reason != FailureAssertionFailed && reason != FailureMutationDetected && reason != FailureReadinessTimeout {
+			return fmt.Errorf("invalid conformance failure reason %q", reason)
+		}
+		if reason == FailureReadinessTimeout && !validReadinessEventForCheck(id, event) {
+			return fmt.Errorf("readiness timeout for %q has invalid event %q", id, event)
+		}
+	} else if reason != "" || event != "" {
+		return fmt.Errorf("non-FAIL conformance check %q cannot carry failure evidence", id)
 	}
 	i, ok := r.index[id]
 	if !ok {
 		return fmt.Errorf("unknown Computer conformance check %q", id)
 	}
 	r.receipt.Checks[i].Status, r.receipt.Checks[i].Detail = status, detail
+	r.receipt.Checks[i].FailureReason, r.receipt.Checks[i].ReadinessEvent = reason, event
+	r.receipt.Checks[i].ReadinessObservationWindowSeconds = 0
+	r.receipt.Checks[i].ReadinessObservationElapsedSeconds = 0
+	r.receipt.Checks[i].ReadinessObservedLater = false
 	return nil
+}
+
+var readinessEventPairings = map[string][]ReadinessEvent{
+	"transport.view-ready":              {ReadinessEventViewEndpointReady, ReadinessEventFirstRFBFrame},
+	"transport.control-ready":           {ReadinessEventControlEndpointReady, ReadinessEventFirstRFBFrame},
+	"input.view-isolated":               {ReadinessEventInputOracleReady, ReadinessEventKeyObserverAdvanced},
+	"input.view-isolated-during-tenure": {ReadinessEventKeyObserverAdvanced},
+}
+
+func validReadinessEventForCheck(id string, event ReadinessEvent) bool {
+	return slices.Contains(readinessEventPairings[id], event)
+}
+
+func (r *Recorder) RecordReadinessTimeout(id, detail string, event ReadinessEvent, window, elapsed time.Duration) error {
+	if window <= 0 {
+		return fmt.Errorf("readiness timeout for %q has invalid observation window %s", id, window)
+	}
+	if elapsed < window {
+		return fmt.Errorf("readiness timeout for %q elapsed %s before observation window %s", id, elapsed, window)
+	}
+	if err := r.RecordFailure(id, StatusFail, detail, FailureReadinessTimeout, event); err != nil {
+		return err
+	}
+	i := r.index[id]
+	r.receipt.Checks[i].ReadinessObservationWindowSeconds = window.Seconds()
+	r.receipt.Checks[i].ReadinessObservationElapsedSeconds = elapsed.Seconds()
+	return nil
+}
+
+func (r *Recorder) ObserveReadinessEvent(event ReadinessEvent) {
+	for i := range r.receipt.Checks {
+		check := &r.receipt.Checks[i]
+		if check.FailureReason == FailureReadinessTimeout && check.ReadinessEvent == event {
+			check.ReadinessObservedLater = true
+		}
+	}
 }
 
 func (r *Recorder) Finish(finishedAt time.Time) Receipt {

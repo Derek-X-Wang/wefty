@@ -9,6 +9,7 @@ COPY --chmod=0755 examples/computer-wayland/view-proxy-fixture.py /tmp/wefty-vie
 COPY --chmod=0755 examples/computer/fixtures/entrypoint.sh /tmp/wefty-xfce-entrypoint-fixture
 COPY --chmod=0755 examples/computer/fixtures/watch-driver.py /tmp/wefty-xfce-watch-driver-fixture
 COPY --chmod=0755 examples/computer/fixtures/rfb-websocket.py /tmp/wefty-xfce-rfb-websocket-fixture
+COPY --chmod=0755 examples/computer/fixtures/raw-rfb-listener.py /tmp/wefty-raw-rfb-listener-fixture
 USER 0
 RUN if [ -d /opt/wefty-computer-wayland ]; then \
       install --mode=0755 /tmp/wefty-wayland-entrypoint-fixture /usr/local/bin/wefty-computer-wayland-entrypoint; \
@@ -19,6 +20,8 @@ RUN if [ -d /opt/wefty-computer-wayland ]; then \
       install --mode=0755 /tmp/wefty-xfce-watch-driver-fixture /usr/local/libexec/wefty-watch-driver; \
       install --mode=0755 /tmp/wefty-xfce-rfb-websocket-fixture /usr/local/libexec/wefty-rfb-websocket; \
     fi \
+    && install --mode=0755 /tmp/wefty-raw-rfb-listener-fixture /usr/local/libexec/wefty-raw-rfb-listener \
     && rm -f /tmp/wefty-wayland-entrypoint-fixture /tmp/wefty-watch-driver-fixture /tmp/wefty-view-proxy-fixture \
-      /tmp/wefty-xfce-entrypoint-fixture /tmp/wefty-xfce-watch-driver-fixture /tmp/wefty-xfce-rfb-websocket-fixture
+      /tmp/wefty-xfce-entrypoint-fixture /tmp/wefty-xfce-watch-driver-fixture /tmp/wefty-xfce-rfb-websocket-fixture \
+      /tmp/wefty-raw-rfb-listener-fixture
 USER 12000:12000

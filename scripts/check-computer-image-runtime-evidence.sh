@@ -13,7 +13,37 @@ require_receipt() {
     return 1
   fi
   if ! jq -e '
-    type == "object" and .version == 2 and (.checks | type == "array") and
+    def valid_readiness_pair:
+      (.id == "transport.view-ready" and (.readiness_event == "view_endpoint_ready" or .readiness_event == "first_rfb_frame")) or
+      (.id == "transport.control-ready" and (.readiness_event == "control_endpoint_ready" or .readiness_event == "first_rfb_frame")) or
+      (.id == "input.view-isolated" and (.readiness_event == "input_oracle_ready" or .readiness_event == "key_observer_advanced")) or
+      (.id == "input.view-isolated-during-tenure" and .readiness_event == "key_observer_advanced");
+    type == "object" and .version == 2 and
+    (.checks | type == "array" and all(.[];
+      type == "object" and (.id | type == "string") and
+      (.status == "PASS" or .status == "FAIL" or .status == "NOT-RUN") and
+      ((.detail // "") | type == "string") and
+      if .status == "FAIL" then
+        (.failure_reason == "assertion_failed" or .failure_reason == "mutation_detected" or .failure_reason == "readiness_timeout") and
+        if .failure_reason == "readiness_timeout" then
+          valid_readiness_pair and
+          (.readiness_observation_window_seconds | type == "number" and . > 0) and
+          (.readiness_observation_elapsed_seconds | type == "number") and
+          (.readiness_observation_elapsed_seconds >= .readiness_observation_window_seconds) and
+          ((.readiness_observed_later // false) | type == "boolean")
+        else
+          (has("readiness_event") | not) and
+          (has("readiness_observation_window_seconds") | not) and
+          (has("readiness_observation_elapsed_seconds") | not) and
+          (has("readiness_observed_later") | not)
+        end
+      else
+        (has("failure_reason") | not) and (has("readiness_event") | not) and
+        (has("readiness_observation_window_seconds") | not) and
+        (has("readiness_observation_elapsed_seconds") | not) and
+        (has("readiness_observed_later") | not)
+      end
+    )) and
     (.teardown | type == "object") and
     (.teardown.retries_used | type == "number" and . >= 0 and floor == .) and
     (.teardown.permission_repair_performed | type == "boolean") and
@@ -78,12 +108,34 @@ case ${1:-} in
     fi
     if ! jq -e --arg cell "$cell" --arg detail "$detail" '
       [.checks[] | select(.status == "FAIL")] as $failed |
-      ($failed | length) == 1 and $failed[0].id == $cell and $failed[0].detail == $detail
+      [$failed[] | select(.failure_reason == "mutation_detected" and .id == $cell and .detail == $detail)] as $mutation |
+      [.checks[] | select(.id == $cell)] as $expected_id |
+      [$failed[] | select(.failure_reason == "readiness_timeout" and (.id | startswith("input.")))] as $input_timeouts |
+      [.checks[] | select((.id == "input.view-isolated" or .id == "input.view-isolated-during-tenure") and .status != "NOT-RUN")] as $input_started |
+      ($mutation | length) == 1 and
+      ($expected_id | length) == 1 and
+      all($failed[];
+        (.failure_reason == "mutation_detected" and .id == $cell and .detail == $detail) or
+        .failure_reason == "readiness_timeout"
+      ) and
+      (($input_timeouts | length) == 0 or
+        (all($input_timeouts[]; .readiness_observed_later == true) and
+         ([.checks[] | select(.id == "input.control-accepted" and .status == "PASS")] | length) == 1)) and
+      (($input_started | length) == 0 or $cell == "input.view-isolated" or
+        ([.checks[] | select(.id == "input.control-accepted" and .status != "NOT-RUN")] | length) == 1)
     ' "$receipt" >/dev/null; then
       error "fail-set/$mutation" "unexpected FAIL rows after ${checker_wall_seconds}s checker wall time; expected exactly $cell"
-      jq -c '[.checks[] | select(.status == "FAIL") | {id,detail}]' "$receipt" >&2 || \
+      jq -c '[.checks[] | select(.status == "FAIL") | {id,detail,failure_reason,readiness_event}]' "$receipt" >&2 || \
         error "receipt-jq/$mutation" 'could not render unexpected FAIL rows'
       exit 1
+    fi
+    readiness_timeouts=$(jq -c '[.checks[] | select(.status == "FAIL" and .failure_reason == "readiness_timeout") | {id,readiness_event}]' "$receipt") || {
+      error "receipt-jq/$mutation" 'could not render readiness timeout rows'
+      exit 1
+    }
+    if [[ $readiness_timeouts != '[]' ]]; then
+      printf '::notice title=computer runtime conformance::readiness-timeout/%s: mutation detected with unrelated typed readiness rows %s\n' \
+        "$mutation" "$readiness_timeouts" >&2
     fi
     ;;
   summary)
