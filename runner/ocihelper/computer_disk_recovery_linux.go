@@ -25,6 +25,7 @@ const (
 	defaultComputerDiskQuarantineGCFailures = 3
 	computerOperationalDeferralRecordName   = "recovery-deferral.json"
 	computerOperationalDeferralFaultSuffix  = "-recovery-deferral-fault.json"
+	computerDiskQuarantineGCFailureSuffix   = "-quarantine-gc-failure.json"
 )
 
 var errComputerStoragePreenCorrected = errors.New("Computer Storage preen corrected filesystem errors")
@@ -674,6 +675,12 @@ func (engine *ContainerdEngine) resumeComputerStorageCopy(ctx context.Context, r
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
+		if _, err := os.Lstat(filepath.Join(root, "attachment.json")); err == nil {
+			return "", &computerDiskRecoveryRecordError{Operation: "computer_storage_copy", Storage: request.Destination,
+				Cause: errors.New("pre-publication Computer Storage copy conflicts with a published attachment")}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
 		// No destination manifest has been published in these phases. Removing
 		// the staged/premature image and operation record is an exact rollback;
 		// the immutable source remains available for a fresh copy directive.
@@ -990,6 +997,30 @@ func readAndValidateComputerDiskQuarantineReceipt(path string) (computerDiskQuar
 	return receipt, validateComputerDiskQuarantineReceipt(receipt)
 }
 
+func computerDiskQuarantineGCFailurePath(root string) string {
+	return filepath.Join(filepath.Dir(root), "."+filepath.Base(root)+computerDiskQuarantineGCFailureSuffix)
+}
+
+func readComputerDiskQuarantineGCFailure(root string) (computerDiskQuarantineReceipt, error) {
+	return readAndValidateComputerDiskQuarantineReceipt(computerDiskQuarantineGCFailurePath(root))
+}
+
+func (engine *ContainerdEngine) writeComputerDiskQuarantineReceipt(root string, payload []byte) error {
+	write := engine.computerQuarantineWrite
+	if write == nil {
+		write = writeDurableFile
+	}
+	return write(root, ".quarantine.json.tmp-", "quarantine.json", payload, 0o600)
+}
+
+func removeComputerDiskQuarantineGCFailure(root string) error {
+	path := computerDiskQuarantineGCFailurePath(root)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(root))
+}
+
 func (engine *ContainerdEngine) resumeComputerDiskQuarantine(root, name string) (bool, error) {
 	receipt, err := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(root, "quarantine.json"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -1101,9 +1132,17 @@ func (engine *ContainerdEngine) recordComputerDiskQuarantineGCFailure(root strin
 		action = SweepActionQuarantineGCEscalated
 	}
 	payload, err := json.Marshal(receipt)
-	if err != nil || writeDurableFile(root, ".quarantine.json.tmp-", "quarantine.json", payload, 0o600) != nil {
+	if err != nil {
 		return SweepActionQuarantineGCFailed
 	}
+	parent := filepath.Dir(root)
+	if err := writeDurableFile(parent, ".quarantine-gc-failure.tmp-", filepath.Base(computerDiskQuarantineGCFailurePath(root)), payload, 0o600); err != nil {
+		return SweepActionQuarantineGCFailed
+	}
+	if engine.writeComputerDiskQuarantineReceipt(root, payload) != nil {
+		return action
+	}
+	_ = removeComputerDiskQuarantineGCFailure(root)
 	return action
 }
 
@@ -1154,6 +1193,11 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 			closeComputerDiskLock(lock)
 			continue
 		}
+		if mirrored, mirrorErr := readComputerDiskQuarantineGCFailure(root); mirrorErr == nil &&
+			mirrored.Kind == receipt.Kind && mirrored.ReceiptID == receipt.ReceiptID && mirrored.DiskName == receipt.DiskName &&
+			mirrored.Storage == receipt.Storage && mirrored.GCFailures > receipt.GCFailures {
+			receipt = mirrored
+		}
 		if receipt.GCEscalatedAt != nil {
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
 				Class: RemovalResourceComputerQuarantine, ID: receipt.DiskName, Action: SweepActionRetained, Method: "quarantine_gc_escalated",
@@ -1201,14 +1245,16 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 		payload, marshalErr := json.Marshal(receipt)
 		writeErr := marshalErr
 		if writeErr == nil {
-			writeErr = writeDurableFile(root, ".quarantine.json.tmp-", "quarantine.json", payload, 0o600)
+			writeErr = engine.writeComputerDiskQuarantineReceipt(root, payload)
 		}
 		if writeErr != nil {
+			receipt.PayloadDroppedAt = nil
 			action := engine.recordComputerDiskQuarantineGCFailure(root, &receipt, "record_payload_drop", now)
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{Class: RemovalResourceComputerQuarantine, ID: receipt.DiskName, Action: action, Method: "record_payload_drop"})
 			closeComputerDiskLock(lock)
 			continue
 		}
+		_ = removeComputerDiskQuarantineGCFailure(root)
 		method := "remove_payload"
 		if receipt.Reason == "legacy_reset_quarantine" {
 			method = receipt.Reason

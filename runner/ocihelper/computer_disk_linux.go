@@ -441,6 +441,10 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 	if err != nil {
 		return err
 	}
+	quarantineEntryMatches := func(entry string) bool {
+		return entry == name || strings.HasPrefix(entry, name+"-") ||
+			strings.HasPrefix(entry, "."+name+"-") && strings.HasSuffix(entry, computerDiskQuarantineGCFailureSuffix)
+	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	var lock *os.File
 	defer func() {
@@ -519,7 +523,7 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 		return err
 	}
 	for _, entry := range quarantines {
-		if entry.Name() == name || strings.HasPrefix(entry.Name(), name+"-") {
+		if quarantineEntryMatches(entry.Name()) {
 			if err := os.RemoveAll(filepath.Join(quarantineRoot, entry.Name())); err != nil {
 				return err
 			}
@@ -542,7 +546,7 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 		return err
 	}
 	for _, entry := range quarantines {
-		if entry.Name() == name || strings.HasPrefix(entry.Name(), name+"-") {
+		if quarantineEntryMatches(entry.Name()) {
 			return errors.New("Computer disk removal left quarantine residue")
 		}
 	}
@@ -1417,7 +1421,13 @@ diskLoop:
 				closeComputerDiskLock(recoveryLock)
 				continue
 			}
-			deferred, deferredPresent, _ := engine.inspectOperationalComputerRecoveryDeferral(root, entry.Name())
+			deferred, deferredPresent, deferredReadErr := engine.inspectOperationalComputerRecoveryDeferral(root, entry.Name())
+			method := "manifest_missing"
+			if deferredReadErr != nil {
+				deferred.Recovery.Reason = "deferral_record_unreadable"
+				deferredPresent = true
+				method += ":deferral_record_unreadable"
+			}
 			quarantineErr := error(nil)
 			if deferredPresent {
 				quarantineErr = engine.quarantineComputerDiskAuthorityFailureWithDeferral(root, entry.Name(), "manifest_missing", deferred.Recovery)
@@ -1427,11 +1437,11 @@ diskLoop:
 			if quarantineErr != nil {
 				closeComputerDiskLock(recoveryLock)
 				engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence,
-					engine.resolveOperationalComputerRecoveryFailure(root, entry.Name(), "quarantine_move_failed", ComputerStorageReference{}, quarantineErr, countRecoveryAttempt))
+					engine.resolveOperationalComputerRecoveryFailure(root, entry.Name(), "quarantine_move_failed", ComputerStorageReference{}, errors.Join(deferredReadErr, quarantineErr), countRecoveryAttempt))
 				continue
 			}
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
-				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: "manifest_missing",
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: method,
 			})
 			closeComputerDiskLock(recoveryLock)
 			continue
