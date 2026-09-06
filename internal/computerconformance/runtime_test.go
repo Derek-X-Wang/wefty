@@ -83,6 +83,7 @@ func assertStartKeyCauseIsAssertion(t *testing.T, protocol string, frames [][]by
 		for _, payload := range frames {
 			_, _ = connection.Write(append([]byte{0x82, byte(len(payload))}, payload...))
 		}
+		_, _ = io.Copy(io.Discard, connection)
 	})
 	defer closeListener()
 	runner := runtimeRunner{
