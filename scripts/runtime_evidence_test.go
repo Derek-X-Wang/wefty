@@ -4,10 +4,71 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestReadinessEventVocabularyMatchesGoAndJQ(t *testing.T) {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not resolve runtime_evidence_test.go path")
+	}
+	repositoryRoot := filepath.Dir(filepath.Dir(source))
+	read := func(relative string) string {
+		t.Helper()
+		payload, err := os.ReadFile(filepath.Join(repositoryRoot, relative))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(payload)
+	}
+	extract := func(pattern, payload string) map[string]bool {
+		t.Helper()
+		values := make(map[string]bool)
+		for _, match := range regexp.MustCompile(pattern).FindAllStringSubmatch(payload, -1) {
+			values[match[1]] = true
+		}
+		return values
+	}
+	goEvents := extract(`ReadinessEvent[A-Za-z]+\s+ReadinessEvent\s+=\s+"([^"]+)"`, read("internal/computerconformance/receipt.go"))
+	jqEvents := extract(`\.readiness_event\s*==\s*"([^"]+)"`, read("scripts/check-computer-image-runtime-evidence.sh"))
+	if len(goEvents) != len(jqEvents) {
+		t.Fatalf("readiness vocabulary sizes differ: Go=%v jq=%v", goEvents, jqEvents)
+	}
+	for event := range goEvents {
+		if !jqEvents[event] {
+			t.Fatalf("Go readiness event %q is missing from jq validation: Go=%v jq=%v", event, goEvents, jqEvents)
+		}
+	}
+
+	allowed := map[string]map[string]bool{
+		"transport.view-ready":              {"view_endpoint_ready": true, "first_rfb_frame": true},
+		"transport.control-ready":           {"control_endpoint_ready": true, "first_rfb_frame": true},
+		"input.view-isolated":               {"input_oracle_ready": true, "key_observer_advanced": true},
+		"input.view-isolated-during-tenure": {"key_observer_advanced": true},
+	}
+	temp := t.TempDir()
+	for checkID, events := range allowed {
+		for event := range goEvents {
+			path := filepath.Join(temp, strings.ReplaceAll(checkID+"-"+event, ".", "-")+".json")
+			payload := `{"version":2,"checks":[` +
+				`{"id":"persistence.edge-recovers","status":"FAIL","detail":"expected","failure_reason":"mutation_detected"},` +
+				`{"id":"` + checkID + `","status":"FAIL","detail":"late","failure_reason":"readiness_timeout","readiness_event":"` + event + `","readiness_observation_window_seconds":1.5,"readiness_observation_elapsed_seconds":1.5,"readiness_observed_later":true},` +
+				`{"id":"input.control-accepted","status":"PASS","detail":"observed"}],` +
+				`"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}}`
+			if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("bash", filepath.Join(repositoryRoot, "scripts/check-computer-image-runtime-evidence.sh"), "mutation", path, "edge-does-not-recover", "persistence.edge-recovers", "expected", "1", "3")
+			_, err := command.CombinedOutput()
+			if (err == nil) != events[event] {
+				t.Fatalf("jq readiness pairing %s -> %s accepted=%t, want %t: %v", checkID, event, err == nil, events[event], err)
+			}
+		}
+	}
+}
 
 func TestRuntimeEvidenceDiagnosticsNameEveryTerminalFailure(t *testing.T) {
 	temp := t.TempDir()
@@ -77,11 +138,16 @@ func TestRuntimeEvidenceReplaysIssue320ReadinessRows(t *testing.T) {
 		}
 		return path
 	}
-	mutation := func(name, expectedID, expectedDetail, readinessID, readinessEvent string) {
+	mutation := func(name, expectedID, expectedDetail, readinessID, readinessEvent string, observedLater bool) {
 		t.Helper()
+		recovered := ""
+		if observedLater {
+			recovered = `,"readiness_observed_later":true`
+		}
 		checks := `[` +
 			`{"id":"` + expectedID + `","status":"FAIL","detail":"` + expectedDetail + `","failure_reason":"mutation_detected"},` +
-			`{"id":"` + readinessID + `","status":"FAIL","detail":"readiness event was not observed","failure_reason":"readiness_timeout","readiness_event":"` + readinessEvent + `"}` +
+			`{"id":"` + readinessID + `","status":"FAIL","detail":"readiness event was not observed","failure_reason":"readiness_timeout","readiness_event":"` + readinessEvent + `","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625` + recovered + `},` +
+			`{"id":"input.control-accepted","status":"PASS","detail":"control input observed"}` +
 			`]`
 		receipt := write(name, checks)
 		command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", receipt, name, expectedID, expectedDetail, "1", "29")
@@ -94,9 +160,12 @@ func TestRuntimeEvidenceReplaysIssue320ReadinessRows(t *testing.T) {
 		}
 	}
 
-	mutation("profile-state-lost", "persistence.profile-survives", "profile marker under HOME was lost", "input.view-isolated-during-tenure", "key_observer_advanced")
-	mutation("edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "input.view-isolated-during-tenure", "key_observer_advanced")
-	mutation("missing-control-endpoint", "transport.control-ready", "control never completed rfb-websocket-v1", "transport.plain-tcp-rejected", "first_rfb_frame")
+	// These are post-fix projections of the four recorded rows: receipt v1 did
+	// not carry failure reasons, readiness pairings, observation timing, or
+	// later-event recovery evidence, so the literal artifacts remain invalid.
+	mutation("profile-state-lost", "persistence.profile-survives", "profile marker under HOME was lost", "input.view-isolated-during-tenure", "key_observer_advanced", true)
+	mutation("edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "input.view-isolated-during-tenure", "key_observer_advanced", true)
+	mutation("missing-control-endpoint", "transport.control-ready", "control never completed rfb-websocket-v1", "transport.control-ready", "first_rfb_frame", false)
 
 	positive := write("pr-323-positive", `[{"id":"input.view-isolated-during-tenure","status":"FAIL","detail":"key observer did not advance after the control liveness keystroke (key_events=2 observer_lines=0)","failure_reason":"readiness_timeout","readiness_event":"key_observer_advanced"}]`)
 	positivePayload, err := os.ReadFile(positive)
@@ -118,6 +187,44 @@ func TestRuntimeEvidenceReplaysIssue320ReadinessRows(t *testing.T) {
 	command = exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", wrong, "profile-state-lost", "persistence.profile-survives", "profile marker under HOME was lost", "1", "29")
 	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "fail-set/profile-state-lost") {
 		t.Fatalf("synthetic wrong fail-set did not fail closed: err=%v output=%s", err, output)
+	}
+}
+
+func TestMutationEvidenceClosesEveryReadinessMaskingBranch(t *testing.T) {
+	temp := t.TempDir()
+	teardown := `"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}`
+	run := func(name, checks string) error {
+		t.Helper()
+		path := filepath.Join(temp, name+".json")
+		if err := os.WriteFile(path, []byte(`{"version":2,"checks":`+checks+`,`+teardown+`}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", path, "edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "1", "29")
+		_, err := command.CombinedOutput()
+		return err
+	}
+	expected := `{"id":"persistence.edge-recovers","status":"FAIL","detail":"both endpoints did not recover after edge withdrawal","failure_reason":"mutation_detected"}`
+	inputTimeout := `{"id":"input.view-isolated-during-tenure","status":"FAIL","detail":"late","failure_reason":"readiness_timeout","readiness_event":"key_observer_advanced","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625}`
+	controlPass := `{"id":"input.control-accepted","status":"PASS","detail":"observed"}`
+
+	for name, checks := range map[string]string{
+		"unrecovered input timeout":    `[` + expected + `,` + inputTimeout + `,` + controlPass + `]`,
+		"control not run":              `[` + expected + `,` + strings.Replace(inputTimeout, `}`, `,"readiness_observed_later":true}`, 1) + `,{"id":"input.control-accepted","status":"NOT-RUN","detail":"unavailable"}]`,
+		"adjacent control not run":     `[` + expected + `,{"id":"input.view-isolated","status":"PASS","detail":"observed"},{"id":"input.control-accepted","status":"NOT-RUN","detail":"unavailable"}]`,
+		"duplicate expected assertion": `[` + expected + `,{"id":"persistence.edge-recovers","status":"FAIL","detail":"both endpoints did not recover after edge withdrawal","failure_reason":"assertion_failed"}]`,
+		"owning reason deleted":        `[{"id":"persistence.edge-recovers","status":"FAIL","detail":"both endpoints did not recover after edge withdrawal","failure_reason":"assertion_failed"}]`,
+		"invalid check event pairing":  `[` + expected + `,{"id":"input.view-isolated-during-tenure","status":"FAIL","detail":"late","failure_reason":"readiness_timeout","readiness_event":"first_rfb_frame","readiness_observation_window_seconds":1.5,"readiness_observation_elapsed_seconds":1.5,"readiness_observed_later":true},` + controlPass + `]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := run(name, checks); err == nil {
+				t.Fatal("malformed mutation evidence passed")
+			}
+		})
+	}
+
+	recovered := strings.Replace(inputTimeout, `}`, `,"readiness_observed_later":true}`, 1)
+	if err := run("recovered-input-timeout", `[`+expected+`,`+recovered+`,`+controlPass+`]`); err != nil {
+		t.Fatalf("closed recovered readiness evidence was rejected: %v", err)
 	}
 }
 

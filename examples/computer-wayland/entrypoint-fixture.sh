@@ -159,6 +159,8 @@ elif [ "$mutation" != missing-view-endpoint ]; then
 fi
 if [ "$mutation" = plain-tcp-control ]; then
   start python3 -m http.server "$control_port" --bind 127.0.0.1
+elif [ "$mutation" = plain-rfb-control ]; then
+  start /usr/local/libexec/wefty-raw-rfb-listener "$control_port"
 elif [ -n "$mutation" ] && [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != duplicate-endpoint ] && [ "$mutation" != view-accepts-input ]; then
   start supervise_edge control "$control_port"
 fi

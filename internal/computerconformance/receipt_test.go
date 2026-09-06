@@ -101,6 +101,56 @@ func TestUnknownCheckAndStatusFailClosed(t *testing.T) {
 	}
 }
 
+func TestReadinessTimeoutCheckEventPairingsAreClosed(t *testing.T) {
+	valid := map[string][]ReadinessEvent{
+		"transport.view-ready":              {ReadinessEventViewEndpointReady, ReadinessEventFirstRFBFrame},
+		"transport.control-ready":           {ReadinessEventControlEndpointReady, ReadinessEventFirstRFBFrame},
+		"input.view-isolated":               {ReadinessEventInputOracleReady, ReadinessEventKeyObserverAdvanced},
+		"input.view-isolated-during-tenure": {ReadinessEventKeyObserverAdvanced},
+	}
+	allEvents := []ReadinessEvent{
+		ReadinessEventInputOracleReady,
+		ReadinessEventKeyObserverAdvanced,
+		ReadinessEventViewEndpointReady,
+		ReadinessEventControlEndpointReady,
+		ReadinessEventFirstRFBFrame,
+	}
+	for _, definition := range CheckCatalog {
+		allowed := valid[definition.ID]
+		for _, event := range allEvents {
+			want := false
+			for _, candidate := range allowed {
+				want = want || candidate == event
+			}
+			recorder := NewRecorder("image", "docker", "linux/arm64", time.Unix(100, 0))
+			err := recorder.RecordReadinessTimeout(definition.ID, "late", event, 1500*time.Millisecond, 1625*time.Millisecond)
+			if (err == nil) != want {
+				t.Fatalf("readiness pairing %s -> %s accepted=%t, want %t: %v", definition.ID, event, err == nil, want, err)
+			}
+		}
+	}
+}
+
+func TestReadinessTimeoutRequiresMeasuredWindowAndLaterObservationIsMonotonic(t *testing.T) {
+	recorder := NewRecorder("image", "docker", "linux/arm64", time.Unix(100, 0))
+	if err := recorder.RecordReadinessTimeout("input.view-isolated", "late", ReadinessEventKeyObserverAdvanced, 2*time.Second, time.Second); err == nil {
+		t.Fatal("elapsed observation shorter than its applied window was accepted")
+	}
+	if err := recorder.RecordReadinessTimeout("input.view-isolated", "late", ReadinessEventKeyObserverAdvanced, 1500*time.Millisecond, 1625*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	recorder.ObserveReadinessEvent(ReadinessEventKeyObserverAdvanced)
+	check := recorder.Finish(time.Unix(101, 0)).Checks[0]
+	for _, candidate := range recorder.Finish(time.Unix(101, 0)).Checks {
+		if candidate.ID == "input.view-isolated" {
+			check = candidate
+		}
+	}
+	if !check.ReadinessObservedLater || check.ReadinessObservationWindowSeconds != 1.5 || check.ReadinessObservationElapsedSeconds != 1.625 {
+		t.Fatalf("readiness observation evidence = %+v", check)
+	}
+}
+
 func TestObservedCompatibilityFailsClosedWhenCatalogIDIsMissing(t *testing.T) {
 	recorder := NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0))
 	for _, definition := range CheckCatalog {

@@ -13,6 +13,11 @@ require_receipt() {
     return 1
   fi
   if ! jq -e '
+    def valid_readiness_pair:
+      (.id == "transport.view-ready" and (.readiness_event == "view_endpoint_ready" or .readiness_event == "first_rfb_frame")) or
+      (.id == "transport.control-ready" and (.readiness_event == "control_endpoint_ready" or .readiness_event == "first_rfb_frame")) or
+      (.id == "input.view-isolated" and (.readiness_event == "input_oracle_ready" or .readiness_event == "key_observer_advanced")) or
+      (.id == "input.view-isolated-during-tenure" and .readiness_event == "key_observer_advanced");
     type == "object" and .version == 2 and
     (.checks | type == "array" and all(.[];
       type == "object" and (.id | type == "string") and
@@ -21,14 +26,22 @@ require_receipt() {
       if .status == "FAIL" then
         (.failure_reason == "assertion_failed" or .failure_reason == "mutation_detected" or .failure_reason == "readiness_timeout") and
         if .failure_reason == "readiness_timeout" then
-          (.readiness_event == "input_oracle_ready" or .readiness_event == "key_observer_advanced" or
-           .readiness_event == "view_endpoint_ready" or .readiness_event == "control_endpoint_ready" or
-           .readiness_event == "first_rfb_frame")
+          valid_readiness_pair and
+          (.readiness_observation_window_seconds | type == "number" and . > 0) and
+          (.readiness_observation_elapsed_seconds | type == "number") and
+          (.readiness_observation_elapsed_seconds >= .readiness_observation_window_seconds) and
+          ((.readiness_observed_later // false) | type == "boolean")
         else
-          has("readiness_event") | not
+          (has("readiness_event") | not) and
+          (has("readiness_observation_window_seconds") | not) and
+          (has("readiness_observation_elapsed_seconds") | not) and
+          (has("readiness_observed_later") | not)
         end
       else
-        (has("failure_reason") | not) and (has("readiness_event") | not)
+        (has("failure_reason") | not) and (has("readiness_event") | not) and
+        (has("readiness_observation_window_seconds") | not) and
+        (has("readiness_observation_elapsed_seconds") | not) and
+        (has("readiness_observed_later") | not)
       end
     )) and
     (.teardown | type == "object") and
@@ -95,9 +108,19 @@ case ${1:-} in
     fi
     if ! jq -e --arg cell "$cell" --arg detail "$detail" '
       [.checks[] | select(.status == "FAIL")] as $failed |
-      [$failed[] | select(.id == $cell and .detail == $detail and .failure_reason == "mutation_detected")] as $mutation |
-      [$failed[] | select(.id != $cell or .detail != $detail) | select(.failure_reason != "readiness_timeout" or ((.readiness_event // "") | length) == 0)] as $unrelated |
-      ($mutation | length) == 1 and ($unrelated | length) == 0
+      [$failed[] | select(.failure_reason == "mutation_detected" and .id == $cell and .detail == $detail)] as $mutation |
+      [$failed[] | select(.failure_reason == "readiness_timeout" and (.id | startswith("input.")))] as $input_timeouts |
+      [.checks[] | select((.id == "input.view-isolated" or .id == "input.view-isolated-during-tenure") and .status != "NOT-RUN")] as $input_started |
+      ($mutation | length) == 1 and
+      all($failed[];
+        (.failure_reason == "mutation_detected" and .id == $cell and .detail == $detail) or
+        .failure_reason == "readiness_timeout"
+      ) and
+      (($input_timeouts | length) == 0 or
+        (all($input_timeouts[]; .readiness_observed_later == true) and
+         ([.checks[] | select(.id == "input.control-accepted" and .status == "PASS")] | length) == 1)) and
+      (($input_started | length) == 0 or $cell == "input.view-isolated" or
+        ([.checks[] | select(.id == "input.control-accepted" and .status != "NOT-RUN")] | length) == 1)
     ' "$receipt" >/dev/null; then
       error "fail-set/$mutation" "unexpected FAIL rows after ${checker_wall_seconds}s checker wall time; expected exactly $cell"
       jq -c '[.checks[] | select(.status == "FAIL") | {id,detail,failure_reason,readiness_event}]' "$receipt" >&2 || \

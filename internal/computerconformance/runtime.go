@@ -22,6 +22,7 @@ import (
 const (
 	missingEndpointObservationWindow = 15 * time.Second
 	driverObservationInterval        = 250 * time.Millisecond
+	legacyInputObserverWindow        = 3 * 4 * 125 * time.Millisecond
 	// driverObservationSleepBudget bounds only scheduled sleeps. Each phase
 	// also performs up to 40 runtime exec round-trips; attach plus mutation can
 	// therefore take twice this sleep budget plus runtime latency.
@@ -221,6 +222,7 @@ var mutationFailureCells = map[string]string{
 	"missing-view-endpoint":           "transport.view-ready",
 	"duplicate-endpoint":              "endpoints.distinct",
 	"plain-tcp-control":               "transport.plain-tcp-rejected",
+	"plain-rfb-control":               "transport.plain-tcp-rejected",
 	"view-accepts-input":              "input.view-isolated",
 	"text-frames-accepted":            "transport.text-frame-rejected",
 	"driver-json-ignored":             "driver.true-consumed",
@@ -336,14 +338,18 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 }
 
 func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, restart bool) error {
-	viewReady, controlReady, plainTCP := false, false, false
+	viewReady, controlReady := false, false
+	viewPlainTCP, controlPlainTCP := false, false
+	viewEvent, controlEvent := ReadinessEventViewEndpointReady, ReadinessEventControlEndpointReady
 	var viewProbeErr, controlProbeErr error
 	for BeforeReadinessDeadline(r.config.Now(), startedAt) {
 		if !viewReady {
-			viewReady, plainTCP, viewProbeErr = r.probeReady(ctx, r.viewPort, plainTCP)
+			viewReady, viewEvent, viewProbeErr = r.probeReady(ctx, r.viewPort, viewEvent)
+			viewPlainTCP = viewPlainTCP || probeProvesPlainTCP(ctx, r.viewPort, viewProbeErr)
 		}
 		if !controlReady {
-			controlReady, plainTCP, controlProbeErr = r.probeReady(ctx, r.controlPort, plainTCP)
+			controlReady, controlEvent, controlProbeErr = r.probeReady(ctx, r.controlPort, controlEvent)
+			controlPlainTCP = controlPlainTCP || probeProvesPlainTCP(ctx, r.controlPort, controlProbeErr)
 		}
 		if viewReady && controlReady {
 			r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
@@ -360,14 +366,14 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= missingEndpointObservationWindow {
 			break
 		}
-		if plainTCP && viewReady {
+		if viewPlainTCP || controlPlainTCP || probeAssertionFailed(viewProbeErr) || probeAssertionFailed(controlProbeErr) {
 			break
 		}
 		if err := r.config.Sleep(ctx, 250*time.Millisecond); err != nil {
 			return err
 		}
 	}
-	if plainTCP {
+	if viewPlainTCP || controlPlainTCP {
 		r.record("transport.plain-tcp-rejected", StatusFail, "endpoint accepted TCP but did not complete the required WebSocket upgrade")
 		return errors.New("plain TCP is not rfb-websocket-v1 readiness")
 	}
@@ -375,8 +381,24 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 		r.record("readiness.before-deadline", StatusFail, "endpoint pair was not ready before t0 + 60s")
 		return errors.New("Computer startup readiness timeout")
 	}
+	if probeProtocolFailed(viewProbeErr) {
+		r.record("transport.view-ready", StatusFail, r.runtimeDetail("view violated rfb-websocket-v1", viewProbeErr))
+		return fmt.Errorf("view endpoint protocol failure: %w", viewProbeErr)
+	}
+	if probeProtocolFailed(controlProbeErr) {
+		r.record("transport.control-ready", StatusFail, r.runtimeDetail("control violated rfb-websocket-v1", controlProbeErr))
+		return fmt.Errorf("control endpoint protocol failure: %w", controlProbeErr)
+	}
+	observationWindow := contract.ComputerStartupReadinessTimeout
+	if r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint" {
+		observationWindow = missingEndpointObservationWindow
+	}
+	observationElapsed := r.config.Now().Sub(startedAt)
+	if observationElapsed < observationWindow {
+		observationElapsed = observationWindow
+	}
 	if !viewReady {
-		r.recordReadinessTimeout("transport.view-ready", "view never completed rfb-websocket-v1", ReadinessEventViewEndpointReady)
+		r.recordReadinessTimeout("transport.view-ready", "view never completed rfb-websocket-v1", viewEvent, observationWindow, observationElapsed)
 		if viewProbeErr != nil {
 			return fmt.Errorf("view endpoint readiness timeout: %w", viewProbeErr)
 		}
@@ -384,7 +406,7 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 	}
 	r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
 	if !controlReady {
-		r.recordReadinessTimeout("transport.control-ready", "control never completed rfb-websocket-v1", ReadinessEventControlEndpointReady)
+		r.recordReadinessTimeout("transport.control-ready", "control never completed rfb-websocket-v1", controlEvent, observationWindow, observationElapsed)
 		if controlProbeErr != nil {
 			return fmt.Errorf("control endpoint readiness timeout: %w", controlProbeErr)
 		}
@@ -393,17 +415,49 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 	return errors.New("Computer startup readiness timeout")
 }
 
-func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool) (bool, bool, error) {
+func (r *runtimeRunner) probeReady(ctx context.Context, port int, pendingEvent ReadinessEvent) (bool, ReadinessEvent, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	connection, err := OpenRFB(probeCtx, port, contract.ComputerDisplayWebSocketPath)
 	if err == nil {
 		connection.close()
-		return true, plainSeen, nil
+		return true, pendingEvent, nil
 	}
+	var firstFrame *rfbFirstFrameReadError
+	if errors.As(err, &firstFrame) {
+		pendingEvent = ReadinessEventFirstRFBFrame
+	}
+	return false, pendingEvent, err
+}
+
+func probeAssertionFailed(err error) bool {
 	var rejected *rfbUpgradeRejectedError
-	plainSeen = plainSeen || errors.As(err, &rejected)
-	return false, plainSeen, err
+	var protocol *rfbProtocolError
+	return errors.As(err, &rejected) || errors.As(err, &protocol)
+}
+
+func probeProtocolFailed(err error) bool {
+	var protocol *rfbProtocolError
+	return errors.As(err, &protocol)
+}
+
+func probeProvesPlainTCP(ctx context.Context, port int, err error) bool {
+	var rejected *rfbUpgradeRejectedError
+	if errors.As(err, &rejected) {
+		return true
+	}
+	var incomplete *websocketUpgradeIncompleteError
+	return errors.As(err, &incomplete) && rawTCPAccepted(ctx, port)
+}
+
+func rawTCPAccepted(ctx context.Context, port int) bool {
+	dialer := net.Dialer{Timeout: 250 * time.Millisecond}
+	connection, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = connection.Close()
+	return true
 }
 
 // BeforeReadinessDeadline is the publication edge shared by runtime polling
@@ -776,17 +830,23 @@ type inputObservation struct {
 	ObserverLines  *uint64  `json:"observer_lines,omitempty"`
 }
 
-func (r *runtimeRunner) waitInputReady(ctx context.Context) bool {
+func (r *runtimeRunner) waitInputReady(ctx context.Context) (bool, time.Duration, time.Duration, error) {
+	const window = 400 * 125 * time.Millisecond
+	startedAt := r.config.Now()
 	for attempt := 0; attempt < 400; attempt++ {
 		observation, err := r.readInputObservation(ctx)
 		if err == nil && (observation.Ready == nil || *observation.Ready) {
-			return true
+			return true, window, r.config.Now().Sub(startedAt), nil
 		}
-		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-			return false
+		if err := r.config.Sleep(ctx, 125*time.Millisecond); err != nil {
+			return false, window, r.config.Now().Sub(startedAt), err
 		}
 	}
-	return false
+	elapsed := r.config.Now().Sub(startedAt)
+	if elapsed < window {
+		elapsed = window
+	}
+	return false, window, elapsed, nil
 }
 
 func (r *runtimeRunner) readInputObservation(ctx context.Context) (inputObservation, error) {
@@ -845,61 +905,49 @@ func inputObserverLines(observation inputObservation) uint64 {
 	return *observation.ObserverLines
 }
 
-func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inputObservation, session *InputSession) (inputObservation, bool) {
+func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inputObservation, session *InputSession) (inputObservation, bool, time.Duration, time.Duration, error) {
 	last := inputObservation{}
 	// wayvnc can create a new client's virtual keyboard after its first RFB
 	// messages arrive. Reuse that established client while proving liveness so
 	// a cold-start discard cannot look like a dead guest observer.
-	if budget, dynamic := r.readinessEventObservationBudget(); dynamic {
-		deadline := r.config.Now().Add(budget)
-		for dispatch := 0; r.config.Now().Before(deadline); dispatch++ {
-			for poll := 0; poll < 4 && r.config.Now().Before(deadline); poll++ {
-				value, err := r.readInputObservation(ctx)
-				if err == nil {
-					last = value
-					if inputObserverAdvanced(before, value) {
-						return value, true
-					}
-				}
-				if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-					return last, false
-				}
-			}
-			if r.config.Now().Before(deadline) && session.SendKey() != nil {
-				return last, false
-			}
-		}
-		return last, false
-	}
-	for dispatch := 0; dispatch < 3; dispatch++ {
-		for poll := 0; poll < 4; poll++ {
+	window := r.readinessEventObservationBudget()
+	startedAt := r.config.Now()
+	deadline := startedAt.Add(window)
+	for r.config.Now().Before(deadline) {
+		for poll := 0; poll < 4 && r.config.Now().Before(deadline); poll++ {
 			value, err := r.readInputObservation(ctx)
 			if err == nil {
 				last = value
 				if inputObserverAdvanced(before, value) {
-					return value, true
+					return value, true, window, r.config.Now().Sub(startedAt), nil
 				}
 			}
-			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-				return last, false
+			if err := r.config.Sleep(ctx, 125*time.Millisecond); err != nil {
+				return last, false, window, r.config.Now().Sub(startedAt), err
 			}
 		}
-		if dispatch < 2 && session.SendKey() != nil {
-			return last, false
+		if r.config.Now().Before(deadline) {
+			if err := session.SendKey(); err != nil {
+				return last, false, window, r.config.Now().Sub(startedAt), err
+			}
 		}
 	}
-	return last, false
+	elapsed := r.config.Now().Sub(startedAt)
+	if elapsed < window {
+		elapsed = window
+	}
+	return last, false, window, elapsed, nil
 }
 
-func (r *runtimeRunner) readinessEventObservationBudget() (time.Duration, bool) {
+func (r *runtimeRunner) readinessEventObservationBudget() time.Duration {
 	if r.config.Platform != "linux/arm64" || r.firstBootReadiness <= 0 {
-		return 0, false
+		return legacyInputObserverWindow
 	}
 	// The current arm64/QEMU run supplies the measurement. Two observed startup
 	// intervals give an event that lags endpoint publication one full startup
 	// cycle to arrive, without changing native/amd64 polling or using a fixed
 	// emulation timeout.
-	return 2 * r.firstBootReadiness, true
+	return max(legacyInputObserverWindow, 2*r.firstBootReadiness)
 }
 
 func (r *runtimeRunner) sendControlInput(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
@@ -937,6 +985,9 @@ func (r *runtimeRunner) sendControlInput(ctx context.Context, after uint64, x, y
 		}
 		session.Close()
 		if keyObserved {
+			if inputObserverAdvanced(observation, last) {
+				r.observeReadinessEvent(ReadinessEventKeyObserverAdvanced)
+			}
 			return last, true
 		}
 	}
@@ -956,21 +1007,45 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 			return false
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		probeStartedAt := r.config.Now()
+		probeWindow := 10 * time.Second
+		probeDeadline, hasProbeDeadline := probeCtx.Deadline()
+		if hasProbeDeadline {
+			probeWindow = time.Until(probeDeadline)
+		}
 		observerSession, err := StartKey(probeCtx, r.controlPort)
+		deadlineExpired := errors.Is(probeCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
+		var networkError net.Error
+		if !deadlineExpired && hasProbeDeadline && errors.As(err, &networkError) && networkError.Timeout() {
+			deadlineExpired = !time.Now().Before(probeDeadline)
+		}
 		cancel()
 		if err != nil {
 			if observerSession != nil {
 				observerSession.Close()
 			}
-			r.recordReadinessTimeout(id, "key observer liveness control keystroke could not be sent", ReadinessEventKeyObserverAdvanced)
+			if deadlineExpired {
+				elapsed := r.config.Now().Sub(probeStartedAt)
+				if elapsed < probeWindow {
+					elapsed = probeWindow
+				}
+				r.recordReadinessTimeout(id, "key observer liveness control keystroke could not be sent", ReadinessEventKeyObserverAdvanced, probeWindow, elapsed)
+			} else {
+				r.record(id, StatusFail, r.runtimeDetail("key observer liveness RFB negotiation failed", err))
+			}
 			return false
 		}
-		observer, observerLive := r.waitInputObserverAdvance(ctx, before, observerSession)
+		observer, observerLive, window, elapsed, observerErr := r.waitInputObserverAdvance(ctx, before, observerSession)
 		observerSession.Close()
-		if !observerLive {
-			r.recordReadinessTimeout(id, fmt.Sprintf("key observer did not advance after the control liveness keystroke (key_events=%d observer_lines=%d)", observer.KeyEvents, inputObserverLines(observer)), ReadinessEventKeyObserverAdvanced)
+		if observerErr != nil {
+			r.record(id, StatusFail, r.runtimeDetail("key observer liveness probe failed", observerErr))
 			return false
 		}
+		if !observerLive {
+			r.recordReadinessTimeout(id, fmt.Sprintf("key observer did not advance after the control liveness keystroke (key_events=%d observer_lines=%d)", observer.KeyEvents, inputObserverLines(observer)), ReadinessEventKeyObserverAdvanced, window, elapsed)
+			return false
+		}
+		r.observeReadinessEvent(ReadinessEventKeyObserverAdvanced)
 		before = observer
 		probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
 		viewSession, err := StartInput(probeCtx, r.viewPort, x, y)
@@ -1044,25 +1119,38 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	if !r.requireTools(ids, "cat") {
 		return
 	}
-	if !r.waitInputReady(ctx) {
-		r.recordReadinessTimeout(ids[0], "guest input observer did not become ready", ReadinessEventInputOracleReady)
+	defer r.finalizeInputReadinessTimeouts()
+	inputReady, window, elapsed, waitErr := r.waitInputReady(ctx)
+	if waitErr != nil {
+		r.record(ids[0], StatusFail, r.runtimeDetail("guest input observer wait failed", waitErr))
 		return
 	}
-	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
+	if !inputReady {
+		r.recordReadinessTimeout(ids[0], "guest input observer did not become ready", ReadinessEventInputOracleReady, window, elapsed)
 		return
+	}
+	r.observeReadinessEvent(ReadinessEventInputOracleReady)
+	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
+		if !r.checkHasReadinessTimeout(ids[0]) {
+			return
+		}
 	}
 	if !r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, "valid", true).OK() {
 		r.record(ids[1], StatusNotRun, "driver tenure oracle was unavailable")
 		r.record(ids[2], StatusNotRun, "driver tenure oracle was unavailable")
+		r.failed = true
 		return
 	}
 	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 477) {
-		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
-		return
+		if !r.checkHasReadinessTimeout(ids[1]) {
+			_ = r.writeDriver(`{"version":1,"human_driving":false}`)
+			return
+		}
 	}
 	before, err := r.readInputObservation(ctx)
 	if err != nil {
 		r.record(ids[2], StatusNotRun, "input oracle was unavailable")
+		r.failed = true
 		return
 	}
 	controlObservation, controlObserved := r.sendControlInput(ctx, before.Generation, 1103, 389)
@@ -1338,13 +1426,32 @@ func (r *runtimeRunner) record(id string, status Status, detail string) {
 	}
 }
 
-func (r *runtimeRunner) recordReadinessTimeout(id, detail string, event ReadinessEvent) {
+func (r *runtimeRunner) recordReadinessTimeout(id, detail string, event ReadinessEvent, window, elapsed time.Duration) {
 	if mutationFailureCells[r.config.MutationProfile] == id {
 		r.record(id, StatusFail, detail)
 		return
 	}
-	if err := r.recorder.RecordFailure(id, StatusFail, detail, FailureReadinessTimeout, event); err != nil {
+	if err := r.recorder.RecordReadinessTimeout(id, detail, event, window, elapsed); err != nil {
 		panic(err)
+	}
+}
+
+func (r *runtimeRunner) observeReadinessEvent(event ReadinessEvent) {
+	r.recorder.ObserveReadinessEvent(event)
+}
+
+func (r *runtimeRunner) checkHasReadinessTimeout(id string) bool {
+	index, ok := r.recorder.index[id]
+	return ok && r.recorder.receipt.Checks[index].FailureReason == FailureReadinessTimeout
+}
+
+func (r *runtimeRunner) finalizeInputReadinessTimeouts() {
+	for _, id := range []string{"input.view-isolated", "input.view-isolated-during-tenure"} {
+		index := r.recorder.index[id]
+		check := r.recorder.receipt.Checks[index]
+		if check.FailureReason == FailureReadinessTimeout && !check.ReadinessObservedLater {
+			r.failed = true
+		}
 	}
 }
 

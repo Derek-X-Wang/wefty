@@ -35,6 +35,21 @@ func (e *rfbUpgradeRejectedError) Error() string {
 	return "upgrade failed: " + e.status
 }
 
+type websocketUpgradeIncompleteError struct{ err error }
+
+func (e *websocketUpgradeIncompleteError) Error() string { return e.err.Error() }
+func (e *websocketUpgradeIncompleteError) Unwrap() error { return e.err }
+
+type rfbFirstFrameReadError struct{ err error }
+
+func (e *rfbFirstFrameReadError) Error() string { return "read RFB greeting: " + e.err.Error() }
+func (e *rfbFirstFrameReadError) Unwrap() error { return e.err }
+
+type rfbProtocolError struct{ err error }
+
+func (e *rfbProtocolError) Error() string { return e.err.Error() }
+func (e *rfbProtocolError) Unwrap() error { return e.err }
+
 func dialWebSocket(ctx context.Context, port int, path string, protocol *string) (*websocketConnection, string, textproto.MIMEHeader, error) {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	connection, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
@@ -57,18 +72,18 @@ func dialWebSocket(ctx context.Context, port int, path string, protocol *string)
 	request.WriteString("\r\n")
 	if _, err := io.WriteString(connection, request.String()); err != nil {
 		_ = connection.Close()
-		return nil, "", nil, err
+		return nil, "", nil, &websocketUpgradeIncompleteError{err: err}
 	}
 	reader := bufio.NewReader(connection)
 	status, err := reader.ReadString('\n')
 	if err != nil {
 		_ = connection.Close()
-		return nil, "", nil, err
+		return nil, "", nil, &websocketUpgradeIncompleteError{err: err}
 	}
 	headers, err := textproto.NewReader(reader).ReadMIMEHeader()
 	if err != nil {
 		_ = connection.Close()
-		return nil, "", nil, err
+		return nil, "", nil, &websocketUpgradeIncompleteError{err: err}
 	}
 	return &websocketConnection{connection: connection, reader: reader}, strings.TrimSpace(status), headers, nil
 }
@@ -131,26 +146,27 @@ func OpenRFB(ctx context.Context, port int, path string) (*websocketConnection, 
 	if err != nil {
 		return nil, err
 	}
-	fail := func(format string, args ...any) (*websocketConnection, error) {
+	failProtocol := func(format string, args ...any) (*websocketConnection, error) {
 		connection.close()
-		return nil, fmt.Errorf(format, args...)
+		return nil, &rfbProtocolError{err: fmt.Errorf(format, args...)}
 	}
 	if !strings.HasPrefix(status, "HTTP/1.1 101 ") {
 		connection.close()
 		return nil, &rfbUpgradeRejectedError{status: status}
 	}
 	if headers.Get("Sec-WebSocket-Accept") != expectedWebSocketAccept() {
-		return fail("invalid Sec-WebSocket-Accept")
+		return failProtocol("invalid Sec-WebSocket-Accept")
 	}
 	if headers.Get("Sec-WebSocket-Protocol") != contract.ComputerDisplayWebSocketSubprotocol {
-		return fail("binary subprotocol was not negotiated")
+		return failProtocol("binary subprotocol was not negotiated")
 	}
 	opcode, banner, err := connection.readFrame()
 	if err != nil {
-		return fail("read RFB greeting: %v", err)
+		connection.close()
+		return nil, &rfbFirstFrameReadError{err: err}
 	}
 	if opcode != 2 || !contract.ValidComputerRFBVersionBanner(banner) {
-		return fail("invalid binary RFB greeting: opcode=%d payload=%q", opcode, banner)
+		return failProtocol("invalid binary RFB greeting: opcode=%d payload=%q", opcode, banner)
 	}
 	connection.banner = banner
 	return connection, nil

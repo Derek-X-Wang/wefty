@@ -994,31 +994,35 @@ func TestWaylandFurniturePublisherRejectsUnearnedFields(t *testing.T) {
 	}
 }
 
-func TestReferenceComputerRunsTwentyBrokenImagesThroughRealChecker(t *testing.T) {
+func TestReferenceComputerRunsTwentyOneBrokenImagesThroughRealChecker(t *testing.T) {
 	payload, err := os.ReadFile("../scripts/test-computer-image-runtime.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	rows := regexp.MustCompile(`(?m)^run_mutation ([^ ]+) ([^ ]+) '([^']+)'$`).FindAllSubmatch(payload, -1)
-	if len(rows) != 20 {
-		t.Fatalf("real broken-image rows = %d, want 20", len(rows))
+	if len(rows) != 21 {
+		t.Fatalf("real broken-image rows = %d, want 21", len(rows))
 	}
 	if bytes.Contains(payload, []byte(`if [[ $arch != amd64 ]]; then exit 0; fi`)) {
 		t.Fatal("arm64 skips the broken-image matrix")
 	}
-	names, cells := map[string]bool{}, map[string]bool{}
+	names, cells := map[string]bool{}, map[string]int{}
 	for _, row := range rows {
 		name, cell, detail := string(row[1]), string(row[2]), string(row[3])
 		if names[name] {
 			t.Fatalf("duplicate broken image %q", name)
 		}
-		if cells[cell] {
+		cells[cell]++
+		if cells[cell] > 1 && cell != "transport.plain-tcp-rejected" {
 			t.Fatalf("duplicate owning cell %q", cell)
 		}
 		if detail == "" {
 			t.Fatalf("broken image %q has no stable reason", name)
 		}
-		names[name], cells[cell] = true, true
+		names[name] = true
+	}
+	if !names["plain-tcp-control"] || !names["plain-rfb-control"] || cells["transport.plain-tcp-rejected"] != 2 {
+		t.Fatalf("plain transport fixtures = names %v cells %v", names, cells)
 	}
 }
 

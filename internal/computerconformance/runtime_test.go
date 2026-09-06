@@ -99,6 +99,11 @@ func TestMutationFailureStopsAfterOwningCell(t *testing.T) {
 	if !runner.mutationFailed() {
 		t.Fatal("mutation continued after its first failed assertion")
 	}
+	for _, check := range runner.recorder.Finish(time.Unix(101, 0)).Checks {
+		if check.ID == "harness.shm-size" && check.FailureReason != FailureMutationDetected {
+			t.Fatalf("owning failure reason = %q, want mutation_detected", check.FailureReason)
+		}
+	}
 }
 
 func TestMutationReadinessTimeoutContinuesUntilOwningCell(t *testing.T) {
@@ -106,10 +111,11 @@ func TestMutationReadinessTimeoutContinuesUntilOwningCell(t *testing.T) {
 		config:   RuntimeConfig{MutationProfile: "edge-does-not-recover"},
 		recorder: NewRecorder("broken", "docker", "linux/arm64", time.Unix(100, 0)),
 	}
-	runner.recordReadinessTimeout("input.view-isolated-during-tenure", "key observer did not advance", ReadinessEventKeyObserverAdvanced)
+	runner.recordReadinessTimeout("input.view-isolated-during-tenure", "key observer did not advance", ReadinessEventKeyObserverAdvanced, 18*time.Second, 18*time.Second)
 	if runner.mutationFailed() {
 		t.Fatal("typed readiness timeout short-circuited the mutation before its owning cell")
 	}
+	runner.observeReadinessEvent(ReadinessEventKeyObserverAdvanced)
 	runner.record("persistence.edge-recovers", StatusFail, "both endpoints did not recover after edge withdrawal")
 	if !runner.mutationFailed() {
 		t.Fatal("owning mutation cell did not stop the broken-image row")
@@ -126,11 +132,23 @@ func TestMutationReadinessTimeoutContinuesUntilOwningCell(t *testing.T) {
 		t.Fatalf("missing receipt check %q", id)
 		return Check{}
 	}
-	if got := assertion("input.view-isolated-during-tenure"); got.FailureReason != FailureReadinessTimeout || got.ReadinessEvent != ReadinessEventKeyObserverAdvanced {
+	if got := assertion("input.view-isolated-during-tenure"); got.FailureReason != FailureReadinessTimeout || got.ReadinessEvent != ReadinessEventKeyObserverAdvanced || !got.ReadinessObservedLater || got.ReadinessObservationWindowSeconds != 18 || got.ReadinessObservationElapsedSeconds != 18 {
 		t.Fatalf("readiness timeout evidence = %+v", got)
 	}
 	if got := assertion("persistence.edge-recovers"); got.FailureReason != FailureMutationDetected || got.ReadinessEvent != "" {
 		t.Fatalf("mutation evidence = %+v", got)
+	}
+}
+
+func TestMutationUnrecoveredInputReadinessTimeoutFailsClosed(t *testing.T) {
+	runner := runtimeRunner{
+		config:   RuntimeConfig{MutationProfile: "edge-does-not-recover"},
+		recorder: NewRecorder("broken", "docker", "linux/arm64", time.Unix(100, 0)),
+	}
+	runner.recordReadinessTimeout("input.view-isolated-during-tenure", "key observer did not advance", ReadinessEventKeyObserverAdvanced, 18*time.Second, 18*time.Second)
+	runner.finalizeInputReadinessTimeouts()
+	if !runner.mutationFailed() {
+		t.Fatal("unrecovered input readiness timeout did not stop the mutation row")
 	}
 }
 
@@ -156,15 +174,19 @@ func TestArm64ReadinessEventBudgetTracksObservedStartupWithoutChangingAMD64(t *t
 		config:             RuntimeConfig{Platform: "linux/arm64"},
 		firstBootReadiness: measuredArm64Startup,
 	}
-	if got, dynamic := arm64.readinessEventObservationBudget(); !dynamic || got != 2*measuredArm64Startup {
-		t.Fatalf("arm64 readiness-event budget = %s, %t; want %s, true", got, dynamic, 2*measuredArm64Startup)
+	if got := arm64.readinessEventObservationBudget(); got != 2*measuredArm64Startup {
+		t.Fatalf("arm64 readiness-event budget = %s, want %s", got, 2*measuredArm64Startup)
+	}
+	fastArm64 := runtimeRunner{config: RuntimeConfig{Platform: "linux/arm64"}, firstBootReadiness: 100 * time.Millisecond}
+	if got := fastArm64.readinessEventObservationBudget(); got != legacyInputObserverWindow {
+		t.Fatalf("fast arm64 readiness-event budget = %s, want legacy floor %s", got, legacyInputObserverWindow)
 	}
 	amd64 := runtimeRunner{
 		config:             RuntimeConfig{Platform: "linux/amd64"},
 		firstBootReadiness: measuredArm64Startup,
 	}
-	if got, dynamic := amd64.readinessEventObservationBudget(); dynamic || got != 0 {
-		t.Fatalf("amd64 readiness-event budget = %s, %t; want unchanged fixed polling", got, dynamic)
+	if got := amd64.readinessEventObservationBudget(); got != legacyInputObserverWindow {
+		t.Fatalf("amd64 readiness-event budget = %s, want unchanged legacy window", got)
 	}
 }
 
@@ -201,9 +223,12 @@ func TestArm64KeyObserverWaitUsesMeasuredEventBudget(t *testing.T) {
 			close(done)
 		}()
 		session := &InputSession{connection: &websocketConnection{connection: client}}
-		_, observed := runner.waitInputObserverAdvance(context.Background(), before, session)
+		_, observed, _, _, waitErr := runner.waitInputObserverAdvance(context.Background(), before, session)
 		session.Close()
 		<-done
+		if waitErr != nil {
+			t.Fatalf("observer wait failed: %v", waitErr)
+		}
 		return observed, reads
 	}
 
@@ -238,9 +263,12 @@ func TestReadinessProbeDoesNotCallFirstFrameDelayPlainTCP(t *testing.T) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ready, plainTCP, err := (&runtimeRunner{}).probeReady(ctx, port, false)
-	if ready || plainTCP || err == nil {
-		t.Fatalf("first-frame delay probe = ready %t plain-tcp %t err %v", ready, plainTCP, err)
+	ready, event, err := (&runtimeRunner{}).probeReady(ctx, port, ReadinessEventViewEndpointReady)
+	if ready || event != ReadinessEventFirstRFBFrame || err == nil {
+		t.Fatalf("first-frame delay probe = ready %t event %q err %v", ready, event, err)
+	}
+	if probeProvesPlainTCP(ctx, port, err) {
+		t.Fatal("first-frame delay was promoted to plain TCP evidence")
 	}
 	_ = listener.Close()
 	<-done
@@ -265,10 +293,129 @@ func TestReadinessProbeStillCallsNonUpgradeHTTPPlainTCP(t *testing.T) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ready, plainTCP, err := (&runtimeRunner{}).probeReady(ctx, port, false)
-	if ready || !plainTCP || err == nil {
-		t.Fatalf("non-upgrade HTTP probe = ready %t plain-tcp %t err %v", ready, plainTCP, err)
+	ready, event, err := (&runtimeRunner{}).probeReady(ctx, port, ReadinessEventControlEndpointReady)
+	var rejected *rfbUpgradeRejectedError
+	if ready || event != ReadinessEventControlEndpointReady || !errors.As(err, &rejected) {
+		t.Fatalf("non-upgrade HTTP probe = ready %t event %q err %v", ready, event, err)
 	}
+	<-done
+}
+
+func TestLateRawTCPProbeDetectsRawRFBListener(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for accepted := 0; accepted < 2; accepted++ {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_, _ = io.WriteString(connection, "RFB 003.008\n")
+			_ = connection.Close()
+		}
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ready, event, probeErr := (&runtimeRunner{}).probeReady(ctx, port, ReadinessEventControlEndpointReady)
+	if ready || event != ReadinessEventControlEndpointReady || probeErr == nil {
+		t.Fatalf("raw RFB readiness probe = ready %t event %q err %v", ready, event, probeErr)
+	}
+	if !probeProvesPlainTCP(ctx, port, probeErr) {
+		t.Fatal("late raw TCP probe did not detect the raw RFB listener")
+	}
+	_ = listener.Close()
+	<-done
+}
+
+func TestViewIsolationClassifiesRFBNegotiationFailureAsAssertion(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		_, _ = fmt.Fprint(connection, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong\r\nSec-WebSocket-Protocol: binary\r\n\r\n")
+		_ = connection.Close()
+	}()
+	runner := runtimeRunner{
+		controlPort: listener.Addr().(*net.TCPAddr).Port,
+		config: RuntimeConfig{
+			InputOraclePath: "/oracle",
+			Now:             time.Now,
+			Sleep:           sleepContext,
+		},
+		recorder: NewRecorder("broken", "docker", "linux/arm64", time.Now()),
+		runCommandHook: func(context.Context, ...string) (commandResult, error) {
+			return commandResult{stdout: `{"version":1,"generation":0,"key_events":2,"x":0,"y":0,"pointer_history":[]}`}, nil
+		},
+	}
+	if runner.proveViewIsolation(context.Background(), "input.view-isolated", 1, 2, 3, 4) {
+		t.Fatal("bad WebSocket negotiation proved view isolation")
+	}
+	for _, check := range runner.recorder.Finish(time.Now()).Checks {
+		if check.ID == "input.view-isolated" {
+			if check.FailureReason != FailureAssertionFailed || check.ReadinessEvent != "" {
+				t.Fatalf("negotiation failure evidence = %+v", check)
+			}
+		}
+	}
+	_ = listener.Close()
+	<-done
+}
+
+func TestViewIsolationClassifiesOnlyExpiredRFBDeadlineAsReadiness(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = io.Copy(io.Discard, connection)
+	}()
+	runner := runtimeRunner{
+		controlPort: listener.Addr().(*net.TCPAddr).Port,
+		config: RuntimeConfig{
+			InputOraclePath: "/oracle",
+			Now:             time.Now,
+			Sleep:           sleepContext,
+		},
+		recorder: NewRecorder("broken", "docker", "linux/arm64", time.Now()),
+		runCommandHook: func(context.Context, ...string) (commandResult, error) {
+			return commandResult{stdout: `{"version":1,"generation":0,"key_events":2,"x":0,"y":0,"pointer_history":[]}`}, nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if runner.proveViewIsolation(ctx, "input.view-isolated", 1, 2, 3, 4) {
+		t.Fatal("silent RFB endpoint proved view isolation")
+	}
+	for _, check := range runner.recorder.Finish(time.Now()).Checks {
+		if check.ID == "input.view-isolated" {
+			if check.FailureReason != FailureReadinessTimeout || check.ReadinessEvent != ReadinessEventKeyObserverAdvanced || check.ReadinessObservationWindowSeconds <= 0 || check.ReadinessObservationElapsedSeconds < check.ReadinessObservationWindowSeconds {
+				t.Fatalf("deadline failure evidence = %+v", check)
+			}
+		}
+	}
+	_ = listener.Close()
 	<-done
 }
 
