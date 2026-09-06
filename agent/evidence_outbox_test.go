@@ -540,12 +540,23 @@ func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
 	}
 }
 
-func TestHealthyAttemptPendingCountContentionDoesNotBecomeOutputError(t *testing.T) {
+func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *testing.T) {
+	uploadedTail := make(chan contract.LogEvent, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if !strings.HasSuffix(request.URL.Path, "/logs") {
 			http.NotFound(w, request)
 			return
 		}
+		var appendRequest l1.AppendLogsRequest
+		if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		if len(appendRequest.Events) != 1 {
+			t.Errorf("final redaction upload events = %d, want 1", len(appendRequest.Events))
+			return
+		}
+		uploadedTail <- appendRequest.Events[0]
 		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
 			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
 		})
@@ -595,6 +606,120 @@ func TestHealthyAttemptPendingCountContentionDoesNotBecomeOutputError(t *testing
 	}
 	if countWasContended {
 		t.Fatal("final redaction flush synchronously recounted pending spool events")
+	}
+	select {
+	case tail := <-uploadedTail:
+		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" {
+			t.Fatalf("final redaction tail = %#v, want durable stdout sequence 0 with bytes tail", tail)
+		}
+	default:
+		t.Fatal("final redaction tail did not reach the durable spool and bounded upload")
+	}
+}
+
+func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/logs") {
+			http.NotFound(w, request)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
+		})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "append-deadline-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+
+	appendStarted := make(chan struct{}, 1)
+	outbox.spool.appendCheckpoint = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); !bounded {
+			return
+		}
+		appendStarted <- struct{}{}
+		<-ctx.Done()
+	}
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "append-deadline-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{
+				contract.EnvRunToken: "tail-secret",
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "append-deadline-attempt", FencingToken: "append-deadline-fence"},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox, runtimes: testRuntimeSet(bufferedOutputRunner{}),
+		clock: systemClock{}, nodeID: "append-deadline-node", bootSessionID: "append-deadline-boot",
+		finalizationTimeout: 25 * time.Millisecond,
+		observer:            newLifecycleObserver(systemClock{}),
+	})
+
+	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	select {
+	case <-appendStarted:
+	default:
+		t.Fatal("final redaction flush never reached the injected spool append contention")
+	}
+	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || !result.LogEvidenceIncomplete {
+		t.Fatalf("healthy attempt under append contention = result %#v err=%v, want exit 0 with incomplete output evidence", result, runErr)
+	}
+}
+
+func TestBatchThresholdWakesUploaderBeforeClose(t *testing.T) {
+	uploadStarted := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/logs") {
+			http.NotFound(w, request)
+			return
+		}
+		var appendRequest l1.AppendLogsRequest
+		if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		if len(appendRequest.Events) != 3 {
+			t.Errorf("threshold upload events = %d, want 3", len(appendRequest.Events))
+			return
+		}
+		uploadStarted <- struct{}{}
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 2},
+		})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "threshold-wake-node", 1<<20, systemClock{}, 3, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "threshold-wake-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "threshold-wake-attempt", FencingToken: "threshold-wake-fence"},
+	}
+	sink, err := outbox.newLogSink(t.Context(), client, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	for sequence := uint64(0); sequence < 3; sequence++ {
+		if err := sink.WriteOutput(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, sequence, "threshold")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("batch threshold did not wake the uploader before close")
 	}
 }
 

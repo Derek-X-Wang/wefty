@@ -63,6 +63,9 @@ type logSpool struct {
 	db              *sql.DB
 	maxOneShotBytes int64
 	maxServiceBytes int64
+	// appendCheckpoint is a test-only scheduling seam for contention before a
+	// durable append transaction; production construction always leaves it nil.
+	appendCheckpoint func(context.Context)
 	// pendingCountCheckpoint is a test-only scheduling seam for contention at
 	// the pending-count query; production construction always leaves it nil.
 	pendingCountCheckpoint func(context.Context)
@@ -611,14 +614,17 @@ func (spool *logSpool) append(ctx context.Context, event contract.LogEvent) erro
 	if event.Sequence > math.MaxInt64 {
 		return fmt.Errorf("agent: log sequence %d exceeds durable spool range", event.Sequence)
 	}
+	if spool.appendCheckpoint != nil {
+		spool.appendCheckpoint(ctx)
+	}
 	tx, err := spool.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("agent: begin log spool append: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: begin log spool append", err)
 	}
 	defer tx.Rollback()
 	var class string
 	if err := tx.QueryRowContext(ctx, "SELECT class FROM spool_attempts WHERE attempt_id=?", event.AttemptID).Scan(&class); err != nil {
-		return fmt.Errorf("agent: read log spool attempt class: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: read log spool attempt class", err)
 	}
 	storedEvent := event
 	if class == contract.JobClassService && storedEvent.Gap == nil && int64(len(storedEvent.Bytes)) > spool.maxServiceBytes {
@@ -648,14 +654,14 @@ WHERE attempt_id=? AND stream=? AND sequence=?`, storedEvent.AttemptID, storedEv
 		return nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("agent: read log spool event: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: read log spool event", err)
 	}
 	var used int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(e.payload_bytes), 0)
 FROM spool_events e
 JOIN spool_attempts a ON a.attempt_id=e.attempt_id
 WHERE a.class=?`, class).Scan(&used); err != nil {
-		return fmt.Errorf("agent: measure log spool retention: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: measure log spool retention", err)
 	}
 	payloadBytes := int64(len(storedEvent.Bytes))
 	switch class {
@@ -675,12 +681,19 @@ WHERE a.class=?`, class).Scan(&used); err != nil {
 	_, err = tx.ExecContext(ctx, `INSERT INTO spool_events(attempt_id, stream, sequence, timestamp_ns, bytes, gap_json, payload_bytes)
 VALUES(?, ?, ?, ?, ?, ?, ?)`, storedEvent.AttemptID, storedEvent.Stream, storedEvent.Sequence, storedEvent.Timestamp.UTC().Round(0).UnixNano(), storedEvent.Bytes, gapJSON, payloadBytes)
 	if err != nil {
-		return fmt.Errorf("agent: append durable log event: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: append durable log event", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("agent: commit durable log event: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: commit durable log event", err)
 	}
 	return nil
+}
+
+func wrapLogSpoolContextError(ctx context.Context, operation string, err error) error {
+	if cause := context.Cause(ctx); cause != nil && err == cause {
+		return cause
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 type serviceEvictionEvent struct {
