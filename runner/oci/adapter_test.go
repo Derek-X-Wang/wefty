@@ -1151,17 +1151,22 @@ func TestAdapterPumpsConstrainedMacHostBridgeFallback(t *testing.T) {
 }
 
 func TestAdapterDoesNotDialHostBeforeHelperBridgeReady(t *testing.T) {
+	const bridgeConcurrency = 4
 	engine := &adapterTestEngine{
 		watch:          ocihelper.WatchResponse{ExitCode: intPointer(0)},
-		bridgeExchange: make(chan error, 4),
+		bridgeExchange: make(chan error, bridgeConcurrency),
 		bridgeReady:    make(chan struct{}),
+		bridgeWaiting:  make(chan struct{}, bridgeConcurrency),
 	}
+	var releaseReady sync.Once
+	releaseBridgeReady := func() { releaseReady.Do(func() { close(engine.bridgeReady) }) }
+	t.Cleanup(releaseBridgeReady)
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
 	request := adapterTestRequest()
 	request.Execution.Env = map[string]string{contract.EnvL3Endpoint: "http://127.0.0.1:43100/l3"}
 	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-	hostDialed := make(chan struct{}, 4)
+	hostDialed := make(chan struct{}, bridgeConcurrency)
 	request.HostBridgeDial = func(context.Context) (net.Conn, error) {
 		hostDialed <- struct{}{}
 		return nil, errors.New("stop host bridge probe")
@@ -1176,11 +1181,16 @@ func TestAdapterDoesNotDialHostBeforeHelperBridgeReady(t *testing.T) {
 		runDone <- runResult{result: result, err: err}
 	}()
 	select {
+	case <-engine.bridgeWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("helper bridge pump did not reach its backend-readiness wait")
+	}
+	select {
 	case <-hostDialed:
 		t.Fatal("adapter dialed the host bridge before the helper reported a guest attachment")
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
-	close(engine.bridgeReady)
+	releaseBridgeReady()
 	select {
 	case <-hostDialed:
 	case <-time.After(time.Second):
@@ -1746,6 +1756,7 @@ type adapterTestEngine struct {
 	lastEnsure                    ocihelper.EnsureImageRequest
 	bridgeExchange                chan error
 	bridgeReady                   chan struct{}
+	bridgeWaiting                 chan struct{}
 	missingUntilEnsure            bool
 	reconcileCalls                int
 	watchSignals                  chan ocihelper.Signal
@@ -1999,9 +2010,12 @@ func (engine *adapterTestEngine) DialHostBridge(_ context.Context, _ ocihelper.D
 		return errors.New("unsupported")
 	}
 	if engine.bridgeReady != nil {
+		if engine.bridgeWaiting != nil {
+			engine.bridgeWaiting <- struct{}{}
+		}
 		<-engine.bridgeReady
 	}
-	_, err := stream.Write(append([]byte{ocihelper.HostBridgeBackendReadyMarker}, []byte("guest-request")...))
+	_, err := stream.Write(append([]byte{hostBridgeBackendReadyMarkerForTest}, []byte("guest-request")...))
 	if err == nil {
 		payload := make([]byte, len("host-response"))
 		_, err = io.ReadFull(stream, payload)

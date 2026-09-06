@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 type staticComputerGrantVerifier struct{ proof l3.ComputerTokenScopeProof }
@@ -703,6 +706,297 @@ func TestComputerSubmissionPolicyRemintClosesUnusedHelperPreconnection(t *testin
 		t.Fatal("unused helper preconnection remained open after policy remint")
 	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 		t.Fatal("unused helper preconnection was not closed before the read deadline")
+	}
+}
+
+func TestComputerSubmissionPolicyRemintDrainsFourWaitingHostBridgePumpsWithoutForcedClose(t *testing.T) {
+	engine := newWorkflowBridgeMarkerEngine()
+	adapter, stopAdapter := startWorkflowBridgeMarkerAdapter(t, engine)
+	defer stopAdapter()
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	bridge, err := newComputerAttemptBridge(t.Context(), participant, "wefty://run-ledger", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+	request := workflowBridgeMarkerRequest(bridge)
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(runContext, request, nil)
+		runDone <- err
+	}()
+	const bridgeConcurrency = 4
+	for pump := 0; pump < bridgeConcurrency; pump++ {
+		select {
+		case <-engine.bridgeEntered:
+		case <-time.After(time.Second):
+			t.Fatalf("host-bridge pump %d/%d did not reach helper readiness", pump+1, bridgeConcurrency)
+		}
+	}
+	if count := trackedWorkflowBridgeConnectionCount(bridge); count != 0 {
+		t.Fatalf("waiting helper pumps eagerly created %d host bridge connection(s)", count)
+	}
+
+	started := time.Now()
+	if err := bridge.closeWithCause(errComputerSubmissionPolicyReminted); err != nil {
+		t.Fatalf("policy remint forced closed waiting helper pumps: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= workflowBridgeCloseTimeout {
+		t.Fatalf("policy remint drain elapsed=%s, reached unchanged force-close bound %s", elapsed, workflowBridgeCloseTimeout)
+	}
+	if count := trackedWorkflowBridgeConnectionCount(bridge); count != 0 {
+		t.Fatalf("policy remint reached a force-close set of %d connection(s)", count)
+	}
+	cancelRun()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled host-bridge run = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("adapter did not finish after canceling the waiting host-bridge pumps")
+	}
+}
+
+func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T) {
+	network := plain.NewNetwork()
+	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	l3Listener, err := l3Fabric.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := make(chan struct{})
+	canceled := make(chan struct{})
+	bodyRead := make(chan error, 1)
+	l3Server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.WriteHeader(http.StatusContinue)
+		close(admitted)
+		go func() {
+			<-request.Context().Done()
+			close(canceled)
+		}()
+		_, readErr := io.ReadAll(request.Body)
+		bodyRead <- readErr
+		panic(http.ErrAbortHandler)
+	})}
+	go func() { _ = l3Server.Serve(l3Listener) }()
+	defer l3Server.Close()
+
+	engine := newWorkflowBridgeMarkerEngine()
+	adapter, stopAdapter := startWorkflowBridgeMarkerAdapter(t, engine)
+	defer stopAdapter()
+	bridge, err := newComputerAttemptBridge(t.Context(), agentFabric, "wefty://run-ledger", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+	request := workflowBridgeMarkerRequest(bridge)
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(runContext, request, nil)
+		runDone <- err
+	}()
+	const bridgeConcurrency = 4
+	for pump := 0; pump < bridgeConcurrency; pump++ {
+		select {
+		case <-engine.bridgeEntered:
+		case <-time.After(time.Second):
+			t.Fatalf("host-bridge pump %d/%d did not reach helper readiness", pump+1, bridgeConcurrency)
+		}
+	}
+	guest, helperGuest := net.Pipe()
+	defer guest.Close()
+	engine.guestConnections <- helperGuest
+	deadline := time.Now().Add(time.Second)
+	for trackedWorkflowBridgeConnectionCount(bridge) != 1 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if count := trackedWorkflowBridgeConnectionCount(bridge); count != 1 {
+		t.Fatalf("backend-ready marker established %d host connections, want 1", count)
+	}
+
+	httpRequest, err := http.NewRequest(http.MethodPost, bridge.l3Endpoint+"/v1/runs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-admitted:
+	case <-time.After(time.Second):
+		t.Fatal("marker-backed paused request did not reach upstream admission")
+	}
+	reader := bufio.NewReader(guest)
+	interim, err := http.ReadResponse(reader, httpRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interim.Body.Close()
+	if interim.StatusCode != http.StatusContinue {
+		t.Fatalf("paused request acknowledgement status=%d, want 100", interim.StatusCode)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- bridge.closeWithCause(errComputerSubmissionPolicyReminted) }()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("policy remint did not cancel the marker-backed request")
+	}
+	if _, err := io.WriteString(guest, "x"); err != nil {
+		t.Fatalf("release marker-backed paused body after policy remint: %v", err)
+	}
+	var response *http.Response
+	for {
+		response, err = http.ReadResponse(reader, httpRequest)
+		if err != nil {
+			t.Fatalf("marker-backed request received EOF instead of typed policy-remint response: %v", err)
+		}
+		if response.StatusCode != http.StatusContinue {
+			break
+		}
+		response.Body.Close()
+	}
+	defer response.Body.Close()
+	var typed contract.ErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&typed); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway || typed.Error.Code != contract.ErrorPassUnavailable || typed.Error.Message != errComputerSubmissionPolicyReminted.Error() {
+		t.Fatalf("marker-backed policy-remint response = status %d error %#v, want typed 502", response.StatusCode, typed.Error)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("marker-backed request did not drain: %v", err)
+	}
+	select {
+	case <-bodyRead:
+	case <-time.After(time.Second):
+		t.Fatal("marker-backed upstream body reader did not drain")
+	}
+	cancelRun()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled marker-backed host-bridge run = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("adapter did not finish after marker-backed request cancellation")
+	}
+}
+
+type workflowBridgeMarkerEngine struct {
+	ocihelper.UnavailableEngine
+	bridgeEntered    chan struct{}
+	guestConnections chan net.Conn
+}
+
+func newWorkflowBridgeMarkerEngine() *workflowBridgeMarkerEngine {
+	return &workflowBridgeMarkerEngine{bridgeEntered: make(chan struct{}, 4), guestConnections: make(chan net.Conn, 1)}
+}
+
+func (*workflowBridgeMarkerEngine) EnsureImage(_ context.Context, _ ocihelper.EnsureImageRequest, _ io.Reader, emit func(ocihelper.EnsureImageEvent) error) error {
+	response := workflowBridgeMarkerImage()
+	return emit(ocihelper.EnsureImageEvent{Kind: ocihelper.ImageComplete, Result: &response})
+}
+
+func (*workflowBridgeMarkerEngine) Run(_ context.Context, request ocihelper.RunRequest) (ocihelper.RunResponse, error) {
+	image := workflowBridgeMarkerImage().Evidence
+	response := ocihelper.RunResponse{Started: true, StartedAt: time.Now().UTC(), Image: &image}
+	if !strings.HasPrefix(request.Authority.JobID, "probe-") {
+		response.HostBridgeReady = true
+		response.HostBridgeEndpoint = "http://127.0.0.1:42002/l3"
+	}
+	return response, nil
+}
+
+func (*workflowBridgeMarkerEngine) Watch(ctx context.Context, request ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+	if !strings.HasPrefix(request.Authority.JobID, "probe-") {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	exitCode := 0
+	return emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &ocihelper.WatchResponse{ExitCode: &exitCode}})
+}
+
+func (*workflowBridgeMarkerEngine) Delete(context.Context, ocihelper.DeleteRequest) (ocihelper.DeleteResponse, error) {
+	return ocihelper.DeleteResponse{Deleted: true}, nil
+}
+
+func (*workflowBridgeMarkerEngine) Sweep(context.Context, ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
+	return ocihelper.SweepResponse{SweepEpoch: "workflow-bridge-marker-sweep"}, nil
+}
+
+func (*workflowBridgeMarkerEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	return ocihelper.VerifyResponse{Absent: true}, nil
+}
+
+func (*workflowBridgeMarkerEngine) ReapSession(context.Context, ocihelper.SessionIdentity) (ocihelper.SweepResponse, error) {
+	return ocihelper.SweepResponse{SweepEpoch: "workflow-bridge-marker-reap"}, nil
+}
+
+func (engine *workflowBridgeMarkerEngine) DialHostBridge(ctx context.Context, _ ocihelper.DialHostBridgeRequest, stream io.ReadWriteCloser) error {
+	engine.bridgeEntered <- struct{}{}
+	select {
+	case guest := <-engine.guestConnections:
+		defer guest.Close()
+		if _, err := stream.Write([]byte{1}); err != nil {
+			return err
+		}
+		return ocihelper.Relay(ctx, stream, guest)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func workflowBridgeMarkerImage() ocihelper.EnsureImageResponse {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	return ocihelper.EnsureImageResponse{
+		TopLevelDigest: digest, PlatformDigest: digest,
+		Evidence: ocihelper.ImageEvidence{
+			SubmittedReference: "example.invalid/image", TopLevelDigest: digest,
+			TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json", PlatformManifestDigest: digest,
+			Platform:       ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
+			RuntimeHandler: ocihelper.DefaultRuntimeHandler, Snapshotter: ocihelper.DefaultSnapshotter,
+		},
+	}
+}
+
+func startWorkflowBridgeMarkerAdapter(t *testing.T, engine ocihelper.Engine) (*ocirunner.Adapter, func()) {
+	t.Helper()
+	barrier, stop := startPreAdmissionHelper(t, engine, time.Now)
+	if err := barrier.Ensure(t.Context()); err != nil {
+		stop()
+		t.Fatal(err)
+	}
+	adapter := ocirunner.NewAdapter(barrier)
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := adapter.Probe(t.Context(), "pre-admission-node", "pre-admission-boot", "example.invalid/image", digest, time.Second); err != nil {
+		stop()
+		t.Fatal(err)
+	}
+	return adapter, stop
+}
+
+func workflowBridgeMarkerRequest(bridge *workflowBridge) workloadrunner.Request {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	return workloadrunner.Request{
+		Authority: workloadrunner.AttemptAuthority{
+			NodeID: "pre-admission-node", BootSessionID: "pre-admission-boot", JobID: "bridge-job", AttemptID: "bridge-attempt",
+			FencingToken: "bridge-fence", WorkloadClass: contract.JobClassOneShot, RemovalGeneration: "bridge-removal",
+		},
+		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/image", Digest: &digest}, Argv: []string{"/bin/true"},
+		}},
+		InitialDeadman:           time.Second,
+		OCIImageResolved:         func(context.Context, workloadrunner.OCIImageObservation) error { return nil },
+		OCIStarted:               func(context.Context, workloadrunner.OCIImageObservation) error { return nil },
+		HostBridgeDial:           bridge.dial,
+		HostBridgeFallbackActive: true,
 	}
 }
 
