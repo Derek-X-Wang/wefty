@@ -630,13 +630,26 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	if a == nil || a.capabilities == nil || a.session == nil {
 		return nil
 	}
-	a.capabilities.allowOCIIntent()
-	if a.session.ociBootBarrier == nil {
-		return a.capabilities.refresh(ctx)
-	}
-	generation, err := a.session.recoverOCIRuntime(ctx)
+	generation, err := a.session.recoverOCIRuntimeValidated(ctx, func() error {
+		if a.ociIntentGate == nil || a.ociIntentGate.observe == nil {
+			return nil
+		}
+		suppressionSequence := a.capabilities.ociSuppressionSequence.Load()
+		observation, observeErr := a.ociIntentGate.observe(ctx)
+		if observeErr != nil {
+			return fmt.Errorf("agent: validate durable OCI intent before recovery: %w", observeErr)
+		}
+		if !observation.Enabled {
+			a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+			return nil
+		}
+		return a.capabilities.allowOCIIntentIfUnchanged(suppressionSequence)
+	})
 	if err != nil {
 		return err
+	}
+	if a.session.ociBootBarrier == nil {
+		return nil
 	}
 	_, err = a.session.publishCapabilityHeartbeat(ctx, &generation)
 	return err

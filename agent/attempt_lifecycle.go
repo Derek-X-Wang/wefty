@@ -435,14 +435,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		outcome := <-completed
 		<-renewalDone
 		result := agentTerminatedResult(outcome.result)
-		if errors.Is(cause, errOCIIntentDisabled) && claim.Job.Spec.Class == contract.JobClassOneShot &&
-			outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0 {
-			// Runtime stop can race a one-shot whose Wait result is already
-			// successful. Preserve that genuine terminal result; a killed or
-			// otherwise failed payload still carries its signal/error and takes
-			// the agent-terminated classification above.
-			result = outcome.result
-		}
 		outcome.result = result
 		if err := persistCompletion(&outcome); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)

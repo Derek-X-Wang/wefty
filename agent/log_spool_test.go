@@ -488,6 +488,23 @@ func TestSuppressedCompletionKeepsEarliestIntentRevision(t *testing.T) {
 	if reversed := spool.inspectCompletion(t.Context(), second.Lease.AttemptID); reversed.IntentRevision != 1 {
 		t.Fatalf("earlier suppression revision lost to commit order: %+v", reversed)
 	}
+	beforePayload := serviceSpoolTestClaim("suppression-revision-before-payload")
+	beforePayload.Job.Spec.Kind = contract.JobKindOCI
+	if err := spool.ensureAttempt(t.Context(), beforePayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), beforePayload.Lease.AttemptID, "suppressed", "service_intent_stop", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), beforePayload.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.storeCompletion(t.Context(), beforePayload.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if early := spool.inspectCompletion(t.Context(), beforePayload.Lease.AttemptID); early.IntentRevision != 1 || early.State != "suppressed" {
+		t.Fatalf("pre-payload suppression revision lost to later writer: %+v", early)
+	}
 }
 
 func TestLogSpoolBoundsFullSuppressedPayloadsPerJob(t *testing.T) {

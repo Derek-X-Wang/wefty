@@ -1195,8 +1195,10 @@ func (spool *logSpool) recordCompletionDisposition(ctx context.Context, attemptI
 	var finishedNS sql.NullInt64
 	var existingDisposition sql.NullString
 	var existingRevision sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT job_id, result_json, finished_ns, completion_disposition, intent_revision
-FROM spool_attempts WHERE attempt_id=?`, attemptID).
+	err = tx.QueryRowContext(ctx, `SELECT a.job_id, a.result_json, a.finished_ns,
+COALESCE(a.completion_disposition, r.disposition), COALESCE(a.intent_revision, r.intent_revision)
+FROM spool_attempts a LEFT JOIN spool_completion_receipts r ON r.attempt_id=a.attempt_id
+WHERE a.attempt_id=?`, attemptID).
 		Scan(&jobID, &resultJSON, &finishedNS, &existingDisposition, &existingRevision)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("agent: read completion evidence for disposition: %w", err)
@@ -1228,7 +1230,7 @@ terminal_audit_json=COALESCE(excluded.terminal_audit_json, spool_completion_rece
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts
 SET completion_disposition=?, completion_reason=?, intent_revision=?
-WHERE attempt_id=? AND result_json IS NOT NULL`,
+WHERE attempt_id=?`,
 		disposition, reason, storedRevision, attemptID); err != nil {
 		return fmt.Errorf("agent: join completion disposition to payload: %w", err)
 	}
