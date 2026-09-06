@@ -2673,6 +2673,9 @@ func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request Dial
 		}
 	}
 	_ = listener.SetDeadline(time.Time{})
+	if _, err := stream.Write([]byte{HostBridgeBackendReadyMarker}); err != nil {
+		return err
+	}
 	defer guest.Close()
 	return Relay(ctx, stream, guest)
 }

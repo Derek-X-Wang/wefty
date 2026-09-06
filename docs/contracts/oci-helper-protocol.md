@@ -403,6 +403,12 @@ Neither direction accepts a caller-supplied network destination.
 The OCI adapter runs exactly four `DialHostBridge` pumps per Computer attempt;
 that fixed bound is the only Computer submission path on every platform, and
 additional guest connections wait for one of those pumps.
+The helper sends the `HostBridgeBackendReadyMarker` as the first raw byte only
+after it has accepted the guest connection and cleared the listener deadline.
+The host-side client consumes that marker before dialing the loopback bridge;
+the authorization success frame alone is not permission to create a host
+connection. This prevents zero-byte host preconnections from occupying the
+four fixed pumps while a guest is still attaching.
 
 For service stop, the agent keeps `Watch` independent from execution-context
 cancellation, sends `TERM`, waits the configured grace, and escalates to

@@ -655,7 +655,7 @@ func (session *Session) DialAttemptPort(ctx context.Context, request DialAttempt
 }
 
 func (session *Session) DialHostBridge(ctx context.Context, request DialHostBridgeRequest) (net.Conn, error) {
-	return session.openStream(ctx, MethodDialHostBridge, request, 0, false)
+	return session.openStream(ctx, MethodDialHostBridge, request, HostBridgeBackendReadyMarker, false)
 }
 
 func (session *Session) call(ctx context.Context, method Method, request, response any) error {

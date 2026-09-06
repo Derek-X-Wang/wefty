@@ -3004,6 +3004,54 @@ func TestHostBridgeStreamRemainsCoupledToDialContext(t *testing.T) {
 	}
 }
 
+func TestHostBridgeClientWaitsForBackendReady(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42002/l3"}
+	engine.dialHostBridgeReady = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.EnableHostBridgeFallback = true
+	run, err := session.Run(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		stream net.Conn
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		stream, err := session.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: request.Authority, BridgeCapability: run.BridgeCapability})
+		resultCh <- result{stream: stream, err: err}
+	}()
+	select {
+	case result := <-resultCh:
+		if result.stream != nil {
+			_ = result.stream.Close()
+		}
+		t.Fatal("DialHostBridge returned before the helper emitted backend readiness")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(engine.dialHostBridgeReady)
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		_ = result.stream.Close()
+	case <-time.After(time.Second):
+		t.Fatal("DialHostBridge did not return after backend readiness")
+	}
+}
+
 func TestAttemptPortSetupCancellationReturnsTypedError(t *testing.T) {
 	client, server := net.Pipe()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -3944,6 +3992,7 @@ type fakeEngine struct {
 	dialAttemptWithoutMarker bool
 	dialAttemptErr           error
 	dialHostBridgeRead       bool
+	dialHostBridgeReady      chan struct{}
 	dialHostBridgeDone       chan struct{}
 	lastDialAttemptRequest   DialAttemptPortRequest
 	controlWrites            []SetComputerControlStateRequest
@@ -4612,6 +4661,12 @@ func (engine *fakeEngine) DialAttemptPort(_ context.Context, request DialAttempt
 }
 func (engine *fakeEngine) DialHostBridge(_ context.Context, _ DialHostBridgeRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialHostBridge")
+	if engine.dialHostBridgeReady != nil {
+		<-engine.dialHostBridgeReady
+	}
+	if _, err := stream.Write([]byte{HostBridgeBackendReadyMarker}); err != nil {
+		return err
+	}
 	if engine.dialHostBridgeRead {
 		_, err := io.Copy(io.Discard, stream)
 		close(engine.dialHostBridgeDone)

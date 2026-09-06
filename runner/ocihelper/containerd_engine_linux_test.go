@@ -2383,6 +2383,10 @@ func TestDialHostBridgePairsOnlyTheAttemptsGuestListener(t *testing.T) {
 	if _, err := guest.Write([]byte("guest")); err != nil {
 		t.Fatal(err)
 	}
+	marker := []byte{0}
+	if _, err := io.ReadFull(host, marker); err != nil || marker[0] != HostBridgeBackendReadyMarker {
+		t.Fatalf("host bridge ready marker = %d, %v", marker[0], err)
+	}
 	payload := make([]byte, 5)
 	if _, err := io.ReadFull(host, payload); err != nil || string(payload) != "guest" {
 		t.Fatalf("host payload = %q, %v", payload, err)
