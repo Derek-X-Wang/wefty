@@ -1,16 +1,20 @@
 package scripts
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
 )
 
-func TestReadinessEventVocabularyMatchesGoAndJQ(t *testing.T) {
+func TestReadinessCheckEventPairingsMatchRecorderAndJQ(t *testing.T) {
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("could not resolve runtime_evidence_test.go path")
@@ -24,34 +28,52 @@ func TestReadinessEventVocabularyMatchesGoAndJQ(t *testing.T) {
 		}
 		return string(payload)
 	}
-	extract := func(pattern, payload string) map[string]bool {
-		t.Helper()
-		values := make(map[string]bool)
-		for _, match := range regexp.MustCompile(pattern).FindAllStringSubmatch(payload, -1) {
-			values[match[1]] = true
-		}
-		return values
+	type scriptPairing struct {
+		Check  string   `json:"check"`
+		Events []string `json:"events"`
 	}
-	goEvents := extract(`ReadinessEvent[A-Za-z]+\s+ReadinessEvent\s+=\s+"([^"]+)"`, read("internal/computerconformance/receipt.go"))
-	jqEvents := extract(`\.readiness_event\s*==\s*"([^"]+)"`, read("scripts/check-computer-image-runtime-evidence.sh"))
-	if len(goEvents) != len(jqEvents) {
-		t.Fatalf("readiness vocabulary sizes differ: Go=%v jq=%v", goEvents, jqEvents)
+	script := read("scripts/check-computer-image-runtime-evidence.sh")
+	match := regexp.MustCompile(`(?s)readonly readiness_pairings='([^']+)'`).FindStringSubmatch(script)
+	if len(match) != 2 {
+		t.Fatal("jq readiness pairing table is missing")
 	}
-	for event := range goEvents {
-		if !jqEvents[event] {
-			t.Fatalf("Go readiness event %q is missing from jq validation: Go=%v jq=%v", event, goEvents, jqEvents)
+	var scriptPairings []scriptPairing
+	if err := json.Unmarshal([]byte(match[1]), &scriptPairings); err != nil {
+		t.Fatalf("parse jq readiness pairing table: %v", err)
+	}
+	canonical := func(values map[string][]string) []string {
+		var pairs []string
+		for check, events := range values {
+			for _, event := range events {
+				pairs = append(pairs, check+"="+event)
+			}
 		}
+		sort.Strings(pairs)
+		return pairs
+	}
+	recorderPairings := make(map[string][]string)
+	allEvents := make(map[string]bool)
+	for check, events := range computerconformance.ReadinessEventPairings() {
+		for _, event := range events {
+			recorderPairings[check] = append(recorderPairings[check], string(event))
+			allEvents[string(event)] = true
+		}
+	}
+	jqPairings := make(map[string][]string)
+	for _, pairing := range scriptPairings {
+		jqPairings[pairing.Check] = append(jqPairings[pairing.Check], pairing.Events...)
+	}
+	if recorder, jq := strings.Join(canonical(recorderPairings), "\n"), strings.Join(canonical(jqPairings), "\n"); recorder != jq {
+		t.Fatalf("readiness check/event pairings differ:\nrecorder:\n%s\njq:\n%s", recorder, jq)
 	}
 
-	allowed := map[string]map[string]bool{
-		"transport.view-ready":              {"view_endpoint_ready": true, "first_rfb_frame": true},
-		"transport.control-ready":           {"control_endpoint_ready": true, "first_rfb_frame": true},
-		"input.view-isolated":               {"input_oracle_ready": true, "key_observer_advanced": true},
-		"input.view-isolated-during-tenure": {"key_observer_advanced": true},
-	}
 	temp := t.TempDir()
-	for checkID, events := range allowed {
-		for event := range goEvents {
+	for checkID, events := range recorderPairings {
+		allowed := make(map[string]bool, len(events))
+		for _, event := range events {
+			allowed[event] = true
+		}
+		for event := range allEvents {
 			path := filepath.Join(temp, strings.ReplaceAll(checkID+"-"+event, ".", "-")+".json")
 			payload := `{"version":2,"checks":[` +
 				`{"id":"persistence.edge-recovers","status":"FAIL","detail":"expected","failure_reason":"mutation_detected"},` +
@@ -63,8 +85,8 @@ func TestReadinessEventVocabularyMatchesGoAndJQ(t *testing.T) {
 			}
 			command := exec.Command("bash", filepath.Join(repositoryRoot, "scripts/check-computer-image-runtime-evidence.sh"), "mutation", path, "edge-does-not-recover", "persistence.edge-recovers", "expected", "1", "3")
 			_, err := command.CombinedOutput()
-			if (err == nil) != events[event] {
-				t.Fatalf("jq readiness pairing %s -> %s accepted=%t, want %t: %v", checkID, event, err == nil, events[event], err)
+			if (err == nil) != allowed[event] {
+				t.Fatalf("jq readiness pairing %s -> %s accepted=%t, want %t: %v", checkID, event, err == nil, allowed[event], err)
 			}
 		}
 	}
@@ -230,6 +252,26 @@ func TestMutationEvidenceClosesEveryReadinessMaskingBranch(t *testing.T) {
 	recovered := strings.Replace(inputTimeout, `}`, `,"readiness_observed_later":true}`, 1)
 	if err := run("recovered-input-timeout", `[`+expected+`,`+recovered+`,`+controlPass+`]`); err != nil {
 		t.Fatalf("closed recovered readiness evidence was rejected: %v", err)
+	}
+}
+
+func TestRuntimeEvidenceAcceptsRelabelledReadinessMeasurement(t *testing.T) {
+	temp := t.TempDir()
+	receipt := filepath.Join(temp, "relabelled-readiness.json")
+	payload := `{"version":2,"checks":[` +
+		`{"id":"persistence.edge-recovers","status":"FAIL","detail":"both endpoints did not recover after edge withdrawal","failure_reason":"mutation_detected"},` +
+		`{"id":"input.view-isolated-during-tenure","status":"FAIL","detail":"late","failure_reason":"assertion_failed","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625}],` +
+		`"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}}`
+	if err := os.WriteFile(receipt, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", receipt, "edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "1", "29")
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("unrecovered readiness assertion unexpectedly passed mutation evidence: %s", output)
+	}
+	if !strings.Contains(string(output), "fail-set/edge-does-not-recover") || strings.Contains(string(output), "receipt/edge-does-not-recover") {
+		t.Fatalf("measured readiness assertion was treated as malformed instead of terminal: %s", output)
 	}
 }
 

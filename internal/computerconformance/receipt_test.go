@@ -101,6 +101,18 @@ func TestUnknownCheckAndStatusFailClosed(t *testing.T) {
 	}
 }
 
+func TestRecorderRejectsReadinessEventWithoutReadinessTimeout(t *testing.T) {
+	for _, reason := range []FailureReason{FailureAssertionFailed, FailureMutationDetected} {
+		t.Run(string(reason), func(t *testing.T) {
+			recorder := NewRecorder("image", "docker", "linux/arm64", time.Unix(100, 0))
+			err := recorder.RecordFailure("transport.view-ready", StatusFail, "failed", reason, ReadinessEventViewEndpointReady)
+			if err == nil {
+				t.Fatalf("%s accepted a readiness event", reason)
+			}
+		})
+	}
+}
+
 func TestReadinessTimeoutCheckEventPairingsAreClosed(t *testing.T) {
 	valid := map[string][]ReadinessEvent{
 		"transport.view-ready":              {ReadinessEventViewEndpointReady, ReadinessEventFirstRFBFrame},
@@ -148,6 +160,37 @@ func TestReadinessTimeoutRequiresMeasuredWindowAndLaterObservationIsMonotonic(t 
 	}
 	if !check.ReadinessObservedLater || check.ReadinessObservationWindowSeconds != 1.5 || check.ReadinessObservationElapsedSeconds != 1.625 {
 		t.Fatalf("readiness observation evidence = %+v", check)
+	}
+}
+
+func TestRecorderRelabelsOnlyUnobservedReadinessTimeouts(t *testing.T) {
+	recorder := NewRecorder("image", "docker", "linux/arm64", time.Unix(100, 0))
+	if err := recorder.RecordReadinessTimeout("input.view-isolated", "late", ReadinessEventKeyObserverAdvanced, 1500*time.Millisecond, 1625*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if !recorder.HasReadinessTimeout("input.view-isolated") {
+		t.Fatal("recorded readiness timeout was not queryable")
+	}
+	relabelled, err := recorder.RelabelUnobservedReadinessTimeout("input.view-isolated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !relabelled || recorder.HasReadinessTimeout("input.view-isolated") {
+		t.Fatal("unobserved readiness timeout was not relabelled")
+	}
+	for _, check := range recorder.Finish(time.Unix(101, 0)).Checks {
+		if check.ID == "input.view-isolated" && (check.FailureReason != FailureAssertionFailed || check.ReadinessEvent != "" || check.ReadinessObservationWindowSeconds != 1.5 || check.ReadinessObservationElapsedSeconds != 1.625) {
+			t.Fatalf("relabelled readiness evidence = %+v", check)
+		}
+	}
+
+	observed := NewRecorder("image", "docker", "linux/arm64", time.Unix(100, 0))
+	if err := observed.RecordReadinessTimeout("input.view-isolated", "late", ReadinessEventKeyObserverAdvanced, 1500*time.Millisecond, 1625*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	observed.ObserveReadinessEvent(ReadinessEventKeyObserverAdvanced)
+	if relabelled, err := observed.RelabelUnobservedReadinessTimeout("input.view-isolated"); err != nil || relabelled {
+		t.Fatalf("observed readiness timeout relabelled=%t err=%v", relabelled, err)
 	}
 }
 

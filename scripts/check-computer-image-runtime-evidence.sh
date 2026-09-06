@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly readiness_pairings='[
+  {"check":"transport.view-ready","events":["view_endpoint_ready","first_rfb_frame"]},
+  {"check":"transport.control-ready","events":["control_endpoint_ready","first_rfb_frame"]},
+  {"check":"input.view-isolated","events":["input_oracle_ready","key_observer_advanced"]},
+  {"check":"input.view-isolated-during-tenure","events":["key_observer_advanced"]}
+]'
+
 error() {
   local stage=$1 message=$2
   printf '::error title=computer runtime conformance::%s: %s\n' "$stage" "$message" >&2
@@ -12,12 +19,11 @@ require_receipt() {
     error "receipt/$row" "missing receipt $receipt"
     return 1
   fi
-  if ! jq -e '
+  if ! jq -e --argjson readiness_pairings "$readiness_pairings" '
     def valid_readiness_pair:
-      (.id == "transport.view-ready" and (.readiness_event == "view_endpoint_ready" or .readiness_event == "first_rfb_frame")) or
-      (.id == "transport.control-ready" and (.readiness_event == "control_endpoint_ready" or .readiness_event == "first_rfb_frame")) or
-      (.id == "input.view-isolated" and (.readiness_event == "input_oracle_ready" or .readiness_event == "key_observer_advanced")) or
-      (.id == "input.view-isolated-during-tenure" and .readiness_event == "key_observer_advanced");
+      . as $check |
+      any($readiness_pairings[];
+        .check == $check.id and any(.events[]; . == $check.readiness_event));
     type == "object" and .version == 2 and
     (.checks | type == "array" and all(.[];
       type == "object" and (.id | type == "string") and
@@ -33,9 +39,17 @@ require_receipt() {
           ((.readiness_observed_later // false) | type == "boolean")
         else
           (has("readiness_event") | not) and
-          (has("readiness_observation_window_seconds") | not) and
-          (has("readiness_observation_elapsed_seconds") | not) and
-          (has("readiness_observed_later") | not)
+          (has("readiness_observed_later") | not) and
+          if .failure_reason == "assertion_failed" then
+            (((has("readiness_observation_window_seconds") | not) and
+              (has("readiness_observation_elapsed_seconds") | not)) or
+             ((.readiness_observation_window_seconds | type == "number" and . > 0) and
+              (.readiness_observation_elapsed_seconds | type == "number") and
+              (.readiness_observation_elapsed_seconds >= .readiness_observation_window_seconds)))
+          else
+            (has("readiness_observation_window_seconds") | not) and
+            (has("readiness_observation_elapsed_seconds") | not)
+          end
         end
       else
         (has("failure_reason") | not) and (has("readiness_event") | not) and
