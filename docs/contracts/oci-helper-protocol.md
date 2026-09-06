@@ -322,8 +322,9 @@ succeeded, all Started evidence has been accepted, and helper `Run` has admitted
 that exact attempt in the same helper session generation. Successful L1
 renewals that arrive during image delivery remain agent-local; the first such
 renewal is queued only after the full Started path succeeds. The retained value
-is an absolute L1 expiry, and the TTL sent at admission is only its remaining
-monotonic lifetime. Terminal authority or reap closes the gate; a late flush is
+is an absolute L1 expiry, and the heartbeat client derives the wire TTL only at
+flush from its remaining monotonic lifetime. An expiry reached before flush is
+dropped. Terminal authority or reap closes the gate; a late flush is
 a no-op, and a replacement helper generation drops the renewal with typed
 evidence rather than targeting the replacement session.
 Receipt sets an absolute deadline from the helper's monotonic clock.
@@ -1232,10 +1233,12 @@ lists. The agent queues one attempt renewal only on the successful L1 renewal
 path, only when the returned directive is empty, and only after helper `Run`
 has admitted that exact tuple and its full Started evidence has reached L1. A
 pre-admission renewal is retained as an absolute expiry and the latest one is
-queued with only its remaining lifetime after authoritative `Started`; failed,
-timed-out, stale, `stop`, and `restart` responses never refresh the helper
+queued after authoritative `Started`; its remaining lifetime is calculated
+only when the heartbeat is flushed. Failed, timed-out, stale, `stop`, and
+`restart` responses never refresh the helper
 deadman. The retained generation must equal the session that admitted the
-attempt, and terminal paths discard it before reap. The pump uses
+attempt; mismatch closes the renewal gate, and terminal paths discard pending
+evidence before reap. The pump uses
 separate operation connections for image/watch streams so backpressure cannot
 starve session authority, and it locally verifies the returned helper checksum
 against a non-empty installed expectation before exposing the session.

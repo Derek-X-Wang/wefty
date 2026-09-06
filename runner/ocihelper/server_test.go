@@ -2406,6 +2406,66 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 	}
 }
 
+func TestAttemptDeadmanTTLAnchorsAtHeartbeatFlush(t *testing.T) {
+	t.Run("delayed flush clamps to the absolute L1 expiry", func(t *testing.T) {
+		engine := newFakeEngine()
+		clock := newManualClock(time.Unix(22_000, 0))
+		client, stop := startTestServer(t, engine, ServerConfig{
+			Clock: clock, HeartbeatTimeout: 5 * time.Minute, MaximumAttemptDeadman: 5 * time.Minute,
+		})
+		defer stop()
+		client.Now = clock.Now
+		session, err := client.OpenSession(t.Context(), testSessionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		requireSweep(t, session)
+		authority := testAuthority()
+		if _, err := session.Run(t.Context(), testRunRequest(authority, 5*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.QueueAttemptRenewalUntil(authority, clock.Now().Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(20 * time.Second)
+		if err := session.flushHeartbeat(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(40 * time.Second)
+		waitFor(t, time.Second, func() bool { return engine.attemptReapCount() == 1 }, "absolute-expiry attempt deadman reap")
+	})
+
+	t.Run("expired queued renewal is dropped", func(t *testing.T) {
+		engine := newFakeEngine()
+		clock := newManualClock(time.Unix(23_000, 0))
+		client, stop := startTestServer(t, engine, ServerConfig{
+			Clock: clock, HeartbeatTimeout: 5 * time.Minute, MaximumAttemptDeadman: 5 * time.Minute,
+		})
+		defer stop()
+		client.Now = clock.Now
+		session, err := client.OpenSession(t.Context(), testSessionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		requireSweep(t, session)
+		authority := testAuthority()
+		if _, err := session.Run(t.Context(), testRunRequest(authority, 15*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.QueueAttemptRenewalUntil(authority, clock.Now().Add(10*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(10 * time.Second)
+		if err := session.flushHeartbeat(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Second)
+		waitFor(t, time.Second, func() bool { return engine.attemptReapCount() == 1 }, "original attempt deadman reap")
+	})
+}
+
 func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
 	engine := newGuardianRecordingEngine()
 	clock := newManualClock(time.Unix(25_000, 0))

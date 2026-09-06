@@ -2469,25 +2469,23 @@ type nativeAgentAttemptDeadman struct {
 	nodeID, bootSessionID string
 }
 
-func (renewer nativeAgentAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration, expected workloadrunner.RuntimeGeneration) error {
+func (renewer nativeAgentAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, expiresAt time.Time, expected workloadrunner.RuntimeGeneration) error {
 	session, err := renewer.barrier.Session()
 	if err != nil {
 		return err
 	}
-	handshake := session.Handshake()
-	observed := workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration}
-	if observed != expected {
-		return &agent.AttemptDeadmanGenerationMismatchError{Expected: expected, Observed: observed}
+	if err := agent.ValidateAttemptDeadmanSessionGeneration(session, expected); err != nil {
+		return err
 	}
 	removalGeneration := "attempt"
 	if claim.Job.Spec.Class == contract.JobClassService {
 		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
 	}
-	return session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
+	return session.QueueAttemptRenewalUntil(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID,
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
-	}, ttl)
+	}, expiresAt)
 }
 
 func doNativeJSON(t *testing.T, client *http.Client, method, path string, input any, headers http.Header, wantStatus int, output any) {

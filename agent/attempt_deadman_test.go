@@ -37,8 +37,8 @@ func TestHelperDeadmanQueuesOnlyLiveAdmittedOCIRenewals(t *testing.T) {
 	if err := admission.admit(generation); err != nil {
 		t.Fatal(err)
 	}
-	if renewer.calls != 1 || renewer.ttl != 30*time.Second || renewer.generation != generation {
-		t.Fatalf("first admitted OCI renewal calls=%d ttl=%s generation=%+v", renewer.calls, renewer.ttl, renewer.generation)
+	if renewer.calls != 1 || !renewer.expiresAt.Equal(absoluteExpiry) || renewer.generation != generation {
+		t.Fatalf("first admitted OCI renewal calls=%d expires_at=%s generation=%+v", renewer.calls, renewer.expiresAt, renewer.generation)
 	}
 
 	admission.terminate()
@@ -68,6 +68,32 @@ func TestHelperDeadmanQueuesOnlyLiveAdmittedOCIRenewals(t *testing.T) {
 	if !strings.Contains(strings.Join(logs, "\n"), "reason=session_generation_mismatch") {
 		t.Fatalf("session-generation mismatch lacked typed evidence: %q", logs)
 	}
+	if err := mismatched.queue(first, clock.Now().Add(first.LeaseTTL)); err != nil {
+		t.Fatalf("terminal mismatch gate returned a later renewal error: %v", err)
+	}
+	if renewer.calls != 2 {
+		t.Fatalf("session-generation mismatch left renewal gate open: calls=%d", renewer.calls)
+	}
+}
+
+func TestHelperDeadmanDropsStopAndRestartDirectives(t *testing.T) {
+	renewer := &recordingDeadmanRenewer{}
+	claim := l1.Claim{Job: l1.Job{JobID: "job", Spec: contract.JobSpec{Kind: contract.JobKindOCI}}}
+	clock := newManualClock(time.Unix(11_000, 0))
+	generation := workloadrunner.RuntimeGeneration{InstanceID: "helper", Generation: 1}
+	admission := newAttemptDeadmanAdmission(renewer, claim, clock, nil)
+	if err := admission.admit(generation); err != nil {
+		t.Fatal(err)
+	}
+	for _, directive := range []l1.AttemptDirective{l1.AttemptDirectiveStop, l1.AttemptDirectiveRestart} {
+		lease := l1.AttemptLease{LeaseTTL: time.Minute, Directive: directive}
+		if err := admission.queue(lease, clock.Now().Add(lease.LeaseTTL)); err != nil {
+			t.Fatalf("directive %q: %v", directive, err)
+		}
+	}
+	if renewer.calls != 0 {
+		t.Fatalf("stop/restart directives reached helper deadman queue: calls=%d", renewer.calls)
+	}
 }
 
 func TestHelperDeadmanAdmissionFailsLoudlyWhenUnwired(t *testing.T) {
@@ -89,14 +115,14 @@ func TestHelperDeadmanAdmissionFailsLoudlyWhenUnwired(t *testing.T) {
 
 type recordingDeadmanRenewer struct {
 	calls      int
-	ttl        time.Duration
+	expiresAt  time.Time
 	generation workloadrunner.RuntimeGeneration
 	err        error
 }
 
-func (renewer *recordingDeadmanRenewer) QueueSuccessfulRenewal(_ l1.Claim, ttl time.Duration, generation workloadrunner.RuntimeGeneration) error {
+func (renewer *recordingDeadmanRenewer) QueueSuccessfulRenewal(_ l1.Claim, expiresAt time.Time, generation workloadrunner.RuntimeGeneration) error {
 	renewer.calls++
-	renewer.ttl = ttl
+	renewer.expiresAt = expiresAt
 	renewer.generation = generation
 	return renewer.err
 }

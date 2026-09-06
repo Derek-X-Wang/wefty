@@ -682,11 +682,13 @@ refreshes an attempt's helper deadman only after the matching L1 lease renewal
 succeeds and helper `Run` has admitted that exact attempt. Renewals during image
 delivery remain pending in the agent and the latest is queued only after every
 helper Started-evidence check and the fenced L1 `StartAttempt` succeed. The
-queued value retains its absolute monotonic L1 expiry, so admission sends only
-the remaining lifetime and never extends helper authority beyond L1. It is
-bound to the helper session generation that admitted the attempt; a replacement
-generation drops it with typed local evidence. Stop, restart, authority loss,
-and every terminal/reap path close the gate and discard pending evidence, while
+queued value retains its absolute monotonic L1 expiry; the heartbeat client
+derives its relative TTL only when the queued heartbeat is flushed, and drops
+an expiry already reached at that edge. It therefore never extends helper
+authority beyond L1. The renewal is bound to the helper session generation
+that admitted the attempt; a replacement generation drops it with typed local
+evidence and closes the gate. Stop, restart, authority loss, and every
+terminal/reap path also close the gate and discard pending evidence, while
 `Run`'s initial deadman covers helper-side starting. Agent-helper
 control EOF, a helper-clock heartbeat blackhole, or an
 expired per-attempt deadman therefore reaps runtime-owned state independently

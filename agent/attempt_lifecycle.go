@@ -13,6 +13,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -31,7 +32,7 @@ type attemptWatch interface {
 // implementation queues evidence into the helper client's heartbeat pump; it
 // must never perform an independent L1 renewal.
 type AttemptDeadmanRenewer interface {
-	QueueSuccessfulRenewal(l1.Claim, time.Duration, workloadrunner.RuntimeGeneration) error
+	QueueSuccessfulRenewal(l1.Claim, time.Time, workloadrunner.RuntimeGeneration) error
 }
 
 // AttemptDeadmanGenerationMismatchError reports that the helper session
@@ -44,6 +45,19 @@ type AttemptDeadmanGenerationMismatchError struct {
 
 func (failure *AttemptDeadmanGenerationMismatchError) Error() string {
 	return fmt.Sprintf("OCI attempt deadman session generation mismatch: expected %+v, observed %+v", failure.Expected, failure.Observed)
+}
+
+// ValidateAttemptDeadmanSessionGeneration binds renewal evidence to the exact
+// helper session that admitted the attempt. Every production adapter and
+// real-seam double uses this single comparison so takeover cannot silently
+// redirect stale L1 authority into a replacement helper session.
+func ValidateAttemptDeadmanSessionGeneration(session *ocihelper.Session, expected workloadrunner.RuntimeGeneration) error {
+	handshake := session.Handshake()
+	observed := workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration}
+	if observed != expected {
+		return &AttemptDeadmanGenerationMismatchError{Expected: expected, Observed: observed}
+	}
+	return nil
 }
 
 type disabledAttemptWatchdog struct{}
@@ -126,7 +140,6 @@ type attemptDeadmanAdmission struct {
 }
 
 type attemptDeadmanRenewal struct {
-	lease     l1.AttemptLease
 	expiresAt time.Time
 }
 
@@ -153,10 +166,10 @@ func (admission *attemptDeadmanAdmission) queue(lease l1.AttemptLease, expiresAt
 		return errors.New("OCI attempt deadman renewer is not wired")
 	}
 	if !admission.admitted {
-		admission.pending = &attemptDeadmanRenewal{lease: lease, expiresAt: expiresAt}
+		admission.pending = &attemptDeadmanRenewal{expiresAt: expiresAt}
 		return nil
 	}
-	return admission.queueLocked(attemptDeadmanRenewal{lease: lease, expiresAt: expiresAt})
+	return admission.queueLocked(attemptDeadmanRenewal{expiresAt: expiresAt})
 }
 
 func (admission *attemptDeadmanAdmission) admit(generation workloadrunner.RuntimeGeneration) error {
@@ -194,10 +207,11 @@ func (admission *attemptDeadmanAdmission) queueLocked(renewal attemptDeadmanRene
 		admission.log("attempt_deadman_renewal outcome=dropped reason=l1_lease_expired attempt_id=%q", admission.claim.Lease.AttemptID)
 		return nil
 	}
-	renewal.lease.LeaseTTL = remaining
-	err := queueHelperDeadman(admission.renewer, admission.claim, renewal.lease, admission.generation)
+	err := queueHelperDeadman(admission.renewer, admission.claim, renewal.expiresAt, admission.generation)
 	var mismatch *AttemptDeadmanGenerationMismatchError
 	if errors.As(err, &mismatch) {
+		admission.terminal = true
+		admission.pending = nil
 		admission.log(
 			"attempt_deadman_renewal outcome=dropped reason=session_generation_mismatch attempt_id=%q expected_instance_id=%q expected_generation=%d observed_instance_id=%q observed_generation=%d",
 			admission.claim.Lease.AttemptID, mismatch.Expected.InstanceID, mismatch.Expected.Generation, mismatch.Observed.InstanceID, mismatch.Observed.Generation,
@@ -1354,11 +1368,11 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 	}
 }
 
-func queueHelperDeadman(renewer AttemptDeadmanRenewer, claim l1.Claim, lease l1.AttemptLease, generation workloadrunner.RuntimeGeneration) error {
-	if renewer == nil || claim.Job.Spec.Kind != contract.JobKindOCI || lease.Directive != "" {
+func queueHelperDeadman(renewer AttemptDeadmanRenewer, claim l1.Claim, expiresAt time.Time, generation workloadrunner.RuntimeGeneration) error {
+	if renewer == nil {
 		return nil
 	}
-	return renewer.QueueSuccessfulRenewal(claim, lease.LeaseTTL, generation)
+	return renewer.QueueSuccessfulRenewal(claim, expiresAt, generation)
 }
 
 func returnWithDirective(failures chan<- destinationError, directive error) {

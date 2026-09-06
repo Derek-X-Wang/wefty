@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,11 +36,11 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	defer stopL1()
 
 	engine := newPreAdmissionRenewalEngine()
-	barrier, stopHelper := startPreAdmissionHelper(t, engine)
+	clock := newManualClock(time.Unix(10_000, 0))
+	barrier, stopHelper := startPreAdmissionHelper(t, engine, clock.Now)
 	defer stopHelper()
 	helperRenewals := make(chan struct{}, 8)
 	adapter := ocirunner.NewAdapter(barrier)
-	clock := newManualClock(time.Unix(10_000, 0))
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "pre-admission-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -257,6 +258,90 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	}
 }
 
+func TestSessionGenerationMismatchDropsRenewalAfterHelperTakeover(t *testing.T) {
+	engine := newPreAdmissionRenewalEngine()
+	barrier, stopHelper := startPreAdmissionHelper(t, engine, time.Now)
+	defer stopHelper()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	staleSession, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleHandshake := staleSession.Handshake()
+	staleGeneration := workloadrunner.RuntimeGeneration{
+		InstanceID: staleHandshake.HelperInstanceID,
+		Generation: staleHandshake.SessionGeneration,
+	}
+
+	// Reject a genuinely unknown tuple to withdraw the incumbent session, then
+	// let the real boot barrier complete a fresh exclusive-session takeover.
+	trigger := ocihelper.AttemptAuthority{
+		NodeID: "pre-admission-node", BootSessionID: "pre-admission-boot",
+		JobID: "takeover-trigger", AttemptID: "takeover-trigger-attempt", FencingToken: "takeover-trigger-fence",
+		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(l1.InitialServiceRemovalGeneration),
+	}
+	if err := staleSession.QueueAttemptRenewal(trigger, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	lossDeadline := time.Now().Add(time.Second)
+	for staleSession.HealthError() == nil && time.Now().Before(lossDeadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := staleSession.HealthError(); err == nil {
+		t.Fatal("unknown renewal did not withdraw the incumbent helper session")
+	}
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatalf("replacement helper session takeover: %v", err)
+	}
+	replacement, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementHandshake := replacement.Handshake()
+	replacementGeneration := workloadrunner.RuntimeGeneration{
+		InstanceID: replacementHandshake.HelperInstanceID,
+		Generation: replacementHandshake.SessionGeneration,
+	}
+	if replacementGeneration == staleGeneration {
+		t.Fatalf("helper takeover retained stale generation: %+v", replacementGeneration)
+	}
+
+	queued := make(chan struct{}, 1)
+	var logs []string
+	claim := l1.Claim{
+		Job:   l1.Job{JobID: "stale-generation-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}},
+		Lease: l1.AttemptLease{AttemptID: "stale-generation-attempt", FencingToken: "stale-generation-fence", LeaseTTL: time.Second},
+	}
+	admission := newAttemptDeadmanAdmission(preAdmissionDeadman{
+		barrier: barrier, nodeID: "pre-admission-node", bootSessionID: "pre-admission-boot",
+		observe: func() { queued <- struct{}{} },
+	}, claim, systemClock{}, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	if err := admission.admit(staleGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.queue(claim.Lease, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("stale-generation renewal was not dropped: %v", err)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "reason=session_generation_mismatch") {
+		t.Fatalf("stale-generation renewal lacked mismatch evidence: %q", logs)
+	}
+	if err := admission.queue(claim.Lease, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("terminal mismatch gate returned a later renewal error: %v", err)
+	}
+	select {
+	case <-queued:
+		t.Fatal("stale-generation renewal reached the replacement helper session")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := replacement.HealthError(); err != nil {
+		t.Fatalf("stale-generation renewal invalidated replacement helper session: %v", err)
+	}
+}
+
 func preAdmissionString(value string) *string { return &value }
 
 type preAdmissionDeadman struct {
@@ -265,21 +350,19 @@ type preAdmissionDeadman struct {
 	observe               func()
 }
 
-func (renewer preAdmissionDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration, expected workloadrunner.RuntimeGeneration) error {
+func (renewer preAdmissionDeadman) QueueSuccessfulRenewal(claim l1.Claim, expiresAt time.Time, expected workloadrunner.RuntimeGeneration) error {
 	session, err := renewer.barrier.Session()
 	if err != nil {
 		return err
 	}
-	handshake := session.Handshake()
-	observed := workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration}
-	if observed != expected {
-		return &AttemptDeadmanGenerationMismatchError{Expected: expected, Observed: observed}
+	if err := ValidateAttemptDeadmanSessionGeneration(session, expected); err != nil {
+		return err
 	}
-	err = session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
+	err = session.QueueAttemptRenewalUntil(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID,
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: fmt.Sprint(l1.InitialServiceRemovalGeneration),
-	}, ttl)
+	}, expiresAt)
 	if err == nil && renewer.observe != nil {
 		renewer.observe()
 	}
@@ -415,7 +498,7 @@ func preAdmissionImageResponse() ocihelper.EnsureImageResponse {
 	return ocihelper.EnsureImageResponse{TopLevelDigest: preAdmissionImageDigest, PlatformDigest: preAdmissionImageDigest, Evidence: evidence}
 }
 
-func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine) (*ocihelper.BootBarrier, func()) {
+func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine, now func() time.Time) (*ocihelper.BootBarrier, func()) {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "wefty-332-")
 	if err != nil {
@@ -439,6 +522,7 @@ func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine) (*ocihelper.
 	go func() { serveDone <- server.Serve(serveContext, listener) }()
 	client := ocihelper.NewUnixClient(path, "checksum-test")
 	client.HeartbeatInterval = 20 * time.Millisecond
+	client.Now = now
 	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
 		NodeID: "pre-admission-node", BootSessionID: "pre-admission-boot",
 	})

@@ -34,6 +34,7 @@ type Client struct {
 	Version              int
 	ExpectedChecksum     string
 	HeartbeatInterval    time.Duration
+	Now                  func() time.Time
 	disableHeartbeatPump bool
 }
 
@@ -75,6 +76,13 @@ func (client *Client) protocolVersion() int {
 		return ProtocolVersion
 	}
 	return client.Version
+}
+
+func (client *Client) currentTime() time.Time {
+	if client != nil && client.Now != nil {
+		return client.Now()
+	}
+	return time.Now()
 }
 
 func (client *Client) OpenSession(ctx context.Context, request AcquireSessionRequest) (*Session, error) {
@@ -262,15 +270,26 @@ func (session *Session) SetLossHandler(handler func(error)) {
 }
 
 // QueueAttemptRenewal records successful L1 lease evidence for the heartbeat
-// pump. It is the only API that can renew an attempt deadman.
+// pump. The relative TTL is anchored here and clamped again when the queued
+// heartbeat is flushed, so queue and transport delay cannot extend authority.
 func (session *Session) QueueAttemptRenewal(authority AttemptAuthority, ttl time.Duration) error {
+	if session == nil || session.client == nil {
+		return errors.New("OCI helper session is closed")
+	}
+	return session.QueueAttemptRenewalUntil(authority, session.client.currentTime().Add(ttl))
+}
+
+// QueueAttemptRenewalUntil records the absolute L1 lease expiry. Production
+// renewal paths use this form so the helper TTL is derived at heartbeat flush.
+func (session *Session) QueueAttemptRenewalUntil(authority AttemptAuthority, expiresAt time.Time) error {
 	if session == nil || session.control == nil {
 		return errors.New("OCI helper session is closed")
 	}
 	if err := authority.validate(); err != nil {
 		return err
 	}
-	if ttl <= 0 || ttl > session.response.MaximumAttemptDeadman {
+	remaining := expiresAt.Sub(session.client.currentTime())
+	if remaining <= 0 || remaining > session.response.MaximumAttemptDeadman {
 		return errors.New("attempt deadman TTL is outside helper bounds")
 	}
 	if !session.client.disableHeartbeatPump {
@@ -283,7 +302,7 @@ func (session *Session) QueueAttemptRenewal(authority AttemptAuthority, ttl time
 	session.queueMu.Lock()
 	session.queueToken++
 	session.pending[authority.key()] = pendingRenewal{
-		renewal: DeadmanRenewal{Authority: authority, TTL: ttl}, token: session.queueToken,
+		authority: authority, expiresAt: expiresAt, token: session.queueToken,
 	}
 	session.queueMu.Unlock()
 	notify(session.queued)
@@ -329,9 +348,14 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 	session.queueMu.Lock()
 	renewals := make([]DeadmanRenewal, 0, len(session.pending))
 	snapshot := make(map[string]uint64, len(session.pending))
+	now := session.client.currentTime()
 	for key, pending := range session.pending {
 		snapshot[key] = pending.token
-		renewals = append(renewals, pending.renewal)
+		remaining := pending.expiresAt.Sub(now)
+		if remaining <= 0 {
+			continue
+		}
+		renewals = append(renewals, DeadmanRenewal{Authority: pending.authority, TTL: remaining})
 	}
 	session.sequence++
 	sequence := session.sequence
@@ -360,8 +384,9 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 }
 
 type pendingRenewal struct {
-	renewal DeadmanRenewal
-	token   uint64
+	authority AttemptAuthority
+	expiresAt time.Time
+	token     uint64
 }
 
 func (session *Session) EnsureImage(ctx context.Context, request EnsureImageRequest, receive func(EnsureImageEvent) error) error {
