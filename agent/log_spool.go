@@ -66,6 +66,10 @@ type logSpool struct {
 	// appendCheckpoint is a test-only scheduling seam for contention before a
 	// durable append transaction; production construction always leaves it nil.
 	appendCheckpoint func(context.Context)
+	// serviceEvictionCheckpoint is a test-only scheduling seam for contention
+	// after service retention pressure has selected the eviction path;
+	// production construction always leaves it nil.
+	serviceEvictionCheckpoint func(context.Context)
 	// pendingCountCheckpoint is a test-only scheduling seam for contention at
 	// the pending-count query; production construction always leaves it nil.
 	pendingCountCheckpoint func(context.Context)
@@ -705,13 +709,16 @@ type serviceEvictionEvent struct {
 }
 
 func (spool *logSpool) evictServicePrefix(ctx context.Context, tx *sql.Tx, required int64) error {
+	if spool.serviceEvictionCheckpoint != nil {
+		spool.serviceEvictionCheckpoint(ctx)
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT e.ordinal, e.attempt_id, e.stream, e.sequence, e.payload_bytes
 FROM spool_events e
 JOIN spool_attempts a ON a.attempt_id=e.attempt_id
 WHERE a.class=? AND e.payload_bytes>0
 ORDER BY e.ordinal`, contract.JobClassService)
 	if err != nil {
-		return fmt.Errorf("agent: select service log eviction prefix: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: select service log eviction prefix", err)
 	}
 	var candidates []serviceEvictionEvent
 	var released int64
@@ -721,7 +728,7 @@ ORDER BY e.ordinal`, contract.JobClassService)
 		var payloadBytes int64
 		if err := rows.Scan(&candidate.ordinal, &candidate.attemptID, &candidate.stream, &sequence, &payloadBytes); err != nil {
 			rows.Close()
-			return fmt.Errorf("agent: scan service log eviction prefix: %w", err)
+			return wrapLogSpoolContextError(ctx, "agent: scan service log eviction prefix", err)
 		}
 		candidate.sequence = uint64(sequence)
 		candidate.payloadBytes = uint64(payloadBytes)
@@ -730,10 +737,10 @@ ORDER BY e.ordinal`, contract.JobClassService)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return fmt.Errorf("agent: iterate service log eviction prefix: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: iterate service log eviction prefix", err)
 	}
 	if err := rows.Close(); err != nil {
-		return fmt.Errorf("agent: close service log eviction prefix: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: close service log eviction prefix", err)
 	}
 	if released < required {
 		return fmt.Errorf("agent: service log spool cannot release %d bytes from %d bytes of retained payload", required, released)
@@ -786,11 +793,11 @@ func replaceEvictedServiceRun(ctx context.Context, tx *sql.Tx, events []serviceE
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_events SET bytes=X'', gap_json=?, payload_bytes=0
 WHERE ordinal=? AND attempt_id=? AND stream=?`, gapJSON, first.ordinal, first.attemptID, first.stream); err != nil {
-		return fmt.Errorf("agent: store service log eviction gap: %w", err)
+		return wrapLogSpoolContextError(ctx, "agent: store service log eviction gap", err)
 	}
 	for _, event := range events[1:] {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM spool_events WHERE ordinal=? AND attempt_id=?", event.ordinal, event.attemptID); err != nil {
-			return fmt.Errorf("agent: release evicted service log payload: %w", err)
+			return wrapLogSpoolContextError(ctx, "agent: release evicted service log payload", err)
 		}
 	}
 	return nil

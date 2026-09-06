@@ -102,13 +102,13 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 	case <-sink.done:
 		return sink.err()
 	case <-ctx.Done():
-		return ctx.Err()
+		err := ctx.Err()
+		sink.retainDeadlineInterrupted(ctx, event, err)
+		return err
 	default:
 	}
 	if err := sink.spool.append(ctx, event); err != nil {
-		if cause := context.Cause(ctx); cause == context.DeadlineExceeded && err == cause && sink.retainLate != nil {
-			sink.retainLate(event)
-		}
+		sink.retainDeadlineInterrupted(ctx, event, err)
 		return err
 	}
 	pending := sink.pendingEvents.Add(1)
@@ -120,6 +120,12 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 	default:
 	}
 	return nil
+}
+
+func (sink *batchingLogSink) retainDeadlineInterrupted(ctx context.Context, event contract.LogEvent, err error) {
+	if cause := context.Cause(ctx); cause == context.DeadlineExceeded && err == cause && sink.retainLate != nil {
+		sink.retainLate(event)
+	}
 }
 
 func (sink *batchingLogSink) Close() error {
