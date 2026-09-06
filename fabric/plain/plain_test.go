@@ -75,6 +75,108 @@ func TestEchoWithInjectedIdentity(t *testing.T) {
 	}
 }
 
+func TestDialWaitsForConcurrentLogicalListenerRegistration(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	bindStarted := make(chan struct{})
+	releaseBind := make(chan struct{})
+	network.listenFn = func(network, address string) (net.Listener, error) {
+		close(bindStarted)
+		<-releaseBind
+		return net.Listen(network, address)
+	}
+
+	type listenResult struct {
+		listener net.Listener
+		err      error
+	}
+	listening := make(chan listenResult, 1)
+	go func() {
+		listener, err := server.Listen("tcp", "wefty://run-ledger")
+		listening <- listenResult{listener: listener, err: err}
+	}()
+	<-bindStarted
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	dialed := make(chan dialResult, 1)
+	go func() {
+		connection, err := client.Dial(ctx, "tcp", "wefty://run-ledger")
+		dialed <- dialResult{connection: connection, err: err}
+	}()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case result := <-dialed:
+			close(releaseBind)
+			t.Fatalf("Dial() returned before listener registration completed: %v", result.err)
+		case <-deadline.C:
+			close(releaseBind)
+			t.Fatal("Dial() did not observe the in-progress listener registration")
+		default:
+		}
+		network.mu.RLock()
+		registration := network.names["wefty://run-ledger"]
+		waiting := registration != nil && registration.waiters > 0
+		network.mu.RUnlock()
+		if waiting {
+			close(releaseBind)
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	listen := <-listening
+	if listen.err != nil {
+		t.Fatal(listen.err)
+	}
+	defer listen.listener.Close()
+	result := <-dialed
+	if result.err != nil {
+		t.Fatalf("Dial() during listener registration = %v", result.err)
+	}
+	connection := result.connection
+	defer connection.Close()
+}
+
+func TestLogicalListenerTeardownPreservesCurrentOwner(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	client := network.NewFabric(fabric.Identity{NodeID: "agent"})
+
+	firstListener, err := server.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRegistration := firstListener.(*listener).registration
+	if err := firstListener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	currentListener, err := server.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer currentListener.Close()
+
+	// A delayed cleanup from the first participant must not remove the
+	// replacement participant's registration.
+	network.unregisterName("wefty://run-ledger", firstRegistration)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	connection, err := client.Dial(ctx, "tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatalf("Dial() after stale listener teardown = %v", err)
+	}
+	defer connection.Close()
+}
+
 func TestExplicitFabricIDJoinsSeparateProcessNetworks(t *testing.T) {
 	first, err := NewNetworkWithID("plain-linux-computer-acceptance")
 	if err != nil {
