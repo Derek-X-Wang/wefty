@@ -967,7 +967,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		finalizationErr := errors.Join(recoveryErr, reapErr, outputErr, uploadErr)
 		if finalizationErr != nil {
-			if result.RuntimeFailure == nil {
+			if result.RuntimeFailure == nil && result.SpawnError == nil {
 				result = contract.ProcessResult{OutputError: finalizationErr.Error(), LogEvidenceIncomplete: result.LogEvidenceIncomplete}
 			}
 		}
