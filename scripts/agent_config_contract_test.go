@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -14,6 +15,56 @@ import (
 )
 
 const agentImportPath = "github.com/Derek-X-Wang/wefty/agent"
+
+func TestOCICapableAgentConfigFixturesRequireIntentAuthority(t *testing.T) {
+	tests := []struct {
+		name       string
+		configBody string
+		want       int
+	}{
+		{
+			name:       "bare capability key",
+			configBody: `Capabilities: map[string]bool{"oci": true, "process": true}`,
+			want:       1,
+		},
+		{
+			name:       "normalized capability key",
+			configBody: `Capabilities: map[string]bool{"kind:oci": true, "kind:process": true}`,
+			want:       1,
+		},
+		{
+			name:       "OCI workload runtime",
+			configBody: `WorkloadRuntimes: map[string]WorkloadRuntime{JobKindOCI: adapter, JobKindProcess: adapter}`,
+			want:       1,
+		},
+		{
+			name:       "legitimate process-only configuration",
+			configBody: `Capabilities: map[string]bool{"process": true}, WorkloadRuntimes: map[string]WorkloadRuntime{JobKindProcess: adapter}`,
+			want:       0,
+		},
+		{
+			name:       "explicit nil authority remains compile-visible",
+			configBody: `Capabilities: map[string]bool{"kind:oci": true}, OCIIntent: nil`,
+			want:       0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "fixture.go")
+			source := "package agent\nfunc fixture() { _ = Config{" + test.configBody + "} }\n"
+			if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			violations, err := missingOCIIntentAuthorities(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(violations) != test.want {
+				t.Fatalf("violations=%v, want %d for %s", violations, test.want, source)
+			}
+		})
+	}
+}
 
 func TestOCICapableAgentConfigLiteralsDeclareIntentAuthority(t *testing.T) {
 	_, source, _, ok := runtime.Caller(0)
@@ -75,10 +126,10 @@ func missingOCIIntentAuthorities(path string) ([]token.Position, error) {
 		agentAliases[name] = true
 	}
 	var violations []token.Position
-	inspect := func(node ast.Node, allowMissing bool) {
+	inspect := func(node ast.Node) {
 		ast.Inspect(node, func(candidate ast.Node) bool {
 			literal, ok := candidate.(*ast.CompositeLit)
-			if !ok || !isAgentConfigLiteral(parsed.Name.Name, agentAliases, literal.Type) || allowMissing {
+			if !ok || !isAgentConfigLiteral(parsed.Name.Name, agentAliases, literal.Type) {
 				return true
 			}
 			if configLiteralOffersOCI(literal) && !configLiteralHasField(literal, "OCIIntent") {
@@ -88,14 +139,10 @@ func missingOCIIntentAuthorities(path string) ([]token.Position, error) {
 		})
 	}
 	for _, declaration := range parsed.Decls {
-		if function, ok := declaration.(*ast.FuncDecl); ok {
-			// This one test deliberately constructs invalid configurations to pin
-			// the runtime fail-closed fallback after the source contract fires.
-			inspect(function.Body, function.Name.Name == "TestAgentRefusesOCIWithoutIntentAuthority")
-			continue
-		}
-		inspect(declaration, false)
+		inspect(declaration)
 	}
+	// Dynamic or non-literal Config construction is intentionally outside this
+	// source contract; Agent.New remains the runtime fail-closed backstop.
 	return violations, nil
 }
 
@@ -159,10 +206,10 @@ func expressionNamesOCI(expression ast.Expr) bool {
 		case *ast.BasicLit:
 			if value.Kind == token.STRING {
 				decoded, err := strconv.Unquote(value.Value)
-				found = err == nil && (strings.EqualFold(strings.TrimSpace(decoded), "oci") || strings.EqualFold(strings.TrimSpace(decoded), "kind:oci"))
+				found = found || err == nil && (strings.EqualFold(strings.TrimSpace(decoded), "oci") || strings.EqualFold(strings.TrimSpace(decoded), "kind:oci"))
 			}
 		case *ast.Ident:
-			found = value.Name == "JobKindOCI"
+			found = found || value.Name == "JobKindOCI"
 		}
 		return !found
 	})

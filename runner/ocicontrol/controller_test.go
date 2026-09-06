@@ -28,6 +28,7 @@ type controlTestRuntime struct {
 	stopped      int
 	fenced       bool
 	stopErr      error
+	fenceErr     error
 	live         bool
 	fenceEntered chan struct{}
 	fenceRelease chan struct{}
@@ -51,6 +52,9 @@ func (runtime *controlTestRuntime) FenceOCIIntentStop(ctx context.Context, revis
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+	}
+	if runtime.fenceErr != nil {
+		return nil, runtime.fenceErr
 	}
 	return func() {}, nil
 }
@@ -160,6 +164,23 @@ func TestControllerWaitsForCompletionDrainBeforeRuntimeStop(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if runtime.stopped != 1 {
 		t.Fatalf("runtime stop calls=%d, want 1", runtime.stopped)
+	}
+}
+
+func TestControllerDoesNotReportQuiescedAfterCompletionDrainFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	clock := &controlTestClock{now: time.Date(2026, 8, 28, 12, 45, 0, 0, time.UTC)}
+	if _, err := lima.InitializeOCIIntent(path, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &controlTestRuntime{intentPath: path, fenceErr: errors.New("suppression persistence failed")}
+	controller, err := NewController(ControllerConfig{IntentPath: path, Runtime: runtime, Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := controller.Stop(t.Context(), IntentMutationRequest{ExpectedRevision: 1})
+	if err == nil || response.RuntimeQuiesced || runtime.stopped != 0 {
+		t.Fatalf("stop response=%+v runtime_stop_calls=%d err=%v", response, runtime.stopped, err)
 	}
 }
 

@@ -505,10 +505,15 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 			}
 			if !lifecycle.dependencies.ociIntentGate.allows(observation) {
 				if lifecycle.dependencies.outbox != nil {
-					if err := lifecycle.dependencies.outbox.suppressCompletion(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); err != nil {
-						releaseIntent()
-						return destinationError{destination: errorDestinationUnclassified, err: err}
+					suppressionContext, cancelSuppression := lifecycle.dependencies.ociIntentGate.beginSuppression(ctx)
+					err := lifecycle.dependencies.outbox.suppressCompletion(suppressionContext, claim.Lease.AttemptID, observation.Revision)
+					cancelSuppression()
+					persistenceErr := lifecycle.dependencies.ociIntentGate.finishSuppression(claim.Lease.AttemptID, observation, err)
+					releaseIntent()
+					if persistenceErr != nil {
+						return destinationError{destination: errorDestinationUnclassified, err: persistenceErr}
 					}
+					return destinationError{destination: errorDestinationUnclassified, err: errOCIIntentDisabled}
 				}
 				releaseIntent()
 				return destinationError{destination: errorDestinationUnclassified, err: errOCIIntentDisabled}

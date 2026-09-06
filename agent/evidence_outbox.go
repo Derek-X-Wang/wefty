@@ -82,7 +82,19 @@ func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID
 }
 
 func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string, revision uint64) error {
-	return outbox.spool.recordCompletionDisposition(ctx, attemptID, "suppressed", "service_intent_stop", revision)
+	for {
+		err := outbox.spool.recordCompletionDisposition(ctx, attemptID, "suppressed", "service_intent_stop", revision)
+		if err == nil {
+			return nil
+		}
+		timer := outbox.clock.NewTimer(outbox.retryInterval)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return errors.Join(err, ctx.Err())
+		case <-timer.C():
+		}
+	}
 }
 
 func (outbox *evidenceOutbox) withholdCompletion(ctx context.Context, attemptID, reason string, revision uint64) error {
@@ -414,7 +426,10 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 				return intentErr
 			}
 			if !outbox.ociIntentGate.allows(observation) {
-				err := outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID, observation.Revision)
+				suppressionContext, cancelSuppression := outbox.ociIntentGate.beginSuppression(ctx)
+				err := outbox.suppressCompletion(suppressionContext, attempt.attemptID, observation.Revision)
+				cancelSuppression()
+				err = outbox.ociIntentGate.finishSuppression(attempt.attemptID, observation, err)
 				releaseIntent()
 				return err
 			}

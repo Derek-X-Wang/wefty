@@ -489,6 +489,81 @@ WHERE job_id='restart-always-service' AND result_json IS NOT NULL`).Scan(&retain
 	}
 }
 
+func TestCompletionDispositionSurvivesMissingFullAttempt(t *testing.T) {
+	t.Run("unknown attempt", func(t *testing.T) {
+		spool := openTestLogSpool(t, t.TempDir(), "unknown-disposition-node", 1<<20)
+		defer spool.Close()
+		if err := spool.recordCompletionDisposition(t.Context(), "unknown-attempt", "withheld", "intent_authority_unavailable", 0); err != nil {
+			t.Fatal(err)
+		}
+		receipt := spool.inspectCompletion(t.Context(), "unknown-attempt")
+		if receipt.State != "withheld" || receipt.Reason != "intent_authority_unavailable" {
+			t.Fatalf("unknown attempt disposition=%+v", receipt)
+		}
+	})
+
+	t.Run("compacted attempt", func(t *testing.T) {
+		spool := openTestLogSpool(t, t.TempDir(), "compacted-disposition-node", 1<<20)
+		defer spool.Close()
+		const jobID = "compacted-disposition-job"
+		for index := range maxSuppressedCompletionPayloadsPerJob + 1 {
+			attemptID := fmt.Sprintf("compacted-disposition-%02d", index)
+			claim := serviceSpoolTestClaim(attemptID)
+			claim.Job.JobID = jobID
+			claim.Job.Spec.Kind = contract.JobKindOCI
+			if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+				t.Fatal(err)
+			}
+			exitCode := index
+			if err := spool.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Unix(int64(index+1), 0)); err != nil {
+				t.Fatal(err)
+			}
+			if err := spool.recordCompletionDisposition(t.Context(), attemptID, "suppressed", "service_intent_stop", uint64(index+1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const compactedAttempt = "compacted-disposition-00"
+		if before := spool.inspectCompletion(t.Context(), compactedAttempt); before.TerminalAudit == nil {
+			t.Fatalf("attempt was not compacted before reclassification=%+v", before)
+		}
+		if err := spool.recordCompletionDisposition(t.Context(), compactedAttempt, "withheld", "intent_authority_unavailable", 0); err != nil {
+			t.Fatal(err)
+		}
+		after := spool.inspectCompletion(t.Context(), compactedAttempt)
+		if after.State != "withheld" || after.Reason != "intent_authority_unavailable" || after.TerminalAudit == nil {
+			t.Fatalf("compacted attempt disposition=%+v", after)
+		}
+		if err := spool.purgeJob(t.Context(), jobID); err != nil {
+			t.Fatal(err)
+		}
+		if purged := spool.inspectCompletion(t.Context(), compactedAttempt); purged.State != "never_persisted" {
+			t.Fatalf("job purge retained reclassified compact receipt=%+v", purged)
+		}
+	})
+}
+
+func TestDeliveredCompletionReceiptIsPurgedWithJob(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "delivered-purge-node", 1<<20)
+	defer spool.Close()
+	claim := serviceSpoolTestClaim("delivered-purge-attempt")
+	if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.purgeJob(t.Context(), claim.Job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if receipt := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID); receipt.State != "never_persisted" {
+		t.Fatalf("job purge retained delivered receipt=%+v", receipt)
+	}
+}
+
 func TestSuppressedPayloadCompactionWaitsForLogAcknowledgement(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "suppression-log-bound-node", 1<<20)
 	defer spool.Close()

@@ -353,18 +353,19 @@ func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
 		name   string
 		config Config
 	}{
-		{name: "raw capability", config: Config{Capabilities: map[string]bool{"kind:oci": true}}},
+		{name: "raw capability", config: Config{Capabilities: map[string]bool{"kind:oci": true}, OCIIntent: nil}},
 		{name: "probe only", config: Config{
 			CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 				return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 			}),
 			OCIBootBarrier: readyOCIBootBarrier{},
+			OCIIntent:      nil,
 		}},
-		{name: "normalized capability", config: Config{Capabilities: map[string]bool{"  KiNd:OcI  ": true}}},
-		{name: "bare job kind", config: Config{Capabilities: map[string]bool{contract.JobKindOCI: true}}},
+		{name: "normalized capability", config: Config{Capabilities: map[string]bool{"  KiNd:OcI  ": true}, OCIIntent: nil}},
+		{name: "bare job kind", config: Config{Capabilities: map[string]bool{contract.JobKindOCI: true}, OCIIntent: nil}},
 		{name: "runtime only", config: Config{WorkloadRuntimes: map[string]WorkloadRuntime{
 			contract.JobKindOCI: instantWorkloadRuntime{},
-		}}},
+		}, OCIIntent: nil}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

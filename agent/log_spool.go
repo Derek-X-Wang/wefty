@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -62,6 +63,8 @@ type logSpool struct {
 	db              *sql.DB
 	maxOneShotBytes int64
 	maxServiceBytes int64
+	dispositionMu   sync.Mutex
+	dispositionNext chan struct{}
 	// runtimeRemovalCheckpoint is a test-only crash seam exercised at durable
 	// manifest state boundaries; production construction always leaves it nil.
 	runtimeRemovalCheckpoint func(runtimeRemovalCheckpoint) error
@@ -95,7 +98,10 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 		return nil, fmt.Errorf("agent: open log spool: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	spool := &logSpool{db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes}
+	spool := &logSpool{
+		db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes,
+		dispositionNext: make(chan struct{}),
+	}
 	if err := spool.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -1032,6 +1038,36 @@ LEFT JOIN spool_completion_receipts r ON r.attempt_id=?`, attemptID, attemptID, 
 	return receipt
 }
 
+// waitCompletionDisposition observes the commit edge shared by live completion
+// and process-lifetime recovery. Capturing the notification channel before the
+// read prevents a commit between inspection and waiting from being missed.
+func (spool *logSpool) waitCompletionDisposition(ctx context.Context, attemptID, disposition string, intentRevision uint64) (completionInspectionReceipt, error) {
+	for {
+		spool.dispositionMu.Lock()
+		changed := spool.dispositionNext
+		spool.dispositionMu.Unlock()
+		receipt := spool.inspectCompletion(ctx, attemptID)
+		if receipt.State == disposition && receipt.IntentRevision == intentRevision {
+			return receipt, nil
+		}
+		if receipt.State == "inspection_error" {
+			return receipt, fmt.Errorf("agent: inspect completion disposition: %s", receipt.InspectionError)
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return receipt, fmt.Errorf("agent: wait for %s completion disposition at intent revision %d: %w", disposition, intentRevision, ctx.Err())
+		}
+	}
+}
+
+func (spool *logSpool) notifyCompletionDisposition() {
+	spool.dispositionMu.Lock()
+	close(spool.dispositionNext)
+	spool.dispositionNext = make(chan struct{})
+	spool.dispositionMu.Unlock()
+}
+
 func (spool *logSpool) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
 	var quiescenceEvidence l1.RuntimeQuiescenceEvidence
 	if len(evidence) > 0 {
@@ -1098,10 +1134,18 @@ func (spool *logSpool) completionDelivered(ctx context.Context, attemptID string
 		return fmt.Errorf("agent: begin durable completion acknowledgement: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns, intent_revision)
-VALUES(?, 'delivered', 'acknowledged_by_l1', ?, ?)
+	var jobID sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT job_id FROM spool_attempts WHERE attempt_id=?", attemptID).Scan(&jobID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent: read delivered completion job: %w", err)
+	}
+	var storedJobID any
+	if jobID.Valid {
+		storedJobID = jobID.String
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns, intent_revision, job_id)
+VALUES(?, 'delivered', 'acknowledged_by_l1', ?, ?, ?)
 ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, observed_ns=excluded.observed_ns, intent_revision=excluded.intent_revision`,
-		attemptID, time.Now().UTC().UnixNano(), revision); err != nil {
+		attemptID, time.Now().UTC().UnixNano(), revision, storedJobID); err != nil {
 		return fmt.Errorf("agent: record delivered completion receipt: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL,
@@ -1123,6 +1167,7 @@ SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit durable completion acknowledgement: %w", err)
 	}
+	spool.notifyCompletionDisposition()
 	return nil
 }
 
@@ -1139,11 +1184,12 @@ func (spool *logSpool) recordCompletionDisposition(ctx context.Context, attemptI
 	if revision > 0 {
 		storedRevision = int64(revision)
 	}
-	var jobID string
+	var jobID sql.NullString
 	var resultJSON []byte
 	var finishedNS sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT job_id, result_json, finished_ns FROM spool_attempts WHERE attempt_id=?`, attemptID).
-		Scan(&jobID, &resultJSON, &finishedNS); err != nil {
+	err = tx.QueryRowContext(ctx, `SELECT job_id, result_json, finished_ns FROM spool_attempts WHERE attempt_id=?`, attemptID).
+		Scan(&jobID, &resultJSON, &finishedNS)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("agent: read completion evidence for disposition: %w", err)
 	}
 	var terminalAuditJSON []byte
@@ -1157,8 +1203,10 @@ func (spool *logSpool) recordCompletionDisposition(ctx context.Context, attemptI
 attempt_id, disposition, reason, observed_ns, intent_revision, job_id, finished_ns, terminal_audit_json)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason,
-observed_ns=excluded.observed_ns, intent_revision=excluded.intent_revision, job_id=excluded.job_id,
-finished_ns=excluded.finished_ns, terminal_audit_json=excluded.terminal_audit_json`,
+observed_ns=excluded.observed_ns, intent_revision=excluded.intent_revision,
+job_id=COALESCE(excluded.job_id, spool_completion_receipts.job_id),
+finished_ns=COALESCE(excluded.finished_ns, spool_completion_receipts.finished_ns),
+terminal_audit_json=COALESCE(excluded.terminal_audit_json, spool_completion_receipts.terminal_audit_json)`,
 		attemptID, disposition, reason, time.Now().UTC().UnixNano(), storedRevision, jobID, finishedNS, terminalAuditJSON); err != nil {
 		return fmt.Errorf("agent: record completion disposition: %w", err)
 	}
@@ -1167,8 +1215,8 @@ SET completion_disposition=?, completion_reason=?, intent_revision=? WHERE attem
 		disposition, reason, storedRevision, attemptID); err != nil {
 		return fmt.Errorf("agent: join completion disposition to payload: %w", err)
 	}
-	if disposition == "suppressed" {
-		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
+	if disposition == "suppressed" && jobID.Valid {
+		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID.String); err != nil {
 			return err
 		}
 	}
@@ -1179,6 +1227,7 @@ SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit durable completion disposition: %w", err)
 	}
+	spool.notifyCompletionDisposition()
 	return nil
 }
 

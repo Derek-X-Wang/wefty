@@ -986,9 +986,12 @@ func waitNativeServiceAttempt(t *testing.T, store *l1.Store, nodeAgent *Agent, b
 
 func inspectNativeIntentStopCompletion(t *testing.T, nodeAgent *Agent, attemptID string, intentRevision uint64) completionInspectionReceipt {
 	t.Helper()
-	// Controller.Stop cannot return until the completion-gate writer has
-	// crossed any suppressing reader's durable disposition transaction.
-	receipt := nodeAgent.logSpool.inspectCompletion(t.Context(), attemptID)
+	observationContext, cancelObservation := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelObservation()
+	receipt, err := nodeAgent.logSpool.waitCompletionDisposition(observationContext, attemptID, "suppressed", intentRevision)
+	if err != nil {
+		t.Fatalf("wait for durable intent-stop disposition: %v", err)
+	}
 	if receipt.State != "suppressed" || receipt.Reason != "service_intent_stop" ||
 		receipt.IntentRevision != intentRevision || receipt.Result == (l1.ProcessResult{}) {
 		t.Fatalf("intent-stop spool disposition=%+v revision=%d", receipt, intentRevision)
