@@ -100,6 +100,7 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 		OCIIntent:         enabledTestOCIIntent,
 		OCIBootBarrier:    readyOCIBootBarrier{},
 		WorkloadRuntimes:  map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+		AttemptDeadman:    &recordingDeadmanRenewer{},
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: managedRoot,
 	})
@@ -264,6 +265,15 @@ func (runtime *ociOneshotAcceptanceRuntime) Run(ctx context.Context, request wor
 	}
 	if err := request.OCIStarted(ctx, observation); err != nil {
 		return workloadrunner.Result{}, err
+	}
+	if request.OCIHelperAdmitted != nil {
+		helperSession, _ := (readyOCIBootBarrier{}).Generation()
+		generation := workloadrunner.RuntimeGeneration{
+			InstanceID: helperSession.HelperInstanceID, Generation: helperSession.SessionGeneration,
+		}
+		if err := request.OCIHelperAdmitted(generation); err != nil {
+			return workloadrunner.Result{}, err
+		}
 	}
 	runtime.mu.Lock()
 	runtime.payloadStarts++
