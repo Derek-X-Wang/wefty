@@ -176,6 +176,7 @@ const (
 	defaultLostAttemptRetention                   = 5 * time.Minute
 	defaultComputerReimagePreflightTimeout        = 10 * time.Second
 	doctorRuntimeReadTimeout                      = 2 * time.Second
+	hostBridgeAcceptPollInterval                  = 250 * time.Millisecond
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
@@ -2666,7 +2667,7 @@ func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request Dial
 			attempt.bridgeAcceptMu.Unlock()
 			return err
 		}
-		if err := listener.SetDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		if err := listener.SetDeadline(time.Now().Add(hostBridgeAcceptPollInterval)); err != nil {
 			attempt.bridgeAcceptMu.Unlock()
 			return err
 		}

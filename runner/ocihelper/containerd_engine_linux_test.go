@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/leases"
 	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -2485,6 +2486,191 @@ func TestDialHostBridgeCancellationDrainsFourAcceptsAfterOneGuest(t *testing.T) 
 	}
 }
 
+func TestSessionInvalidationDrainsFourHostBridgeOperationsBeforeReap(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpListener := listener.(*net.TCPListener)
+	defer tcpListener.Close()
+	listenerAddress := tcpListener.Addr().String()
+	authority := testAuthority()
+	terminalReady := make(chan struct{})
+	close(terminalReady)
+
+	engine, err := NewContainerdEngine(NativeEngineConfig{
+		Address:             filepath.Join(t.TempDir(), "missing-containerd.sock"),
+		RuntimeRoot:         t.TempDir(),
+		ContainerdStateRoot: t.TempDir(),
+		CgroupRoot:          t.TempDir(),
+		IPExecutable:        "/bin/true",
+		IPTablesExecutable:  "/bin/true",
+		IP6TablesExecutable: "/bin/true",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	engine.attempts[authority.key()] = &containerdAttempt{
+		authority: authority, task: &hostBridgeReapTask{}, terminalReady: terminalReady,
+		hostBridge: tcpListener, endpointHolds: make(map[string]net.Listener),
+	}
+	reapingEngine := &observedHostBridgeReapEngine{ContainerdEngine: engine, started: make(chan struct{})}
+	server, err := NewServer(reapingEngine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid())}, ReapTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.serveCtx = context.Background()
+	helperControl, agentControl := net.Pipe()
+	defer helperControl.Close()
+	defer agentControl.Close()
+	bridgeCapability := "bridge-capability"
+	serverSession := &serverSession{
+		server: server, identity: SessionIdentity{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID},
+		helper: HelperSession{HelperInstanceID: "helper-test", SessionGeneration: 1}, capability: "session-capability", control: helperControl,
+		heartbeatChanged: make(chan struct{}, 1), done: make(chan struct{}), operations: make(map[*sessionOperation]struct{}), sweepVerified: true,
+		attempts: map[string]*serverAttempt{authority.key(): {
+			authority: authority, state: attemptLive, bridgeCapability: bridgeCapability,
+			watchDone: make(chan struct{}), reaped: make(chan struct{}),
+		}},
+	}
+	server.active = serverSession
+
+	serverResults := make(chan error, 4)
+	client := &Client{Version: ProtocolVersion, ExpectedChecksum: "checksum-test"}
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		agent, helper := net.Pipe()
+		go func() {
+			defer helper.Close()
+			wire := newFramedConn(helper)
+			var request frame
+			if err := wire.read(&request); err != nil {
+				serverResults <- err
+				return
+			}
+			operation, rpcErr := serverSession.beginOperation(ctx, helper)
+			if rpcErr != nil {
+				serverResults <- writeRPCError(wire, rpcErr)
+				return
+			}
+			defer operation.finish()
+			server.dispatch(operation, wire, request)
+			serverResults <- nil
+		}()
+		return agent, nil
+	}
+	clientSession := &Session{client: client, capability: serverSession.capability, control: agentControl}
+
+	const bridgeConcurrency = 4
+	type dialResult struct {
+		stream net.Conn
+		err    error
+	}
+	dialResults := make(chan dialResult, bridgeConcurrency)
+	for range bridgeConcurrency {
+		go func() {
+			stream, err := clientSession.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: authority, BridgeCapability: bridgeCapability})
+			dialResults <- dialResult{stream: stream, err: err}
+		}()
+	}
+	waitForHostBridgePumps(t, bridgeConcurrency, time.Second)
+
+	guest, err := net.Dial("tcp4", listenerAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	var attached net.Conn
+	select {
+	case result := <-dialResults:
+		if result.err != nil {
+			t.Fatalf("one guest did not release a host-bridge operation: %v", result.err)
+		}
+		attached = result.stream
+		defer attached.Close()
+	case <-time.After(time.Second):
+		t.Fatal("one guest did not release a host-bridge operation")
+	}
+
+	// With one serialized Accept in flight, cancellation should need no more
+	// than one 250 ms poll. A second poll is the explicit scheduler margin and
+	// catches canceled waiters that enter another round after acquiring the lock.
+	drainBound := 2 * hostBridgeAcceptPollInterval
+	invalidated := make(chan struct{})
+	started := time.Now()
+	go func() {
+		serverSession.invalidate("host-bridge reap regression")
+		close(invalidated)
+	}()
+
+	clientReturned := 1
+	serverReturned := 0
+	reapStarted := false
+	reapStartedCh := reapingEngine.started
+	listenerClosed := false
+	timer := time.NewTimer(drainBound)
+	defer timer.Stop()
+	for clientReturned < bridgeConcurrency || serverReturned < bridgeConcurrency || !reapStarted || !listenerClosed {
+		select {
+		case result := <-dialResults:
+			clientReturned++
+			if result.stream != nil {
+				_ = result.stream.Close()
+			}
+			if result.err == nil {
+				t.Fatal("more than one host-bridge operation attached to the sole guest")
+			}
+		case err := <-serverResults:
+			serverReturned++
+			if err != nil {
+				t.Fatalf("host-bridge server operation failed before invalidation: %v", err)
+			}
+		case <-reapStartedCh:
+			reapStarted = true
+			reapStartedCh = nil
+		default:
+			if reapStarted {
+				connection, err := net.DialTimeout("tcp4", listenerAddress, 10*time.Millisecond)
+				if err != nil {
+					listenerClosed = true
+				} else {
+					_ = connection.Close()
+				}
+			}
+			runtime.Gosched()
+		}
+		select {
+		case <-timer.C:
+			_ = tcpListener.Close()
+			t.Fatalf("session invalidation returned client=%d/%d server=%d/%d reap_started=%t listener_closed=%t within %s", clientReturned, bridgeConcurrency, serverReturned, bridgeConcurrency, reapStarted, listenerClosed, drainBound)
+		default:
+		}
+	}
+	t.Logf("session invalidation joined four host-bridge operations and reached listener close in %s (bound %s)", time.Since(started), drainBound)
+
+	select {
+	case <-invalidated:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session invalidation did not return after the bounded reap context")
+	}
+}
+
+type hostBridgeReapTask struct{ containerd.Task }
+
+func (*hostBridgeReapTask) Kill(context.Context, syscall.Signal, ...containerd.KillOpts) error {
+	return errdefs.ErrNotFound
+}
+
+type observedHostBridgeReapEngine struct {
+	*ContainerdEngine
+	started chan struct{}
+}
+
+func (engine *observedHostBridgeReapEngine) ReapSession(ctx context.Context, identity SessionIdentity) (SweepResponse, error) {
+	close(engine.started)
+	return engine.ContainerdEngine.ReapSession(ctx, identity)
+}
+
 func TestDialHostBridgeMarkerFailureClosesAcceptedGuest(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -2524,6 +2710,16 @@ func TestDialHostBridgeMarkerFailureClosesAcceptedGuest(t *testing.T) {
 	}
 }
 
+// These exact stack symbols intentionally couple the checkpoint to the real
+// host-bridge accept path so either production rename fails loudly here.
+var hostBridgePumpStackSymbols = struct {
+	dial   []byte
+	accept []byte
+}{
+	dial:   []byte("(*ContainerdEngine).DialHostBridge"),
+	accept: []byte("(*TCPListener).Accept"),
+}
+
 func waitForHostBridgePumps(t *testing.T, count int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -2533,10 +2729,10 @@ func waitForHostBridgePumps(t *testing.T, count int, timeout time.Duration) {
 		pumps := 0
 		accepts := 0
 		for _, stack := range bytes.Split(stacks[:stackCount], []byte("\n\n")) {
-			if bytes.Contains(stack, []byte("(*ContainerdEngine).DialHostBridge")) {
+			if bytes.Contains(stack, hostBridgePumpStackSymbols.dial) {
 				pumps++
 			}
-			if bytes.Contains(stack, []byte("(*ContainerdEngine).DialHostBridge")) && bytes.Contains(stack, []byte("(*TCPListener).Accept")) {
+			if bytes.Contains(stack, hostBridgePumpStackSymbols.dial) && bytes.Contains(stack, hostBridgePumpStackSymbols.accept) {
 				accepts++
 			}
 		}

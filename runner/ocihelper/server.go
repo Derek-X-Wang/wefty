@@ -2092,12 +2092,6 @@ func writeImageStreamResult(connection *framedConn, err error) {
 	_ = connection.write(frame{Version: ProtocolVersion, OK: true})
 }
 
-func readStreamAcknowledgement(connection io.Reader) bool {
-	var acknowledgement [1]byte
-	_, err := io.ReadFull(connection, acknowledgement[:])
-	return err == nil && acknowledgement[0] == 1
-}
-
 func writeSuccess(connection *framedConn, body any) error {
 	raw, err := marshalBody(body)
 	if err != nil {
