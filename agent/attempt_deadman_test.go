@@ -8,27 +8,43 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-func TestHelperDeadmanQueuesOnlySuccessfulLiveOCIRenewals(t *testing.T) {
+func TestHelperDeadmanQueuesOnlySuccessfulAdmittedOCIRenewals(t *testing.T) {
 	renewer := &recordingDeadmanRenewer{}
 	claim := l1.Claim{Job: l1.Job{JobID: "job", Spec: contract.JobSpec{Kind: contract.JobKindOCI}}}
 	lease := l1.AttemptLease{LeaseTTL: 30 * time.Second}
-	if err := queueHelperDeadman(renewer, claim, lease); err != nil {
+	admission := newAttemptDeadmanAdmission(renewer, claim)
+	if err := admission.queue(lease); err != nil {
 		t.Fatal(err)
 	}
-	if renewer.calls != 1 || renewer.ttl != lease.LeaseTTL {
-		t.Fatalf("successful OCI renewal calls=%d ttl=%s", renewer.calls, renewer.ttl)
+	newer := lease
+	newer.LeaseTTL = time.Minute
+	if err := admission.queue(newer); err != nil {
+		t.Fatal(err)
+	}
+	if renewer.calls != 0 {
+		t.Fatalf("pre-admission OCI renewal calls=%d", renewer.calls)
+	}
+	if err := admission.admit(); err != nil {
+		t.Fatal(err)
+	}
+	if renewer.calls != 1 || renewer.ttl != newer.LeaseTTL {
+		t.Fatalf("first admitted OCI renewal calls=%d ttl=%s", renewer.calls, renewer.ttl)
 	}
 	lease.Directive = l1.AttemptDirectiveStop
-	if err := queueHelperDeadman(renewer, claim, lease); err != nil {
+	if err := admission.queue(lease); err != nil {
 		t.Fatal(err)
 	}
 	lease.Directive = l1.AttemptDirectiveRestart
-	if err := queueHelperDeadman(renewer, claim, lease); err != nil {
+	if err := admission.queue(lease); err != nil {
 		t.Fatal(err)
 	}
 	claim.Job.Spec.Kind = contract.JobKindProcess
 	lease.Directive = ""
-	if err := queueHelperDeadman(renewer, claim, lease); err != nil {
+	processAdmission := newAttemptDeadmanAdmission(renewer, claim)
+	if err := processAdmission.admit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := processAdmission.queue(lease); err != nil {
 		t.Fatal(err)
 	}
 	if renewer.calls != 1 {

@@ -98,6 +98,50 @@ type attemptLifecycle struct {
 	dependencies attemptLifecycleDependencies
 }
 
+// attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
+// helper has admitted the attempt. Unknown attempt tuples are session-fatal at
+// the helper, so the renewal path must not race ahead of Run authority.
+type attemptDeadmanAdmission struct {
+	mu       sync.Mutex
+	renewer  AttemptDeadmanRenewer
+	claim    l1.Claim
+	admitted bool
+	pending  *l1.AttemptLease
+}
+
+func newAttemptDeadmanAdmission(renewer AttemptDeadmanRenewer, claim l1.Claim) *attemptDeadmanAdmission {
+	return &attemptDeadmanAdmission{renewer: renewer, claim: claim}
+}
+
+func (admission *attemptDeadmanAdmission) queue(lease l1.AttemptLease) error {
+	if admission == nil || admission.renewer == nil || admission.claim.Job.Spec.Kind != contract.JobKindOCI || lease.Directive != "" {
+		return nil
+	}
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if !admission.admitted {
+		copy := lease
+		admission.pending = &copy
+		return nil
+	}
+	return queueHelperDeadman(admission.renewer, admission.claim, lease)
+}
+
+func (admission *attemptDeadmanAdmission) admit() error {
+	if admission == nil {
+		return nil
+	}
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	admission.admitted = true
+	if admission.pending == nil {
+		return nil
+	}
+	lease := *admission.pending
+	admission.pending = nil
+	return queueHelperDeadman(admission.renewer, admission.claim, lease)
+}
+
 func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLifecycle {
 	if dependencies.watchdog == nil {
 		dependencies.watchdog = disabledAttemptWatchdog{}
@@ -229,12 +273,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	authority := localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(claim.Lease.LeaseTTL)}
 	watch := lifecycle.dependencies.watchdog.Start(attemptContext, authority, cancelAttempt)
 	defer watch.Stop()
+	deadmanAdmission := newAttemptDeadmanAdmission(lifecycle.dependencies.attemptDeadman, claim)
 
 	renewalErrors := make(chan destinationError, 1)
 	renewalDone := make(chan struct{})
 	go func() {
 		defer close(renewalDone)
-		lifecycle.renewalLoop(attemptContext, claim, authority, renewalErrors, watch)
+		lifecycle.renewalLoop(attemptContext, claim, authority, renewalErrors, watch, deadmanAdmission)
 	}()
 
 	// The attempt-long context is uncancelable by execution shutdown so final
@@ -258,7 +303,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		var reapEvidence workloadrunner.ReapEvidence
 		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, &reapEvidence, func(unlock func()) {
 			handoffUnlock = unlock
-		})
+		}, deadmanAdmission)
 		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err}
 	}()
 	persistCompletion := func(outcome *runOutcome) error {
@@ -575,7 +620,7 @@ func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult
 func (lifecycle *attemptLifecycle) runWorkload(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
 	finalization := newAttemptFinalization(ctx, lifecycle.dependencies.finalizationTimeout)
 	defer finalization.stop()
-	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil, nil)
+	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil, nil, nil)
 }
 
 func (lifecycle *attemptLifecycle) runWorkloadContexts(
@@ -584,6 +629,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	claim l1.Claim,
 	reapEvidence *workloadrunner.ReapEvidence,
 	retainHandoffLock func(func()),
+	deadmanAdmission *attemptDeadmanAdmission,
 ) (contract.ProcessResult, error) {
 	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
 		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
@@ -629,6 +675,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		request.OCIImageReady = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
+		}
+		if deadmanAdmission != nil {
+			request.OCIHelperAdmitted = deadmanAdmission.admit
 		}
 		request.OCIRuntimeUnavailable = func(generation workloadrunner.RuntimeGeneration) {
 			generation = ociRuntimeLoss.record(generation)
@@ -1138,7 +1187,7 @@ func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workl
 	return runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: spec}})
 }
 
-func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch) {
+func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch, deadmanAdmission *attemptDeadmanAdmission) {
 	lease := claim.Lease
 	nextDelay := renewalDelay(authority.deadline.Sub(lifecycle.dependencies.clock.Now()), lifecycle.dependencies.renewalInterval)
 	for {
@@ -1190,7 +1239,7 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		lease = updated
 		authority = localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(updated.LeaseTTL)}
 		watch.Renewed(authority)
-		if err := queueHelperDeadman(lifecycle.dependencies.attemptDeadman, claim, updated); err != nil {
+		if err := deadmanAdmission.queue(updated); err != nil {
 			select {
 			case failures <- destinationError{destination: errorDestinationAttemptAuthority, err: err}:
 			default:

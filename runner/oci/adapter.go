@@ -1069,6 +1069,12 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		}
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	if request.OCIHelperAdmitted != nil {
+		if err := request.OCIHelperAdmitted(); err != nil {
+			_ = reapAfterFailedStart(session, authority)
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+	}
 	if runResponse.Image == nil {
 		err := errors.New("OCI helper Started response omitted image evidence")
 		_ = reapAfterFailedStart(session, authority)

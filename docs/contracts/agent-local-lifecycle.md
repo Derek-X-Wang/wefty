@@ -679,7 +679,10 @@ each renewal timeout is strictly shorter than the remaining local authority.
 For `kind=oci`, the privileged helper provides the Guardian-equivalent second
 boundary described in [OCI helper protocol](oci-helper-protocol.md). The agent
 refreshes an attempt's helper deadman only after the matching L1 lease renewal
-succeeds. Agent-helper control EOF, a helper-clock heartbeat blackhole, or an
+succeeds and helper `Run` has admitted that exact attempt. Renewals during image
+delivery remain pending in the agent and the latest is queued after helper
+`Started`, while `Run`'s initial deadman covers helper-side starting. Agent-helper
+control EOF, a helper-clock heartbeat blackhole, or an
 expired per-attempt deadman therefore reaps runtime-owned state independently
 of the agent's own authority watchdog.
 

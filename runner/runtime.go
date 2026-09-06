@@ -390,6 +390,9 @@ type Request struct {
 	// OCIImageReady returns the local observer to starting while the helper
 	// constructs the runtime. L1 still remains Claimed.
 	OCIImageReady func()
+	// OCIHelperAdmitted reports that helper Run returned authoritative Started
+	// evidence and the exact attempt is now eligible for deadman renewals.
+	OCIHelperAdmitted func() error
 	// OCIRuntimeUnavailable reports helper/session or engine loss to the agent.
 	// The agent performs recovery later under its finalization context. L1
 	// transport failures must not call this hook.

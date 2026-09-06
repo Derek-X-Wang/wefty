@@ -314,7 +314,10 @@ losing attempt has no remaining runtime.
 `Run` establishes an initial attempt deadman within the helper's configured
 maximum. The control heartbeat may carry exact attempt renewals, each with a
 bounded TTL; the agent emits one only after the matching L1 lease renewal has
-succeeded. Receipt sets an absolute deadline from the helper's monotonic clock.
+succeeded and helper `Run` has admitted that exact attempt. Successful L1
+renewals that arrive during image delivery remain agent-local; the first such
+renewal is queued only after `Run` returns authoritative `Started` evidence.
+Receipt sets an absolute deadline from the helper's monotonic clock.
 Timer wakeups re-read that deadline before expiring authority, so a superseded
 timer cannot reap a renewed attempt. A missing renewal reaps that attempt even
 while session heartbeats continue.
@@ -1217,8 +1220,10 @@ socket activation.
 The client owns the control-stream heartbeat pump and its strictly monotonic
 sequence counter. Ordinary callers cannot submit arbitrary heartbeat renewal
 lists. The agent queues one attempt renewal only on the successful L1 renewal
-path and only when the returned directive is empty; failed, timed-out, stale,
-`stop`, and `restart` responses never refresh the helper deadman. The pump uses
+path, only when the returned directive is empty, and only after helper `Run`
+has admitted that exact tuple. A pre-admission renewal is retained locally and
+the latest one is queued after authoritative `Started`; failed, timed-out,
+stale, `stop`, and `restart` responses never refresh the helper deadman. The pump uses
 separate operation connections for image/watch streams so backpressure cannot
 starve session authority, and it locally verifies the returned helper checksum
 against a non-empty installed expectation before exposing the session.
