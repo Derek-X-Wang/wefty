@@ -251,19 +251,20 @@ completion that linearized before the stop may land; every later completion
 observes the disabled revision and is suppressed. A suppressing reader holds
 the read side until its local disposition is durable. If that persistence
 budget expires, the reader registers a typed
-`OCIIntentSuppressionPersistenceError` before release and the writer returns
-that failure instead of allowing `Controller.Stop` to report runtime quiescence.
-A successful controller stop is therefore also an observation barrier for the
-suppression receipt. The receipt retains the observed intent revision.
+`OCIIntentSuppressionPersistenceError` before release. Within one agent process
+lifetime, either the waiting writer or the resident-teardown join returns that
+failure instead of allowing `Controller.Stop` to report runtime quiescence. A
+successful controller stop is therefore also a same-process observation barrier
+for the suppression receipt. The receipt retains the observed intent revision.
 
 The suppression lock order is completion-gate read side, then the spool's sole
 database connection. The database transaction, including any retention
-compaction, inherits the agent operation timeout (ten seconds by default) and
-retries only within that window. That storage window is subordinate to the OCI
-control server's 10m5s response-drain budget: database connection contention
-cannot hold the completion gate for the full control drain. The same committed
-disposition notification is emitted by live completion and process-lifetime
-recovery so bounded acceptance observation covers either path.
+compaction, uses the lesser of the configured agent operation timeout (ten
+seconds by default) and the OCI control server's 10m5s response-drain budget,
+and retries only within that window. Database connection contention therefore
+cannot outlive the control drain. The same committed disposition notification
+is emitted by live completion and process-lifetime recovery so bounded
+acceptance observation covers either path.
 
 Only an authoritative `enabled=false` suppresses a payload. On a node with an
 intent authority, an unavailable or malformed marker withholds publication,
