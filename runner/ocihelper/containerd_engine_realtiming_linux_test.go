@@ -2405,6 +2405,7 @@ func exerciseOrdinaryL3OCIOneshot(
 			return agent.OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, intentErr
 		},
 		WorkloadRuntimes:  map[string]agent.WorkloadRuntime{contract.JobKindOCI: adapter},
+		AttemptDeadman:    nativeAgentAttemptDeadman{barrier: barrier, nodeID: "native-node", bootSessionID: "native-boot"},
 		HeartbeatInterval: time.Second, ClaimInterval: 25 * time.Millisecond, RenewalInterval: time.Second,
 		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: managedRoot,
 	})
@@ -2461,6 +2462,32 @@ func (probe realOCIProbe) Probe(ctx context.Context) (agent.CapabilityProbeResul
 	return agent.CapabilityProbeResult{Capabilities: map[string]bool{
 		"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true,
 	}}, nil
+}
+
+type nativeAgentAttemptDeadman struct {
+	barrier               *ocihelper.BootBarrier
+	nodeID, bootSessionID string
+}
+
+func (renewer nativeAgentAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration, expected workloadrunner.RuntimeGeneration) error {
+	session, err := renewer.barrier.Session()
+	if err != nil {
+		return err
+	}
+	handshake := session.Handshake()
+	observed := workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration}
+	if observed != expected {
+		return &agent.AttemptDeadmanGenerationMismatchError{Expected: expected, Observed: observed}
+	}
+	removalGeneration := "attempt"
+	if claim.Job.Spec.Class == contract.JobClassService {
+		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
+	}
+	return session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
+		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID,
+		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
+		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
+	}, ttl)
 }
 
 func doNativeJSON(t *testing.T, client *http.Client, method, path string, input any, headers http.Header, wantStatus int, output any) {
