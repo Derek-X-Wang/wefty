@@ -655,7 +655,7 @@ func (session *Session) DialAttemptPort(ctx context.Context, request DialAttempt
 }
 
 func (session *Session) DialHostBridge(ctx context.Context, request DialHostBridgeRequest) (net.Conn, error) {
-	return session.openStream(ctx, MethodDialHostBridge, request, 0, false)
+	return session.openStream(ctx, MethodDialHostBridge, request, hostBridgeBackendReady, false)
 }
 
 func (session *Session) call(ctx context.Context, method Method, request, response any) error {
@@ -838,10 +838,10 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		return true
 	}
 	if err.Code == CodeEngineFailure {
-		// Attempt-port backend refusal is scoped to the already-authorized live
-		// attempt. The helper process and exclusive session remain authoritative;
-		// readiness probes may retry while the payload listener republishes.
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDialAttemptPort {
+		// Attempt-port and host-bridge backend refusals are scoped to the
+		// already-authorized live attempt. The helper process and exclusive
+		// session remain authoritative while the attempt backend republishes.
+		if err.EngineFailure != nil && (err.EngineFailure.Operation == MethodDialAttemptPort || err.EngineFailure.Operation == MethodDialHostBridge) {
 			return false
 		}
 		// Managed-volume deletion is independently authorized and verified for

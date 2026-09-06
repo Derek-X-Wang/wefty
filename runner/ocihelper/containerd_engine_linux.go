@@ -72,6 +72,7 @@ type containerdAttempt struct {
 	deleted          bool
 	logAcknowledged  map[string]uint64
 	hostBridge       net.Listener
+	bridgeAcceptMu   sync.Mutex
 	endpoints        map[string]uint16
 	endpointHolds    map[string]net.Listener
 	controlDirectory string
@@ -175,6 +176,7 @@ const (
 	defaultLostAttemptRetention                   = 5 * time.Minute
 	defaultComputerReimagePreflightTimeout        = 10 * time.Second
 	doctorRuntimeReadTimeout                      = 2 * time.Second
+	hostBridgeAcceptPollInterval                  = 250 * time.Millisecond
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
@@ -2657,13 +2659,29 @@ func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request Dial
 	}
 	var guest net.Conn
 	for guest == nil {
-		if err := listener.SetDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attempt.bridgeAcceptMu.Lock()
+		if err := ctx.Err(); err != nil {
+			attempt.bridgeAcceptMu.Unlock()
+			return err
+		}
+		if err := listener.SetDeadline(time.Now().Add(hostBridgeAcceptPollInterval)); err != nil {
+			attempt.bridgeAcceptMu.Unlock()
 			return err
 		}
 		guest, err = listener.Accept()
 		if err == nil {
+			defer guest.Close()
+			clearErr := listener.SetDeadline(time.Time{})
+			attempt.bridgeAcceptMu.Unlock()
+			if clearErr != nil {
+				return clearErr
+			}
 			break
 		}
+		attempt.bridgeAcceptMu.Unlock()
 		var timeout net.Error
 		if !errors.As(err, &timeout) || !timeout.Timeout() {
 			return err
@@ -2672,8 +2690,9 @@ func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request Dial
 			return ctx.Err()
 		}
 	}
-	_ = listener.SetDeadline(time.Time{})
-	defer guest.Close()
+	if _, err := stream.Write([]byte{hostBridgeBackendReady}); err != nil {
+		return err
+	}
 	return Relay(ctx, stream, guest)
 }
 

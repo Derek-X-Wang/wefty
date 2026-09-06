@@ -69,6 +69,11 @@ const (
 // authorized stream to the payload's exact attempt-local loopback port.
 const attemptPortBackendReady byte = 1
 
+// hostBridgeBackendReady is emitted only after the helper has accepted
+// the guest side of the authorized host bridge. The client must consume this
+// marker before dialing its host-side loopback bridge.
+const hostBridgeBackendReady byte = 1
+
 type ErrorCode string
 
 const (
