@@ -397,21 +397,26 @@ timeout names the exact missing `readiness_event`, such as endpoint readiness,
 the first RFB frame, or key-observer advancement, and records both the applied
 observation window and elapsed observation. Check and event are validated as a
 closed pairing rather than as independent vocabularies. The broken-image matrix
-may retain unrelated `readiness_timeout` cells only after its exact expected
-cell is present once with `mutation_detected` and the expected detail. An input
-timeout additionally requires later success for the same event and an executed
-`input.control-accepted` cell. An absent or duplicate expected cell, a missing
-input-adjacent cell, or any extra `assertion_failed` cell remains a fail-set
-failure; the positive reference-image run never ignores a readiness timeout.
+may retain unrelated `readiness_timeout` cells only after the expected check ID
+appears exactly once in the receipt and that row carries `mutation_detected`
+with the expected detail. An input timeout additionally requires later success
+for the same event and an executed `input.control-accepted` cell; an input
+timeout not recovered by the end of input evaluation is re-labelled
+`assertion_failed` while retaining its diagnostic detail. An absent or duplicate
+expected cell, a missing input-adjacent cell, or any extra `assertion_failed`
+cell remains a fail-set failure; the positive reference-image run never ignores
+a readiness timeout.
 
 The emulated arm64 input-event observation window is the greater of the legacy
 1.5-second window and twice that container's observed first-boot endpoint
 readiness. amd64 retains the same 1.5-second, 12-poll behavior through the
 shared polling loop. A successful WebSocket upgrade waiting for the first RFB
 frame is an incomplete readiness event, not proof that plain TCP was accepted.
-A separate post-upgrade-attempt dial preserves raw-RFB, silent-accept, and
-accept-then-close detection; an observed non-upgrade HTTP response remains a
-protocol failure.
+A separate raw dial is sampled only after the readiness observation window is
+exhausted. It preserves raw-RFB and silent-accept detection without making one
+transient accept-without-answer sticky or ending readiness polling early. A
+persistent accept-then-close listener is likewise rejected after the window;
+an observed non-upgrade HTTP response remains an immediate protocol failure.
 
 Checker teardown asks Docker to stop the container and then removes it so every
 bind mount is detached before the checker-owned temporary root is removed. The
