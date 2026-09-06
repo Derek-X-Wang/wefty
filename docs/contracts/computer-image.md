@@ -10,10 +10,13 @@ The helper mirrors that record beside the generation and prefers whichever
 primary or mirror copy remains readable, so a one-sided read failure does not
 erase Storage identity, attempts, or `first_deferred_at`. When neither copy is
 readable, the generation remains countable as `deferral_record_unreadable`
-across helper replacement. A missing attachment manifest never authorizes
-deleting an existing image; it quarantines the bytes unless a valid matching
-pre-publication copy record proves that its staged destination was never
-published and can be rolled back.
+across helper replacement. A primary record bound to a foreign disk is instead
+a structural `deferral_record_identity_mismatch` even when the name-bound
+mirror is valid; the generation quarantines without Storage authority and the
+helper emits the typed mismatch on that sweep. A missing attachment manifest
+never authorizes deleting an existing image; it quarantines the bytes unless a
+valid matching pre-publication copy record proves that its staged destination
+was never published and can be rolled back.
 Only boot-barrier startup sweeps increment the attempt count; in-session reap
 sweeps do not. Recovery terminates as `resume_abandoned` only after both
 twenty-four failed agent boot-barrier sweeps and 24 elapsed hours, so a helper

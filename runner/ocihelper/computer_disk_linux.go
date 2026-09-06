@@ -524,9 +524,11 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 	}
 	for _, entry := range quarantines {
 		if quarantineEntryMatches(entry.Name()) {
-			if err := os.RemoveAll(filepath.Join(quarantineRoot, entry.Name())); err != nil {
+			root := filepath.Join(quarantineRoot, entry.Name())
+			if err := os.RemoveAll(root); err != nil {
 				return err
 			}
+			engine.forgetComputerDiskQuarantineGC(root)
 		}
 	}
 	for _, path := range []string{diskRoot, imagePath, filepath.Join(diskRoot, "attachment.json"), mountPath} {

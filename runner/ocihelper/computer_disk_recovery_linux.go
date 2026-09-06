@@ -194,6 +194,10 @@ func (engine *ContainerdEngine) inspectOperationalComputerRecoveryDeferral(root,
 		}
 	}
 	fallback, fallbackPresent, fallbackErr := readOperationalComputerRecoveryDeferralFault(root, name)
+	var structuralErr *computerDiskRecoveryStructuralError
+	if errors.As(primaryErr, &structuralErr) && structuralErr.Reason == "deferral_record_identity_mismatch" {
+		return computerOperationalRecoveryDeferral{}, false, errors.Join(rootErr, primaryErr)
+	}
 	if primaryErr == nil && primaryPresent && (fallbackErr != nil || !fallbackPresent) {
 		return primary, true, nil
 	}
@@ -212,7 +216,12 @@ func (engine *ContainerdEngine) inspectOperationalComputerRecoveryDeferral(root,
 func (engine *ContainerdEngine) deferOperationalComputerRecovery(root, name, operation string, storage ComputerStorageReference, cause error, countAttempt bool) (computerStorageRecoveryDeferral, bool, error) {
 	record, present, err := engine.inspectOperationalComputerRecoveryDeferral(root, name)
 	if err != nil {
-		return engine.deferOperationalComputerRecoveryFault(root, name, operation, storage, cause, countAttempt, "deferral_record_unreadable")
+		reason := "deferral_record_unreadable"
+		var structuralErr *computerDiskRecoveryStructuralError
+		if errors.As(err, &structuralErr) && structuralErr.Reason == "deferral_record_identity_mismatch" {
+			reason = structuralErr.Reason
+		}
+		return engine.deferOperationalComputerRecoveryFault(root, name, operation, storage, cause, countAttempt, reason)
 	}
 	if present && (record.DiskName != name ||
 		record.Storage.ComputerID != "" && storage.ComputerID != "" && !sameComputerStorageIdentity(record.Storage, storage)) {

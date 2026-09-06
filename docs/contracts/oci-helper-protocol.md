@@ -986,11 +986,12 @@ bound. Three authority-valid payload-GC failures record
 written to both the mirrored sidecar and primary receipt when possible; either
 readable copy preserves the bound. If neither location accepts the update, the
 helper retains a typed `memory_only_both_writes_failed` record and stops after
-three process-local failures. Helper replacement also cannot authorize retries
-forever: the durable retention deadline plus a 24-hour unrecorded-retry window
-is the absolute wall-clock stop. Operator inventory carries the GC failure
-count, first/last failure facts, escalation timestamp, and evidence location;
-doctor reports the number of escalated quarantines. Legacy `-reset-N`
+three process-local failures. The 24-hour unrecorded-retry window applies only
+while that memory-only failure evidence remains in the same helper process; a
+replacement helper without failure evidence attempts GC again. Operator
+inventory carries the GC failure count, first/last failure facts, escalation
+timestamp, and evidence location; doctor reports the number of escalated
+quarantines. Legacy `-reset-N`
 quarantines are first normalized into the same receipt-backed retention and GC
 path. Invalid authority never permits byte deletion, and a per-generation GC
 failure does not fail helper startup, so generation N is never admissible
