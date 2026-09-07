@@ -69,6 +69,11 @@ type agentSession struct {
 	serviceReaps              map[string]runtimeReapOutcome
 	serviceBoots              map[string]string
 	residentChanged           chan struct{}
+
+	// residentSuppressionReopenRevision is the latest enabled intent revision
+	// that superseded failures from an older disabled episode.
+	residentSuppressionReopenRevision uint64
+
 	// ociStopBeforeResidentScan is a test seam for completing a resident in
 	// the narrow interval after the controller fence is released and before
 	// runtime teardown takes its first resident snapshot. Production leaves it nil.
@@ -83,6 +88,10 @@ type agentSession struct {
 	custody                   *custodyController
 	computerPolicy            *ComputerPolicyCache
 	computerAcks              *computerPolicyAckController
+
+	// residentBeforeCompletionRecord is a test seam for holding a completed
+	// resident before its result is published to the session ledger.
+	residentBeforeCompletionRecord func(error)
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -965,10 +974,13 @@ func (session *agentSession) executeResident(
 	defer session.attempts.Done()
 	defer session.gates[gateKey].release()
 	defer func() {
+		if session.residentBeforeCompletionRecord != nil {
+			session.residentBeforeCompletionRecord(executeErr)
+		}
 		session.claimMu.Lock()
 		resident.completionErr = executeErr
 		var persistenceErr *OCIIntentSuppressionPersistenceError
-		if errors.As(executeErr, &persistenceErr) {
+		if errors.As(executeErr, &persistenceErr) && persistenceErr.IntentRevision >= session.residentSuppressionReopenRevision {
 			session.residentSuppressionErrors[claim.Job.JobID] = executeErr
 		}
 		delete(session.resident, claim.Job.JobID)
@@ -1096,7 +1108,7 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 	}
 }
 
-func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence uint64) error {
+func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence, intentRevision uint64) error {
 	// Keep the existing claimMu -> claimPublication lock order so no newly
 	// admitted resident or later stop episode can publish an error between the
 	// positive reopen and clearing failures owned by the prior disabled episode.
@@ -1106,6 +1118,7 @@ func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence uint6
 		return err
 	}
 	clear(session.residentSuppressionErrors)
+	session.residentSuppressionReopenRevision = intentRevision
 	return nil
 }
 
