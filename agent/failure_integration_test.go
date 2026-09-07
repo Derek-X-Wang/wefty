@@ -1049,7 +1049,7 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 		},
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
-		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		HeartbeatInterval: 25 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 		LogRetryInterval: 20 * time.Millisecond, AttemptDeadman: deadman, Logf: t.Logf,
 	})
 	if err != nil {
@@ -1069,6 +1069,8 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 	case <-time.After(5 * time.Second):
 		t.Fatal("OCI service did not start")
 	}
+	// Before the first advance, only renewal uses a 50 ms deadline; the
+	// shorter heartbeat interval cannot satisfy this readiness barrier.
 	// Drive a renewal after startup without spending the lease on fixture work.
 	clock.waitForDeadline(t, clock.Now().Add(50*time.Millisecond))
 	clock.Advance(50 * time.Millisecond)
