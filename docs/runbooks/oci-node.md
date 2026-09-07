@@ -349,7 +349,7 @@ Meaning: the Computer screen-isolation receipt read lacked a helper dependency. 
 
 ## doctor-code-oci-computer-screen-isolation-not-recorded
 
-Meaning: no completed Computer profile or complete X-isolation observation is available. This includes the normal pre-first-stream window and images whose exact target X token has not bound or is not used. Recorded namespace and firewall facts remain visible, but missing X evidence is `NOT-RUN`, never verified enforcement. First action: preserve the facts; for an X-using image, inspect again after its X token is live and an owned endpoint is used. Do not stop admission solely for missing evidence or infer a backend type from an absent X token.
+Meaning: no completed Computer profile or complete X-isolation observation is available. This includes the normal pre-first-stream window and images whose exact target X token has not bound or is not used. Recorded namespace and firewall facts remain visible, but missing X evidence is `NOT-RUN`, never verified enforcement. First action: preserve the facts; for an X-using image, inspect again after its X token is live and an owned endpoint is used. Do not stop admission solely for missing X evidence or infer a backend type from an absent X token. A current firewall read that is unavailable with no live Computers also remains NOT-RUN; its detail names that unavailable source.
 
 ## doctor-code-oci-computer-screen-isolation-enforced
 
@@ -357,7 +357,7 @@ Meaning: the exact target X token was live after endpoint readiness, absent from
 
 ## doctor-code-oci-computer-screen-isolation-not-enforced
 
-Meaning: recorded facts contradict isolation: equal helper/task network namespaces, an omitted private namespace despite a complete inode sample, a helper-visible X token, identical veth/gateway addresses, or an observed missing firewall attachment while Computers are live. These contradictions take precedence even when target X liveness is unavailable. Evidence: preserve the complete observation and firewall facts. First action: stop admitting Computers and repair the demonstrated boundary failure. Missing observations alone belong to `NOT-RUN`, not this diagnosis.
+Meaning: recorded facts contradict isolation: equal helper/task network namespaces, an omitted private namespace despite a complete inode sample, a helper-visible X token, identical veth/gateway addresses, or an observed missing firewall attachment while Computers are live. These contradictions take precedence even when target X liveness is unavailable. An unavailable current firewall read while Computers are live also fails closed under this diagnosis: this means active isolation cannot be verified, not that chains were observed absent. Evidence: preserve the complete observation and distinguish failed reads from observed missing chains. First action: stop admitting Computers and repair the demonstrated boundary failure or restore the active firewall diagnostic read. Ordinary pending X evidence remains `NOT-RUN`.
 
 ## doctor-code-oci-resource-admission-not-run
 

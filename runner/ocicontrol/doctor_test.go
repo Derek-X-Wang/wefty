@@ -853,3 +853,54 @@ func TestDoctorRequiresLiveTargetXBeforeCertifyingAbsence(t *testing.T) {
 		})
 	}
 }
+
+func TestDoctorComputerFirewallReadAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		live, x, read bool
+		want          DiagnosticOutcome
+	}{
+		{"live unavailable with X", true, true, false, DiagnosticFailed},
+		{"live unavailable pending X", true, false, false, DiagnosticFailed},
+		{"live present pending X", true, false, true, DiagnosticNotRun},
+		{"no live unavailable", false, true, false, DiagnosticNotRun},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := healthyDoctorConfig(time.Now(), "")
+			base := config.Helper
+			config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+				snapshot, err := base(ctx)
+				snapshot.Runtime.ComputerAttemptsLive = tc.live
+				snapshot.Runtime.LastProfile.TargetAbstractSocketLive = tc.x
+				if !tc.read {
+					snapshot.Runtime.ComputerFirewallRead = ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadFailed, ErrorCode: ocihelper.DiagnosticErrorComputerFirewall}
+				}
+				return snapshot, err
+			}
+			report := BuildDoctor(t.Context(), config)
+			if report.ComputerScreenIsolation.Outcome != tc.want {
+				t.Fatalf("want %s, got %+v", tc.want, report.ComputerScreenIsolation)
+			}
+			if !tc.read {
+				if !report.ComputerScreenIsolation.ComputerFirewallPresent {
+					t.Fatal("failed read manufactured observed firewall absence")
+				}
+				for _, f := range report.Findings {
+					if f.Check != "computer-screen-isolation" {
+						continue
+					}
+					wantCode := "oci_computer_screen_isolation_not_recorded"
+					if tc.live {
+						wantCode = "oci_computer_screen_isolation_not_enforced"
+					}
+					if f.Code != wantCode || !strings.Contains(f.Detail, "firewall read is unavailable") {
+						t.Fatalf("firewall read uncertainty hidden or misclassified: %+v", f)
+					}
+					if !tc.live && f.NotRunCause != NotRunSourceUnavailable {
+						t.Fatalf("missing source not identified: %+v", f)
+					}
+				}
+			}
+		})
+	}
+}

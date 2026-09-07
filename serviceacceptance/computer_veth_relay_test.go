@@ -47,13 +47,14 @@ import ipaddress, json, select, socket, sys, threading
 address, view, control = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 if ipaddress.ip_address(address).is_unspecified or view == control:
     raise ValueError("exact address and distinct ports required")
-listeners = []
+destinations = {"view": ("127.0.0.1", view), "control": ("127.0.0.1", control)}
+listeners = {}
 limit = threading.BoundedSemaphore(4)
-def forward(front, port):
+def forward(front, destination):
     back = None
     try:
         front.settimeout(5)
-        back = socket.create_connection(("127.0.0.1", port), timeout=5)
+        back = socket.create_connection(destination, timeout=5)
         active = [front, back]
         while active:
             readable, _, _ = select.select(active, [], [], 5)
@@ -74,26 +75,40 @@ def forward(front, port):
         if back is not None:
             back.close()
         limit.release()
-for port in (view, control):
+for name, destination in destinations.items():
+    port = destination[1]
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind((address, port))
     listener.listen(4)
-    listeners.append(listener)
-print("relay-ready", flush=True)
+    listeners[listener] = destination
+print(json.dumps({"event": "relay-ready", "view_backend": "%s:%d" % destinations["view"], "control_backend": "%s:%d" % destinations["control"]}), flush=True)
 while True:
-    readable, _, _ = select.select(listeners, [], [])
+    readable, _, _ = select.select(list(listeners), [], [])
     for listener in readable:
         front, _ = listener.accept()
         if not limit.acquire(blocking=False):
             front.close()
             continue
-        threading.Thread(target=forward, args=(front, listener.getsockname()[1]), daemon=True).start()
+        threading.Thread(target=forward, args=(front, listeners[listener]), daemon=True).start()
 `
 
 type computerRelayConfig struct {
 	Socket, ContainerID, JobID, AttemptID, NamespaceInode, Address, ExecID string
 	ViewPort, ControlPort                                                  int
 }
+type computerRelayAnnouncement struct {
+	Event          string `json:"event"`
+	ViewBackend    string `json:"view_backend"`
+	ControlBackend string `json:"control_backend"`
+}
+
+func validateComputerRelayAnnouncement(announcement computerRelayAnnouncement, config computerRelayConfig) error {
+	if announcement.Event != "relay-ready" || announcement.ViewBackend != fmt.Sprintf("127.0.0.1:%d", config.ViewPort) || announcement.ControlBackend != fmt.Sprintf("127.0.0.1:%d", config.ControlPort) {
+		return errors.New("executed relay destination announcement does not match pinned endpoints")
+	}
+	return nil
+}
+
 type computerRelaySnapshot struct {
 	NamespaceInode    string `json:"namespace_inode"`
 	ViewInode         string `json:"view_inode"`
@@ -104,9 +119,10 @@ type computerRelaySnapshot struct {
 	RelayControlInode string `json:"relay_control_inode"`
 }
 type computerRelayEvent struct {
-	RelayPID                                uint32              `json:"relay_pid"`
-	Event                                   string              `json:"event"`
-	Config                                  computerRelayConfig `json:"config"`
+	Announcement                            computerRelayAnnouncement `json:"announcement"`
+	RelayPID                                uint32                    `json:"relay_pid"`
+	Event                                   string                    `json:"event"`
+	Config                                  computerRelayConfig       `json:"config"`
 	Before, During, After                   computerRelaySnapshot
 	ExitConfirmed, Deleted, ListenersAbsent bool
 	Error                                   string `json:"error,omitempty"`
@@ -281,6 +297,7 @@ func runComputerRelaySupervisor(input io.Reader, output io.Writer) (resultErr er
 	stdoutRead, stdoutWrite := io.Pipe()
 	defer stdoutRead.Close()
 	defer stdoutWrite.Close()
+	ready, drained := readComputerRelayOutput(stdoutRead)
 	process, execErr := task.Exec(setupCtx, config.ExecID, &processSpec, cio.NewCreator(cio.WithStreams(nil, stdoutWrite, os.Stderr)))
 	if execErr != nil {
 		// An uncertain Exec response never authorizes replay. Recover only the
@@ -304,6 +321,13 @@ func runComputerRelaySupervisor(input io.Reader, output io.Writer) (resultErr er
 		}
 		event.ExitConfirmed, event.Deleted, err = stopComputerRelayProcess(cleanupCtx, process, exited)
 		resultErr = errors.Join(resultErr, err)
+		_ = stdoutWrite.Close()
+		select {
+		case drainErr := <-drained:
+			resultErr = errors.Join(resultErr, drainErr)
+		case <-cleanupCtx.Done():
+			resultErr = errors.Join(resultErr, errors.New("relay output drain did not close after cleanup"), cleanupCtx.Err())
+		}
 		after, snapshotErr := computerRelaySocketSnapshot(pid, config)
 		event.After = after
 		event.ListenersAbsent = snapshotErr == nil && after.RelayViewInode == "" && after.RelayControlInode == ""
@@ -324,17 +348,17 @@ func runComputerRelaySupervisor(input io.Reader, output io.Writer) (resultErr er
 	if err != nil {
 		return err
 	} // Observe before Start.
-	ready := make(chan string, 1)
-	// Drain readiness before Start: an uncertain Start response can make the
-	// SDK wait for its I/O copier, which must not block on our pipe reader.
-	go func() { line, _ := bufio.NewReader(stdoutRead).ReadString('\n'); ready <- strings.TrimSpace(line) }()
 	if err = process.Start(setupCtx); err != nil {
 		return err
 	}
+	var announcement computerRelayAnnouncement
 	select {
 	case line := <-ready:
-		if line != "relay-ready" {
-			return fmt.Errorf("relay readiness failed: %q", line)
+		if err := json.Unmarshal([]byte(line), &announcement); err != nil {
+			return fmt.Errorf("decode executed relay readiness: %w", err)
+		}
+		if err := validateComputerRelayAnnouncement(announcement, config); err != nil {
+			return err
 		}
 	case <-setupCtx.Done():
 		return setupCtx.Err()
@@ -349,7 +373,7 @@ func runComputerRelaySupervisor(input io.Reader, output io.Writer) (resultErr er
 	if !sameComputerRelayBackend(before, during) || during.RelayViewInode == "" || during.RelayControlInode == "" || !computerRelayOwnsSockets(process.Pid(), during) {
 		return errors.New("relay changed target backend or did not bind both veth ports")
 	}
-	if err = encoder.Encode(computerRelayEvent{Event: "ready", RelayPID: process.Pid(), Config: config, Before: before, During: during}); err != nil {
+	if err = encoder.Encode(computerRelayEvent{Event: "ready", Announcement: announcement, RelayPID: process.Pid(), Config: config, Before: before, During: during}); err != nil {
 		return err
 	}
 	_, err = reader.ReadString('\n') // Parent stop or EOF both trigger owned cleanup.
@@ -440,6 +464,9 @@ func startComputerVethRelay(t *testing.T, computer l1.Computer, endpoints liveCo
 		if !ok || event.Event != "ready" || event.Error != "" {
 			t.Fatalf("relay did not become ready: %+v", event)
 		}
+		if err := validateComputerRelayAnnouncement(event.Announcement, config); err != nil {
+			t.Fatal(err)
+		}
 		return event, stop
 	case <-time.After(15 * time.Second):
 		t.Fatal("relay readiness unconfirmed")
@@ -473,6 +500,7 @@ type fakeRelayProcess struct {
 	killed, deleted bool
 	deleteErr       error
 	killErr         error
+	deleteWait      <-chan error
 }
 
 func (p *fakeRelayProcess) Status(context.Context) (containerd.Status, error) {
@@ -482,8 +510,18 @@ func (p *fakeRelayProcess) Kill(context.Context, syscall.Signal, ...containerd.K
 	p.killed = true
 	return p.killErr
 }
-func (p *fakeRelayProcess) Delete(context.Context, ...containerd.ProcessDeleteOpts) (*containerd.ExitStatus, error) {
+func (p *fakeRelayProcess) Delete(ctx context.Context, _ ...containerd.ProcessDeleteOpts) (*containerd.ExitStatus, error) {
 	p.deleted = true
+	if p.deleteWait != nil {
+		select {
+		case err := <-p.deleteWait:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	return nil, p.deleteErr
 }
 func TestRelayCleanupRequiresObservedExitAndDeletion(t *testing.T) {
@@ -592,8 +630,9 @@ func TestVethRelayLivenessRequiresRealRFBBackends(t *testing.T) {
 	go func() { line, _ := bufio.NewReader(stdout).ReadString('\n'); ready <- strings.TrimSpace(line) }()
 	select {
 	case line := <-ready:
-		if line != "relay-ready" {
-			t.Fatalf("relay startup: %q", line)
+		var announced map[string]string
+		if err := json.Unmarshal([]byte(line), &announced); err != nil || announced["view_backend"] != fmt.Sprintf("127.0.0.1:%d", ports[0]) || announced["control_backend"] != fmt.Sprintf("127.0.0.1:%d", ports[1]) {
+			t.Fatalf("executed relay did not announce actual destinations: %q (%v)", line, err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay startup timed out")
@@ -677,4 +716,86 @@ func networkNamespaceInodeForRelay(pid uint32) (string, error) {
 		return "", errors.New("namespace stat authority unavailable")
 	}
 	return strconv.FormatUint(uint64(stat.Ino), 10), nil
+}
+
+// Keep draining after the bounded readiness line: containerd Delete waits for
+// its stdout copier, including bytes written after readiness or during failure.
+func readComputerRelayOutput(input io.Reader) (<-chan string, <-chan error) {
+	ready := make(chan string, 1)
+	drained := make(chan error, 1)
+	go func() {
+		defer close(ready)
+		defer close(drained)
+		reader := bufio.NewReaderSize(input, 4096)
+		line, readErr := reader.ReadSlice('\n')
+		if readErr != nil {
+			ready <- ""
+		} else {
+			ready <- strings.TrimSpace(string(line))
+		}
+		_, err := io.Copy(io.Discard, reader)
+		drained <- errors.Join(readErr, err)
+	}()
+	return ready, drained
+}
+
+func TestRelayOutputDrainsAfterReadinessBeforeCleanup(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ready, drained := readComputerRelayOutput(reader)
+	copied := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, "relay-ready\n"+strings.Repeat("x", 1<<20))
+		writer.Close()
+		copied <- err
+	}()
+	select {
+	case line := <-ready:
+		if line != "relay-ready" {
+			t.Fatal(line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readiness blocked")
+	}
+	// Model the SDK Delete edge that joins the stdout copier. An observed
+	// process exit alone cannot finish cleanup if the consumer stopped reading.
+	process := &fakeRelayProcess{status: containerd.Stopped, deleteWait: copied}
+	exited := make(chan containerd.ExitStatus, 1)
+	exited <- *containerd.NewExitStatus(0, time.Now(), nil)
+	cleanupCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	confirmed, deleted, err := stopComputerRelayProcess(cleanupCtx, process, exited)
+	if err != nil || !confirmed || !deleted {
+		t.Fatalf("SDK-style cleanup blocked on output after readiness: confirmed=%t deleted=%t err=%v", confirmed, deleted, err)
+	}
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drain did not close after copier EOF")
+	}
+}
+
+func TestRelayAnnouncementRequiresPinnedDestinations(t *testing.T) {
+	config := computerRelayConfig{ViewPort: 42002, ControlPort: 42003}
+	for _, tc := range []struct {
+		name, view, control string
+		want                bool
+	}{
+		{"exact", "127.0.0.1:42002", "127.0.0.1:42003", true},
+		{"missing view", "", "127.0.0.1:42003", false},
+		{"missing control", "127.0.0.1:42002", "", false},
+		{"altered view", "127.0.0.1:49999", "127.0.0.1:42003", false},
+		{"altered control", "127.0.0.1:42002", "198.18.0.2:42003", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateComputerRelayAnnouncement(computerRelayAnnouncement{Event: "relay-ready", ViewBackend: tc.view, ControlBackend: tc.control}, config)
+			if (err == nil) != tc.want {
+				t.Fatalf("accepted=%t want=%t: %v", err == nil, tc.want, err)
+			}
+		})
+	}
 }

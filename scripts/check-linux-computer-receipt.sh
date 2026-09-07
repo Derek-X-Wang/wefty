@@ -149,7 +149,9 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
       ($e.backend_identity_before | split(":")[0]) == $e.target_network_namespace_inode and
       $e.backend_identity_before == $e.backend_identity_during and $e.backend_identity_before == $e.backend_identity_after and
       $e.relay_exit_confirmed == "true" and $e.relay_exec_deleted == "true" and $e.relay_listeners_absent == "true" and
-      $e.target_loopback_view == "read_succeeded" and $e.target_loopback_control == "inject_succeeded"
+      $e.target_loopback_view == "read_succeeded" and $e.target_loopback_control == "inject_succeeded" and
+      $e.target_loopback_view_address == ("127.0.0.1:" + $e.target_view_port) and
+      $e.target_loopback_control_address == ("127.0.0.1:" + $e.target_control_port)
     ) and
     (.rows["linux.screen_crossover_refused"].evidence.source_computer_id | length > 0) and
     (.rows["linux.screen_crossover_refused"].evidence.source_attempt_id | length > 0) and

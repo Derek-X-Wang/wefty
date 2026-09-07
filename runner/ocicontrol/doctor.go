@@ -701,6 +701,11 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 			if contradicted {
 				diagnostic = diagnosticReceipt{ran: true, code: "oci_computer_screen_isolation_not_enforced", detail: "observed namespace, host socket, or live firewall facts contradict Computer isolation"}
 				report.ComputerScreenIsolation.Outcome = DiagnosticFailed
+			} else if !firewallObserved && runtimeStatus.ComputerAttemptsLive {
+				diagnostic = diagnosticReceipt{ran: true, code: "oci_computer_screen_isolation_not_enforced", detail: "current firewall read is unavailable while Computers are live; active isolation cannot be verified (this does not prove the chains are absent)"}
+				report.ComputerScreenIsolation.Outcome = DiagnosticFailed
+			} else if !firewallObserved {
+				diagnostic = diagnosticReceipt{code: "oci_computer_screen_isolation_not_recorded", notRunCause: NotRunSourceUnavailable, detail: "current firewall read is unavailable and no Computers are live; recorded namespace and X facts remain visible but current enforcement is not verified"}
 			} else if enforced {
 				diagnostic = diagnosticReceipt{ran: true, passed: true, code: "oci_computer_screen_isolation_enforced", detail: "the target X token was live after endpoint readiness, absent in the helper namespace, with distinct namespace inodes and a current firewall observation"}
 				report.ComputerScreenIsolation.Outcome = DiagnosticOK

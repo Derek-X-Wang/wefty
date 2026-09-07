@@ -188,6 +188,21 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"relay loopback liveness": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_liveness_view_address"] = "127.0.0.1:42002"
 		},
+		"relay missing announced backend": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string), "relay_backend_view_address")
+		},
+		"relay missing announced control": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string), "relay_backend_control_address")
+		},
+		"missing post-cleanup control address": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string), "target_loopback_control_address")
+		},
+		"relay altered announced backend": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["relay_backend_control_address"] = "127.0.0.1:49999"
+		},
+		"wrong post-cleanup probe address": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_loopback_view_address"] = "198.18.0.2:42002"
+		},
 		"relay wrong backend identity": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["backend_identity_during"] = "42:9:2:3:4"
 		},
@@ -306,6 +321,7 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"backend_identity_before": "42:1:2:3:4", "backend_identity_during": "42:1:2:3:4", "backend_identity_after": "42:1:2:3:4",
 		"relay_exit_confirmed": "true", "relay_exec_deleted": "true", "relay_listeners_absent": "true",
 		"target_loopback_view": "read_succeeded", "target_loopback_control": "inject_succeeded",
+		"target_loopback_view_address": "127.0.0.1:42002", "target_loopback_control_address": "127.0.0.1:42003",
 		"target_view_port": "42002", "target_control_port": "42003", "target_egress_address": "198.18.0.6", "target_veth_gateway": "198.18.0.5", "target_egress_port": "43999",
 		"view_read_outcome": "refused", "view_read_errno": "ECONNREFUSED",
 		"view_read_address":      "198.18.0.6:42002",
