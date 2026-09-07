@@ -1090,10 +1090,16 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Join(append(joinedErrors, ctx.Err())...)
 		case <-changed:
 		}
 	}
+}
+
+func (session *agentSession) clearResidentSuppressionErrors() {
+	session.claimMu.Lock()
+	clear(session.residentSuppressionErrors)
+	session.claimMu.Unlock()
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {

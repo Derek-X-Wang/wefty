@@ -643,7 +643,11 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 			a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
 			return nil
 		}
-		return a.capabilities.allowOCIIntentIfUnchanged(suppressionSequence)
+		if err := a.capabilities.allowOCIIntentIfUnchanged(suppressionSequence); err != nil {
+			return err
+		}
+		a.session.clearResidentSuppressionErrors()
+		return nil
 	})
 	if err != nil {
 		return err

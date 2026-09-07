@@ -290,37 +290,112 @@ func TestControllerStopReportsResidentSuppressionFailureCompletedBeforeTeardownS
 	}
 }
 
-func TestControllerStopJoinsEveryResidentSuppressionFailure(t *testing.T) {
+func TestControllerStopDoesNotReuseSuppressionFailureAfterIntentReopens(t *testing.T) {
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
+	gate := &ociIntentCompletionGate{
+		observe: func(ctx context.Context) (OCIIntentObservation, error) {
+			intent, err := intentSource.ReadIntent(ctx)
+			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+		},
+	}
+	cause := errors.New("suppression persist failed")
+	failure := gate.finishSuppression("reopened-attempt", OCIIntentObservation{Enabled: false, Revision: 2}, cause)
+	session.residentSuppressionErrors["reopened-job"] = failure
+	nodeAgent := &Agent{session: session, ociIntentGate: gate, capabilities: capabilities}
+	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{
+		IntentPath: intentPath,
+		Runtime:    nodeAgent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResponse, firstStopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
+	if !errors.Is(firstStopErr, cause) || firstResponse.RuntimeQuiesced {
+		t.Fatalf("first stop response=%+v error=%v, want failed completion fence", firstResponse, firstStopErr)
+	}
+	if err := gate.finishSuppression("reopened-attempt", OCIIntentObservation{Enabled: false, Revision: 2}, nil); err != nil {
+		t.Fatal(err)
+	}
+	startResponse, err := controller.Start(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 2})
+	if err != nil || !startResponse.CapabilityPublished || !startResponse.Intent.Enabled {
+		t.Fatalf("reopen response=%+v error=%v", startResponse, err)
+	}
+	secondResponse, err := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 3})
+	if err != nil || !secondResponse.RuntimeQuiesced {
+		t.Fatalf("later stop with no residents response=%+v error=%v, want quiesced", secondResponse, err)
+	}
+}
+
+func TestStopOCIRuntimeJoinsSuppressionFailureWithClaimWaitCancellation(t *testing.T) {
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
+	cause := errors.New("suppression persist failed")
+	session.residentSuppressionErrors["completed-job"] = &OCIIntentSuppressionPersistenceError{
+		AttemptID: "completed-attempt", IntentRevision: 2, Err: cause,
+	}
+	session.residentKind["claim-in-publication"] = contract.JobKindOCI
+	session.residentJobID["claim-in-publication"] = struct{}{}
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancelStop()
+	err := (&Agent{session: session, capabilities: capabilities}).StopOCIRuntime(stopContext)
+	var persistenceErr *OCIIntentSuppressionPersistenceError
+	if !errors.As(err, &persistenceErr) || !errors.Is(err, cause) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stop cancellation error=%T %v, want joined typed suppression failure and deadline", err, err)
+	}
+}
+
+func TestControllerStopDrainsResidentAdmittedAfterSuppressionFailureSnapshot(t *testing.T) {
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 2)
-	firstCause := errors.New("first suppression persist failed")
-	secondCause := errors.New("second suppression persist failed")
-	for index, failure := range []*OCIIntentSuppressionPersistenceError{
-		{AttemptID: "first-attempt", IntentRevision: 2, Err: firstCause},
-		{AttemptID: "second-attempt", IntentRevision: 2, Err: secondCause},
-	} {
-		jobID := []string{"first-job", "second-job"}[index]
-		attemptContext, cancel := context.WithCancelCause(context.Background())
-		done := make(chan struct{})
-		reaped := make(chan runtimeReapOutcome, 1)
+	cause := errors.New("first suppression persist failed")
+	failure := &OCIIntentSuppressionPersistenceError{AttemptID: "first-attempt", IntentRevision: 2, Err: cause}
+	firstContext, cancelFirst := context.WithCancelCause(context.Background())
+	firstDone := make(chan struct{})
+	firstReaped := make(chan runtimeReapOutcome, 1)
+	healthyCompleted := make(chan struct{})
+	go func() {
+		<-firstContext.Done()
+		firstReaped <- runtimeReapOutcome{receipt: workloadrunner.ReapReceipt{
+			RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+		}}
+		healthyContext, cancelHealthy := context.WithCancelCause(context.Background())
+		healthyDone := make(chan struct{})
+		healthyReaped := make(chan runtimeReapOutcome, 1)
+		session.claimMu.Lock()
+		session.resident["healthy-job"] = &residentAttempt{
+			kind: contract.JobKindOCI, class: contract.JobClassService, cancel: cancelHealthy,
+			done: healthyDone, runtimeReaped: healthyReaped,
+		}
+		session.residentKind["healthy-job"] = contract.JobKindOCI
+		session.residentJobID["healthy-job"] = struct{}{}
+		session.notifyResidentChangedLocked()
+		session.claimMu.Unlock()
 		go func() {
-			<-attemptContext.Done()
-			reaped <- runtimeReapOutcome{receipt: workloadrunner.ReapReceipt{
+			<-healthyContext.Done()
+			healthyReaped <- runtimeReapOutcome{receipt: workloadrunner.ReapReceipt{
 				RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
 			}}
-			close(done)
+			close(healthyDone)
+			close(healthyCompleted)
 		}()
-		session.resident[jobID] = &residentAttempt{
-			kind: contract.JobKindOCI, class: contract.JobClassService, cancel: cancel,
-			done: done, runtimeReaped: reaped, completionErr: failure,
-		}
-		session.residentKind[jobID] = contract.JobKindOCI
-		session.residentJobID[jobID] = struct{}{}
+		close(firstDone)
+	}()
+	session.resident["first-job"] = &residentAttempt{
+		kind: contract.JobKindOCI, class: contract.JobClassService, cancel: cancelFirst,
+		done: firstDone, runtimeReaped: firstReaped, completionErr: failure,
 	}
+	session.residentKind["first-job"] = contract.JobKindOCI
+	session.residentJobID["first-job"] = struct{}{}
 	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{
 		IntentPath: intentPath,
 		Runtime:    &Agent{session: session, ociIntentGate: &ociIntentCompletionGate{}, capabilities: capabilities},
@@ -329,11 +404,16 @@ func TestControllerStopJoinsEveryResidentSuppressionFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	response, stopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
-	if !errors.Is(stopErr, firstCause) || !errors.Is(stopErr, secondCause) {
-		t.Fatalf("controller stop response=%+v error=%v, want both resident suppression failures", response, stopErr)
+	if !errors.Is(stopErr, cause) {
+		t.Fatalf("controller stop response=%+v error=%v, want suppression failure", response, stopErr)
+	}
+	select {
+	case <-healthyCompleted:
+	default:
+		t.Fatal("controller stop returned before the healthy resident completed")
 	}
 	if response.RuntimeQuiesced {
-		t.Fatalf("controller stop reported quiesced after resident suppression failures: %+v", response)
+		t.Fatalf("controller stop reported quiesced after resident suppression failure: %+v", response)
 	}
 }
 

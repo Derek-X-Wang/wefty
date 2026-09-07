@@ -265,13 +265,14 @@ before returning. The receipt retains the observed intent revision.
 
 Across an agent restart, recovery re-evaluation is the durable classification
 strategy; there is no separate `suppression pending` marker. Every reopened
-`durable_completion` service row re-reads the current durable intent while
-holding the completion gate before its first L1 publication call. A disabled
-revision therefore writes the ordinary suppression disposition and excludes
-the row from replay before anything can publish it. The prior process's typed
-error is not reconstructed, so an already-restarted controller stop is not a
-startup-recovery completion barrier; the safety guarantee is that recovery
-re-suppresses the row before publication.
+`durable_completion` OCI service row governed by `requiresOCIIntentFence`
+re-reads the current durable intent while holding the completion gate before
+its first L1 publication call. A disabled revision therefore writes the
+ordinary suppression disposition and excludes the row from replay before
+anything can publish it; a re-enabled revision permits publication. The prior
+process's typed error is not reconstructed, so an already-restarted controller
+stop is not a startup-recovery completion barrier; the safety guarantee is that
+recovery re-suppresses the row before publication.
 
 The suppression lock order is completion-gate read side, then the spool's sole
 database connection. The database transaction, including any retention
