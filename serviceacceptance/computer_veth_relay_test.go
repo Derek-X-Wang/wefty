@@ -664,9 +664,6 @@ func TestVethRelayLivenessRequiresRealRFBBackends(t *testing.T) {
 }
 
 func TestRFBProbeFailsClosedOnHandshakeEOF(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("probe reads Linux namespace authority")
-	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

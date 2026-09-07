@@ -1326,6 +1326,11 @@ import base64, errno, json, os, socket, struct, subprocess, sys
 variant, source_id, target_id, view_text, control_text, egress_address, egress_port_text, node_ipv6, node_port_text = sys.argv[1:10]
 view_port, control_port, egress_port, node_port = int(view_text), int(control_text), int(egress_port_text), int(node_port_text)
 target_host = sys.argv[10]
+# Portable transport probes cannot supply Linux namespace authority. On Linux,
+# the required stat remains uncaught: a failed read must fail the whole probe.
+namespace_inode = ""
+if sys.platform.startswith("linux"):
+    namespace_inode = str(os.stat("/proc/self/ns/net").st_ino)
 
 def refused(address, error):
     number = error.errno or 0
@@ -1488,7 +1493,7 @@ def tcp6_attempt(host, port):
 
 print(json.dumps({
     "version": 1,
-    "namespace_inode": str(os.stat("/proc/self/ns/net").st_ino),
+    "namespace_inode": namespace_inode,
     "variant": variant,
     "source_computer_id": source_id,
     "target_computer_id": target_id,
@@ -1627,6 +1632,14 @@ func TestScreenCrossoverProbeRecordsTypedTransportRefusal(t *testing.T) {
 	var receipt screenCrossoverReceipt
 	if err := json.Unmarshal(bytes.TrimSpace(output), &receipt); err != nil {
 		t.Fatalf("decode crossover probe contract: %v\n%s", err, output)
+	}
+	if runtime.GOOS == "linux" {
+		inode, err := networkNamespaceInodeForRelay(uint32(os.Getpid()))
+		if err != nil || receipt.NamespaceInode != inode {
+			t.Fatalf("Linux namespace authority: got %q want %q err=%v", receipt.NamespaceInode, inode, err)
+		}
+	} else if receipt.NamespaceInode != "" {
+		t.Fatalf("unsupported platform fabricated namespace authority: %q", receipt.NamespaceInode)
 	}
 	if receipt.ViewRead.Outcome != "refused" || receipt.ViewRead.ErrnoName != "ECONNREFUSED" ||
 		receipt.ControlInject.Outcome != "refused" || receipt.ControlInject.ErrnoName != "ECONNREFUSED" ||
@@ -3113,4 +3126,32 @@ func appendUnique(values []string, value string) []string {
 		}
 	}
 	return append(values, value)
+}
+
+func TestScreenCrossoverProbeNamespaceReadFailure(t *testing.T) {
+	// Inject only the required read failure, without fabricating procfs or
+	// changing platform identity. The same probe runs on the real host platform.
+	fault := `import os
+original_stat = os.stat
+def unavailable_namespace(path, *args, **kwargs):
+    if path == "/proc/self/ns/net":
+        raise FileNotFoundError("required-network-namespace-unavailable")
+    return original_stat(path, *args, **kwargs)
+os.stat = unavailable_namespace
+`
+	output, err := exec.Command("python3", "-c", fault+liveComputerScreenCrossoverPython,
+		"wayland", "source", "target", "1", "1", "127.0.0.1", "1", "::1", "1", "127.0.0.1").CombinedOutput()
+	if runtime.GOOS == "linux" {
+		if err == nil || !bytes.Contains(output, []byte("required-network-namespace-unavailable")) || json.Valid(bytes.TrimSpace(output)) {
+			t.Fatalf("missing Linux authority did not fail closed: err=%v output=%s", err, output)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("unsupported transport probe tried Linux authority: %v %s", err, output)
+	}
+	var receipt screenCrossoverReceipt
+	if err := json.Unmarshal(output, &receipt); err != nil || receipt.NamespaceInode != "" {
+		t.Fatalf("unsupported namespace evidence: %v %+v", err, receipt)
+	}
 }
