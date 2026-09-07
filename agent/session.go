@@ -1096,10 +1096,17 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 	}
 }
 
-func (session *agentSession) clearResidentSuppressionErrors() {
+func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence uint64) error {
+	// Keep the existing claimMu -> claimPublication lock order so no newly
+	// admitted resident or later stop episode can publish an error between the
+	// positive reopen and clearing failures owned by the prior disabled episode.
 	session.claimMu.Lock()
+	defer session.claimMu.Unlock()
+	if err := session.capabilities.allowOCIIntentIfUnchanged(suppressionSequence); err != nil {
+		return err
+	}
 	clear(session.residentSuppressionErrors)
-	session.claimMu.Unlock()
+	return nil
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
