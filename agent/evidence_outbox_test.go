@@ -2332,11 +2332,11 @@ func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.
 		_ = connectionBlocker.Rollback()
 		t.Fatalf("suppression persistence failure=%v, want deadline exhaustion", persistenceErr)
 	}
-	if elapsed < suppressionBudget-100*time.Millisecond || elapsed >= suppressionBudget+500*time.Millisecond {
+	if elapsed < suppressionBudget-50*time.Millisecond || elapsed >= suppressionBudget+100*time.Millisecond {
 		_ = connectionBlocker.Rollback()
-		t.Fatalf("intent-stop drain elapsed=%s, want suppression budget %s honored within [-100ms,+500ms]", elapsed, suppressionBudget)
+		t.Fatalf("intent-stop drain elapsed=%s, want suppression budget %s honored within [-50ms,+100ms]", elapsed, suppressionBudget)
 	}
-	t.Logf("suppression persistence deadline: configured=%s observed=%s tolerance=[-100ms,+500ms]", suppressionBudget, elapsed)
+	t.Logf("suppression persistence deadline: configured=%s observed=%s tolerance=[-50ms,+100ms]", suppressionBudget, elapsed)
 	failure := <-completionDone
 	if !errors.As(failure.err, &persistenceErr) {
 		_ = connectionBlocker.Rollback()
@@ -2417,6 +2417,112 @@ func TestRecoveryIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *
 	}
 	if err := connectionBlocker.Rollback(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRestartReevaluatesDurableCompletionAgainstCurrentIntentBeforePublication(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		observation     OCIIntentObservation
+		wantDisposition string
+		wantPublished   bool
+	}{
+		{name: "disabled intent is re-suppressed", observation: OCIIntentObservation{Enabled: false, Revision: 2}, wantDisposition: "suppressed"},
+		{name: "re-enabled intent is published", observation: OCIIntentObservation{Enabled: true, Revision: 3}, wantDisposition: "delivered", wantPublished: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			completionPublished := make(chan struct{}, 1)
+			client, stopServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if !strings.HasSuffix(request.URL.Path, "/complete") {
+					http.NotFound(w, request)
+					return
+				}
+				completionPublished <- struct{}{}
+				_ = json.NewEncoder(w).Encode(l1.Job{})
+			}), time.Second)
+			defer stopServer()
+			defer client.Close()
+			spoolDirectory := t.TempDir()
+			const nodeID = "restart-suppression-node"
+			claim := l1.Claim{Job: l1.Job{JobID: "restart-suppression-job", Spec: contract.JobSpec{
+				Kind: contract.JobKindOCI, Class: contract.JobClassService,
+			}}, Lease: l1.AttemptLease{AttemptID: "restart-suppression-attempt", FencingToken: "fence"}}
+			exitCode := 7
+
+			firstOutbox, err := newEvidenceOutbox(spoolDirectory, nodeID, 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := firstOutbox.ensureAttempt(t.Context(), claim); err != nil {
+				t.Fatal(err)
+			}
+			if err := firstOutbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			connectionBlocker, err := firstOutbox.spool.db.BeginTx(t.Context(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connectionBlocker.ExecContext(t.Context(), `UPDATE spool_attempts SET job_id=job_id WHERE attempt_id=?`, claim.Lease.AttemptID); err != nil {
+				t.Fatal(err)
+			}
+			failedGate := &ociIntentCompletionGate{suppressionTimeout: 50 * time.Millisecond}
+			failedContext, cancelFailed := failedGate.beginSuppression(t.Context())
+			failedPersist := firstOutbox.suppressCompletion(failedContext, claim.Lease.AttemptID, 2)
+			cancelFailed()
+			if failedPersist == nil {
+				_ = connectionBlocker.Rollback()
+				t.Fatal("initial suppression persist unexpectedly succeeded")
+			}
+			if err := connectionBlocker.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if receipt := firstOutbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID); receipt.State != "durable_completion" {
+				t.Fatalf("failed suppression state=%+v, want durable_completion", receipt)
+			}
+			if err := firstOutbox.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			restartedOutbox, err := newEvidenceOutbox(spoolDirectory, nodeID, 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restartedOutbox.Close()
+			restartedOutbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
+				return test.observation, nil
+			}}
+			recoveryContext, cancelRecovery := context.WithCancel(t.Context())
+			defer cancelRecovery()
+			recoveryErrors := make(chan error, 1)
+			restartedOutbox.startRecovery(recoveryContext, client, func(err error) { recoveryErrors <- err })
+			waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
+			defer cancelWait()
+			receipt, err := restartedOutbox.spool.waitCompletionDisposition(
+				waitContext, claim.Lease.AttemptID, test.wantDisposition, test.observation.Revision,
+			)
+			if err != nil {
+				select {
+				case recoveryErr := <-recoveryErrors:
+					t.Fatalf("restart recovery error=%v; disposition wait=%v", recoveryErr, err)
+				default:
+					t.Fatal(err)
+				}
+			}
+			if receipt.State != test.wantDisposition || receipt.IntentRevision != test.observation.Revision {
+				t.Fatalf("restarted recovery disposition=%+v, want %s at revision %d", receipt, test.wantDisposition, test.observation.Revision)
+			}
+			select {
+			case <-completionPublished:
+				if !test.wantPublished {
+					t.Fatal("disabled restart recovery published retained completion")
+				}
+			default:
+				if test.wantPublished {
+					t.Fatal("re-enabled restart recovery did not publish retained completion")
+				}
+			}
+		})
 	}
 }
 
