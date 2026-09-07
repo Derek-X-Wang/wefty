@@ -418,21 +418,30 @@ appears exactly once in the receipt and that row carries `mutation_detected`
 with the expected detail. An input timeout additionally requires later success
 for the same event and an executed `input.control-accepted` cell; an input
 timeout not recovered by the end of input evaluation is re-labelled
-`assertion_failed` while retaining its diagnostic detail. An absent or duplicate
-expected cell, a missing input-adjacent cell, or any extra `assertion_failed`
-cell remains a fail-set failure; the positive reference-image run never ignores
-a readiness timeout.
+`assertion_failed` while retaining its diagnostic detail and numeric observation
+window and elapsed evidence. An absent or duplicate expected cell, a missing
+input-adjacent cell, or any extra `assertion_failed` cell remains a fail-set
+failure; the positive reference-image run never ignores a readiness timeout.
 
 The emulated arm64 input-event observation window is the greater of the legacy
 1.5-second window and twice that container's observed first-boot endpoint
 readiness. amd64 retains the same 1.5-second, 12-poll behavior through the
 shared polling loop. A successful WebSocket upgrade waiting for the first RFB
 frame is an incomplete readiness event, not proof that plain TCP was accepted.
-A separate raw dial is sampled only after the readiness observation window is
-exhausted. It preserves raw-RFB and silent-accept detection without making one
-transient accept-without-answer sticky or ending readiness polling early. A
-persistent accept-then-close listener is likewise rejected after the window;
-an observed non-upgrade HTTP response remains an immediate protocol failure.
+A separate terminal classification is sampled only after the readiness
+observation window is exhausted. It preserves raw-RFB, silent-accept,
+accept-then-close, non-upgrade HTTP, and RFB protocol-error detection without
+making one transient answer sticky or ending readiness polling early. A
+proxy-fronted or still-initializing endpoint may therefore recover from an
+intermediate `502` or protocol error, but only a later exact WebSocket and RFB
+handshake satisfies readiness; a persistent violation remains terminal at the
+unchanged deadline.
+
+This late-only classification intentionally adds approximately 60 seconds to
+the `plain-tcp-control` mutation row in each arm64 reference-image lane: its
+`python3 -m http.server` listener returns a persistent non-101 HTTP response,
+so the row now consumes the existing 60-second readiness deadline before
+emitting the unchanged expected detail.
 
 Checker teardown asks Docker to stop the container and then removes it so every
 bind mount is detached before the checker-owned temporary root is removed. The

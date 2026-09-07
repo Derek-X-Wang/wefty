@@ -363,9 +363,6 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= missingEndpointObservationWindow {
 			break
 		}
-		if probeAssertionFailed(viewProbeErr) || probeAssertionFailed(controlProbeErr) {
-			break
-		}
 		if err := r.config.Sleep(ctx, 250*time.Millisecond); err != nil {
 			return err
 		}
@@ -427,12 +424,6 @@ func (r *runtimeRunner) probeReady(ctx context.Context, port int, endpointEvent 
 		return false, ReadinessEventFirstRFBFrame, err
 	}
 	return false, endpointEvent, err
-}
-
-func probeAssertionFailed(err error) bool {
-	var rejected *rfbUpgradeRejectedError
-	var protocol *rfbProtocolError
-	return errors.As(err, &rejected) || errors.As(err, &protocol)
 }
 
 func probeProtocolFailed(err error) bool {
@@ -1130,7 +1121,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	}
 	r.observeReadinessEvent(ReadinessEventInputOracleReady)
 	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
-		if !r.checkHasReadinessTimeout(ids[0]) {
+		if !r.recorder.HasReadinessTimeout(ids[0]) {
 			r.failed = true
 			return
 		}
@@ -1142,7 +1133,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		return
 	}
 	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 477) {
-		if !r.checkHasReadinessTimeout(ids[1]) {
+		if !r.recorder.HasReadinessTimeout(ids[1]) {
 			r.failed = true
 			_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 			return
@@ -1441,19 +1432,13 @@ func (r *runtimeRunner) observeReadinessEvent(event ReadinessEvent) {
 	r.recorder.ObserveReadinessEvent(event)
 }
 
-func (r *runtimeRunner) checkHasReadinessTimeout(id string) bool {
-	index, ok := r.recorder.index[id]
-	return ok && r.recorder.receipt.Checks[index].FailureReason == FailureReadinessTimeout
-}
-
 func (r *runtimeRunner) finalizeInputReadinessTimeouts() {
 	for _, id := range []string{"input.view-isolated", "input.view-isolated-during-tenure"} {
-		index := r.recorder.index[id]
-		check := r.recorder.receipt.Checks[index]
-		if check.FailureReason == FailureReadinessTimeout && !check.ReadinessObservedLater {
-			if err := r.recorder.RecordFailure(id, StatusFail, check.Detail, FailureAssertionFailed, ""); err != nil {
-				panic(err)
-			}
+		relabelled, err := r.recorder.RelabelUnobservedReadinessTimeout(id)
+		if err != nil {
+			panic(err)
+		}
+		if relabelled {
 			r.failed = true
 		}
 	}
