@@ -506,6 +506,54 @@ func TestStopOCIRuntimeJoinsSuppressionFailureWithClaimWaitCancellation(t *testi
 	}
 }
 
+func TestControllerStopJoinsEveryResidentSuppressionFailure(t *testing.T) {
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 2)
+	firstFailure := &OCIIntentSuppressionPersistenceError{
+		AttemptID: "first-attempt", IntentRevision: 2, Err: errors.New("first suppression persist failed"),
+	}
+	secondFailure := &OCIIntentSuppressionPersistenceError{
+		AttemptID: "second-attempt", IntentRevision: 2, Err: errors.New("second suppression persist failed"),
+	}
+	for index, failure := range []*OCIIntentSuppressionPersistenceError{firstFailure, secondFailure} {
+		jobID := []string{"first-job", "second-job"}[index]
+		attemptContext, cancel := context.WithCancelCause(context.Background())
+		done := make(chan struct{})
+		reaped := make(chan runtimeReapOutcome, 1)
+		go func() {
+			<-attemptContext.Done()
+			reaped <- runtimeReapOutcome{receipt: workloadrunner.ReapReceipt{
+				RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			}}
+			close(done)
+		}()
+		session.resident[jobID] = &residentAttempt{
+			kind: contract.JobKindOCI, class: contract.JobClassService, cancel: cancel,
+			done: done, runtimeReaped: reaped, completionErr: failure,
+		}
+		session.residentKind[jobID] = contract.JobKindOCI
+		session.residentJobID[jobID] = struct{}{}
+	}
+	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{
+		IntentPath: intentPath,
+		Runtime:    &Agent{session: session, ociIntentGate: &ociIntentCompletionGate{}, capabilities: capabilities},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, stopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
+	if !errors.Is(stopErr, firstFailure) || !errors.Is(stopErr, secondFailure) {
+		t.Fatalf("controller stop response=%+v error=%v, want both typed resident suppression failures", response, stopErr)
+	}
+	if response.RuntimeQuiesced {
+		t.Fatalf("controller stop reported quiesced after resident suppression failures: %+v", response)
+	}
+}
+
 func TestControllerStopDrainsResidentAdmittedAfterSuppressionFailureSnapshot(t *testing.T) {
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
@@ -541,8 +589,8 @@ func TestControllerStopDrainsResidentAdmittedAfterSuppressionFailureSnapshot(t *
 			healthyReaped <- runtimeReapOutcome{receipt: workloadrunner.ReapReceipt{
 				RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
 			}}
-			close(healthyDone)
 			close(healthyCompleted)
+			close(healthyDone)
 		}()
 		close(firstDone)
 	}()
