@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,42 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
+
+func TestServiceEvictionReturnsPreserveExactContextCause(t *testing.T) {
+	source, err := os.ReadFile("log_spool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := []string{
+		"agent: select service log eviction prefix",
+		"agent: scan service log eviction prefix",
+		"agent: iterate service log eviction prefix",
+		"agent: close service log eviction prefix",
+		"agent: store service log eviction gap",
+		"agent: release evicted service log payload",
+	}
+	for _, operation := range operations {
+		t.Run(operation, func(t *testing.T) {
+			returnStatement := `return wrapLogSpoolContextError(ctx, "` + operation + `", err)`
+			if !strings.Contains(string(source), returnStatement) {
+				t.Fatalf("service eviction return does not preserve the exact context cause: want %q", returnStatement)
+			}
+
+			cause := errors.New("caller finalization expired")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			cancel(cause)
+			if got := wrapLogSpoolContextError(ctx, operation, cause); got != cause {
+				t.Fatalf("exact context cause = %v, want identical %v", got, cause)
+			}
+
+			destinationErr := errors.New("sqlite failure")
+			got := wrapLogSpoolContextError(ctx, operation, destinationErr)
+			if got == destinationErr || !errors.Is(got, destinationErr) || !strings.HasPrefix(got.Error(), operation+": ") {
+				t.Fatalf("destination error = %v, want operation-wrapped sqlite failure", got)
+			}
+		})
+	}
+}
 
 func TestComputerControlTokenKeyPersistsAcrossAgentRestart(t *testing.T) {
 	directory := t.TempDir()

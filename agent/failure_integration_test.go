@@ -498,11 +498,11 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	network := plain.NewNetwork()
 	clock := newManualClock(time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC))
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
-		"intent-marker-node": {Tags: []string{"intent-marker"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+		"intent-marker-node": {Tags: []string{"intent-marker"}, MaxOneshotSlots: 1, MaxServiceSlots: 2},
 	}, 500*time.Millisecond)
 	defer stopServer()
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+	jobSpec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-marker-finished-service",
 		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
 		RoutingTags: []string{"intent-marker"}, RuntimeHandler: "io.containerd.runc.v2",
@@ -510,7 +510,8 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-marker:v1", Digest: &digest},
 			Argv:  []string{"/payload"},
 		}},
-	})
+	}
+	job, _, err := store.CreateJob(t.Context(), jobSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +544,7 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		}),
 		OCIIntent:      intentEnabled,
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
-		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 2,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 		AttemptDeadman: deadman, ComputerTokenMinter: &recordingComputerTokenMinter{}, Logf: t.Logf,
 	})
@@ -614,6 +615,12 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	replacementSpec := jobSpec
+	replacementSpec.DispatchKey = "intent-marker-finished-service-replacement"
+	replacementJob, _, err := store.CreateJob(t.Context(), replacementSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
 	clock.Advance(time.Second)
 	deadline = time.Now().Add(3 * time.Second)
 	for {
@@ -645,13 +652,35 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	nodes, err := store.ListNodes(t.Context())
-	if err != nil || len(nodes) != 1 || nodes[0].Capabilities["kind:oci"] {
-		t.Fatalf("replacement OCI admission remained published while intent-stop completion reader was held: nodes=%+v err=%v", nodes, err)
+	var replacementAttempts []l1.Attempt
+	var nodes []l1.Node
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		replacementAttempts, err = store.ListJobAttempts(t.Context(), replacementJob.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nodes, err = store.ListNodes(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(replacementAttempts) != 0 || len(nodes) == 1 && !nodes[0].Capabilities["kind:oci"] {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement OCI attempt remained admissible but was not claimed: attempts=%+v nodes=%+v", replacementAttempts, nodes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(replacementAttempts) != 0 {
+		t.Fatalf("replacement OCI attempt was admitted before the intent-stop completion reader released: attempts=%+v", replacementAttempts)
+	}
+	if len(nodes) != 1 || nodes[0].Capabilities["kind:oci"] {
+		t.Fatalf("replacement OCI admission remained published while intent-stop completion reader was held: nodes=%+v", nodes)
 	}
 	attemptsBeforeRelease, err := store.ListJobAttempts(t.Context(), job.JobID)
 	if err != nil || len(attemptsBeforeRelease) != 1 || attemptsBeforeRelease[0].AttemptID != firstAttempt {
-		t.Fatalf("replacement OCI attempt was admitted before the intent-stop completion reader released: attempts=%+v err=%v", attemptsBeforeRelease, err)
+		t.Fatalf("finished service attempt changed before the intent-stop completion reader released: attempts=%+v err=%v", attemptsBeforeRelease, err)
 	}
 	release()
 	if err := <-stopDone; err != nil {

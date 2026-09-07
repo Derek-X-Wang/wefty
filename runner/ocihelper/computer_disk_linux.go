@@ -1381,8 +1381,21 @@ diskLoop:
 			continue
 		}
 		if err := engine.clearOperationalComputerRecoveryDeferral(root, entry.Name(), "computer_storage_copy"); err != nil {
-			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence,
-				engine.resolveOperationalDeferralRecordFailure(root, entry.Name(), "computer_storage_copy", manifest.Storage, err, countRecoveryAttempt))
+			var structuralErr *computerDiskRecoveryStructuralError
+			if !present && errors.As(err, &structuralErr) && structuralErr.Reason == "deferral_record_identity_mismatch" {
+				if quarantineErr := engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), structuralErr.Reason); quarantineErr != nil {
+					closeComputerDiskLock(recoveryLock)
+					engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence,
+						engine.resolveOperationalComputerRecoveryFailure(root, entry.Name(), "quarantine_move_failed", ComputerStorageReference{}, errors.Join(err, quarantineErr), countRecoveryAttempt))
+					continue
+				}
+				engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+					Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: structuralErr.Reason,
+				})
+			} else {
+				engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence,
+					engine.resolveOperationalDeferralRecordFailure(root, entry.Name(), "computer_storage_copy", manifest.Storage, err, countRecoveryAttempt))
+			}
 			closeComputerDiskLock(recoveryLock)
 			continue
 		}
