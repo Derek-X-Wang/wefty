@@ -66,6 +66,22 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.network_egress"].assertions.mounted_resolver_recorded and
     .rows["linux.network_egress"].assertions.loopback_proxy_listening and
     .rows["linux.network_egress"].assertions.proxy_upstream_reachable and
+    .rows["linux.network_egress"].assertions.helper_control_socket_refused and
+    .rows["linux.network_egress"].assertions.node_loopback_by_name_refused and
+    .rows["linux.network_egress"].evidence.proxy_upstream_authority == "attachment_profile" and
+    (.rows["linux.network_egress"].evidence.computer_network_namespace_inode | test("^[0-9]+$")) and
+    (.rows["linux.network_egress"].evidence.node_network_namespace_inode | test("^[0-9]+$")) and
+    .rows["linux.network_egress"].evidence.node_network_namespace_inode != .rows["linux.network_egress"].evidence.computer_network_namespace_inode and
+    (.rows["linux.network_egress"].evidence.computer_mount_namespace | startswith("mnt:[")) and
+    (.rows["linux.network_egress"].evidence.node_mount_namespace | startswith("mnt:[")) and
+    .rows["linux.network_egress"].evidence.computer_mount_namespace != .rows["linux.network_egress"].evidence.node_mount_namespace and
+    (.rows["linux.network_egress"].evidence.helper_control_socket_path | startswith("/")) and
+    .rows["linux.network_egress"].evidence.helper_control_socket_present_on_node == "true" and
+    .rows["linux.network_egress"].evidence.helper_control_socket_outcome == "refused" and
+    .rows["linux.network_egress"].evidence.helper_control_socket_errno == "ENOENT" and
+    .rows["linux.network_egress"].evidence.node_loopback_address == ("localhost:" + (.rows["linux.network_egress"].evidence.node_listener_ipv4_address | split(":")[-1])) and
+    .rows["linux.network_egress"].evidence.node_loopback_outcome == "refused" and
+    .rows["linux.network_egress"].evidence.node_loopback_errno == "ECONNREFUSED" and
     .rows["linux.network_egress"].assertions.default_route_present and
     .rows["linux.network_egress"].assertions.public_ipv4_connected and
     .rows["linux.network_egress"].assertions.resolver_reachable and

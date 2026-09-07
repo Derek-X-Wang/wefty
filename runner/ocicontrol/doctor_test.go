@@ -58,7 +58,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					ComputerFirewallPresent: true, ComputerAttemptsLive: true, ComputerFirewallRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
-					LastProfile: &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false,
+					LastProfile: &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false, HostAbstractSocketObservedAfterEndpointReady: true,
 						ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", ComputerResolverAddress: "127.0.0.53",
 						ComputerDNSProxyUDP: true, ComputerDNSProxyTCP: true, ComputerDNSUpstreamAddress: "168.63.129.16", ComputerDNSUpstreamSource: "systemd_uplink", ComputerDNSUpstreamReachable: true, ComputerIPv6NATState: ocihelper.ComputerIPv6NATConfigured,
 						MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
@@ -126,7 +126,7 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	if err := WriteDoctorHuman(&human, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1 resolver=127.0.0.53 dns_proxy_udp=true dns_proxy_tcp=true dns_upstream=168.63.129.16 dns_source=systemd_uplink dns_reachable=true ipv6_nat=configured computer_firewall_present=true computer_attempts_live=true") {
+	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false after_endpoint_ready=true address=198.18.0.2 gateway=198.18.0.1 resolver=127.0.0.53 dns_proxy_udp=true dns_proxy_tcp=true dns_upstream=168.63.129.16 dns_source=systemd_uplink dns_reachable=true ipv6_nat=configured computer_firewall_present=true computer_attempts_live=true") {
 		t.Fatalf("human doctor omitted screen isolation fact:\n%s", human.String())
 	}
 	if !strings.Contains(human.String(), "SESSION INVALIDATION\tobserved_at=2026-09-04T11:59:00Z session_generation=6 attempt_id=attempt-stale rejection_code=unauthorized_attempt") {
@@ -816,4 +816,17 @@ func findDoctorFinding(t *testing.T, report DoctorResponse, check string) Diagno
 	}
 	t.Fatalf("finding %s missing", check)
 	return DiagnosticFinding{}
+}
+
+func TestDoctorRejectsAbstractAbsenceBeforeEndpointReady(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC), "")
+	base := config.Helper
+	config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+		snapshot, err := base(ctx)
+		snapshot.Runtime.LastProfile.HostAbstractSocketObservedAfterEndpointReady = false
+		return snapshot, err
+	}
+	if got := BuildDoctor(t.Context(), config).ComputerScreenIsolation.Outcome; got != DiagnosticFailed {
+		t.Fatalf("pre-readiness absence = %s, want failed", got)
+	}
 }

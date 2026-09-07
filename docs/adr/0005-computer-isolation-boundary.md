@@ -111,3 +111,22 @@ and record the refusal through receipts.
 - Runtime isolation evidence is observed after `task.Start`: the helper records
   both namespace inodes and scans its own `/proc/net/unix` for the exact X token.
   Serialized-profile inference cannot earn the doctor verdict.
+
+### Current hosts snapshot exposure
+
+The helper mounts a read-only snapshot of the Node's `/etc/hosts` into each
+Computer. This currently exposes all host-to-IP mappings in that file, including
+private Node names and addresses, to every Computer. The snapshot is not filtered
+per Computer. The helper refreshes its managed network files before starting an
+attempt; existing mounts of that shared snapshot can observe a later refresh.
+Knowledge of these
+names does not grant network access: the Computer network boundary still refuses
+Node listeners and cross-Computer traffic. This describes the current exposure;
+it does not extend the Computer's access authority.
+
+The initial post-Start network namespace inode check remains fail closed. Abstract
+X socket absence earns a completed doctor observation only after an owned
+view/control endpoint is reachable, when the helper repeats the namespace and
+host socket observation before admitting the stream. The XFCE entrypoint binds X
+before those endpoints; Wayland uses the same endpoint readiness edge without
+waiting for an X server. A missing reobservation cannot earn an enforced verdict.

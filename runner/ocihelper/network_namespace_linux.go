@@ -23,6 +23,7 @@ import (
 	"time"
 
 	netlink "github.com/tailscale/netlink"
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sys/unix"
 )
 
@@ -686,7 +687,48 @@ func validDNSQuery(payload []byte) bool {
 }
 
 func validDNSResponse(query, response []byte) bool {
-	return len(query) >= 2 && len(response) >= 12 && response[2]&0x80 != 0 && response[0] == query[0] && response[1] == query[1]
+	if !validDNSQuery(query) || len(response) < 12 || response[2]&0x80 == 0 || response[0] != query[0] || response[1] != query[1] || binary.BigEndian.Uint16(query[4:6]) != binary.BigEndian.Uint16(response[4:6]) {
+		return false
+	}
+	var queryParser, responseParser dnsmessage.Parser
+	if _, err := queryParser.Start(query); err != nil {
+		return false
+	}
+	if _, err := responseParser.Start(response); err != nil {
+		return false
+	}
+	for range int(binary.BigEndian.Uint16(query[4:6])) {
+		expected, err := queryParser.Question()
+		if err != nil {
+			return false
+		}
+		actual, err := responseParser.Question()
+		if err != nil || actual.Type != expected.Type || actual.Class != expected.Class || !equalDNSName(expected.Name, actual.Name) {
+			return false
+		}
+	}
+	return true
+}
+
+// DNS names compare case-insensitively for ASCII letters only. Parsing expands
+// compression before comparison; malformed names never become matching questions.
+func equalDNSName(a, b dnsmessage.Name) bool {
+	if a.Length != b.Length {
+		return false
+	}
+	for i := range int(a.Length) {
+		x, y := a.Data[i], b.Data[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 func (proxy *computerDNSProxy) allowDNSQuery(now time.Time) bool {

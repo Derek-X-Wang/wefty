@@ -151,6 +151,7 @@ type ContainerdEngine struct {
 	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)
 	computerReimageDiskOwner    func(context.Context, string) (uint32, uint32, error)
 	lastProfile                 *ProfileReceipt
+	lastProfileNetworkNamespace *pinnedNetworkNamespace
 	capacityMu                  sync.Mutex
 	capacityReservations        map[string]*capacityReservation
 	lastAdmission               *ResourceAdmissionReceipt
@@ -1245,6 +1246,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		profile.HostAbstractSocketVisible = hostVisible
 		engine.mu.Lock()
 		engine.lastProfile = &profile
+		engine.lastProfileNetworkNamespace = networkNamespace
 		engine.mu.Unlock()
 		if observeErr != nil {
 			return RunResponse{}, fmt.Errorf("observe Computer network isolation: %w", observeErr)
@@ -1255,6 +1257,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	} else {
 		engine.mu.Lock()
 		engine.lastProfile = &profile
+		engine.lastProfileNetworkNamespace = networkNamespace
 		engine.mu.Unlock()
 	}
 	startedAt := time.Now().UTC().Round(0)
@@ -2559,6 +2562,7 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
 	var networkNamespace *pinnedNetworkNamespace
+	var viewPort uint16
 	if authorityErr := request.Authority.validate(); authorityErr == nil {
 		attempt, err := engine.attempt(request.Authority)
 		if err != nil {
@@ -2566,6 +2570,7 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		}
 		attempt.mu.Lock()
 		networkNamespace = attempt.networkNamespace
+		viewPort = attempt.endpoints["view"]
 		attempt.mu.Unlock()
 	} else if request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl {
 		return &ComputerAttemptAuthorityRefusalError{Cause: authorityErr}
@@ -2589,10 +2594,47 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		return fmt.Errorf("dial attempt loopback port: %w", err)
 	}
 	defer backend.Close()
+	if networkNamespace != nil && viewPort != 0 && (request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl) {
+		// The shipped XFCE image binds X before publishing its view/control
+		// listeners; Wayland reaches this same edge without an X server.
+		// Keep Start's inode check, but never earn socket absence from that
+		// earlier sample alone. Recheck before admitting each endpoint stream.
+		if err := engine.observeReadyComputerIsolation(networkNamespace, viewPort); err != nil {
+			return err
+		}
+	}
 	if _, err := stream.Write([]byte{attemptPortBackendReady}); err != nil {
 		return fmt.Errorf("confirm attempt loopback connection: %w", err)
 	}
 	return Relay(ctx, stream, backend)
+}
+
+func (engine *ContainerdEngine) observeReadyComputerIsolation(namespace *pinnedNetworkNamespace, viewPort uint16) error {
+	observer := engine.observeComputerIsolation
+	if observer == nil {
+		observer = observeComputerNetworkIsolation
+	}
+	helperInode, taskInode, visible, err := observer(namespace, "@/tmp/.X11-unix/X"+fmt.Sprint(viewPort))
+	namespacePresent := helperInode != "" && taskInode != "" && helperInode != taskInode
+	engine.mu.Lock()
+	// Doctor's last profile may belong to a newer Computer. Do not attach this
+	// observation to that other attachment, or mutate a returned Run profile.
+	if engine.lastProfile != nil && engine.lastProfileNetworkNamespace == namespace {
+		profile := *engine.lastProfile
+		profile.HelperNetworkNamespaceInode = helperInode
+		profile.NetworkNamespacePresent = namespacePresent
+		profile.HostAbstractSocketVisible = visible
+		profile.HostAbstractSocketObservedAfterEndpointReady = err == nil
+		engine.lastProfile = &profile
+	}
+	engine.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("observe ready Computer isolation: %w", err)
+	}
+	if !namespacePresent || visible {
+		return errors.New("ready Computer network isolation was not enforced")
+	}
+	return nil
 }
 
 type ComputerAttemptAuthorityRefusalError struct {

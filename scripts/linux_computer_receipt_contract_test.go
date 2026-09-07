@@ -162,6 +162,26 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"loopback resolver without reachable upstream": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["proxy_upstream_reachable"] = "false"
 		},
+		"missing helper control socket probe": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string), "helper_control_socket_path")
+		},
+		"helper control socket connected": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["helper_control_socket_outcome"] = "connected"
+		},
+		"Node loopback by name connected": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["node_loopback_outcome"] = "connected"
+		},
+		"shared network namespace": func(receipt map[string]any) {
+			e := receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)
+			e["computer_network_namespace_inode"] = e["node_network_namespace_inode"]
+		},
+		"shared mount namespace": func(receipt map[string]any) {
+			e := receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)
+			e["computer_mount_namespace"] = e["node_mount_namespace"]
+		},
+		"missing attachment DNS authority": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string), "proxy_upstream_authority")
+		},
 		"wrong default route gateway": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["default_route_gateway"] = "198.18.0.9"
 		},
@@ -268,10 +288,15 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	}
 	crossover["evidence"] = crossoverEvidence
 	network := rows["linux.network_egress"].(map[string]any)
-	network["assertions"] = map[string]bool{"private_veth_address_present": true, "mounted_resolver_recorded": true, "loopback_proxy_listening": true, "proxy_upstream_reachable": true, "default_route_present": true, "public_ipv4_connected": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_listener_ipv4_refused": true, "node_listener_ipv6_refused": true}
+	network["assertions"] = map[string]bool{"private_veth_address_present": true, "mounted_resolver_recorded": true, "loopback_proxy_listening": true, "proxy_upstream_reachable": true, "default_route_present": true, "public_ipv4_connected": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_listener_ipv4_refused": true, "node_listener_ipv6_refused": true, "helper_control_socket_refused": true, "node_loopback_by_name_refused": true}
 	network["evidence"] = map[string]string{
 		"computer_id": "computer-1", "attempt_id": "attempt-1", "veth_address": "198.18.0.2", "veth_gateway": "198.18.0.1",
 		"resolver_snapshot": "nameserver 127.0.0.53", "resolver_address": "127.0.0.53", "proxy_udp_listening": "true", "proxy_tcp_listening": "true",
+		"proxy_upstream_authority": "attachment_profile", "computer_network_namespace_inode": "4026533000", "node_network_namespace_inode": "4026532000",
+		"computer_mount_namespace": "mnt:[4026533001]", "node_mount_namespace": "mnt:[4026532000]",
+		"helper_control_socket_path": "/run/wefty/helper.sock", "helper_control_socket_present_on_node": "true",
+		"helper_control_socket_outcome": "refused", "helper_control_socket_errno": "ENOENT",
+		"node_loopback_address": "localhost:45000", "node_loopback_outcome": "refused", "node_loopback_errno": "ECONNREFUSED",
 		"proxy_upstream_address": "168.63.129.16", "proxy_upstream_source": "systemd_uplink", "proxy_upstream_reachable": "true",
 		"default_route_interface": "eth0", "default_route_gateway": "198.18.0.1", "public_ipv4_address": "1.1.1.1:443", "public_ipv4_outcome": "connected", "dns_outcome": "resolved",
 		"resolved_name": "example.com", "resolved_address": "192.0.2.1", "helper_http_status": "200",

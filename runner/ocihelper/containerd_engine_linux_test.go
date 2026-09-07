@@ -2745,3 +2745,40 @@ func waitForHostBridgePumps(t *testing.T, count int, timeout time.Duration) {
 		runtime.Gosched()
 	}
 }
+
+func TestReadyComputerIsolationObservationFailsClosedAndKeepsAttachmentIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name, helper, task string
+		visible            bool
+		err                error
+		valid              bool
+	}{
+		{name: "ready XFCE or Wayland", helper: "10", task: "20", valid: true},
+		{name: "late visible socket", helper: "10", task: "20", visible: true},
+		{name: "missing observation", err: errors.New("read failed")},
+		{name: "same namespace", helper: "10", task: "10"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			namespace := &pinnedNetworkNamespace{}
+			engine := &ContainerdEngine{lastProfileNetworkNamespace: namespace, lastProfile: &ProfileReceipt{Computer: true, TaskNetworkNamespaceInode: "20", HostAbstractSocketObservedAfterEndpointReady: true}, observeComputerIsolation: func(got *pinnedNetworkNamespace, token string) (string, string, bool, error) {
+				if got != namespace || token != "@/tmp/.X11-unix/X42000" {
+					t.Fatalf("wrong observation target: %p %s", got, token)
+				}
+				return test.helper, test.task, test.visible, test.err
+			}}
+			err := engine.observeReadyComputerIsolation(namespace, 42000)
+			if (err == nil) != test.valid {
+				t.Fatalf("ready observation err=%v want valid=%t", err, test.valid)
+			}
+			if engine.lastProfile.HostAbstractSocketObservedAfterEndpointReady != (test.err == nil) {
+				t.Fatal("read failure retained successful evidence")
+			}
+			other := &ProfileReceipt{ComputerNetworkAddress: "198.18.0.6"}
+			engine.lastProfile, engine.lastProfileNetworkNamespace = other, &pinnedNetworkNamespace{}
+			_ = engine.observeReadyComputerIsolation(namespace, 42000)
+			if engine.lastProfile != other {
+				t.Fatal("observation replaced another attachment's profile")
+			}
+		})
+	}
+}
