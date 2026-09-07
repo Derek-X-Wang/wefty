@@ -401,12 +401,17 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 			<-continueCompletionRecord
 		}
 	}
+	residentCanceled := make(chan struct{})
 	residentDone := make(chan error, 1)
 	go func() {
 		_, executeErr := session.executeResident(t.Context(), workloadClassService, claim, time.Now(), func(ctx context.Context, _ l1.Claim, _ time.Time) (errorDestination, error) {
 			failure := lifecycle.completeWithRetry(ctx, claim, l1.CompletionRequest{
 				FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: result,
 			})
+			go func() {
+				<-ctx.Done()
+				close(residentCanceled)
+			}()
 			return failure.destination, failure.err
 		})
 		residentDone <- executeErr
@@ -473,6 +478,36 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 	if err != nil || !startResponse.CapabilityPublished || !startResponse.Intent.Enabled {
 		t.Fatalf("reopen response=%+v error=%v", startResponse, err)
 	}
+	secondStopDone := make(chan struct {
+		response ocicontrol.IntentResponse
+		err      error
+	}, 1)
+	go func() {
+		response, stopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 3})
+		secondStopDone <- struct {
+			response ocicontrol.IntentResponse
+			err      error
+		}{response: response, err: stopErr}
+	}()
+	markerDeadline = time.Now().Add(time.Second)
+	for {
+		intent, readErr := intentSource.ReadIntent(t.Context())
+		if readErr == nil && !intent.Enabled && intent.Revision == 4 {
+			break
+		}
+		if time.Now().After(markerDeadline) {
+			t.Fatalf("disabled revision 4 was not written: intent=%+v error=%v", intent, readErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-residentCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("later stop did not select the live resident")
+	}
+	session.recordRuntimeReap(claim.Job.JobID, workloadrunner.ReapReceipt{
+		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+	}, nil)
 	close(continueCompletionRecord)
 	select {
 	case err := <-residentDone:
@@ -482,9 +517,80 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 	case <-time.After(time.Second):
 		t.Fatal("resident completion did not publish its delayed result")
 	}
-	secondResponse, err := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 3})
-	if err != nil || !secondResponse.RuntimeQuiesced {
-		t.Fatalf("later stop with no residents response=%+v error=%v, want quiesced", secondResponse, err)
+	select {
+	case secondStop := <-secondStopDone:
+		if secondStop.err != nil || !secondStop.response.RuntimeQuiesced {
+			t.Fatalf("later stop with live resident response=%+v error=%v, want quiesced", secondStop.response, secondStop.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("later stop did not join the resident")
+	}
+}
+
+func TestControllerStopReportsResidentSuppressionFailureFromCurrentEpisodeAfterIntentReopens(t *testing.T) {
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
+	gate := &ociIntentCompletionGate{
+		observe: func(ctx context.Context) (OCIIntentObservation, error) {
+			intent, err := intentSource.ReadIntent(ctx)
+			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
+		},
+	}
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
+	nodeAgent := &Agent{session: session, ociIntentGate: gate, capabilities: capabilities}
+	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{IntentPath: intentPath, Runtime: nodeAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStop, err := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
+	if err != nil || !firstStop.RuntimeQuiesced {
+		t.Fatalf("initial stop response=%+v error=%v, want quiesced", firstStop, err)
+	}
+	startResponse, err := controller.Start(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 2})
+	if err != nil || !startResponse.CapabilityPublished || !startResponse.Intent.Enabled {
+		t.Fatalf("reopen response=%+v error=%v", startResponse, err)
+	}
+
+	claim := l1.Claim{Job: l1.Job{JobID: "current-episode-job", Spec: contract.JobSpec{
+		Kind: contract.JobKindOCI, Class: contract.JobClassService,
+	}}, Lease: l1.AttemptLease{AttemptID: "current-episode-attempt", FencingToken: "fence"}}
+	session.residentKind[claim.Job.JobID] = contract.JobKindOCI
+	session.residentJobID[claim.Job.JobID] = struct{}{}
+	if !session.gates[workloadClassService].tryAcquire() {
+		t.Fatal("acquire service gate for resident")
+	}
+	session.attempts.Add(1)
+	cause := errors.New("current episode suppression persist failed")
+	failure := &OCIIntentSuppressionPersistenceError{
+		AttemptID: claim.Lease.AttemptID, IntentRevision: 4, Err: cause,
+	}
+	residentStarted := make(chan struct{})
+	residentDone := make(chan error, 1)
+	go func() {
+		_, executeErr := session.executeResident(t.Context(), workloadClassService, claim, time.Now(), func(ctx context.Context, _ l1.Claim, _ time.Time) (errorDestination, error) {
+			close(residentStarted)
+			<-ctx.Done()
+			session.recordRuntimeReap(claim.Job.JobID, workloadrunner.ReapReceipt{
+				RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			}, nil)
+			return errorDestinationTransient, failure
+		})
+		residentDone <- executeErr
+	}()
+	<-residentStarted
+
+	secondStop, stopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 3})
+	var persistenceErr *OCIIntentSuppressionPersistenceError
+	if !errors.As(stopErr, &persistenceErr) || persistenceErr.AttemptID != claim.Lease.AttemptID ||
+		persistenceErr.IntentRevision != 4 || !errors.Is(stopErr, cause) || secondStop.RuntimeQuiesced {
+		t.Fatalf("current episode stop response=%+v error=%T %v, want typed suppression failure", secondStop, stopErr, stopErr)
+	}
+	if err := <-residentDone; !errors.Is(err, cause) {
+		t.Fatalf("resident completion error=%T %v, want current episode failure", err, err)
 	}
 }
 

@@ -978,9 +978,9 @@ func (session *agentSession) executeResident(
 			session.residentBeforeCompletionRecord(executeErr)
 		}
 		session.claimMu.Lock()
-		resident.completionErr = executeErr
 		var persistenceErr *OCIIntentSuppressionPersistenceError
 		if errors.As(executeErr, &persistenceErr) && persistenceErr.IntentRevision >= session.residentSuppressionReopenRevision {
+			resident.completionErr = executeErr
 			session.residentSuppressionErrors[claim.Job.JobID] = executeErr
 		}
 		delete(session.resident, claim.Job.JobID)

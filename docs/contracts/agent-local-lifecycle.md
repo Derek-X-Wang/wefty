@@ -261,7 +261,10 @@ successful controller stop is therefore also a same-process observation barrier
 for the suppression receipt. Resident teardown retains every typed persistence
 failure until the join consumes it, including a completion that exits between
 the fence release and the first teardown scan, and joins all resident failures
-before returning. The receipt retains the observed intent revision.
+before returning. A positive reopen supersedes every typed failure from an
+older disabled-intent episode; resident teardown discards such a failure even
+if its delayed defer becomes readable during a later stop. The receipt retains
+the observed intent revision.
 
 Across an agent restart, recovery re-evaluation is the durable classification
 strategy; there is no separate `suppression pending` marker. Every reopened
