@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"os"
@@ -253,15 +256,34 @@ func TestMutationUnrecoveredInputReadinessTimeoutFailsClosed(t *testing.T) {
 	}
 }
 
-func TestRuntimeRunnerUsesRecorderReadinessAPI(t *testing.T) {
-	source, err := os.ReadFile("runtime.go")
+func TestRecorderPrivateStateIsConfinedToReceiptImplementation(t *testing.T) {
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, privateState := range []string{"r.recorder.index", "r.recorder.receipt"} {
-		if strings.Contains(string(source), privateState) {
-			t.Fatalf("runtime runner reaches into Recorder state through %q", privateState)
+	fileset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == "receipt.go" {
+			continue
 		}
+		file, err := parser.ParseFile(fileset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.SelectorExpr:
+				if node.Sel.Name == "index" || node.Sel.Name == "receipt" {
+					t.Errorf("%s reaches into Recorder private state %q outside receipt.go", fileset.Position(node.Pos()), node.Sel.Name)
+				}
+			case *ast.CompositeLit:
+				if recorder, ok := node.Type.(*ast.Ident); ok && recorder.Name == "Recorder" {
+					t.Errorf("%s constructs Recorder outside receipt.go", fileset.Position(node.Pos()))
+				}
+			}
+			return true
+		})
 	}
 }
 

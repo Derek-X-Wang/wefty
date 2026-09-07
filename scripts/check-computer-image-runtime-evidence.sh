@@ -43,7 +43,8 @@ require_receipt() {
           if .failure_reason == "assertion_failed" then
             (((has("readiness_observation_window_seconds") | not) and
               (has("readiness_observation_elapsed_seconds") | not)) or
-             ((.readiness_observation_window_seconds | type == "number" and . > 0) and
+             ((.id == "input.view-isolated" or .id == "input.view-isolated-during-tenure") and
+              (.readiness_observation_window_seconds | type == "number" and . > 0) and
               (.readiness_observation_elapsed_seconds | type == "number") and
               (.readiness_observation_elapsed_seconds >= .readiness_observation_window_seconds)))
           else

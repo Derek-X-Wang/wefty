@@ -275,6 +275,26 @@ func TestRuntimeEvidenceAcceptsRelabelledReadinessMeasurement(t *testing.T) {
 	}
 }
 
+func TestRuntimeEvidenceRejectsReadinessMeasurementOnUnrelatedAssertion(t *testing.T) {
+	temp := t.TempDir()
+	receipt := filepath.Join(temp, "unrelated-measured-assertion.json")
+	payload := `{"version":2,"checks":[` +
+		`{"id":"persistence.edge-recovers","status":"FAIL","detail":"both endpoints did not recover after edge withdrawal","failure_reason":"mutation_detected"},` +
+		`{"id":"harness.rootfs-read-only","status":"FAIL","detail":"write failed with EACCES, not EROFS","failure_reason":"assertion_failed","readiness_observation_window_seconds":18.588,"readiness_observation_elapsed_seconds":18.625}],` +
+		`"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}}`
+	if err := os.WriteFile(receipt, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", receipt, "edge-does-not-recover", "persistence.edge-recovers", "both endpoints did not recover after edge withdrawal", "1", "29")
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("unrelated measured assertion unexpectedly passed mutation evidence: %s", output)
+	}
+	if !strings.Contains(string(output), "receipt/edge-does-not-recover") {
+		t.Fatalf("unrelated measured assertion was not rejected as malformed: %s", output)
+	}
+}
+
 func TestMutationEvidenceStillRejectsMissingMutationWhenPrimaryCardinalityGuardIsRelaxed(t *testing.T) {
 	script, err := os.ReadFile("check-computer-image-runtime-evidence.sh")
 	if err != nil {

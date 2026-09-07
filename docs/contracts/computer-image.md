@@ -434,6 +434,12 @@ intermediate `502` or protocol error, but only a later exact WebSocket and RFB
 handshake satisfies readiness; a persistent violation remains terminal at the
 unchanged deadline.
 
+This late-only classification intentionally adds approximately 60 seconds to
+the `plain-tcp-control` mutation row in each arm64 reference-image lane: its
+`python3 -m http.server` listener returns a persistent non-101 HTTP response,
+so the row now consumes the existing 60-second readiness deadline before
+emitting the unchanged expected detail.
+
 Checker teardown asks Docker to stop the container and then removes it so every
 bind mount is detached before the checker-owned temporary root is removed. The
 pre-stop in-container chmod can race a desktop process creating a later path;
