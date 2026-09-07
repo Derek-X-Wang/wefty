@@ -1008,7 +1008,8 @@ func TestDurableOCIIntentStopSuppressesSpooledServiceCompletion(t *testing.T) {
 
 func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.T) {
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+	clock := newManualClock(time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC))
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"authority-recovery-node": {Tags: []string{"authority-recovery"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, 500*time.Millisecond)
 	defer stopServer()
@@ -1025,6 +1026,7 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 		t.Fatal(err)
 	}
 	runtime := newLiveIntentAuthorityRuntime()
+	deadman := newRecordingDeadmanRenewer()
 	var authorityAvailable atomic.Bool
 	authorityAvailable.Store(true)
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "authority-recovery-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
@@ -1034,7 +1036,7 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 	}
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
-		NodeID: "authority-recovery-node", BootSessionID: "authority-recovery-boot", Version: "test",
+		NodeID: "authority-recovery-node", BootSessionID: "authority-recovery-boot", Version: "test", Clock: clock,
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true},
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
@@ -1048,14 +1050,17 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
-		LogRetryInterval: 20 * time.Millisecond, Logf: t.Logf,
+		LogRetryInterval: 20 * time.Millisecond, AttemptDeadman: deadman, Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
 	runContext, cancelRun := context.WithCancel(t.Context())
-	defer cancelRun()
+	defer func() {
+		runtime.complete()
+		cancelRun()
+	}()
 	runDone := make(chan error, 1)
 	go func() { runDone <- nodeAgent.Run(runContext) }()
 	var attemptID string
@@ -1063,6 +1068,13 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 	case attemptID = <-runtime.started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("OCI service did not start")
+	}
+	// Drive a renewal after startup without spending the lease on fixture work.
+	clock.waitForDeadline(t, clock.Now().Add(50*time.Millisecond))
+	clock.Advance(50 * time.Millisecond)
+	deadman.waitForRenewal(t)
+	if calls, _, generation := deadman.snapshot(); calls < 1 || generation != readyOCIHelperGeneration() {
+		t.Fatalf("authority-recovery deadman renewals=%d generation=%+v, want at least one renewal for %+v", calls, generation, readyOCIHelperGeneration())
 	}
 	if _, err := store.SetNodeClaimsByOperator(t.Context(), "authority-recovery-node", "operator", l1.NodeIntentRequest{
 		ClaimsEnabled: false, IntentRevision: 0, Reason: "hold replacement while observing late evidence",
@@ -1073,6 +1085,10 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 	runtime.complete()
 	waitCompletionReceiptState(t, nodeAgent.outbox, attemptID, "withheld", 3*time.Second)
 
+	// Only expire L1 authority once the original payload is durably withheld.
+	// Wall-clock delays in OCI start and renewal must not admit a replacement
+	// before the fixture has established the operator claims hold.
+	clock.Advance(time.Second)
 	var lost l1.Attempt
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -1105,6 +1121,7 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 		if time.Now().After(deadline) {
 			t.Fatalf("retained completion did not publish after authority recovery: attempts=%+v err=%v", attempts, listErr)
 		}
+		clock.Advance(20 * time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
 	}
 	waitCompletionReceiptState(t, nodeAgent.outbox, attemptID, "delivered", 3*time.Second)
@@ -3069,6 +3086,9 @@ func (runtime *liveIntentAuthorityRuntime) Run(ctx context.Context, request work
 		return workloadrunner.Result{}, err
 	}
 	if err := request.OCIStarted(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if err := admitReadyOCIHelper(request); err != nil {
 		return workloadrunner.Result{}, err
 	}
 	runtime.starts.Add(1)
