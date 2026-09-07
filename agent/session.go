@@ -61,23 +61,28 @@ type agentSession struct {
 	capacityChanged chan struct{}
 	claimsEnabled   bool
 
-	claimMu           sync.Mutex
-	residentJobID     map[string]struct{}
-	residentKind      map[string]string
-	resident          map[string]*residentAttempt
-	serviceReaps      map[string]runtimeReapOutcome
-	serviceBoots      map[string]string
-	residentChanged   chan struct{}
-	reapPriorBoot     func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error)
-	removals          *removalController
-	storageResets     *storageResetController
-	storageGrows      *storageGrowController
-	reimagePreflights *reimagePreflightController
-	backups           *backupController
-	storageCopies     *storageCopyController
-	custody           *custodyController
-	computerPolicy    *ComputerPolicyCache
-	computerAcks      *computerPolicyAckController
+	claimMu                   sync.Mutex
+	residentJobID             map[string]struct{}
+	residentKind              map[string]string
+	resident                  map[string]*residentAttempt
+	residentSuppressionErrors map[string]error
+	serviceReaps              map[string]runtimeReapOutcome
+	serviceBoots              map[string]string
+	residentChanged           chan struct{}
+	// ociStopBeforeResidentScan is a test seam for completing a resident in
+	// the narrow interval after the controller fence is released and before
+	// runtime teardown takes its first resident snapshot. Production leaves it nil.
+	ociStopBeforeResidentScan func()
+	reapPriorBoot             func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error)
+	removals                  *removalController
+	storageResets             *storageResetController
+	storageGrows              *storageGrowController
+	reimagePreflights         *reimagePreflightController
+	backups                   *backupController
+	storageCopies             *storageCopyController
+	custody                   *custodyController
+	computerPolicy            *ComputerPolicyCache
+	computerAcks              *computerPolicyAckController
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -143,16 +148,17 @@ func newAgentSession(
 			workloadClassOneShot: maxOneshotSlots,
 			workloadClassService: maxServiceSlots,
 		},
-		capacityChanged: make(chan struct{}, 1),
-		claimsEnabled:   true,
-		residentJobID:   make(map[string]struct{}),
-		residentKind:    make(map[string]string),
-		resident:        make(map[string]*residentAttempt),
-		serviceReaps:    make(map[string]runtimeReapOutcome),
-		serviceBoots:    make(map[string]string),
-		residentChanged: make(chan struct{}, 1),
-		drainRequested:  make(chan struct{}),
-		computerPolicy:  NewComputerPolicyCache(clock, registration.NodeID, registration.BootSessionID),
+		capacityChanged:           make(chan struct{}, 1),
+		claimsEnabled:             true,
+		residentJobID:             make(map[string]struct{}),
+		residentKind:              make(map[string]string),
+		resident:                  make(map[string]*residentAttempt),
+		residentSuppressionErrors: make(map[string]error),
+		serviceReaps:              make(map[string]runtimeReapOutcome),
+		serviceBoots:              make(map[string]string),
+		residentChanged:           make(chan struct{}, 1),
+		drainRequested:            make(chan struct{}),
+		computerPolicy:            NewComputerPolicyCache(clock, registration.NodeID, registration.BootSessionID),
 	}
 	session.computerAcks = newComputerPolicyAckController(client, clock, logf)
 	return session
@@ -961,6 +967,10 @@ func (session *agentSession) executeResident(
 	defer func() {
 		session.claimMu.Lock()
 		resident.completionErr = executeErr
+		var persistenceErr *OCIIntentSuppressionPersistenceError
+		if errors.As(executeErr, &persistenceErr) {
+			session.residentSuppressionErrors[claim.Job.JobID] = executeErr
+		}
 		delete(session.resident, claim.Job.JobID)
 		delete(session.residentJobID, claim.Job.JobID)
 		delete(session.residentKind, claim.Job.JobID)
@@ -994,12 +1004,23 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 			}
 		}()
 	}
+	if session.ociStopBeforeResidentScan != nil {
+		session.ociStopBeforeResidentScan()
+	}
 
 	seen := make(map[string]struct{})
+	var joinedErrors []error
 	for {
 		session.claimMu.Lock()
 		pending := false
-		var targets []*residentAttempt
+		var targets []struct {
+			jobID    string
+			resident *residentAttempt
+		}
+		for jobID, err := range session.residentSuppressionErrors {
+			joinedErrors = append(joinedErrors, err)
+			delete(session.residentSuppressionErrors, jobID)
+		}
 		for jobID, kind := range session.residentKind {
 			if kind != contract.JobKindOCI {
 				continue
@@ -1012,35 +1033,47 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 			if _, already := seen[jobID]; !already {
 				seen[jobID] = struct{}{}
 				resident.cancel(errOCIIntentDisabled)
-				targets = append(targets, resident)
+				targets = append(targets, struct {
+					jobID    string
+					resident *residentAttempt
+				}{jobID: jobID, resident: resident})
 			}
 		}
 		changed := session.residentChanged
 		session.claimMu.Unlock()
-		for _, resident := range targets {
+		for _, target := range targets {
+			resident := target.resident
 			var outcome runtimeReapOutcome
+			outcomePresent := true
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return errors.Join(append(joinedErrors, ctx.Err())...)
 			case outcome = <-resident.runtimeReaped:
 			case <-resident.done:
 				select {
 				case outcome = <-resident.runtimeReaped:
 				default:
-					return errors.New("agent: OCI attempt completed without a runtime reap receipt")
+					outcomePresent = false
+					joinedErrors = append(joinedErrors, errors.New("agent: OCI attempt completed without a runtime reap receipt"))
 				}
 			}
-			if _, err := verifiedRuntimeReap("OCI attempt", outcome); err != nil {
-				return err
+			if outcomePresent {
+				if _, err := verifiedRuntimeReap("OCI attempt", outcome); err != nil {
+					joinedErrors = append(joinedErrors, err)
+				}
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return errors.Join(append(joinedErrors, ctx.Err())...)
 			case <-resident.done:
 			}
+			session.claimMu.Lock()
+			completionErr := resident.completionErr
+			delete(session.residentSuppressionErrors, target.jobID)
+			session.claimMu.Unlock()
 			var persistenceErr *OCIIntentSuppressionPersistenceError
-			if errors.As(resident.completionErr, &persistenceErr) {
-				return persistenceErr
+			if errors.As(completionErr, &persistenceErr) {
+				joinedErrors = append(joinedErrors, persistenceErr)
 			}
 		}
 		if !pending {
@@ -1052,15 +1085,28 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 			}
 			session.claimMu.Unlock()
 			if !remaining {
-				return nil
+				return errors.Join(joinedErrors...)
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Join(append(joinedErrors, ctx.Err())...)
 		case <-changed:
 		}
 	}
+}
+
+func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence uint64) error {
+	// Keep the existing claimMu -> claimPublication lock order so no newly
+	// admitted resident or later stop episode can publish an error between the
+	// positive reopen and clearing failures owned by the prior disabled episode.
+	session.claimMu.Lock()
+	defer session.claimMu.Unlock()
+	if err := session.capabilities.allowOCIIntentIfUnchanged(suppressionSequence); err != nil {
+		return err
+	}
+	clear(session.residentSuppressionErrors)
+	return nil
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
