@@ -169,6 +169,8 @@ func (r *Recorder) RecordFailure(id string, status Status, detail string, reason
 		}
 		if reason == FailureReadinessTimeout && !validReadinessEventForCheck(id, event) {
 			return fmt.Errorf("readiness timeout for %q has invalid event %q", id, event)
+		} else if reason != FailureReadinessTimeout && event != "" {
+			return fmt.Errorf("conformance failure reason %q cannot carry readiness event %q", reason, event)
 		}
 	} else if reason != "" || event != "" {
 		return fmt.Errorf("non-FAIL conformance check %q cannot carry failure evidence", id)
@@ -190,6 +192,16 @@ var readinessEventPairings = map[string][]ReadinessEvent{
 	"transport.control-ready":           {ReadinessEventControlEndpointReady, ReadinessEventFirstRFBFrame},
 	"input.view-isolated":               {ReadinessEventInputOracleReady, ReadinessEventKeyObserverAdvanced},
 	"input.view-isolated-during-tenure": {ReadinessEventKeyObserverAdvanced},
+}
+
+// ReadinessEventPairings returns the recorder's closed check/event table for
+// consumers that must validate serialized receipts independently.
+func ReadinessEventPairings() map[string][]ReadinessEvent {
+	pairings := make(map[string][]ReadinessEvent, len(readinessEventPairings))
+	for id, events := range readinessEventPairings {
+		pairings[id] = slices.Clone(events)
+	}
+	return pairings
 }
 
 func validReadinessEventForCheck(id string, event ReadinessEvent) bool {
@@ -219,6 +231,26 @@ func (r *Recorder) ObserveReadinessEvent(event ReadinessEvent) {
 			check.ReadinessObservedLater = true
 		}
 	}
+}
+
+func (r *Recorder) HasReadinessTimeout(id string) bool {
+	i, ok := r.index[id]
+	return ok && r.receipt.Checks[i].FailureReason == FailureReadinessTimeout
+}
+
+func (r *Recorder) RelabelUnobservedReadinessTimeout(id string) (bool, error) {
+	i, ok := r.index[id]
+	if !ok {
+		return false, fmt.Errorf("unknown Computer conformance check %q", id)
+	}
+	check := &r.receipt.Checks[i]
+	if check.FailureReason != FailureReadinessTimeout || check.ReadinessObservedLater {
+		return false, nil
+	}
+	check.FailureReason = FailureAssertionFailed
+	check.ReadinessEvent = ""
+	check.ReadinessObservedLater = false
+	return true, nil
 }
 
 func (r *Recorder) Finish(finishedAt time.Time) Receipt {

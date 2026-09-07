@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"os"
@@ -246,10 +249,41 @@ func TestMutationUnrecoveredInputReadinessTimeoutFailsClosed(t *testing.T) {
 	}
 	for _, check := range runner.recorder.Finish(time.Unix(101, 0)).Checks {
 		if check.ID == "input.view-isolated-during-tenure" {
-			if check.FailureReason != FailureAssertionFailed || check.Detail != "key observer did not advance" || check.ReadinessEvent != "" {
+			if check.FailureReason != FailureAssertionFailed || check.Detail != "key observer did not advance" || check.ReadinessEvent != "" || check.ReadinessObservationWindowSeconds != 18 || check.ReadinessObservationElapsedSeconds != 18 {
 				t.Fatalf("unrecovered input timeout evidence = %+v", check)
 			}
 		}
+	}
+}
+
+func TestRecorderPrivateStateIsConfinedToReceiptImplementation(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == "receipt.go" {
+			continue
+		}
+		file, err := parser.ParseFile(fileset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.SelectorExpr:
+				if node.Sel.Name == "index" || node.Sel.Name == "receipt" {
+					t.Errorf("%s reaches into Recorder private state %q outside receipt.go", fileset.Position(node.Pos()), node.Sel.Name)
+				}
+			case *ast.CompositeLit:
+				if recorder, ok := node.Type.(*ast.Ident); ok && recorder.Name == "Recorder" {
+					t.Errorf("%s constructs Recorder outside receipt.go", fileset.Position(node.Pos()))
+				}
+			}
+			return true
+		})
 	}
 }
 
@@ -495,11 +529,53 @@ func TestReadinessProbeStillCallsNonUpgradeHTTPPlainTCP(t *testing.T) {
 	<-done
 }
 
-func TestReadinessWindowRecoversAfterTransientAcceptWithoutUpgrade(t *testing.T) {
-	viewPort, closeView := startReadinessTestListener(t, func(accepted int, connection net.Conn) {
-		if accepted > 0 {
-			serveConformantReadiness(connection)
-		}
+func TestReadinessWindowRecoversAfterTransientProtocolAnswer(t *testing.T) {
+	for name, firstResponse := range map[string]func(net.Conn){
+		"HTTP 502": func(connection net.Conn) {
+			_, _ = fmt.Fprint(connection, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+		},
+		"RFB protocol error": func(connection net.Conn) {
+			_, _ = fmt.Fprint(connection, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong\r\nSec-WebSocket-Protocol: binary\r\n\r\n")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			viewPort, closeView := startReadinessTestListener(t, func(accepted int, connection net.Conn) {
+				if accepted == 0 {
+					firstResponse(connection)
+					return
+				}
+				serveConformantReadiness(connection)
+			})
+			controlPort, closeControl := startReadinessTestListener(t, func(_ int, connection net.Conn) {
+				serveConformantReadiness(connection)
+			})
+			defer closeView()
+			defer closeControl()
+
+			startedAt := time.Unix(100, 0)
+			now := startedAt
+			runner := runtimeRunner{
+				viewPort:    viewPort,
+				controlPort: controlPort,
+				recorder:    NewRecorder("image", "docker", "linux/amd64", startedAt),
+				config: RuntimeConfig{
+					Now: func() time.Time { return now },
+					Sleep: func(context.Context, time.Duration) error {
+						now = now.Add(250 * time.Millisecond)
+						return nil
+					},
+				},
+			}
+			if err := runner.waitReady(context.Background(), startedAt, false); err != nil {
+				t.Fatalf("transient protocol answer prevented later conformant readiness: %v", err)
+			}
+		})
+	}
+}
+
+func TestReadinessWindowRejectsPersistentHTTPAfterDeadline(t *testing.T) {
+	viewPort, closeView := startReadinessTestListener(t, func(_ int, connection net.Conn) {
+		_, _ = fmt.Fprint(connection, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 	})
 	controlPort, closeControl := startReadinessTestListener(t, func(_ int, connection net.Conn) {
 		serveConformantReadiness(connection)
@@ -507,24 +583,42 @@ func TestReadinessWindowRecoversAfterTransientAcceptWithoutUpgrade(t *testing.T)
 	defer closeView()
 	defer closeControl()
 
+	startedAt := time.Unix(100, 0)
+	now := startedAt
+	sleeps := 0
 	runner := runtimeRunner{
 		viewPort:    viewPort,
 		controlPort: controlPort,
-		recorder:    NewRecorder("image", "docker", "linux/amd64", time.Now()),
+		recorder:    NewRecorder("image", "docker", "linux/amd64", startedAt),
 		config: RuntimeConfig{
-			Now:   time.Now,
-			Sleep: sleepContext,
+			Now: func() time.Time { return now },
+			Sleep: func(context.Context, time.Duration) error {
+				sleeps++
+				now = startedAt.Add(contract.ComputerStartupReadinessTimeout)
+				return nil
+			},
 		},
 	}
-	if err := runner.waitReady(context.Background(), time.Now(), false); err != nil {
-		t.Fatalf("transient accept prevented later conformant readiness: %v", err)
+	if err := runner.waitReady(context.Background(), startedAt, false); err == nil {
+		t.Fatal("persistent HTTP response passed readiness")
+	}
+	if sleeps != 1 {
+		t.Fatalf("persistent HTTP response ended polling after %d sleeps, want the readiness window to expire", sleeps)
+	}
+	for _, check := range runner.recorder.Finish(now).Checks {
+		if check.ID == "transport.plain-tcp-rejected" && (check.Status != StatusFail || check.FailureReason != FailureAssertionFailed) {
+			t.Fatalf("persistent HTTP evidence = %+v", check)
+		}
 	}
 }
 
 func TestReadinessWindowAllowsDelayedUpgrade(t *testing.T) {
+	viewConnections := 0
 	viewPort, closeView := startReadinessTestListener(t, func(accepted int, connection net.Conn) {
-		if accepted == 0 {
-			time.Sleep(100 * time.Millisecond)
+		viewConnections = accepted + 1
+		if accepted < 2 {
+			time.Sleep(2100 * time.Millisecond)
+			return
 		}
 		serveConformantReadiness(connection)
 	})
@@ -534,17 +628,26 @@ func TestReadinessWindowAllowsDelayedUpgrade(t *testing.T) {
 	defer closeView()
 	defer closeControl()
 
+	startedAt := time.Unix(100, 0)
+	now := startedAt
 	runner := runtimeRunner{
 		viewPort:    viewPort,
 		controlPort: controlPort,
-		recorder:    NewRecorder("image", "docker", "linux/amd64", time.Now()),
+		recorder:    NewRecorder("image", "docker", "linux/amd64", startedAt),
 		config: RuntimeConfig{
-			Now:   time.Now,
-			Sleep: sleepContext,
+			Now: func() time.Time { return now },
+			Sleep: func(context.Context, time.Duration) error {
+				now = now.Add(250 * time.Millisecond)
+				return nil
+			},
 		},
 	}
-	if err := runner.waitReady(context.Background(), time.Now(), false); err != nil {
+	if err := runner.waitReady(context.Background(), startedAt, false); err != nil {
 		t.Fatalf("delayed upgrade inside readiness window failed: %v", err)
+	}
+	closeView()
+	if viewConnections < 3 {
+		t.Fatalf("readiness used %d view polls, want two timeouts before the conformant upgrade", viewConnections)
 	}
 }
 
