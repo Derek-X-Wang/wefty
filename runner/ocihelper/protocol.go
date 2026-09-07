@@ -718,6 +718,7 @@ type ProfileReceipt struct {
 	HelperNetworkNamespaceInode                  string               `json:"helper_network_namespace_inode,omitempty"`
 	TaskNetworkNamespaceInode                    string               `json:"task_network_namespace_inode,omitempty"`
 	HostAbstractSocketVisible                    bool                 `json:"host_abstract_socket_visible"`
+	TargetAbstractSocketLive                     bool                 `json:"target_abstract_socket_live"`
 	HostAbstractSocketObservedAfterEndpointReady bool                 `json:"host_abstract_socket_observed_after_endpoint_ready"`
 	ComputerNetworkAddress                       string               `json:"computer_network_address,omitempty"`
 	ComputerNetworkGateway                       string               `json:"computer_network_gateway,omitempty"`

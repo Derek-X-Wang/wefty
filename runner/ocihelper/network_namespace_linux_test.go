@@ -107,7 +107,7 @@ func TestComputerIsolationObservationUsesLiveNamespaceFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer namespace.close()
-	helperInode, taskInode, visible, err := observeComputerNetworkIsolation(namespace, "@/tmp/.X11-unix/X42000")
+	helperInode, taskInode, visible, _, err := observeComputerNetworkIsolation(namespace, "@/tmp/.X11-unix/X42000")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1215,7 +1215,7 @@ func TestComputerEndpointReadinessReobservesLateHostAbstractSocket(t *testing.T)
 	defer backend.Close()
 	port := uint16(backend.Addr().(*net.TCPAddr).Port)
 	token := "@/tmp/.X11-unix/X" + fmt.Sprint(port)
-	helperInode, taskInode, visible, err := observeComputerNetworkIsolation(namespace, token)
+	helperInode, taskInode, visible, _, err := observeComputerNetworkIsolation(namespace, token)
 	if err != nil || visible {
 		t.Fatalf("initial observation visible=%t err=%v", visible, err)
 	}
@@ -1248,5 +1248,30 @@ func TestComputerEndpointReadinessReobservesLateHostAbstractSocket(t *testing.T)
 	}
 	if !engine.lastProfile.HostAbstractSocketVisible {
 		t.Fatal("late visible socket was not recorded")
+	}
+}
+
+func TestComputerXObservationRequiresActualTargetBinding(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	command := startIsolatedNetworkTask(t)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	token := "@/tmp/.X11-unix/Xlate-ordering"
+	_, _, host, live, err := observeComputerNetworkIsolation(namespace, token)
+	if err != nil || host || live {
+		t.Fatalf("before custom image binds X: host=%t live=%t err=%v", host, live, err)
+	}
+	var listener net.Listener
+	err = inNetworkNamespace(namespace, func() error { var err error; listener, err = net.Listen("unix", token); return err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, _, host, live, err = observeComputerNetworkIsolation(namespace, token)
+	if err != nil || host || !live {
+		t.Fatalf("after actual target bind: host=%t live=%t err=%v", host, live, err)
 	}
 }

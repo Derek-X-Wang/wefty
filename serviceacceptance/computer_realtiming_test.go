@@ -188,26 +188,27 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	nodeGatewayIPv6 := readComputerHostLinkIPv6(t, readyEndpoints.ViewPort)
 	egress := probeComputerNetworkEgress(t, ready, readyEndpoints, nodeGatewayIPv6, nodeListenerPort, helperSocket, controlSocket)
 	completeLinuxComputerRow(t, receipt, "linux.network_egress", map[string]bool{
-		"private_veth_address_present":  egress.Address != "" && egress.Gateway != "" && egress.Address != egress.Gateway,
-		"mounted_resolver_recorded":     egress.ResolverSnapshot != "" && egress.ResolverAddress != "",
-		"loopback_proxy_listening":      !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUDPListening && egress.ProxyTCPListening,
-		"proxy_upstream_reachable":      !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUpstreamReachable,
-		"default_route_present":         egress.DefaultRouteInterface == "eth0" && egress.DefaultRouteGateway == egress.Gateway,
-		"public_ipv4_connected":         egress.PublicIPv4.Outcome == "connected",
-		"resolver_reachable":            egress.DNSOutcome == "resolved" && egress.ResolvedName == "example.com" && egress.ResolvedAddress != "",
-		"helper_http_through_veth":      egress.HelperHTTPStatus == 200 && egress.HelperHTTPBody == "wefty-computer-egress-v1" && !mutatingLinuxComputerRow("linux.network_egress"),
-		"helper_control_socket_refused": egress.HelperControlSocketPresentOnNode && egress.HelperControlSocket.Outcome == "refused" && egress.HelperControlSocket.ErrnoName == "ENOENT" && egress.ComputerMountNamespace != "" && egress.NodeMountNamespace != egress.ComputerMountNamespace,
-		"node_loopback_by_name_refused": egress.NodeLoopback.Outcome == "refused" && egress.NodeLoopback.ErrnoName == "ECONNREFUSED" && egress.NodeNetworkNamespaceInode != "" && egress.NodeNetworkNamespaceInode != egress.NetworkNamespaceInode,
-		"node_listener_ipv4_refused":    egress.NodeListenerIPv4.Outcome == "refused" && egress.NodeListenerIPv4.ErrnoName == "ECONNREFUSED",
-		"node_listener_ipv6_refused":    egress.NodeListenerIPv6.Outcome == "refused" && slices.Contains(linuxComputerIPv6RefusalErrnos, egress.NodeListenerIPv6.ErrnoName),
+		"private_veth_address_present":                             egress.Address != "" && egress.Gateway != "" && egress.Address != egress.Gateway,
+		"mounted_resolver_recorded":                                egress.ResolverSnapshot != "" && egress.ResolverAddress != "",
+		"loopback_proxy_listening":                                 !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUDPListening && egress.ProxyTCPListening,
+		"proxy_upstream_reachable":                                 !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUpstreamReachable,
+		"default_route_present":                                    egress.DefaultRouteInterface == "eth0" && egress.DefaultRouteGateway == egress.Gateway,
+		"public_ipv4_connected":                                    egress.PublicIPv4.Outcome == "connected",
+		"resolver_reachable":                                       egress.DNSOutcome == "resolved" && egress.ResolvedName == "example.com" && egress.ResolvedAddress != "",
+		"helper_http_through_veth":                                 egress.HelperHTTPStatus == 200 && egress.HelperHTTPBody == "wefty-computer-egress-v1" && !mutatingLinuxComputerRow("linux.network_egress"),
+		"helper_control_socket_absent_in_computer_mount_namespace": egress.HelperControlSocketPresentOnNode && egress.HelperControlSocket.Outcome == "absent" && egress.HelperControlSocket.ErrnoName == "ENOENT" && egress.ComputerMountNamespace != "" && egress.NodeMountNamespace != egress.ComputerMountNamespace,
+		"node_loopback_by_name_refused":                            egress.NodeLoopback.Outcome == "refused" && egress.NodeLoopback.ErrnoName == "ECONNREFUSED" && egress.NodeNetworkNamespaceInode != "" && egress.NodeNetworkNamespaceInode != egress.NetworkNamespaceInode,
+		"node_listener_ipv4_refused":                               egress.NodeListenerIPv4.Outcome == "refused" && egress.NodeListenerIPv4.ErrnoName == "ECONNREFUSED",
+		"node_listener_ipv6_refused":                               egress.NodeListenerIPv6.Outcome == "refused" && slices.Contains(linuxComputerIPv6RefusalErrnos, egress.NodeListenerIPv6.ErrnoName),
 	}, map[string]string{
 		"computer_id": ready.ComputerID, "attempt_id": ready.CurrentJob.CurrentAttemptID,
 		"veth_address": egress.Address, "veth_gateway": egress.Gateway,
 		"resolver_snapshot": egress.ResolverSnapshot, "resolver_address": egress.ResolverAddress,
 		"proxy_udp_listening": strconv.FormatBool(egress.ProxyUDPListening), "proxy_tcp_listening": strconv.FormatBool(egress.ProxyTCPListening),
 		"proxy_upstream_address": egress.ProxyUpstreamAddress, "proxy_upstream_source": egress.ProxyUpstreamSource,
-		"proxy_upstream_reachable":         strconv.FormatBool(egress.ProxyUpstreamReachable),
-		"proxy_upstream_authority":         "attachment_profile",
+		"proxy_upstream_reachable":   strconv.FormatBool(egress.ProxyUpstreamReachable),
+		"proxy_upstream_authority":   "attachment_profile",
+		"matched_profile_task_inode": egress.MatchedProfileTaskInode, "matched_profile_resolver": egress.MatchedProfileResolver,
 		"computer_network_namespace_inode": egress.NetworkNamespaceInode,
 		"node_network_namespace_inode":     egress.NodeNetworkNamespaceInode,
 		"computer_mount_namespace":         egress.ComputerMountNamespace, "node_mount_namespace": egress.NodeMountNamespace,
@@ -237,19 +238,24 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		probeTarget = ready
 	}
 	targetEndpoints := readLiveComputerEndpointEnvironment(t, probeTarget)
+	relayReady, stopRelay := startComputerVethRelay(t, probeTarget, targetEndpoints)
 	stopEgressListener := startLiveComputerEgressListener(t, probeTarget, targetEndpoints.Address)
 	egressAlive := probeLiveComputerEgressListener(t, probeTarget, targetEndpoints.Address)
-	crossover := probeComputerScreenCrossover(t, ready, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort)
-	// The target-local success immediately after A's refusals proves the target
-	// screen and test listener were alive at the same boundary edge.
-	liveness := probeComputerScreenCrossover(t, probeTarget, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort)
+	beforeLiveness := probeComputerScreenCrossover(t, probeTarget, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort, targetEndpoints.Address)
+	crossover := probeComputerScreenCrossover(t, ready, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort, targetEndpoints.Address)
+	liveness := probeComputerScreenCrossover(t, probeTarget, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort, targetEndpoints.Address)
+	relayStopped := stopRelay()
+	if relayStopped.Error != "" || !relayStopped.ExitConfirmed || !relayStopped.Deleted || !relayStopped.ListenersAbsent {
+		t.Fatal("temporary relay cleanup is unconfirmed; normal endpoint checks cannot resume")
+	}
+	afterLoopback := probeComputerScreenCrossover(t, probeTarget, probeTarget, variant, targetEndpoints, nodeGatewayIPv6, nodeListenerPort, "127.0.0.1")
 	stopEgressListener()
 	removedNeighbour := removeAndWaitComputer(t, harness, neighbour, 4*time.Minute)
 	crossoverRefused := crossover.ViewRead.Outcome == "refused" && crossover.ViewRead.ErrnoName == "ECONNREFUSED" &&
 		crossover.ControlInject.Outcome == "refused" && crossover.ControlInject.ErrnoName == "ECONNREFUSED" &&
 		crossover.EgressAddress.Outcome == "refused" && crossover.EgressAddress.ErrnoName == "ECONNREFUSED" &&
 		crossover.NodeListenerIPv6.Outcome == "refused" && slices.Contains(linuxComputerIPv6RefusalErrnos, crossover.NodeListenerIPv6.ErrnoName)
-	targetAlive := egressAlive && liveness.ViewRead.Outcome == "read_succeeded" && liveness.ControlInject.Outcome == "inject_succeeded" && liveness.EgressAddress.Outcome == "connected"
+	targetAlive := beforeLiveness.ViewRead.Outcome == "read_succeeded" && beforeLiveness.ControlInject.Outcome == "inject_succeeded" && beforeLiveness.NamespaceInode == targetEndpoints.NamespaceInode && liveness.NamespaceInode == targetEndpoints.NamespaceInode && egressAlive && liveness.ViewRead.Outcome == "read_succeeded" && liveness.ControlInject.Outcome == "inject_succeeded" && liveness.EgressAddress.Outcome == "connected"
 	if variant == "xfce" {
 		crossoverRefused = crossoverRefused && !crossover.AbstractSocketVisible &&
 			crossover.AbstractSocket.Outcome == "refused" && slices.Contains(linuxComputerAbstractSocketRefusalErrnos, crossover.AbstractSocket.ErrnoName) &&
@@ -259,42 +265,70 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	completeLinuxComputerRow(t, receipt, "linux.screen_crossover_refused", map[string]bool{
 		"two_colocated_computers_live": ready.CurrentJob.CurrentAttemptID != "" && neighbour.CurrentJob.CurrentAttemptID != "" && ready.ComputerID != neighbour.ComputerID,
 		"target_alive_at_refusal_edge": targetAlive,
+		"relay_cleanup_verified":       relayStopped.ExitConfirmed && relayStopped.Deleted && relayStopped.ListenersAbsent && relayStopped.Error == "",
+		"target_loopback_preserved":    afterLoopback.NamespaceInode == targetEndpoints.NamespaceInode && afterLoopback.ViewRead.Outcome == "read_succeeded" && afterLoopback.ControlInject.Outcome == "inject_succeeded",
 		"crossover_refused":            crossoverRefused,
 		"neighbour_removed_verified":   removedNeighbour.RemovalOutcome == "removed_verified",
 	}, map[string]string{
-		"source_computer_id":         ready.ComputerID,
-		"source_attempt_id":          ready.CurrentJob.CurrentAttemptID,
-		"target_computer_id":         probeTarget.ComputerID,
-		"target_attempt_id":          probeTarget.CurrentJob.CurrentAttemptID,
-		"target_view_port":           fmt.Sprint(targetEndpoints.ViewPort),
-		"target_control_port":        fmt.Sprint(targetEndpoints.ControlPort),
-		"target_egress_address":      targetEndpoints.Address,
-		"target_veth_gateway":        targetEndpoints.Gateway,
-		"target_egress_port":         fmt.Sprint(liveComputerEgressListenerPort),
-		"target_liveness_view":       liveness.ViewRead.Outcome,
-		"target_liveness_control":    liveness.ControlInject.Outcome,
-		"target_liveness_x":          liveness.DerivedDisplay.Outcome,
-		"target_liveness_egress":     liveness.EgressAddress.Outcome,
-		"abstract_socket":            crossover.AbstractSocketName,
-		"abstract_socket_visible":    strconv.FormatBool(crossover.AbstractSocketVisible),
-		"abstract_socket_outcome":    crossover.AbstractSocket.Outcome,
-		"abstract_socket_errno":      crossover.AbstractSocket.ErrnoName,
-		"derived_display":            crossover.DerivedDisplay.Address,
-		"derived_display_outcome":    crossover.DerivedDisplay.Outcome,
-		"derived_display_class":      crossover.DerivedDisplay.Class,
-		"view_read_outcome":          crossover.ViewRead.Outcome,
-		"view_read_address":          crossover.ViewRead.Address,
-		"view_read_errno":            crossover.ViewRead.ErrnoName,
-		"control_inject_outcome":     crossover.ControlInject.Outcome,
-		"control_inject_address":     crossover.ControlInject.Address,
-		"control_inject_errno":       crossover.ControlInject.ErrnoName,
-		"egress_address_outcome":     crossover.EgressAddress.Outcome,
-		"egress_address_target":      crossover.EgressAddress.Address,
-		"egress_address_errno":       crossover.EgressAddress.ErrnoName,
-		"node_listener_ipv6_address": crossover.NodeListenerIPv6.Address,
-		"node_listener_ipv6_outcome": crossover.NodeListenerIPv6.Outcome,
-		"node_listener_ipv6_errno":   crossover.NodeListenerIPv6.ErrnoName,
-		"neighbour_removal_outcome":  removedNeighbour.RemovalOutcome,
+		"source_computer_id":                     ready.ComputerID,
+		"source_attempt_id":                      ready.CurrentJob.CurrentAttemptID,
+		"target_computer_id":                     probeTarget.ComputerID,
+		"target_attempt_id":                      probeTarget.CurrentJob.CurrentAttemptID,
+		"target_view_port":                       fmt.Sprint(targetEndpoints.ViewPort),
+		"target_control_port":                    fmt.Sprint(targetEndpoints.ControlPort),
+		"target_egress_address":                  targetEndpoints.Address,
+		"target_veth_gateway":                    targetEndpoints.Gateway,
+		"target_egress_port":                     fmt.Sprint(liveComputerEgressListenerPort),
+		"fixture_mode":                           "target_veth_relay_to_loopback",
+		"relay_exec_id":                          relayReady.Config.ExecID,
+		"relay_pid":                              fmt.Sprint(relayReady.RelayPID),
+		"target_container_id":                    relayReady.Config.ContainerID,
+		"relay_target_attempt_id":                relayReady.Config.AttemptID,
+		"relay_target_namespace_inode":           relayReady.Config.NamespaceInode,
+		"target_loopback_namespace_inode":        afterLoopback.NamespaceInode,
+		"target_network_namespace_inode":         targetEndpoints.NamespaceInode,
+		"before_liveness_namespace_inode":        beforeLiveness.NamespaceInode,
+		"after_liveness_namespace_inode":         liveness.NamespaceInode,
+		"target_liveness_before_view":            beforeLiveness.ViewRead.Outcome,
+		"target_liveness_before_control":         beforeLiveness.ControlInject.Outcome,
+		"target_liveness_before_view_address":    beforeLiveness.ViewRead.Address,
+		"target_liveness_before_control_address": beforeLiveness.ControlInject.Address,
+		"target_liveness_view_address":           liveness.ViewRead.Address,
+		"target_liveness_control_address":        liveness.ControlInject.Address,
+		"relay_backend_view_address":             afterLoopback.ViewRead.Address,
+		"relay_backend_control_address":          afterLoopback.ControlInject.Address,
+		"backend_identity_before":                computerRelayBackendIdentity(relayReady.Before),
+		"backend_identity_during":                computerRelayBackendIdentity(relayReady.During),
+		"backend_identity_after":                 computerRelayBackendIdentity(relayStopped.After),
+		"relay_exit_confirmed":                   strconv.FormatBool(relayStopped.ExitConfirmed),
+		"relay_exec_deleted":                     strconv.FormatBool(relayStopped.Deleted),
+		"relay_listeners_absent":                 strconv.FormatBool(relayStopped.ListenersAbsent),
+		"target_loopback_view":                   afterLoopback.ViewRead.Outcome,
+		"target_loopback_control":                afterLoopback.ControlInject.Outcome,
+		"target_liveness_view":                   liveness.ViewRead.Outcome,
+		"target_liveness_control":                liveness.ControlInject.Outcome,
+		"target_liveness_x":                      liveness.DerivedDisplay.Outcome,
+		"target_liveness_egress":                 liveness.EgressAddress.Outcome,
+		"abstract_socket":                        crossover.AbstractSocketName,
+		"abstract_socket_visible":                strconv.FormatBool(crossover.AbstractSocketVisible),
+		"abstract_socket_outcome":                crossover.AbstractSocket.Outcome,
+		"abstract_socket_errno":                  crossover.AbstractSocket.ErrnoName,
+		"derived_display":                        crossover.DerivedDisplay.Address,
+		"derived_display_outcome":                crossover.DerivedDisplay.Outcome,
+		"derived_display_class":                  crossover.DerivedDisplay.Class,
+		"view_read_outcome":                      crossover.ViewRead.Outcome,
+		"view_read_address":                      crossover.ViewRead.Address,
+		"view_read_errno":                        crossover.ViewRead.ErrnoName,
+		"control_inject_outcome":                 crossover.ControlInject.Outcome,
+		"control_inject_address":                 crossover.ControlInject.Address,
+		"control_inject_errno":                   crossover.ControlInject.ErrnoName,
+		"egress_address_outcome":                 crossover.EgressAddress.Outcome,
+		"egress_address_target":                  crossover.EgressAddress.Address,
+		"egress_address_errno":                   crossover.EgressAddress.ErrnoName,
+		"node_listener_ipv6_address":             crossover.NodeListenerIPv6.Address,
+		"node_listener_ipv6_outcome":             crossover.NodeListenerIPv6.Outcome,
+		"node_listener_ipv6_errno":               crossover.NodeListenerIPv6.ErrnoName,
+		"neighbour_removal_outcome":              removedNeighbour.RemovalOutcome,
 	})
 
 	receipt.begin("linux.remote_takeover")
@@ -911,6 +945,7 @@ func stringSetDifference(before, after []string) []string {
 }
 
 type liveComputerEndpointEnvironment struct {
+	NamespaceInode string `json:"namespace_inode"`
 	ListeningPorts []int  `json:"listening_ports"`
 	ViewPort       int    `json:"view_port"`
 	ControlPort    int    `json:"control_port"`
@@ -919,6 +954,8 @@ type liveComputerEndpointEnvironment struct {
 }
 
 type computerNetworkEgressReceipt struct {
+	MatchedProfileTaskInode          string                 `json:"matched_profile_task_inode"`
+	MatchedProfileResolver           string                 `json:"matched_profile_resolver"`
 	NodeNetworkNamespaceInode        string                 `json:"node_network_namespace_inode"`
 	NetworkNamespaceInode            string                 `json:"network_namespace_inode"`
 	ComputerMountNamespace           string                 `json:"computer_mount_namespace"`
@@ -960,6 +997,7 @@ type screenCrossoverAttempt struct {
 }
 
 type screenCrossoverReceipt struct {
+	NamespaceInode        string                 `json:"namespace_inode"`
 	Version               int                    `json:"version"`
 	Variant               string                 `json:"variant"`
 	SourceComputerID      string                 `json:"source_computer_id"`
@@ -1034,7 +1072,7 @@ func readComputerHostLinkIPv6(t *testing.T, viewPort int) string {
 }
 
 const liveComputerEndpointEnvironmentPython = `
-import json, socket, struct
+import json, os, socket, struct
 values = {}
 for item in open("/proc/1/environ", "rb").read().split(b"\0"):
     if b"=" in item:
@@ -1058,6 +1096,7 @@ for path in ("/proc/net/tcp", "/proc/net/tcp6"):
             listening_ports.append(int(fields[1].split(":")[1], 16))
 print(json.dumps({
     "listening_ports": listening_ports,
+    "namespace_inode": str(os.stat("/proc/self/ns/net").st_ino),
     "view_port": int(values["WEFTY_COMPUTER_VIEW_PORT"]),
     "control_port": int(values["WEFTY_COMPUTER_CONTROL_PORT"]),
     "address": address,
@@ -1161,6 +1200,8 @@ try:
     helper_control = {"address": helper_socket, "outcome": "connected"}
 except OSError as error:
     helper_control = refused(helper_socket, error)
+    if error.errno == errno.ENOENT:
+        helper_control["outcome"] = "absent"
 finally:
     connection.close()
 node_loopback = attempted_connect("localhost", node_port)
@@ -1239,6 +1280,8 @@ func recordComputerDNSAuthority(receipt *computerNetworkEgressReceipt, facts oci
 	if !facts.NetworkNamespacePresent || facts.HelperNetworkNamespaceInode == "" || facts.HelperNetworkNamespaceInode == facts.TaskNetworkNamespaceInode || receipt.NetworkNamespaceInode == "" || facts.TaskNetworkNamespaceInode != receipt.NetworkNamespaceInode || facts.ComputerNetworkAddress != receipt.Address || facts.ComputerNetworkGateway != receipt.Gateway || facts.ComputerResolverAddress != receipt.ResolverAddress {
 		return errors.New("doctor profile does not identify the probed Computer attachment")
 	}
+	receipt.MatchedProfileTaskInode = facts.TaskNetworkNamespaceInode
+	receipt.MatchedProfileResolver = facts.ComputerResolverAddress
 	receipt.NodeNetworkNamespaceInode = facts.HelperNetworkNamespaceInode
 	receipt.ProxyUpstreamAddress = facts.ComputerDNSUpstreamAddress
 	receipt.ProxyUpstreamSource = facts.ComputerDNSUpstreamSource
@@ -1280,7 +1323,7 @@ import base64, errno, json, os, socket, struct, subprocess, sys
 
 variant, source_id, target_id, view_text, control_text, egress_address, egress_port_text, node_ipv6, node_port_text = sys.argv[1:10]
 view_port, control_port, egress_port, node_port = int(view_text), int(control_text), int(egress_port_text), int(node_port_text)
-target_host = "127.0.0.1" if source_id == target_id else egress_address
+target_host = sys.argv[10]
 
 def refused(address, error):
     number = error.errno or 0
@@ -1352,7 +1395,10 @@ def rfb_attempt(port, inject):
         connection.sendall(request)
         response = b""
         while b"\r\n\r\n" not in response:
-            response += connection.recv(1)
+            chunk = connection.recv(1)
+            if not chunk:
+                raise EOFError("peer closed during WebSocket upgrade")
+            response += chunk
             if len(response) > 16384:
                 raise ValueError("oversized WebSocket response")
         if not response.startswith(b"HTTP/1.1 101"):
@@ -1440,6 +1486,7 @@ def tcp6_attempt(host, port):
 
 print(json.dumps({
     "version": 1,
+    "namespace_inode": str(os.stat("/proc/self/ns/net").st_ino),
     "variant": variant,
     "source_computer_id": source_id,
     "target_computer_id": target_id,
@@ -1535,14 +1582,14 @@ func readLiveComputerEndpointEnvironment(t *testing.T, computer l1.Computer) liv
 	return environment
 }
 
-func probeComputerScreenCrossover(t *testing.T, source, target l1.Computer, variant string, endpoints liveComputerEndpointEnvironment, nodeIPv6 string, nodePort int) screenCrossoverReceipt {
+func probeComputerScreenCrossover(t *testing.T, source, target l1.Computer, variant string, endpoints liveComputerEndpointEnvironment, nodeIPv6 string, nodePort int, targetHost string) screenCrossoverReceipt {
 	t.Helper()
 	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
 	containerID := liveComputerContainerID(t, source.CurrentJobID)
 	execID := fmt.Sprintf("screen-crossover-%d", time.Now().UnixNano())
 	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
 		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerScreenCrossoverPython,
-		variant, source.ComputerID, target.ComputerID, fmt.Sprint(endpoints.ViewPort), fmt.Sprint(endpoints.ControlPort), endpoints.Address, fmt.Sprint(liveComputerEgressListenerPort), nodeIPv6, fmt.Sprint(nodePort)).CombinedOutput()
+		variant, source.ComputerID, target.ComputerID, fmt.Sprint(endpoints.ViewPort), fmt.Sprint(endpoints.ControlPort), endpoints.Address, fmt.Sprint(liveComputerEgressListenerPort), nodeIPv6, fmt.Sprint(nodePort), targetHost).CombinedOutput()
 	if err != nil {
 		t.Fatalf("execute Computer screen crossover probe: %v\n%s", err, output)
 	}
@@ -1571,7 +1618,7 @@ func TestScreenCrossoverProbeRecordsTypedTransportRefusal(t *testing.T) {
 		}
 	}
 	output, err := exec.Command("python3", "-c", liveComputerScreenCrossoverPython,
-		"wayland", "source", "target", fmt.Sprint(ports[0]), fmt.Sprint(ports[1]), "127.0.0.1", fmt.Sprint(ports[0]), "::1", "1").CombinedOutput()
+		"wayland", "source", "target", fmt.Sprint(ports[0]), fmt.Sprint(ports[1]), "127.0.0.1", fmt.Sprint(ports[0]), "::1", "1", "127.0.0.1").CombinedOutput()
 	if err != nil {
 		t.Fatalf("execute crossover probe contract: %v\n%s", err, output)
 	}

@@ -1468,44 +1468,63 @@ func loopbackListenInode(namespace *pinnedNetworkNamespace, port uint16) (inode 
 	return inode, found, err
 }
 
-func observeComputerNetworkIsolation(namespace *pinnedNetworkNamespace, abstractSocketName string) (helperInode, taskInode string, hostVisible bool, err error) {
+func observeComputerNetworkIsolation(namespace *pinnedNetworkNamespace, abstractSocketName string) (helperInode, taskInode string, hostVisible, targetLive bool, err error) {
 	if abstractSocketName == "" {
-		return "", "", false, errors.New("Computer abstract X socket name is required")
+		return "", "", false, false, errors.New("Computer abstract X socket name is required")
 	}
 	helper, err := os.Open("/proc/self/ns/net")
 	if err != nil {
-		return "", "", false, fmt.Errorf("open helper network namespace for observation: %w", err)
+		return "", "", false, false, fmt.Errorf("open helper network namespace for observation: %w", err)
 	}
 	defer helper.Close()
 	target, err := namespace.duplicate()
 	if err != nil {
-		return "", "", false, err
+		return "", "", false, false, err
 	}
 	defer target.Close()
 	helperInfo, err := helper.Stat()
 	if err != nil {
-		return "", "", false, fmt.Errorf("stat helper network namespace: %w", err)
+		return "", "", false, false, fmt.Errorf("stat helper network namespace: %w", err)
 	}
 	taskInfo, err := target.Stat()
 	if err != nil {
-		return "", "", false, fmt.Errorf("stat task network namespace: %w", err)
+		return "", "", false, false, fmt.Errorf("stat task network namespace: %w", err)
 	}
 	helperStat, helperOK := helperInfo.Sys().(*syscall.Stat_t)
 	taskStat, taskOK := taskInfo.Sys().(*syscall.Stat_t)
 	if !helperOK || !taskOK {
-		return "", "", false, errors.New("network namespace inode metadata is unavailable")
+		return "", "", false, false, errors.New("network namespace inode metadata is unavailable")
 	}
 	helperInode, taskInode = strconv.FormatUint(helperStat.Ino, 10), strconv.FormatUint(taskStat.Ino, 10)
 	file, err := os.Open("/proc/net/unix")
 	if err != nil {
-		return "", "", false, fmt.Errorf("read helper abstract sockets: %w", err)
+		return "", "", false, false, fmt.Errorf("read helper abstract sockets: %w", err)
 	}
 	defer file.Close()
 	hostVisible, err = abstractSocketVisible(file, abstractSocketName)
 	if err != nil {
-		return "", "", false, err
+		return "", "", false, false, err
 	}
-	return helperInode, taskInode, hostVisible, nil
+	err = inNetworkNamespace(namespace, func() error {
+		// A nonblocking connect proves that the exact target X token has
+		// actually bound. Missing tokens (including images without X) are
+		// unobserved evidence, not proof of host absence and not a wait.
+		fd, socketErr := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		if socketErr != nil {
+			return socketErr
+		}
+		defer unix.Close(fd)
+		connectErr := unix.Connect(fd, &unix.SockaddrUnix{Name: abstractSocketName})
+		if connectErr != nil {
+			// Refusal, a full backlog, or another connect failure supplies no
+			// positive X evidence. Namespace and host contradictions remain
+			// independently observable and take precedence in diagnostics.
+			return nil
+		}
+		targetLive = true
+		return nil
+	})
+	return helperInode, taskInode, hostVisible, targetLive, err
 }
 
 func abstractSocketVisible(source io.Reader, exactName string) (bool, error) {

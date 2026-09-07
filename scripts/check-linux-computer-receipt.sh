@@ -66,9 +66,11 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.network_egress"].assertions.mounted_resolver_recorded and
     .rows["linux.network_egress"].assertions.loopback_proxy_listening and
     .rows["linux.network_egress"].assertions.proxy_upstream_reachable and
-    .rows["linux.network_egress"].assertions.helper_control_socket_refused and
+    .rows["linux.network_egress"].assertions.helper_control_socket_absent_in_computer_mount_namespace and
     .rows["linux.network_egress"].assertions.node_loopback_by_name_refused and
     .rows["linux.network_egress"].evidence.proxy_upstream_authority == "attachment_profile" and
+    .rows["linux.network_egress"].evidence.matched_profile_task_inode == .rows["linux.network_egress"].evidence.computer_network_namespace_inode and
+    .rows["linux.network_egress"].evidence.matched_profile_resolver == .rows["linux.network_egress"].evidence.resolver_address and
     (.rows["linux.network_egress"].evidence.computer_network_namespace_inode | test("^[0-9]+$")) and
     (.rows["linux.network_egress"].evidence.node_network_namespace_inode | test("^[0-9]+$")) and
     .rows["linux.network_egress"].evidence.node_network_namespace_inode != .rows["linux.network_egress"].evidence.computer_network_namespace_inode and
@@ -77,7 +79,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.network_egress"].evidence.computer_mount_namespace != .rows["linux.network_egress"].evidence.node_mount_namespace and
     (.rows["linux.network_egress"].evidence.helper_control_socket_path | startswith("/")) and
     .rows["linux.network_egress"].evidence.helper_control_socket_present_on_node == "true" and
-    .rows["linux.network_egress"].evidence.helper_control_socket_outcome == "refused" and
+    .rows["linux.network_egress"].evidence.helper_control_socket_outcome == "absent" and
     .rows["linux.network_egress"].evidence.helper_control_socket_errno == "ENOENT" and
     .rows["linux.network_egress"].evidence.node_loopback_address == ("localhost:" + (.rows["linux.network_egress"].evidence.node_listener_ipv4_address | split(":")[-1])) and
     .rows["linux.network_egress"].evidence.node_loopback_outcome == "refused" and
@@ -125,6 +127,30 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.screen_crossover_refused"].status == "PASS" and
     .rows["linux.screen_crossover_refused"].assertions.crossover_refused and
     .rows["linux.screen_crossover_refused"].assertions.target_alive_at_refusal_edge and
+    .rows["linux.screen_crossover_refused"].assertions.relay_cleanup_verified and
+    .rows["linux.screen_crossover_refused"].assertions.target_loopback_preserved and
+    (.rows["linux.screen_crossover_refused"].evidence as $e |
+      $e.fixture_mode == "target_veth_relay_to_loopback" and
+      ($e.relay_exec_id | startswith("crossover-relay-")) and ($e.relay_pid | test("^[1-9][0-9]*$")) and
+      ($e.target_container_id | length > 0) and $e.relay_target_attempt_id == $e.target_attempt_id and
+      ($e.target_network_namespace_inode | test("^[0-9]+$")) and
+      $e.relay_target_namespace_inode == $e.target_network_namespace_inode and
+      $e.before_liveness_namespace_inode == $e.target_network_namespace_inode and
+      $e.after_liveness_namespace_inode == $e.target_network_namespace_inode and
+      $e.target_loopback_namespace_inode == $e.target_network_namespace_inode and
+      $e.target_liveness_before_view == "read_succeeded" and $e.target_liveness_before_control == "inject_succeeded" and
+      $e.target_liveness_before_view_address == $e.view_read_address and
+      $e.target_liveness_before_control_address == $e.control_inject_address and
+      $e.target_liveness_view_address == $e.view_read_address and
+      $e.target_liveness_control_address == $e.control_inject_address and
+      $e.relay_backend_view_address == ("127.0.0.1:" + $e.target_view_port) and
+      $e.relay_backend_control_address == ("127.0.0.1:" + $e.target_control_port) and
+      ($e.backend_identity_before | test("^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+$")) and
+      ($e.backend_identity_before | split(":")[0]) == $e.target_network_namespace_inode and
+      $e.backend_identity_before == $e.backend_identity_during and $e.backend_identity_before == $e.backend_identity_after and
+      $e.relay_exit_confirmed == "true" and $e.relay_exec_deleted == "true" and $e.relay_listeners_absent == "true" and
+      $e.target_loopback_view == "read_succeeded" and $e.target_loopback_control == "inject_succeeded"
+    ) and
     (.rows["linux.screen_crossover_refused"].evidence.source_computer_id | length > 0) and
     (.rows["linux.screen_crossover_refused"].evidence.source_attempt_id | length > 0) and
     (.rows["linux.screen_crossover_refused"].evidence.target_computer_id | length > 0) and

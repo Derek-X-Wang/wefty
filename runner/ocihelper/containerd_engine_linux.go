@@ -169,7 +169,7 @@ type ContainerdEngine struct {
 	computerForwardingOwned     bool
 	computerFirewallConfigured  bool
 	computerIPv6NATState        ComputerIPv6NATState
-	observeComputerIsolation    func(*pinnedNetworkNamespace, string) (string, string, bool, error)
+	observeComputerIsolation    func(*pinnedNetworkNamespace, string) (string, string, bool, bool, error)
 }
 
 const (
@@ -1152,7 +1152,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err != nil {
 			return RunResponse{}, fmt.Errorf("pin Computer network namespace: %w", err)
 		}
-		computerNetwork, err = engine.prepareComputerNetwork(leaseContext, networkNamespace, endpoints["view"])
+		computerNetwork, err = engine.prepareComputerNetwork(leaseContext, networkNamespace, endpoints[contract.ComputerDisplayEndpointView])
 		if err != nil {
 			return RunResponse{}, fmt.Errorf("prepare Computer network namespace: %w", err)
 		}
@@ -1239,11 +1239,12 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if observer == nil {
 			observer = observeComputerNetworkIsolation
 		}
-		helperInode, taskInode, hostVisible, observeErr := observer(networkNamespace, "@/tmp/.X11-unix/X"+fmt.Sprint(endpoints["view"]))
+		helperInode, taskInode, hostVisible, targetLive, observeErr := observer(networkNamespace, "@/tmp/.X11-unix/X"+fmt.Sprint(endpoints[contract.ComputerDisplayEndpointView]))
 		profile.HelperNetworkNamespaceInode = helperInode
 		profile.TaskNetworkNamespaceInode = taskInode
 		profile.NetworkNamespacePresent = helperInode != "" && taskInode != "" && helperInode != taskInode
 		profile.HostAbstractSocketVisible = hostVisible
+		profile.TargetAbstractSocketLive = targetLive
 		engine.mu.Lock()
 		engine.lastProfile = &profile
 		engine.lastProfileNetworkNamespace = networkNamespace
@@ -2570,10 +2571,14 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		}
 		attempt.mu.Lock()
 		networkNamespace = attempt.networkNamespace
-		viewPort = attempt.endpoints["view"]
+		viewPort = attempt.endpoints[contract.ComputerDisplayEndpointView]
 		attempt.mu.Unlock()
 	} else if request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl {
 		return &ComputerAttemptAuthorityRefusalError{Cause: authorityErr}
+	}
+	isComputerDisplay := request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl
+	if isComputerDisplay && (networkNamespace == nil || viewPort == 0) {
+		return &ComputerAttemptAuthorityRefusalError{Cause: errors.New("Computer display isolation authority is incomplete")}
 	}
 	if request.CgroupID != "" {
 		bindContext, cancelBind := context.WithTimeout(ctx, engine.config.AttemptPortBindTimeout)
@@ -2594,9 +2599,9 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		return fmt.Errorf("dial attempt loopback port: %w", err)
 	}
 	defer backend.Close()
-	if networkNamespace != nil && viewPort != 0 && (request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl) {
-		// The shipped XFCE image binds X before publishing its view/control
-		// listeners; Wayland reaches this same edge without an X server.
+	if isComputerDisplay {
+		// Endpoint readiness alone does not prove that an image has bound X.
+		// The observation also probes the exact X token in the target namespace.
 		// Keep Start's inode check, but never earn socket absence from that
 		// earlier sample alone. Recheck before admitting each endpoint stream.
 		if err := engine.observeReadyComputerIsolation(networkNamespace, viewPort); err != nil {
@@ -2614,7 +2619,7 @@ func (engine *ContainerdEngine) observeReadyComputerIsolation(namespace *pinnedN
 	if observer == nil {
 		observer = observeComputerNetworkIsolation
 	}
-	helperInode, taskInode, visible, err := observer(namespace, "@/tmp/.X11-unix/X"+fmt.Sprint(viewPort))
+	helperInode, taskInode, visible, targetLive, err := observer(namespace, "@/tmp/.X11-unix/X"+fmt.Sprint(viewPort))
 	namespacePresent := helperInode != "" && taskInode != "" && helperInode != taskInode
 	engine.mu.Lock()
 	// Doctor's last profile may belong to a newer Computer. Do not attach this
@@ -2622,6 +2627,8 @@ func (engine *ContainerdEngine) observeReadyComputerIsolation(namespace *pinnedN
 	if engine.lastProfile != nil && engine.lastProfileNetworkNamespace == namespace {
 		profile := *engine.lastProfile
 		profile.HelperNetworkNamespaceInode = helperInode
+		profile.TaskNetworkNamespaceInode = taskInode
+		profile.TargetAbstractSocketLive = targetLive
 		profile.NetworkNamespacePresent = namespacePresent
 		profile.HostAbstractSocketVisible = visible
 		profile.HostAbstractSocketObservedAfterEndpointReady = err == nil

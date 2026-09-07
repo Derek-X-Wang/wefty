@@ -476,9 +476,17 @@ names does not grant network access: the Computer network boundary still refuses
 Node listeners and cross-Computer traffic. This describes the current exposure;
 it does not extend the Computer's access authority.
 
-The initial post-Start network namespace inode check remains fail closed. Abstract
-X socket absence earns a completed doctor observation only after an owned
-view/control endpoint is reachable, when the helper repeats the namespace and
-host socket observation before admitting the stream. The XFCE entrypoint binds X
-before those endpoints; Wayland uses the same endpoint readiness edge without
-waiting for an X server. A missing reobservation cannot earn an enforced verdict.
+The initial post-Start network namespace inode check remains fail closed. Endpoint
+readiness alone does not establish X binding: custom images may bind X later, and
+Wayland images may never use X. After an owned view/control endpoint is reachable,
+the helper reobserves both namespace inodes and probes the exact X token inside
+the target namespace without waiting. X absence in the helper namespace is verified
+only if the target token is live. Missing target X evidence remains `NOT-RUN`,
+including for images without X; this does not infer that an image uses Wayland.
+Contradictory namespace, host socket or firewall observations remain failures.
+The shipped XFCE image currently starts X before its endpoints, but this is not a
+global image ordering requirement.
+
+The DNS proxy discards upstream responses whose questions do not match the query,
+including QDCOUNT-zero error replies. Such unauthenticated error shapes are not
+forwarded; a client may time out rather than receive the upstream error.

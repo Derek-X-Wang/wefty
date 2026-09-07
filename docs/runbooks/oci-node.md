@@ -349,15 +349,15 @@ Meaning: the Computer screen-isolation receipt read lacked a helper dependency. 
 
 ## doctor-code-oci-computer-screen-isolation-not-recorded
 
-Meaning: the helper has no completed Computer profile receipt in its current generation. Evidence: preserve the absence as `NOT-RUN`. First action: inspect doctor again after the next Computer reaches runtime profile construction. Escalation: do not substitute an ordinary OCI profile receipt.
+Meaning: no completed Computer profile or complete X-isolation observation is available. This includes the normal pre-first-stream window and images whose exact target X token has not bound or is not used. Recorded namespace and firewall facts remain visible, but missing X evidence is `NOT-RUN`, never verified enforcement. First action: preserve the facts; for an X-using image, inspect again after its X token is live and an owned endpoint is used. Do not stop admission solely for missing evidence or infer a backend type from an absent X token.
 
 ## doctor-code-oci-computer-screen-isolation-enforced
 
-Meaning: the last post-start Computer observation contains distinct helper/task network namespace inodes, does not expose the exact abstract X11 socket token to the helper namespace, and a fresh firewall read found both chain sets attached. Evidence: preserve both inode values, both Boolean facts, the veth address/gateway, `computer_firewall_present`, and `computer_attempts_live`. First action: none. Escalation: pair the receipt with the egress and crossover acceptance rows when enforcement is disputed.
+Meaning: the exact target X token was live after endpoint readiness, absent from the helper namespace, and the same observation sample recorded distinct helper/task network namespace inodes; a fresh firewall read found the required chains. Evidence: preserve both inodes, `target_abstract_socket_live`, `host_abstract_socket_observed_after_endpoint_ready`, host visibility, veth address/gateway and firewall facts. First action: none. Escalation: pair this with the egress and crossover receipts.
 
 ## doctor-code-oci-computer-screen-isolation-not-enforced
 
-Meaning: the last Computer observation was skipped or failed, recorded equal or missing namespace inodes, omitted its private namespace, left its abstract X11 socket helper-visible, failed its firewall read, or observed a missing firewall attachment while a Computer was live. Evidence: preserve the inode values, Boolean facts, `computer_firewall_present`, `computer_attempts_live`, and the exact runtime receipt. First action: stop admitting Computers on the Node and repair the helper/network firewall profile. Escalation: treat co-located screen isolation as failed.
+Meaning: recorded facts contradict isolation: equal helper/task network namespaces, an omitted private namespace despite a complete inode sample, a helper-visible X token, identical veth/gateway addresses, or an observed missing firewall attachment while Computers are live. These contradictions take precedence even when target X liveness is unavailable. Evidence: preserve the complete observation and firewall facts. First action: stop admitting Computers and repair the demonstrated boundary failure. Missing observations alone belong to `NOT-RUN`, not this diagnosis.
 
 ## doctor-code-oci-resource-admission-not-run
 

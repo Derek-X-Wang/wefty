@@ -182,6 +182,33 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"missing attachment DNS authority": func(receipt map[string]any) {
 			delete(receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string), "proxy_upstream_authority")
 		},
+		"relay missing mode": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["fixture_mode"] = ""
+		},
+		"relay loopback liveness": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_liveness_view_address"] = "127.0.0.1:42002"
+		},
+		"relay wrong backend identity": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["backend_identity_during"] = "42:9:2:3:4"
+		},
+		"relay wrong namespace": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["after_liveness_namespace_inode"] = "99"
+		},
+		"relay exit unconfirmed": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["relay_exit_confirmed"] = "false"
+		},
+		"relay delete incomplete": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["relay_exec_deleted"] = "false"
+		},
+		"relay listeners retained": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["relay_listeners_absent"] = "false"
+		},
+		"wrong matched_profile_task_inode": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["matched_profile_task_inode"] = "wrong"
+		},
+		"wrong matched_profile_resolver": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["matched_profile_resolver"] = "wrong"
+		},
 		"wrong default route gateway": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["default_route_gateway"] = "198.18.0.9"
 		},
@@ -269,6 +296,16 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	crossoverEvidence := map[string]string{
 		"source_computer_id": "computer-1", "source_attempt_id": "attempt-1",
 		"target_computer_id": "computer-2", "target_attempt_id": "attempt-2",
+		"fixture_mode": "target_veth_relay_to_loopback", "relay_exec_id": "crossover-relay-1",
+		"relay_pid": "123", "target_container_id": "container-2", "relay_target_attempt_id": "attempt-2", "relay_target_namespace_inode": "42", "target_loopback_namespace_inode": "42",
+		"target_network_namespace_inode": "42", "before_liveness_namespace_inode": "42", "after_liveness_namespace_inode": "42",
+		"target_liveness_before_view": "read_succeeded", "target_liveness_before_control": "inject_succeeded",
+		"target_liveness_before_view_address": "198.18.0.6:42002", "target_liveness_before_control_address": "198.18.0.6:42003",
+		"target_liveness_view_address": "198.18.0.6:42002", "target_liveness_control_address": "198.18.0.6:42003",
+		"relay_backend_view_address": "127.0.0.1:42002", "relay_backend_control_address": "127.0.0.1:42003",
+		"backend_identity_before": "42:1:2:3:4", "backend_identity_during": "42:1:2:3:4", "backend_identity_after": "42:1:2:3:4",
+		"relay_exit_confirmed": "true", "relay_exec_deleted": "true", "relay_listeners_absent": "true",
+		"target_loopback_view": "read_succeeded", "target_loopback_control": "inject_succeeded",
 		"target_view_port": "42002", "target_control_port": "42003", "target_egress_address": "198.18.0.6", "target_veth_gateway": "198.18.0.5", "target_egress_port": "43999",
 		"view_read_outcome": "refused", "view_read_errno": "ECONNREFUSED",
 		"view_read_address":      "198.18.0.6:42002",
@@ -281,21 +318,22 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"egress_address_target":      "198.18.0.6:43999",
 		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "EADDRNOTAVAIL",
 	}
-	crossover["assertions"] = map[string]bool{"crossover_refused": true, "target_alive_at_refusal_edge": true}
+	crossover["assertions"] = map[string]bool{"crossover_refused": true, "target_alive_at_refusal_edge": true, "relay_cleanup_verified": true, "target_loopback_preserved": true}
 	if variant == "wayland" {
 		crossoverEvidence["abstract_socket_outcome"] = "not_applicable"
 		crossoverEvidence["derived_display_outcome"] = "not_applicable"
 	}
 	crossover["evidence"] = crossoverEvidence
 	network := rows["linux.network_egress"].(map[string]any)
-	network["assertions"] = map[string]bool{"private_veth_address_present": true, "mounted_resolver_recorded": true, "loopback_proxy_listening": true, "proxy_upstream_reachable": true, "default_route_present": true, "public_ipv4_connected": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_listener_ipv4_refused": true, "node_listener_ipv6_refused": true, "helper_control_socket_refused": true, "node_loopback_by_name_refused": true}
+	network["assertions"] = map[string]bool{"private_veth_address_present": true, "mounted_resolver_recorded": true, "loopback_proxy_listening": true, "proxy_upstream_reachable": true, "default_route_present": true, "public_ipv4_connected": true, "resolver_reachable": true, "helper_http_through_veth": true, "node_listener_ipv4_refused": true, "node_listener_ipv6_refused": true, "helper_control_socket_absent_in_computer_mount_namespace": true, "node_loopback_by_name_refused": true}
 	network["evidence"] = map[string]string{
 		"computer_id": "computer-1", "attempt_id": "attempt-1", "veth_address": "198.18.0.2", "veth_gateway": "198.18.0.1",
 		"resolver_snapshot": "nameserver 127.0.0.53", "resolver_address": "127.0.0.53", "proxy_udp_listening": "true", "proxy_tcp_listening": "true",
+		"matched_profile_task_inode": "4026533000", "matched_profile_resolver": "127.0.0.53",
 		"proxy_upstream_authority": "attachment_profile", "computer_network_namespace_inode": "4026533000", "node_network_namespace_inode": "4026532000",
 		"computer_mount_namespace": "mnt:[4026533001]", "node_mount_namespace": "mnt:[4026532000]",
 		"helper_control_socket_path": "/run/wefty/helper.sock", "helper_control_socket_present_on_node": "true",
-		"helper_control_socket_outcome": "refused", "helper_control_socket_errno": "ENOENT",
+		"helper_control_socket_outcome": "absent", "helper_control_socket_errno": "ENOENT",
 		"node_loopback_address": "localhost:45000", "node_loopback_outcome": "refused", "node_loopback_errno": "ECONNREFUSED",
 		"proxy_upstream_address": "168.63.129.16", "proxy_upstream_source": "systemd_uplink", "proxy_upstream_reachable": "true",
 		"default_route_interface": "eth0", "default_route_gateway": "198.18.0.1", "public_ipv4_address": "1.1.1.1:443", "public_ipv4_outcome": "connected", "dns_outcome": "resolved",
