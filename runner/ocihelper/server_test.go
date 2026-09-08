@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -1411,25 +1412,36 @@ func TestBootBarrierClassifiesSocketBacklogWithoutCompletedHandshakeAsStalled(t 
 }
 
 func TestBootBarrierClassifiesLastDeadlineEdgeConnectionAsStalled(t *testing.T) {
-	dials := 0
-	client := &Client{ExpectedChecksum: "checksum-test", Dial: func(ctx context.Context) (net.Conn, error) {
-		dials++
-		if dials < 3 {
-			return nil, syscall.ENOENT
+	// Advance the takeover deadline and retry timers together, independently
+	// of host scheduling, so both missing dials precede the connected edge.
+	synctest.Test(t, func(t *testing.T) {
+		dials := 0
+		client := &Client{ExpectedChecksum: "checksum-test", Dial: func(ctx context.Context) (net.Conn, error) {
+			dials++
+			if dials < 3 {
+				return nil, syscall.ENOENT
+			}
+			clientSide, serverSide := net.Pipe()
+			// Keep the peer open: the handshake must fail at its I/O deadline,
+			// rather than race a peer close triggered by context cancellation.
+			t.Cleanup(func() { _ = serverSide.Close() })
+			return clientSide, nil
+		}}
+		barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
 		}
-		clientSide, serverSide := net.Pipe()
-		go func() { <-ctx.Done(); _ = serverSide.Close() }()
-		return clientSide, nil
-	}}
-	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = barrier.Ensure(t.Context())
-	var stalled *HelperHandshakeStalledError
-	if !errors.As(err, &stalled) || dials != 3 {
-		t.Fatalf("last connected dial classification = stalled=%#v err=%v dials=%d", stalled, err, dials)
-	}
+		started := time.Now()
+		err = barrier.Ensure(t.Context())
+		var stalled *HelperHandshakeStalledError
+		if !errors.As(err, &stalled) || dials != 3 || stalled.DialAttempts != 3 ||
+			!errors.Is(err, context.DeadlineExceeded) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalled {
+			t.Fatalf("last connected dial classification = stalled=%#v err=%v dials=%d reason=%q", stalled, err, dials, barrier.CapabilityReasonCode())
+		}
+		if elapsed := time.Since(started); elapsed != 20*time.Millisecond {
+			t.Fatalf("last connected dial elapsed = %s, want takeover deadline 20ms", elapsed)
+		}
+	})
 }
 
 func TestBootBarrierDoesNotReuseEarlierAbsenceForFinalUnknownDial(t *testing.T) {
