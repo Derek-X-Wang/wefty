@@ -117,6 +117,7 @@ type ContainerdEngine struct {
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
+	computerStorageRootMu       sync.Mutex // root creation through flock admission; never held for copy/format
 	storageCopyMu               sync.Mutex
 	diskSystem                  computerDiskSystem
 	storageResetHook            func(computerStorageResetPhase) error
@@ -1750,8 +1751,8 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 		if request.ComputerStorage == nil || request.Removal == nil || request.Removal.PriorJobID == "" {
 			return DeleteManagedVolumeResponse{}, errors.New("Computer disk deletion requires Storage and removal authority")
 		}
-		if err := engine.deleteComputerDisk(*request.ComputerStorage, *request.Removal); err != nil {
-			if request.QuarantineOnFailure && request.FailureAttempts > 0 {
+		if err := engine.deleteComputerDiskWithAbsence(*request.ComputerStorage, *request.Removal, request.StorageAbsent); err != nil {
+			if !request.StorageAbsent && request.QuarantineOnFailure && request.FailureAttempts > 0 {
 				receipt, quarantineErr := engine.quarantineComputerDiskCleanup(request)
 				if quarantineErr != nil {
 					return DeleteManagedVolumeResponse{}, errors.Join(err, quarantineErr)
@@ -1789,18 +1790,20 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 
 func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request InventoryRemovalRequest) (InventoryRemovalResponse, error) {
 	ctx = engineContext(ctx)
-	inventory, err := engine.inventory(ctx)
-	if err != nil {
+	if request.ComputerStorage != nil {
+		// Generation evidence is filesystem-only. Neither the general runtime
+		// inventory nor the Job authority scan may gate this request.
+		var inventory ResourceInventory
+		if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+			return InventoryRemovalResponse{}, err
+		}
+		return engine.inventoryComputerStorageRemoval(ctx, request, inventory)
+	}
+	if _, err := engine.inventory(ctx); err != nil {
 		return InventoryRemovalResponse{}, err
 	}
 	authorities := make(map[string]AttemptAuthority)
 	add := func(authority AttemptAuthority, kind, observedID string) error {
-		// Per-generation calls prove only prepared or already-deleted Storage.
-		// Runtime authorities are inventoried once by the job-scoped call so they
-		// cannot be repeated for every historical generation.
-		if request.ComputerStorage != nil {
-			return nil
-		}
 		if authority.JobID != request.Removal.JobID {
 			return nil
 		}
@@ -1878,9 +1881,6 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 			return InventoryRemovalResponse{}, err
 		}
 	}
-	if request.ComputerStorage != nil {
-		return engine.inventoryComputerStorageRemoval(ctx, request, inventory)
-	}
 	if len(authorities) == 0 {
 		return InventoryRemovalResponse{NoRuntimeAttempts: true}, nil
 	}
@@ -1919,6 +1919,15 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 			engine.computerReimageMu.Unlock()
 		}
 	}()
+	if !lockComputerReimageMutex(ctx, &engine.computerStorageRootMu) {
+		return InventoryRemovalResponse{}, fmt.Errorf("acquire Computer root admission: %w", context.Cause(ctx))
+	}
+	rootLocked := true
+	defer func() {
+		if rootLocked {
+			engine.computerStorageRootMu.Unlock()
+		}
+	}()
 	root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	if _, statErr := os.Lstat(root); errors.Is(statErr, os.ErrNotExist) {
 		attempt, attemptErr := absentComputerStorageRemovalAttempt(request, storage)
@@ -1937,6 +1946,8 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 		_ = lock.Close()
 		return InventoryRemovalResponse{}, errComputerStorageAttachmentOwned
 	}
+	engine.computerStorageRootMu.Unlock()
+	rootLocked = false
 	engine.computerReimageMu.Unlock()
 	reimageLocked = false
 	defer func() {

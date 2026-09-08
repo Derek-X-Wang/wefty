@@ -216,6 +216,28 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 	if needsRuntimeProof && noRuntime && len(computerStorages) != 0 && !computerStorageInventoryComplete(attempts, computerStorages) {
 		return errors.New("agent: Computer removal lacks helper inventory for every claimed Storage generation")
 	}
+	volumes := []workloadrunner.ManagedVolume(nil)
+	if needsRuntimeProof {
+		volumes = make([]workloadrunner.ManagedVolume, 0, len(computerStorages))
+		for _, storage := range computerStorages {
+			absent := false
+			for _, attempt := range attempts {
+				candidate := attempt.ComputerStorage
+				if !attempt.StorageAbsent || candidate == nil || candidate.ComputerID != storage.ComputerID ||
+					candidate.StorageID != storage.StorageID || candidate.StorageGeneration != storage.StorageGeneration {
+					continue
+				}
+				if validateRuntimeResourceManifest(attempt) != nil || attempt.JobID != removal.jobID || attempt.NodeID != controller.nodeID ||
+					attempt.FencingToken != removal.cleanupFence || attempt.RemovalGeneration != fmt.Sprint(removal.generation) {
+					return errors.New("Computer removal has invalid frozen Storage absence authority")
+				}
+				absent = true
+			}
+			// Any exact frozen absence remains a restrictive precondition even if
+			// another runtime manifest names this generation.
+			volumes = append(volumes, workloadrunner.ManagedVolume{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage, StorageAbsent: absent})
+		}
+	}
 	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
@@ -227,10 +249,6 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 	if len(computerStorages) != 0 && needsRuntimeProof {
 		if controller.finalizeVolumes == nil {
 			return errors.New("Computer removal requires OCI disk finalization")
-		}
-		volumes := make([]workloadrunner.ManagedVolume, 0, len(computerStorages))
-		for _, storage := range computerStorages {
-			volumes = append(volumes, workloadrunner.ManagedVolume{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage})
 		}
 		if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 			Volumes: volumes,

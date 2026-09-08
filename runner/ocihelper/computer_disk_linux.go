@@ -430,6 +430,10 @@ func (engine *ContainerdEngine) quarantineComputerDiskCleanup(request DeleteMana
 }
 
 func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority) error {
+	return engine.deleteComputerDiskWithAbsence(storage, removal, false)
+}
+
+func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority, storageAbsent bool) error {
 	engine.computerReimageMu.Lock()
 	reimageLocked := true
 	defer func() {
@@ -445,6 +449,13 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 		return entry == name || strings.HasPrefix(entry, name+"-") ||
 			strings.HasPrefix(entry, "."+name+"-") && strings.HasSuffix(entry, computerDiskQuarantineGCFailureSuffix)
 	}
+	engine.computerStorageRootMu.Lock()
+	rootLocked := true
+	defer func() {
+		if rootLocked {
+			engine.computerStorageRootMu.Unlock()
+		}
+	}()
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	var lock *os.File
 	defer func() {
@@ -464,11 +475,18 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	// The per-generation flock, when present, now excludes preflight and
-	// attachment for this disk. Release the node-wide admission mutex before
-	// filesystem inspection and deletion so other Computers remain live.
-	engine.computerReimageMu.Unlock()
-	reimageLocked = false
+	if lock != nil {
+		if storageAbsent {
+			return errors.New("Computer disk deletion observed a reappeared generation after frozen Storage absence")
+		}
+		// The generation flock excludes creators and attachment. If the root
+		// was absent, retain admission until cleanup finishes: there is no flock
+		// inode yet to exclude copy/reset root creation.
+		engine.computerStorageRootMu.Unlock()
+		rootLocked = false
+		engine.computerReimageMu.Unlock()
+		reimageLocked = false
+	}
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil {
 		return err

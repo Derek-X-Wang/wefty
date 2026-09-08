@@ -1375,8 +1375,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		default:
 			identityErr = fmt.Errorf("managed volume kind %q cannot be deleted", body.Kind)
 		}
-		if body.Kind != ManagedVolumeComputerDisk && (body.QuarantineOnFailure || body.FailureAttempts != 0) {
-			identityErr = errors.New("cleanup quarantine evidence is closed to Computer disks")
+		if body.Kind != ManagedVolumeComputerDisk && (body.StorageAbsent || body.QuarantineOnFailure || body.FailureAttempts != 0) {
+			identityErr = errors.New("Storage absence and cleanup quarantine evidence are closed to Computer disks")
 		}
 		if identityErr != nil {
 			_ = writeFailure(wire, CodeInvalidRequest, identityErr.Error())

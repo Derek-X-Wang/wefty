@@ -469,6 +469,9 @@ func TestLegacyNeverRunComputerRemovalSurvivesRetiredAbsentGeneration(t *testing
 		if len(request.Volumes) != 2 {
 			t.Fatalf("finalized Storage generations = %d, want 2", len(request.Volumes))
 		}
+		if !request.Volumes[0].StorageAbsent || request.Volumes[1].StorageAbsent {
+			t.Fatalf("frozen per-generation absence was lost or widened: %+v", request.Volumes)
+		}
 		return nil
 	}
 	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
@@ -1038,4 +1041,54 @@ func (*resumedManagedResource) remove(context.Context, localRemoval) error { ret
 func (resource *resumedManagedResource) resumeRemovals(context.Context) ([]localRemoval, error) {
 	resource.resumed = true
 	return resource.completed, nil
+}
+
+func TestComputerFinalizationKeepsFrozenAbsenceRestrictive(t *testing.T) {
+	for _, scenario := range []string{"exact", "mixed", "other-generation", "invalid"} {
+		t.Run(scenario, func(t *testing.T) {
+			removal := localRemoval{jobID: "computer", kind: contract.JobKindOCI, generation: 2, cleanupFence: "cleanup"}
+			storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30}
+			attempt := workloadrunner.RuntimeResourceManifest{
+				Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "previous-boot", JobID: removal.jobID,
+				AttemptID: contract.StorageAbsentRemovalAttemptID(1), FencingToken: removal.cleanupFence,
+				WorkloadClass: contract.JobClassService, RemovalGeneration: "2", ComputerStorage: storage, StorageOnly: true, StorageAbsent: true,
+			}
+			if scenario == "other-generation" {
+				other := *storage
+				other.StorageGeneration = 2
+				attempt.ComputerStorage = &other
+				attempt.AttemptID = contract.StorageAbsentRemovalAttemptID(2)
+			}
+			if scenario == "invalid" {
+				attempt.FencingToken = "foreign"
+			}
+			attempts := []workloadrunner.RuntimeResourceManifest{attempt}
+			if scenario == "mixed" {
+				present := attempt
+				present.StorageAbsent = false
+				attempts = append(attempts, present)
+			}
+			record := runtimeRemovalRecord{manifest: runtimeRemovalManifest{Attempts: attempts}}
+			mutated := false
+			stopped := errors.New("stopped after observing finalization")
+			controller := &removalController{nodeID: "node", bootSessionID: "current-boot"}
+			controller.purgeJob = func(context.Context, string) error { mutated = true; return nil }
+			controller.removeResource = func(context.Context, localRemoval) error { return nil }
+			controller.finalizeVolumes = func(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
+				wantAbsent := scenario != "other-generation"
+				if len(request.Volumes) != 1 || request.Volumes[0].StorageAbsent != wantAbsent {
+					t.Fatalf("frozen absence precondition: %+v", request.Volumes)
+				}
+				return stopped
+			}
+			err := controller.completeLocalRemoval(t.Context(), removal, &record, []*workloadrunner.ComputerStorage{storage})
+			if scenario == "invalid" {
+				if err == nil || mutated {
+					t.Fatalf("invalid frozen authority reached cleanup: mutated=%v err=%v", mutated, err)
+				}
+			} else if !errors.Is(err, stopped) {
+				t.Fatalf("finalization not reached: %v", err)
+			}
+		})
+	}
 }

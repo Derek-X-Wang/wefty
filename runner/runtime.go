@@ -165,6 +165,8 @@ type ManagedVolume struct {
 	Kind            ManagedVolumeKind
 	OwnerKey        string
 	ComputerStorage *ComputerStorage
+	// StorageAbsent requires deletion to revalidate frozen absence, never delete a reappeared generation.
+	StorageAbsent bool
 }
 
 // ComputerStorage identifies one non-transferable durable Storage generation.

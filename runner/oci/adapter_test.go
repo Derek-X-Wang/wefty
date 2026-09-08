@@ -1738,6 +1738,7 @@ func TestServiceRestartRejectsChangedProbePlatformWithoutMutatingFirstBinding(t 
 }
 
 type adapterTestEngine struct {
+	volumeDeleteRequests          []ocihelper.DeleteManagedVolumeRequest
 	mu                            sync.Mutex
 	watch                         ocihelper.WatchResponse
 	deletes                       int
@@ -1965,6 +1966,7 @@ func (engine *adapterTestEngine) DeleteManagedVolume(_ context.Context, request 
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.volumeDeleteCalls++
+	engine.volumeDeleteRequests = append(engine.volumeDeleteRequests, request)
 	if engine.requireReapBeforeVolumeDelete && engine.runtimeDeletes == 0 {
 		engine.volumeDeleteBeforeReap = true
 		return ocihelper.DeleteManagedVolumeResponse{}, errors.New("Computer disk remains mounted during deletion")
@@ -2391,4 +2393,22 @@ func (source *adapterReceiptSource) ExecutionSnapshot() (*ocihelper.Session, oci
 }
 func (source *adapterReceiptSource) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
 	return source.receipt, true
+}
+
+func TestManagedVolumeFinalizationPreservesFrozenStorageAbsence(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	authority := adapterTestRequest().Authority
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 4096}
+	request := workloadrunner.ManagedVolumeFinalizationRequest{
+		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage, StorageAbsent: true}},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, PriorJobID: authority.JobID, RemovalGeneration: 2, CleanupFence: "cleanup"},
+	}
+	if err := adapter.FinalizeManagedVolumes(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(engine.volumeDeleteRequests) != 1 || !engine.volumeDeleteRequests[0].StorageAbsent || engine.volumeDeleteRequests[0].ComputerStorage.StorageGeneration != 1 {
+		t.Fatalf("frozen absence lost across helper protocol: %+v", engine.volumeDeleteRequests)
+	}
 }

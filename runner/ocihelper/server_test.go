@@ -4924,3 +4924,16 @@ func (timer *manualTimer) ResetAt(deadline time.Time) bool {
 	timer.clock.fireLocked(timer)
 	return wasActive
 }
+
+func TestStorageAbsencePreconditionIsClosedToComputerDisks(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "handoff", StorageAbsent: true})
+	assertRPCCode(t, err, CodeInvalidRequest)
+}
