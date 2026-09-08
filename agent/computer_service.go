@@ -145,6 +145,18 @@ func (controller *computerAttemptBridgeController) dial(ctx context.Context) (ne
 	}
 }
 
+// newComputerPublicationOperation detaches execution cancellation while
+// retaining its exact earlier deadline and the caller's operation authority.
+func newComputerPublicationOperation(ctx context.Context, factory func(context.Context) (context.Context, context.CancelFunc)) (context.Context, context.CancelFunc) {
+	parent := context.WithoutCancel(ctx)
+	cancelParent := func() {}
+	if deadline, ok := ctx.Deadline(); ok {
+		parent, cancelParent = context.WithDeadline(parent, deadline)
+	}
+	operation, cancelOperation := factory(parent)
+	return operation, func() { cancelOperation(); cancelParent() }
+}
+
 // runComputerService is the production owner of the private Computer front
 // door. The guest endpoints remain process-local dial capabilities; only the
 // Fabric listener address can enter L1 publication.
@@ -318,13 +330,7 @@ func runComputerService(
 		// Keep an earlier caller deadline while detaching execution cancellation.
 		// Anchor the caller's operation budget once; every final mutation and
 		// retry shares it, including time spent closing sessions below.
-		parent := context.WithoutCancel(ctx)
-		if deadline, ok := ctx.Deadline(); ok {
-			var cancelParent context.CancelFunc
-			parent, cancelParent = context.WithDeadline(parent, deadline)
-			defer cancelParent()
-		}
-		operationContext, cancelOperation := config.publicationOperation(parent)
+		operationContext, cancelOperation := newComputerPublicationOperation(ctx, config.publicationOperation)
 		defer cancelOperation()
 		publicationMu.Lock()
 		drainContext = operationContext

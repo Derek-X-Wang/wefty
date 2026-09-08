@@ -24,7 +24,7 @@ import (
 )
 
 func TestComputerPublicationFinalWithdrawal(t *testing.T) {
-	for _, mode := range []string{"commits_after_payload_cancel", "transient_then_success", "transient_deadline", "earlier_caller_deadline", "authority_loss"} {
+	for _, mode := range []string{"commits_after_payload_cancel", "transient_then_success", "transient_deadline", "earlier_caller_operation_deadline", "authority_loss"} {
 		t.Run(mode, func(t *testing.T) { assertComputerPublicationFinalWithdrawal(t, mode) })
 	}
 }
@@ -111,11 +111,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	defer backend.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	var earlierDeadline time.Time
-	if mode == "earlier_caller_deadline" {
-		cancel()
-		earlierDeadline = time.Now().Add(3 * DefaultPublicationRetryInterval)
-		ctx, cancel = context.WithDeadline(t.Context(), earlierDeadline)
-	}
+
 	runtime := &publicationLossProbeRuntime{opaqueEndpointRuntime: &opaqueEndpointRuntime{}, lost: make(chan struct{}), canceled: make(chan struct{})}
 	releaseFalse := make(chan struct{})
 	var releaseOnce sync.Once
@@ -162,10 +158,17 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 		}, nil, computerServiceConfig{
 			publicationOperation: func(parent context.Context) (context.Context, context.CancelFunc) {
 				operationCalls.Add(1)
+				cancelParent := func() {}
+				if mode == "earlier_caller_operation_deadline" {
+					// The real-L1 case budgets withdrawal after admission. Exact
+					// execution deadlines are covered at the production helper.
+					parent, cancelParent = context.WithTimeout(parent, 3*DefaultPublicationRetryInterval)
+					earlierDeadline, _ = parent.Deadline()
+				}
 				operationContext, cancelOperation := client.boundedContext(parent)
 				operationDeadline, _ = operationContext.Deadline()
 				trace("operation_anchored", operationDeadline.Format(time.RFC3339Nano))
-				return operationContext, cancelOperation
+				return operationContext, func() { cancelOperation(); cancelParent() }
 			},
 			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: client,
 			computerID: computer.ComputerID, jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID,
@@ -193,7 +196,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 						falseCause <- context.Cause(publishContext)
 					}
 					trace("false_released_before_real_client", context.Cause(publishContext))
-					if mode == "transient_deadline" || mode == "earlier_caller_deadline" || (mode == "transient_then_success" && falseCalls == 1) {
+					if mode == "transient_deadline" || mode == "earlier_caller_operation_deadline" || (mode == "transient_then_success" && falseCalls == 1) {
 						return &ProtocolError{StatusCode: http.StatusServiceUnavailable, APIError: contract.APIError{
 							Code: contract.ErrorInternal, Message: "controlled transient final publication failure", Retryable: true,
 						}}
@@ -236,6 +239,9 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	availability, err := store.GetComputerTakeoverAvailability(t.Context(), identity, computer.ComputerID)
 	if err != nil || availability.DisplayEndpoint == nil || *availability.DisplayEndpoint != endpoint {
 		t.Fatalf("initial durable endpoint=%v err=%v", availability.DisplayEndpoint, err)
+	}
+	if operationCalls.Load() != 0 {
+		t.Fatal("publication operation budget began before admitted runtime loss")
 	}
 	trace("drive_typed_runtime_loss", nil)
 	runtime.lose()
@@ -293,7 +299,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 		if clearErr := <-falseResult; clearErr != nil || strings.Contains(fmt.Sprint(serviceErr), "withdraw Computer publication") {
 			t.Fatalf("healthy final clear failed: clear=%v service=%v", clearErr, serviceErr)
 		}
-	case "transient_deadline", "earlier_caller_deadline":
+	case "transient_deadline", "earlier_caller_operation_deadline":
 		if !errors.Is(serviceErr, context.DeadlineExceeded) || !strings.Contains(fmt.Sprint(serviceErr), "withdraw Computer publication") || falseCalls < 2 {
 			t.Fatalf("deadline failure missing or no retry: calls=%d err=%v", falseCalls, serviceErr)
 		}
