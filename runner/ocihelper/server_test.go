@@ -1660,6 +1660,169 @@ func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.
 	}
 }
 
+func TestBootBarrierReconcilesOnlyExpiredLogRetention(t *testing.T) {
+	const name = "wefty-log-segments-0123456789abcdef0123456789abcdef"
+	for _, scenario := range []string{"expired", "still_valid", "unbound", "foreign_owner", "extra_log", "other_resource", "network_resource", "malformed_deadline", "retry_residue"} {
+		t.Run(scenario, func(t *testing.T) {
+			clock := newManualClock(time.Unix(1_000, 0))
+			retention := DurableRetention{Class: RemovalResourceLogSegments, ID: name, Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing, AttemptID: "attempt-1", State: DurableRetentionStateUnsealed, Bound: time.Minute, RecordedAt: clock.Now().Add(-time.Minute + 500*time.Millisecond), Deadline: clock.Now().Add(500 * time.Millisecond)}
+			if scenario == "still_valid" {
+				retention.RecordedAt = clock.Now()
+				retention.Deadline = clock.Now().Add(time.Minute)
+			}
+			if scenario == "malformed_deadline" {
+				retention.Deadline = retention.Deadline.Add(-time.Second)
+			}
+			if scenario == "foreign_owner" {
+				retention.Owner = "foreign"
+			}
+			bindings := []DurableRetention{retention}
+			if scenario == "unbound" {
+				bindings = nil
+			}
+			observed := ResourceInventory{LogSegments: []string{name}}
+			if scenario == "extra_log" {
+				observed.LogSegments = append(observed.LogSegments, "unbound-log")
+			}
+			if scenario == "other_resource" {
+				observed.Cgroups = []string{"unbound-cgroup"}
+			}
+			if scenario == "network_resource" {
+				observed.ComputerNetworkLinks = []string{"wftch-unbound"}
+			}
+			residue := VerifyResponse{Inventory: observed, RuntimeResidue: observed}
+			firstEvidence := SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: "attempt-1", Action: SweepActionRetained, Method: "bounded_seal_wait"}
+			secondEvidence := SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: "attempt-1", Action: SweepActionRetentionBoundReaped, Method: "remove_all"}
+			engine := &retentionReconciliationFailureEngine{fakeEngine: newFakeEngine(), beforeAdmissionVerify: func() { clock.Advance(time.Second) }}
+			initial := cloneResourceInventory(observed)
+			initial.Containers = []string{"removed-container"}
+			engine.sweepResponses = []SweepResponse{{}, {Inventory: initial, DurableRetentions: bindings, Evidence: []SweepEvidence{firstEvidence}}, {Inventory: observed, Evidence: []SweepEvidence{secondEvidence}}}
+			final := VerifyResponse{Absent: true}
+			if scenario == "retry_residue" {
+				final = residue
+			}
+			engine.verifyResponses = []VerifyResponse{{Absent: true}, residue, final}
+			client, stop := startTestServer(t, engine, ServerConfig{})
+			defer stop()
+			dial := client.Dial
+			var deadlines []time.Time
+			client.Dial = func(ctx context.Context) (net.Conn, error) {
+				deadline, _ := ctx.Deadline()
+				deadlines = append(deadlines, deadline)
+				return dial(ctx)
+			}
+			barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{Clock: clock})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = barrier.Ensure(t.Context())
+			if (scenario == "expired") != (err == nil) {
+				t.Fatalf("Ensure=%v", err)
+			}
+			wantSweeps := 2 // startup plus admission
+			if scenario == "expired" || scenario == "retry_residue" {
+				wantSweeps = 3
+			}
+			engine.mu.Lock()
+			calls := slices.Clone(engine.calls)
+			engine.mu.Unlock()
+			count := 0
+			for _, call := range calls {
+				if call == "Sweep" {
+					count++
+				}
+			}
+			if count != wantSweeps {
+				t.Fatalf("Sweep calls=%d want=%d (%v)", count, wantSweeps, calls)
+			}
+			if scenario == "expired" {
+				receipt, ok := barrier.SweepReceipt()
+				if !ok || receipt.SweepEpoch != engine.sweepEpochs[2] || receipt.SweepEpoch == engine.sweepEpochs[1] || !receipt.VerifiedAbsent || !slices.Equal(receipt.SweptInventory.LogSegments, observed.LogSegments) || !slices.Equal(receipt.SweptInventory.Containers, initial.Containers) || len(receipt.SweepEvidence) != 2 || receipt.SweepEvidence[0].Action != secondEvidence.Action || receipt.SweepEvidence[1].Action != firstEvidence.Action {
+					t.Fatalf("cumulative final receipt=%+v", receipt)
+				}
+				if len(deadlines) < 5 {
+					t.Fatalf("RPC deadlines=%v", deadlines)
+				}
+				for _, deadline := range deadlines[len(deadlines)-4:] {
+					if deadline.IsZero() || !deadline.Equal(deadlines[len(deadlines)-1]) {
+						t.Fatalf("reconciliation reset barrier deadline: %v", deadlines)
+					}
+				}
+			} else if barrier.Ready() {
+				t.Fatal("residue exposed a ready session")
+			}
+		})
+	}
+}
+
+type retentionReconciliationFailureEngine struct {
+	*fakeEngine
+	failMethod            string
+	sweeps, verifies      int
+	sweepEpochs           []string
+	beforeAdmissionVerify func()
+}
+
+func (engine *retentionReconciliationFailureEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
+	response, err := engine.fakeEngine.Sweep(ctx, request)
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.sweeps++
+	engine.sweepEpochs = append(engine.sweepEpochs, request.SweepEpoch)
+	if engine.sweeps == 3 && engine.failMethod == "Sweep" {
+		return SweepResponse{}, errors.New("reconciliation sweep failed")
+	}
+	return response, err
+}
+
+func (engine *retentionReconciliationFailureEngine) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
+	response, err := engine.fakeEngine.Verify(ctx, request)
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.verifies++
+	if engine.verifies == 2 && engine.beforeAdmissionVerify != nil {
+		engine.beforeAdmissionVerify()
+	}
+	if engine.verifies == 3 && engine.failMethod == "Verify" {
+		return VerifyResponse{}, errors.New("reconciliation verification failed")
+	}
+	return response, err
+}
+
+func TestBootBarrierRetentionReconciliationFailureKeepsAdmissionClosed(t *testing.T) {
+	for _, method := range []string{"Sweep", "Verify"} {
+		t.Run(method, func(t *testing.T) {
+			const name = "wefty-log-segments-0123456789abcdef0123456789abcdef"
+			clock := newManualClock(time.Unix(1_000, 0))
+			retention := DurableRetention{Class: RemovalResourceLogSegments, ID: name, Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing, AttemptID: "attempt-1", State: DurableRetentionStateUnsealed, Bound: time.Minute, RecordedAt: clock.Now().Add(-time.Minute), Deadline: clock.Now()}
+			observed := ResourceInventory{LogSegments: []string{name}}
+			engine := &retentionReconciliationFailureEngine{fakeEngine: newFakeEngine(), failMethod: method}
+			engine.sweepResponses = []SweepResponse{{}, {Inventory: observed, DurableRetentions: []DurableRetention{retention}}, {}}
+			engine.verifyResponses = []VerifyResponse{{Absent: true}, {Inventory: observed, RuntimeResidue: observed}, {Absent: true}}
+			client, stop := startTestServer(t, engine, ServerConfig{})
+			defer stop()
+			barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{Clock: clock})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := barrier.Ensure(t.Context()); err == nil {
+				t.Fatal("reconciliation RPC failure was ignored")
+			}
+			if barrier.Ready() {
+				t.Fatal("failed reconciliation opened admission")
+			}
+			if _, err := barrier.Session(); err == nil {
+				t.Fatal("failed reconciliation exposed session")
+			}
+			engine.mu.Lock()
+			defer engine.mu.Unlock()
+			if engine.sweeps != 3 {
+				t.Fatalf("sweeps=%d, want exactly one reconciliation after startup/admission", engine.sweeps)
+			}
+		})
+	}
+}
+
 func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *testing.T) {
 	engine := newFakeEngine()
 	handoff, err := DeterministicHandoffVolumeDirectory("live-owner")

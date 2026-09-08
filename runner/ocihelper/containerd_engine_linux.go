@@ -4057,6 +4057,35 @@ func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context,
 	pending := make(map[string]pendingLog)
 	progress := make(map[string]logSealScanState)
 	var evidence []SweepEvidence
+	reapExpired := func(name, path string, record durableAttemptOwnership) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if retention, retained := retentionFor(record, RemovalResourceLogSegments, name); retained && !clock.Now().Before(retention.Deadline) {
+			owned, err := helperOwnedAttemptDirectory(path, "wefty-log-segments-", name)
+			if err != nil {
+				return false, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
+			}
+			if !owned {
+				return true, nil
+			}
+			if engine.attemptOwnershipIsLive(record) {
+				return true, nil
+			}
+			if err := unmountComputerControlTmpfs(filepath.Join(path, "control")); err != nil {
+				return false, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
+			}
+			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return false, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
+			}
+			if err := engine.clearAttemptRetention(record, RemovalResourceLogSegments, name); err != nil {
+				return false, err
+			}
+			evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Action: SweepActionRetentionBoundReaped, Method: "remove_all", Duration: clock.Now().Sub(started)})
+			return true, nil
+		}
+		return false, nil
+	}
 	for _, name := range names {
 		path := filepath.Join(engine.config.RuntimeRoot, "logs", name)
 		record, bound := ownershipByLogName(ownership, name)
@@ -4067,20 +4096,9 @@ func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context,
 		if !bound || !owned || engine.attemptOwnershipIsLive(record) {
 			continue
 		}
-		if retention, retained := retentionFor(record, RemovalResourceLogSegments, name); retained && !clock.Now().Before(retention.Deadline) {
-			if engine.attemptOwnershipIsLive(record) {
-				continue
-			}
-			if err := unmountComputerControlTmpfs(filepath.Join(path, "control")); err != nil {
-				return nil, nil, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
-			}
-			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return nil, nil, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
-			}
-			if err := engine.clearAttemptRetention(record, RemovalResourceLogSegments, name); err != nil {
-				return nil, nil, err
-			}
-			evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Action: SweepActionRetentionBoundReaped, Method: "remove_all", Duration: clock.Now().Sub(started)})
+		if expired, err := reapExpired(name, path, record); err != nil {
+			return nil, nil, err
+		} else if expired {
 			continue
 		}
 		pending[name] = pendingLog{path: path, record: record}
@@ -4130,6 +4148,13 @@ func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context,
 			poll.Stop()
 			retained := make([]DurableRetention, 0, len(pending))
 			for name, candidate := range pending {
+				// An existing fixed deadline can expire while the seal scan waits.
+				// Reap it positively instead of returning an expired retention.
+				if expired, err := reapExpired(name, candidate.path, candidate.record); err != nil {
+					return nil, nil, err
+				} else if expired {
+					continue
+				}
 				if engine.attemptOwnershipIsLive(candidate.record) {
 					continue
 				}

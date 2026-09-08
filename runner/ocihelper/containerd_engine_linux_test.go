@@ -532,6 +532,171 @@ func TestSweepLostAttemptLogSegmentsRetainsPendingSealWithOwnerAndReason(t *test
 	}
 }
 
+// An existing retention must not become an expired receipt merely because the
+// spool stays unsealed throughout this invocation's bounded seal wait.
+func TestSweepLostAttemptLogSegmentsRetentionExpiresDuringSealWait(t *testing.T) {
+	engine, clock, resources, retention := expiringLogRetentionFixture(t)
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.afterLogSealObservation = func() { clock.Advance(time.Second) }
+	retained, evidence, err := engine.sweepLostAttemptLogSegments(t.Context(), []string{resources.LogSegmentDirectory}, ownership)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retained) != 0 || len(evidence) != 1 || evidence[0].Action != SweepActionRetentionBoundReaped {
+		t.Fatalf("expiry during seal wait returned retained=%+v evidence=%+v; original deadline=%s", retained, evidence, retention.Deadline)
+	}
+	if _, err := os.Stat(filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired spool bytes remain: %v", err)
+	}
+	ownership, err = engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := retentionFor(ownership[testAuthority().key()], RemovalResourceLogSegments, resources.LogSegmentDirectory); found {
+		t.Fatal("removed spool retained an ownership receipt")
+	}
+}
+
+func TestSweepLostAttemptLogSegmentsRetentionExpiresAfterLogPhase(t *testing.T) {
+	engine, clock, resources, original := expiringLogRetentionFixture(t)
+	// The log phase finishes before the original deadline. The next fresh
+	// verification observes time after it, as can happen during cgroup cleanup.
+	engine.config.LogSealTimeout = 100 * time.Millisecond
+	engine.afterLogSealObservation = func() { clock.Advance(100 * time.Millisecond) }
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, _, err := engine.sweepLostAttemptLogSegments(t.Context(), []string{resources.LogSegmentDirectory}, ownership)
+	if err != nil || len(retained) != 1 || retained[0] != original {
+		t.Fatalf("retained=%+v err=%v", retained, err)
+	}
+	clock.Advance(time.Second)
+	observed := ResourceInventory{LogSegments: []string{resources.LogSegmentDirectory}}
+	residue, bindings, err := engine.runtimeAbsenceInventory(observed, clock.Now())
+	if err != nil || !slices.Equal(residue.LogSegments, observed.LogSegments) || len(bindings) != 0 {
+		t.Fatalf("expired retention must remain residue: residue=%+v bindings=%+v err=%v", residue, bindings, err)
+	}
+	if _, err := os.Stat(filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSweepLostAttemptLogSegmentsExpiryPreservesAuthorityAndCancellation(t *testing.T) {
+	for _, scenario := range []string{"live_at_entry", "becomes_live", "unbound", "symlink_during_wait", "canceled", "remove_failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			engine, clock, resources, original := expiringLogRetentionFixture(t)
+			directory := filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory)
+			ownership, err := engine.loadAttemptOwnershipRecords()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			makeLive := func() {
+				engine.attempts = map[string]*containerdAttempt{testAuthority().key(): {authority: testAuthority()}}
+			}
+			if scenario == "live_at_entry" {
+				makeLive()
+			}
+			if scenario == "unbound" {
+				ownership = nil
+			}
+			if scenario == "remove_failure" && os.Geteuid() == 0 {
+				t.Skip("permission-denial fixture requires an unprivileged helper")
+			}
+
+			engine.afterLogSealObservation = func() {
+				clock.Advance(time.Second)
+				switch scenario {
+				case "remove_failure":
+					parent := filepath.Dir(directory)
+					if err := os.Chmod(parent, 0o500); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+				case "becomes_live":
+					makeLive()
+				case "canceled":
+					cancel()
+				case "symlink_during_wait":
+					if err := os.Rename(directory, directory+"-preserved"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(directory+"-preserved", directory); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			retained, evidence, err := engine.sweepLostAttemptLogSegments(ctx, []string{resources.LogSegmentDirectory}, ownership)
+			switch scenario {
+			case "canceled":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation=%v", err)
+				}
+			case "remove_failure":
+				var bound *RetentionBoundExceededError
+				if !errors.As(err, &bound) || bound.ID != resources.LogSegmentDirectory || !bound.Deadline.Equal(original.Deadline) {
+					t.Fatalf("bound failure=%v", err)
+				}
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(retained) != 0 || len(evidence) != 0 {
+				t.Fatalf("protected/failed resource reported success: retained=%+v evidence=%+v", retained, evidence)
+			}
+			if _, err := os.Lstat(directory); err != nil {
+				t.Fatalf("protected or failed spool disappeared: %v", err)
+			}
+			persisted, err := engine.loadAttemptOwnershipRecords()
+			if err != nil {
+				t.Fatal(err)
+			}
+			retention, found := retentionFor(persisted[testAuthority().key()], RemovalResourceLogSegments, resources.LogSegmentDirectory)
+			if !found || retention != original {
+				t.Fatalf("original receipt changed: %+v", retention)
+			}
+		})
+	}
+}
+
+func expiringLogRetentionFixture(t *testing.T) (*ContainerdEngine, *observedClock, ResourceIdentity, DurableRetention) {
+	t.Helper()
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &observedClock{manualClock: newManualClock(time.Unix(1_000, 0)), timerCreated: make(chan struct{}, 8)}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: t.TempDir(), LogSealTimeout: time.Second, LostAttemptRetention: time.Minute, Clock: clock}}
+	directory := filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		if err := os.WriteFile(filepath.Join(directory, stream+".frames"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, retention, err := engine.retainAttemptResource(ownership[authority.key()], RemovalResourceLogSegments, resources.LogSegmentDirectory, DurableRetentionReasonLogSpoolSealing, DurableRetentionStateUnsealed, clock.Now().Add(-time.Minute+500*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine, clock, resources, retention
+}
+
 func TestSweepLostAttemptCgroupKillsPopulatedOwnedTree(t *testing.T) {
 	authority := testAuthority()
 	resources, err := DeterministicResourceIdentity(authority)

@@ -760,6 +760,22 @@ directory as durable retained only by reading the unexpired receipt; it never
 reconstructs retention from a name, UID, or bytes. A later sweep removes a
 sealed directory, and expiry of the five-minute bound forces removal with typed
 evidence or returns the typed `retention bound exceeded` operator outcome.
+The fixed deadline is checked again after the bounded seal wait, so expiry
+within that wait cannot produce a new successful retained outcome. Cancellation
+and current helper ownership/live-Attempt checks still apply before removal.
+
+If retention expires after the log phase, namespace Verify remains observational
+and reports those bytes as runtime residue. The boot barrier may reconcile once
+with another Sweep and Verify under the same original advertised reap deadline,
+only when every residual identity is a log directory in the preceding sweep's
+inventory with an exact helper-owned, now-expired log-sealing retention receipt.
+Any additional or unbound residue prevents reconciliation. The helper rechecks
+current ownership and live-Attempt authority; a formerly retained Attempt that
+became live remains protected and prevents verified absence. Reconciliation
+failure or remaining residue fails closed without another retry. The final
+receipt uses the second sweep's epoch and the server's existing cumulative
+pending-sweep inventory and evidence; it does not renew any retention deadline.
+
 
 Handoff volumes live under a distinct helper-owned durable root, not the
 attempt namespace. `Delete` reaps and verifies the attempt while retaining its
