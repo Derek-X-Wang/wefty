@@ -183,6 +183,39 @@ func inventoryIdentityCountPortable(inventory ResourceInventory) int {
 		len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies)
 }
 
+// onlyExpiredSweptLogRetentions recognizes the single recoverable gap between
+// a log phase's retention observation and a later namespace verification.
+func onlyExpiredSweptLogRetentions(sweep SweepResponse, residue ResourceInventory, now time.Time) bool {
+	if sweep.SweepEpoch == "" || len(residue.LogSegments) == 0 {
+		return false
+	}
+	other := residue
+	other.LogSegments = nil
+	if !InventoryEmpty(other) {
+		return false
+	}
+	for _, name := range residue.LogSegments {
+		if !slices.Contains(sweep.Inventory.LogSegments, name) {
+			return false
+		}
+		bound := false
+		for _, retention := range sweep.DurableRetentions {
+			if retention.Class == RemovalResourceLogSegments && retention.ID == name &&
+				retention.Owner == DurableRetentionOwnerOCIHelper && retention.AttemptID != "" &&
+				retention.Reason == DurableRetentionReasonLogSpoolSealing && retention.State == DurableRetentionStateUnsealed &&
+				retention.Bound > 0 && !retention.RecordedAt.IsZero() && !retention.Deadline.IsZero() &&
+				retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) && !now.Before(retention.Deadline) {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return false
+		}
+	}
+	return true
+}
+
 func namespaceResidueError(operation string, verification VerifyResponse) error {
 	return &NamespaceResidueError{
 		Operation:         operation,
@@ -359,6 +392,29 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	if err := validateNamespaceVerification("verify OCI runtime namespace", verification); err != nil {
 		return err
 	}
+	verifyElapsed := time.Since(verifyStarted)
+	if !verification.Absent && onlyExpiredSweptLogRetentions(sweep, verification.RuntimeResidue, barrier.config.Clock.Now()) {
+		// Reconcile only this known expiry boundary, once, within the original
+		// advertised reap deadline. The helper rechecks current ownership/live
+		// authority; a previous retention is not permission to delete by itself.
+		sweepStarted = time.Now()
+		sweep, err = session.Sweep(barrierContext, SweepRequest{})
+		if err != nil {
+			return fmt.Errorf("reconcile expired OCI log retention: %w", err)
+		}
+		sweepElapsed += time.Since(sweepStarted)
+		// The server carries pending sweep evidence and initial inventory into
+		// this response under its new epoch. Do not aggregate them twice.
+		verifyStarted = time.Now()
+		verification, err = session.Verify(barrierContext, VerifyRequest{Scope: VerifyNamespace})
+		if err != nil {
+			return fmt.Errorf("verify reconciled OCI runtime namespace: %w", err)
+		}
+		verifyElapsed += time.Since(verifyStarted)
+		if err := validateNamespaceVerification("verify reconciled OCI runtime namespace", verification); err != nil {
+			return err
+		}
+	}
 	if !verification.Absent {
 		return namespaceResidueError("verify OCI runtime namespace", verification)
 	}
@@ -390,7 +446,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 			HandshakeElapsed:        handshakeElapsed,
 			SessionAdmissionElapsed: sessionAdmissionElapsed,
 			SweepElapsed:            sweepElapsed,
-			VerifyElapsed:           time.Since(verifyStarted),
+			VerifyElapsed:           verifyElapsed,
 			VerifiedReadyElapsed:    verifiedReadyElapsed,
 		},
 	}
