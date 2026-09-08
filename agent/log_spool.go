@@ -694,7 +694,11 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, storedEvent.AttemptID, storedEvent.Stream, storedE
 }
 
 func wrapLogSpoolContextError(ctx context.Context, operation string, err error) error {
-	if cause := context.Cause(ctx); cause != nil && err == cause {
+	// database/sql returns ctx.Err(), which is Canceled for a cancel-cause
+	// context even when its originating cause is the finalization deadline.
+	// Preserve only that exact raw context error; wrapped or joined destination
+	// failures remain errors even when cancellation happened concurrently.
+	if cause := context.Cause(ctx); cause != nil && (err == cause || err == ctx.Err()) {
 		return cause
 	}
 	return fmt.Errorf("%s: %w", operation, err)
@@ -830,7 +834,7 @@ func (spool *logSpool) pendingBatch(ctx context.Context, attemptID string, limit
 	rows, err := spool.db.QueryContext(ctx, `SELECT ordinal, stream, sequence, timestamp_ns, bytes, gap_json
 FROM spool_events WHERE attempt_id=? ORDER BY ordinal LIMIT ?`, attemptID, limit)
 	if err != nil {
-		return nil, fmt.Errorf("agent: read pending log spool: %w", err)
+		return nil, wrapLogSpoolContextError(ctx, "agent: read pending log spool", err)
 	}
 	defer rows.Close()
 	events := make([]durableSpoolEvent, 0, limit)
