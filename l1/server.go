@@ -1556,18 +1556,16 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 				"revoke pre-restore Computer authority"))
 			return
 		}
-		tokenReceipt, err := s.revokeComputerAuthorityWithReceipt(r.Context(), revocation.ComputerID, "computer_restoring")
+		tokenReceipt, err := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
+			ComputerID: revocation.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true,
+			Reason: "computer_restoring", RestoreOperationRevision: revocation.OperationRevision,
+		})
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		if tokenReceipt == nil {
-			writeError(w, internalError(errors.New("L3 Computer token revocation returned no receipt"),
-				"revoke pre-restore Computer authority"))
-			return
-		}
 		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), revocation.ComputerID, revocation.OperationRevision, ComputerRestoreRevocationEvidence{
-			RevokeAll: true, TokenRevocation: *tokenReceipt,
+			RevokeAll: true, TokenRevocation: tokenReceipt,
 		}); err != nil {
 			writeError(w, err)
 			return

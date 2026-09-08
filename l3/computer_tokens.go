@@ -128,7 +128,10 @@ func (s *Store) MintComputerToken(ctx context.Context, proof ComputerTokenScopeP
 func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenRevocationRequest) (contract.ComputerTokenRevocationReceipt, error) {
 	request.ComputerID = strings.TrimSpace(request.ComputerID)
 	request.Reason = strings.TrimSpace(request.Reason)
-	if request.ComputerID == "" || len(request.ComputerID) > 255 || (!request.RevokeAll && request.SubmitIntentRevision < 1) || request.Reason == "" || len(request.Reason) > 255 {
+	if request.RestoreOperationRevision < 0 ||
+		(request.RestoreOperationRevision > 0 && (!request.RevokeAll || request.Reason != "computer_restoring")) ||
+		request.ComputerID == "" || len(request.ComputerID) > 255 ||
+		(!request.RevokeAll && request.SubmitIntentRevision < 1) || request.Reason == "" || len(request.Reason) > 255 {
 		return contract.ComputerTokenRevocationReceipt{}, protocolError(contract.ErrorInvalidRequest, "Computer token revocation is incomplete")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -151,7 +154,7 @@ func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenR
 		return contract.ComputerTokenRevocationReceipt{}, internalError(err, "commit Computer token revocation")
 	}
 	return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
-		SubmitIntentRevision: request.SubmitIntentRevision, RevokedGrantCount: revoked, CommittedAt: now}, nil
+		SubmitIntentRevision: request.SubmitIntentRevision, RestoreOperationRevision: request.RestoreOperationRevision, RevokedGrantCount: revoked, CommittedAt: now}, nil
 }
 
 func (s *Store) RevokeComputerTokenScope(ctx context.Context, scope ComputerTokenScope, reason string) error {

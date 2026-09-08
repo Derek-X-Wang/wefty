@@ -210,8 +210,22 @@ records its restore-revision-bound token-revocation receipt. Take-over session
 termination is attempt-lineage-bound: the prerequisite stop supplies the typed
 `takeover_session_ended` evidence rather than restore relabeling audit rows as
 a revocation act. Helper admission and successor publication both require the
-revision-bound receipt; a legacy `authority_revoked_ns` without that receipt
-fails closed and causes revocation to be reissued after upgrade. The helper
+revision-bound receipt: L1 sends the existing `restore_operation_revision` in
+an authenticated L3 request with `revoke_all=true` and
+`reason=computer_restoring`. L3 echoes it only after committing a fresh
+revocation transaction, even with zero affected grants or on retry. L1 requires
+that inner Computer/revision binding as well as its current-operation CAS;
+`committed_at` remains L3 audit time and is never compared with L1's reservation
+clock. Missing or mismatched inner binding cannot authorize a successor, even
+with a future timestamp. Same-operation replay preserves the first bound
+receipt. A current reserved/prepared restore with missing receipt JSON or valid
+legacy unbound JSON reissues revocation and blocks helper admission/publication
+until L1 transactionally replaces that legacy receipt and recorded time with a
+bound acknowledgement. Malformed or wrong nonzero bindings remain fail closed;
+published/completed history is not rewritten and published retirement proceeds
+unchanged. Deploy L3 first (or coordinate versions): old L3 rejects the new field,
+and new L1 never downgrades to an unbound acknowledgement. General revocations
+may continue omitting the field. The helper
 copies only from the selected published Backup copy,
 verifies source size and digest before publication, and returns exact
 Node/root/operation-bound evidence. L1 records that evidence before publishing

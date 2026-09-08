@@ -103,6 +103,8 @@ type ComputerStoragePreparationOutcome struct {
 }
 
 type computerStorageCopyRow struct {
+	RevokedNS             sql.NullInt64
+	RevocationJSON        []byte
 	DestinationComputerID string
 	Operation             string
 	OperationRevision     int64
@@ -169,7 +171,7 @@ const storageCopyColumns = `destination_computer_id, operation, operation_revisi
 	destination_generation, destination_size, bound_node_id, root_instance_id,
 	job_id, cleanup_fence, keep_old_as_backup, old_backup_id, old_copy_id,
 	idempotency_key, request_hash, status, acknowledgement_key, acknowledgement_hash,
-	export_id, external_path, manifest_digest, source_spec_json, source_spec_hash, actor`
+	export_id, external_path, manifest_digest, source_spec_json, source_spec_hash, actor, authority_revoked_ns, authority_revocation_receipt_json`
 
 func scanComputerStorageCopy(scanner interface{ Scan(...any) error }) (computerStorageCopyRow, error) {
 	var row computerStorageCopyRow
@@ -181,7 +183,7 @@ func scanComputerStorageCopy(scanner interface{ Scan(...any) error }) (computerS
 		&row.KeepOldBackup, &row.OldBackupID, &row.OldCopyID, &row.IdempotencyKey,
 		&row.RequestHash, &row.Status, &row.AcknowledgementKey, &row.AcknowledgementHash,
 		&row.ExportID, &row.ExternalPath, &row.ManifestDigest, &row.SourceSpecJSON,
-		&row.SourceSpecHash, &row.Actor)
+		&row.SourceSpecHash, &row.Actor, &row.RevokedNS, &row.RevocationJSON)
 	return row, err
 }
 
@@ -531,6 +533,11 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 		if err != nil {
 			return nil, internalError(err, "scan Computer Storage copy directive")
 		}
+		// Published restores only need retirement; never rewrite their historical evidence.
+		if row.Operation == "restore" && row.Status != "published" &&
+			!boundComputerRestoreRevocation(row.RevokedNS, row.RevocationJSON, row.DestinationComputerID, row.OperationRevision) {
+			continue
+		}
 		directives = append(directives, storageCopyDirective(row))
 	}
 	if err := rows.Err(); err != nil {
@@ -544,9 +551,8 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 }
 
 func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID string) ([]ComputerRestoreRevocationDirective, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT destination_computer_id, operation_revision FROM computer_storage_copy_operations
+	rows, err := s.db.QueryContext(ctx, `SELECT destination_computer_id, operation_revision, authority_revocation_receipt_json FROM computer_storage_copy_operations
 		WHERE bound_node_id=? AND operation='restore' AND status IN ('reserved', 'prepared')
-		AND authority_revocation_receipt_json IS NULL
 		AND (destination_computer_id, operation_revision) IN (SELECT computer_id, reconfiguration_revision
 			FROM computers WHERE reconfiguration_phase='restoring')
 		ORDER BY requested_ns, destination_computer_id`, nodeID)
@@ -557,8 +563,15 @@ func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID s
 	directives := []ComputerRestoreRevocationDirective{}
 	for rows.Next() {
 		var directive ComputerRestoreRevocationDirective
-		if err := rows.Scan(&directive.ComputerID, &directive.OperationRevision); err != nil {
+		var payload []byte
+		if err := rows.Scan(&directive.ComputerID, &directive.OperationRevision, &payload); err != nil {
 			return nil, internalError(err, "scan pending restore authority revocation")
+		}
+		if len(payload) != 0 {
+			receipt, valid := parseComputerRestoreRevocation(payload, directive.ComputerID, directive.OperationRevision)
+			if !valid || receipt.TokenRevocation.RestoreOperationRevision != 0 {
+				continue
+			}
 		}
 		directives = append(directives, directive)
 	}
@@ -583,8 +596,30 @@ func readLastComputerRestoreRevocation(ctx context.Context, q queryer, computerI
 	return &receipt, nil
 }
 
+// parseComputerRestoreRevocation validates both historical unbound receipts and
+// current bound receipts. A wrong nonzero binding is never legacy evidence.
+func parseComputerRestoreRevocation(payload []byte, computerID string, revision int64) (ComputerRestoreRevocationReceipt, bool) {
+	var receipt ComputerRestoreRevocationReceipt
+	if json.Unmarshal(payload, &receipt) != nil || receipt.Kind != computerRestoreRevocationReceiptKind ||
+		receipt.ComputerID != computerID || receipt.OperationRevision != revision || !receipt.RevokeAll ||
+		receipt.TokenRevocation.ComputerID != computerID || receipt.TokenRevocation.RevokedGrantCount < 0 ||
+		receipt.TokenRevocation.CommittedAt.IsZero() || receipt.AuthorityRevokedAt.IsZero() ||
+		!receipt.AuthorityRevokedAt.Equal(receipt.TokenRevocation.CommittedAt) ||
+		(receipt.TokenRevocation.RestoreOperationRevision != 0 && receipt.TokenRevocation.RestoreOperationRevision != revision) {
+		return receipt, false
+	}
+	return receipt, true
+}
+
+func boundComputerRestoreRevocation(recorded sql.NullInt64, payload []byte, computerID string, revision int64) bool {
+	receipt, valid := parseComputerRestoreRevocation(payload, computerID, revision)
+	return valid && recorded.Valid && recorded.Int64 == receipt.AuthorityRevokedAt.UnixNano() &&
+		receipt.TokenRevocation.RestoreOperationRevision == revision
+}
+
 func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, computerID string, operationRevision int64, evidence ComputerRestoreRevocationEvidence) error {
 	if operationRevision < 1 || !evidence.RevokeAll || evidence.TokenRevocation.ComputerID != computerID ||
+		evidence.TokenRevocation.RestoreOperationRevision != operationRevision ||
 		evidence.TokenRevocation.RevokedGrantCount < 0 || evidence.TokenRevocation.CommittedAt.IsZero() {
 		return protocolError(contract.ErrorInvalidRequest, "Computer restore authority revocation evidence is incomplete")
 	}
@@ -593,18 +628,35 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 		return internalError(err, "begin restore authority revocation receipt")
 	}
 	defer tx.Rollback()
-	var requestedNS int64
-	if err := tx.QueryRowContext(ctx, `SELECT requested_ns FROM computer_storage_copy_operations
+	var existingJSON []byte
+	var existingNS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT authority_revoked_ns, authority_revocation_receipt_json FROM computer_storage_copy_operations
 		WHERE destination_computer_id=? AND operation_revision=? AND operation='restore'
-		AND status IN ('reserved', 'prepared')`, computerID, operationRevision).Scan(&requestedNS); err != nil {
+		AND status IN ('reserved', 'prepared') AND EXISTS (
+			SELECT 1 FROM computers WHERE computer_id=? AND intent_revision=?
+			AND reconfiguration_revision=? AND reconfiguration_phase='restoring')`, computerID, operationRevision, computerID, operationRevision, operationRevision).Scan(&existingNS, &existingJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns authority revocation")
 		}
 		return internalError(err, "read restore authority revocation operation")
 	}
-	if evidence.TokenRevocation.CommittedAt.Before(time.Unix(0, requestedNS).UTC()) {
-		return protocolError(contract.ErrorConflict, "Computer token revocation predates the restore reservation")
+	if len(existingJSON) != 0 {
+		existing, valid := parseComputerRestoreRevocation(existingJSON, computerID, operationRevision)
+		if !valid {
+			return protocolError(contract.ErrorConflict, "Computer restore has invalid prior revocation evidence")
+		}
+		if existing.TokenRevocation.RestoreOperationRevision != 0 {
+			if !boundComputerRestoreRevocation(existingNS, existingJSON, computerID, operationRevision) {
+				return protocolError(contract.ErrorConflict, "Computer restore has inconsistent prior revocation evidence")
+			}
+			// Preserve the first committed bound receipt on same-operation replay.
+			if err := tx.Commit(); err != nil {
+				return internalError(err, "commit restore authority revocation replay")
+			}
+			return nil
+		}
 	}
+	// L3's clock is audit evidence, never an ordering comparison with L1's clock.
 	revokedAt := canonicalTime(evidence.TokenRevocation.CommittedAt)
 	receipt := ComputerRestoreRevocationReceipt{Kind: computerRestoreRevocationReceiptKind,
 		ComputerID: computerID, OperationRevision: operationRevision,
@@ -615,8 +667,8 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 		return internalError(err, "encode restore authority revocation receipt")
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET
-		authority_revoked_ns=COALESCE(authority_revoked_ns, ?),
-		authority_revocation_receipt_json=COALESCE(authority_revocation_receipt_json, ?)
+		authority_revoked_ns=?,
+		authority_revocation_receipt_json=?
 		WHERE destination_computer_id=? AND operation_revision=? AND operation='restore'
 		AND status IN ('reserved', 'prepared') AND EXISTS (
 			SELECT 1 FROM computers WHERE computer_id=? AND intent_revision=?
@@ -874,19 +926,7 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 		return Computer{}, protocolError(contract.ErrorConflict, "Computer Storage copy has no durable positive verification")
 	}
 	if row.Operation == "restore" {
-		var revoked sql.NullInt64
-		var revocationJSON []byte
-		if err := tx.QueryRowContext(ctx, `SELECT authority_revoked_ns, authority_revocation_receipt_json
-			FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
-			destinationComputerID, operationRevision).Scan(&revoked, &revocationJSON); err != nil {
-			return Computer{}, internalError(err, "read durable restore authority revocation")
-		}
-		var revocation ComputerRestoreRevocationReceipt
-		if !revoked.Valid || revoked.Int64 <= 0 || len(revocationJSON) == 0 ||
-			json.Unmarshal(revocationJSON, &revocation) != nil ||
-			revocation.Kind != computerRestoreRevocationReceiptKind || revocation.ComputerID != destinationComputerID ||
-			revocation.OperationRevision != operationRevision || !revocation.RevokeAll ||
-			revocation.TokenRevocation.ComputerID != destinationComputerID || revocation.TokenRevocation.CommittedAt.IsZero() {
+		if !boundComputerRestoreRevocation(row.RevokedNS, row.RevocationJSON, destinationComputerID, operationRevision) {
 			return Computer{}, protocolError(contract.ErrorConflict, "Computer restore authority was not durably revoked before publication")
 		}
 	}
