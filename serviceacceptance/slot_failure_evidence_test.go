@@ -208,10 +208,28 @@ func slotResultArm(value any) any {
 		return nil
 	}
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(fmt.Sprint(value)), &raw); err != nil {
+	if err := json.Unmarshal([]byte(fmt.Sprint(value)), &raw); err != nil || raw == nil {
 		return map[string]any{"decode_error": "invalid durable result JSON"}
 	}
+	// L1 stores ProcessResult directly; the agent spool stores durableCompletion.
+	// Never fall back to top-level fields when a present envelope is malformed.
+	if nested, present := raw["result"]; present {
+		var outcome map[string]json.RawMessage
+		if err := json.Unmarshal(nested, &outcome); err != nil || outcome == nil {
+			return map[string]any{"decode_error": "invalid durable completion result envelope"}
+		}
+		raw = outcome
+	}
 	result := map[string]any{}
+	for _, name := range []string{"spawn_failure_code", "runtime_failure_code"} {
+		if data, present := raw[name]; present {
+			var code string
+			if err := json.Unmarshal(data, &code); err != nil || code == "" {
+				return map[string]any{"decode_error": "invalid terminal audit failure code"}
+			}
+			result[name] = code
+		}
+	}
 	for _, name := range []string{"exit_code", "signal", "termination_cause", "oom", "disk_exhausted", "log_evidence_incomplete"} {
 		if data, ok := raw[name]; ok {
 			var v any
@@ -231,6 +249,9 @@ func slotResultArm(value any) any {
 				}
 			}
 		}
+	}
+	if len(result) == 0 {
+		return map[string]any{"decode_error": "no recognized durable result fields"}
 	}
 	return result
 }
@@ -302,7 +323,9 @@ func TestSlotFailureEvidenceCapturesDurableArmAndRedacts(t *testing.T) {
 	setup(filepath.Join(spoolDir, "node.sqlite"), []string{
 		`CREATE TABLE spool_attempts(job_id TEXT,attempt_id TEXT,fencing_token TEXT,class TEXT,kind TEXT,created_ns INTEGER,finished_ns INTEGER,result_json BLOB,completion_disposition TEXT,completion_reason TEXT)`,
 		`CREATE TABLE spool_completion_receipts(job_id TEXT,attempt_id TEXT,disposition TEXT,reason TEXT,observed_ns INTEGER,finished_ns INTEGER,terminal_audit_json BLOB)`,
-		`INSERT INTO spool_attempts VALUES('oneshot-job','attempt-1','live-fencing-authority','oneshot','process',40,101,'{"output_error":"context canceled known-sensitive-env-value"}',NULL,NULL)`,
+		`INSERT INTO spool_attempts VALUES('oneshot-job','attempt-1','live-fencing-authority','oneshot','process',40,101,'{"result":{"output_error":"context canceled known-sensitive-env-value"},"runtime_quiescence_evidence":"attempt"}',NULL,NULL)`,
+		`INSERT INTO spool_completion_receipts VALUES('oneshot-job','spawn-audit','suppressed','retained',102,101,'{"spawn_failure_code":"process_spawn_failed"}')`,
+		`INSERT INTO spool_completion_receipts VALUES('oneshot-job','runtime-audit','withheld','retained',102,101,'{"runtime_failure_code":"runtime_unavailable"}')`,
 	})
 	evidence := newSlotFailureEvidence()
 	evidence.stage = "await-oneshot-2-succeeded"
@@ -310,6 +333,30 @@ func TestSlotFailureEvidenceCapturesDurableArmAndRedacts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
 	data := evidence.capture(ctx, l1Path, spoolDir, "stderr "+secret+" "+token+" "+boot+" password=unlisted-credential", []string{secret})
+	// Assert each durable store independently: L1 fields must not mask a
+	// missing nested spool result or compact terminal audit code.
+	spoolAttempts, ok := data["spool_attempts"].([]map[string]any)
+	if !ok || len(spoolAttempts) != 1 {
+		t.Fatalf("spool attempts=%+v", data["spool_attempts"])
+	}
+	spoolResult, ok := spoolAttempts[0]["result_json"].(map[string]any)
+	if !ok || spoolResult["output_error_present"] != true || spoolResult["output_error_cause"] != "context canceled" {
+		t.Errorf("nested spool output arm=%+v", spoolAttempts[0]["result_json"])
+	}
+	audits, ok := data["spool_receipts"].([]map[string]any)
+	if !ok || len(audits) != 2 {
+		t.Fatalf("spool audits=%+v", data["spool_receipts"])
+	}
+	for _, audit := range audits {
+		summary, ok := audit["terminal_audit_json"].(map[string]any)
+		key, want := "spawn_failure_code", "process_spawn_failed"
+		if audit["attempt_id"] == "runtime-audit" {
+			key, want = "runtime_failure_code", "runtime_unavailable"
+		}
+		if !ok || summary[key] != want {
+			t.Errorf("audit %v: %s=%v, want %s", audit["attempt_id"], key, summary[key], want)
+		}
+	}
 	encoded, err := json.Marshal(data)
 	if err != nil {
 		t.Fatal(err)
@@ -358,5 +405,20 @@ func TestSlotFailureEvidenceReportsReadErrors(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("read-only capture created database: %v", err)
+	}
+}
+
+func TestSlotFailureEvidenceRejectsMalformedResultEnvelope(t *testing.T) {
+	for _, input := range []string{`null`, `{"result":null}`, `{"result":"private error message"}`, `{"result":[]}`, `{"result":123}`, `{"result":{}}`, `{"runtime_quiescence_evidence":"reaped"}`} {
+		t.Run(input, func(t *testing.T) {
+			summary, ok := slotResultArm(input).(map[string]any)
+			if !ok || summary["decode_error"] == nil {
+				t.Fatalf("malformed result silently accepted: %+v", summary)
+			}
+			encoded, _ := json.Marshal(summary)
+			if strings.Contains(string(encoded), "private error message") {
+				t.Fatal("malformed envelope exposed message")
+			}
+		})
 	}
 }
