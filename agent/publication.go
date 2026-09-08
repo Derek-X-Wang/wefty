@@ -131,6 +131,9 @@ func (controller *publicationController) Run(ctx context.Context) error {
 		requestedRevision := snapshot.revision
 		if *desired {
 			requestedTrue = true
+			// A later true may commit even if its response is lost. An older
+			// false acknowledgement no longer proves publication is clear.
+			acknowledged = nil
 		}
 		err := controller.publish(ctx, *desired)
 		if err != nil {
