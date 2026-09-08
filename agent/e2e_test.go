@@ -224,11 +224,22 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 	client := newHTTPClient(clientFabric, address)
 	defer client.CloseIdleConnections()
 	workingDirectory := t.TempDir()
+	completionBudget := 10 * time.Second
+	if len(arguments) == 2 && arguments[1] == "wait-release" {
+		// Crossing the original lease boundary and observing the next renewal
+		// require the configured lease plus one renewal interval. Preserve the
+		// rest of the existing 10s fixture budget as process/HTTP/scheduler and
+		// clean-completion headroom, not a production latency guarantee.
+		const processTransportCompletionMargin = 8900 * time.Millisecond
+		completionBudget = leaseDuration + renewalInterval + processTransportCompletionMargin
+		t.Logf("phase=renewal budget=%s lease=%s cadence=%s completion-margin=%s", completionBudget, leaseDuration, renewalInterval, processTransportCompletionMargin)
+	}
 	var workloadReady, workloadRelease string
 	if len(arguments) == 2 && arguments[1] == "wait-release" {
 		workloadReady = filepath.Join(directory, "workload-ready")
 		workloadRelease = filepath.Join(directory, "workload-release")
-		arguments = append(append([]string(nil), arguments...), workloadReady, workloadRelease)
+		registerE2EWorkloadRelease(t, workloadRelease)
+		arguments = append(append([]string(nil), arguments...), workloadReady, workloadRelease, completionBudget.String())
 	}
 	job := submitE2EJob(t, client, contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
@@ -243,16 +254,6 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 			HandoffDirectory: workingDirectory,
 		},
 	})
-	completionBudget := 10 * time.Second
-	if workloadRelease != "" {
-		// Crossing the original lease boundary and observing the next renewal
-		// require the configured lease plus one renewal interval. Preserve the
-		// rest of the existing 10s fixture budget as process/HTTP/scheduler and
-		// clean-completion headroom, not a production latency guarantee.
-		const processTransportCompletionMargin = 8900 * time.Millisecond
-		completionBudget = leaseDuration + renewalInterval + processTransportCompletionMargin
-		t.Logf("phase=renewal budget=%s lease=%s cadence=%s completion-margin=%s", completionBudget, leaseDuration, renewalInterval, processTransportCompletionMargin)
-	}
 	completionDeadline := time.Now().Add(completionBudget)
 	var renewedAttempt string
 	if workloadRelease != "" {
@@ -272,6 +273,79 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 	server.stop(t)
 	if wantOutput != "" && !bytes.Contains(agentLogs.Bytes(), []byte(wantOutput)) {
 		t.Fatalf("agent output does not contain %q:\n%s", wantOutput, agentLogs.Bytes())
+	}
+}
+
+// Register after node/server shutdown and temporary-directory cleanups so LIFO
+// releases a failed test's payload before draining its agent or removing files.
+func registerE2EWorkloadRelease(t *testing.T, release string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+			t.Errorf("phase=workload release cleanup path=%s err=%v; helper retains its bounded failure fallback", release, err)
+		}
+	})
+}
+
+func TestE2EWorkloadReleaseCleanupOnFailure(t *testing.T) {
+	const childEnvironment = "WEFTY_RELEASE_CLEANUP_CHILD"
+	if os.Getenv(childEnvironment) == "1" {
+		directory := t.TempDir()
+		ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
+		payload := startManagedProcess(t, agentHelperPath, "wait-release", ready, release, "10s")
+		// This callback occupies the agent-shutdown position in the real fixture.
+		// A zero exit proves the release was observed before any stop signal.
+		t.Cleanup(func() {
+			select {
+			case <-payload.done:
+				if err := payload.waitError(); err != nil {
+					t.Errorf("payload did not exit by release: %v", err)
+					return
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("payload was not released before shutdown cleanup")
+				return
+			}
+			if err := os.WriteFile(os.Getenv("WEFTY_RELEASE_CLEANUP_MARKER"), []byte("released before shutdown"), 0o600); err != nil {
+				t.Error(err)
+			}
+		})
+		registerE2EWorkloadRelease(t, release)
+		payload.start(t)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("cleanup fixture payload did not become ready")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("injected renewal assertion failure")
+	}
+	marker := filepath.Join(t.TempDir(), "cleanup-marker")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestE2EWorkloadReleaseCleanupOnFailure$", "-test.count=1")
+	command.Env = append(os.Environ(), childEnvironment+"=1", "WEFTY_RELEASE_CLEANUP_MARKER="+marker)
+	output, err := command.CombinedOutput()
+	if err == nil || !bytes.Contains(output, []byte("injected renewal assertion failure")) {
+		t.Fatalf("expected injected child-test failure: err=%v output=%s", err, output)
+	}
+	if body, err := os.ReadFile(marker); err != nil || string(body) != "released before shutdown" {
+		t.Fatalf("failure cleanup did not release payload before shutdown: marker=%q err=%v child=%s", body, err, output)
+	}
+}
+
+func TestE2EWorkloadReleaseHelperHasBoundedFailureFallback(t *testing.T) {
+	directory := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, agentHelperPath, "wait-release", filepath.Join(directory, "ready"), filepath.Join(directory, "absent-release"), "50ms")
+	output, err := command.CombinedOutput()
+	if err == nil || ctx.Err() != nil || !bytes.Contains(output, []byte("phase=release fallback")) {
+		t.Fatalf("missing release did not fail within helper bound: err=%v context=%v output=%s", err, ctx.Err(), output)
 	}
 }
 

@@ -183,15 +183,27 @@ func fatalf(format string, args ...any) {
 // waitRelease is a test-only rendezvous: the real process remains alive until
 // its parent test has observed the lease evidence it needs over HTTP.
 func waitRelease() {
-	if len(os.Args) != 4 {
-		fatalf("wait-release requires ready and release paths")
+	if len(os.Args) != 5 {
+		fatalf("wait-release requires ready/release paths and a failure bound")
 	}
+	failureBound, err := time.ParseDuration(os.Args[4])
+	if err != nil || failureBound <= 0 {
+		fatalf("invalid wait-release failure bound %q", os.Args[4])
+	}
+	started := time.Now()
+	deadline := time.NewTimer(failureBound)
+	defer deadline.Stop()
 	if err := os.WriteFile(os.Args[2], []byte("ready"), 0o600); err != nil {
 		fatalf("publish workload readiness: %v", err)
 	}
 	poll := time.NewTicker(time.Millisecond)
 	defer poll.Stop()
-	for range poll.C {
+	for {
+		select {
+		case <-deadline.C:
+			fatalf("phase=release fallback elapsed=%s: release not observed within %s", time.Since(started), failureBound)
+		case <-poll.C:
+		}
 		if _, err := os.Stat(os.Args[3]); err == nil {
 			return
 		} else if !os.IsNotExist(err) {
