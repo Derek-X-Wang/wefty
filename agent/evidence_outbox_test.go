@@ -1317,6 +1317,9 @@ func TestCompletionDirectivePreservesSessionAndEvidence(t *testing.T) {
 				t.Logf("without_outbox=true destination=%d retained_error=%v", destination, executeErr)
 				return
 			}
+			if test.fenced && (destination != errorDestinationAttemptAuthority || executeErr == nil || protocolErrorCode(executeErr) != contract.ErrorAttemptMismatch) {
+				t.Fatalf("renewal authority error lost: destination=%d err=%v", destination, executeErr)
+			}
 			pending := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 			if pending.State != "durable_completion" || !reflect.DeepEqual(pending.Result, liveBody.Result) {
 				t.Fatalf("live cancellation lost durable completion: %+v", pending)
@@ -3040,4 +3043,231 @@ func startEvidenceReplayServer(t *testing.T, handler http.Handler, operationTime
 			t.Errorf("serve evidence replay test: %v", err)
 		}
 	}
+}
+
+// The transport releases a completed HTTP response only after the directive
+// cancels delivery. This orders the lifecycle join without replacing the real
+// Client decoder, completion classifier, durable outbox, or handoff manager.
+func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
+	for _, directive := range []l1.AttemptDirective{l1.AttemptDirectiveStop, l1.AttemptDirectiveRestart} {
+		for _, test := range []struct {
+			name              string
+			ownVerdict        contract.ErrorCode
+			wantDestination   errorDestination
+			successfulHandoff bool
+			loseOwnership     bool
+			rejectReplay      bool
+		}{
+			{name: "own_attempt_mismatch", ownVerdict: contract.ErrorAttemptMismatch, wantDestination: errorDestinationAttemptAuthority},
+			{name: "own_stale_fence", ownVerdict: contract.ErrorStaleFence, wantDestination: errorDestinationAttemptAuthority},
+			{name: "own_node_session_replaced", ownVerdict: contract.ErrorNodeSessionReplaced, wantDestination: errorDestinationNodeSession},
+			{name: "successful_handoff_delivered", successfulHandoff: true},
+			{name: "successful_handoff_replay_rejected", successfulHandoff: true, rejectReplay: true},
+			{name: "handoff_ownership_failure", successfulHandoff: true, loseOwnership: true},
+		} {
+			t.Run(string(directive)+"/"+test.name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+				defer cancel()
+				claim := spoolTestClaim("directive-" + string(directive) + "-" + test.name)
+				claim.Job.Spec.Kind = contract.JobKindProcess
+				claim.Lease.LeaseTTL = time.Second
+				entered := make(chan struct{})
+				replayed := make(chan l1.CompletionRequest, 1)
+				var live l1.CompletionRequest
+				var calls int
+				var mu sync.Mutex
+				var phases []string
+				record := func(phase string) { mu.Lock(); phases = append(phases, phase); mu.Unlock() }
+				response := func(request *http.Request, status int, body any) (*http.Response, error) {
+					data, err := json.Marshal(body)
+					if err != nil {
+						return nil, err
+					}
+					return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(data))), Request: request}, nil
+				}
+				client := &Client{baseURL: "http://directive.test", operationTimeout: time.Second, transport: &http.Transport{}}
+				client.httpClient = &http.Client{Timeout: time.Second, Transport: completionDirectiveRoundTripper(func(request *http.Request) (*http.Response, error) {
+					if request.Body != nil {
+						defer request.Body.Close()
+					}
+					switch {
+					case strings.HasSuffix(request.URL.Path, "/complete"):
+						var body l1.CompletionRequest
+						if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+							return nil, err
+						}
+						mu.Lock()
+						calls++
+						first := calls == 1
+						mu.Unlock()
+						if first {
+							live = body
+							record("completion_entered")
+							close(entered)
+							<-request.Context().Done()
+							wantCause := errAttemptDirectiveStop
+							if directive == l1.AttemptDirectiveRestart {
+								wantCause = errAttemptDirectiveRestart
+							}
+							if context.Cause(request.Context()) != wantCause {
+								return nil, errors.New("completion canceled by a different cause")
+							}
+							record("matching_directive_cancellation")
+							if test.ownVerdict != "" {
+								return response(request, http.StatusConflict, contract.ErrorResponse{Error: contract.APIError{Code: test.ownVerdict, Message: "independent completion verdict"}})
+							}
+							return nil, request.Context().Err()
+						}
+						replayed <- body
+						if test.rejectReplay {
+							return response(request, http.StatusConflict, contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorAttemptMismatch, Message: "superseded completion rejected"}})
+						}
+						return response(request, http.StatusOK, l1.Job{})
+					case strings.HasSuffix(request.URL.Path, "/lease"):
+						select {
+						case <-entered:
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+						record("directive_renewal")
+						lease := claim.Lease
+						lease.Directive = directive
+						return response(request, http.StatusOK, lease)
+					default:
+						return response(request, http.StatusOK, struct{}{})
+					}
+				})}
+				defer client.Close()
+				outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer outbox.Close()
+				var handoffs *handoffManager
+				var handoffPath string
+				if test.successfulHandoff {
+					root := filepath.Join(t.TempDir(), "handoffs")
+					handoffPath = filepath.Join(root, "directive-run")
+					handoffs = newHandoffManager(root, time.Hour)
+					claim.Job.Spec.Class = contract.JobClassOneShot
+					claim.Job.Spec.Labels = map[string]string{"run_id": "directive-run"}
+					claim.Job.Spec.Execution.WorkingDirectory = t.TempDir()
+					claim.Job.Spec.Execution.HandoffDirectory = handoffPath
+				}
+				runner := completionDirectiveRunFunc(func(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+					if request.Started != nil {
+						request.Started()
+					}
+					if !test.successfulHandoff {
+						record("runtime_failure")
+						return contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "controlled runtime failure"}}, nil
+					}
+					marker, exists, err := readHandoffMarker(handoffPath)
+					if err != nil || !exists || marker.NodeID != "stable-node" {
+						return contract.ProcessResult{}, errors.New("real handoff preparation did not establish ownership")
+					}
+					if err := os.WriteFile(filepath.Join(handoffPath, "result"), []byte("successful workload output"), 0600); err != nil {
+						return contract.ProcessResult{}, err
+					}
+					if test.loseOwnership {
+						marker.NodeID = "other-node"
+						if err := writeHandoffMarker(handoffPath, marker); err != nil {
+							return contract.ProcessResult{}, err
+						}
+					}
+					record("runtime_success")
+					zero := 0
+					return contract.ProcessResult{ExitCode: &zero}, nil
+				})
+				lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, outbox: outbox, handoffs: handoffs,
+					runtimes: testRuntimeSet(runner), nodeID: "stable-node", bootSessionID: "directive-boot",
+					clock: systemClock{}, renewalInterval: time.Millisecond, completionRetry: time.Millisecond,
+					observer: newLifecycleObserver(systemClock{}),
+				})
+				destination, executeErr := lifecycle.execute(ctx, claim, time.Now())
+				mu.Lock()
+				observed := append([]string(nil), phases...)
+				mu.Unlock()
+				firstPhase := "runtime_failure"
+				if test.successfulHandoff {
+					firstPhase = "runtime_success"
+				}
+				if !reflect.DeepEqual(observed, []string{firstPhase, "completion_entered", "directive_renewal", "matching_directive_cancellation"}) {
+					t.Fatalf("incorrect branch ordering: %v", observed)
+				}
+				if test.ownVerdict != "" {
+					var protocolErr *ProtocolError
+					var abandoned *completionDeliveryAbandoned
+					if destination != test.wantDestination || executeErr == nil || !strings.HasPrefix(executeErr.Error(), "agent: directive completion: ") || !errors.As(executeErr, &protocolErr) || protocolErr.APIError.Code != test.ownVerdict || errors.As(executeErr, &abandoned) {
+						t.Fatalf("own verdict lost at directive join: destination=%d err=%v", destination, executeErr)
+					}
+					t.Logf("phases=%v own_verdict=%s destination=%d error=%v", observed, test.ownVerdict, destination, executeErr)
+					return
+				}
+				if test.loseOwnership {
+					if destination != errorDestinationUnclassified || executeErr == nil || !strings.Contains(executeErr.Error(), "finish handoff lifecycle") || !strings.Contains(executeErr.Error(), "lost its ownership marker") {
+						t.Fatalf("handoff failure absorbed: destination=%d err=%v", destination, executeErr)
+					}
+					if _, err := os.Stat(filepath.Join(handoffPath, "result")); err != nil {
+						t.Fatalf("unowned handoff mutated: %v", err)
+					}
+				} else {
+					if destination != errorDestinationUnclassified || executeErr != nil {
+						t.Fatalf("successful completion failed: destination=%d err=%v", destination, executeErr)
+					}
+					if _, err := os.Stat(handoffPath); !os.IsNotExist(err) {
+						t.Fatalf("successful handoff not removed before replay: %v", err)
+					}
+				}
+				pending := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+				if pending.State != "durable_completion" || live.Result.ExitCode == nil || *live.Result.ExitCode != 0 || !reflect.DeepEqual(pending.Result, live.Result) {
+					t.Fatalf("successful completion not durable before replay: %+v", pending)
+				}
+				recoveryErrors := make(chan error, 1)
+				outbox.startRecovery(t.Context(), client, func(err error) { recoveryErrors <- err })
+				select {
+				case body := <-replayed:
+					if !reflect.DeepEqual(body, live) {
+						t.Fatalf("replay identity changed: live=%+v replay=%+v", live, body)
+					}
+				case <-ctx.Done():
+					t.Fatal("durable completion not replayed")
+				}
+				state := "delivered"
+				if test.rejectReplay {
+					state = "sealed_incomplete"
+				}
+				waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, state, 2*time.Second)
+				if test.rejectReplay {
+					select {
+					case err := <-recoveryErrors:
+						if !strings.Contains(err.Error(), "durable evidence sealed incomplete") || !strings.Contains(err.Error(), string(contract.ErrorAttemptMismatch)) {
+							t.Fatalf("wrong rejection evidence: %v", err)
+						}
+					case <-ctx.Done():
+						t.Fatal("permanent replay rejection was not reported")
+					}
+				} else {
+					select {
+					case err := <-recoveryErrors:
+						t.Fatalf("unexpected replay error: %v", err)
+					default:
+					}
+				}
+				t.Logf("phases=%v handoff_ownership_error=%v destination=%d err=%v exact_replay=true replay_state=%s", observed, test.loseOwnership, destination, executeErr, state)
+			})
+		}
+	}
+}
+
+type completionDirectiveRoundTripper func(*http.Request) (*http.Response, error)
+
+func (transport completionDirectiveRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+type completionDirectiveRunFunc func(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error)
+
+func (run completionDirectiveRunFunc) Run(ctx context.Context, request processrunner.Request, output processrunner.OutputSink) (contract.ProcessResult, error) {
+	return run(ctx, request, output)
 }
