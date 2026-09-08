@@ -31,7 +31,17 @@ const (
 func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	trace := newPreAdmissionFailureTrace()
 	snapshot := func() {}
-	fatalf := func(format string, args ...any) { snapshot(); trace.emit(t.Logf); t.Fatalf(format, args...) }
+	fatalf := func(format string, args ...any) {
+		trace.reportFailure(t.Logf, snapshot)
+		t.Fatalf(format, args...)
+	}
+	// Registered first, so failure evidence includes all deferred cleanup and
+	// helper directory removal. Successful runs remain silent.
+	t.Cleanup(func() {
+		if t.Failed() {
+			trace.emit(t.Logf)
+		}
+	})
 	network := plain.NewNetwork()
 	store, stopL1 := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
 		"pre-admission-node": {Tags: []string{"pre-admission"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
@@ -111,6 +121,7 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		releaseWatch()
 		releaseDelete()
 		<-executionJoined
+		trace.add("execution cleanup joined")
 	}()
 	snapshot = func() {
 		trace.add("snapshot context cause", context.Cause(runCtx))
@@ -122,11 +133,7 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		} else {
 			trace.add("session HealthError", session.HealthError())
 		}
-		attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
-		trace.add("durable attempts query", err, len(attempts))
-		for _, attempt := range attempts {
-			trace.attempt(attempt)
-		}
+		trace.snapshotAttempts(t.Context(), store.ListJobAttempts, job.JobID)
 	}
 	executionDone := make(chan error, 1)
 	go func() {
@@ -143,6 +150,10 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		fatalf("%v", "attempt did not reach held pre-admission image delivery")
+	}
+
+	if preAdmissionControlledEarlyFailure {
+		fatalf("controlled failure while image admission is held")
 	}
 
 	trace.add("advance agent manual clock 200ms")
