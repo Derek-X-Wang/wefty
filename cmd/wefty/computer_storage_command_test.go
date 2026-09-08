@@ -927,7 +927,8 @@ func (h *storageCLIHarness) startStorageCopyHelperDelayed(operation, destination
 				if err == nil && computer.ReconfigurationPhase == l1.ComputerReconfigurationRestoring {
 					if err := h.store.RecordComputerRestoreAuthorityRevoked(h.ctx, destinationComputerID, computer.IntentRevision, l1.ComputerRestoreRevocationEvidence{
 						RevokeAll: true, TokenRevocation: contract.ComputerTokenRevocationReceipt{
-							ComputerID: destinationComputerID, SubmitIntentRevision: 1, CommittedAt: time.Now().UTC(),
+							ComputerID: destinationComputerID, RestoreOperationRevision: computer.IntentRevision,
+							SubmitIntentRevision: 1, CommittedAt: time.Now().UTC(),
 						},
 					}); err != nil {
 						done <- err
