@@ -89,9 +89,15 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	if err != nil {
 		t.Fatalf("phase=policy install elapsed=%s err=%v", time.Since(started), err)
 	}
+	// Revocation has no intentional lease/grace delay: relay.Close force-closes
+	// sockets before releasing this barrier, and audit finalization follows it
+	// (docs/contracts/agent-local-lifecycle.md). All of the existing 5s bound
+	// is OS/goroutine-delivery margin; startup and audit timers do not apply.
+	const revocationSocketDeliveryMargin = 5 * time.Second
+	t.Logf("phase=revocation relay drain delivery-margin=%s", revocationSocketDeliveryMargin)
 	select {
 	case <-receipt.SessionsClosed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(revocationSocketDeliveryMargin):
 		t.Fatalf("phase=revocation relay drain elapsed=%s acknowledgement=%+v audits=%#v", time.Since(started), receipt.Acknowledgement, auditor.snapshot())
 	}
 	if _, _, err := connection.Read(t.Context()); err == nil {

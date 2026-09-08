@@ -243,7 +243,17 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 			HandoffDirectory: workingDirectory,
 		},
 	})
-	completionDeadline := time.Now().Add(10 * time.Second)
+	completionBudget := 10 * time.Second
+	if workloadRelease != "" {
+		// Crossing the original lease boundary and observing the next renewal
+		// require the configured lease plus one renewal interval. Preserve the
+		// rest of the existing 10s fixture budget as process/HTTP/scheduler and
+		// clean-completion headroom, not a production latency guarantee.
+		const processTransportCompletionMargin = 8900 * time.Millisecond
+		completionBudget = leaseDuration + renewalInterval + processTransportCompletionMargin
+		t.Logf("phase=renewal budget=%s lease=%s cadence=%s completion-margin=%s", completionBudget, leaseDuration, renewalInterval, processTransportCompletionMargin)
+	}
+	completionDeadline := time.Now().Add(completionBudget)
 	var renewedAttempt string
 	if workloadRelease != "" {
 		renewedAttempt = waitForE2ERenewal(t, client, job.JobID, leaseDuration, workloadReady, node, server, completionDeadline)
