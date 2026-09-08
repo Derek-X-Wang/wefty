@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -27,6 +28,8 @@ func main() {
 		hang()
 	case "spawn-child":
 		spawnChild()
+	case "wait-release":
+		waitRelease()
 	case "sleep":
 		sleep()
 	case "paced-output":
@@ -130,10 +133,19 @@ func spawnChild() {
 		fatalf("locate helper executable: %v", err)
 	}
 	child := exec.Command(executable, "hang")
-	child.Stdout = nil
+	ready, err := child.StdoutPipe()
+	if err != nil {
+		fatalf("open child readiness pipe: %v", err)
+	}
+	defer ready.Close()
 	child.Stderr = os.Stderr
 	if err := child.Start(); err != nil {
 		fatalf("start child: %v", err)
+	}
+	// hang publishes its PID only after installing its SIGTERM handler.
+	// Parent output therefore proves both group members are signal-ready.
+	if _, err := bufio.NewReader(ready).ReadString('\n'); err != nil {
+		fatalf("read child signal readiness: %v", err)
 	}
 	ignoreTermination(func() { fmt.Fprintln(os.Stdout, "term") })
 	fmt.Fprintln(os.Stdout, child.Process.Pid)
@@ -166,4 +178,24 @@ func ignoreTermination(onTermination func()) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(2)
+}
+
+// waitRelease is a test-only rendezvous: the real process remains alive until
+// its parent test has observed the lease evidence it needs over HTTP.
+func waitRelease() {
+	if len(os.Args) != 4 {
+		fatalf("wait-release requires ready and release paths")
+	}
+	if err := os.WriteFile(os.Args[2], []byte("ready"), 0o600); err != nil {
+		fatalf("publish workload readiness: %v", err)
+	}
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for range poll.C {
+		if _, err := os.Stat(os.Args[3]); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			fatalf("observe release: %v", err)
+		}
+	}
 }

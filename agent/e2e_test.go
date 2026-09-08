@@ -38,14 +38,12 @@ func TestAgentProcessEndToEndPlainFabric(t *testing.T) {
 			wantOutput:      "e2e-complete\n",
 		},
 		{
-			// The process (3s) outlives the original lease (1s) three times
-			// over, so success proves renewal. Margins are wide because this
-			// runs real processes over HTTP on shared CI runners; sub-second
-			// leases flake under scheduler pauses.
+			// Release the real process only after observing an accepted renewal
+			// on its same attempt beyond the original one-second lease.
 			name:            "renew short lease during long process",
 			leaseDuration:   1 * time.Second,
 			renewalInterval: 100 * time.Millisecond,
-			arguments:       []string{"processhelper", "sleep", "3000"},
+			arguments:       []string{"processhelper", "wait-release"},
 		},
 	}
 	for _, test := range tests {
@@ -226,6 +224,12 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 	client := newHTTPClient(clientFabric, address)
 	defer client.CloseIdleConnections()
 	workingDirectory := t.TempDir()
+	var workloadReady, workloadRelease string
+	if len(arguments) == 2 && arguments[1] == "wait-release" {
+		workloadReady = filepath.Join(directory, "workload-ready")
+		workloadRelease = filepath.Join(directory, "workload-release")
+		arguments = append(append([]string(nil), arguments...), workloadReady, workloadRelease)
+	}
 	job := submitE2EJob(t, client, contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "e2e-" + fmt.Sprint(time.Now().UnixNano()),
@@ -239,12 +243,63 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 			HandoffDirectory: workingDirectory,
 		},
 	})
-	waitForE2EJobState(t, client, job.JobID, contract.JobSucceeded, 10*time.Second)
+	completionDeadline := time.Now().Add(10 * time.Second)
+	var renewedAttempt string
+	if workloadRelease != "" {
+		renewedAttempt = waitForE2ERenewal(t, client, job.JobID, leaseDuration, workloadReady, node, server, completionDeadline)
+		if err := os.WriteFile(workloadRelease, []byte("release"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForE2EJobState(t, client, job.JobID, contract.JobSucceeded, time.Until(completionDeadline))
+	if renewedAttempt != "" {
+		completed := getE2EJob(t, client, job.JobID)
+		if len(completed.Attempts) != 1 || completed.Attempts[0].AttemptID != renewedAttempt {
+			t.Fatalf("phase=renewed attempt completion expected=%s job=%+v", renewedAttempt, completed)
+		}
+	}
 	node.stop(t)
 	server.stop(t)
 	if wantOutput != "" && !bytes.Contains(agentLogs.Bytes(), []byte(wantOutput)) {
 		t.Fatalf("agent output does not contain %q:\n%s", wantOutput, agentLogs.Bytes())
 	}
+}
+
+// This observes server-persisted renewal evidence, without mutating authority
+// or relying on a fixed-duration sleeping payload. The ten-second bound is the
+// shared existing E2E completion budget; none of it changes the real one-second lease.
+func waitForE2ERenewal(t *testing.T, client *http.Client, jobID string, lease time.Duration, ready string, node, server *managedProcess, deadline time.Time) string {
+	t.Helper()
+	started := time.Now()
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+	var last l1.Job
+	var processObservedAt time.Time
+	for time.Now().Before(deadline) {
+		if node.exited() || server.exited() {
+			t.Fatalf("phase=lease renewal elapsed=%s node=%v server=%v", time.Since(started), node.waitError(), server.waitError())
+		}
+		last = getE2EJobContext(t, ctx, client, jobID)
+		if len(last.Attempts) > 1 || last.State == contract.JobFailed {
+			t.Fatalf("phase=lease renewal elapsed=%s job=%+v", time.Since(started), last)
+		}
+		if len(last.Attempts) == 1 {
+			attempt := last.Attempts[0]
+			originalBoundary := attempt.CreatedAt.Add(lease)
+			_, readyErr := os.Stat(ready)
+			if readyErr == nil && processObservedAt.IsZero() {
+				processObservedAt = time.Now()
+			}
+			if !processObservedAt.IsZero() && attempt.UpdatedAt.After(processObservedAt) && attempt.State == contract.AttemptRunning &&
+				attempt.UpdatedAt.After(originalBoundary) && attempt.LeaseExpiresAt.After(originalBoundary) {
+				t.Logf("phase=lease renewal elapsed=%s attempt=%s original-boundary=%s renewed-expiry=%s", time.Since(started), attempt.AttemptID, originalBoundary, attempt.LeaseExpiresAt)
+				return attempt.AttemptID
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("phase=lease renewal elapsed=%s job=%+v", time.Since(started), last)
+	return ""
 }
 
 func submitE2EJob(t *testing.T, client *http.Client, spec contract.JobSpec) l1.Job {
@@ -279,41 +334,51 @@ func submitE2EJob(t *testing.T, client *http.Client, spec contract.JobSpec) l1.J
 
 func waitForE2EJobState(t *testing.T, client *http.Client, jobID string, state contract.JobState, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+	var job l1.Job
 	for time.Now().Before(deadline) {
-		job := getE2EJob(t, client, jobID)
+		job = getE2EJobContext(t, ctx, client, jobID)
 		if job.State == state {
 			return
 		}
 		if job.State == contract.JobFailed {
-			t.Fatalf("job failed while waiting for %q", state)
+			t.Fatalf("phase=job completion elapsed=%s wanted=%q job=%+v", time.Since(started), state, job)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for job %q state %q", jobID, state)
+	t.Fatalf("phase=job completion elapsed=%s job=%q wanted=%q last=%+v", time.Since(started), jobID, state, job)
 }
 
 func getE2EJob(t *testing.T, client *http.Client, jobID string) l1.Job {
 	t.Helper()
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://control-plane.invalid/v1/jobs/"+jobID, nil)
+	return getE2EJobContext(t, t.Context(), client, jobID)
+}
+
+func getE2EJobContext(t *testing.T, ctx context.Context, client *http.Client, jobID string) l1.Job {
+	t.Helper()
+	started := time.Now()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control-plane.invalid/v1/jobs/"+jobID, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("get job status = %d body=%s", response.StatusCode, body)
 	}
 	var job l1.Job
 	if err := json.Unmarshal(body, &job); err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	return job
 }
@@ -372,7 +437,8 @@ type readyMetadata struct {
 
 func waitForReadyAddress(t *testing.T, path string, process *managedProcess, timeout time.Duration) string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
 	for time.Now().Before(deadline) {
 		if process.exited() {
 			t.Fatalf("control plane exited before ready: %v", process.waitError())
@@ -393,7 +459,7 @@ func waitForReadyAddress(t *testing.T, path string, process *managedProcess, tim
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for control-plane ready file")
+	t.Fatalf("phase=control-plane ready file elapsed=%s", time.Since(started))
 	return ""
 }
 

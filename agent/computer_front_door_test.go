@@ -65,13 +65,14 @@ func TestComputerFrontDoorKeepsPermanentDenialNonRetryable(t *testing.T) {
 }
 
 func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.T) {
+	started := time.Now()
 	_, cache, auditor, controlDials, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	defer server.Close()
 	connection, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
 	defer connection.CloseNow()
 	messageType, banner, err := connection.Read(t.Context())
 	if err != nil || messageType != websocket.MessageBinary || string(banner) != "RFB 003.008\n" {
-		t.Fatalf("admitted banner = %q type=%v err=%v", banner, messageType, err)
+		t.Fatalf("phase=view banner elapsed=%s banner=%q type=%v err=%v", time.Since(started), banner, messageType, err)
 	}
 	if controlDials.Load() != 0 {
 		t.Fatalf("control-authorized admission dialed control %d times", controlDials.Load())
@@ -86,22 +87,22 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	})
 	receipt, err := cache.Install(revoked)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=policy install elapsed=%s err=%v", time.Since(started), err)
 	}
 	select {
 	case <-receipt.SessionsClosed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("revocation acknowledgement did not wait for relay closure")
+		t.Fatalf("phase=revocation relay drain elapsed=%s acknowledgement=%+v audits=%#v", time.Since(started), receipt.Acknowledgement, auditor.snapshot())
 	}
 	if _, _, err := connection.Read(t.Context()); err == nil {
-		t.Fatal("revocation left the client relay open")
+		t.Fatalf("phase=revoked client closure elapsed=%s: relay left open", time.Since(started))
 	}
 	waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
 	events := auditor.snapshot()
 	if len(events) != 2 || events[0].Kind != l1.ComputerTakeoverSessionOpen || events[1].Kind != l1.ComputerTakeoverSessionClose ||
 		events[0].AuthorizedRole != l1.ComputerGrantControl || events[0].AdmittedMode != "view" ||
 		events[1].Reason != l1.ComputerTakeoverRevoked {
-		t.Fatalf("take-over audit events = %#v", events)
+		t.Fatalf("phase=revocation audit elapsed=%s events=%#v", time.Since(started), events)
 	}
 	for _, event := range events {
 		if event.UserID != identity.UserID || event.DeviceID != identity.DeviceID || event.AuthorityGeneration != 0 {
@@ -114,7 +115,7 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 		failure.body.Receipt.TenureState != contract.ComputerControlTenureFree ||
 		failure.body.Receipt.PolicyRevision != 2 ||
 		failure.body.Receipt.SessionEndReason != string(l1.ComputerTakeoverRevoked) {
-		t.Fatalf("revoked session control response = status=%d body=%+v", failure.status, failure.body)
+		t.Fatalf("phase=revoked control receipt elapsed=%s status=%d body=%+v", time.Since(started), failure.status, failure.body)
 	}
 }
 
@@ -924,6 +925,7 @@ func (auditor *recordingComputerAuditor) snapshot() []l1.ComputerTakeoverAuditEv
 
 func waitComputerAuditKind(t *testing.T, auditor *recordingComputerAuditor, kind l1.ComputerTakeoverAuditEventKind) {
 	t.Helper()
+	started := time.Now()
 	for {
 		auditor.mu.Lock()
 		for _, event := range auditor.events {
@@ -940,7 +942,7 @@ func waitComputerAuditKind(t *testing.T, auditor *recordingComputerAuditor, kind
 		select {
 		case <-changed:
 		case <-t.Context().Done():
-			t.Fatalf("waiting for %s audit: %v; events: %#v", kind, context.Cause(t.Context()), auditor.snapshot())
+			t.Fatalf("phase=%s audit elapsed=%s: %v; events: %#v", kind, time.Since(started), context.Cause(t.Context()), auditor.snapshot())
 		}
 	}
 }
