@@ -5,13 +5,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
 
 func TestServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
@@ -525,4 +528,111 @@ func TestServiceRemovalWALCheckpointRetriesBlockedReaders(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reader was not released")
 	}
+}
+
+// Serve only the real HTTP handler: this test owns every reconciliation step.
+// In particular no background tick can finalize between acknowledgement and GET.
+func TestForceForgottenAcknowledgementPrecedesTombstoneFinalization(t *testing.T) {
+	network := plain.NewNetwork()
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewServer(serverFabric, store, ServerConfig{NodePolicies: map[string]NodePolicy{"node-1": DefaultNodePolicy()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: server.Handler()}
+	served := make(chan error, 1)
+	go func() { served <- httpServer.Serve(listener) }()
+	h := &integrationHarness{t: t, network: network, store: store, server: server, clock: clock}
+	defer func() {
+		for _, client := range h.clients {
+			client.CloseIdleConnections()
+		}
+		_ = httpServer.Close()
+		if err := <-served; !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve L1 handler: %v", err)
+		}
+	}()
+	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "fabric-agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "node-1")
+	job := submitRemovalService(t, h, client, removalServiceSpec("forgotten-finalization-phase", nil))
+	claimRestartService(t, h, agent, node)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/forget?class=service", ForceForgetRequest{Force: true})
+	if status != http.StatusOK {
+		t.Fatalf("force forget = %d body=%s", status, body)
+	}
+	directives, err := store.ListNodeRemovalDirectives(t.Context(), "fabric-agent", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("directives=%#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	ack := RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, IdempotencyKey: "phase-ack"}
+	// Stage the same committed store operation used by the HTTP ACK handler,
+	// leaving its separate finalization operation under test control.
+	if _, err := store.AcknowledgeServiceRemoval(t.Context(), "fabric-agent", job.JobID, ack); err != nil {
+		t.Fatal(err)
+	}
+	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+job.JobID+"?class=service", nil)
+	var projected Job
+	if status != http.StatusOK {
+		t.Fatalf("GET acknowledged job=%d body=%s", status, body)
+	}
+	if err := json.Unmarshal(body, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.State != contract.JobForgottenCleanupUnverified || projected.Removal == nil ||
+		projected.Removal.RemovalOutcome != ServiceRemovalForgotten || projected.Removal.CleanupAcknowledgedAt == nil ||
+		projected.Removal.RemovalGeneration != directive.RemovalGeneration || projected.Removal.RemovalBoundNodeID != directive.BoundNodeID {
+		t.Fatalf("acknowledged GET projection=%#v", projected)
+	}
+	var before sql.NullInt64
+	if err := store.db.QueryRow(`SELECT cleanup_acknowledged_ns FROM service_tombstones WHERE job_id=?`, job.JobID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before.Valid {
+		t.Fatalf("tombstone finalized before explicit phase: %#v", before)
+	}
+	t.Log("real acknowledged GET satisfies original waiter predicate while tombstone cleanup_acknowledged_ns is NULL")
+	// Guard the old predicate/reader mismatch using the real unfinalized row.
+	var originalReader int64
+	if err := store.db.QueryRow(`SELECT cleanup_acknowledged_ns FROM service_tombstones WHERE job_id=?`, job.JobID).Scan(&originalReader); err == nil {
+		t.Fatal("original int64 reader unexpectedly accepted the unfinalized tombstone")
+	}
+	finalized, changed, err := store.FinalizeServiceRemoval(t.Context(), job.JobID)
+	if err != nil || !changed {
+		t.Fatalf("finalize=%#v changed=%v err=%v", finalized, changed, err)
+	}
+	if finalized.State != contract.JobForgottenCleanupUnverified || finalized.Removal.RemovalOutcome != ServiceRemovalForgotten {
+		t.Fatalf("finalization upgraded forgotten outcome: %#v", finalized)
+	}
+	var after int64
+	if err := store.db.QueryRow(`SELECT cleanup_acknowledged_ns FROM service_tombstones WHERE job_id=?`, job.JobID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != projected.Removal.CleanupAcknowledgedAt.UnixNano() {
+		t.Fatalf("finalized ack=%d want=%d", after, projected.Removal.CleanupAcknowledgedAt.UnixNano())
+	}
+
+	var generation uint64
+	var boundNode, rootInstance string
+	if err := store.db.QueryRow(`SELECT removal_generation, last_bound_node_id, root_instance_id FROM service_tombstones WHERE job_id=?`, job.JobID).Scan(&generation, &boundNode, &rootInstance); err != nil {
+		t.Fatal(err)
+	}
+	if generation != directive.RemovalGeneration || boundNode != directive.BoundNodeID || rootInstance != directive.RootInstanceID {
+		t.Fatalf("finalized identity=%d/%q/%q want=%d/%q/%q", generation, boundNode, rootInstance, directive.RemovalGeneration, directive.BoundNodeID, directive.RootInstanceID)
+	}
+	t.Log("explicit finalization records non-NULL acknowledgement without upgrading forgotten outcome")
+	assertRemovedServiceRows(t, h, job.JobID)
 }
