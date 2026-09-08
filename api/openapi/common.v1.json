@@ -13,8 +13,9 @@
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
           "submit_intent_revision": { "type": "integer", "minimum": 0 },
+          "restore_operation_revision": { "type": "integer", "minimum": 1, "description": "When present, acknowledges a committed fresh RevokeAll for this restore operation. Omitted for general or legacy revocation." },
           "revoked_grant_count": { "type": "integer", "minimum": 0 },
-          "committed_at": { "type": "string", "format": "date-time" }
+          "committed_at": { "type": "string", "format": "date-time", "description": "L3 audit time; never a cross-host ordering prerequisite." }
         }
       },
       "ErrorResponse": {

@@ -243,10 +243,11 @@ type ComputerTokenGrant struct {
 }
 
 type ComputerTokenRevocationRequest struct {
-	ComputerID           string `json:"computer_id"`
-	SubmitIntentRevision int64  `json:"submit_intent_revision"`
-	RevokeAll            bool   `json:"revoke_all,omitempty"`
-	Reason               string `json:"reason"`
+	RestoreOperationRevision int64  `json:"restore_operation_revision,omitempty"`
+	ComputerID               string `json:"computer_id"`
+	SubmitIntentRevision     int64  `json:"submit_intent_revision"`
+	RevokeAll                bool   `json:"revoke_all,omitempty"`
+	Reason                   string `json:"reason"`
 }
 
 type ComputerAttemptTokenRevocationRequest struct {
