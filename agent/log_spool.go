@@ -293,6 +293,18 @@ WHERE result_json IS NOT NULL AND completion_disposition IS NULL
               WHERE r.attempt_id=spool_attempts.attempt_id AND r.disposition IN ('suppressed', 'withheld'))`); err != nil {
 		return fmt.Errorf("agent: join legacy completion dispositions to payloads: %w", err)
 	}
+	// Delivery is cleanup authority for a retained log backlog, not merely
+	// bounded inspection history. Backfill only surviving positive receipts;
+	// an already-pruned legacy receipt cannot establish delivery by inference.
+	if _, err := spool.db.ExecContext(ctx, `UPDATE spool_attempts
+SET completion_disposition='delivered',
+    completion_reason=(SELECT reason FROM spool_completion_receipts r WHERE r.attempt_id=spool_attempts.attempt_id),
+    intent_revision=(SELECT intent_revision FROM spool_completion_receipts r WHERE r.attempt_id=spool_attempts.attempt_id)
+WHERE result_json IS NULL AND completion_disposition IS NULL
+  AND EXISTS (SELECT 1 FROM spool_completion_receipts r
+              WHERE r.attempt_id=spool_attempts.attempt_id AND r.disposition='delivered')`); err != nil {
+		return fmt.Errorf("agent: join legacy delivery evidence to log backlogs: %w", err)
+	}
 	// Older evidence rows did not carry workload kind. OCI attempt manifests
 	// and binding pins identify OCI rows. Plain one-shots retain process
 	// semantics; unclassifiable legacy service rows stay fail-closed rather than
@@ -892,7 +904,7 @@ ON CONFLICT(attempt_id, stream) DO UPDATE SET sequence=MAX(sequence, excluded.se
 	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_attempts
 WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
   AND NOT EXISTS (SELECT 1 FROM spool_events WHERE attempt_id=?)
-  AND EXISTS (SELECT 1 FROM spool_completion_receipts WHERE attempt_id=? AND disposition='delivered')`, attemptID, attemptID, attemptID); err != nil {
+  AND completion_disposition='delivered'`, attemptID, attemptID); err != nil {
 		return fmt.Errorf("agent: clean drained delivered spool attempt: %w", err)
 	}
 	if jobID != "" {
@@ -1185,7 +1197,7 @@ ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=e
 		return fmt.Errorf("agent: record delivered completion receipt: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL,
-completion_disposition=NULL, completion_reason=NULL, intent_revision=NULL WHERE attempt_id=?`, attemptID); err != nil {
+completion_disposition='delivered', completion_reason='acknowledged_by_l1', intent_revision=? WHERE attempt_id=?`, revision, attemptID); err != nil {
 		return fmt.Errorf("agent: release delivered completion: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_attempt_manifests WHERE attempt_id=?`, attemptID); err != nil {
