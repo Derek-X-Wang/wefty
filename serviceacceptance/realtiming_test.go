@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -384,9 +385,8 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	forgottenResponse := runServiceCLI(t, harness, "services", "forget", offline.JobID, "--force")
 	evidence.write("force-forget-offline.json", forgottenResponse)
 	harness.restartAgent(t)
-	forgotten := waitForForgottenCleanup(t, harness, offline.JobID, offlineRoot, 45*time.Second)
+	forgotten, tombstoneBefore := waitForForgottenCleanup(t, harness, offline.JobID, offlineRoot, 45*time.Second)
 	evidence.recordJSON("force-forgotten-after-return.json", forgotten)
-	tombstoneBefore := readRemovalTombstone(t, harness.l1Database, offline.JobID)
 	evidence.recordJSON("removal-tombstone-before-ack-replay.json", tombstoneBefore)
 	replayed := replayFinalizedAcknowledgement(t, harness, offline.JobID, tombstoneBefore)
 	evidence.recordJSON("removal-ack-replay-response.json", replayed)
@@ -658,7 +658,7 @@ func waitForForgottenCleanup(
 	harness *acceptanceHarness,
 	jobID, serviceRoot string,
 	timeout time.Duration,
-) l1.Job {
+) (l1.Job, removalTombstone) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -672,7 +672,20 @@ func waitForForgottenCleanup(
 			if _, err := os.Lstat(serviceRoot); !os.IsNotExist(err) {
 				t.Fatalf("force-forgotten cleanup acknowledged before root absence: %v", err)
 			}
-			return job
+
+			// GET can observe the acknowledgement commit before the separate
+			// finalization commit. Observe both within this same cleanup deadline.
+			tombstone, finalized := readRemovalTombstoneState(t, harness.l1Database, jobID)
+			if finalized {
+				if job.Removal.RemovalOutcome != l1.ServiceRemovalForgotten ||
+					tombstone.Outcome != string(l1.ServiceRemovalForgotten) ||
+					tombstone.LastBoundNodeID != job.Removal.RemovalBoundNodeID ||
+					tombstone.RemovalGeneration != job.Removal.RemovalGeneration ||
+					tombstone.CleanupAcknowledgedNS != job.Removal.CleanupAcknowledgedAt.UnixNano() {
+					t.Fatalf("finalized forgotten tombstone differs from acknowledged job: job=%#v tombstone=%#v", job, tombstone)
+				}
+				return job, tombstone
+			}
 		}
 		if harness.agent.exited() {
 			t.Fatalf("returning agent exited during force-forgotten cleanup: %v\n%s",
@@ -681,7 +694,7 @@ func waitForForgottenCleanup(
 		time.Sleep(250 * time.Millisecond)
 	}
 	t.Fatalf("force-forgotten cleanup did not complete for %q", jobID)
-	return l1.Job{}
+	return l1.Job{}, removalTombstone{}
 }
 
 type removalTombstone struct {
@@ -699,23 +712,39 @@ type removalTombstone struct {
 
 func readRemovalTombstone(t *testing.T, databasePath, jobID string) removalTombstone {
 	t.Helper()
+	tombstone, finalized := readRemovalTombstoneState(t, databasePath, jobID)
+	if !finalized {
+		t.Fatalf("removal tombstone for %q has not finalized cleanup acknowledgement", jobID)
+	}
+	return tombstone
+}
+
+// A force-forgotten tombstone exists before late cleanup finalizes. NULL is
+// pending evidence, never a zero acknowledgement or permission to replay.
+func readRemovalTombstoneState(t *testing.T, databasePath, jobID string) (removalTombstone, bool) {
+	t.Helper()
 	database, err := sql.Open("sqlite", databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer database.Close()
 	var tombstone removalTombstone
+	var acknowledged sql.NullInt64
 	if err := database.QueryRow(`SELECT dispatch_key_hash, request_hash, created_ns, removal_requested_ns,
 		removed_ns, outcome, last_bound_node_id, removal_generation, root_instance_id,
 		cleanup_acknowledged_ns FROM service_tombstones WHERE job_id=?`, jobID).Scan(
 		&tombstone.DispatchKeyHash, &tombstone.RequestHash, &tombstone.CreatedNS,
 		&tombstone.RemovalRequestedNS, &tombstone.RemovedNS, &tombstone.Outcome,
 		&tombstone.LastBoundNodeID, &tombstone.RemovalGeneration, &tombstone.RootInstanceID,
-		&tombstone.CleanupAcknowledgedNS,
+		&acknowledged,
 	); err != nil {
 		t.Fatal(err)
 	}
-	return tombstone
+	if !acknowledged.Valid {
+		return removalTombstone{}, false
+	}
+	tombstone.CleanupAcknowledgedNS = acknowledged.Int64
+	return tombstone, true
 }
 
 func replayFinalizedAcknowledgement(
@@ -955,4 +984,105 @@ func (evidence *realTimingEvidence) write(name string, payload []byte) {
 	if err := os.WriteFile(filepath.Join(evidence.directory, name), payload, 0o600); err != nil {
 		evidence.t.Errorf("write evidence %s: %v", name, err)
 	}
+}
+
+// This exercises the acceptance reader against real L1 transactions, without
+// an agent or background reconciler; each durable phase is explicitly driven.
+func TestForgottenTombstoneObservationRequiresFinalization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forgotten.sqlite")
+	store, err := l1.OpenStore(path, l1.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registration := contract.NodeRegistration{NodeID: "node", BootSessionID: "boot", RootInstanceID: "root",
+		OS: "linux", Architecture: runtime.GOARCH, AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC()}
+	if _, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, registration, l1.DefaultNodePolicy(), true); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey: "forgotten-reader", Kind: contract.JobKindProcess, Class: contract.JobClassService,
+		Restart: contract.RestartAlways, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/echo"}, Argv: []string{"echo", "hello"}, WorkingDirectory: "/tmp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimJob(t.Context(), "agent", registration.NodeID, registration.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim=%#v err=%v", claim, err)
+	}
+	if _, err := store.ForceForgetService(t.Context(), job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	directives, err := store.ListNodeRemovalDirectives(t.Context(), "agent", registration.NodeID, registration.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("directives=%#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	ack := l1.RemovalAcknowledgementRequest{NodeID: registration.NodeID, BootSessionID: registration.BootSessionID,
+		RemovalGeneration: directive.RemovalGeneration, RootInstanceID: directive.RootInstanceID,
+		CleanupFence: directive.CleanupFence, IdempotencyKey: "ack"}
+	if _, finalized := readRemovalTombstoneState(t, path, job.JobID); finalized {
+		t.Fatal("force-forgotten tombstone accepted before acknowledgement")
+	}
+	acknowledged, err := store.AcknowledgeServiceRemoval(t.Context(), "agent", job.JobID, ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acknowledged.State != contract.JobForgottenCleanupUnverified || acknowledged.Removal == nil || acknowledged.Removal.CleanupAcknowledgedAt == nil {
+		t.Fatalf("acknowledged=%#v", acknowledged)
+	}
+	if _, finalized := readRemovalTombstoneState(t, path, job.JobID); finalized {
+		t.Fatal("acknowledgement accepted as finalized tombstone")
+	}
+
+	// Finalize only when the waiter requests a second observation. Returning
+	// after the first API acknowledgement would leave the tombstone NULL.
+	observations := 0
+	transport := forgottenCleanupTransport(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/jobs/"+job.JobID {
+			return nil, fmt.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+		}
+		observations++
+		if observations == 2 {
+			if _, changed, err := store.FinalizeServiceRemoval(request.Context(), job.JobID); err != nil || !changed {
+				return nil, fmt.Errorf("controlled finalization changed=%v err=%v", changed, err)
+			}
+		}
+		projected, err := store.GetJob(request.Context(), job.JobID)
+		if err != nil {
+			return nil, err
+		}
+		body, err := json.Marshal(projected)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+	harness := &acceptanceHarness{client: &http.Client{Transport: transport}, l1Database: path, agent: &managedProcess{done: make(chan struct{})}}
+	observed, before := waitForForgottenCleanup(t, harness, job.JobID, filepath.Join(t.TempDir(), "absent-service-root"), 45*time.Second)
+	if observations != 2 || observed.State != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("waiter observations=%d job=%#v", observations, observed)
+	}
+	if before.Outcome != string(l1.ServiceRemovalForgotten) || before.RemovalGeneration != directive.RemovalGeneration ||
+		before.RootInstanceID != directive.RootInstanceID || before.LastBoundNodeID != directive.BoundNodeID ||
+		before.CleanupAcknowledgedNS != acknowledged.Removal.CleanupAcknowledgedAt.UnixNano() {
+		t.Fatalf("finalized tombstone=%#v", before)
+	}
+	ack.CleanupFence = "not-retained-after-finalization"
+	ack.IdempotencyKey = "replayed-after-finalization"
+	replayed, err := store.AcknowledgeServiceRemoval(t.Context(), "agent", job.JobID, ack)
+	if err != nil || replayed.State != contract.JobForgottenCleanupUnverified || replayed.Removal.RemovalOutcome != l1.ServiceRemovalForgotten {
+		t.Fatalf("replayed=%#v err=%v", replayed, err)
+	}
+	if after := readRemovalTombstone(t, path, job.JobID); after != before {
+		t.Fatalf("replay changed tombstone: before=%#v after=%#v", before, after)
+	}
+}
+
+// Only the HTTP boundary is controlled; responses come from the real L1 store.
+type forgottenCleanupTransport func(*http.Request) (*http.Response, error)
+
+func (transport forgottenCleanupTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
 }
