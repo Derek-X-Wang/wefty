@@ -1878,6 +1878,50 @@ ORDER BY d.depth DESC, r.created_ns, r.run_id`, contract.RunSucceeded, contract.
 	return runs, nil
 }
 
+// failMissingL1Job fails closed without replay: a cold authority may have lost
+// dispatch-key deduplication along with the job. The first write checks the
+// captured state and both durable identities; terminal winners cannot be changed.
+func (s *Store) failMissingL1Job(ctx context.Context, run projectedRun) (bool, error) {
+	if run.JobID == "" || run.State == contract.RunSucceeded || run.State == contract.RunFailed {
+		return false, nil
+	}
+	now := canonicalTime(s.clock.Now())
+	cause := contract.APIError{Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed", Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": run.JobID}}
+	payload, err := json.Marshal(cause)
+	if err != nil {
+		return false, internalError(err, "encode L1 regression")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, internalError(err, "begin L1 regression")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, updated_ns=?, started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?)
+ WHERE run_id=? AND status=? AND l1_job_id=? AND EXISTS (
+ SELECT 1 FROM dispatch_outbox o WHERE o.run_id=runs.run_id AND o.job_id=? AND o.dispatched_ns IS NOT NULL)`,
+		contract.RunFailed, now.UnixNano(), now.UnixNano(), now.UnixNano(), run.RunID, run.State, run.JobID, run.JobID)
+	if err != nil {
+		return false, internalError(err, "fail L1-regressed run")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, internalError(err, "read L1 regression result")
+	}
+	if changed == 0 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`, string(payload), run.RunID); err != nil {
+		return false, internalError(err, "record L1 regression")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, canonicalTime(now.Add(s.tokenGrace)).UnixNano(), run.RunID); err != nil {
+		return false, internalError(err, "expire L1-regressed run token")
+	}
+	if err := tx.Commit(); err != nil {
+		return false, internalError(err, "commit L1 regression")
+	}
+	return true, nil
+}
+
 func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState contract.JobState) error {
 	target, change, err := ProjectJobState(run.State, jobState)
 	if err != nil || !change {
@@ -1948,7 +1992,7 @@ func (s *Store) recordRunNode(ctx context.Context, runID, nodeID string) error {
 		return nil
 	}
 	now := canonicalTime(s.clock.Now())
-	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=? AND COALESCE(node_id, '')=''`, nodeID, now.UnixNano(), runID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=? AND COALESCE(node_id, '')='' AND status NOT IN (?, ?)`, nodeID, now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed); err != nil {
 		return internalError(err, "record run node attribution")
 	}
 	return nil

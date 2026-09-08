@@ -293,26 +293,30 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		"job_id": primary.JobID, "attempt_ids": attemptIDs, "payload_pids": payloadPIDs,
 	})
 
-	runningRemoval := runServiceCLI(t, harness, "services", "remove", sibling.JobID, "--wait=90s")
+	runningRemovalCtx, cancelRunningRemoval := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancelRunningRemoval()
+	runningRemoval := runServiceCLIContext(t, runningRemovalCtx, harness, "services", "remove", sibling.JobID, "--wait=90s")
 	evidence.write("remove-running.json", runningRemoval)
-	harness.waitForJobState(t, sibling.JobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
-	waitForProcessAbsent(t, siblingHealth.PID, 10*time.Second)
-	assertPublishedUnavailable(t, harness, ports[1])
+	assertRemovalVerified(t, runningRemovalCtx, harness, sibling.JobID)
 	assertRemovalPersistence(
-		t, harness, sibling.JobID, harness.specs[sibling.JobID],
+		t, runningRemovalCtx, harness, sibling.JobID, harness.specs[sibling.JobID],
 		harness.specs[sibling.JobID].Execution.SensitiveEnv["SERVICE_ACCEPTANCE_SECRET"],
 	)
+	waitForProcessAbsent(t, siblingHealth.PID, 10*time.Second)
+	assertPublishedUnavailable(t, harness, ports[1])
 	assertNoServiceResidue(t, harness, sibling.JobID)
 
 	primaryHealth = waitForHealth(t, primaryClient, "http://primary.invalid", harness.agent)
 	stopResponse = runServiceCLI(t, harness, "services", "stop", primary.JobID, "--wait=45s")
 	evidence.write("cli-stop-before-removal.json", stopResponse)
 	harness.waitForJobState(t, primary.JobID, contract.JobClassService, contract.JobStopped, 10*time.Second)
-	stoppedRemoval := runServiceCLI(t, harness, "services", "remove", primary.JobID, "--wait=90s")
+	stoppedRemovalCtx, cancelStoppedRemoval := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancelStoppedRemoval()
+	stoppedRemoval := runServiceCLIContext(t, stoppedRemovalCtx, harness, "services", "remove", primary.JobID, "--wait=90s")
 	evidence.write("remove-stopped.json", stoppedRemoval)
-	harness.waitForJobState(t, primary.JobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
+	assertRemovalVerified(t, stoppedRemovalCtx, harness, primary.JobID)
 	assertRemovalPersistence(
-		t, harness, primary.JobID, harness.specs[primary.JobID],
+		t, stoppedRemovalCtx, harness, primary.JobID, harness.specs[primary.JobID],
 		harness.specs[primary.JobID].Execution.SensitiveEnv["SERVICE_ACCEPTANCE_SECRET"],
 	)
 	var primaryReplay l1.Job
@@ -624,6 +628,13 @@ func assertStoppedService(
 
 func runServiceCLI(t *testing.T, harness *acceptanceHarness, arguments ...string) []byte {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return runServiceCLIContext(t, ctx, harness, arguments...)
+}
+
+func runServiceCLIContext(t *testing.T, ctx context.Context, harness *acceptanceHarness, arguments ...string) []byte {
+	t.Helper()
 	args := []string{
 		"--fabric=plain",
 		"--l1=" + harness.controlPlaneAddress,
@@ -631,12 +642,13 @@ func runServiceCLI(t *testing.T, harness *acceptanceHarness, arguments ...string
 		"--json",
 	}
 	args = append(args, arguments...)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	command := exec.CommandContext(ctx, weftyBinaryPath, args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run wefty %v: %v\n%s", arguments, err, output)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatal(err)
 	}
 	return output
 }

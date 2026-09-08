@@ -285,3 +285,59 @@ VALUES('attempt', 'job', 'fence', ?, 1)`, test.class); err != nil {
 		})
 	}
 }
+
+func TestLegacyDeliveryBackfillRequiresSurvivingPositiveReceipt(t *testing.T) {
+	for _, positive := range []bool{true, false} {
+		t.Run(fmt.Sprintf("surviving-receipt-%t", positive), func(t *testing.T) {
+			directory := t.TempDir()
+			spool := openTestLogSpool(t, directory, "legacy-delivery", 1024)
+			defer func() { spool.Close() }()
+			claim := spoolTestClaim("legacy-delivered")
+			prepareDeliveredBacklog(t, spool, claim)
+			// Emulate the prior writer: delivery cleared the payload and decision.
+			if _, err := spool.db.ExecContext(t.Context(), "UPDATE spool_attempts SET completion_disposition=NULL,completion_reason=NULL,intent_revision=NULL WHERE attempt_id=?", claim.Lease.AttemptID); err != nil {
+				t.Fatal(err)
+			}
+			if !positive {
+				if _, err := spool.db.ExecContext(t.Context(), "DELETE FROM spool_completion_receipts WHERE attempt_id=?", claim.Lease.AttemptID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seedNewerDeliveryReceipts(t, spool, claim.Lease.AttemptID)
+			if err := spool.Close(); err != nil {
+				t.Fatal(err)
+			}
+			spool = openTestLogSpool(t, directory, "legacy-delivery", 1024)
+			// Open performs genuine pruning: positive evidence must be joined first.
+			assertDeliveryReceiptPruned(t, spool, claim.Lease.AttemptID)
+			receipt := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+			expected := "never_persisted"
+			if positive {
+				expected = "delivered"
+			}
+			if receipt.State != expected || receipt.EventCount != 2 {
+				t.Fatalf("legacy inspection=%+v, want %s", receipt, expected)
+			}
+			if positive && (receipt.Reason != "acknowledged_by_l1" || receipt.IntentRevision != 7) {
+				t.Fatalf("backfilled authority=%+v", receipt)
+			}
+			if _, _, _, present, err := spool.completionWithEvidence(t.Context(), claim.Lease.AttemptID); err != nil || present {
+				t.Fatalf("legacy completion replayable=%t err=%v", present, err)
+			}
+			if err := spool.acknowledge(t.Context(), claim.Lease.AttemptID, map[contract.LogStream]uint64{contract.LogStdout: 1}); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := spool.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			want := 1
+			if positive {
+				want = 0
+			}
+			if count != want {
+				t.Fatalf("legacy retained rows=%d want%d", count, want)
+			}
+		})
+	}
+}

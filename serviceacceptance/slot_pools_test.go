@@ -16,51 +16,82 @@ import (
 )
 
 func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
+	evidence := newSlotFailureEvidence()
+	defer func() {
+		failure := recover()
+		if t.Failed() || failure != nil {
+			evidence.log(t)
+		}
+		if failure != nil {
+			panic(failure)
+		}
+	}()
+	evidence.stage = "harness-start"
 	harness := newAcceptanceHarness(t)
+	evidence.harness = harness
+	evidence.stage = "reserve-ports"
 	ports := reserveDistinctPorts(t, 3)
-	services := []l1.Job{
-		harness.submitEchoService(t, ports[0]),
-		harness.submitEchoService(t, ports[1]),
-		harness.submitEchoService(t, ports[2]),
+	services := make([]l1.Job, 3)
+	for index := range services {
+		evidence.stage = fmt.Sprintf("submit-service-%d", index)
+		services[index] = harness.submitEchoService(t, ports[index])
+		evidence.jobs[index].JobID = services[index].JobID
 	}
 
+	evidence.stage = "published-clients"
 	serviceClients := []*http.Client{
 		harness.publishedHTTPClient(t, ports[0]),
 		harness.publishedHTTPClient(t, ports[1]),
 	}
 	serviceURLs := []string{"http://service-a.invalid", "http://service-b.invalid"}
+	evidence.stage = "initial-health-a"
 	healthA := waitForHealth(t, serviceClients[0], serviceURLs[0], harness.agent)
+	evidence.stage = "initial-health-b"
 	healthB := waitForHealth(t, serviceClients[1], serviceURLs[1], harness.agent)
+	evidence.stage = "initial-running-a"
 	runningA := harness.waitForJobState(t, services[0].JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
+	evidence.stage = "initial-running-b"
 	harness.waitForJobState(t, services[1].JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
+	evidence.stage = "initial-c-queued"
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
 
 	oneshots := make([]l1.Job, 0, 5)
 	for index := range 5 {
+		evidence.stage = fmt.Sprintf("submit-oneshot-%d", index)
 		oneshots = append(oneshots, harness.submitSleepingOneShot(t, index))
+		evidence.jobs[3+index].JobID = oneshots[index].JobID
 	}
+	evidence.stage = "oneshot-saturation"
 	waitForOneShotSaturation(t, harness, oneshots, 5*time.Second)
 
+	evidence.stage = "kill-a-and-check-b"
 	if err := syscall.Kill(healthA.PID, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill first service payload: %v", err)
 	}
+	evidence.stage = "post-kill-b-echo"
 	assertEcho(t, serviceClients[1], serviceURLs[1], []byte("sibling survived"))
 	if harness.agent.exited() {
 		t.Fatalf("agent exited after one service payload was killed: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
 	}
+	evidence.stage = "post-kill-b-pid"
 	if current := waitForHealth(t, serviceClients[1], serviceURLs[1], harness.agent); current.PID != healthB.PID {
 		t.Fatalf("unaffected service PID = %d, want original sibling PID %d", current.PID, healthB.PID)
 	}
 
+	evidence.stage = "a-restart"
 	restarted := waitForFreshRunningAttempt(t, harness, services[0].JobID, runningA.CurrentAttemptID, 8*time.Second)
+	evidence.stage = "a-restart-health"
 	restartedHealth := waitForHealth(t, serviceClients[0], serviceURLs[0], harness.agent)
 	if restarted.CurrentAttemptID == runningA.CurrentAttemptID || restartedHealth.PID == healthA.PID {
 		t.Fatalf("killed service did not restart under a fresh attempt and payload: attempt=%q pid=%d", restarted.CurrentAttemptID, restartedHealth.PID)
 	}
+	evidence.stage = "post-restart-c-queued"
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
 
 	for index, job := range oneshots {
+		evidence.stage = fmt.Sprintf("await-oneshot-%d-succeeded", index)
 		harness.waitForJobState(t, job.JobID, contract.JobClassOneShot, contract.JobSucceeded, 8*time.Second)
+		evidence.stage = fmt.Sprintf("oneshot-%d-output", index)
 		output := harness.agent.outputString()
 		if !attributedOutputContains(output, job.JobID, fmt.Sprintf("oneshot-%d", index)) {
 			t.Fatalf("one-shot %s output was not visibly attributed\n%s", job.JobID, output)

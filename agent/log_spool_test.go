@@ -890,3 +890,170 @@ func spoolTestEvent(attemptID string, stream contract.LogStream, sequence uint64
 		Bytes:     []byte(payload),
 	}
 }
+
+func TestDeliveredBacklogSurvivesReceiptPruningAndReopen(t *testing.T) {
+	directory := t.TempDir()
+	spool := openTestLogSpool(t, directory, "delivery-marker", 1024)
+	defer func() { spool.Close() }()
+	claim := spoolTestClaim("delivered-pruned")
+	prepareDeliveredBacklog(t, spool, claim)
+	seedNewerDeliveryReceipts(t, spool, claim.Lease.AttemptID)
+	trigger := spoolTestClaim("prune-trigger")
+	if err := spool.ensureAttempt(t.Context(), trigger); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	if err := spool.storeCompletion(t.Context(), trigger.Lease.AttemptID, l1.ProcessResult{ExitCode: &zero}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.completionDelivered(t.Context(), trigger.Lease.AttemptID, 0); err != nil {
+		t.Fatal(err)
+	}
+	assertDeliveryReceiptPruned(t, spool, claim.Lease.AttemptID)
+	check := func(events int64) {
+		receipt := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+		if receipt.State != "delivered" || receipt.Reason != "acknowledged_by_l1" || receipt.IntentRevision != 7 || receipt.EventCount != events {
+			t.Errorf("delivery evidence after receipt pruning=%+v", receipt)
+		}
+		if _, _, _, present, err := spool.completionWithEvidence(t.Context(), claim.Lease.AttemptID); err != nil || present {
+			t.Fatalf("delivered completion replayable=%t err=%v", present, err)
+		}
+	}
+	check(2)
+	if err := spool.acknowledge(t.Context(), claim.Lease.AttemptID, map[contract.LogStream]uint64{contract.LogStdout: 0}); err != nil {
+		t.Fatal(err)
+	}
+	check(1)
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spool = openTestLogSpool(t, directory, "delivery-marker", 1024)
+	check(1)
+	if err := spool.acknowledge(t.Context(), claim.Lease.AttemptID, map[contract.LogStream]uint64{contract.LogStdout: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"spool_attempts", "spool_acknowledgements", "spool_events"} {
+		var count int
+		if err := spool.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table+" WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("final ACK retained %s rows=%d", table, count)
+		}
+	}
+}
+
+func prepareDeliveredBacklog(t *testing.T, spool *logSpool, claim l1.Claim) {
+	t.Helper()
+	if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for sequence, payload := range []string{"one", "two"} {
+		if err := spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	zero := 0
+	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &zero}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID, 7); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Past nanosecond ordinals impose deterministic pruning order without future
+// authority timestamps. The caller invokes a real production prune path.
+func seedNewerDeliveryReceipts(t *testing.T, spool *logSpool, attemptID string) {
+	t.Helper()
+	tx, err := spool.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(t.Context(), "UPDATE spool_completion_receipts SET observed_ns=1 WHERE attempt_id=?", attemptID); err != nil {
+		t.Fatal(err)
+	}
+	for index := range maxCompletionInspectionReceipts {
+		if _, err := tx.ExecContext(t.Context(), `INSERT INTO spool_completion_receipts(attempt_id,disposition,reason,observed_ns) VALUES(?,'delivered','test',?)`, fmt.Sprintf("past-receipt-%04d", index), index+2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+func assertDeliveryReceiptPruned(t *testing.T, spool *logSpool, attemptID string) {
+	t.Helper()
+	var target, total int
+	if err := spool.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM spool_completion_receipts WHERE attempt_id=?", attemptID).Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM spool_completion_receipts").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if target != 0 || total > maxCompletionInspectionReceipts {
+		t.Fatalf("prune precondition: target=%d total=%d cap=%d", target, total, maxCompletionInspectionReceipts)
+	}
+	t.Logf("real audit prune: target=%d total=%d cap=%d", target, total, maxCompletionInspectionReceipts)
+}
+
+func TestDeliveredCleanupRequiresPositiveEvidenceAndEmptyBacklog(t *testing.T) {
+	for _, state := range []string{"undelivered", "never-completed", "suppressed", "withheld", "incomplete", "pending"} {
+		t.Run(state, func(t *testing.T) {
+			spool := openTestLogSpool(t, t.TempDir(), "delivery-guards", 1024)
+			defer spool.Close()
+			claim := spoolTestClaim("guard-" + state)
+			if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+				t.Fatal(err)
+			}
+			for sequence := range 2 {
+				if err := spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), "x")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state != "never-completed" {
+				zero := 0
+				if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &zero}, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch state {
+			case "suppressed", "withheld":
+				if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, state, "test", 2); err != nil {
+					t.Fatal(err)
+				}
+			case "incomplete":
+				if err := spool.sealIncomplete(t.Context(), claim.Lease.AttemptID, "test incomplete", contract.ErrorAttemptNotFound, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID, 7); err != nil {
+					t.Fatal(err)
+				}
+			case "pending":
+				if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID, 7); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sequence := uint64(1)
+			if state == "pending" {
+				sequence = 0
+			}
+			if err := spool.acknowledge(t.Context(), claim.Lease.AttemptID, map[contract.LogStream]uint64{contract.LogStdout: sequence}); err != nil {
+				t.Fatal(err)
+			}
+			var rows int
+			if err := spool.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 1 {
+				t.Fatalf("cleanup deleted %s evidence", state)
+			}
+			inspection := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+			expected := map[string]string{"undelivered": "durable_completion", "never-completed": "never_persisted", "suppressed": "suppressed", "withheld": "withheld", "incomplete": "sealed_incomplete", "pending": "delivered"}[state]
+			if inspection.State != expected {
+				t.Fatalf("%s inspection=%+v", state, inspection)
+			}
+		})
+	}
+}
