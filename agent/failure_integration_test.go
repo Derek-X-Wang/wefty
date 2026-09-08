@@ -25,6 +25,10 @@ import (
 )
 
 func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
+	runOCIIntentStopFixture(t, false)
+}
+
+func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
 		"intent-node": {Tags: []string{"intent-stop"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
@@ -76,6 +80,7 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 			intent, err := intentSource.ReadIntent(ctx)
 			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
 		},
+		AttemptDeadman:       newRecordingDeadmanRenewer(),
 		OCIBootBarrier:       readyOCIBootBarrier{},
 		WorkloadRuntimes:     map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
@@ -86,11 +91,8 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
-	runContext, cancelRun := context.WithCancel(t.Context())
-	defer cancelRun()
-	defer runtime.release()
-	runDone := make(chan error, 1)
-	go func() { runDone <- nodeAgent.Run(runContext) }()
+	cancelRun, runDone, cleanupRun := startOCIIntentFixtureAgent(t, nodeAgent, store, job.JobID, runtime.release, controlledRenewal)
+	defer cleanupRun()
 	var attemptID string
 	select {
 	case attemptID = <-runtime.started:
@@ -180,6 +182,10 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 }
 
 func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *testing.T) {
+	runPreStartedOCIRuntimeLossFixture(t, false)
+}
+
+func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 	for _, test := range []struct {
 		name       string
 		intentStop bool
@@ -238,6 +244,7 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 					intent, err := intentSource.ReadIntent(ctx)
 					return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
 				},
+				AttemptDeadman: newRecordingDeadmanRenewer(),
 				OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 				ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
 				HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
@@ -247,9 +254,10 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 				t.Fatal(err)
 			}
 			defer nodeAgent.Close()
-			runContext, cancelRun := context.WithCancel(t.Context())
-			runDone := make(chan error, 1)
-			go func() { runDone <- nodeAgent.Run(runContext) }()
+			var releaseOnce sync.Once
+			releaseRuntime := func() { releaseOnce.Do(func() { close(runtime.release) }) }
+			cancelRun, runDone, cleanupRun := startOCIIntentFixtureAgent(t, nodeAgent, store, job.JobID, releaseRuntime, controlledRenewal)
+			defer cleanupRun()
 			select {
 			case <-runtime.entered:
 			case <-time.After(5 * time.Second):
@@ -274,7 +282,7 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 				cancelRun()
 				t.Fatal(err)
 			}
-			close(runtime.release)
+			releaseRuntime()
 			deadline := time.Now().Add(3 * time.Second)
 			if test.intentStop {
 				for {
