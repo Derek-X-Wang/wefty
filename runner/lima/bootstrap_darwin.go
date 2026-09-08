@@ -201,8 +201,12 @@ func (installer guestHelperInstaller) remove(ctx context.Context, config GuestHe
 	}
 	state, stateErr := decodeInstanceState(statePayload, config.Instance)
 	if stateErr != nil {
-		// A removed instance cannot retain guest helper files.
-		return GuestHelperRemovalEvidence{SocketStopped: true, ServiceStopped: true, FilesAbsent: true}, nil
+		var absent *instanceAbsentError
+		if errors.As(stateErr, &absent) {
+			// A positively absent instance cannot retain guest helper files.
+			return GuestHelperRemovalEvidence{SocketStopped: true, ServiceStopped: true, FilesAbsent: true}, nil
+		}
+		return GuestHelperRemovalEvidence{}, stateErr
 	}
 	startedForRemoval := false
 	if state == InstanceBroken {

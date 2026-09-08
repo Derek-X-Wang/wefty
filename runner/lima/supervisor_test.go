@@ -589,3 +589,33 @@ func (runner *supervisorRunner) commandsSnapshot() [][]string {
 	}
 	return result
 }
+
+func TestDecodeInstanceStateDistinguishesAbsenceFromInvalidInspection(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		payload   string
+		wantState InstanceState
+		wantError string
+		absent    bool
+	}{
+		{name: "empty", wantState: InstanceUnknown, wantError: `inspect Lima instance: instance "wefty-oci" is absent`, absent: true},
+		{name: "other", payload: `{"name":"other","status":"running"}`, wantState: InstanceUnknown, wantError: `inspect Lima instance: instance "wefty-oci" is absent`, absent: true},
+		{name: "malformed", payload: `{`, wantState: InstanceUnknown, wantError: "inspect Lima instance: invalid JSON"},
+		{name: "unknown_status", payload: `{"name":"wefty-oci","status":"unknown"}`, wantState: InstanceUnknown},
+		{name: "running", payload: `{"name":"wefty-oci","status":"Running"}`, wantState: InstanceRunning},
+		{name: "stopped", payload: `{"name":"wefty-oci","status":"Stopped"}`, wantState: InstanceStopped},
+		{name: "broken", payload: `{"name":"wefty-oci","status":"Broken"}`, wantState: InstanceBroken},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, err := decodeInstanceState([]byte(test.payload), DefaultInstanceName)
+			message := ""
+			if err != nil {
+				message = err.Error()
+			}
+			var absent *instanceAbsentError
+			if state != test.wantState || message != test.wantError || errors.As(err, &absent) != test.absent {
+				t.Fatalf("state=%q err=%v absent=%t; want state=%q err=%q absent=%t", state, err, absent != nil, test.wantState, test.wantError, test.absent)
+			}
+		})
+	}
+}

@@ -410,6 +410,16 @@ func reasonForInstanceState(state InstanceState) contract.CapabilityReasonCode {
 	}
 }
 
+// instanceAbsentError distinguishes a parsed inventory without the requested
+// instance from an inspection that could not establish its presence or absence.
+type instanceAbsentError struct {
+	instance string
+}
+
+func (err *instanceAbsentError) Error() string {
+	return fmt.Sprintf("inspect Lima instance: instance %q is absent", err.instance)
+}
+
 func decodeInstanceState(payload []byte, instance string) (InstanceState, error) {
 	type limaInstance struct {
 		Name   string `json:"name"`
@@ -438,7 +448,7 @@ func decodeInstanceState(payload []byte, instance string) (InstanceState, error)
 			return InstanceUnknown, nil
 		}
 	}
-	return InstanceUnknown, fmt.Errorf("inspect Lima instance: instance %q is absent", instance)
+	return InstanceUnknown, &instanceAbsentError{instance: instance}
 }
 
 func waitForSupervisor(ctx context.Context, delay time.Duration) error {
