@@ -19,22 +19,23 @@ import (
 )
 
 type computerServiceConfig struct {
-	clock             Clock
-	fabric            fabric.Fabric
-	authorizer        *ComputerPolicyCache
-	auditor           computerTakeoverAuditor
-	computerTokens    ComputerTokenMinter
-	controlTokens     *computerControlTokenCodec
-	computerBridge    *computerAttemptBridgeController
-	submission        ComputerSubmissionAuthority
-	computerID        string
-	jobID             string
-	attemptID         string
-	storageID         string
-	storageGeneration int64
-	fencingToken      string
-	dial              computerEndpointDial
-	publish           func(context.Context, bool, string) error
+	clock                Clock
+	fabric               fabric.Fabric
+	authorizer           *ComputerPolicyCache
+	auditor              computerTakeoverAuditor
+	computerTokens       ComputerTokenMinter
+	controlTokens        *computerControlTokenCodec
+	computerBridge       *computerAttemptBridgeController
+	submission           ComputerSubmissionAuthority
+	computerID           string
+	jobID                string
+	attemptID            string
+	storageID            string
+	storageGeneration    int64
+	fencingToken         string
+	dial                 computerEndpointDial
+	publish              func(context.Context, bool, string) error
+	publicationOperation func(context.Context) (context.Context, context.CancelFunc)
 }
 
 // computerAttemptBridgeController makes the transport follow Computer
@@ -158,7 +159,7 @@ func runComputerService(
 	if clock == nil {
 		clock = systemClock{}
 	}
-	if config.fabric == nil || config.authorizer == nil || config.auditor == nil || config.dial == nil {
+	if config.fabric == nil || config.authorizer == nil || config.auditor == nil || config.dial == nil || config.publicationOperation == nil {
 		err := errors.New("Computer service front door dependencies are incomplete")
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
@@ -219,15 +220,39 @@ func runComputerService(
 		serverErrors <- serveErr
 	}()
 
+	// Payload cancellation cannot cancel the final publication operation. The
+	// caller supplies its existing L1 operation bound when withdrawal begins.
+	publicationContext, cancelPublication := context.WithCancelCause(context.WithoutCancel(ctx))
+	defer cancelPublication(nil)
+	var publicationMu sync.Mutex
+	var drainContext context.Context
+	var requestedPublication, confirmedWithdrawal bool
+	var lastPublicationErr error
 	publication := newPublicationController(clock, 0, 0,
 		func(publishContext context.Context, ready bool) error {
-			if config.publish == nil {
-				return nil
+			publicationMu.Lock()
+			if drainContext != nil {
+				publishContext = drainContext
 			}
-			return config.publish(publishContext, ready, displayEndpoint)
+			if ready {
+				requestedPublication = true
+				confirmedWithdrawal = false
+			}
+			publicationMu.Unlock()
+			var err error
+			if config.publish != nil {
+				err = config.publish(publishContext, ready, displayEndpoint)
+			}
+			publicationMu.Lock()
+			lastPublicationErr = err
+			if err == nil {
+				confirmedWithdrawal = !ready
+			}
+			publicationMu.Unlock()
+			return err
 		}, frontDoor.SetReady)
 	publicationDone := make(chan error, 1)
-	go func() { publicationDone <- publication.Run(runContext) }()
+	go func() { publicationDone <- publication.Run(publicationContext) }()
 
 	started := make(chan time.Time, 1)
 	runtimeStarted := make(chan struct{})
@@ -290,6 +315,24 @@ func runComputerService(
 	}()
 
 	stop := func(publicationFinished bool, publicationErr error) error {
+		// Keep an earlier caller deadline while detaching execution cancellation.
+		// Anchor the caller's operation budget once; every final mutation and
+		// retry shares it, including time spent closing sessions below.
+		parent := context.WithoutCancel(ctx)
+		if deadline, ok := ctx.Deadline(); ok {
+			var cancelParent context.CancelFunc
+			parent, cancelParent = context.WithDeadline(parent, deadline)
+			defer cancelParent()
+		}
+		operationContext, cancelOperation := config.publicationOperation(parent)
+		defer cancelOperation()
+		publicationMu.Lock()
+		drainContext = operationContext
+		publicationMu.Unlock()
+		stopDeadline := context.AfterFunc(operationContext, func() {
+			cancelPublication(context.Cause(operationContext))
+		})
+		defer stopDeadline()
 		bridgeErr := config.computerBridge.disable(errComputerAttemptClosed)
 		publication.Stop()
 		frontDoor.EndSessions(l1.ComputerTakeoverAttemptAuthorityLost)
@@ -302,6 +345,16 @@ func runComputerService(
 		if !publicationFinished {
 			publicationErr = <-publicationDone
 		}
+		cancelPublication(nil)
+		publicationMu.Lock()
+		if requestedPublication && !confirmedWithdrawal {
+			failure := errors.Join(publicationErr, lastPublicationErr, context.Cause(operationContext))
+			if failure == nil {
+				failure = errors.New("publication controller stopped without acknowledging final false")
+			}
+			publicationErr = fmt.Errorf("withdraw Computer publication: %w", failure)
+		}
+		publicationMu.Unlock()
 		return errors.Join(bridgeErr, publicationErr, frontDoorErr)
 	}
 	select {
