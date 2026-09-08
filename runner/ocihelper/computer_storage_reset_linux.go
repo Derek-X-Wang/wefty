@@ -84,13 +84,13 @@ func closeComputerDiskLock(lock *os.File) {
 // attach therefore either owns the lock first (and reset refuses) or observes
 // the durable fence after acquiring it; it can never resurrect the generation
 // after successor verification.
-func (engine *ContainerdEngine) fenceResetPredecessor(storage ComputerStorageReference, authority ComputerStorageResetAuthority) error {
+func (engine *ContainerdEngine) fenceResetPredecessor(ctx context.Context, storage ComputerStorageReference, authority ComputerStorageResetAuthority) error {
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return err
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-	lock, err := openComputerDiskLock(diskRoot)
+	lock, err := engine.openComputerStorageDestination(ctx, diskRoot)
 	if err != nil {
 		return err
 	}
@@ -292,7 +292,7 @@ func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, reques
 	} else if quarantined {
 		return ResetComputerStorageResponse{}, &ComputerStorageQuarantinedError{Storage: successor}
 	}
-	if err := engine.fenceResetPredecessor(request.Storage, request.Authority); err != nil {
+	if err := engine.fenceResetPredecessor(ctx, request.Storage, request.Authority); err != nil {
 		return ResetComputerStorageResponse{}, err
 	}
 	receipt, err := engine.prepareResetSuccessor(ctx, request)

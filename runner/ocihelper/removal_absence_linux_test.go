@@ -200,3 +200,74 @@ func TestStorageCreatorsReleaseRootAdmissionBeforeGenerationWork(t *testing.T) {
 		})
 	}
 }
+
+func TestResetPredecessorCreationWaitsForAbsentDeletion(t *testing.T) {
+	system := &removalAdmissionDiskSystem{fakeComputerDiskSystem: newFakeComputerDiskSystem()}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: t.TempDir()}, diskSystem: system}
+	request := resetTestRequest(testComputerStorage(), testComputerAuthority("prior", "fence", "boot"))
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	storage := request.Storage
+	name, _ := deterministicComputerDiskName(storage)
+	root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: "boot", JobID: request.Authority.JobID, PriorJobID: request.Authority.PriorJobID, RemovalGeneration: 1, CleanupFence: "removal-fence"}
+	inventory, err := engine.inventoryComputerStorageRemoval(t.Context(), InventoryRemovalRequest{Removal: removal, RootInstanceID: request.Authority.RootInstanceID, ComputerStorage: &storage}, ResourceInventory{})
+	if err != nil || len(inventory.Attempts) != 1 || !inventory.Attempts[0].StorageAbsent {
+		t.Fatalf("freeze predecessor absence: %+v err=%v", inventory, err)
+	}
+	observed := false
+	system.inspect = func() {
+		// Disable recursion when the old predecessor path inspects its mount.
+		system.inspect = nil
+		observed = true
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := engine.ResetComputerStorage(ctx, request); !errors.Is(err, context.Canceled) {
+			t.Errorf("reset did not respect owned absence admission: %v", err)
+		}
+		if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("reset predecessor root entered absent deletion interval: %v", err)
+		}
+	}
+	if err := engine.deleteComputerDiskWithAbsence(storage, removal, inventory.Attempts[0].StorageAbsent); err != nil {
+		t.Fatal(err)
+	}
+	if !observed {
+		t.Fatal("deletion did not exercise the post-absence filesystem interval")
+	}
+
+	// Once deletion releases admission, the same request may create its missing
+	// predecessor and keep the retirement fence through successor verification.
+	fenced := false
+	engine.storageResetHook = func(phase computerStorageResetPhase) error {
+		if phase != computerStorageResetRetirementFenced {
+			return nil
+		}
+		fenced = true
+		if !engine.computerStorageRootMu.TryLock() {
+			t.Error("retirement publication retained root admission")
+		} else {
+			engine.computerStorageRootMu.Unlock()
+		}
+		lock, err := openComputerDiskLock(root)
+		if lock != nil {
+			closeComputerDiskLock(lock)
+		}
+		if !errors.Is(err, errComputerStorageAttachmentOwned) {
+			t.Errorf("retirement publication lost predecessor flock: %v", err)
+		}
+		return nil
+	}
+	response, err := engine.ResetComputerStorage(t.Context(), request)
+	if err != nil || !response.Verified || !fenced {
+		t.Fatalf("reset after deletion: response=%+v fenced=%v err=%v", response, fenced, err)
+	}
+	manifest, present, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+	if err != nil || !present || manifest.Retirement == nil || !sameComputerStorageResetAuthority(*manifest.Retirement, request.Authority) {
+		t.Fatalf("durable predecessor retirement lost: manifest=%+v present=%v err=%v", manifest, present, err)
+	}
+	_, err = engine.attachComputerDisk(t.Context(), storage, testComputerAuthority("late", "late-fence", "boot"))
+	var retired *computerStorageRetiredError
+	if !errors.As(err, &retired) {
+		t.Fatalf("delayed predecessor attachment bypassed retirement: %v", err)
+	}
+}
