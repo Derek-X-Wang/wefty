@@ -32,7 +32,7 @@ func protocolError(code contract.ErrorCode, format string, args ...any) error {
 }
 
 func internalError(err error, message string) error {
-	return &Error{Code: contract.ErrorInternal, Message: message, Cause: err}
+	return &Error{Code: contract.ErrorInternal, Message: message, Retryable: true, Cause: err}
 }
 
 func errorDetails(err error) (contract.ErrorCode, bool) {
