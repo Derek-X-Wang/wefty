@@ -369,6 +369,7 @@ func TestMaxRuntimeUsesInjectedClock(t *testing.T) {
 }
 
 func TestTimeoutTerminatesThenKillsEntireProcessGroup(t *testing.T) {
+	started := time.Now()
 	clock := newFakeClock(time.Unix(3_000, 0))
 	sink := newCollectingSink()
 	runner := New(Config{
@@ -381,20 +382,38 @@ func TestTimeoutTerminatesThenKillsEntireProcessGroup(t *testing.T) {
 		Execution: helperExecution("spawn-child"),
 	}, sink)
 
-	childPID := eventPID(t, sink.Next(t))
-	// The PID event is delivered from inside the output writer. Let that real
-	// OS/process boundary return before advancing the injected idle clock, so
-	// termination cannot overtake the writer that proves signal delivery.
-	time.Sleep(50 * time.Millisecond)
-	clock.WaitForTimerCount(t, 1)
-	clock.Advance(10 * time.Second)
-	if event := sink.Next(t); !bytes.Contains(event.Bytes, []byte("term")) {
-		t.Fatalf("graceful termination output = %q, want term", event.Bytes)
+	childPID := eventPID(t, sink.NextPhase(t, finished, "child PID / signal readiness", started))
+	groupID, err := syscall.Getpgid(childPID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	clock.WaitForTimerCount(t, 2)
+	joined := false
+	t.Cleanup(func() {
+		if !joined {
+			_ = syscall.Kill(-groupID, syscall.SIGKILL)
+		}
+	})
+	// PID delivery proves that activity was marked, but not that the runner
+	// finished resetting the idle timer for that activity. Advancing while
+	// Reset is in flight can move its relative deadline another idle period.
+	clock.WaitForResetDeadline(t, clock.Now().Add(10*time.Second))
+	clock.Advance(10 * time.Second)
+	if event := sink.NextPhase(t, finished, "stdout SIGTERM acknowledgement", started); !bytes.Contains(event.Bytes, []byte("term")) {
+		t.Fatalf("phase=SIGTERM acknowledgement elapsed=%s stdout=%q, want term", time.Since(started), event.Bytes)
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("phase=TERM grace elapsed=%s child %d exited before group KILL: %v", time.Since(started), childPID, err)
+	}
+	clock.WaitForActiveDeadline(t, clock.Now().Add(2*time.Second))
 	clock.Advance(2 * time.Second)
 
-	outcome := awaitRun(t, finished)
+	var outcome runOutcome
+	select {
+	case outcome = <-finished:
+	case <-time.After(DefaultStartupReadinessDeadline):
+		t.Fatalf("phase=runner reap elapsed=%s after group KILL", time.Since(started))
+	}
+	joined = true
 	if !errors.Is(outcome.err, ErrIdleTimeout) {
 		t.Fatalf("Run() error = %v, want %v", outcome.err, ErrIdleTimeout)
 	}
@@ -537,6 +556,24 @@ func (sink *collectingSink) Next(t *testing.T) contract.LogEvent {
 	}
 }
 
+// NextPhase retains the existing 30-second process-output failure bound,
+// expressed using the runner's real-process startup bound. Runner completion
+// makes an absent output immediately actionable instead of consuming the bound.
+func (sink *collectingSink) NextPhase(t *testing.T, finished <-chan runOutcome, phase string, started time.Time) contract.LogEvent {
+	t.Helper()
+	timer := time.NewTimer(DefaultStartupReadinessDeadline)
+	defer timer.Stop()
+	select {
+	case event := <-sink.next:
+		return event
+	case outcome := <-finished:
+		t.Fatalf("phase=%s elapsed=%s runner finished: result=%#v err=%v events=%#v", phase, time.Since(started), outcome.result, outcome.err, sink.Events())
+	case <-timer.C:
+		t.Fatalf("phase=%s elapsed=%s output deadline=%s events=%#v", phase, time.Since(started), DefaultStartupReadinessDeadline, sink.Events())
+	}
+	return contract.LogEvent{}
+}
+
 type runOutcome struct {
 	result contract.ProcessResult
 	err    error
@@ -582,7 +619,8 @@ func eventPID(t *testing.T, event contract.LogEvent) int {
 
 func waitForProcessGone(t *testing.T, pid int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	started := time.Now()
+	deadline := started.Add(DefaultProcessReapTimeout)
 	for time.Now().Before(deadline) {
 		err := syscall.Kill(pid, 0)
 		if errors.Is(err, syscall.ESRCH) {
@@ -590,7 +628,7 @@ func waitForProcessGone(t *testing.T, pid int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("process %d still exists after group kill", pid)
+	t.Fatalf("phase=child absence elapsed=%s process %d still exists after group kill", time.Since(started), pid)
 }
 
 type fakeClock struct {
@@ -649,6 +687,22 @@ func (clock *fakeClock) WaitForTimerCount(t *testing.T, count int) {
 	}, fmt.Sprintf("%d timers", count))
 }
 
+// WaitForResetDeadline observes completion under the same lock as Reset.
+// An initially-created timer with this deadline is not sufficient evidence.
+func (clock *fakeClock) WaitForResetDeadline(t *testing.T, deadline time.Time) {
+	t.Helper()
+	waitForCondition(t, func() bool {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		for _, timer := range clock.timers {
+			if timer.resets > 0 && timer.active && timer.deadline.Equal(deadline) {
+				return true
+			}
+		}
+		return false
+	}, "completed idle reset to "+deadline.String())
+}
+
 func (clock *fakeClock) WaitForActiveDeadline(t *testing.T, deadline time.Time) {
 	t.Helper()
 	waitForCondition(t, func() bool {
@@ -668,6 +722,7 @@ type fakeTimer struct {
 	channel  chan time.Time
 	deadline time.Time
 	active   bool
+	resets   int
 }
 
 func (timer *fakeTimer) C() <-chan time.Time { return timer.channel }
@@ -684,6 +739,7 @@ func (timer *fakeTimer) Reset(duration time.Duration) bool {
 	timer.clock.mu.Lock()
 	defer timer.clock.mu.Unlock()
 	wasActive := timer.active
+	timer.resets++
 	timer.deadline = timer.clock.now.Add(duration)
 	timer.active = true
 	return wasActive
@@ -691,12 +747,13 @@ func (timer *fakeTimer) Reset(duration time.Duration) bool {
 
 func waitForCondition(t *testing.T, condition func() bool, description string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	started := time.Now()
+	deadline := started.Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", description)
+	t.Fatalf("phase=%s elapsed=%s: condition not observed", description, time.Since(started))
 }

@@ -38,14 +38,12 @@ func TestAgentProcessEndToEndPlainFabric(t *testing.T) {
 			wantOutput:      "e2e-complete\n",
 		},
 		{
-			// The process (3s) outlives the original lease (1s) three times
-			// over, so success proves renewal. Margins are wide because this
-			// runs real processes over HTTP on shared CI runners; sub-second
-			// leases flake under scheduler pauses.
+			// Release the real process only after observing an accepted renewal
+			// on its same attempt beyond the original one-second lease.
 			name:            "renew short lease during long process",
 			leaseDuration:   1 * time.Second,
 			renewalInterval: 100 * time.Millisecond,
-			arguments:       []string{"processhelper", "sleep", "3000"},
+			arguments:       []string{"processhelper", "wait-release"},
 		},
 	}
 	for _, test := range tests {
@@ -226,6 +224,23 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 	client := newHTTPClient(clientFabric, address)
 	defer client.CloseIdleConnections()
 	workingDirectory := t.TempDir()
+	completionBudget := 10 * time.Second
+	if len(arguments) == 2 && arguments[1] == "wait-release" {
+		// Crossing the original lease boundary and observing the next renewal
+		// require the configured lease plus one renewal interval. Preserve the
+		// rest of the existing 10s fixture budget as process/HTTP/scheduler and
+		// clean-completion headroom, not a production latency guarantee.
+		const processTransportCompletionMargin = 8900 * time.Millisecond
+		completionBudget = leaseDuration + renewalInterval + processTransportCompletionMargin
+		t.Logf("phase=renewal budget=%s lease=%s cadence=%s completion-margin=%s", completionBudget, leaseDuration, renewalInterval, processTransportCompletionMargin)
+	}
+	var workloadReady, workloadRelease string
+	if len(arguments) == 2 && arguments[1] == "wait-release" {
+		workloadReady = filepath.Join(directory, "workload-ready")
+		workloadRelease = filepath.Join(directory, "workload-release")
+		registerE2EWorkloadRelease(t, workloadRelease)
+		arguments = append(append([]string(nil), arguments...), workloadReady, workloadRelease, completionBudget.String())
+	}
 	job := submitE2EJob(t, client, contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "e2e-" + fmt.Sprint(time.Now().UnixNano()),
@@ -239,12 +254,136 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 			HandoffDirectory: workingDirectory,
 		},
 	})
-	waitForE2EJobState(t, client, job.JobID, contract.JobSucceeded, 10*time.Second)
+	completionDeadline := time.Now().Add(completionBudget)
+	var renewedAttempt string
+	if workloadRelease != "" {
+		renewedAttempt = waitForE2ERenewal(t, client, job.JobID, leaseDuration, workloadReady, node, server, completionDeadline)
+		if err := os.WriteFile(workloadRelease, []byte("release"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForE2EJobState(t, client, job.JobID, contract.JobSucceeded, time.Until(completionDeadline))
+	if renewedAttempt != "" {
+		completed := getE2EJob(t, client, job.JobID)
+		if len(completed.Attempts) != 1 || completed.Attempts[0].AttemptID != renewedAttempt {
+			t.Fatalf("phase=renewed attempt completion expected=%s job=%+v", renewedAttempt, completed)
+		}
+	}
 	node.stop(t)
 	server.stop(t)
 	if wantOutput != "" && !bytes.Contains(agentLogs.Bytes(), []byte(wantOutput)) {
 		t.Fatalf("agent output does not contain %q:\n%s", wantOutput, agentLogs.Bytes())
 	}
+}
+
+// Register after node/server shutdown and temporary-directory cleanups so LIFO
+// releases a failed test's payload before draining its agent or removing files.
+func registerE2EWorkloadRelease(t *testing.T, release string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+			t.Errorf("phase=workload release cleanup path=%s err=%v; helper retains its bounded failure fallback", release, err)
+		}
+	})
+}
+
+func TestE2EWorkloadReleaseCleanupOnFailure(t *testing.T) {
+	const childEnvironment = "WEFTY_RELEASE_CLEANUP_CHILD"
+	if os.Getenv(childEnvironment) == "1" {
+		directory := t.TempDir()
+		ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
+		payload := startManagedProcess(t, agentHelperPath, "wait-release", ready, release, "10s")
+		// This callback occupies the agent-shutdown position in the real fixture.
+		// A zero exit proves the release was observed before any stop signal.
+		t.Cleanup(func() {
+			select {
+			case <-payload.done:
+				if err := payload.waitError(); err != nil {
+					t.Errorf("payload did not exit by release: %v", err)
+					return
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("payload was not released before shutdown cleanup")
+				return
+			}
+			if err := os.WriteFile(os.Getenv("WEFTY_RELEASE_CLEANUP_MARKER"), []byte("released before shutdown"), 0o600); err != nil {
+				t.Error(err)
+			}
+		})
+		registerE2EWorkloadRelease(t, release)
+		payload.start(t)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("cleanup fixture payload did not become ready")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("injected renewal assertion failure")
+	}
+	marker := filepath.Join(t.TempDir(), "cleanup-marker")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestE2EWorkloadReleaseCleanupOnFailure$", "-test.count=1")
+	command.Env = append(os.Environ(), childEnvironment+"=1", "WEFTY_RELEASE_CLEANUP_MARKER="+marker)
+	output, err := command.CombinedOutput()
+	if err == nil || !bytes.Contains(output, []byte("injected renewal assertion failure")) {
+		t.Fatalf("expected injected child-test failure: err=%v output=%s", err, output)
+	}
+	if body, err := os.ReadFile(marker); err != nil || string(body) != "released before shutdown" {
+		t.Fatalf("failure cleanup did not release payload before shutdown: marker=%q err=%v child=%s", body, err, output)
+	}
+}
+
+func TestE2EWorkloadReleaseHelperHasBoundedFailureFallback(t *testing.T) {
+	directory := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, agentHelperPath, "wait-release", filepath.Join(directory, "ready"), filepath.Join(directory, "absent-release"), "50ms")
+	output, err := command.CombinedOutput()
+	if err == nil || ctx.Err() != nil || !bytes.Contains(output, []byte("phase=release fallback")) {
+		t.Fatalf("missing release did not fail within helper bound: err=%v context=%v output=%s", err, ctx.Err(), output)
+	}
+}
+
+// This observes server-persisted renewal evidence, without mutating authority
+// or relying on a fixed-duration sleeping payload. The ten-second bound is the
+// shared existing E2E completion budget; none of it changes the real one-second lease.
+func waitForE2ERenewal(t *testing.T, client *http.Client, jobID string, lease time.Duration, ready string, node, server *managedProcess, deadline time.Time) string {
+	t.Helper()
+	started := time.Now()
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+	var last l1.Job
+	var processObservedAt time.Time
+	for time.Now().Before(deadline) {
+		if node.exited() || server.exited() {
+			t.Fatalf("phase=lease renewal elapsed=%s node=%v server=%v", time.Since(started), node.waitError(), server.waitError())
+		}
+		last = getE2EJobContext(t, ctx, client, jobID)
+		if len(last.Attempts) > 1 || last.State == contract.JobFailed {
+			t.Fatalf("phase=lease renewal elapsed=%s job=%+v", time.Since(started), last)
+		}
+		if len(last.Attempts) == 1 {
+			attempt := last.Attempts[0]
+			originalBoundary := attempt.CreatedAt.Add(lease)
+			_, readyErr := os.Stat(ready)
+			if readyErr == nil && processObservedAt.IsZero() {
+				processObservedAt = time.Now()
+			}
+			if !processObservedAt.IsZero() && attempt.UpdatedAt.After(processObservedAt) && attempt.State == contract.AttemptRunning &&
+				attempt.UpdatedAt.After(originalBoundary) && attempt.LeaseExpiresAt.After(originalBoundary) {
+				t.Logf("phase=lease renewal elapsed=%s attempt=%s original-boundary=%s renewed-expiry=%s", time.Since(started), attempt.AttemptID, originalBoundary, attempt.LeaseExpiresAt)
+				return attempt.AttemptID
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("phase=lease renewal elapsed=%s job=%+v", time.Since(started), last)
+	return ""
 }
 
 func submitE2EJob(t *testing.T, client *http.Client, spec contract.JobSpec) l1.Job {
@@ -279,41 +418,51 @@ func submitE2EJob(t *testing.T, client *http.Client, spec contract.JobSpec) l1.J
 
 func waitForE2EJobState(t *testing.T, client *http.Client, jobID string, state contract.JobState, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+	var job l1.Job
 	for time.Now().Before(deadline) {
-		job := getE2EJob(t, client, jobID)
+		job = getE2EJobContext(t, ctx, client, jobID)
 		if job.State == state {
 			return
 		}
 		if job.State == contract.JobFailed {
-			t.Fatalf("job failed while waiting for %q", state)
+			t.Fatalf("phase=job completion elapsed=%s wanted=%q job=%+v", time.Since(started), state, job)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for job %q state %q", jobID, state)
+	t.Fatalf("phase=job completion elapsed=%s job=%q wanted=%q last=%+v", time.Since(started), jobID, state, job)
 }
 
 func getE2EJob(t *testing.T, client *http.Client, jobID string) l1.Job {
 	t.Helper()
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://control-plane.invalid/v1/jobs/"+jobID, nil)
+	return getE2EJobContext(t, t.Context(), client, jobID)
+}
+
+func getE2EJobContext(t *testing.T, ctx context.Context, client *http.Client, jobID string) l1.Job {
+	t.Helper()
+	started := time.Now()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control-plane.invalid/v1/jobs/"+jobID, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("get job status = %d body=%s", response.StatusCode, body)
 	}
 	var job l1.Job
 	if err := json.Unmarshal(body, &job); err != nil {
-		t.Fatal(err)
+		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
 	return job
 }
@@ -372,7 +521,8 @@ type readyMetadata struct {
 
 func waitForReadyAddress(t *testing.T, path string, process *managedProcess, timeout time.Duration) string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
 	for time.Now().Before(deadline) {
 		if process.exited() {
 			t.Fatalf("control plane exited before ready: %v", process.waitError())
@@ -393,7 +543,7 @@ func waitForReadyAddress(t *testing.T, path string, process *managedProcess, tim
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for control-plane ready file")
+	t.Fatalf("phase=control-plane ready file elapsed=%s", time.Since(started))
 	return ""
 }
 

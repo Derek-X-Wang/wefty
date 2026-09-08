@@ -646,3 +646,72 @@ func TestRunTokenLineageFilterErrorNeverReturnsUnfilteredDescendants(t *testing.
 }
 
 var _ ComputerGrantVerifier = (*controlledComputerGrantVerifier)(nil)
+
+func TestRestoreRevocationClientBindsFreshCommittedTransactions(t *testing.T) {
+	h := newComputerHTTPHarness(t, nil)
+	ctx := context.Background()
+	client, err := l1.NewComputerTokenRevocationClient(h.network.NewFabric(fabric.Identity{NodeID: h.server.controlPlaneNodeID}), h.address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.CloseIdleConnections)
+	request := l1.ComputerTokenRevocation{ComputerID: "computer-1", NewSubmitIntentRevision: 1, RevokeAll: true, Reason: "computer_restoring", RestoreOperationRevision: 17}
+	for _, wantCount := range []int{0, 1, 0} {
+		var token string
+		if wantCount == 1 {
+			grant, err := h.store.MintComputerToken(ctx, testComputerScope())
+			if err != nil {
+				t.Fatal(err)
+			}
+			token = grant.Token
+		}
+		receipt, err := client.RevokeComputerTokens(ctx, request)
+		if err != nil || receipt.ComputerID != request.ComputerID || receipt.RestoreOperationRevision != 17 || receipt.RevokedGrantCount != wantCount || receipt.CommittedAt.IsZero() {
+			t.Fatalf("fresh revocation receipt=%#v err=%v want count=%d", receipt, err, wantCount)
+		}
+		if token != "" {
+			if _, err := h.store.AuthenticateComputerToken(ctx, token); err == nil {
+				t.Fatal("fresh retry did not revoke intervening grant")
+			}
+		}
+	}
+	unauthorized, err := l1.NewComputerTokenRevocationClient(h.network.NewFabric(fabric.Identity{NodeID: "not-control-plane"}), h.address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(unauthorized.CloseIdleConnections)
+	if receipt, err := unauthorized.RevokeComputerTokens(ctx, request); err == nil || receipt.RestoreOperationRevision != 0 {
+		t.Fatalf("unauthorized receipt=%#v err=%v", receipt, err)
+	}
+	for _, invalid := range []l1.ComputerTokenRevocation{
+		{ComputerID: "computer-1", NewSubmitIntentRevision: 1, Reason: "computer_restoring", RestoreOperationRevision: 17},
+		{ComputerID: "computer-1", NewSubmitIntentRevision: 1, RevokeAll: true, Reason: "disabled", RestoreOperationRevision: 17},
+		{ComputerID: "computer-1", NewSubmitIntentRevision: 1, RevokeAll: true, Reason: "computer_restoring", RestoreOperationRevision: -1},
+	} {
+		if receipt, err := client.RevokeComputerTokens(ctx, invalid); err == nil || receipt.RestoreOperationRevision != 0 {
+			t.Fatalf("invalid context receipt=%#v err=%v", receipt, err)
+		}
+	}
+	// An omitted operation binding continues to support ordinary revocation.
+	request.RestoreOperationRevision = 0
+	request.Reason = "disabled"
+	if receipt, err := client.RevokeComputerTokens(ctx, request); err != nil || receipt.RestoreOperationRevision != 0 {
+		t.Fatalf("general receipt=%#v err=%v", receipt, err)
+	}
+	// A failed revocation transaction must not issue a bound acknowledgement.
+	if _, err := h.store.db.Exec(`CREATE TRIGGER fail_restore_revocation BEFORE UPDATE OF revoked_ns ON computer_token_grants BEGIN SELECT RAISE(ABORT, 'injected revoke failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	grant, err := h.store.MintComputerToken(ctx, testComputerScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.RestoreOperationRevision = 18
+	request.Reason = "computer_restoring"
+	if receipt, err := client.RevokeComputerTokens(ctx, request); err == nil || receipt.RestoreOperationRevision != 0 {
+		t.Fatalf("failed transaction receipt=%#v err=%v", receipt, err)
+	}
+	if _, err := h.store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
+		t.Fatalf("failed transaction changed grant: %v", err)
+	}
+}

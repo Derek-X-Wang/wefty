@@ -39,6 +39,15 @@ func publishedBackupForStorageCopy(t *testing.T, keepCapacity int64) (*integrati
 }
 
 func TestRestoreHeartbeatFailsClosedAndRecordsRevocationBeforeDirective(t *testing.T) {
+	testRestoreHeartbeatRevocation(t, 0)
+}
+
+func TestRestoreHeartbeatAcceptsClockSkew(t *testing.T) {
+	testRestoreHeartbeatRevocation(t, -2*time.Minute)
+}
+
+func testRestoreHeartbeatRevocation(t *testing.T, skew time.Duration) {
+	t.Helper()
 	h, node, computer, source, claim := publishedBackupForStorageCopy(t, 2)
 	for index, event := range []struct {
 		id, kind, sessionID, reason string
@@ -68,12 +77,12 @@ func TestRestoreHeartbeatFailsClosedAndRecordsRevocationBeforeDirective(t *testi
 	}
 	revocations := 0
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
-		if request.ComputerID != computer.ComputerID || !request.RevokeAll || request.Reason != "computer_restoring" {
+		if request.ComputerID != computer.ComputerID || !request.RevokeAll || request.Reason != "computer_restoring" || request.RestoreOperationRevision != reserved.IntentRevision {
 			t.Fatalf("restore revocation = %#v", request)
 		}
 		revocations++
 		return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
-			SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
+			RestoreOperationRevision: request.RestoreOperationRevision, SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now().Add(skew)}, nil
 	}}
 	for heartbeat := 1; heartbeat <= 2; heartbeat++ {
 		status, _, body = h.do(agentClient, http.MethodPost, "/v1/agent/nodes/"+node.NodeID+"/heartbeat", heartbeatRequestForNode(node))
@@ -94,9 +103,9 @@ func TestRestoreHeartbeatFailsClosedAndRecordsRevocationBeforeDirective(t *testi
 	}
 }
 
-func testRestoreRevocationEvidence(computerID string) ComputerRestoreRevocationEvidence {
+func testRestoreRevocationEvidence(computerID string, operationRevision int64) ComputerRestoreRevocationEvidence {
 	return ComputerRestoreRevocationEvidence{RevokeAll: true, TokenRevocation: contract.ComputerTokenRevocationReceipt{
-		ComputerID: computerID, SubmitIntentRevision: 1, CommittedAt: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+		ComputerID: computerID, RestoreOperationRevision: operationRevision, SubmitIntentRevision: 1, CommittedAt: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 	}}
 }
 
@@ -109,7 +118,7 @@ func TestRestoreRevocationReceiptRejectsWrongOperationRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID,
-		reserved.IntentRevision+1, testRestoreRevocationEvidence(computer.ComputerID))
+		reserved.IntentRevision+1, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision+1))
 	if errorCode(err) != contract.ErrorStaleIntentRevision {
 		t.Fatalf("wrong-revision restore revocation = %v, want stale intent", err)
 	}
@@ -123,7 +132,7 @@ func TestRestoreRevocationReceiptRejectsWrongOperationRevision(t *testing.T) {
 	}
 }
 
-func TestRestoreRevocationReceiptRejectsEvidenceBeforeReservation(t *testing.T) {
+func TestRestoreRevocationReceiptAcceptsBoundEvidenceBeforeReservation(t *testing.T) {
 	h, _, computer, source, _ := publishedBackupForStorageCopy(t, 2)
 	reserved, _, err := h.store.BeginComputerRestore(context.Background(), computer.ComputerID,
 		ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
@@ -131,11 +140,26 @@ func TestRestoreRevocationReceiptRejectsEvidenceBeforeReservation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := testRestoreRevocationEvidence(computer.ComputerID)
+	evidence := testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)
 	evidence.TokenRevocation.CommittedAt = h.clock.Now().Add(-time.Nanosecond)
 	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID,
-		reserved.IntentRevision, evidence); errorCode(err) != contract.ErrorConflict {
-		t.Fatalf("pre-reservation restore revocation = %v, want conflict", err)
+		reserved.IntentRevision, evidence); err != nil {
+		t.Fatalf("bound skewed restore revocation = %v", err)
+	}
+}
+
+func TestRestoreRejectsUnboundPriorRevocationReceipt(t *testing.T) {
+	h, _, computer, source, _ := publishedBackupForStorageCopy(t, 2)
+	reserved, _, err := h.store.BeginComputerRestore(context.Background(), computer.ComputerID,
+		ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+			BackupID: source.BackupID, IdempotencyKey: "unbound-replay"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := testRestoreRevocationEvidence(computer.ComputerID, 0)
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID,
+		reserved.IntentRevision, evidence); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("unbound prior receipt = %v, want invalid request", err)
 	}
 }
 
@@ -203,7 +227,7 @@ func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *te
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("old planted credential scope = %v, want forbidden", err)
 	}
-	revocationEvidence := testRestoreRevocationEvidence(computer.ComputerID)
+	revocationEvidence := testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)
 	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, revocationEvidence); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +287,10 @@ func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *te
 	if err != nil || replayed || second.IntentRevision != completed.IntentRevision+1 {
 		t.Fatalf("second restore reservation = %#v replayed=%t err=%v", second, replayed, err)
 	}
-	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), completed.ComputerID, second.IntentRevision, testRestoreRevocationEvidence(completed.ComputerID)); err != nil {
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), completed.ComputerID, second.IntentRevision, revocationEvidence); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("prior inner receipt relabelled as successor: %v", err)
+	}
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), completed.ComputerID, second.IntentRevision, testRestoreRevocationEvidence(completed.ComputerID, second.IntentRevision)); err != nil {
 		t.Fatal(err)
 	}
 	directives, err = h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
@@ -280,7 +307,7 @@ func TestComputerRemovalSupersedesAndAttestsRestorePrecommittedBackup(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID)); err != nil {
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); err != nil {
 		t.Fatal(err)
 	}
 	storageCopies, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(),
@@ -652,7 +679,7 @@ func TestComputerRestoreRejectsFailedPredecessorBackupBeforeSwitchover(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID)); err != nil {
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); err != nil {
 		t.Fatal(err)
 	}
 	directives, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
@@ -694,7 +721,7 @@ func TestRestorePublicationRequiresDurableRetriedAuthorityRevocation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID)); err != nil {
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); err != nil {
 		t.Fatal(err)
 	}
 	directives, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
@@ -713,10 +740,10 @@ func TestRestorePublicationRequiresDurableRetriedAuthorityRevocation(t *testing.
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("publication without durable revocation = %v", err)
 	}
-	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID)); err != nil {
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID)); err != nil {
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); err != nil {
 		t.Fatalf("reissued revocation was not idempotent: %v", err)
 	}
 	published, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request)
@@ -771,5 +798,177 @@ func TestRemovingCloneSourceSupersedesReservedForkAndCannotVerifyCustody(t *test
 	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("in-flight fork custody outcome = %#v err=%v", removed, err)
+	}
+}
+
+func TestRestoreRevocationRejectsMismatchedEvidenceAndSupersededCAS(t *testing.T) {
+	h, _, computer, source, _ := publishedBackupForStorageCopy(t, 2)
+	reserved, _, err := h.store.BeginComputerRestore(context.Background(), computer.ComputerID,
+		ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), BackupID: source.BackupID, IdempotencyKey: "binding-negatives"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*ComputerRestoreRevocationEvidence){
+		func(e *ComputerRestoreRevocationEvidence) { e.TokenRevocation.RestoreOperationRevision-- },
+		func(e *ComputerRestoreRevocationEvidence) { e.TokenRevocation.ComputerID = "other" },
+		func(e *ComputerRestoreRevocationEvidence) { e.RevokeAll = false },
+		func(e *ComputerRestoreRevocationEvidence) { e.TokenRevocation.RevokedGrantCount = -1 },
+		func(e *ComputerRestoreRevocationEvidence) { e.TokenRevocation.CommittedAt = time.Time{} },
+	} {
+		evidence := testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)
+		change(&evidence)
+		if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, evidence); errorCode(err) != contract.ErrorInvalidRequest {
+			t.Fatalf("mismatched receipt=%#v err=%v", evidence, err)
+		}
+	}
+	// Model a reply in flight while the current intent advances, without changing its operation row.
+	if _, err := h.store.db.Exec(`UPDATE computers SET intent_revision=intent_revision+1 WHERE computer_id=?`, computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); errorCode(err) != contract.ErrorStaleIntentRevision {
+		t.Fatalf("superseded receipt=%v", err)
+	}
+	var payload []byte
+	if err := h.store.db.QueryRow(`SELECT authority_revocation_receipt_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`, computer.ComputerID, reserved.IntentRevision).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) != 0 {
+		t.Fatalf("superseded CAS persisted %s", payload)
+	}
+}
+
+func TestRestoreRevocationUpgradesOnlyActiveLegacyEvidence(t *testing.T) {
+	for _, mode := range []string{"legacy", "wrong-binding", "malformed", "published", "complete"} {
+		t.Run(mode, func(t *testing.T) {
+			h, node, computer, source, _ := publishedBackupForStorageCopy(t, 2)
+			reserved, _, err := h.store.BeginComputerRestore(context.Background(), computer.ComputerID,
+				ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), BackupID: source.BackupID, IdempotencyKey: "legacy-upgrade"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial := testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)
+			if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, initial); err != nil {
+				t.Fatal(err)
+			}
+			directives, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("initial directives=%#v err=%v", directives, err)
+			}
+			legacy := ComputerRestoreRevocationReceipt{Kind: computerRestoreRevocationReceiptKind, ComputerID: computer.ComputerID,
+				OperationRevision: reserved.IntentRevision, RevokeAll: true, TokenRevocation: initial.TokenRevocation, AuthorityRevokedAt: initial.TokenRevocation.CommittedAt}
+			legacy.TokenRevocation.RestoreOperationRevision = 0
+			if mode == "wrong-binding" {
+				legacy.TokenRevocation.RestoreOperationRevision = reserved.IntentRevision + 1
+			}
+			payload, err := json.Marshal(legacy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "malformed" {
+				payload = []byte(`{"kind":`)
+			}
+			if _, err := h.store.db.Exec(`UPDATE computer_storage_copy_operations SET authority_revocation_receipt_json=? WHERE destination_computer_id=? AND operation_revision=?`, payload, computer.ComputerID, reserved.IntentRevision); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "published" || mode == "complete" {
+				if _, err := h.store.db.Exec(`UPDATE computer_storage_copy_operations SET status=? WHERE destination_computer_id=? AND operation_revision=?`, mode, computer.ComputerID, reserved.IntentRevision); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pending, err := h.store.ListNodeComputerRestoreRevocations(context.Background(), node.NodeID)
+			wantPending := 0
+			if mode == "legacy" {
+				wantPending = 1
+			}
+			if err != nil || len(pending) != wantPending {
+				t.Fatalf("pending=%#v err=%v want=%d", pending, err, wantPending)
+			}
+			eligible, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+			wantEligible := 0
+			if mode == "published" {
+				wantEligible = 1
+			}
+			if err != nil || len(eligible) != wantEligible {
+				t.Fatalf("legacy directives=%#v err=%v", eligible, err)
+			}
+			replacement := testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)
+			replacement.TokenRevocation.CommittedAt = h.clock.Now().Add(-2 * time.Minute)
+			if mode == "legacy" {
+				request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: "legacy-blocked", Receipt: successfulStorageCopyReceipt(directives[0])}
+				if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
+					t.Fatalf("legacy publication=%v", err)
+				}
+			}
+			if mode == "legacy" {
+				calls := 0
+				h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+					calls++
+					if request.ComputerID != computer.ComputerID || request.RestoreOperationRevision != reserved.IntentRevision || !request.RevokeAll || request.Reason != "computer_restoring" {
+						t.Fatalf("legacy reissue request=%#v", request)
+					}
+					return replacement.TokenRevocation, nil
+				}}
+				client := h.client(fabric.Identity{NodeID: "fabric-computer-node", Tags: []string{DefaultAgentPrincipalTag}})
+				status, _, body := h.do(client, http.MethodPost, "/v1/agent/nodes/"+node.NodeID+"/heartbeat", heartbeatRequestForNode(node))
+				var response HeartbeatResponse
+				if status != http.StatusOK || json.Unmarshal(body, &response) != nil || len(response.StorageCopyDirectives) != 1 || calls != 1 {
+					t.Fatalf("legacy heartbeat status=%d calls=%d response=%#v body=%s", status, calls, response, body)
+				}
+				err = nil
+			} else {
+				err = h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, replacement)
+			}
+			if mode != "legacy" {
+				wantCode := contract.ErrorConflict
+				if mode == "published" || mode == "complete" {
+					wantCode = contract.ErrorStaleIntentRevision
+				}
+				if errorCode(err) != wantCode {
+					t.Fatalf("nonlegacy replacement=%v want=%s", err, wantCode)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			var after []byte
+			var recorded int64
+			if err := h.store.db.QueryRow(`SELECT authority_revocation_receipt_json, authority_revoked_ns FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`, computer.ComputerID, reserved.IntentRevision).Scan(&after, &recorded); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "legacy" {
+				if string(after) != string(payload) || recorded != initial.TokenRevocation.CommittedAt.UnixNano() {
+					t.Fatal("nonlegacy evidence was changed")
+				}
+				return
+			}
+			var upgraded ComputerRestoreRevocationReceipt
+			if err := json.Unmarshal(after, &upgraded); err != nil {
+				t.Fatal(err)
+			}
+			if upgraded.TokenRevocation.RestoreOperationRevision != reserved.IntentRevision || recorded != replacement.TokenRevocation.CommittedAt.UnixNano() {
+				t.Fatalf("upgrade=%#v recorded=%d", upgraded, recorded)
+			}
+			replacement.TokenRevocation.CommittedAt = replacement.TokenRevocation.CommittedAt.Add(time.Hour)
+			replacement.TokenRevocation.RevokedGrantCount = 99
+			if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID, reserved.IntentRevision, replacement); err != nil {
+				t.Fatal(err)
+			}
+			var replay []byte
+			if err := h.store.db.QueryRow(`SELECT authority_revocation_receipt_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`, computer.ComputerID, reserved.IntentRevision).Scan(&replay); err != nil {
+				t.Fatal(err)
+			}
+			if string(replay) != string(after) {
+				t.Fatal("same-operation replay replaced first bound receipt")
+			}
+			pending, err = h.store.ListNodeComputerRestoreRevocations(context.Background(), node.NodeID)
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("bound receipt still pending=%#v err=%v", pending, err)
+			}
+			request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "legacy-blocked", Receipt: successfulStorageCopyReceipt(directives[0])}
+			if published, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request); err != nil || published.StorageGeneration != computer.StorageGeneration+1 {
+				t.Fatalf("upgraded publication=%#v err=%v", published, err)
+			}
+		})
 	}
 }

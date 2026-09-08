@@ -735,6 +735,7 @@
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 }, "submit_intent_revision": { "type": "integer", "minimum": 0 },
           "revoke_all": { "type": "boolean", "default": false },
+          "restore_operation_revision": { "type": "integer", "minimum": 1, "description": "Existing L1 restore operation revision. Requires revoke_all=true and reason=computer_restoring; every request executes a fresh transaction, including retries." },
           "reason": { "type": "string", "minLength": 1 }
         }
       },

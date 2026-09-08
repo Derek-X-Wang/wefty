@@ -18,11 +18,17 @@ supported_mac="$(run_case supported-mac 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=darwin
 grep -Fq 'DRY-RUN: brew install lima' <<<"$supported_mac" || fail "supported mac did not plan Lima"
 grep -Fq '1. wefty node setup-oci' <<<"$supported_mac" || fail "supported mac omitted setup before doctor"
 
+# A supported installed patch is preserved even when the tested pin advances.
 rerun_linux="$(run_case rerun-linux 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=debian WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=13 WEFTY_OCI_INSTALL_TEST_ARCH=amd64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION=2.3.4 WEFTY_OCI_INSTALL_TEST_RUNC_VERSION=1.5.1 WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=/usr/lib/systemd/system/containerd.service)"
 grep -Fq 'containerd 2.3.4 already satisfies' <<<"$rerun_linux" || fail "rerun did not preserve containerd"
 grep -Fq 'runc 1.5.1 already satisfies' <<<"$rerun_linux" || fail "rerun did not preserve runc"
 grep -Fq 'preserve packaged containerd unit at /usr/lib/systemd/system/containerd.service' <<<"$rerun_linux" || fail "distro unit was not preserved"
 grep -Fq '1. sudo wefty node setup-oci' <<<"$rerun_linux" || fail "Linux next-command order is wrong"
+
+rerun_tested_linux="$(run_case rerun-tested-linux 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=debian WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=13 WEFTY_OCI_INSTALL_TEST_ARCH=amd64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION=2.3.5 WEFTY_OCI_INSTALL_TEST_RUNC_VERSION=1.5.1 WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=/usr/lib/systemd/system/containerd.service)"
+grep -Fq 'containerd 2.3.5 already satisfies' <<<"$rerun_tested_linux" || fail "rerun did not preserve tested containerd"
+grep -Fq 'runc 1.5.1 already satisfies' <<<"$rerun_tested_linux" || fail "tested rerun did not preserve runc"
+grep -Fq 'preserve packaged containerd unit at /usr/lib/systemd/system/containerd.service' <<<"$rerun_tested_linux" || fail "tested rerun did not preserve distro unit"
 
 unknown="$(run_case unknown-release 64 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=arch WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=rolling WEFTY_OCI_INSTALL_TEST_ARCH=amd64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION= WEFTY_OCI_INSTALL_TEST_RUNC_VERSION= WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=none)"
 grep -Fq 'unsupported Linux release' <<<"$unknown" || fail "unknown release was not refused"
@@ -32,11 +38,11 @@ grep -Fq 'below the supported minimum 2.0.0' <<<"$below_minimum" || fail "below-
 
 supported_linux="$(run_case supported-linux 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=fedora WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=44 WEFTY_OCI_INSTALL_TEST_ARCH=arm64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION= WEFTY_OCI_INSTALL_TEST_RUNC_VERSION= WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=none)"
 for expected in \
-  'containerd-2.3.4-linux-arm64.tar.gz' \
-  '/usr/local/lib/wefty/oci-runtime/containerd-2.3.4' \
+  'containerd-2.3.5-linux-arm64.tar.gz' \
+  '/usr/local/lib/wefty/oci-runtime/containerd-2.3.5' \
   '/usr/local/lib/wefty/oci-runtime/runc-1.5.1/runc' \
   'root:root 0644' \
-  'ExecStart=/usr/local/lib/wefty/oci-runtime/containerd-2.3.4/bin/containerd; Type=notify; Restart=always' \
+  'ExecStart=/usr/local/lib/wefty/oci-runtime/containerd-2.3.5/bin/containerd; Type=notify; Restart=always' \
   'No services were started'; do
   grep -Fq "$expected" <<<"$supported_linux" || fail "supported Linux plan omitted $expected"
 done

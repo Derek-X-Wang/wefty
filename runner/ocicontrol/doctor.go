@@ -24,7 +24,7 @@ const (
 	DoctorUIDIssue           = "https://github.com/Derek-X-Wang/wefty/issues/220"
 	DoctorLaunchUnmanaged    = "unmanaged"
 	DoctorRunbookPrefix      = RunbookPath + "#doctor-code-"
-	TestedContainerdVersion  = "2.3.4"
+	TestedContainerdVersion  = "2.3.5"
 	TestedRuncVersion        = "1.5.1"
 	MinimumContainerdVersion = "2.0.0"
 	MinimumRuncVersion       = "1.0.0"

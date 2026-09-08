@@ -298,27 +298,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if prBuild.If != "github.event_name == 'pull_request'" || prBuild.With["candidate_sha"] != "${{ github.event.pull_request.head.sha }}" || prBuild.With["source_repository"] != "${{ github.event.pull_request.head.repo.full_name }}" {
 		t.Fatalf("PR realtiming artifact source guard = if %q with %#v", prBuild.If, prBuild.With)
 	}
-	dependsOnPRBuild := map[string]bool{"build-pr-artifacts": true}
-	for changed := true; changed; {
-		changed = false
-		for jobName, job := range realtiming.Jobs {
-			if dependsOnPRBuild[jobName] {
-				continue
-			}
-			for _, need := range workflowNeeds(t, job.Needs) {
-				if dependsOnPRBuild[need] {
-					dependsOnPRBuild[jobName] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-	delete(dependsOnPRBuild, "build-pr-artifacts")
-	for jobName := range dependsOnPRBuild {
-		guard := realtiming.Jobs[jobName].If
-		if !strings.Contains(guard, "always()") && !strings.Contains(guard, "!cancelled()") {
-			t.Fatalf("realtiming job %s transitively needs PR-only build-pr-artifacts but its guard %q does not tolerate that job being skipped", jobName, guard)
+	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
+		if err := validateSkipGuards(t, workflow.Jobs); err != nil {
+			t.Fatalf("%s: %v", name, err)
 		}
 	}
 	for _, sharedAnchor := range []string{"Provision pinned Linux OCI engine and probe", "Run service acceptance at production timings", "Capture Linux OCI service diagnostics", "Upload service acceptance evidence", "name: realtiming-result"} {
@@ -1205,6 +1187,198 @@ func TestComputerRootNetworkProofWorkflowContract(t *testing.T) {
 			if validate(mutation) {
 				t.Fatalf("accepted removed %s in %s", name, file)
 			}
+		}
+	}
+}
+
+func TestRealtimingSkipGuardPolicy(t *testing.T) {
+	const event = "github.event_name == 'pull_request'"
+	for _, tc := range []struct {
+		name, source, child string
+		bridge              string
+		wantError           bool
+	}{
+		{name: "renamed direct", source: event, wantError: true},
+		{name: "path direct", source: "contains(github.event.head_commit.message, 'paths')", wantError: true},
+		{name: "OS transitive through always", source: "runner.os == 'Linux'", bridge: "always()", wantError: true},
+		{name: "transitive through same condition", source: event, bridge: event, wantError: true},
+		{name: "same", source: event, child: event},
+		{name: "parentheses wrappers", source: "${{ (" + event + ") }}", child: " (( github.event_name  ==  'pull_request' )) "},
+		{name: "stricter", source: event, child: "vars.paths == 'true' && (" + event + ")"},
+		{name: "same OR", source: event + " || vars.paths", child: "(" + event + " || vars.paths) && vars.extra"},
+		{name: "opposite", source: event, child: "github.event_name != 'pull_request'", wantError: true},
+		{name: "OR escape", source: event, child: event + " || vars.paths", wantError: true},
+		{name: "negated", source: event, child: "!(" + event + ")", wantError: true},
+		{name: "quoted guard decoy", source: event, child: "vars.note == 'github.event_name == ''pull_request'''", wantError: true},
+		{name: "quoted status decoy", source: event, child: "vars.note == 'always() !cancelled()'", wantError: true},
+		{name: "partial conjunction", source: event + " && vars.paths", child: event, wantError: true},
+		{name: "mixed source", source: "!cancelled() && " + event, wantError: true},
+		{name: "always", source: event, child: "always()"},
+		{name: "not cancelled", source: event, child: "!cancelled() && vars.paths"},
+		{name: "success is not tolerance", source: event, child: "success()", wantError: true},
+		{name: "failure is not tolerance", source: event, child: "failure()", wantError: true},
+		{name: "cancelled is not tolerance", source: event, child: "cancelled()", wantError: true},
+		{name: "not always", source: event, child: "!always()", wantError: true},
+		{name: "contradictory status", source: event, child: "!cancelled() && success()", wantError: true},
+		{name: "status OR escape", source: event, child: "!cancelled() || vars.paths", wantError: true},
+		{name: "malformed", source: event, child: "always() && (", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jobs := map[string]workflowJob{"conditional": {If: tc.source}, "child": {Needs: "conditional", If: tc.child}}
+			if tc.bridge != "" {
+				jobs["bridge"] = workflowJob{Needs: "conditional", If: tc.bridge}
+				jobs["child"] = workflowJob{Needs: []any{"bridge"}, If: tc.child}
+			}
+			err := validateSkipGuards(t, jobs)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("guard policy error = %v, wantError=%t", err, tc.wantError)
+			}
+		})
+	}
+	t.Run("original source same condition", func(t *testing.T) {
+		jobs := map[string]workflowJob{"build-pr-artifacts": {If: event}, "child": {Needs: "build-pr-artifacts", If: event}}
+		if err := validateSkipGuards(t, jobs); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("mixed source same condition", func(t *testing.T) {
+		jobs := map[string]workflowJob{"source": {If: "!cancelled() && " + event}, "child": {Needs: "source", If: event}}
+		if err := validateSkipGuards(t, jobs); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("every ancestor independently", func(t *testing.T) {
+		jobs := map[string]workflowJob{"event": {If: event}, "paths": {If: "vars.paths"}, "child": {Needs: []any{"event", "paths"}, If: event}}
+		if err := validateSkipGuards(t, jobs); err == nil {
+			t.Fatal("accepted child pinned to only one ancestor")
+		}
+	})
+	t.Run("unconditional and independent", func(t *testing.T) {
+		if err := validateSkipGuards(t, map[string]workflowJob{"root": {}, "child": {Needs: "root"}, "independent": {If: event}}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestRealtimingResolverAndDiagnosticContract(t *testing.T) {
+	for _, path := range []string{"../.github/workflows/service-acceptance-realtiming.yml", "../.github/workflows/service-acceptance-realtiming-scheduled.yml"} {
+		workflow, _ := readWorkflow(t, path)
+		for _, name := range []string{"service-acceptance-realtiming", "fabric-machine-identity", "fabric-person-identity"} {
+			t.Run(path+"/"+name, func(t *testing.T) {
+				guard := workflow.Jobs[name].If
+				if err := validateResolverConsumer(guard); err != nil {
+					t.Fatal(err)
+				}
+				const success = "needs.resolve-published-artifact.result == 'success'"
+				for _, mutation := range []string{"true", "needs.resolve-published-artifact.result != 'failure'", "(" + success + " || vars.escape)", "vars.decoy == 'needs.resolve-published-artifact.result == ''success'''"} {
+					changed := strings.Replace(guard, success, mutation, 1)
+					if changed == guard || validateResolverConsumer(changed) == nil {
+						t.Fatalf("accepted resolver prerequisite mutation: %s", changed)
+					}
+				}
+				node, err := parseWorkflowGuard(guard)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, result := range []string{"success", "failure", "cancelled", "skipped"} {
+					for _, available := range []string{"true", "false"} {
+						for _, cancelled := range []bool{false, true} {
+							values := map[string]any{
+								"needs.resolve-published-artifact.result":            result,
+								"needs.resolve-published-artifact.outputs.available": available,
+								"cancelled()":       cancelled,
+								"github.event_name": "workflow_run", "github.event.workflow_run.event": "push", "github.event.workflow_run.head_branch": "main",
+								"github.ref": "refs/heads/main", "vars.TSNET_SMOKE_REQUIRED": "true", "vars.TSNET_CI_TESTER_REQUIRED": "true",
+							}
+							if strings.Contains(path, "-scheduled") {
+								values["github.event_name"] = "schedule"
+							}
+							got := evaluateGuardFixture(t, node, values)
+							want := result == "success" && available == "true" && !cancelled
+							if got != want {
+								t.Fatalf("resolver=%s available=%s cancelled=%t: guard=%v want=%t", result, available, cancelled, got, want)
+							}
+						}
+					}
+				}
+			})
+		}
+		t.Run(path+"/diagnostic", func(t *testing.T) {
+			job := workflow.Jobs["realtiming-result"]
+			step, err := realtimingDiagnosticStep(job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, mutation := range []string{"missing always", "decoy always", "duplicate", "wrong env", "missing status", "assert before status", "comment decoy", "status after assertion"} {
+				mutated := job
+				mutated.Steps = append([]workflowStep(nil), job.Steps...)
+				for i, candidate := range mutated.Steps {
+					if candidate.Name != step.Name {
+						continue
+					}
+					switch mutation {
+					case "missing always":
+						candidate.If = ""
+					case "decoy always":
+						candidate.If = ""
+						mutated.Steps = append(mutated.Steps, workflowStep{Name: "Decoy", If: "always()"})
+					case "duplicate":
+						mutated.Steps = append(mutated.Steps, candidate)
+					case "wrong env":
+						candidate.Env = maps.Clone(candidate.Env)
+						candidate.Env["RESOLVE_RESULT"] = "success"
+					case "missing status":
+						candidate.Run = strings.Replace(candidate.Run, "artifact-available=$ARTIFACT_AVAILABLE", "removed", 1)
+					case "assert before status":
+						candidate.Run = "test false = true\n" + candidate.Run
+					case "comment decoy":
+						candidate.Run = "# " + candidate.Run
+					case "status after assertion":
+						candidate.Run = "set -eu\ntest \"$RESOLVE_RESULT\" = success\n" + strings.TrimPrefix(candidate.Run, "set -eu\n")
+					}
+					mutated.Steps[i] = candidate
+					break
+				}
+				if _, err := realtimingDiagnosticStep(mutated); err == nil {
+					t.Fatalf("accepted diagnostic mutation %s", mutation)
+				}
+			}
+		})
+	}
+}
+
+func TestRealtimingDiagnosticShellFailures(t *testing.T) {
+	// This executes the actual assertion shell locally. The always() scheduling
+	// guarantee is structural above; post-change hosted main runs remain separate.
+	for _, path := range []string{"../.github/workflows/service-acceptance-realtiming.yml", "../.github/workflows/service-acceptance-realtiming-scheduled.yml"} {
+		workflow, _ := readWorkflow(t, path)
+		step, err := realtimingDiagnosticStep(workflow.Jobs["realtiming-result"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct{ name, resolve, available, matrix string }{
+			{"typed skip", "success", "false", "skipped"},
+			{"resolver failed after output", "failure", "true", "skipped"},
+			{"missing receipt after download failure", "success", "true", "success"},
+		} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				script := strings.ReplaceAll(step.Run, "${{ needs.resolve-published-artifact.outputs.candidate-sha }}", strings.Repeat("a", 40))
+				script = strings.ReplaceAll(script, "${{ inputs.mutation_row != 'none' && inputs.mutation_row || '' }}", "")
+				command := exec.Command("bash", "-c", script)
+				command.Dir = ".."
+				command.Env = append(os.Environ(), "RUNNER_TEMP="+t.TempDir(), "RESOLVE_RESULT="+tc.resolve, "ARTIFACT_AVAILABLE="+tc.available, "REALTIMING_RESULT="+tc.matrix,
+					"TRUST_DOMAIN=trusted", "MACHINE_RESULT=skipped", "PERSON_RESULT=skipped", "MACHINE_ARMED=false", "PERSON_ARMED=false", "WEFTY_REALTIME_EVIDENCE_SOURCE=published-artifact")
+				output, err := command.CombinedOutput()
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+					t.Fatalf("wanted fail-closed exit 1, got %v\n%s", err, output)
+				}
+				want := "resolve-published-artifact=" + tc.resolve + "\nartifact-available=" + tc.available + "\nservice-acceptance-realtiming=" + tc.matrix + "\n"
+				if string(output) != want {
+					t.Fatalf("diagnostic output=%q, want %q", output, want)
+				}
+				t.Logf("local extracted shell exit=%d\n%s", exit.ExitCode(), output)
+			})
 		}
 	}
 }

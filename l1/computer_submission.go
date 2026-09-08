@@ -111,10 +111,11 @@ func (s *Store) GetComputerSubmissionState(ctx context.Context, identity fabric.
 }
 
 type ComputerTokenRevocation struct {
-	ComputerID              string `json:"computer_id"`
-	NewSubmitIntentRevision int64  `json:"new_submit_intent_revision"`
-	RevokeAll               bool   `json:"revoke_all,omitempty"`
-	Reason                  string `json:"reason"`
+	RestoreOperationRevision int64  `json:"restore_operation_revision,omitempty"`
+	ComputerID               string `json:"computer_id"`
+	NewSubmitIntentRevision  int64  `json:"new_submit_intent_revision"`
+	RevokeAll                bool   `json:"revoke_all,omitempty"`
+	Reason                   string `json:"reason"`
 }
 
 type ComputerTokenRevoker interface {

@@ -105,7 +105,7 @@ jobs:
   fabric-machine-identity:
     name: fabric-identity / machine
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -139,7 +139,7 @@ jobs:
   fabric-person-identity:
     name: fabric-identity / person-whoami
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -177,7 +177,7 @@ jobs:
   service-acceptance-realtiming:
     name: service-acceptance-realtiming / ${{ matrix.os }} / ${{ matrix.image }}
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && needs.resolve-published-artifact.outputs.available == 'true' }}
+    if: ${{ !cancelled() && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -256,7 +256,7 @@ jobs:
       - name: Provision pinned Linux OCI engine and probe
         if: runner.os == 'Linux'
         env:
-          CONTAINERD_VERSION: 2.3.4
+          CONTAINERD_VERSION: 2.3.5
           RUNC_VERSION: 1.5.1
         run: |
           set -euo pipefail
@@ -648,6 +648,7 @@ jobs:
             "$RUNNER_TEMP/fabric-machine-identity/fabric-machine-identity.json" \
             "$RUNNER_TEMP/fabric-person-identity/fabric-person-identity.json"
       - name: Fail closed unless the artifact lane executed and passed
+        if: ${{ always() }}
         env:
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
           ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}

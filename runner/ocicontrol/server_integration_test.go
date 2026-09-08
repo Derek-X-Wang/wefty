@@ -78,55 +78,72 @@ func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
+	started := time.Now()
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = command.Wait()
+		close(done)
+	}()
 	t.Cleanup(func() {
-		if command.ProcessState == nil {
+		select {
+		case <-done:
+		default:
 			_ = command.Process.Kill()
-			_, _ = command.Process.Wait()
+			<-done
 		}
 	})
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
-			if info.Mode().Perm() != 0o600 {
-				t.Fatalf("control socket mode=%#o", info.Mode().Perm())
-			}
-			parent, err := os.Stat(root)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if parent.Mode().Perm() != 0o700 {
-				t.Fatalf("control directory mode=%#o", parent.Mode().Perm())
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			_ = command.Process.Kill()
-			_, _ = command.Process.Wait()
-			t.Fatalf("real control process did not publish its socket:\n%s", childOutput.String())
-		}
-	}
+	// Keep the existing five-second fixture bound. This fixture performs
+	// only intent-file IO; the production header-read bound is sufficient for
+	// startup and request delivery without adopting the image-upload drain.
+	const phaseBudget = controlReadHeaderTimeout
 	client, err := NewClient(socket)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	intent, err := client.Intent(t.Context())
-	if err != nil || !intent.Enabled || intent.Revision != 1 {
-		t.Fatalf("real-process intent=%+v err=%v", intent, err)
-	}
-	response, err := client.Stop(t.Context(), intent.Revision)
-	if err != nil || response.Intent.Enabled || !response.RuntimeQuiesced {
-		t.Fatalf("real-process stop=%+v err=%v", response, err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("real control process: %v\n%s", err, childOutput.String())
+	readyContext, cancelReady := context.WithTimeout(t.Context(), phaseBudget)
+	defer cancelReady()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	var intent lima.OCIIntent
+	for {
+		intent, err = client.Intent(readyContext)
+		if err == nil {
+			break
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("real control process did not exit")
+		select {
+		case <-done:
+			t.Fatalf("phase=socket readiness elapsed=%s child exited=%v output=%s", time.Since(started), waitErr, childOutput.String())
+		case <-readyContext.Done():
+			t.Fatalf("phase=socket readiness elapsed=%s last Intent error=%v", time.Since(started), err)
+		case <-poll.C:
+		}
+	}
+	info, err := os.Stat(socket)
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o600 {
+		t.Fatalf("phase=socket permissions elapsed=%s info=%v err=%v", time.Since(started), info, err)
+	}
+	parent, err := os.Stat(root)
+	if err != nil || parent.Mode().Perm() != 0o700 {
+		t.Fatalf("phase=directory permissions elapsed=%s info=%v err=%v", time.Since(started), parent, err)
+	}
+	if !intent.Enabled || intent.Revision != 1 {
+		t.Fatalf("phase=intent elapsed=%s real-process intent=%+v", time.Since(started), intent)
+	}
+	stopContext, cancelStop := context.WithTimeout(t.Context(), phaseBudget)
+	defer cancelStop()
+	response, err := client.Stop(stopContext, intent.Revision)
+	if err != nil || response.Intent.Enabled || !response.RuntimeQuiesced {
+		t.Fatalf("phase=stop response elapsed=%s real-process stop=%+v err=%v", time.Since(started), response, err)
+	}
+	select {
+	case <-done:
+		if waitErr != nil {
+			t.Fatalf("phase=child exit elapsed=%s error=%v output=%s", time.Since(started), waitErr, childOutput.String())
+		}
+	case <-time.After(phaseBudget):
+		t.Fatalf("phase=child exit elapsed=%s: real control process did not exit", time.Since(started))
 	}
 }
 
@@ -264,6 +281,9 @@ func runControlChild(t *testing.T) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownStarted := make(chan struct{})
+	var server *Server
+	var err error
 	service := ServiceFuncs{
 		IntentFunc: func(ctx context.Context) (lima.OCIIntent, error) {
 			return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
@@ -271,14 +291,21 @@ func runControlChild(t *testing.T) {
 		StopFunc: func(_ context.Context, request IntentMutationRequest) (IntentResponse, error) {
 			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
 			if err == nil {
+				// Register only after Serve has installed the HTTP server. The
+				// callback is an observable shutdown fact, not a scheduling sleep.
+				server.server.RegisterOnShutdown(func() { close(shutdownStarted) })
+				started := time.Now()
 				stop()
-				// Force the response to overlap shutdown without retrying the request.
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-shutdownStarted:
+				case <-time.After(controlReadHeaderTimeout):
+					return IntentResponse{}, fmt.Errorf("phase=shutdown rendezvous elapsed=%s", time.Since(started))
+				}
 			}
 			return IntentResponse{Intent: intent, RuntimeQuiesced: err == nil}, err
 		},
 	}
-	server, err := NewServer(socket, service)
+	server, err = NewServer(socket, service)
 	if err != nil {
 		t.Fatal(err)
 	}

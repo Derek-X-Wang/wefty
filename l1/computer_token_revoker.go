@@ -36,11 +36,12 @@ func (c *ComputerTokenRevocationClient) CloseIdleConnections() { c.transport.Clo
 
 func (c *ComputerTokenRevocationClient) RevokeComputerTokens(ctx context.Context, revocation ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 	payload, err := json.Marshal(struct {
-		ComputerID           string `json:"computer_id"`
-		SubmitIntentRevision int64  `json:"submit_intent_revision"`
-		RevokeAll            bool   `json:"revoke_all,omitempty"`
-		Reason               string `json:"reason"`
-	}{revocation.ComputerID, revocation.NewSubmitIntentRevision, revocation.RevokeAll, revocation.Reason})
+		RestoreOperationRevision int64  `json:"restore_operation_revision,omitempty"`
+		ComputerID               string `json:"computer_id"`
+		SubmitIntentRevision     int64  `json:"submit_intent_revision"`
+		RevokeAll                bool   `json:"revoke_all,omitempty"`
+		Reason                   string `json:"reason"`
+	}{revocation.RestoreOperationRevision, revocation.ComputerID, revocation.NewSubmitIntentRevision, revocation.RevokeAll, revocation.Reason})
 	if err != nil {
 		return contract.ComputerTokenRevocationReceipt{}, fmt.Errorf("l1: encode Computer token revocation: %w", err)
 	}
