@@ -354,6 +354,7 @@ func TestGuestHelperRemovalIsIdempotentAndVerified(t *testing.T) {
 		}
 		return nil, nil
 	}}
+	installer.inventoryExecute = inventoryLegacyFake(t, installer.run)
 	evidence, err := installer.remove(t.Context(), GuestHelperRemovalConfig{Instance: DefaultInstanceName, Limactl: "limactl"})
 	if err != nil {
 		t.Fatal(err)
@@ -378,7 +379,7 @@ func TestGuestHelperRemovalRequiresConfirmedInspection(t *testing.T) {
 		{name: "malformed", payload: "not-json", wantError: "inspect Lima instance: invalid JSON"},
 		{name: "truncated", payload: `{"name":`, wantError: "inspect Lima instance: invalid JSON"},
 		{name: "malformed_after_other_instance", payload: `{"name":"other","status":"running"}` + "\n{", wantError: "inspect Lima instance: invalid JSON"},
-		{name: "command_failure", commandError: inspectionFailure, wantError: "inspect Lima before guest helper removal: inspection command failed"},
+		{name: "command_failure", commandError: inspectionFailure, wantError: "inspect Lima before guest helper removal: limactl: inspection command failed: "},
 		{name: "unknown_status", payload: `{"name":"wefty-oci","status":"unknown"}`, wantError: "guest helper removal requires a Running, Stopped, or Broken Lima instance"},
 		{name: "empty_inventory", absent: true},
 		{name: "other_instance_only", payload: `{"name":"other","status":"running"}`, absent: true},
@@ -389,8 +390,9 @@ func TestGuestHelperRemovalRequiresConfirmedInspection(t *testing.T) {
 				commands = append(commands, append([]string{name}, arguments...))
 				return []byte(test.payload), test.commandError
 			}}
+			installer.inventoryExecute = inventoryLegacyFake(t, installer.run)
 			evidence, err := installer.remove(t.Context(), GuestHelperRemovalConfig{Instance: DefaultInstanceName, Limactl: "limactl"})
-			wantCommands := [][]string{{"limactl", "list", "--json", DefaultInstanceName}}
+			wantCommands := [][]string{{"limactl", "list", "--json"}}
 			if !reflect.DeepEqual(commands, wantCommands) {
 				t.Fatalf("unconfirmed/absent inspection performed mutation commands: %v", commands)
 			}
@@ -419,6 +421,7 @@ func TestGuestHelperRemovalTemporarilyStartsStoppedInstance(t *testing.T) {
 		}
 		return nil, nil
 	}}
+	installer.inventoryExecute = inventoryLegacyFake(t, installer.run)
 	if _, err := installer.remove(t.Context(), GuestHelperRemovalConfig{Instance: DefaultInstanceName, Limactl: "limactl"}); err != nil {
 		t.Fatal(err)
 	}
