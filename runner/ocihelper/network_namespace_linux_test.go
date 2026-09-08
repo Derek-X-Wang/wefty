@@ -107,7 +107,7 @@ func TestComputerIsolationObservationUsesLiveNamespaceFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer namespace.close()
-	helperInode, taskInode, visible, err := observeComputerNetworkIsolation(namespace, "@/tmp/.X11-unix/X42000")
+	helperInode, taskInode, visible, _, err := observeComputerNetworkIsolation(namespace, "@/tmp/.X11-unix/X42000")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestComputerDNSProxyForwardsLoopbackResolver(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer proxy.close()
-	query := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	query := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
 	wantResponse := slices.Clone(query)
 	wantResponse[2] |= 0x80
 	go func() {
@@ -341,7 +341,7 @@ func TestComputerDNSProxyRateLimitIsAttemptLocalAndBounded(t *testing.T) {
 }
 
 func TestComputerDNSProxyForwardingUsesValidatedFakeUpstream(t *testing.T) {
-	query := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	query := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
 	want := slices.Clone(query)
 	want[2] |= 0x80
 	client, server := net.Pipe()
@@ -1148,5 +1148,130 @@ func assertNamespaceTCPRefused(t *testing.T, namespace *pinnedNetworkNamespace, 
 	var errno syscall.Errno
 	if err == nil || !errors.As(err, &errno) || (errno != syscall.ECONNREFUSED && errno != syscall.ENETUNREACH && errno != syscall.EHOSTUNREACH) {
 		t.Fatalf("Computer dial %s %s = %v, want typed refusal/unreachable", network, address, err)
+	}
+}
+
+func TestValidDNSResponseMatchesQuestions(t *testing.T) {
+	query := []byte{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
+	response := slices.Clone(query)
+	response[2] |= 0x80
+	for _, test := range []struct {
+		name   string
+		change func([]byte) []byte
+		valid  bool
+	}{
+		{"same", func(b []byte) []byte { return b }, true},
+		{"case insensitive", func(b []byte) []byte { b[13] = 'W'; b[17] = 'E'; return b }, true},
+		{"wrong name", func(b []byte) []byte { b[13] = 'x'; return b }, false},
+		{"wrong type", func(b []byte) []byte { b[len(b)-3] = 28; return b }, false},
+		{"wrong class", func(b []byte) []byte { b[len(b)-1] = 3; return b }, false},
+		{"missing question", func(b []byte) []byte { b[5] = 0; return b[:12] }, false},
+		{"extra question", func(b []byte) []byte { b[5] = 2; return append(b, b[12:]...) }, false},
+		{"truncated question", func(b []byte) []byte { return b[:len(b)-1] }, false},
+		{"compression cycle", func(b []byte) []byte { return append(b[:12], 0xc0, 12, 0, 1, 0, 1) }, false},
+		{"compression pointer out of bounds", func(b []byte) []byte { return append(b[:12], 0xff, 0xff, 0, 1, 0, 1) }, false},
+		{"wrong transaction", func(b []byte) []byte { b[0] ^= 1; return b }, false},
+		{"not response", func(b []byte) []byte { b[2] &^= 0x80; return b }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validDNSResponse(query, test.change(slices.Clone(response))); got != test.valid {
+				t.Fatalf("validDNSResponse=%t, want %t", got, test.valid)
+			}
+		})
+	}
+	t.Run("backward compressed second question", func(t *testing.T) {
+		multiple := append(slices.Clone(query), query[12:]...)
+		multiple[5] = 2
+		compressed := append(slices.Clone(response), 0xc0, 12, 0, 1, 0, 1)
+		compressed[5] = 2
+		if !validDNSResponse(multiple, compressed) {
+			t.Fatal("valid compressed question mismatch")
+		}
+		compressed[len(compressed)-3] = 28
+		if validDNSResponse(multiple, compressed) {
+			t.Fatal("compressed question with wrong type accepted")
+		}
+	})
+	t.Run("malformed query", func(t *testing.T) {
+		if validDNSResponse(query[:12], response) {
+			t.Fatal("malformed original question accepted")
+		}
+	})
+
+}
+
+func TestComputerEndpointReadinessReobservesLateHostAbstractSocket(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	command := startIsolatedNetworkTask(t)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	backend, err := listenTaskLoopback(namespace, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	port := uint16(backend.Addr().(*net.TCPAddr).Port)
+	token := "@/tmp/.X11-unix/X" + fmt.Sprint(port)
+	helperInode, taskInode, visible, _, err := observeComputerNetworkIsolation(namespace, token)
+	if err != nil || visible {
+		t.Fatalf("initial observation visible=%t err=%v", visible, err)
+	}
+	// The X token appears after Start's sample but before the endpoint is used.
+	lateSocket, err := net.Listen("unix", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lateSocket.Close()
+	authority := testAuthority()
+	engine := &ContainerdEngine{
+		attempts:                    map[string]*containerdAttempt{authority.key(): {authority: authority, networkNamespace: namespace, endpoints: map[string]uint16{"view": port}}},
+		lastProfileNetworkNamespace: namespace,
+		lastProfile:                 &ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: helperInode, TaskNetworkNamespaceInode: taskInode},
+	}
+	client, helper := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		defer helper.Close()
+		done <- engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "view", Port: port}, helper)
+	}()
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var ready [1]byte
+	if _, err := client.Read(ready[:]); err == nil {
+		t.Fatal("published backend-ready despite late host abstract socket")
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "isolation") {
+		t.Fatalf("late socket dial = %v", err)
+	}
+	if !engine.lastProfile.HostAbstractSocketVisible {
+		t.Fatal("late visible socket was not recorded")
+	}
+}
+
+func TestComputerXObservationRequiresActualTargetBinding(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	command := startIsolatedNetworkTask(t)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	token := "@/tmp/.X11-unix/Xlate-ordering"
+	_, _, host, live, err := observeComputerNetworkIsolation(namespace, token)
+	if err != nil || host || live {
+		t.Fatalf("before custom image binds X: host=%t live=%t err=%v", host, live, err)
+	}
+	var listener net.Listener
+	err = inNetworkNamespace(namespace, func() error { var err error; listener, err = net.Listen("unix", token); return err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, _, host, live, err = observeComputerNetworkIsolation(namespace, token)
+	if err != nil || host || !live {
+		t.Fatalf("after actual target bind: host=%t live=%t err=%v", host, live, err)
 	}
 }

@@ -1161,3 +1161,50 @@ func assertFileNotContains(t *testing.T, path string, values ...string) {
 		}
 	}
 }
+
+func TestComputerRootNetworkProofWorkflowContract(t *testing.T) {
+	required := []string{"TestComputerDNSProxyForwardsLoopbackResolver", "TestComputerDNSProxyRejectsNonDNSPayload", "TestComputerNetworkUsesMountedResolverForLoopbackProxy", "TestComputerFirewallReconcilesOnEveryAttemptStart", "TestComputerFirewallObservationAndRepairRequireFirstJump"}
+	validate := func(workflow workflowContract) bool {
+		count := 0
+		for _, job := range workflow.Jobs {
+			for _, step := range job.Steps {
+				if step.Name != "Prove Computer DNS and firewall repair in a root network namespace" {
+					continue
+				}
+				count++
+				if step.If != "runner.os == 'Linux'" || fmt.Sprint(step.Env["WEFTY_RUN_NETWORK_NAMESPACE_EGRESS_TEST"]) != "1" || !strings.Contains(step.Run, "sudo env") || !strings.Contains(step.Run, "./runner/ocihelper") {
+					return false
+				}
+				expression := regexp.MustCompile(`-run '([^']+)'`).FindStringSubmatch(step.Run)
+				if len(expression) != 2 {
+					return false
+				}
+				selected, err := regexp.Compile(expression[1])
+				if err != nil {
+					return false
+				}
+				for _, name := range required {
+					if !selected.MatchString(name) {
+						return false
+					}
+				}
+			}
+		}
+		return count == 1
+	}
+	for _, file := range []string{"../.github/workflows/service-acceptance-realtiming.yml", "../.github/workflows/service-acceptance-realtiming-scheduled.yml"} {
+		workflow, payload := readWorkflow(t, file)
+		if !validate(workflow) {
+			t.Fatalf("missing executable Computer root proofs: %s", file)
+		}
+		for _, name := range required {
+			var mutation workflowContract
+			if err := yaml.Unmarshal(bytes.ReplaceAll(payload, []byte(name), []byte("RemovedProof")), &mutation); err != nil {
+				t.Fatal(err)
+			}
+			if validate(mutation) {
+				t.Fatalf("accepted removed %s in %s", name, file)
+			}
+		}
+	}
+}

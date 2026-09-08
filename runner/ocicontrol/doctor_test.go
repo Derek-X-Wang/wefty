@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,7 +59,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					ComputerFirewallPresent: true, ComputerAttemptsLive: true, ComputerFirewallRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
-					LastProfile: &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false,
+					LastProfile: &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false, TargetAbstractSocketLive: true, HostAbstractSocketObservedAfterEndpointReady: true,
 						ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", ComputerResolverAddress: "127.0.0.53",
 						ComputerDNSProxyUDP: true, ComputerDNSProxyTCP: true, ComputerDNSUpstreamAddress: "168.63.129.16", ComputerDNSUpstreamSource: "systemd_uplink", ComputerDNSUpstreamReachable: true, ComputerIPv6NATState: ocihelper.ComputerIPv6NATConfigured,
 						MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
@@ -126,7 +127,7 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	if err := WriteDoctorHuman(&human, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1 resolver=127.0.0.53 dns_proxy_udp=true dns_proxy_tcp=true dns_upstream=168.63.129.16 dns_source=systemd_uplink dns_reachable=true ipv6_nat=configured computer_firewall_present=true computer_attempts_live=true") {
+	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false after_endpoint_ready=true target_x_live=true address=198.18.0.2 gateway=198.18.0.1 resolver=127.0.0.53 dns_proxy_udp=true dns_proxy_tcp=true dns_upstream=168.63.129.16 dns_source=systemd_uplink dns_reachable=true ipv6_nat=configured computer_firewall_present=true computer_attempts_live=true") {
 		t.Fatalf("human doctor omitted screen isolation fact:\n%s", human.String())
 	}
 	if !strings.Contains(human.String(), "SESSION INVALIDATION\tobserved_at=2026-09-04T11:59:00Z session_generation=6 attempt_id=attempt-stale rejection_code=unauthorized_attempt") {
@@ -145,7 +146,7 @@ func TestDoctorFailsClosedWhenPostStartObservationWasSkipped(t *testing.T) {
 		return snapshot, err
 	}
 	report := BuildDoctor(t.Context(), config)
-	if report.ComputerScreenIsolation.Outcome != DiagnosticFailed {
+	if report.ComputerScreenIsolation.Outcome != DiagnosticNotRun {
 		t.Fatalf("skipped post-start observation = %+v", report.ComputerScreenIsolation)
 	}
 }
@@ -816,4 +817,90 @@ func findDoctorFinding(t *testing.T, report DoctorResponse, check string) Diagno
 	}
 	t.Fatalf("finding %s missing", check)
 	return DiagnosticFinding{}
+}
+
+func TestDoctorRejectsAbstractAbsenceBeforeEndpointReady(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC), "")
+	base := config.Helper
+	config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+		snapshot, err := base(ctx)
+		snapshot.Runtime.LastProfile.HostAbstractSocketObservedAfterEndpointReady = false
+		return snapshot, err
+	}
+	if got := BuildDoctor(t.Context(), config).ComputerScreenIsolation.Outcome; got != DiagnosticNotRun {
+		t.Fatalf("pre-readiness absence = %s, want NOT-RUN", got)
+	}
+}
+
+func TestDoctorRequiresLiveTargetXBeforeCertifyingAbsence(t *testing.T) {
+	for _, hostVisible := range []bool{false, true} {
+		t.Run(fmt.Sprint(hostVisible), func(t *testing.T) {
+			config := healthyDoctorConfig(time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC), "")
+			base := config.Helper
+			config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+				snapshot, err := base(ctx)
+				snapshot.Runtime.LastProfile.TargetAbstractSocketLive = false
+				snapshot.Runtime.LastProfile.HostAbstractSocketVisible = hostVisible
+				return snapshot, err
+			}
+			want := DiagnosticNotRun
+			if hostVisible {
+				want = DiagnosticFailed
+			}
+			if got := BuildDoctor(t.Context(), config).ComputerScreenIsolation.Outcome; got != want {
+				t.Fatalf("target X absent, host visible=%t: got %s want %s", hostVisible, got, want)
+			}
+		})
+	}
+}
+
+func TestDoctorComputerFirewallReadAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		live, x, read bool
+		want          DiagnosticOutcome
+	}{
+		{"live unavailable with X", true, true, false, DiagnosticFailed},
+		{"live unavailable pending X", true, false, false, DiagnosticFailed},
+		{"live present pending X", true, false, true, DiagnosticNotRun},
+		{"no live unavailable", false, true, false, DiagnosticNotRun},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := healthyDoctorConfig(time.Now(), "")
+			base := config.Helper
+			config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+				snapshot, err := base(ctx)
+				snapshot.Runtime.ComputerAttemptsLive = tc.live
+				snapshot.Runtime.LastProfile.TargetAbstractSocketLive = tc.x
+				if !tc.read {
+					snapshot.Runtime.ComputerFirewallRead = ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadFailed, ErrorCode: ocihelper.DiagnosticErrorComputerFirewall}
+				}
+				return snapshot, err
+			}
+			report := BuildDoctor(t.Context(), config)
+			if report.ComputerScreenIsolation.Outcome != tc.want {
+				t.Fatalf("want %s, got %+v", tc.want, report.ComputerScreenIsolation)
+			}
+			if !tc.read {
+				if !report.ComputerScreenIsolation.ComputerFirewallPresent {
+					t.Fatal("failed read manufactured observed firewall absence")
+				}
+				for _, f := range report.Findings {
+					if f.Check != "computer-screen-isolation" {
+						continue
+					}
+					wantCode := "oci_computer_screen_isolation_not_recorded"
+					if tc.live {
+						wantCode = "oci_computer_screen_isolation_not_enforced"
+					}
+					if f.Code != wantCode || !strings.Contains(f.Detail, "firewall read is unavailable") {
+						t.Fatalf("firewall read uncertainty hidden or misclassified: %+v", f)
+					}
+					if !tc.live && f.NotRunCause != NotRunSourceUnavailable {
+						t.Fatalf("missing source not identified: %+v", f)
+					}
+				}
+			}
+		})
+	}
 }

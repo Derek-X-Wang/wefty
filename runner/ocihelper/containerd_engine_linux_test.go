@@ -2745,3 +2745,66 @@ func waitForHostBridgePumps(t *testing.T, count int, timeout time.Duration) {
 		runtime.Gosched()
 	}
 }
+
+func TestReadyComputerIsolationObservationFailsClosedAndKeepsAttachmentIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name, helper, task string
+		visible            bool
+		err                error
+		valid              bool
+	}{
+		{name: "ready with fresh namespace sample", helper: "10", task: "30", valid: true},
+		{name: "late visible socket", helper: "10", task: "20", visible: true},
+		{name: "missing observation", err: errors.New("read failed")},
+		{name: "same namespace", helper: "10", task: "10"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			namespace := &pinnedNetworkNamespace{}
+			engine := &ContainerdEngine{lastProfileNetworkNamespace: namespace, lastProfile: &ProfileReceipt{Computer: true, TaskNetworkNamespaceInode: "20", HostAbstractSocketObservedAfterEndpointReady: true}, observeComputerIsolation: func(got *pinnedNetworkNamespace, token string) (string, string, bool, bool, error) {
+				if got != namespace || token != "@/tmp/.X11-unix/X42000" {
+					t.Fatalf("wrong observation target: %p %s", got, token)
+				}
+				return test.helper, test.task, test.visible, true, test.err
+			}}
+			err := engine.observeReadyComputerIsolation(namespace, 42000)
+			if (err == nil) != test.valid {
+				t.Fatalf("ready observation err=%v want valid=%t", err, test.valid)
+			}
+			if engine.lastProfile.TaskNetworkNamespaceInode != test.task || engine.lastProfile.HelperNetworkNamespaceInode != test.helper {
+				t.Fatal("published mixed namespace samples")
+			}
+			if engine.lastProfile.HostAbstractSocketObservedAfterEndpointReady != (test.err == nil) {
+				t.Fatal("read failure retained successful evidence")
+			}
+			other := &ProfileReceipt{ComputerNetworkAddress: "198.18.0.6"}
+			engine.lastProfile, engine.lastProfileNetworkNamespace = other, &pinnedNetworkNamespace{}
+			_ = engine.observeReadyComputerIsolation(namespace, 42000)
+			if engine.lastProfile != other {
+				t.Fatal("observation replaced another attachment's profile")
+			}
+		})
+	}
+}
+
+func TestComputerDisplayDialRefusesMissingIsolationAuthority(t *testing.T) {
+	for _, missing := range []string{"namespace", "view port"} {
+		t.Run(missing, func(t *testing.T) {
+			authority := testAuthority()
+			attempt := &containerdAttempt{authority: authority, networkNamespace: &pinnedNetworkNamespace{}, endpoints: map[string]uint16{contract.ComputerDisplayEndpointView: 42000}}
+			if missing == "namespace" {
+				attempt.networkNamespace = nil
+			} else {
+				delete(attempt.endpoints, contract.ComputerDisplayEndpointView)
+			}
+			engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): attempt}}
+			left, right := net.Pipe()
+			defer left.Close()
+			defer right.Close()
+			err := engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: contract.ComputerDisplayEndpointControl, Port: 42001}, left)
+			var refusal *ComputerAttemptAuthorityRefusalError
+			if !errors.As(err, &refusal) {
+				t.Fatalf("missing %s: got %v want typed refusal", missing, err)
+			}
+		})
+	}
+}
