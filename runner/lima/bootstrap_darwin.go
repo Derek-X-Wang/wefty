@@ -3,10 +3,12 @@
 package lima
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -19,7 +21,8 @@ import (
 )
 
 type guestHelperInstaller struct {
-	run commandRunner
+	run              commandRunner
+	inventoryExecute func(*exec.Cmd) error
 }
 
 func InspectGuestSystemdVersion(ctx context.Context, instance, limactl string) (int, error) {
@@ -195,7 +198,7 @@ func (installer guestHelperInstaller) remove(ctx context.Context, config GuestHe
 		installer.run = runCommand
 	}
 	run := installer.run
-	statePayload, inspectErr := run(ctx, config.Limactl, "list", "--json", config.Instance)
+	statePayload, inspectErr := runGuestHelperInventory(ctx, config.Limactl, installer.inventoryExecute, "list", "--json")
 	if inspectErr != nil {
 		return GuestHelperRemovalEvidence{}, fmt.Errorf("inspect Lima before guest helper removal: %w", inspectErr)
 	}
@@ -256,3 +259,37 @@ func (installer guestHelperInstaller) remove(ctx context.Context, config GuestHe
 	evidence.SocketStopped = true
 	return evidence, nil
 }
+
+// runGuestHelperInventory decodes only stdout: Lima can warn on stderr even
+// when an untargeted inventory successfully confirms that no instances exist.
+func runGuestHelperInventory(ctx context.Context, name string, execute func(*exec.Cmd) error, arguments ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, name, arguments...)
+	var output bytes.Buffer
+	var diagnostic inventoryDiagnostic
+	command.Stdout = &output
+	command.Stderr = &diagnostic
+	if execute == nil {
+		execute = (*exec.Cmd).Run
+	}
+	if err := execute(command); err != nil {
+		return nil, fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(diagnostic.String()))
+	}
+	return output.Bytes(), nil
+}
+
+// Bound retained command diagnostics without failing writes or mixing them with JSON.
+type inventoryDiagnostic struct{ buffer bytes.Buffer }
+
+func (diagnostic *inventoryDiagnostic) Write(payload []byte) (int, error) {
+	const limit = 4096
+	count := len(payload)
+	if remaining := limit - diagnostic.buffer.Len(); remaining > 0 {
+		if len(payload) > remaining {
+			payload = payload[:remaining]
+		}
+		_, _ = diagnostic.buffer.Write(payload)
+	}
+	return count, nil
+}
+
+func (diagnostic *inventoryDiagnostic) String() string { return diagnostic.buffer.String() }
