@@ -73,7 +73,7 @@ jobs:
   fabric-machine-identity:
     name: fabric-identity / machine
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -116,7 +116,7 @@ jobs:
   fabric-person-identity:
     name: fabric-identity / person-whoami
     needs: [resolve-published-artifact]
-    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -163,7 +163,7 @@ jobs:
   service-acceptance-realtiming:
     name: service-acceptance-realtiming / ${{ matrix.os }} / ${{ matrix.image }}
     needs: [resolve-published-artifact]
-    if: needs.resolve-published-artifact.outputs.available == 'true'
+    if: ${{ !cancelled() && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -640,6 +640,7 @@ jobs:
             "$RUNNER_TEMP/fabric-machine-identity/fabric-machine-identity.json" \
             "$RUNNER_TEMP/fabric-person-identity/fabric-person-identity.json"
       - name: Fail closed unless the published lane executed and passed
+        if: ${{ always() }}
         env:
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
           ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}

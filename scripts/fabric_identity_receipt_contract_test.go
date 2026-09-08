@@ -32,7 +32,7 @@ func TestFabricIdentityWorkflowContract(t *testing.T) {
 		if name == "scheduled" {
 			trustGuard = "github.event_name == 'schedule' && github.ref == 'refs/heads/main'"
 		}
-		machineGuard := "${{ !cancelled() && " + trustGuard + " && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}"
+		machineGuard := "${{ !cancelled() && " + trustGuard + " && needs.resolve-published-artifact.result == 'success' && needs.resolve-published-artifact.outputs.available == 'true' && vars.TSNET_SMOKE_REQUIRED == 'true' }}"
 		personGuard := strings.TrimSuffix(machineGuard, " }}") + " && vars.TSNET_CI_TESTER_REQUIRED == 'true' }}"
 		if machine.If != machineGuard || person.If != personGuard {
 			t.Fatalf("%s Fabric credential guards changed: machine=%q, want %q; person=%q, want %q", name, machine.If, machineGuard, person.If, personGuard)
