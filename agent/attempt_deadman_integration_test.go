@@ -29,6 +29,9 @@ const (
 )
 
 func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
+	trace := newPreAdmissionFailureTrace()
+	snapshot := func() {}
+	fatalf := func(format string, args ...any) { snapshot(); trace.emit(t.Logf); t.Fatalf(format, args...) }
 	network := plain.NewNetwork()
 	store, stopL1 := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
 		"pre-admission-node": {Tags: []string{"pre-admission"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
@@ -37,14 +40,14 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 
 	engine := newPreAdmissionRenewalEngine()
 	clock := newManualClock(time.Unix(10_000, 0))
-	barrier, stopHelper := startPreAdmissionHelper(t, engine, clock.Now)
+	barrier, stopHelper := startPreAdmissionFailureHelper(t, preAdmissionFailureEngine{preAdmissionRenewalEngine: engine, trace: trace}, clock.Now, trace)
 	defer stopHelper()
 	helperRenewals := make(chan struct{}, 8)
 	adapter := ocirunner.NewAdapter(barrier)
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "pre-admission-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
@@ -63,17 +66,17 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: adapter},
 		AttemptDeadman: preAdmissionDeadman{
 			barrier: barrier, nodeID: "pre-admission-node", bootSessionID: "pre-admission-boot",
-			observe: func() { helperRenewals <- struct{}{} },
+			observe: func() { trace.add("renewal queued (not remote ACK)"); helperRenewals <- struct{}{} },
 		},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
 		RenewalInterval: 200 * time.Millisecond, Clock: clock, Logf: t.Logf,
 	})
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	defer nodeAgent.Close()
 	if _, err := nodeAgent.Register(t.Context()); err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 
 	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
@@ -86,41 +89,75 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		}},
 	})
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	claim, err := nodeAgent.session.client.Claim(t.Context(), "pre-admission-node", "pre-admission-boot", contract.JobClassService)
 	if err != nil || claim == nil || claim.Job.JobID != job.JobID {
 		nodes, _ := store.ListNodes(t.Context())
 		current, _ := store.GetJob(t.Context(), job.JobID)
-		t.Fatalf("service claim = %+v err=%v job=%+v nodes=%+v", claim, err, current, nodes)
+		fatalf("service claim = %+v err=%v job=%+v nodes=%+v", claim, err, current, nodes)
 	}
 
+	probeSession, _ := barrier.Session()
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	var imageRelease, watchRelease, deleteRelease sync.Once
+	releaseImage := func() { imageRelease.Do(func() { trace.add("release image gate"); close(engine.releaseImage) }) }
+	releaseWatch := func() { watchRelease.Do(func() { trace.add("release Watch gate"); close(engine.releaseWatch) }) }
+	releaseDelete := func() { deleteRelease.Do(func() { trace.add("release Delete gate"); close(engine.releaseDelete) }) }
+	executionJoined := make(chan struct{})
+	defer func() {
+		cancelRun()
+		releaseImage()
+		releaseWatch()
+		releaseDelete()
+		<-executionJoined
+	}()
+	snapshot = func() {
+		trace.add("snapshot context cause", context.Cause(runCtx))
+		if probeSession != nil {
+			trace.add("first retained session health error", probeSession.HealthError())
+		}
+		if session, err := barrier.Session(); err != nil {
+			trace.add("barrier Session error", err)
+		} else {
+			trace.add("session HealthError", session.HealthError())
+		}
+		attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
+		trace.add("durable attempts query", err, len(attempts))
+		for _, attempt := range attempts {
+			trace.attempt(attempt)
+		}
+	}
 	executionDone := make(chan error, 1)
 	go func() {
-		_, executeErr := nodeAgent.executeClaim(t.Context(), *claim, time.Now())
+		defer close(executionJoined)
+		_, executeErr := nodeAgent.executeClaim(runCtx, *claim, time.Now())
+		trace.add("executeClaim returned", executeErr, context.Cause(runCtx))
 		executionDone <- executeErr
 	}()
 	select {
 	case authority := <-engine.imageEntered:
+		trace.add("image entered observed", authority.AttemptID)
 		if authority.AttemptID != claim.Lease.AttemptID {
-			t.Fatalf("image delivery attempt=%q, want %q", authority.AttemptID, claim.Lease.AttemptID)
+			fatalf("image delivery attempt=%q, want %q", authority.AttemptID, claim.Lease.AttemptID)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("attempt did not reach held pre-admission image delivery")
+		fatalf("%v", "attempt did not reach held pre-admission image delivery")
 	}
 
+	trace.add("advance agent manual clock 200ms")
 	clock.Advance(200 * time.Millisecond)
 	renewalDeadline := time.Now().Add(3 * time.Second)
 	for {
 		attempts, listErr := store.ListJobAttempts(t.Context(), job.JobID)
 		if listErr != nil {
-			t.Fatal(listErr)
+			fatalf("%v", listErr)
 		}
 		if len(attempts) == 1 && attempts[0].LeaseExpiresAt.After(claim.Lease.LeaseExpires) {
 			break
 		}
 		if time.Now().After(renewalDeadline) {
-			t.Fatalf("first L1 renewal did not land at 200ms: attempts=%+v", attempts)
+			fatalf("first L1 renewal did not land at 200ms: attempts=%+v", attempts)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -131,41 +168,43 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	continuityDeadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(continuityDeadline) {
 		if _, err := barrier.Session(); err != nil {
-			t.Fatalf("pre-admission L1 renewal invalidated the helper session: %v", err)
+			fatalf("pre-admission L1 renewal invalidated the helper session: %v", err)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	session, err := barrier.Session()
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	doctor, err := session.DoctorStatus(t.Context())
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	if evidence := doctor.LastSessionInvalidation; evidence != nil && evidence.AttemptID == claim.Lease.AttemptID {
-		t.Fatalf("pre-admission renewal invalidated helper session: attempt=%s code=%s generation=%d",
+		fatalf("pre-admission renewal invalidated helper session: attempt=%s code=%s generation=%d",
 			evidence.AttemptID, evidence.RejectionCode, evidence.SessionGeneration)
 	}
-	close(engine.releaseImage)
+	releaseImage()
 
 	select {
 	case authority := <-engine.runEntered:
+		trace.add("Run entered observed", authority.AttemptID)
 		if authority.AttemptID != claim.Lease.AttemptID {
-			t.Fatalf("helper admitted attempt=%q, want original %q", authority.AttemptID, claim.Lease.AttemptID)
+			fatalf("helper admitted attempt=%q, want original %q", authority.AttemptID, claim.Lease.AttemptID)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("original attempt did not reach helper Run admission")
+		fatalf("%v", "original attempt did not reach helper Run admission")
 	}
 	select {
 	case <-engine.watchEntered:
+		trace.add("Watch entered observed")
 	case <-time.After(5 * time.Second):
-		t.Fatal("original attempt did not continue through Started into Watch")
+		fatalf("%v", "original attempt did not continue through Started into Watch")
 	}
 	select {
 	case <-helperRenewals:
 	case <-time.After(time.Second):
-		t.Fatal("admission did not flush the retained helper renewal")
+		fatalf("%v", "admission did not flush the retained helper renewal")
 	}
 
 	// A later admitted renewal must move the helper deadline. Waiting before
@@ -174,88 +213,91 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	time.Sleep(time.Second)
 	beforeRenewal, err := store.ListJobAttempts(t.Context(), job.JobID)
 	if err != nil || len(beforeRenewal) != 1 {
-		t.Fatalf("attempt before admitted renewal = %+v err=%v", beforeRenewal, err)
+		fatalf("attempt before admitted renewal = %+v err=%v", beforeRenewal, err)
 	}
+	trace.add("advance agent manual clock 200ms")
 	clock.Advance(200 * time.Millisecond)
 	admittedRenewalDeadline := time.Now().Add(time.Second)
 	for {
 		afterRenewal, listErr := store.ListJobAttempts(t.Context(), job.JobID)
 		if listErr != nil {
-			t.Fatal(listErr)
+			fatalf("%v", listErr)
 		}
 		if len(afterRenewal) == 1 && afterRenewal[0].LeaseExpiresAt.After(beforeRenewal[0].LeaseExpiresAt) {
 			break
 		}
 		if time.Now().After(admittedRenewalDeadline) {
-			t.Fatalf("post-admission L1 renewal did not land: before=%+v after=%+v", beforeRenewal, afterRenewal)
+			fatalf("post-admission L1 renewal did not land: before=%+v after=%+v", beforeRenewal, afterRenewal)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	select {
 	case <-helperRenewals:
 	case <-time.After(time.Second):
-		t.Fatal("post-admission renewal did not reach the helper session")
+		fatalf("%v", "post-admission renewal did not reach the helper session")
 	}
 	time.Sleep(1200 * time.Millisecond)
 	if reaps := engine.attemptReapCount(); reaps != 0 {
-		t.Fatalf("helper attempt did not outlive its original InitialDeadman: reaps=%d", reaps)
+		fatalf("helper attempt did not outlive its original InitialDeadman: reaps=%d", reaps)
 	}
-	close(engine.releaseWatch)
+	releaseWatch()
 	select {
 	case <-engine.deleteEntered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("terminal attempt did not enter helper reap")
+		fatalf("%v", "terminal attempt did not enter helper reap")
 	}
 	beforeTerminalRenewal, err := store.ListJobAttempts(t.Context(), job.JobID)
 	if err != nil || len(beforeTerminalRenewal) != 1 {
-		t.Fatalf("attempt before terminal renewal = %+v err=%v", beforeTerminalRenewal, err)
+		fatalf("attempt before terminal renewal = %+v err=%v", beforeTerminalRenewal, err)
 	}
+	trace.add("advance agent manual clock 200ms")
 	clock.Advance(200 * time.Millisecond)
 	terminalRenewalDeadline := time.Now().Add(time.Second)
 	for {
 		afterTerminalRenewal, listErr := store.ListJobAttempts(t.Context(), job.JobID)
 		if listErr != nil {
-			t.Fatal(listErr)
+			fatalf("%v", listErr)
 		}
 		if len(afterTerminalRenewal) == 1 && afterTerminalRenewal[0].LeaseExpiresAt.After(beforeTerminalRenewal[0].LeaseExpiresAt) {
 			break
 		}
 		if time.Now().After(terminalRenewalDeadline) {
-			t.Fatalf("terminal L1 renewal did not land: before=%+v after=%+v", beforeTerminalRenewal, afterTerminalRenewal)
+			fatalf("terminal L1 renewal did not land: before=%+v after=%+v", beforeTerminalRenewal, afterTerminalRenewal)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	select {
 	case <-helperRenewals:
-		t.Fatal("terminal L1 renewal reached the helper while reap was in flight")
+		fatalf("%v", "terminal L1 renewal reached the helper while reap was in flight")
 	case <-time.After(100 * time.Millisecond):
 	}
 	session, err = barrier.Session()
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	doctor, err = session.DoctorStatus(t.Context())
 	if err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	if evidence := doctor.LastSessionInvalidation; evidence != nil && evidence.AttemptID == claim.Lease.AttemptID {
-		t.Fatalf("terminal renewal invalidated helper session during reap: attempt=%s code=%s generation=%d",
+		fatalf("terminal renewal invalidated helper session during reap: attempt=%s code=%s generation=%d",
 			evidence.AttemptID, evidence.RejectionCode, evidence.SessionGeneration)
 	}
-	close(engine.releaseDelete)
+	releaseDelete()
 
 	select {
 	case err := <-executionDone:
 		if err != nil {
-			t.Fatal(err)
+			fatalf("%v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("original attempt did not finish")
+		fatalf("%v", "original attempt did not finish")
 	}
 	attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
 	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != claim.Lease.AttemptID {
-		t.Fatalf("pre-admission ordering produced replacement attempts=%+v err=%v", attempts, err)
+		fatalf("pre-admission ordering produced replacement attempts=%+v err=%v", attempts, err)
 	}
+
 }
 
 func TestSessionGenerationMismatchDropsRenewalAfterHelperTakeover(t *testing.T) {
