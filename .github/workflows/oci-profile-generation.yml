@@ -1,0 +1,215 @@
+name: oci-profile-generation
+
+# Artifact-only generation: fixture changes require review and later assembly.
+# Publishing this workflow does not certify copied fixtures or upgrade a daemon.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - go.mod
+      - go.sum
+      - runner/ocihelper/**
+      - .github/workflows/oci-profile-generation.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-profile-generation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  native-profile:
+    name: native-profile / linux/${{ matrix.arch }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, machine: x86_64, runner: ubuntu-latest}
+          # This native label also serves reference-computer-platform-build in
+          # acceptance-image.yml and acceptance-image-build.yml (arm64 Wayland).
+          - {arch: arm64, machine: aarch64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      GOFLAGS: -mod=readonly
+    steps:
+      - name: Check out the exact PR candidate without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up the candidate Go version
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Record candidate and native host provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/oci-profile-evidence"
+          mkdir -p "$evidence"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$CANDIDATE_SHA"
+          git status --porcelain=v1 --untracked-files=all > "$evidence/source-status-before.txt"
+          test ! -s "$evidence/source-status-before.txt"
+          git diff --binary HEAD > "$evidence/source-before.patch"
+          sha256sum "$evidence/source-before.patch" go.mod go.sum .github/workflows/oci-profile-generation.yml > "$evidence/source-hashes-before.txt"
+          cp .github/workflows/oci-profile-generation.yml "$evidence/workflow-source.yml"
+          printf '%s\n' "$actual_sha" > "$evidence/candidate-sha.txt"
+          uname -a > "$evidence/uname.txt"
+          go version > "$evidence/go-version.txt"
+          go env -json GOOS GOARCH GOHOSTOS GOHOSTARCH GOVERSION > "$evidence/go-environment.json"
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = "$EXPECTED_MACHINE"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
+          facts = json.loads((evidence / "go-environment.json").read_text())
+          assert facts["GOOS"] == facts["GOHOSTOS"] == "linux", facts
+          assert facts["GOARCH"] == facts["GOHOSTARCH"] == os.environ["EXPECTED_ARCH"], facts
+          PY
+          go list -m -json github.com/containerd/containerd/v2 > "$evidence/containerd-module-before.json"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
+          module = json.loads((evidence / "containerd-module-before.json").read_text())
+          assert module["Path"] == "github.com/containerd/containerd/v2", module
+          assert module["Version"] == "v2.3.5" and "Replace" not in module, module
+          sums = [line for line in Path("go.sum").read_text().splitlines()
+                  if line.startswith("github.com/containerd/containerd/v2 v2.3.5")]
+          assert len(sums) == 2, sums
+          (evidence / "containerd-module-checksums.txt").write_text("\n".join(sums) + "\n")
+          expected = {
+              "seccomp-linux-amd64.json", "wefty-v1-linux-amd64.json",
+              "wefty-v1-service-linux-amd64.json", "wefty-v1-computer-linux-amd64.json",
+              "wefty-v1-default-root-linux-amd64.json", "seccomp-linux-arm64.json",
+              "wefty-v1-lima-arm64.json", "wefty-v1-numeric-user-unlimited-lima-arm64.json",
+          }
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          assert {path.name for path in root.iterdir()} == expected
+          hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in sorted(expected)}
+          (evidence / "fixtures-before.json").write_text(json.dumps(hashes, indent=2) + "\n")
+          PY
+      - name: Generate matching native fixtures and run public oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/oci-profile-evidence"
+          run_logged() {
+            local stage="$1" started finished result=0
+            shift
+            printf '%q ' "$@" > "$evidence/$stage.command"
+            printf '\n' >> "$evidence/$stage.command"
+            started="$(date -u +%s)"
+            "$@" > "$evidence/$stage.jsonl" 2>&1 || result=$?
+            finished="$(date -u +%s)"
+            printf 'exit=%s\nstarted_unix=%s\nfinished_unix=%s\nduration_seconds=%s\n' \
+              "$result" "$started" "$finished" "$((finished - started))" > "$evidence/$stage.result"
+            cat "$evidence/$stage.jsonl"
+            return "$result"
+          }
+          run_logged generate env UPDATE_OCI_PROFILE_GOLDENS=1 go test -json ./runner/ocihelper \
+            -run "^TestRuntimeSpecGoldens$/.*${EXPECTED_ARCH}$" -count=1 -timeout=3m
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(root.glob("*.json"))}
+          (evidence / "fixtures-after-generation.json").write_text(json.dumps(hashes, indent=2) + "\n")
+          PY
+          run_logged oracle env UPDATE_OCI_PROFILE_GOLDENS=0 go test -json ./runner/ocihelper \
+            -run '^(TestContainerdBaselineVersionPinned|TestContainerdSeccompFixtureMatchesGuestGenerator|TestPublicRuntimeSpecHandoffUsesRealGuestGenerator|TestRuntimeSpecGoldens|TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup|TestImageUserRootfsSymlinkBoundaries)$' \
+            -count=1 -timeout=3m
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
+          architecture = os.environ["EXPECTED_ARCH"]
+          def passed(stage):
+              events = []
+              for line in (evidence / (stage + ".jsonl")).read_text().splitlines():
+                  try:
+                      events.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass  # Retain raw Go download/compiler stderr in the same log.
+              return {event.get("Test") for event in events if event.get("Action") == "pass"}
+          names = {
+              "amd64": ["native_Linux_amd64", "service_Linux_amd64", "Computer_Linux_amd64", "default_root_Linux_amd64"],
+              "arm64": ["Lima_Linux_arm64", "numeric_user_unlimited_Lima_arm64"],
+          }
+          required_generation = {"TestRuntimeSpecGoldens/" + name for name in names[architecture]}
+          assert required_generation <= passed("generate"), "matching native generation subtests did not pass"
+          required_oracles = {
+              "TestContainerdBaselineVersionPinned",
+              "TestContainerdSeccompFixtureMatchesGuestGenerator/" + architecture,
+              "TestPublicRuntimeSpecHandoffUsesRealGuestGenerator", "TestRuntimeSpecGoldens",
+              "TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup", "TestImageUserRootfsSymlinkBoundaries",
+          }
+          assert required_oracles <= passed("oracle"), "native public oracle was missing or skipped"
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          after_oracle = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(root.glob("*.json"))}
+          after_generation = json.loads((evidence / "fixtures-after-generation.json").read_text())
+          assert after_oracle == after_generation, "read-only oracle changed generated fixture bytes"
+          (evidence / "native-verification.json").write_text(json.dumps({
+              "candidate_sha": os.environ["CANDIDATE_SHA"], "native_os": "linux", "native_arch": architecture,
+              "generation_passes": sorted(required_generation), "oracle_passes": sorted(required_oracles),
+              "fixture_review": "pending", "assembled_candidate_verification": "pending",
+          }, indent=2) + "\n")
+          PY
+      - name: Preserve generated files, hash comparison, and source diff
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/oci-profile-evidence"
+          mkdir -p "$evidence/fixtures"
+          git status --porcelain=v1 --untracked-files=all > "$evidence/source-status-after.txt"
+          git diff --binary HEAD > "$evidence/source-after.patch"
+          git diff --name-only HEAD > "$evidence/changed-files.txt"
+          go list -m -json github.com/containerd/containerd/v2 > "$evidence/containerd-module-after.json"
+          python3 - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          paths = sorted(root.glob("*.json"))
+          assert len(paths) == 8, "incomplete fixture inventory"
+          after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+          (evidence / "fixtures-after.json").write_text(json.dumps(after, indent=2) + "\n")
+          owned = {path.name for path in paths if path.name.endswith("-" + os.environ["EXPECTED_ARCH"] + ".json")}
+          assert len(owned) == (5 if os.environ["EXPECTED_ARCH"] == "amd64" else 3), owned
+          for path in paths:
+              if path.name in owned:
+                  shutil.copyfile(path, evidence / "fixtures" / path.name)
+          before_path = evidence / "fixtures-before.json"
+          assert before_path.exists(), "native provenance/baseline stage did not complete"
+          before = json.loads(before_path.read_text())
+          changed = sorted(name for name in after if before[name] != after[name])
+          (evidence / "fixture-comparison.json").write_text(json.dumps({
+              "owned_files": sorted(owned), "changed_files": changed, "byte_identical": not changed,
+              "native_verification_recorded": (evidence / "native-verification.json").exists(),
+          }, indent=2) + "\n")
+          assert set(changed) <= owned, "generation changed another native architecture's fixtures"
+          allowed = {str(root / name) for name in owned}
+          changed_source = set((evidence / "changed-files.txt").read_text().splitlines())
+          assert changed_source <= allowed, "generation changed source outside its fixture ownership"
+          PY
+          git diff --exit-code -- go.mod go.sum
+      - name: Upload raw native evidence and owned fixture artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oci-profile-linux-${{ matrix.arch }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/oci-profile-evidence
+          if-no-files-found: error
+          retention-days: 14

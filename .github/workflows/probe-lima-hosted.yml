@@ -43,7 +43,7 @@ jobs:
       GUEST_IMAGE_ARCH: ${{ matrix.guest-image-arch }}
       GUEST_IMAGE_DIGEST: ${{ matrix.guest-image-digest }}
       INSTALL_QEMU: ${{ matrix.install-qemu }}
-      CONTAINERD_VERSION: 2.3.4
+      CONTAINERD_VERSION: 2.3.5
       RUNC_VERSION: 1.5.1
     steps:
       - name: Initialize probe receipt state

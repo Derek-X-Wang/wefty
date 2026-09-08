@@ -244,7 +244,7 @@ jobs:
       - name: Provision pinned Linux OCI engine and probe
         if: runner.os == 'Linux'
         env:
-          CONTAINERD_VERSION: 2.3.4
+          CONTAINERD_VERSION: 2.3.5
           RUNC_VERSION: 1.5.1
         run: |
           set -euo pipefail

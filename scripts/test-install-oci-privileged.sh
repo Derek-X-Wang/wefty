@@ -27,12 +27,12 @@ bash /src/scripts/build-oci-install-manifest.sh \
 
 test ! -e /usr/local/lib/wefty/oci-runtime
 bash /src/scripts/install-oci-deps.sh >/tmp/install-first.log
-test -x /usr/local/lib/wefty/oci-runtime/containerd-2.3.4/bin/containerd
-test -x /usr/local/lib/wefty/oci-runtime/containerd-2.3.4/bin/containerd-shim-runc-v2
-test -x /usr/local/lib/wefty/oci-runtime/containerd-2.3.4/bin/ctr
+test -x /usr/local/lib/wefty/oci-runtime/containerd-2.3.5/bin/containerd
+test -x /usr/local/lib/wefty/oci-runtime/containerd-2.3.5/bin/containerd-shim-runc-v2
+test -x /usr/local/lib/wefty/oci-runtime/containerd-2.3.5/bin/ctr
 test -x /usr/local/lib/wefty/oci-runtime/runc-1.5.1/runc
 grep -Fxq 'Type=notify' /etc/systemd/system/containerd.service
-grep -Fxq 'ExecStart=/usr/local/lib/wefty/oci-runtime/containerd-2.3.4/bin/containerd' /etc/systemd/system/containerd.service
+grep -Fxq 'ExecStart=/usr/local/lib/wefty/oci-runtime/containerd-2.3.5/bin/containerd' /etc/systemd/system/containerd.service
 grep -Fxq 'Restart=always' /etc/systemd/system/containerd.service
 find /usr/local/lib/wefty/oci-runtime /etc/systemd/system/containerd.service -type f -exec sha256sum {} + | sort -k2 >/tmp/install-before.sha256
 bash /src/scripts/install-oci-deps.sh >/tmp/install-second.log

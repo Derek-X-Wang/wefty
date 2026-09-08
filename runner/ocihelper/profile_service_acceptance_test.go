@@ -17,7 +17,7 @@ const linuxENOSYS = uint(38)
 func TestServiceAcceptancePinnedRuntimeProfiles(t *testing.T) {
 	for _, test := range runtimeSpecGoldenCases() {
 		t.Run(test.name, func(t *testing.T) {
-			payload, err := os.ReadFile(filepath.Join("testdata", "containerd-v2.3.4", test.golden))
+			payload, err := os.ReadFile(filepath.Join("testdata", "containerd-v2.3.5", test.golden))
 			if err != nil {
 				t.Fatal(err)
 			}
