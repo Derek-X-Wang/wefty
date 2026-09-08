@@ -383,7 +383,7 @@ The transport-neutral Go contract exports the endpoint names, path,
 subprotocol, RFB-banner length/validator, 60-second deadline, and 1 GiB shm
 size. Runtime endpoint aliases and the helper consume those values. The
 complete serialized Computer profile is pinned at
-`runner/ocihelper/testdata/containerd-v2.3.4/wefty-v1-computer-linux-amd64.json`.
+`runner/ocihelper/testdata/containerd-v2.3.5/wefty-v1-computer-linux-amd64.json`.
 
 Portable tests prove reserved-value stripping, exact endpoint admission,
 wire-negative cases, atomic loss/recovery, injected-clock deadline behavior,

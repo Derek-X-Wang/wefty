@@ -728,13 +728,19 @@ func TestTestedRuntimeVersionsMatchRealtimeWorkflowPins(t *testing.T) {
 			}
 		}
 	}
-	payload, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "service-acceptance-realtiming.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, pin := range []string{"CONTAINERD_VERSION: " + TestedContainerdVersion, "RUNC_VERSION: " + TestedRuncVersion} {
-		if !bytes.Contains(payload, []byte(pin)) {
-			t.Fatalf("tested runtime constant drifted from workflow pin %q", pin)
+	for _, workflow := range []string{
+		"service-acceptance-realtiming.yml",
+		"service-acceptance-realtiming-scheduled.yml",
+		"probe-lima-hosted.yml",
+	} {
+		payload, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", workflow))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pin := range []string{"CONTAINERD_VERSION: " + TestedContainerdVersion, "RUNC_VERSION: " + TestedRuncVersion} {
+			if !bytes.Contains(payload, []byte(pin)) {
+				t.Fatalf("tested runtime constant drifted from %s pin %q", workflow, pin)
+			}
 		}
 	}
 }

@@ -7,9 +7,9 @@ This runbook reproduces the supported M3 `kind=oci` node setup without widening 
 | Node path | Minimum | Tested | Installer scope |
 |---|---|---|---|
 | macOS 13.5+ | Lima 2.2 with `vz` | Lima 2.2.0 | Homebrew `lima`; Homebrew itself is not installed |
-| Ubuntu 24.04 or 26.04 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
-| Debian 12 or 13 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
-| Fedora 43 or 44 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
+| Ubuntu 24.04 or 26.04 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.5, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
+| Debian 12 or 13 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.5, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
+| Fedora 43 or 44 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.5, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
 
 Minimum-version failures and unknown platforms stop before mutation. A supported installed version outside the tested pin is preserved and reported as a warning. Preview the exact plan first:
 

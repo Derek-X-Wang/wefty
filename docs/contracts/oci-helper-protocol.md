@@ -538,7 +538,7 @@ configuration, image-rootfs user/group databases, guest architecture/kernel
 facts, resolver and hosts files, translated Lima mount paths, namespace/device
 policy, and OCI JSON never cross from the agent.
 
-The privileged adapter constructs `wefty-v1` from containerd v2.3.4's generated
+The privileged adapter constructs `wefty-v1` from containerd v2.3.5's generated
 Linux baseline, then replaces every security-sensitive field explicitly. It
 resolves the image `USER` and supplemental groups from the pinned guest rootfs;
 sets the fixed capability sets, `noNewPrivileges`, containerd default seccomp,
@@ -664,11 +664,11 @@ The baseline `RLIMIT_NOFILE` soft/hard value of 1024 remains containerd's pinned
 default and is an explicit M3 decision; raising it needs workload evidence and
 a profile amendment. Opportunistic AppArmor names use the closed
 `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}` shape. The `ociVersion` remains the linked
-runtime-spec v1.3.0 used by containerd v2.3.4 and the runc v2 shim targeted by
+runtime-spec v1.3.0 used by containerd v2.3.5 and the runc v2 shim targeted by
 #141; it is not versioned independently.
 
 The serialized fixtures under
-`runner/ocihelper/testdata/containerd-v2.3.4/` are the review boundary for
+`runner/ocihelper/testdata/containerd-v2.3.5/` are the review boundary for
 native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
 numeric-user, unlimited-resource, and the complete Computer profile. The
 Computer fixture proves image USER/ENTRYPOINT/CMD semantics, the unchanged
@@ -679,9 +679,22 @@ final capabilities are applied. Regenerate complete fixtures only in their
 matching Linux architecture with:
 
 ```sh
+# Run natively on Linux amd64; use .*arm64$ on native Linux arm64.
 UPDATE_OCI_PROFILE_GOLDENS=1 go test ./runner/ocihelper \
-  -run 'TestRuntimeSpecGoldens/(amd64|arm64)' -count=1
+  -run '^TestRuntimeSpecGoldens$/.*amd64$' -count=1 -timeout=3m -v
+go test ./runner/ocihelper \
+  -run '^(TestContainerdBaselineVersionPinned|TestContainerdSeccompFixtureMatchesGuestGenerator|TestPublicRuntimeSpecHandoffUsesRealGuestGenerator|TestRuntimeSpecGoldens|TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup|TestImageUserRootfsSymlinkBoundaries)$' \
+  -count=1 -timeout=3m -v
 ```
+
+Record the exact candidate SHA, clean/dirty state and patch hash, native
+OS/architecture and Go/module versions, commands and results, and fixture hashes
+before and after generation. Both native architectures must regenerate their own
+seccomp and complete profiles; an architecture-skipped oracle, a cross-compiled
+binary, or a fixture-backed macOS test is not native generation evidence. Seeded
+copies remain provisional until those artifacts and the complete profile diffs
+are reviewed. After assembling both architectures, run the read-only oracle
+command on each native architecture and require no fixture changes.
 
 The builder also checks the linked containerd module version against the
 fixture version. A containerd patch change therefore fails until the baseline,

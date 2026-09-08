@@ -30,7 +30,7 @@ func TestContainerdSeccompFixtureMatchesGuestGenerator(t *testing.T) {
 				t.Fatal(err)
 			}
 			actual := marshalIndentedJSON(t, profile)
-			expected, err := os.ReadFile(filepath.Join("testdata", "containerd-v2.3.4", "seccomp-linux-"+architecture+".json"))
+			expected, err := os.ReadFile(filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-"+architecture+".json"))
 			if err != nil {
 				t.Fatal(err)
 			}
