@@ -159,11 +159,23 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 		}
 		job, err := s.jobs.GetJob(r.Context(), projection.L1JobID)
 		if err != nil {
-			writeError(w, err)
-			return
+			if !isMissingL1Job(err, projection.L1JobID) || !isL1Regression(projection.DispatchError, projection.L1JobID) {
+				writeError(w, err)
+				return
+			}
+			run, readErr := s.store.GetRun(r.Context(), runID)
+			if readErr != nil {
+				writeError(w, readErr)
+				return
+			}
+			if run.Status != contract.RunFailed || run.L1JobID != projection.L1JobID {
+				writeError(w, err)
+				return
+			}
+		} else {
+			job.Spec.Execution.SensitiveEnv = nil
+			projection.Job = &job
 		}
-		job.Spec.Execution.SensitiveEnv = nil
-		projection.Job = &job
 	}
 	writeJSON(w, http.StatusOK, projection)
 }

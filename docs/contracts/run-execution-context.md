@@ -236,3 +236,38 @@ new immutable image snapshot, copies the complete top-level/platform resolution
 record and every other program field unchanged, and dispatches by the frozen
 top-level digest; later observations and tag movement cannot replace it. If no accepted
 observation exists, rerun creation fails with `no_resolved_image_snapshot`.
+
+## L1 error and recovery boundary
+
+L1 internal errors use HTTP 500 with `retryable: true`; capacity exhaustion
+retains HTTP 409 with `retryable: true`. The reserved `not_implemented` response
+remains HTTP 501 with `retryable: false`. L3 respects decoded authority flags;
+its fallback for malformed HTTP 429 or 5xx responses is retryable.
+
+Each L3-to-L1 request has a 10-second operation deadline, including response
+body reads, with 10-second dial and response-header limits. Earlier caller
+deadlines and cancellation take precedence, including during Fabric dialing.
+All connections use `Fabric.Dial` and the configured logical L1 address.
+These are per-request bounds: a sequential reconciliation pass over multiple
+requests can take longer than 10 seconds.
+
+When an already-dispatched run's `GetJob` returns authoritative absence, L3
+fails the run atomically with a nonretryable dispatch diagnostic whose details
+contain `reason: l1_regressed` and the original `l1_job_id`. Authoritative absence
+means HTTP 404 with a complete `not_found` error envelope from that GetJob
+endpoint, bound to the requested identity (`JobNotFoundError` for alternate
+L3 JobClients). Transport/authentication errors, malformed 404s, missing
+attempts, redirected endpoints, and image-evidence errors do not establish it.
+
+L3 does not replay this work: loss of the L1 job may also mean loss of stable-key
+deduplication, so previous side effects cannot be ruled out. The transaction
+preserves job/outbox identity, dispatch key, dispatch timestamp and attempt
+count, preserves the started timestamp, and applies existing terminal token
+grace. The first committed terminal result wins against concurrent projections;
+repeated passes and restarts cannot replace that result or extend token expiry.
+Other runs and parent/child settlement continue normally.
+
+`GET /v1/runs/{run_id}/execution` exposes the recorded diagnostic and retained
+`l1_job_id` without a `job` only when the failed ledger run and diagnostic match
+the same authoritative missing-job response. Reading execution never creates a
+regression record and does not hide other L1 failures.
