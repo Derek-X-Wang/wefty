@@ -13,10 +13,11 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
+	github.com/rhysd/actionlint v1.7.12
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7
 	golang.org/x/net v0.58.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	howett.net/plist v1.0.1
@@ -82,7 +83,6 @@ require (
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/pires/go-proxyproto v0.8.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/rhysd/actionlint v1.7.12 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/safchain/ethtool v0.3.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
