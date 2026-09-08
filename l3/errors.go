@@ -53,3 +53,26 @@ func apiErrorFrom(err error) contract.APIError {
 	}
 	return contract.APIError{Code: contract.ErrorInternal, Message: err.Error(), Retryable: true}
 }
+
+// JobNotFoundError is authoritative absence from GetJob only. Alternate
+// JobClients must emit it only for a valid not_found HTTP 404 from that endpoint,
+// binding JobID to the requested identity. Other failures must remain ordinary
+// errors, including missing attempts, malformed 404s, and transport failures.
+type JobNotFoundError struct {
+	JobID string
+	Cause error
+}
+
+func (e *JobNotFoundError) Error() string { return fmt.Sprintf("L1 job %q was not found", e.JobID) }
+func (e *JobNotFoundError) Unwrap() error { return e.Cause }
+func isMissingL1Job(err error, jobID string) bool {
+	var missing *JobNotFoundError
+	return jobID != "" && errors.As(err, &missing) && missing.JobID == jobID
+}
+
+const l1RegressedReason = "l1_regressed"
+
+func isL1Regression(cause *contract.APIError, jobID string) bool {
+	return cause != nil && cause.Code == contract.ErrorNotFound && !cause.Retryable &&
+		cause.Details["reason"] == l1RegressedReason && cause.Details["l1_job_id"] == jobID && jobID != ""
+}

@@ -90,6 +90,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	for _, run := range runs {
 		job, err := r.jobs.GetJob(ctx, run.JobID)
 		if err != nil {
+			if isMissingL1Job(err, run.JobID) {
+				changed, storeErr := r.store.failMissingL1Job(ctx, run)
+				if storeErr != nil {
+					passErrors = append(passErrors, errors.Join(err, storeErr))
+				} else if changed {
+					passErrors = append(passErrors, err)
+				}
+				continue
+			}
 			passErrors = append(passErrors, err)
 			continue
 		}

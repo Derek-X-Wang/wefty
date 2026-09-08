@@ -18,6 +18,14 @@ func TestWriteErrorPublishesTruthfulRetryability(t *testing.T) {
 		wantCode      contract.ErrorCode
 		wantRetryable bool
 	}{
+		{name: "plain internal", err: errors.New("private database path"), wantStatus: http.StatusInternalServerError, wantCode: contract.ErrorInternal, wantRetryable: true},
+		{name: "invalid request", err: protocolError(contract.ErrorInvalidRequest, "invalid"), wantStatus: http.StatusBadRequest, wantCode: contract.ErrorInvalidRequest},
+		{name: "unauthorized", err: protocolError(contract.ErrorUnauthorized, "unauthorized"), wantStatus: http.StatusUnauthorized, wantCode: contract.ErrorUnauthorized},
+		{name: "forbidden", err: protocolError(contract.ErrorForbidden, "forbidden"), wantStatus: http.StatusForbidden, wantCode: contract.ErrorForbidden},
+		{name: "not found", err: protocolError(contract.ErrorNotFound, "absent"), wantStatus: http.StatusNotFound, wantCode: contract.ErrorNotFound},
+		{name: "unsupported kind", err: protocolError(contract.ErrorUnsupportedKind, "unsupported"), wantStatus: http.StatusUnprocessableEntity, wantCode: contract.ErrorUnsupportedKind},
+		{name: "unsupported runtime", err: protocolError(contract.ErrorUnsupportedRuntimeHandler, "unsupported"), wantStatus: http.StatusUnprocessableEntity, wantCode: contract.ErrorUnsupportedRuntimeHandler},
+		{name: "reserved not implemented", err: protocolError(contract.ErrorNotImplemented, "reserved"), wantStatus: http.StatusNotImplemented, wantCode: contract.ErrorNotImplemented},
 		{name: "internal", err: internalError(errors.New("database unavailable"), "read node"), wantStatus: http.StatusInternalServerError, wantCode: contract.ErrorInternal, wantRetryable: true},
 		{name: "principal forbidden", err: protocolError(contract.ErrorPrincipalForbidden, "wrong principal"), wantStatus: http.StatusForbidden, wantCode: contract.ErrorPrincipalForbidden},
 		{name: "identity bound", err: protocolError(contract.ErrorIdentityBound, "identity bound"), wantStatus: http.StatusForbidden, wantCode: contract.ErrorIdentityBound},
@@ -53,6 +61,18 @@ func TestWriteErrorPublishesTruthfulRetryability(t *testing.T) {
 			var response contract.ErrorResponse
 			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 				t.Fatal(err)
+			}
+			if test.wantCode == contract.ErrorInternal && response.Error.Message != "internal server error" {
+				t.Fatalf("internal details leaked: %q", response.Error.Message)
+			}
+			var source *Error
+			if errors.As(test.err, &source) {
+				// JSON numbers decode as float64; compare canonical wire values instead.
+				expected, _ := json.Marshal(source.Details)
+				actual, _ := json.Marshal(response.Error.Details)
+				if string(expected) != string(actual) {
+					t.Fatalf("details lost: %s != %s", expected, actual)
+				}
 			}
 			if response.Error.Code != test.wantCode || response.Error.Retryable != test.wantRetryable {
 				t.Fatalf("error = %#v, want code %q retryable %t", response.Error, test.wantCode, test.wantRetryable)
