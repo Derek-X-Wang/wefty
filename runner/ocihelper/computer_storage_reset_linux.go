@@ -165,7 +165,7 @@ func (engine *ContainerdEngine) prepareResetSuccessor(ctx context.Context, reque
 		return ComputerStorageResetReceipt{}, err
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-	lock, err := openComputerDiskLock(diskRoot)
+	lock, err := engine.openComputerStorageDestination(ctx, diskRoot)
 	if err != nil {
 		return ComputerStorageResetReceipt{}, err
 	}
@@ -300,4 +300,14 @@ func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, reques
 		return ResetComputerStorageResponse{}, err
 	}
 	return ResetComputerStorageResponse{Verified: true, Receipt: receipt}, nil
+}
+
+// openComputerStorageDestination orders root publication against absence
+// observation/deletion without taking reimageMu underneath storageResetMu.
+func (engine *ContainerdEngine) openComputerStorageDestination(ctx context.Context, root string) (*os.File, error) {
+	if !lockComputerReimageMutex(ctx, &engine.computerStorageRootMu) {
+		return nil, context.Cause(ctx)
+	}
+	defer engine.computerStorageRootMu.Unlock()
+	return openComputerDiskLock(root)
 }

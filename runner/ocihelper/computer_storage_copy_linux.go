@@ -415,18 +415,11 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		return CopyComputerStorageResponse{}, err
 	}
 	destinationRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", destinationName)
-	if err := os.MkdirAll(destinationRoot, 0o700); err != nil {
-		return CopyComputerStorageResponse{}, err
-	}
-	lock, err := os.OpenFile(filepath.Join(destinationRoot, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := engine.openComputerStorageDestination(ctx, destinationRoot)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination has an attachment owner")
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	defer closeComputerDiskLock(lock)
 	manifestPath := filepath.Join(destinationRoot, "storage-copy.json")
 	manifest, present, err := readComputerStorageCopyManifest(manifestPath)
 	if err != nil {

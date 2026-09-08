@@ -1809,7 +1809,7 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 			if volume.ComputerStorage == nil || request.Removal == nil {
 				return fmt.Errorf("Computer disk finalization requires Storage and removal authority")
 			}
-			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeComputerDisk,
+			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeComputerDisk, StorageAbsent: volume.StorageAbsent,
 				ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID,
 					StorageGeneration: volume.ComputerStorage.StorageGeneration, IntentRevision: volume.ComputerStorage.IntentRevision, DiskBytes: volume.ComputerStorage.DiskBytes},
 				Removal: &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, PriorJobID: request.Removal.PriorJobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
