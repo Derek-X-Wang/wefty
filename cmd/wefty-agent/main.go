@@ -328,12 +328,27 @@ type macBootstrapRemovalEvidence struct {
 }
 
 func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket, nodeConfig, setupState string) error {
+	return (macBootstrapRemover{
+		removeUnit: limarunner.RemoveLaunchDaemon, removeHelper: limarunner.RemoveGuestHelper,
+		remove: os.Remove, stat: os.Stat, output: os.Stdout,
+	}).removeBootstrap(instance, limactl, factsPath, intentPath, controlSocket, nodeConfig, setupState)
+}
+
+type macBootstrapRemover struct {
+	removeUnit   func(context.Context) (limarunner.LaunchDaemonRemovalEvidence, error)
+	removeHelper func(context.Context, limarunner.GuestHelperRemovalConfig) (limarunner.GuestHelperRemovalEvidence, error)
+	remove       func(string) error
+	stat         func(string) (os.FileInfo, error)
+	output       io.Writer
+}
+
+func (remover macBootstrapRemover) removeBootstrap(instance, limactl, factsPath, intentPath, controlSocket, nodeConfig, setupState string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	evidence := macBootstrapRemovalEvidence{}
-	unit, unitErr := limarunner.RemoveLaunchDaemon(ctx)
+	unit, unitErr := remover.removeUnit(ctx)
 	evidence.Unit = unit
-	helper, helperErr := limarunner.RemoveGuestHelper(ctx, limarunner.GuestHelperRemovalConfig{Instance: instance, Limactl: limactl})
+	helper, helperErr := remover.removeHelper(ctx, limarunner.GuestHelperRemovalConfig{Instance: instance, Limactl: limactl})
 	evidence.GuestHelper = helper
 	removeLocal := func(path string) (bool, error) {
 		if path == "" {
@@ -342,11 +357,17 @@ func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket,
 		if !filepath.IsAbs(path) {
 			return false, errors.New("bootstrap removal paths must be absolute")
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := remover.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
-		_, err := os.Stat(path)
-		return errors.Is(err, os.ErrNotExist), nil
+		_, err := remover.stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("verify bootstrap removal: %w", err)
+		}
+		return false, fmt.Errorf("bootstrap removal verification failed: %s still exists", path)
 	}
 	var factsErr, intentErr, socketErr, configErr, setupErr, desiredSetupErr error
 	evidence.FactsAbsent, factsErr = removeLocal(factsPath)
@@ -355,7 +376,7 @@ func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket,
 	evidence.NodeConfigAbsent, configErr = removeLocal(nodeConfig)
 	evidence.SetupStateAbsent, setupErr = removeLocal(setupState)
 	evidence.DesiredSetupAbsent, desiredSetupErr = removeLocal(ocicontrol.DesiredSetupStatePath(setupState))
-	encodeErr := json.NewEncoder(os.Stdout).Encode(evidence)
+	encodeErr := json.NewEncoder(remover.output).Encode(evidence)
 	return errors.Join(unitErr, helperErr, factsErr, intentErr, socketErr, configErr, setupErr, desiredSetupErr, encodeErr)
 }
 
