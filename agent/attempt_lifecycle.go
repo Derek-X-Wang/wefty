@@ -328,6 +328,19 @@ var (
 	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
 )
 
+// completionDeliveryAbandoned identifies cancellation without an independent
+// L1 completion verdict. Its cause is distinct from the wrapped request error.
+type completionDeliveryAbandoned struct {
+	cause error
+	err   error
+}
+
+func (failure *completionDeliveryAbandoned) Error() string {
+	return fmt.Sprintf("attempt completion delivery abandoned after %v: %v", failure.cause, failure.err)
+}
+
+func (failure *completionDeliveryAbandoned) Unwrap() error { return failure.err }
+
 const ociRuntimeRecoveryTimeout = 10 * time.Second
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
@@ -570,6 +583,18 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		<-renewalDone
 		if completionFailure.err != nil {
 			reconcileCompletion = true
+			if renewalFailure.err == errAttemptDirectiveStop || renewalFailure.err == errAttemptDirectiveRestart {
+				var abandoned *completionDeliveryAbandoned
+				if lifecycle.dependencies.outbox != nil && errors.As(completionFailure.err, &abandoned) && abandoned.cause == renewalFailure.err {
+					// The result and quiescence evidence were persisted before
+					// completion started. This directive canceled only delivery;
+					// release it to recovery without ending the node session.
+					return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
+				}
+				// A distinct completion verdict or persistence failure retains
+				// its own destination; a directive cannot mask that failure.
+				return completionFailure.destination, fmt.Errorf("agent: directive completion: %w", completionFailure.err)
+			}
 			return renewalFailure.destination, fmt.Errorf("agent: renew lease while completing: %w", renewalFailure.err)
 		}
 	case err := <-watch.Failures():
@@ -675,7 +700,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 				// A canceled HTTP request has no L1 delivery verdict. Its cause may
 				// itself be a ProtocolError from renewal, but classifying that cause
 				// as the /complete response can falsely acknowledge or seal evidence.
-				return destinationError{destination: errorDestinationUnclassified, err: fmt.Errorf("attempt completion delivery abandoned after %v: %w", cause, err)}
+				return destinationError{destination: errorDestinationUnclassified, err: &completionDeliveryAbandoned{cause: cause, err: err}}
 			}
 			if protocolErrorCode(err) == contract.ErrorLeaseExpired {
 				if lifecycle.dependencies.outbox != nil {

@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -611,6 +613,220 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 	if err := <-agentDone; err != nil {
 		t.Fatalf("agent Run() = %v", err)
 	}
+}
+
+// Exercise Agent.Run, its real session claim loop and the real L1 store; a
+// class gate alone cannot show that a later job survives the routed error.
+func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
+	for _, directive := range []l1.AttemptDirective{l1.AttemptDirectiveStop, l1.AttemptDirectiveRestart} {
+		t.Run(string(directive), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			network := plain.NewNetwork()
+			serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+			store, err := l1.OpenStore(filepath.Join(t.TempDir(), "directive.sqlite"), l1.StoreOptions{LeaseDuration: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			createJob := func(key string) l1.Job {
+				directory := t.TempDir()
+				job, _, createErr := store.CreateJob(t.Context(), contract.JobSpec{
+					SchemaVersion: contract.SchemaVersionV1, DispatchKey: key, Kind: contract.JobKindProcess,
+					Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
+					Execution: contract.ExecutionSpec{
+						Executable: contract.ExecutableSpec{Path: agentHelperPath}, Argv: []string{agentHelperPath},
+						WorkingDirectory: directory, HandoffDirectory: directory,
+					},
+				})
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				return job
+			}
+			first := createJob("directive-first")
+			completionEntered := make(chan struct{})
+			completionCanceled := make(chan struct{})
+			secondCompleted := make(chan struct{}, 1)
+			var firstRequest atomic.Bool
+			var stopResponse atomic.Bool
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/"+first.JobID+"/") && strings.HasSuffix(r.URL.Path, "/complete") && firstRequest.CompareAndSwap(false, true) {
+					// Decode the entire body so the first request is definitely
+					// delivery, not a connection setup or request-body failure.
+					var completion l1.CompletionRequest
+					if err := json.NewDecoder(r.Body).Decode(&completion); err != nil {
+						t.Error(err)
+						return
+					}
+					if completion.Result.RuntimeFailure == nil {
+						t.Error("first completion lacks injected runtime failure")
+					}
+					close(completionEntered)
+					select {
+					case <-r.Context().Done():
+					case <-ctx.Done():
+						t.Error("controller deadline released first completion")
+					}
+					close(completionCanceled)
+					return
+				}
+				if strings.Contains(r.URL.Path, "/"+first.JobID+"/") && strings.HasSuffix(r.URL.Path, "/lease") {
+					select {
+					case <-completionEntered:
+					default:
+						// Preserve early renewals and their original deadlines;
+						// only completion-phase renewals carry the test directive.
+						l1Server.Handler().ServeHTTP(w, r)
+						return
+					}
+					response := httptest.NewRecorder()
+					l1Server.Handler().ServeHTTP(response, r)
+					if response.Code != http.StatusOK {
+						w.WriteHeader(response.Code)
+						_, _ = w.Write(response.Body.Bytes())
+						return
+					}
+					var lease l1.AttemptLease
+					if err := json.Unmarshal(response.Body.Bytes(), &lease); err != nil {
+						t.Error(err)
+						return
+					}
+					lease.Directive = directive
+					stopResponse.Store(true)
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(lease)
+					return
+				}
+				l1Server.Handler().ServeHTTP(w, r)
+				if strings.HasSuffix(r.URL.Path, "/complete") && !strings.Contains(r.URL.Path, "/"+first.JobID+"/") {
+					select {
+					case secondCompleted <- struct{}{}:
+					default:
+					}
+				}
+			})
+			listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var handlerMu sync.Mutex
+			var handlers sync.WaitGroup
+			handlersOpen := true
+			activePaths := map[string]int{}
+			httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handlerMu.Lock()
+				if !handlersOpen {
+					handlerMu.Unlock()
+					return
+				}
+				handlers.Add(1)
+				activePaths[r.URL.Path]++
+				handlerMu.Unlock()
+				defer func() {
+					handlerMu.Lock()
+					activePaths[r.URL.Path]--
+					handlerMu.Unlock()
+					handlers.Done()
+				}()
+				// Retain request cancellation and bind every handler to the
+				// fixture lifetime, including idle claim requests at cleanup.
+				requestCtx, cancelRequest := context.WithCancel(r.Context())
+				stopCancellation := context.AfterFunc(ctx, cancelRequest)
+				defer stopCancellation()
+				defer cancelRequest()
+				handler.ServeHTTP(w, r.WithContext(requestCtx))
+			})}
+			served := make(chan error, 1)
+			go func() { served <- httpServer.Serve(listener) }()
+			defer func() {
+				// Fence handler admission before joining, so Wait cannot
+				// race a new Add even while Close cancels live connections.
+				handlerMu.Lock()
+				handlersOpen = false
+				handlerMu.Unlock()
+				_ = httpServer.Close()
+				joined := make(chan struct{})
+				go func() { handlers.Wait(); close(joined) }()
+				select {
+				case <-joined:
+				case <-time.After(2 * time.Second):
+					handlerMu.Lock()
+					t.Errorf("directive handlers did not join: %v", activePaths)
+					handlerMu.Unlock()
+				}
+				if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
+					t.Errorf("serve directive test: %v", err)
+				}
+			}()
+			var runs atomic.Int32
+			nodeAgent, err := New(Config{
+				Fabric:              network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}}),
+				ControlPlaneAddress: "wefty://control-plane", NodeID: "stable-node", BootSessionID: "boot-directive", Version: "test",
+				Capabilities: map[string]bool{"kind:process": true}, MaxOneshotSlots: 1,
+				HeartbeatInterval: time.Second, ClaimInterval: time.Millisecond, RenewalInterval: time.Millisecond,
+				OperationTimeout: time.Second, LogRetryInterval: time.Millisecond, LogSpoolDirectory: t.TempDir(),
+				WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindProcess: testProcessRuntime(directiveContinuationRunner(func(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+					if request.Started != nil {
+						request.Started()
+					}
+					if runs.Add(1) == 1 {
+						return contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "helper generation lost"}}, nil
+					}
+					zero := 0
+					return contract.ProcessResult{ExitCode: &zero}, nil
+				}))},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodeAgent.Close()
+			done := make(chan error, 1)
+			go func() { done <- nodeAgent.Run(ctx) }()
+			defer func() {
+				cancel()
+				if err := <-done; err != nil {
+					t.Errorf("Agent.Run returned error: %v", err)
+				}
+			}()
+			select {
+			case <-completionEntered:
+			case <-ctx.Done():
+				t.Fatal("first completion did not enter")
+			}
+			second := createJob("directive-second")
+			select {
+			case <-secondCompleted:
+			case <-ctx.Done():
+				t.Fatal("agent did not complete subsequent eligible job")
+			}
+			got, err := store.GetJob(t.Context(), second.JobID)
+			if err != nil || got.State != contract.JobSucceeded || runs.Load() != 2 || !stopResponse.Load() {
+				t.Fatalf("subsequent job=%+v err=%v runs=%d directive=%v", got, err, runs.Load(), stopResponse.Load())
+			}
+			select {
+			case <-completionCanceled:
+			case <-ctx.Done():
+				t.Fatal("first completion handler did not join")
+			}
+			firstState, err := store.GetJob(t.Context(), first.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitCompletionReceiptState(t, nodeAgent.outbox, firstState.CurrentAttemptID, "delivered", 2*time.Second)
+			t.Logf("directive=%s first_completion=delivered second_job=%s state=%s runs=%d", directive, second.JobID, got.State, runs.Load())
+		})
+	}
+}
+
+type directiveContinuationRunner func(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error)
+
+func (run directiveContinuationRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	return run(ctx, request, sink)
 }
 
 type panicRunner struct{}
