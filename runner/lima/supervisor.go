@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -637,6 +639,25 @@ func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, exp
 			break
 		}
 		reason := classifyHelperBarrierError(err)
+		if logf := barrier.Supervisor.config.Logf; logf != nil {
+			innerReason := barrier.Barrier.CapabilityReasonCode()
+			var networkError net.Error
+			networkTimeout := errors.As(err, &networkError) && networkError.Timeout()
+			logf(
+				"Lima helper readiness attempt failed: reason=%s inner_reason=%s error_type=%T canceled=%t deadline=%t eof=%t timeout=%t not_exist=%t connection_refused=%t connection_reset=%t broken_pipe=%t",
+				reason,
+				innerReason,
+				err,
+				errors.Is(err, context.Canceled),
+				errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded),
+				errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe),
+				networkTimeout,
+				errors.Is(err, os.ErrNotExist),
+				errors.Is(err, syscall.ECONNREFUSED),
+				errors.Is(err, syscall.ECONNRESET),
+				errors.Is(err, syscall.EPIPE),
+			)
+		}
 		if reason == contract.CapabilityReasonHelperHandshakeStalled {
 			barrier.Supervisor.recordStalledWindow()
 		}
