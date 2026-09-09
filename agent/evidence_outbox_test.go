@@ -1165,6 +1165,282 @@ func TestAttemptRenewalFailureAbandonsInFlightCompletionToRecovery(t *testing.T)
 	}
 }
 
+// A directive that interrupts delivery must preserve completion evidence and
+// remain within the attempt, including when runtime teardown already failed.
+func TestCompletionDirectivePreservesSessionAndEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		teardownError bool
+		fenced        bool
+		restart       bool
+		withoutOutbox bool
+	}{
+		{name: "valid_stop"},
+		{name: "valid_stop_with_teardown_error", teardownError: true},
+		{name: "attempt_mismatch_control", fenced: true},
+		{name: "valid_restart", restart: true},
+		{name: "valid_stop_without_outbox", withoutOutbox: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			claim := spoolTestClaim("completion-stop-" + test.name)
+			claim.Job.Spec.Kind = contract.JobKindProcess
+			claim.Lease.LeaseTTL = time.Second
+			completionEntered := make(chan struct{})
+			completionCanceled := make(chan struct{})
+			replayed := make(chan l1.CompletionRequest, 1)
+			var mu sync.Mutex
+			var phases []string
+			var live l1.CompletionRequest
+			var completionCalls int
+			record := func(phase string) {
+				mu.Lock()
+				phases = append(phases, phase)
+				mu.Unlock()
+			}
+			handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch {
+				case strings.HasSuffix(request.URL.Path, "/complete"):
+					var body l1.CompletionRequest
+					if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+						t.Error(err)
+						return
+					}
+					if body.FencingToken != claim.Lease.FencingToken {
+						t.Error("completion changed the claim fence")
+					}
+					mu.Lock()
+					completionCalls++
+					first := completionCalls == 1
+					if first {
+						live = body
+					}
+					mu.Unlock()
+					if first {
+						record("completion_entered")
+						close(completionEntered)
+						select {
+						case <-request.Context().Done():
+							record("completion_canceled")
+						case <-ctx.Done():
+							t.Error("probe deadline, not directive, released completion")
+						}
+						close(completionCanceled)
+						return
+					}
+					replayed <- body
+					_ = json.NewEncoder(w).Encode(l1.Job{})
+				case strings.HasSuffix(request.URL.Path, "/lease"):
+					var renewal l1.RenewalRequest
+					if err := json.NewDecoder(request.Body).Decode(&renewal); err != nil {
+						t.Error(err)
+						return
+					}
+					if renewal.FencingToken != claim.Lease.FencingToken {
+						t.Error("renewal changed the claim fence")
+					}
+					select {
+					case <-completionEntered:
+					case <-ctx.Done():
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if test.fenced {
+						record("fencing_renewal")
+						w.WriteHeader(http.StatusConflict)
+						_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+							Code: contract.ErrorAttemptMismatch, Message: "attempt authority changed",
+						}})
+						return
+					}
+					if test.restart {
+						record("restart_renewal")
+					} else {
+						record("stop_renewal")
+					}
+					updated := claim.Lease
+					updated.Directive = l1.AttemptDirectiveStop
+					if test.restart {
+						updated.Directive = l1.AttemptDirectiveRestart
+					}
+					_ = json.NewEncoder(w).Encode(updated)
+				default:
+					http.NotFound(w, request)
+				}
+			})
+			client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+			defer stopServer()
+			defer client.Close()
+			outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outbox.Close()
+			lifecycleOutbox := outbox
+			if test.withoutOutbox {
+				lifecycleOutbox = nil
+			}
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				client: client, runtimes: testRuntimeSet(completionStopProbeRunner{record: record, teardownError: test.teardownError}), outbox: lifecycleOutbox,
+				clock: systemClock{}, renewalInterval: time.Millisecond, completionRetry: time.Millisecond,
+				observer: newLifecycleObserver(systemClock{}),
+			})
+			destination, executeErr := lifecycle.execute(ctx, claim, time.Now())
+			select {
+			case <-completionCanceled:
+			case <-ctx.Done():
+				t.Fatal("completion handler did not join after lifecycle returned")
+			}
+			mu.Lock()
+			observedPhases := append([]string(nil), phases...)
+			liveBody := live
+			mu.Unlock()
+			middle := "stop_renewal"
+			if test.restart {
+				middle = "restart_renewal"
+			}
+			if test.fenced {
+				middle = "fencing_renewal"
+			}
+			if !reflect.DeepEqual(observedPhases, []string{"runtime_failure", "completion_entered", middle, "completion_canceled"}) {
+				t.Fatalf("wrong causal ordering: %v", observedPhases)
+			}
+			if liveBody.Result.RuntimeFailure == nil {
+				t.Fatal("probe did not carry the runtime failure into durable completion")
+			}
+			if test.withoutOutbox {
+				var abandoned *completionDeliveryAbandoned
+				if executeErr == nil || destination != errorDestinationUnclassified || !errors.As(executeErr, &abandoned) {
+					t.Fatalf("canceled delivery without durable outbox was absorbed: destination=%d err=%v", destination, executeErr)
+				}
+				t.Logf("without_outbox=true destination=%d retained_error=%v", destination, executeErr)
+				return
+			}
+			if test.fenced && (destination != errorDestinationAttemptAuthority || executeErr == nil || protocolErrorCode(executeErr) != contract.ErrorAttemptMismatch) {
+				t.Fatalf("renewal authority error lost: destination=%d err=%v", destination, executeErr)
+			}
+			pending := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+			if pending.State != "durable_completion" || !reflect.DeepEqual(pending.Result, liveBody.Result) {
+				t.Fatalf("live cancellation lost durable completion: %+v", pending)
+			}
+			session := newAgentSession(client, contract.NodeRegistration{}, nil, time.Second, time.Millisecond,
+				systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
+			defer session.close()
+			var routed error
+			if executeErr != nil {
+				routed = session.routeError(destination, executeErr)
+			}
+			t.Logf("phases=%v destination=%d execution_error=%v session_routed_error=%v retained=%+v", observedPhases, destination, executeErr, routed, pending)
+			// Recovery is deliberately started only after the live request has
+			// returned, so a recovered receipt cannot mask missing persistence.
+			outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+			select {
+			case body := <-replayed:
+				if !reflect.DeepEqual(body, liveBody) {
+					t.Fatalf("recovery changed completion: live=%+v replay=%+v", liveBody, body)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("completion was not replayed after live cancellation")
+			}
+			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+			admitted := false
+			if routed == nil {
+				admitted, err = session.gates[workloadClassOneShot].execute(t.Context(), func(context.Context) (errorDestination, error) {
+					return errorDestinationUnclassified, nil
+				}, session.routeError)
+			}
+			t.Logf("durable_replay=delivered next_gate_admitted=%v gate_error=%v", admitted, err)
+			if routed != nil || !admitted || err != nil {
+				t.Errorf("stop/fencing during completion must stay within attempt scope: destination=%d routed=%v admitted=%v error=%v", destination, routed, admitted, err)
+			}
+		})
+	}
+}
+
+type completionStopProbeRunner struct {
+	record        func(string)
+	teardownError bool
+}
+
+func (runner completionStopProbeRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	runner.record("runtime_failure")
+	result := contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "helper generation lost",
+	}}
+	if runner.teardownError {
+		return result, errors.New("probe: superseded Computer transport teardown failed")
+	}
+	return result, nil
+}
+
+func TestCompletionDirectiveDoesNotHideDurabilityFailure(t *testing.T) {
+	client, stopServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		t.Errorf("durability failure reached protocol delivery: %s", request.URL.Path)
+	}), time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("completion-durable-write-failure")
+	claim.Job.Spec.Kind = contract.JobKindProcess
+	claim.Lease.LeaseTTL = time.Second
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox,
+		runtimes: testRuntimeSet(completionStopProbeRunner{record: func(string) {
+			// Identity is durable already; fail the subsequent completion
+			// write before the completion/renewal join can absorb anything.
+			if err := outbox.spool.db.Close(); err != nil {
+				t.Error(err)
+			}
+		}}),
+		clock: systemClock{}, renewalInterval: time.Second, completionRetry: time.Millisecond,
+		observer: newLifecycleObserver(systemClock{}),
+	})
+	destination, err := lifecycle.execute(t.Context(), claim, time.Now())
+	if destination != errorDestinationUnclassified || err == nil || !strings.Contains(err.Error(), "persist durable completion") {
+		t.Fatalf("durability failure was absorbed: destination=%d err=%v", destination, err)
+	}
+}
+
+func TestCompletionOwnProtocolVerdictIsNotAbandonedDelivery(t *testing.T) {
+	for _, code := range []contract.ErrorCode{contract.ErrorAttemptMismatch, contract.ErrorNodeSessionReplaced, contract.ErrorStaleFence} {
+		t.Run(string(code), func(t *testing.T) {
+			client, stopServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: "independent completion verdict"}})
+			}), time.Second)
+			defer stopServer()
+			defer client.Close()
+			claim := spoolTestClaim("own-completion-verdict")
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, clock: systemClock{}, completionRetry: time.Millisecond})
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+			defer cancel()
+			failure := lifecycle.completeWithRetry(ctx, claim, l1.CompletionRequest{FencingToken: claim.Lease.FencingToken})
+			var abandoned *completionDeliveryAbandoned
+			if errors.As(failure.err, &abandoned) {
+				t.Fatalf("independent L1 verdict became directive cancellation: %+v", failure)
+			}
+			if failure.err == nil {
+				t.Fatal("independent L1 failure was absorbed")
+			}
+			if code == contract.ErrorAttemptMismatch && failure.destination != errorDestinationAttemptAuthority {
+				t.Fatalf("fencing destination=%d", failure.destination)
+			}
+			if code == contract.ErrorNodeSessionReplaced && failure.destination != errorDestinationNodeSession {
+				t.Fatalf("node-session destination=%d", failure.destination)
+			}
+		})
+	}
+}
+
 func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	t.Helper()
 	completionStarted := make(chan struct{}, 1)
@@ -2767,4 +3043,231 @@ func startEvidenceReplayServer(t *testing.T, handler http.Handler, operationTime
 			t.Errorf("serve evidence replay test: %v", err)
 		}
 	}
+}
+
+// The transport releases a completed HTTP response only after the directive
+// cancels delivery. This orders the lifecycle join without replacing the real
+// Client decoder, completion classifier, durable outbox, or handoff manager.
+func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
+	for _, directive := range []l1.AttemptDirective{l1.AttemptDirectiveStop, l1.AttemptDirectiveRestart} {
+		for _, test := range []struct {
+			name              string
+			ownVerdict        contract.ErrorCode
+			wantDestination   errorDestination
+			successfulHandoff bool
+			loseOwnership     bool
+			rejectReplay      bool
+		}{
+			{name: "own_attempt_mismatch", ownVerdict: contract.ErrorAttemptMismatch, wantDestination: errorDestinationAttemptAuthority},
+			{name: "own_stale_fence", ownVerdict: contract.ErrorStaleFence, wantDestination: errorDestinationAttemptAuthority},
+			{name: "own_node_session_replaced", ownVerdict: contract.ErrorNodeSessionReplaced, wantDestination: errorDestinationNodeSession},
+			{name: "successful_handoff_delivered", successfulHandoff: true},
+			{name: "successful_handoff_replay_rejected", successfulHandoff: true, rejectReplay: true},
+			{name: "handoff_ownership_failure", successfulHandoff: true, loseOwnership: true},
+		} {
+			t.Run(string(directive)+"/"+test.name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+				defer cancel()
+				claim := spoolTestClaim("directive-" + string(directive) + "-" + test.name)
+				claim.Job.Spec.Kind = contract.JobKindProcess
+				claim.Lease.LeaseTTL = time.Second
+				entered := make(chan struct{})
+				replayed := make(chan l1.CompletionRequest, 1)
+				var live l1.CompletionRequest
+				var calls int
+				var mu sync.Mutex
+				var phases []string
+				record := func(phase string) { mu.Lock(); phases = append(phases, phase); mu.Unlock() }
+				response := func(request *http.Request, status int, body any) (*http.Response, error) {
+					data, err := json.Marshal(body)
+					if err != nil {
+						return nil, err
+					}
+					return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(data))), Request: request}, nil
+				}
+				client := &Client{baseURL: "http://directive.test", operationTimeout: time.Second, transport: &http.Transport{}}
+				client.httpClient = &http.Client{Timeout: time.Second, Transport: completionDirectiveRoundTripper(func(request *http.Request) (*http.Response, error) {
+					if request.Body != nil {
+						defer request.Body.Close()
+					}
+					switch {
+					case strings.HasSuffix(request.URL.Path, "/complete"):
+						var body l1.CompletionRequest
+						if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+							return nil, err
+						}
+						mu.Lock()
+						calls++
+						first := calls == 1
+						mu.Unlock()
+						if first {
+							live = body
+							record("completion_entered")
+							close(entered)
+							<-request.Context().Done()
+							wantCause := errAttemptDirectiveStop
+							if directive == l1.AttemptDirectiveRestart {
+								wantCause = errAttemptDirectiveRestart
+							}
+							if context.Cause(request.Context()) != wantCause {
+								return nil, errors.New("completion canceled by a different cause")
+							}
+							record("matching_directive_cancellation")
+							if test.ownVerdict != "" {
+								return response(request, http.StatusConflict, contract.ErrorResponse{Error: contract.APIError{Code: test.ownVerdict, Message: "independent completion verdict"}})
+							}
+							return nil, request.Context().Err()
+						}
+						replayed <- body
+						if test.rejectReplay {
+							return response(request, http.StatusConflict, contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorAttemptMismatch, Message: "superseded completion rejected"}})
+						}
+						return response(request, http.StatusOK, l1.Job{})
+					case strings.HasSuffix(request.URL.Path, "/lease"):
+						select {
+						case <-entered:
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+						record("directive_renewal")
+						lease := claim.Lease
+						lease.Directive = directive
+						return response(request, http.StatusOK, lease)
+					default:
+						return response(request, http.StatusOK, struct{}{})
+					}
+				})}
+				defer client.Close()
+				outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer outbox.Close()
+				var handoffs *handoffManager
+				var handoffPath string
+				if test.successfulHandoff {
+					root := filepath.Join(t.TempDir(), "handoffs")
+					handoffPath = filepath.Join(root, "directive-run")
+					handoffs = newHandoffManager(root, time.Hour)
+					claim.Job.Spec.Class = contract.JobClassOneShot
+					claim.Job.Spec.Labels = map[string]string{"run_id": "directive-run"}
+					claim.Job.Spec.Execution.WorkingDirectory = t.TempDir()
+					claim.Job.Spec.Execution.HandoffDirectory = handoffPath
+				}
+				runner := completionDirectiveRunFunc(func(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+					if request.Started != nil {
+						request.Started()
+					}
+					if !test.successfulHandoff {
+						record("runtime_failure")
+						return contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "controlled runtime failure"}}, nil
+					}
+					marker, exists, err := readHandoffMarker(handoffPath)
+					if err != nil || !exists || marker.NodeID != "stable-node" {
+						return contract.ProcessResult{}, errors.New("real handoff preparation did not establish ownership")
+					}
+					if err := os.WriteFile(filepath.Join(handoffPath, "result"), []byte("successful workload output"), 0600); err != nil {
+						return contract.ProcessResult{}, err
+					}
+					if test.loseOwnership {
+						marker.NodeID = "other-node"
+						if err := writeHandoffMarker(handoffPath, marker); err != nil {
+							return contract.ProcessResult{}, err
+						}
+					}
+					record("runtime_success")
+					zero := 0
+					return contract.ProcessResult{ExitCode: &zero}, nil
+				})
+				lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, outbox: outbox, handoffs: handoffs,
+					runtimes: testRuntimeSet(runner), nodeID: "stable-node", bootSessionID: "directive-boot",
+					clock: systemClock{}, renewalInterval: time.Millisecond, completionRetry: time.Millisecond,
+					observer: newLifecycleObserver(systemClock{}),
+				})
+				destination, executeErr := lifecycle.execute(ctx, claim, time.Now())
+				mu.Lock()
+				observed := append([]string(nil), phases...)
+				mu.Unlock()
+				firstPhase := "runtime_failure"
+				if test.successfulHandoff {
+					firstPhase = "runtime_success"
+				}
+				if !reflect.DeepEqual(observed, []string{firstPhase, "completion_entered", "directive_renewal", "matching_directive_cancellation"}) {
+					t.Fatalf("incorrect branch ordering: %v", observed)
+				}
+				if test.ownVerdict != "" {
+					var protocolErr *ProtocolError
+					var abandoned *completionDeliveryAbandoned
+					if destination != test.wantDestination || executeErr == nil || !strings.HasPrefix(executeErr.Error(), "agent: directive completion: ") || !errors.As(executeErr, &protocolErr) || protocolErr.APIError.Code != test.ownVerdict || errors.As(executeErr, &abandoned) {
+						t.Fatalf("own verdict lost at directive join: destination=%d err=%v", destination, executeErr)
+					}
+					t.Logf("phases=%v own_verdict=%s destination=%d error=%v", observed, test.ownVerdict, destination, executeErr)
+					return
+				}
+				if test.loseOwnership {
+					if destination != errorDestinationUnclassified || executeErr == nil || !strings.Contains(executeErr.Error(), "finish handoff lifecycle") || !strings.Contains(executeErr.Error(), "lost its ownership marker") {
+						t.Fatalf("handoff failure absorbed: destination=%d err=%v", destination, executeErr)
+					}
+					if _, err := os.Stat(filepath.Join(handoffPath, "result")); err != nil {
+						t.Fatalf("unowned handoff mutated: %v", err)
+					}
+				} else {
+					if destination != errorDestinationUnclassified || executeErr != nil {
+						t.Fatalf("successful completion failed: destination=%d err=%v", destination, executeErr)
+					}
+					if _, err := os.Stat(handoffPath); !os.IsNotExist(err) {
+						t.Fatalf("successful handoff not removed before replay: %v", err)
+					}
+				}
+				pending := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+				if pending.State != "durable_completion" || live.Result.ExitCode == nil || *live.Result.ExitCode != 0 || !reflect.DeepEqual(pending.Result, live.Result) {
+					t.Fatalf("successful completion not durable before replay: %+v", pending)
+				}
+				recoveryErrors := make(chan error, 1)
+				outbox.startRecovery(t.Context(), client, func(err error) { recoveryErrors <- err })
+				select {
+				case body := <-replayed:
+					if !reflect.DeepEqual(body, live) {
+						t.Fatalf("replay identity changed: live=%+v replay=%+v", live, body)
+					}
+				case <-ctx.Done():
+					t.Fatal("durable completion not replayed")
+				}
+				state := "delivered"
+				if test.rejectReplay {
+					state = "sealed_incomplete"
+				}
+				waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, state, 2*time.Second)
+				if test.rejectReplay {
+					select {
+					case err := <-recoveryErrors:
+						if !strings.Contains(err.Error(), "durable evidence sealed incomplete") || !strings.Contains(err.Error(), string(contract.ErrorAttemptMismatch)) {
+							t.Fatalf("wrong rejection evidence: %v", err)
+						}
+					case <-ctx.Done():
+						t.Fatal("permanent replay rejection was not reported")
+					}
+				} else {
+					select {
+					case err := <-recoveryErrors:
+						t.Fatalf("unexpected replay error: %v", err)
+					default:
+					}
+				}
+				t.Logf("phases=%v handoff_ownership_error=%v destination=%d err=%v exact_replay=true replay_state=%s", observed, test.loseOwnership, destination, executeErr, state)
+			})
+		}
+	}
+}
+
+type completionDirectiveRoundTripper func(*http.Request) (*http.Response, error)
+
+func (transport completionDirectiveRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+type completionDirectiveRunFunc func(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error)
+
+func (run completionDirectiveRunFunc) Run(ctx context.Context, request processrunner.Request, output processrunner.OutputSink) (contract.ProcessResult, error) {
+	return run(ctx, request, output)
 }
