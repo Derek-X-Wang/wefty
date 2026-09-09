@@ -825,6 +825,15 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
 	observedExact, observedGCNoNew, observedGCRemoved := compareRemovalInventoryBaseline(removalBaseline.Inventory, verification.Inventory)
 	retainedExact, retainedGCNoNew, _ := compareRemovalInventoryBaseline(removalBaseline.DurableRetained, verification.DurableRetained)
+	missingLogSegments := missingRetainedLogSegmentDiagnostics(removalBaseline, verification)
+	if len(missingLogSegments) > 0 {
+		diagnostic, err := json.Marshal(missingLogSegments)
+		if err != nil {
+			t.Cleanup(func() { t.Log("removal-retained-log-segment-diagnostic unavailable") })
+		} else {
+			t.Cleanup(func() { t.Logf("removal-retained-log-segment-diagnostic=%s", diagnostic) })
+		}
+	}
 	receipt.ResidueInventories["post_removal_self_gc_removed"] = observedGCRemoved
 	receipt.ResidueAssertions["post_removal_observed_inventory_restored"] = observedExact && observedGCNoNew
 	receipt.ResidueAssertions["post_removal_runtime_residue_restored"] = reflect.DeepEqual(verification.RuntimeResidue, removalBaseline.RuntimeResidue)
@@ -884,6 +893,61 @@ func mergeAcceptanceInventory(left, right ocihelper.ResourceInventory) ocihelper
 		ComputerStorageQuarantined: append(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined...),
 		ComputerDiskAnomalies:      append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...),
 	}
+}
+
+type retainedLogSegmentRecord struct {
+	Class      ocihelper.RemovalResourceClass   `json:"class"`
+	ID         string                           `json:"id"`
+	Owner      ocihelper.DurableRetentionOwner  `json:"owner"`
+	Reason     ocihelper.DurableRetentionReason `json:"reason"`
+	AttemptID  string                           `json:"attempt_id"`
+	State      ocihelper.DurableRetentionState  `json:"state"`
+	Bound      time.Duration                    `json:"bound"`
+	RecordedAt time.Time                        `json:"recorded_at"`
+	Deadline   time.Time                        `json:"deadline"`
+}
+
+type retainedLogSegmentObservation struct {
+	InventoryPresent       bool                       `json:"inventory_present"`
+	DurableRetainedPresent bool                       `json:"durable_retained_present"`
+	Retentions             []retainedLogSegmentRecord `json:"retentions"`
+}
+
+type retainedLogSegmentDiagnostic struct {
+	ID       string                        `json:"id"`
+	Baseline retainedLogSegmentObservation `json:"baseline"`
+	Final    retainedLogSegmentObservation `json:"final"`
+}
+
+func missingRetainedLogSegmentDiagnostics(baseline, final ocihelper.VerifyResponse) []retainedLogSegmentDiagnostic {
+	diagnostics := make([]retainedLogSegmentDiagnostic, 0)
+	for _, id := range baseline.DurableRetained.LogSegments {
+		if slices.Contains(final.Inventory.LogSegments, id) && slices.Contains(final.DurableRetained.LogSegments, id) {
+			continue
+		}
+		diagnostics = append(diagnostics, retainedLogSegmentDiagnostic{
+			ID: id, Baseline: observeRetainedLogSegment(baseline, id), Final: observeRetainedLogSegment(final, id),
+		})
+	}
+	return diagnostics
+}
+
+func observeRetainedLogSegment(response ocihelper.VerifyResponse, id string) retainedLogSegmentObservation {
+	observation := retainedLogSegmentObservation{
+		InventoryPresent:       slices.Contains(response.Inventory.LogSegments, id),
+		DurableRetainedPresent: slices.Contains(response.DurableRetained.LogSegments, id),
+	}
+	for _, retention := range response.DurableRetentions {
+		if retention.Class != ocihelper.RemovalResourceLogSegments || retention.ID != id {
+			continue
+		}
+		observation.Retentions = append(observation.Retentions, retainedLogSegmentRecord{
+			Class: retention.Class, ID: retention.ID, Owner: retention.Owner, Reason: retention.Reason,
+			AttemptID: retention.AttemptID, State: retention.State, Bound: retention.Bound,
+			RecordedAt: retention.RecordedAt, Deadline: retention.Deadline,
+		})
+	}
+	return observation
 }
 
 // compareRemovalInventoryBaseline keeps the post-removal gate exact for every
