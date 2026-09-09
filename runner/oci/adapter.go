@@ -923,6 +923,10 @@ func failedAdmission(admission workloadrunner.Admission, code contract.SpawnFail
 }
 
 func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (result workloadrunner.Result, runErr error) {
+	return adapter.runObserved(ctx, request, sink, nil)
+}
+
+func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink, trace *terminationTrace) (result workloadrunner.Result, runErr error) {
 	adapter.trackRun(request.Authority, runEntry{})
 	session, imageSweepReceipt, err := adapter.sessions.ExecutionSnapshot()
 	if err != nil {
@@ -1198,7 +1202,7 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		case watchErr := <-watchDone:
 			return watchErr
 		case <-ctx.Done():
-			return terminateAndWait(ctx, session, authority, request.TerminationGrace, watchDone)
+			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, trace)
 		}
 	}
 	if request.HostBridgeDial != nil {
@@ -1268,6 +1272,107 @@ const (
 	postKillReleaseMargin    = time.Second
 )
 
+// terminationTrace is written only by terminateAndWaitObserved. Its caller
+// may read it after that invocation returns; it never retains error objects.
+type terminationTrace struct {
+	termObserved          bool
+	termRawError          terminationErrorClass
+	termEffectiveError    terminationErrorClass
+	termContextError      terminationContextClass
+	termRPCCode           terminationRPCCode
+	termAlreadyTerminated bool
+	decision              terminationDecision
+	killCallEntered       bool
+}
+
+type terminationErrorClass uint8
+
+const (
+	terminationErrorNone terminationErrorClass = iota
+	terminationErrorRPC
+	terminationErrorCanceled
+	terminationErrorDeadline
+	terminationErrorRuntimeLoss
+	terminationErrorOther
+)
+
+type terminationContextClass uint8
+
+const (
+	terminationContextNone terminationContextClass = iota
+	terminationContextCanceled
+	terminationContextDeadline
+	terminationContextOther
+)
+
+type terminationRPCCode uint8
+
+const (
+	terminationRPCNone terminationRPCCode = iota
+	terminationRPCEngineFailure
+	terminationRPCUnauthorizedAttempt
+	terminationRPCSessionStale
+	terminationRPCOther
+)
+
+type terminationDecision uint8
+
+const (
+	terminationDecisionUnobserved terminationDecision = iota
+	terminationWatchPrecompleted
+	terminationSuccessWatchSelected
+	terminationSuccessGraceTimerSelected
+	terminationErrorWatchSelected
+	terminationErrorDefaultSelected
+)
+
+// Direct known-type classification deliberately does not call Error, Is, As,
+// or Unwrap on arbitrary errors. Unknown wrappers, including cycles, stay other.
+func classifyTerminationError(err error) (terminationErrorClass, terminationRPCCode) {
+	if err == nil {
+		return terminationErrorNone, terminationRPCNone
+	}
+	if err == context.Canceled {
+		return terminationErrorCanceled, terminationRPCNone
+	}
+	if err == context.DeadlineExceeded {
+		return terminationErrorDeadline, terminationRPCNone
+	}
+	switch value := err.(type) {
+	case *ocihelper.RuntimeLossError:
+		return terminationErrorRuntimeLoss, terminationRPCNone
+	case *ocihelper.RPCError:
+		if value == nil {
+			return terminationErrorOther, terminationRPCNone
+		}
+		switch value.Code {
+		case ocihelper.CodeEngineFailure:
+			return terminationErrorRPC, terminationRPCEngineFailure
+		case ocihelper.CodeUnauthorizedAttempt:
+			return terminationErrorRPC, terminationRPCUnauthorizedAttempt
+		case ocihelper.CodeSessionStale:
+			return terminationErrorRPC, terminationRPCSessionStale
+		default:
+			return terminationErrorRPC, terminationRPCOther
+		}
+	default:
+		return terminationErrorOther, terminationRPCNone
+	}
+}
+
+func classifyTerminationContext(err error) terminationContextClass {
+	switch err {
+	case nil:
+		return terminationContextNone
+	case context.Canceled:
+		return terminationContextCanceled
+	case context.DeadlineExceeded:
+		return terminationContextDeadline
+	default:
+		return terminationContextOther
+	}
+}
+
 func terminateAndWait(
 	ctx context.Context,
 	session *ocihelper.Session,
@@ -1275,16 +1380,33 @@ func terminateAndWait(
 	grace time.Duration,
 	watchDone <-chan error,
 ) error {
+	return terminateAndWaitObserved(ctx, session, authority, grace, watchDone, nil)
+}
+
+func terminateAndWaitObserved(
+	ctx context.Context,
+	session *ocihelper.Session,
+	authority ocihelper.AttemptAuthority,
+	grace time.Duration,
+	watchDone <-chan error,
+	trace *terminationTrace,
+) error {
 	if grace <= 0 {
 		grace = defaultTerminationGrace
 	}
-	watchResult := func(wait time.Duration) (error, bool) {
+	watchResult := func(wait time.Duration, termGrace bool) (error, bool) {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 		select {
 		case err := <-watchDone:
+			if trace != nil && termGrace {
+				trace.decision = terminationSuccessWatchSelected
+			}
 			return err, true
 		case <-timer.C:
+			if trace != nil && termGrace {
+				trace.decision = terminationSuccessGraceTimerSelected
+			}
 			return nil, false
 		}
 	}
@@ -1292,25 +1414,40 @@ func terminateAndWait(
 		signalContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminationSignalTimeout)
 		defer cancel()
 		response, err := session.SignalResult(signalContext, ocihelper.SignalRequest{Authority: authority, Signal: value})
-		if errors.Is(signalContext.Err(), context.DeadlineExceeded) {
-			return response, &ocihelper.RuntimeLossError{Cause: err}
+		contextErr := signalContext.Err()
+		effectiveErr := err
+		if errors.Is(contextErr, context.DeadlineExceeded) {
+			effectiveErr = &ocihelper.RuntimeLossError{Cause: err}
 		}
-		return response, err
+		if trace != nil && value == ocihelper.SignalTERM {
+			trace.termObserved = true
+			trace.termRawError, trace.termRPCCode = classifyTerminationError(err)
+			trace.termEffectiveError, _ = classifyTerminationError(effectiveErr)
+			trace.termContextError = classifyTerminationContext(contextErr)
+			trace.termAlreadyTerminated = response.AlreadyTerminated
+		}
+		return response, effectiveErr
 	}
 
 	select {
 	case err := <-watchDone:
+		if trace != nil {
+			trace.decision = terminationWatchPrecompleted
+		}
 		return err
 	default:
 	}
 	_, termErr := signal(ocihelper.SignalTERM)
 	if termErr == nil {
-		if err, done := watchResult(grace); done {
+		if err, done := watchResult(grace, true); done {
 			return err
 		}
 	} else {
 		select {
 		case err := <-watchDone:
+			if trace != nil {
+				trace.decision = terminationErrorWatchSelected
+			}
 			// A signal deadline proves that this helper generation stopped
 			// answering control RPCs. Its connection teardown can concurrently
 			// cancel Watch; do not let that secondary cancellation erase the
@@ -1320,7 +1457,13 @@ func terminateAndWait(
 			}
 			return err
 		default:
+			if trace != nil {
+				trace.decision = terminationErrorDefaultSelected
+			}
 		}
+	}
+	if trace != nil {
+		trace.killCallEntered = true
 	}
 	killResponse, killErr := signal(ocihelper.SignalKILL)
 	if killErr != nil {
@@ -1335,7 +1478,7 @@ func terminateAndWait(
 	// waiting for the helper to delete the exited task, seal logger pipes, and
 	// publish terminal evidence, so give that fixed release contract its own
 	// margin instead of serializing a second copy of the TERM grace.
-	if err, done := watchResult(ocihelper.DefaultTaskReleaseTimeout + postKillReleaseMargin); done {
+	if err, done := watchResult(ocihelper.DefaultTaskReleaseTimeout+postKillReleaseMargin, false); done {
 		return err
 	}
 	unconfirmed := errors.New("OCI helper Watch did not confirm exit after KILL")
