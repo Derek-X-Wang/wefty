@@ -219,38 +219,165 @@ func startReadyLimaHelper(t *testing.T, checksum string) string {
 }
 
 func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T) {
-	intent := newMutableIntent(true)
-	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
-	supervisor := newTestSupervisor(t, intent, runner)
-	waits := 0
-	ready := false
-	checksum := "sha256:" + strings.Repeat("a", 64)
-	socketPath := startReadyLimaHelper(t, checksum)
-	supervisor.config.wait = func(context.Context, time.Duration) error {
-		waits++
-		ready = true
-		return nil
-	}
-	client := &ocihelper.Client{
-		Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
-		Dial: func(ctx context.Context) (net.Conn, error) {
-			if !ready {
-				return nil, syscall.ECONNREFUSED
+	for _, test := range []struct {
+		name   string
+		silent bool
+	}{
+		{name: "unit_unavailable"},
+		{name: "unit_unavailable_then_handshake_stalled", silent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			intent := newMutableIntent(true)
+			runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+			supervisor := newTestSupervisor(t, intent, runner)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var recoveryContext context.Context
+			var recoveryDeadline time.Time
+			recoveryContexts := 0
+			withTimeout := supervisor.config.withTimeout
+			supervisor.config.withTimeout = func(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+				bounded, stop := withTimeout(parent, timeout)
+				if timeout == defaultLimaRecoveryTimeout {
+					recoveryContexts++
+					recoveryContext = bounded
+					recoveryDeadline, _ = bounded.Deadline()
+				}
+				return bounded, stop
 			}
-			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
-		},
-	}
-	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
-		TakeoverTimeout: 25 * time.Millisecond,
-		TakeoverRetry:   time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
-	err = barrier.Ensure(t.Context())
-	if err != nil || !barrier.Ready() || barrier.CapabilityReasonCode() != "" || waits != 1 {
-		t.Fatalf("supervised repaired helper err=%v ready=%t reason=%q repair_waits=%d", err, barrier.Ready(), barrier.CapabilityReasonCode(), waits)
+			checksum := "sha256:" + strings.Repeat("a", 64)
+			var socketPath string
+			t.Cleanup(func() {
+				_, err := os.Stat(socketPath)
+				absent := errors.Is(err, os.ErrNotExist)
+				if !absent {
+					t.Errorf("helper socket retained after cleanup: %v", err)
+				}
+				t.Logf("repair-phase cleanup socket=%s absent=%t", socketPath, absent)
+			})
+			socketPath = startReadyLimaHelper(t, checksum)
+			type silentPeer struct {
+				connection net.Conn
+				done       chan struct{}
+				deadline   time.Time
+				closedAt   time.Time
+				cause      error
+			}
+			var peers []*silentPeer
+			var helperBarrier *ocihelper.BootBarrier
+			t.Cleanup(func() {
+				cancel()
+				if helperBarrier != nil {
+					_ = helperBarrier.Close()
+				}
+				for _, peer := range peers {
+					_ = peer.connection.Close()
+					<-peer.done
+				}
+				t.Logf("repair-phase cleanup joined_peers=%d barrier_closed=true", len(peers))
+			})
+			phase := "unavailable"
+			waits, unavailableDials, socketDials := 0, 0, 0
+			unavailableTransitions, stalledTransitions := 0, 0
+			client := &ocihelper.Client{
+				Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
+				Dial: func(dialContext context.Context) (net.Conn, error) {
+					switch phase {
+					case "unavailable":
+						unavailableDials++
+						return nil, syscall.ECONNREFUSED
+					case "silent":
+						clientSide, serverSide := net.Pipe()
+						peer := &silentPeer{connection: serverSide, done: make(chan struct{})}
+						peer.deadline, _ = dialContext.Deadline()
+						peers = append(peers, peer)
+						go func() {
+							<-dialContext.Done()
+							peer.closedAt, peer.cause = time.Now(), context.Cause(dialContext)
+							_ = serverSide.Close()
+							close(peer.done)
+						}()
+						return clientSide, nil
+					default:
+						socketDials++
+						return (&net.Dialer{}).DialContext(dialContext, "unix", socketPath)
+					}
+				},
+			}
+			var err error
+			helperBarrier, err = ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
+				TakeoverTimeout: 25 * time.Millisecond,
+				TakeoverRetry:   time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+			supervisor.config.wait = func(waitContext context.Context, delay time.Duration) error {
+				waits++
+				reason := helperBarrier.CapabilityReasonCode()
+				deadline, hasDeadline := waitContext.Deadline()
+				wantBackoff := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
+				if waitContext != recoveryContext || !hasDeadline || !deadline.Equal(recoveryDeadline) || waitContext.Err() != nil {
+					t.Fatalf("repair changed recovery authority: same_context=%t deadline=%s want=%s err=%v", waitContext == recoveryContext, deadline, recoveryDeadline, waitContext.Err())
+				}
+				if delay != wantBackoff[min(waits-1, len(wantBackoff)-1)] || helperBarrier.Ready() {
+					t.Fatalf("repair wait=%d delay=%s ready=%t", waits, delay, helperBarrier.Ready())
+				}
+				t.Logf("repair-phase at=%s pid=%d pgid=%d phase=%s wait=%d reason=%s backoff=%s deadline=%s unavailable_dials=%d silent_peers=%d socket_dials=%d", time.Now().UTC().Format(time.RFC3339Nano), os.Getpid(), syscall.Getpgrp(), phase, waits, reason, delay, deadline.Format(time.RFC3339Nano), unavailableDials, len(peers), socketDials)
+				switch phase {
+				case "unavailable":
+					if reason != contract.CapabilityReasonHelperUnitUnavailable || unavailableDials == 0 || socketDials != 0 || len(peers) != 0 {
+						t.Fatalf("invalid initial unavailable phase: reason=%s dials=%d socket_dials=%d peers=%d", reason, unavailableDials, socketDials, len(peers))
+					}
+					unavailableTransitions++
+					phase = "socket"
+					if test.silent {
+						phase = "silent"
+					}
+				case "silent":
+					if reason != contract.CapabilityReasonHelperHandshakeStalled || len(peers) == 0 || socketDials != 0 || supervisor.Facts().StalledWindows == 0 {
+						t.Fatalf("invalid controlled stall: reason=%s peers=%d socket_dials=%d facts=%+v", reason, len(peers), socketDials, supervisor.Facts())
+					}
+					for _, peer := range peers {
+						select {
+						case <-peer.done:
+						case <-waitContext.Done():
+							t.Fatal("silent peer did not join under original recovery authority")
+						}
+						if peer.deadline.IsZero() || peer.closedAt.Before(peer.deadline) || peer.cause == nil {
+							t.Fatalf("silent peer closed before its original deadline: closed=%s deadline=%s cause=%v", peer.closedAt, peer.deadline, peer.cause)
+						}
+						t.Logf("repair-phase silent_peer_joined deadline=%s closed=%s cause=%v", peer.deadline.Format(time.RFC3339Nano), peer.closedAt.Format(time.RFC3339Nano), peer.cause)
+					}
+					stalledTransitions++
+					phase = "socket"
+				case "socket":
+					// A real helper may need another bounded takeover window.
+					// Only positively classified retryable outcomes belong here.
+					if reason != contract.CapabilityReasonHelperUnitUnavailable && reason != contract.CapabilityReasonHelperHandshakeStalled {
+						t.Fatalf("unexplained real-socket retry: reason=%s", reason)
+					}
+				}
+				return nil
+			}
+			err = barrier.Ensure(ctx)
+			receipt, receiptOK := barrier.SweepReceipt()
+			if err != nil || !barrier.Ready() || barrier.CapabilityReasonCode() != "" || !receiptOK || !receipt.VerifiedAbsent || receipt.SweepEpoch == "" {
+				t.Fatalf("invalid recovery: err=%v ready=%t reason=%q receipt_ok=%t receipt=%+v", err, barrier.Ready(), barrier.CapabilityReasonCode(), receiptOK, receipt)
+			}
+			if recoveryContexts != 1 || unavailableTransitions != 1 || (test.silent && stalledTransitions != 1) || (!test.silent && stalledTransitions != 0) || socketDials == 0 {
+				t.Fatalf("invalid repair phases: contexts=%d unavailable=%d stalled=%d socket_dials=%d", recoveryContexts, unavailableTransitions, stalledTransitions, socketDials)
+			}
+			if supervisor.Facts().StalledWindows != 0 || helperBarrier.HandshakeStalledWindows() != 0 || helperBarrier.CapabilityReasonCode() != "" {
+				t.Fatalf("successful repair retained failure facts: supervisor=%+v helper_stalls=%d reason=%s", supervisor.Facts(), helperBarrier.HandshakeStalledWindows(), helperBarrier.CapabilityReasonCode())
+			}
+			wantCommands := [][]string{{"limactl", "list", "--json", DefaultInstanceName}}
+			if got := runner.commandsSnapshot(); !reflect.DeepEqual(got, wantCommands) {
+				t.Fatalf("repair mutated running Lima: commands=%v", got)
+			}
+			t.Logf("repair-phase verified_ready=true unavailable_transitions=%d stalled_transitions=%d waits=%d epoch=%s", unavailableTransitions, stalledTransitions, waits, receipt.SweepEpoch)
+		})
 	}
 }
 
