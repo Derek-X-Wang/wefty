@@ -30,6 +30,7 @@ type apiClients struct {
 
 type apiClient struct {
 	name   string
+	flag   string
 	client *http.Client
 }
 
@@ -43,16 +44,28 @@ func (e *apiResponseError) Error() string {
 	return formatAPIError(&e.APIError)
 }
 
+// newAPIClients wires the L1 and L3 HTTP clients over one Fabric
+// participant. L1 is mandatory: ADR-0006 makes an L1-only installation a
+// complete product, so --l1 must always resolve to an address. L3 defaults
+// to l3.DefaultL3Address, but an operator can opt into an L1-only
+// installation by passing an explicit empty --l3 (--l3=). When l3Address is
+// blank the returned apiClients still has a usable l3 field (never nil),
+// but calling any of its methods fails fast with a clear, short error
+// instead of dialing an empty address — see apiClient.doWithResponse.
 func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*apiClients, error) {
 	if participant == nil {
 		return nil, fmt.Errorf("wefty: fabric is required")
 	}
-	if strings.TrimSpace(l1Address) == "" || strings.TrimSpace(l3Address) == "" {
-		return nil, fmt.Errorf("wefty: L1 and L3 addresses are required")
+	if strings.TrimSpace(l1Address) == "" {
+		return nil, fmt.Errorf("wefty: --l1 is required")
+	}
+	l3Client := &apiClient{name: "L3", flag: "l3"}
+	if strings.TrimSpace(l3Address) != "" {
+		l3Client = newAPIClient("L3", "l3", participant, l3Address)
 	}
 	return &apiClients{
-		l1:     newAPIClient("L1", participant, l1Address),
-		l3:     newAPIClient("L3", participant, l3Address),
+		l1:     newAPIClient("L1", "l1", participant, l1Address),
+		l3:     l3Client,
 		images: newRegistryResolver(nil),
 		fabric: participant,
 		wait:   waitForContext,
@@ -70,16 +83,20 @@ func waitForContext(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-func newAPIClient(name string, participant fabric.Fabric, address string) *apiClient {
+func newAPIClient(name, flagName string, participant fabric.Fabric, address string) *apiClient {
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return participant.Dial(ctx, network, address)
 	}}
-	return &apiClient{name: name, client: &http.Client{Transport: transport}}
+	return &apiClient{name: name, flag: flagName, client: &http.Client{Transport: transport}}
 }
 
 func (c *apiClients) close() {
-	c.l1.client.CloseIdleConnections()
-	c.l3.client.CloseIdleConnections()
+	if c.l1.client != nil {
+		c.l1.client.CloseIdleConnections()
+	}
+	if c.l3.client != nil {
+		c.l3.client.CloseIdleConnections()
+	}
 }
 
 func (c *apiClients) listNodes(ctx context.Context) (l1.NodeList, error) {
@@ -587,6 +604,9 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 }
 
 func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("wefty: this command requires --%s, which is not configured", c.flag)
+	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
