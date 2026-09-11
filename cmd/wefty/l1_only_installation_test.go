@@ -24,6 +24,12 @@ import (
 //     error naming the missing --l3 configuration, never a nil-pointer
 //     panic or a dial to an empty address.
 func TestOnlyL1ConfiguredCLIDegradesCleanly(t *testing.T) {
+	// run() reads these as flag defaults for --plain-user-id/--plain-device-id.
+	// Pin them to empty so a developer's shell environment cannot change the
+	// identity under test.
+	t.Setenv("WEFTY_DEV_PLAIN_USER_ID", "")
+	t.Setenv("WEFTY_DEV_PLAIN_DEVICE_ID", "")
+
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 

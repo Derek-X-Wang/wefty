@@ -24,6 +24,17 @@ const l1ImportPath = "github.com/Derek-X-Wang/wefty/l1"
 // unreviewed shortcut around the allowlist below.
 const l1SubpackagePrefix = l1ImportPath + "/"
 
+// repoImportPrefix, contractImportPath, fabricImportPath and
+// fabricSubpackagePrefix close the re-export route: l3 could otherwise
+// reach l1 wire types indirectly by importing some other repository
+// package that itself re-exports them. Non-test l3 code may import only
+// contract, fabric (and its subpackages), and l1 (handled separately
+// above) from this repository.
+const repoImportPrefix = "github.com/Derek-X-Wang/wefty/"
+const contractImportPath = repoImportPrefix + "contract"
+const fabricImportPath = repoImportPrefix + "fabric"
+const fabricSubpackagePrefix = fabricImportPath + "/"
+
 // allowedL1Identifiers is the ADR-0006 contract surface: the only l1.X
 // selectors non-test l3 code may reference. It was seeded from what
 // non-test l3 code actually uses today (l3/client.go, l3/server.go,
@@ -97,6 +108,43 @@ func fixture() {
 `,
 			wantCount:  1,
 			wantSubstr: "l1client.OpenStore",
+		},
+		{
+			name: "dot-import of l1 bypasses the allowlist",
+			source: `package l3
+
+import . "github.com/Derek-X-Wang/wefty/l1"
+
+func fixture() {
+	var s Store
+	_ = s
+}
+`,
+			wantCount:  1,
+			wantSubstr: l1ImportPath,
+		},
+		{
+			name: "blank import of l1 is inert",
+			source: `package l3
+
+import _ "github.com/Derek-X-Wang/wefty/l1"
+
+func fixture() {}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "re-export route through another repository package",
+			source: `package l3
+
+import "github.com/Derek-X-Wang/wefty/l1helpers"
+
+func fixture() {
+	_ = l1helpers.Thing{}
+}
+`,
+			wantCount:  1,
+			wantSubstr: "github.com/Derek-X-Wang/wefty/l1helpers",
 		},
 		{
 			name: "forbidden l1 subpackage import",
@@ -229,7 +277,28 @@ func l1ClientBoundaryViolations(path string) ([]l1BoundaryViolation, error) {
 				Reason:     "l3 may not import an l1 subpackage",
 			})
 		case importPath == l1ImportPath:
-			l1Aliases[importedPackageName(importPath, imported)] = true
+			name := importedPackageName(importPath, imported)
+			switch name {
+			case "_":
+				// A blank import has no side effects worth taking here and
+				// exposes no selectors to check.
+			case ".":
+				violations = append(violations, l1BoundaryViolation{
+					Position:   files.Position(imported.Pos()),
+					Identifier: importPath,
+					Reason:     "l3 may not dot-import l1: every l1 symbol would become a bare identifier, bypassing the ADR-0006 allowlist",
+				})
+			default:
+				l1Aliases[name] = true
+			}
+		case strings.HasPrefix(importPath, repoImportPrefix):
+			if importPath != contractImportPath && importPath != fabricImportPath && !strings.HasPrefix(importPath, fabricSubpackagePrefix) {
+				violations = append(violations, l1BoundaryViolation{
+					Position:   files.Position(imported.Pos()),
+					Identifier: importPath,
+					Reason:     "l3 may import only contract, fabric and l1 from this repository; see ADR-0006",
+				})
+			}
 		}
 	}
 

@@ -30,6 +30,7 @@ type apiClients struct {
 
 type apiClient struct {
 	name   string
+	flag   string
 	client *http.Client
 }
 
@@ -58,12 +59,12 @@ func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*api
 	if strings.TrimSpace(l1Address) == "" {
 		return nil, fmt.Errorf("wefty: --l1 is required")
 	}
-	l3Client := &apiClient{name: "L3"}
+	l3Client := &apiClient{name: "L3", flag: "l3"}
 	if strings.TrimSpace(l3Address) != "" {
-		l3Client = newAPIClient("L3", participant, l3Address)
+		l3Client = newAPIClient("L3", "l3", participant, l3Address)
 	}
 	return &apiClients{
-		l1:     newAPIClient("L1", participant, l1Address),
+		l1:     newAPIClient("L1", "l1", participant, l1Address),
 		l3:     l3Client,
 		images: newRegistryResolver(nil),
 		fabric: participant,
@@ -82,11 +83,11 @@ func waitForContext(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-func newAPIClient(name string, participant fabric.Fabric, address string) *apiClient {
+func newAPIClient(name, flagName string, participant fabric.Fabric, address string) *apiClient {
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return participant.Dial(ctx, network, address)
 	}}
-	return &apiClient{name: name, client: &http.Client{Transport: transport}}
+	return &apiClient{name: name, flag: flagName, client: &http.Client{Transport: transport}}
 }
 
 func (c *apiClients) close() {
@@ -604,7 +605,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 
 func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {
 	if c.client == nil {
-		return nil, fmt.Errorf("wefty: this command requires --%s, which is not configured", strings.ToLower(c.name))
+		return nil, fmt.Errorf("wefty: this command requires --%s, which is not configured", c.flag)
 	}
 	var reader io.Reader
 	if body != nil {
