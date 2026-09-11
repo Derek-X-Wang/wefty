@@ -532,40 +532,19 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
 }
 
-// workflowHelperPolicyExemptions names the shared-policy keys the
-// workflow-written realtiming helper units do not yet carry, and the ticket
-// that owns closing the gap. #412 added RestartPreventExitStatus to bound a
-// deterministic startup-barrier loop; it landed in the two shipped renderers
-// (runner/linuxunit, runner/lima) but not in the two lane fixtures under
-// .github/, which that change was not permitted to touch. Everything else must
-// still match key for key, and a realtiming helper that wedges its boot barrier
-// will still hot-loop until this map is empty.
-var workflowHelperPolicyExemptions = map[string]string{
-	"Service.RestartPreventExitStatus": "#412: the realtiming lane fixtures under .github/ still render the unbounded restart policy",
-}
-
 func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 	modernWant := splitQualifiedPolicy(systemdpolicy.UnitPolicy(255))
-	workflowWant := map[string]map[string]string{}
-	for section, directives := range modernWant {
-		workflowWant[section] = map[string]string{}
-		for key, value := range directives {
-			if _, exempt := workflowHelperPolicyExemptions[section+"."+key]; exempt {
-				continue
-			}
-			workflowWant[section][key] = value
-		}
-	}
-	if len(workflowHelperPolicyExemptions) > 1 {
-		t.Fatalf("the workflow helper policy exemption list grew to %d keys: %v", len(workflowHelperPolicyExemptions), workflowHelperPolicyExemptions)
-	}
+	// Every source of a helper unit -- the two shipped renderers and the two
+	// workflow-written realtiming fixtures -- matches the shared authority key
+	// for key. There is no exemption: a lane whose helper can hot-loop its boot
+	// barrier is not running the policy the product ships (#412).
 	for name, path := range map[string]string{
 		"pr-realtiming": "../.github/workflows/service-acceptance-realtiming.yml",
 		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
 	} {
 		got := helperServicePolicySections(t, path)
-		if !maps.Equal(got["Unit"], workflowWant["Unit"]) || !maps.Equal(got["Service"], workflowWant["Service"]) {
-			t.Fatalf("%s helper policy sections = %#v, want %#v (exemptions %v)", name, got, workflowWant, workflowHelperPolicyExemptions)
+		if !maps.Equal(got["Unit"], modernWant["Unit"]) || !maps.Equal(got["Service"], modernWant["Service"]) {
+			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, modernWant)
 		}
 		assertHelperPolicyMutationRejected(t, name, string(mustReadFile(t, path)))
 	}
@@ -586,15 +565,6 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 			want := splitQualifiedPolicy(systemdpolicy.UnitPolicy(version))
 			if !maps.Equal(got["Unit"], want["Unit"]) || !maps.Equal(got["Service"], want["Service"]) {
 				t.Fatalf("%s policy=%#v", name, got)
-			}
-			// The shipped renderers carry every key, exemptions included: the
-			// exemption is a property of the lane fixtures, never of a unit a
-			// node actually installs.
-			for qualified := range workflowHelperPolicyExemptions {
-				section, key, _ := strings.Cut(qualified, ".")
-				if got[section][key] == "" {
-					t.Fatalf("%s installed unit is missing %s, which no shipped renderer may omit", name, qualified)
-				}
 			}
 			assertHelperPolicyMutationRejected(t, name, text)
 		}
