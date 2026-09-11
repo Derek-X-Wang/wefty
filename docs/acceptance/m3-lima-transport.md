@@ -1,6 +1,6 @@
 # M3 Lima transport and service publication attended acceptance
 
-This is the owner-hardware lane for Tickets #145, #147, #149, #150, #181, and #207 and the Mac rows of the M3 OCI
+This is the owner-hardware lane for Tickets #145, #147, #148, #149, #150, #181, and #207 and the Mac rows of the M3 OCI
 spec §9. It is deliberately absent from `service-acceptance-realtiming`: hosted
 macOS runners do not prove nested Lima `vz`. A run is PASS only when every row
 below has a captured command, exit code, and redacted receipt from the same
@@ -78,7 +78,11 @@ it in place:
   `io.containerd.snapshotter.v1 overlayfs` plugin;
 - exactly one writable host allowed root mapped to `/mnt/wefty-host`;
 - only `/run/wefty/oci-helper.sock` forwarded into the instance `sock/`
-  directory; that directory is operator-owned `0700` and the guest socket is
+  directory; `limactl` creates that host-side directory itself when it wires
+  the socket forward (wefty issues no `chmod`/`chown` for it), and its
+  shipped mode is operator-owned `0750`, not `0700` — the forwarded socket
+  file inside it stays `0600` owner-only regardless, so the directory's
+  group-readability does not expose the socket; the guest socket is
   `0660 root:wefty-oci`;
 - the raw containerd socket has no host forward;
 - `limactl template copy --fill <stored-template> -` shows the first matching
@@ -162,10 +166,11 @@ the helper instance/session generation before each row.
    and successful request through `DialHostBridge`; wrong capability and wrong
    attempt must fail. Discovery failure itself must fail start and must not
    select fallback.
-7. Service publication: export the attended helper socket/checksum and pinned
-   probe image reference/digest as `WEFTY_OCI_HELPER_SOCKET`,
-   `WEFTY_OCI_HELPER_CHECKSUM`, `WEFTY_OCI_PROBE_REFERENCE`, and
-   `WEFTY_OCI_PROBE_DIGEST`, then run:
+7. Service publication: export the attended helper socket/checksum, pinned
+   probe image reference/digest, and probe archive path as
+   `WEFTY_OCI_HELPER_SOCKET`, `WEFTY_OCI_HELPER_CHECKSUM`,
+   `WEFTY_OCI_PROBE_REFERENCE`, `WEFTY_OCI_PROBE_DIGEST`, and
+   `WEFTY_OCI_PROBE_ARCHIVE`, then run:
 
    ```sh
    go test -tags=service_acceptance -run TestOCIServicePublicationThroughHelperTunnel -v ./agent
@@ -183,7 +188,19 @@ the helper instance/session generation before each row.
    begin with exactly that UID:GID and accept a payload write. For one stable
    service job, record attempt counters `0,1,2` across crash restart and
    stop→start while a marker outside `/wefty/service` is absent at the start of
-   every fresh attempt. Start a second service job on the same pinned digest;
+   every fresh attempt. Attribute the crash-restart transition (counter `0` to
+   `1`: a fresh attempt, container, task, and backend port on the same
+   digest-pinned binding) to the `service_restart_fresh_attempt` row, and the
+   stop→start transition (stop releases the slot but retains the binding,
+   digest pin, and service data; start reacquires service capacity through
+   `queued` before the counter advances `1` to `2`) to the
+   `service_stop_start_capacity` row. Separately, stop the same service job in
+   a way that the runtime cannot prove quiescence (for example, killing its
+   containerd shim out from under the runtime before requesting stop) and
+   require L1 to latch the job `failed` on the `oci_runtime_quiescence_failed`
+   control error instead of releasing the slot; record that command, exit
+   code, and the returned error in the `service_failed_quiescence` row. Start
+   a second service job on the same pinned digest;
    require its service data to be empty while the original job remains
    digest-pinned and retains its own counter. The helper-owned backing path must resolve inside the
    Linux guest's native filesystem, remain absent from the Lima host mounts,
@@ -312,6 +329,14 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 `service_health_echo`, `service_startup_timeout`,
 `service_withdrawal_republication`, `service_port_collision`, and
 `service_portless_started` from the same attended session.
+
+Ticket #148 additionally requires `service_restart_fresh_attempt`,
+`service_stop_start_capacity`, and `service_failed_quiescence` from the same
+attended session. The gate does not require additional typed fields for these
+three beyond the standard row shape (`session_id`, non-empty `command`, and
+`exit_code=0`); put the restart-identity, capacity-reacquisition, and
+quiescence-latch facts described above in the row's free-form `reason` and
+`inventories` fields.
 
 Ticket #149 additionally requires `service_data_guest_native` with
 `service_owners` containing `0:0`, `13001:13002`, and `12001:12002`,
