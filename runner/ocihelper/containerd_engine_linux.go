@@ -985,6 +985,12 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvServiceDir, contract.OCIContainerServiceDirectory)
 		}
 	}
+	if request.Workload.L1Endpoint != "" && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL1Endpoint) {
+		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvL1Endpoint, request.Workload.L1Endpoint)
+	}
+	if request.Workload.AttemptToken != "" && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvAttemptToken) {
+		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvAttemptToken, request.Workload.AttemptToken)
+	}
 	if request.Workload.L3Endpoint != "" && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL3Endpoint) {
 		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvL3Endpoint, request.Workload.L3Endpoint)
 	}

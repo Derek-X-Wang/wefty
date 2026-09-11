@@ -36,7 +36,11 @@ const (
 )
 
 type workflowBridge struct {
-	l3Endpoint         string
+	l3Endpoint string
+	// l1Endpoint and l1 are present only on a run-surface bridge. A Computer
+	// bridge never carries the attempt-credential surface.
+	l1Endpoint         string
+	l1                 *http.Transport
 	server             *http.Server
 	l3                 *http.Transport
 	hostBridgeFallback bool
@@ -85,15 +89,35 @@ func (e *workflowBridgeDrainError) ActiveConnectionCount() int {
 	return e.activeConnections
 }
 
+// workflowBridgeOption mounts an additional surface on one attempt-local
+// bridge. It is variadic rather than a parameter because a Computer bridge
+// must never receive the attempt-credential surface.
+type workflowBridgeOption func(*workflowBridge)
+
+func withControlPlaneSurface(participant fabric.Fabric, address string) workflowBridgeOption {
+	return func(b *workflowBridge) {
+		if participant == nil || strings.TrimSpace(address) == "" {
+			return
+		}
+		b.l1 = workflowBridgeTransport(participant, address)
+	}
+}
+
 func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec) (*workflowBridge, error) {
 	computer := contract.IsComputerExecution(execution)
 	computerEnabled := computer && execution.SensitiveEnv[contract.EnvComputerToken] != ""
-	if a.fabric == nil || (computer && !computerEnabled) || (!computer && execution.Env[contract.EnvL3Endpoint] == "") {
+	if a.fabric == nil || (computer && !computerEnabled) {
 		return nil, nil
 	}
 	surface := workflowBridgeSurfaceRun
+	var options []workflowBridgeOption
 	if computer {
 		surface = workflowBridgeSurfaceComputer
+	} else {
+		// Every one-shot attempt gets the attempt-credential surface, whether
+		// or not L3 dispatched it. That is the whole point: an L1-only user
+		// must be able to spawn work from inside work.
+		options = append(options, withControlPlaneSurface(a.fabric, a.controlPlaneAddr))
 	}
 	if kind == contract.JobKindOCI && a.ociBridgeBinder != nil {
 		binding, err := a.ociBridgeBinder.Bind(ctx)
@@ -101,10 +125,10 @@ func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution 
 			return nil, err
 		}
 		return newWorkflowBridgeWithSurface(ctx, a.fabric, a.runLedgerAddr, binding, surface,
-			computerEnabled)
+			computerEnabled, options...)
 	}
 	return newWorkflowBridgeWithSurface(ctx, a.fabric, a.runLedgerAddr, workloadrunner.WorkflowBridgeBinding{}, surface,
-		computerEnabled)
+		computerEnabled, options...)
 }
 
 func newWorkflowBridge(ctx context.Context, participant fabric.Fabric, l3Address string) (*workflowBridge, error) {
@@ -115,9 +139,9 @@ func newComputerAttemptBridge(ctx context.Context, participant fabric.Fabric, l3
 	return newWorkflowBridgeWithSurface(ctx, participant, l3Address, workloadrunner.WorkflowBridgeBinding{}, workflowBridgeSurfaceComputer, reachable)
 }
 
-func newWorkflowBridgeWithSurface(ctx context.Context, participant fabric.Fabric, l3Address string, binding workloadrunner.WorkflowBridgeBinding, surface workflowBridgeSurface, reachable bool) (*workflowBridge, error) {
+func newWorkflowBridgeWithSurface(ctx context.Context, participant fabric.Fabric, l3Address string, binding workloadrunner.WorkflowBridgeBinding, surface workflowBridgeSurface, reachable bool, options ...workflowBridgeOption) (*workflowBridge, error) {
 	if binding.Listener != nil || binding.AdvertiseHost != "" {
-		return newWorkflowBridgeWithBindingAndSurface(ctx, participant, l3Address, binding, surface, reachable)
+		return newWorkflowBridgeWithBindingAndSurface(ctx, participant, l3Address, binding, surface, reachable, options...)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -125,14 +149,14 @@ func newWorkflowBridgeWithSurface(ctx context.Context, participant fabric.Fabric
 	}
 	return newWorkflowBridgeWithBindingAndSurface(ctx, participant, l3Address, workloadrunner.WorkflowBridgeBinding{
 		Listener: listener, AdvertiseHost: "127.0.0.1",
-	}, surface, reachable)
+	}, surface, reachable, options...)
 }
 
 func newWorkflowBridgeWithBinding(ctx context.Context, participant fabric.Fabric, l3Address string, binding workloadrunner.WorkflowBridgeBinding) (*workflowBridge, error) {
 	return newWorkflowBridgeWithBindingAndSurface(ctx, participant, l3Address, binding, workflowBridgeSurfaceRun, true)
 }
 
-func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fabric.Fabric, l3Address string, binding workloadrunner.WorkflowBridgeBinding, surface workflowBridgeSurface, reachable bool) (*workflowBridge, error) {
+func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fabric.Fabric, l3Address string, binding workloadrunner.WorkflowBridgeBinding, surface workflowBridgeSurface, reachable bool, options ...workflowBridgeOption) (*workflowBridge, error) {
 	if binding.Listener == nil || binding.AdvertiseHost == "" {
 		return nil, errors.New("workflow bridge binding is incomplete")
 	}
@@ -158,6 +182,14 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		dial: func(ctx context.Context) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp", dialAddress)
 		},
+	}
+	for _, option := range options {
+		option(bridge)
+	}
+	if surface == workflowBridgeSurfaceComputer {
+		// Defence in depth against a future caller passing the option along a
+		// Computer path: the Computer pass has its own scope and its own door.
+		bridge.l1 = nil
 	}
 	proxyError := contract.ErrorInternal
 	if surface == workflowBridgeSurfaceComputer {
@@ -191,6 +223,10 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	} else {
 		mux := http.NewServeMux()
 		mux.Handle("/l3/", l3Proxy)
+		if bridge.l1 != nil {
+			mux.Handle("/l1/", bridge.controlPlaneHandler(
+				workflowReverseProxy(bridge.l1, "/l1", contract.ErrorInternal)))
+		}
 		handler = mux
 	}
 	bridge.server = &http.Server{
@@ -209,6 +245,9 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	}
 	baseURL := "http://" + net.JoinHostPort(binding.AdvertiseHost, strconv.Itoa(tcpAddress.Port))
 	bridge.l3Endpoint = baseURL + "/l3"
+	if bridge.l1 != nil {
+		bridge.l1Endpoint = baseURL + "/l1"
+	}
 	go func() {
 		_ = bridge.server.Serve(workflowBridgeListener{Listener: binding.Listener, bridge: bridge})
 	}()
@@ -229,6 +268,41 @@ func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 		defer cancel()
 		next.ServeHTTP(w, request.WithContext(requestContext))
 	})
+}
+
+// controlPlaneHandler restricts the attempt-credential surface to the exact
+// three routes L1 publishes for it. L1 refuses everything else anyway, since
+// the agent's Fabric identity reaches no client route without a credential;
+// this is the transport-side half of the same statement.
+func (b *workflowBridge) controlPlaneHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !bridgeRouteAllowed(attemptCredentialBridgeRoutes, request.Method, strings.TrimPrefix(request.URL.Path, "/l1")) {
+			writeWorkflowBridgeError(w, http.StatusForbidden, contract.ErrorPrincipalForbidden,
+				"route is outside the attempt-credential bridge allowlist")
+			return
+		}
+		next.ServeHTTP(w, request)
+	})
+}
+
+type bridgeRoute struct {
+	Method string
+	Path   string
+}
+
+var attemptCredentialBridgeRoutes = []bridgeRoute{
+	{Method: http.MethodPost, Path: "/v1/jobs"},
+	{Method: http.MethodGet, Path: "/v1/jobs/{job_id}"},
+	{Method: http.MethodGet, Path: "/v1/jobs/{job_id}/children"},
+}
+
+func bridgeRouteAllowed(routes []bridgeRoute, method, path string) bool {
+	for _, route := range routes {
+		if method == route.Method && computerBridgePathMatches(route.Path, path) {
+			return true
+		}
+	}
+	return false
 }
 
 func computerBridgeRouteAllowed(method, path string) bool {
@@ -256,7 +330,7 @@ func computerBridgePathMatches(pattern, requestPath string) bool {
 		return false
 	}
 	for index := range patternParts {
-		if patternParts[index] == "{run_id}" {
+		if strings.HasPrefix(patternParts[index], "{") && strings.HasSuffix(patternParts[index], "}") {
 			if requestParts[index] == "" || requestParts[index] == "." || requestParts[index] == ".." ||
 				strings.TrimSpace(requestParts[index]) != requestParts[index] {
 				return false
@@ -352,6 +426,9 @@ func (b *workflowBridge) closeWithCause(cause error) error {
 	defer cancel()
 	err := b.server.Shutdown(closeContext)
 	b.l3.CloseIdleConnections()
+	if b.l1 != nil {
+		b.l1.CloseIdleConnections()
+	}
 	if b.surface == workflowBridgeSurfaceComputer && errors.Is(err, context.DeadlineExceeded) {
 		// The helper pump preconnects its host side before a guest arrives. That
 		// connection has no request context for revocation to cancel, so graceful

@@ -1104,7 +1104,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, bridgeErr), bridgeErr)
 			}
 			executionSpec.Env = cloneEnvironment(executionSpec.Env)
-			delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
+			// A Computer has its own pass and its own door; it receives no
+			// attempt-credential surface in v1.
+			delete(executionSpec.Env, contract.EnvL1Endpoint)
 			executionSpec.Env[contract.EnvL3Endpoint] = endpoint
 		}
 		request.HostBridgeDial = computerBridge.dial
@@ -1117,9 +1119,25 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		if bridge != nil {
 			defer bridge.close()
+			// A bridge now exists for every one-shot attempt, so the L3 endpoint
+			// must be published only when L3 actually dispatched this job.
+			ledgerDispatched := executionSpec.Env[contract.EnvL3Endpoint] != ""
 			executionSpec.Env = cloneEnvironment(executionSpec.Env)
-			delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
-			executionSpec.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
+			executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
+			// Reserved names carry attempt-local truth, never submitter input.
+			for _, name := range []string{contract.EnvL1Endpoint, contract.EnvAttemptToken} {
+				delete(executionSpec.Env, name)
+				delete(executionSpec.SensitiveEnv, name)
+			}
+			if ledgerDispatched {
+				executionSpec.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
+			} else {
+				delete(executionSpec.Env, contract.EnvL3Endpoint)
+			}
+			if bridge.l1Endpoint != "" && claim.AttemptToken != "" {
+				executionSpec.Env[contract.EnvL1Endpoint] = bridge.l1Endpoint
+				executionSpec.SensitiveEnv[contract.EnvAttemptToken] = claim.AttemptToken
+			}
 			if bridge.hostBridgeFallback {
 				request.HostBridgeDial = bridge.dial
 			}

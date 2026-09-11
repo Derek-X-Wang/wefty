@@ -77,11 +77,19 @@ func validateWorkloadWire(input WorkloadInput) error {
 			return err
 		}
 	}
-	if strings.IndexByte(input.L3Endpoint, 0) >= 0 || strings.IndexByte(input.RunToken, 0) >= 0 || strings.IndexByte(input.ComputerToken, 0) >= 0 {
+	if strings.IndexByte(input.L1Endpoint, 0) >= 0 || strings.IndexByte(input.L3Endpoint, 0) >= 0 ||
+		strings.IndexByte(input.AttemptToken, 0) >= 0 || strings.IndexByte(input.RunToken, 0) >= 0 ||
+		strings.IndexByte(input.ComputerToken, 0) >= 0 {
 		return errors.New("helper environment minting inputs contain NUL")
 	}
 	if input.ComputerToken != "" && !input.Computer {
 		return errors.New("Computer token requires a Computer workload")
+	}
+	if (input.AttemptToken == "") != (input.L1Endpoint == "") {
+		return errors.New("attempt credential and L1 endpoint must be supplied together")
+	}
+	if input.AttemptToken != "" && input.Computer {
+		return errors.New("a Computer workload receives no attempt credential")
 	}
 	if input.Computer && (input.ComputerToken == "") != (input.L3Endpoint == "") {
 		return errors.New("Computer token and L3 endpoint must be supplied together")

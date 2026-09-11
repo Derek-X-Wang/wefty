@@ -615,10 +615,13 @@ type WorkloadInput struct {
 	WorkingDirectory     string                `json:"working_directory,omitempty"`
 	Environment          []EnvironmentVariable `json:"environment,omitempty"`
 	SensitiveEnvironment []EnvironmentVariable `json:"sensitive_environment,omitempty"`
-	// L3Endpoint, RunToken, and ComputerToken are closed helper-minting inputs. Their values
-	// become reserved environment only inside the privileged trust boundary;
-	// RunToken is deliberately separate so sensitive-only routing is explicit.
+	// L1Endpoint, L3Endpoint, AttemptToken, RunToken, and ComputerToken are
+	// closed helper-minting inputs. Their values become reserved environment
+	// only inside the privileged trust boundary; the two credentials are
+	// deliberately separate fields so sensitive-only routing is explicit.
+	L1Endpoint           string                    `json:"l1_endpoint,omitempty"`
 	L3Endpoint           string                    `json:"l3_endpoint,omitempty"`
+	AttemptToken         string                    `json:"attempt_token,omitempty"`
 	RunToken             string                    `json:"run_token,omitempty"`
 	ComputerToken        string                    `json:"computer_token,omitempty"`
 	ReservedEnvironment  []EnvironmentVariable     `json:"reserved_environment,omitempty"`
