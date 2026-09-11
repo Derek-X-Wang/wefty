@@ -435,6 +435,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
 			"check-fabric-identity-receipt.sh", "fabric-identity-receipt.json", "MACHINE_RESULT", "PERSON_RESULT",
 			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland",
+			"assemble-oci-acceptance-matrix.sh", "check-oci-acceptance-matrix.sh", "oci-acceptance-matrix.json", "$RUNNER_ENVIRONMENT",
 			"helper-restart-timeline.txt", "observed_startup_failures=6", "startup_failure_arm=6", "fault_1_kill_to_verified_ready_elapsed_ns", "fault_1_kill_to_verified_ready_bound_ns",
 			"capability_reason=helper_unit_unavailable", "lane_helper_kill_action_set", "lane_product_path_fault_actions=1", "disk_quarantine_action=quarantined", "elapsed <= bound"} {
 			if !strings.Contains(resultText, required) {

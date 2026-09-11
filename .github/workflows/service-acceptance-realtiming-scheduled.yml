@@ -639,6 +639,15 @@ jobs:
             "$TRUST_DOMAIN" "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED" \
             "$RUNNER_TEMP/fabric-machine-identity/fabric-machine-identity.json" \
             "$RUNNER_TEMP/fabric-person-identity/fabric-person-identity.json"
+      - name: Assemble the M3 OCI acceptance matrix
+        if: needs.resolve-published-artifact.outputs.available == 'true'
+        run: |
+          scripts/assemble-oci-acceptance-matrix.sh \
+            "$RUNNER_TEMP/oci-acceptance-matrix.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
+            published-artifact \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce" \
+            none "$RUNNER_ENVIRONMENT"
       - name: Fail closed unless the published lane executed and passed
         if: ${{ always() }}
         env:
@@ -679,6 +688,10 @@ jobs:
             "$RUNNER_TEMP/linux-computer-receipt-wayland/native-linux-oci.txt" published-artifact \
             "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-publication-linux.txt" \
             "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-l1-agent-linux.txt"
+          scripts/check-oci-acceptance-matrix.sh \
+            "$RUNNER_TEMP/oci-acceptance-matrix.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
+            published-artifact "$RUNNER_ENVIRONMENT"
           for variant in xfce wayland; do
             timeline="$RUNNER_TEMP/linux-computer-receipt-$variant/helper-restart-timeline.txt"
             grep -Fx 'observed_startup_failures=6' "$timeline"
@@ -713,4 +726,11 @@ jobs:
         with:
           name: fabric-identity-receipt-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-identity-receipt.json
+          if-no-files-found: warn
+      - name: Upload the M3 OCI acceptance matrix
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oci-acceptance-matrix-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/oci-acceptance-matrix.json
           if-no-files-found: warn
