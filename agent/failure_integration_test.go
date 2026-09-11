@@ -1612,7 +1612,7 @@ func assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) 
 		Capabilities: map[string]bool{"kind:process": true},
 	}
 	session := newAgentSession(
-		client, registration, newCapabilityState(registration.Capabilities, nil, systemClock{}, 0),
+		client, registration, newCapabilityState(registration.Capabilities, nil, systemClock{}, 0, nil),
 		time.Second, 10*time.Millisecond, systemClock{}, newLifecycleObserver(systemClock{}), nil, 0, 2,
 	)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1699,7 +1699,7 @@ func assertFailedCompletionLeavesSiblingAndSessionRunning(t *testing.T) {
 	session := newAgentSession(
 		client,
 		registration,
-		newCapabilityState(registration.Capabilities, nil, clock, 0),
+		newCapabilityState(registration.Capabilities, nil, clock, 0, nil),
 		time.Second,
 		time.Millisecond,
 		clock,

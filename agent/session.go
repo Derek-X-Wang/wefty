@@ -1003,7 +1003,7 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 	if session == nil || session.capabilities == nil {
 		return errors.New("agent: OCI runtime control is unavailable")
 	}
-	session.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+	session.capabilities.suppressOCIIntent(errOCIIntentDisabled)
 	// The command must not wait on L1 reachability. Publish immediately when
 	// possible, while the durable marker and local admission remain restrictive
 	// even if this best-effort heartbeat fails.
