@@ -203,9 +203,24 @@ and the guest socket back to `0660 root:wefty-oci`.
 ### Runtime matrix, continued
 
 5. Guest to host primary: resolve `host.lima.internal` from inside the current
-   guest, record the discovered address, bind only that address on macOS, and
-   complete one authenticated run-bridge request. Prove no `0.0.0.0` listener
-   and no fixed gateway string exists in config, argv, or source.
+   guest, record the discovered address, prove it is VM-private, bind only that
+   address on macOS, and complete one authenticated run-bridge request. Prove
+   no `0.0.0.0` listener and no fixed gateway string exists in config, argv, or
+   source. The proof of VM-privateness follows how Lima attached this instance,
+   read from Lima itself: on a `vmType: vz` instance the user-mode network
+   lives inside Virtualization.framework and the host owns no interface for the
+   gateway, so the proof is that the discovered address is the instance's own
+   user-network gateway as Lima configured it; on a vmnet/socket_vmnet instance
+   the proof is that the route to the address leaves through a virtual machine
+   interface rather than a physical one.
+
+   Owner-hardware finding (2026-09-11, Lima 2.2, `vmType: vz`, #394): the
+   discovered address is the vz user-network gateway and passes the proof, but
+   macOS cannot assign that address to any socket, so the bind fails and the
+   run reaches the host over the constrained helper reverse tunnel the OCI
+   spec reserves for exactly that case — row 6. How this row is evidenced on a
+   vz instance is an open owner ruling; the bind step above cannot be produced
+   there.
 6. Guest to host fallback: inject a bind failure for that discovered address.
    Require a host-loopback bridge, helper-issued per-attempt bridge capability,
    and successful request through `DialHostBridge`; wrong capability and wrong
