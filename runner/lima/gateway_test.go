@@ -78,6 +78,30 @@ func refuseRoute(t *testing.T) commandRunner {
 	}
 }
 
+// hostInterfaces fakes what the host itself holds, with no guest in the loop.
+func hostInterfaces(addresses ...string) hostAddressLister {
+	return func() ([]net.Addr, error) {
+		held := make([]net.Addr, 0, len(addresses))
+		for _, address := range addresses {
+			parsed := net.ParseIP(address)
+			mask := net.CIDRMask(64, 128)
+			if parsed.To4() != nil {
+				mask = net.CIDRMask(24, 32)
+			}
+			held = append(held, &net.IPNet{IP: parsed, Mask: mask})
+		}
+		return held, nil
+	}
+}
+
+func refuseHostAddresses(t *testing.T) hostAddressLister {
+	t.Helper()
+	return func() ([]net.Addr, error) {
+		t.Fatal("host interface addresses enumerated outside the vz proof")
+		return nil, nil
+	}
+}
+
 func refuseListen(t *testing.T) listenFunc {
 	t.Helper()
 	return func(string, string) (net.Listener, error) {
@@ -92,6 +116,7 @@ func TestBridgeBinderUsesDiscoveredGatewayWithoutHardCoding(t *testing.T) {
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
 	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("192.168.100.7", "127.0.0.1", "::1")
 	binder.listen = func(network, address string) (net.Listener, error) {
 		listenAddress = address
 		return net.Listen("tcp4", "127.0.0.1:0")
@@ -123,6 +148,7 @@ func TestBridgeBinderProvesVZGatewayAgainstTheInstanceUserNetwork(t *testing.T) 
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
 	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("192.168.100.7", "127.0.0.1", "::1")
 	binder.listen = func(string, string) (net.Listener, error) { return net.Listen("tcp4", "127.0.0.1:0") }
 	binding, err := binder.Bind(t.Context())
 	if err != nil {
@@ -139,6 +165,7 @@ func TestBridgeBinderRejectsVZGatewayOutsideTheInstanceUserNetwork(t *testing.T)
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
 	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("192.168.100.7", "127.0.0.1", "::1")
 	binder.listen = refuseListen(t)
 	_, err := binder.Bind(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "is not the vz user network gateway") {
@@ -155,6 +182,7 @@ func TestBridgeBinderKeepsInterfaceProofForNonVZInstances(t *testing.T) {
 	inspection := vmnetInspection("198.18.0.2")
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
+	binder.hostAddresses = refuseHostAddresses(t)
 	routed := 0
 	binder.route = func(context.Context, string, ...string) ([]byte, error) {
 		routed++
@@ -178,6 +206,7 @@ func TestBridgeBinderRejectsPhysicalGatewayRoute(t *testing.T) {
 	inspection := vmnetInspection("10.0.0.24")
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
+	binder.hostAddresses = refuseHostAddresses(t)
 	binder.route = func(context.Context, string, ...string) ([]byte, error) { return []byte("interface: en0\n"), nil }
 	binder.listen = refuseListen(t)
 	if _, err := binder.Bind(t.Context()); err == nil || !strings.Contains(err.Error(), "physical interface") {
@@ -241,6 +270,7 @@ func TestBridgeBinderRefusesGatewayLimaWillNotAccountFor(t *testing.T) {
 			binder := NewBridgeBinder("ticket-145")
 			binder.run = testCase.inspection.run
 			binder.route = refuseRoute(t)
+			binder.hostAddresses = hostInterfaces("192.168.100.7")
 			binder.listen = refuseListen(t)
 			_, err := binder.Bind(t.Context())
 			if err == nil || !strings.Contains(err.Error(), testCase.wanted) {
@@ -250,11 +280,71 @@ func TestBridgeBinderRefusesGatewayLimaWillNotAccountFor(t *testing.T) {
 	}
 }
 
+// The vz proof reads both halves from inside the instance, so a compromised
+// guest can name one of the host's own addresses twice and pass the equality
+// check. macOS owns that address, the bind would succeed, and the bridge would
+// sit on the LAN. The host-side floor is what stops it, and it asks the guest
+// nothing.
+func TestBridgeBinderRefusesGuestClaimedHostOwnedGateway(t *testing.T) {
+	lanAddress := "192.168.100.7"
+	inspection := vzInspection(lanAddress, lanAddress)
+	binder := NewBridgeBinder("ticket-145")
+	binder.run = inspection.run
+	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("127.0.0.1", lanAddress, "::1")
+	binder.listen = refuseListen(t)
+	_, err := binder.Bind(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "is assigned to a host interface") {
+		t.Fatalf("host-owned gateway error = %v", err)
+	}
+	if !strings.Contains(err.Error(), lanAddress) {
+		t.Fatalf("host-owned gateway error omitted the address: %v", err)
+	}
+}
+
+func TestBridgeBinderRefusesGatewayWhenTheHostCannotBeEnumerated(t *testing.T) {
+	inspection := vzInspection("198.18.0.2", "198.18.0.2")
+	binder := NewBridgeBinder("ticket-145")
+	binder.run = inspection.run
+	binder.route = refuseRoute(t)
+	binder.hostAddresses = func() ([]net.Addr, error) { return nil, errors.New("interface table unavailable") }
+	binder.listen = refuseListen(t)
+	_, err := binder.Bind(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "enumerate host interface addresses") {
+		t.Fatalf("host enumeration failure error = %v", err)
+	}
+}
+
+// The floor must not refuse the real thing: the gateway Lima hands a vz guest
+// is precisely an address the host does not hold.
+func TestBridgeBinderAcceptsVZGatewayTheHostDoesNotHold(t *testing.T) {
+	gateway := strings.Join([]string{"192", "168", "5", "2"}, ".")
+	var listenAddress string
+	inspection := vzInspection(gateway, gateway)
+	binder := NewBridgeBinder("ticket-145")
+	binder.run = inspection.run
+	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("127.0.0.1", "192.168.100.7", "::1")
+	binder.listen = func(network, address string) (net.Listener, error) {
+		listenAddress = address
+		return net.Listen("tcp4", "127.0.0.1:0")
+	}
+	binding, err := binder.Bind(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.Listener.Close()
+	if listenAddress != gateway+":0" || binding.AdvertiseHost != HostGatewayName || binding.HostBridgeFallback {
+		t.Fatalf("binding = %#v, listen address = %q", binding, listenAddress)
+	}
+}
+
 func TestBridgeBinderUsesHelperFallbackOnlyAfterGatewayBindFailure(t *testing.T) {
 	inspection := vzInspection("198.18.0.2", "198.18.0.2")
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
 	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("192.168.100.7", "127.0.0.1", "::1")
 	calls := 0
 	binder.listen = func(network, address string) (net.Listener, error) {
 		calls++
@@ -282,6 +372,7 @@ func TestBridgeBinderDoesNotTunnelAroundDiscoveryFailure(t *testing.T) {
 	binder := NewBridgeBinder("ticket-145")
 	binder.run = inspection.run
 	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("192.168.100.7", "127.0.0.1", "::1")
 	binder.listen = refuseListen(t)
 	if _, err := binder.Bind(t.Context()); err == nil {
 		t.Fatal("discovery failure incorrectly selected the helper fallback")
@@ -295,6 +386,7 @@ func TestBridgeBinderCachesDiscoveryOnlyForAuthoritativeHelperEpoch(t *testing.T
 	binder.Epoch = epoch
 	binder.run = inspection.run
 	binder.route = refuseRoute(t)
+	binder.hostAddresses = hostInterfaces("192.168.100.7", "127.0.0.1", "::1")
 	binder.listen = func(string, string) (net.Listener, error) { return net.Listen("tcp4", "127.0.0.1:0") }
 	for range 2 {
 		binding, err := binder.Bind(t.Context())

@@ -213,6 +213,16 @@ and the guest socket back to `0660 root:wefty-oci`.
    a vmnet/socket_vmnet instance the proof is that the route to the address
    leaves through a virtual machine interface rather than a physical one.
 
+   On vz both halves of that proof — the resolution of `host.lima.internal`
+   and the instance's user-network gateway — are read from inside the guest,
+   so a compromised instance could name one of the host's own addresses twice
+   and satisfy the equality. A host-side floor that asks the guest nothing is
+   what prevents that: the address must not be assigned to any host interface,
+   because a vz user-network gateway never is, and the host being
+   unenumerable refuses the gateway rather than binding it. Without that
+   floor a lying guest would obtain a plaintext run bridge on the LAN, since
+   macOS can bind an address it actually holds.
+
    What is bound afterwards follows the same arrangement:
 
    - vmnet/socket_vmnet: bind only the discovered address on macOS and
