@@ -28,8 +28,14 @@ type attendedArtifact struct {
 }
 
 type attendedResult struct {
-	Status                 string              `json:"status"`
-	Reason                 string              `json:"reason,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+	// BlockedBy is the GitHub issue the owner judged to own this row's
+	// non-PASS outcome, recorded per row at capture time. Attribution that
+	// lives in Go source goes stale the moment the named ticket is fixed --
+	// #394 then #408 each went stale within two runs -- so the receipt row is
+	// the authority and the source-level default is only the fallback.
+	BlockedBy              int                 `json:"blocked_by,omitempty"`
 	SessionID              string              `json:"session_id"`
 	Command                []string            `json:"command"`
 	ExitCode               int                 `json:"exit_code"`
@@ -477,14 +483,26 @@ func containsString(values []string, want string) bool {
 // scripts/assemble-oci-acceptance-matrix.sh merges with the Linux receipts.
 
 const (
-	// The dominant product blocker for every Mac OCI row. #394 (the Lima vz
-	// gateway guard) is fixed, so blaming a NOT-RUN row on it sends a reader to
-	// a closed ticket; the attempts now die one step later, on the arm64
-	// image-platform disagreement that creates zero containers.
-	macMatrixBlockerIssue = 408
+	// macMatrixUnattributedIssue owns a non-PASS row whose attended receipt
+	// recorded no `blocked_by`. It deliberately names the acceptance-matrix
+	// ticket rather than whichever product defect happened to dominate the
+	// last run: a fixed defect makes source-level attribution a lie, while
+	// "nobody recorded who owns this" stays true and is itself #157's job to
+	// chase down.
+	macMatrixUnattributedIssue = 157
 	// Headless cold-reboot evidence is owned by the #128 prototype.
 	macMatrixHeadlessIssue = 128
 )
+
+// owningIssue is the ticket a matrix row's non-PASS outcome belongs to. The
+// attended receipt row is the authority; the documented default only covers a
+// row the owner left unattributed.
+func owningIssue(result attendedResult) int {
+	if result.BlockedBy > 0 {
+		return result.BlockedBy
+	}
+	return macMatrixUnattributedIssue
+}
 
 // macMatrixRows is the frozen Mac half of the matrix. Dependencies are listed
 // dominant cause first: the first non-PASS dependency names the row's reason.
@@ -598,12 +616,13 @@ func buildMacMatrixRow(artifact attendedArtifact, id string, attended []string) 
 			row.Reason = "the attended lane recorded " + firstFailure + " as FAIL without a reason"
 		}
 		row.Evidence["attended_failed_row"] = firstFailure
+		row.NotRunIssue = owningIssue(artifact.Rows[firstFailure])
 	case firstSkip != "":
 		row.Status = "NOT-RUN"
 		row.Evidence["attended_skipped_row"] = firstSkip
 		row.Evidence["attended_reason"] = artifact.Rows[firstSkip].Reason
 		row.Gaps[firstSkip] = artifact.Rows[firstSkip].Reason
-		row.NotRunIssue = macMatrixBlockerIssue
+		row.NotRunIssue = owningIssue(artifact.Rows[firstSkip])
 		row.Reason = artifact.Rows[firstSkip].Reason
 	}
 	if row.Status == "NOT-RUN" && strings.TrimSpace(row.Reason) == "" {
@@ -744,20 +763,54 @@ func TestAttendedMatrixFragmentMapping(t *testing.T) {
 		}
 	})
 
-	t.Run("a blocked attended row is NOT-RUN on the current blocker", func(t *testing.T) {
+	t.Run("a blocked attended row is owned by the issue its own receipt row names", func(t *testing.T) {
 		artifact := base()
-		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", Reason: "blocked by image_platform_unsupported"}
+		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", BlockedBy: 412, Reason: "blocked by the helper ownership wedge"}
 		row := buildMacMatrixFragment(artifact, "sha").Rows["mac.service.publication"]
-		if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixBlockerIssue ||
-			row.Reason != "blocked by image_platform_unsupported" {
-			t.Fatalf("row = %+v, want NOT-RUN owned by #%d", row, macMatrixBlockerIssue)
+		if row.Status != "NOT-RUN" || row.NotRunIssue != 412 || row.Reason != "blocked by the helper ownership wedge" {
+			t.Fatalf("row = %+v, want NOT-RUN owned by the receipt's own #412", row)
 		}
 	})
 
-	t.Run("the owning tickets stay distinct", func(t *testing.T) {
-		if macMatrixBlockerIssue != 408 || macMatrixHeadlessIssue != 128 || macMatrixBlockerIssue == macMatrixHeadlessIssue {
-			t.Fatalf("matrix ownership = blocker #%d, headless #%d; re-pointing is a deliberate edit",
-				macMatrixBlockerIssue, macMatrixHeadlessIssue)
+	t.Run("two rows blocked by different issues keep their own owners", func(t *testing.T) {
+		artifact := base()
+		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", BlockedBy: 412, Reason: "helper wedge"}
+		artifact.Rows["service_data_guest_native"] = attendedResult{Status: "NOT-RUN", BlockedBy: 149, Reason: "hosted runner has no guest-native backing"}
+		fragment := buildMacMatrixFragment(artifact, "sha")
+		assertMacMatrixFragmentIsTyped(t, fragment)
+		if got := fragment.Rows["mac.service.publication"].NotRunIssue; got != 412 {
+			t.Fatalf("publication row owned by #%d, want #412", got)
+		}
+		if got := fragment.Rows["mac.service.data"].NotRunIssue; got != 149 {
+			t.Fatalf("data row owned by #%d, want #149", got)
+		}
+	})
+
+	t.Run("a FAIL also carries the owning issue its receipt row names", func(t *testing.T) {
+		artifact := base()
+		artifact.Rows["oci_oneshot_run"] = attendedResult{Status: "FAIL", BlockedBy: 412, Reason: "helper crash-looped on a durable ownership record"}
+		row := buildMacMatrixFragment(artifact, "sha").Rows["mac.oneshot.image_identity"]
+		if row.Status != "FAIL" || row.NotRunIssue != 412 {
+			t.Fatalf("row = %+v, want a FAIL owned by the receipt's own #412", row)
+		}
+	})
+
+	t.Run("an unattributed non-PASS row falls back to the documented default", func(t *testing.T) {
+		artifact := base()
+		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", Reason: "the owner recorded no blocking ticket"}
+		row := buildMacMatrixFragment(artifact, "sha").Rows["mac.service.publication"]
+		if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixUnattributedIssue {
+			t.Fatalf("row = %+v, want NOT-RUN owned by the documented default #%d", row, macMatrixUnattributedIssue)
+		}
+	})
+
+	// The producer used to hardcode the run's dominant blocker. #394 then #408
+	// each went stale within two runs, so the only attribution left in source
+	// is a default that cannot go stale.
+	t.Run("no product defect is hardcoded as the matrix owner", func(t *testing.T) {
+		if macMatrixUnattributedIssue != 157 || macMatrixHeadlessIssue != 128 || macMatrixUnattributedIssue == macMatrixHeadlessIssue {
+			t.Fatalf("matrix ownership = unattributed #%d, headless #%d; re-pointing is a deliberate edit",
+				macMatrixUnattributedIssue, macMatrixHeadlessIssue)
 		}
 	})
 
@@ -772,15 +825,15 @@ func TestAttendedMatrixFragmentMapping(t *testing.T) {
 			"task_logs_delete", "mount_validation", "host_to_guest",
 			"helper_loss", "vm_loss", "sweep_before_recovery",
 		} {
-			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", Reason: "blocked by image_platform_unsupported"}
+			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", BlockedBy: 412, Reason: "blocked by the helper ownership wedge"}
 		}
 		fragment := buildMacMatrixFragment(artifact, "sha")
 		assertMacMatrixFragmentIsTyped(t, fragment)
 		for _, id := range []string{"mac.oneshot.delivery", "mac.oneshot.engine_loss", "mac.service.crash_recovery", "mac.only.dial_attempt_port"} {
 			row := fragment.Rows[id]
-			if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixBlockerIssue ||
-				row.Reason != "blocked by image_platform_unsupported" {
-				t.Fatalf("row %s = %+v, want NOT-RUN owned by #%d with the attended reason verbatim", id, row, macMatrixBlockerIssue)
+			if row.Status != "NOT-RUN" || row.NotRunIssue != 412 ||
+				row.Reason != "blocked by the helper ownership wedge" {
+				t.Fatalf("row %s = %+v, want NOT-RUN owned by #412 with the attended reason verbatim", id, row)
 			}
 		}
 	})
