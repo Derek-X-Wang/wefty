@@ -144,7 +144,49 @@ the helper instance/session generation before each row.
 
 1. Barrier and probe: acquire, sweep the whole `wefty` namespace, independently
    verify absence, then run the pinned `/bin/true` functional probe. Prove no
-   OCI claim begins before the fresh capability revision is acknowledged.
+   OCI claim begins before the fresh capability revision is acknowledged. This
+   is the daemon's own boot-time acquire, exercised already by the Installed
+   boot topology section above; it produces the `probe` row and needs no
+   further procedure.
+
+### Exclusive helper session for items 2-4
+
+Items 2-4 below (`task_logs_delete`, `mount_validation`, `host_to_guest`) call
+`Run`/`Mount`/`DialAttemptPort` directly against the helper rather than through
+`wefty submit`, and the helper accepts only one session at a time.
+`dev.wefty.agent` has held that session continuously since it started, and
+until now the runbook gave no way to take it for these three rows (#403). Take
+it the same way [m3.5-mac-computer.md](m3.5-mac-computer.md)'s `mac.removal`
+row takes it from the daemon for its independent removal inventory:
+
+```sh
+sudo launchctl bootout system/dev.wefty.agent
+pgrep -fl wefty-agent   # must print nothing
+```
+
+With the daemon offline, open one direct helper-client session against the
+guest socket and, in that one session, run items 2, 3, and 4 in order — the
+same `Run`/mount-validate/`DialAttemptPort` operations the runbook already
+describes for each, just issued directly instead of through the agent. For
+each of the three rows, record `session_id` (the artifact's shared session
+ID), the exact `command` you ran, and `exit_code: 0`; the gate
+(`runner/lima/service_acceptance_test.go`) requires no other typed field for
+these three rows beyond that shared shape.
+
+Re-install and restart the daemon immediately afterward, before item 5 and the
+rest of the runtime matrix — service publication, service data, and the
+removal manifest all assume `dev.wefty.agent` holds the session again:
+
+```sh
+sudo launchctl bootstrap system /Library/LaunchDaemons/dev.wefty.agent.plist
+sudo launchctl kickstart -k system/dev.wefty.agent
+```
+
+Confirm the reload the same way the Installed boot topology section already
+does: `dev.wefty.agent` loaded in the system domain with the operator
+`UserName`, no competing `io.lima-vm.daemon.*`/`io.lima-vm.autostart.*` unit,
+and the guest socket back to `0660 root:wefty-oci`.
+
 2. Task/log/delete: run the test image through `Run`; require authoritative
    `Started`, ordered distinct stdout/stderr frames, terminal exit 0, positive
    `Delete`, and an independent absent `Verify`.
@@ -157,6 +199,9 @@ the helper instance/session generation before each row.
    guest loopback, and exchange distinct request/response markers through
    `DialAttemptPort` for the returned `service` endpoint name. A different name
    and a different attempt tuple must return typed authorization failures.
+
+### Runtime matrix, continued
+
 5. Guest to host primary: resolve `host.lima.internal` from inside the current
    guest, record the discovered address, bind only that address on macOS, and
    complete one authenticated run-bridge request. Prove no `0.0.0.0` listener
@@ -270,8 +315,23 @@ executes it; hosted macOS does not satisfy the row.
 
 ## Loss and recovery order
 
+`helper_loss`, `vm_loss`, and `sweep_before_recovery` need the same exclusive
+helper session as `task_logs_delete`, `mount_validation`, and `host_to_guest`
+above, for the whole fault-and-recovery sequence: the live marker workload,
+the fault, and the recovery all have to be observed from one direct client
+session, and `dev.wefty.agent` cannot be left holding a competing session
+across an injected helper/VM loss without contaminating the recovery it is
+already separately proven for in the Installed boot topology section. Take it
+the same way:
+
+```sh
+sudo launchctl bootout system/dev.wefty.agent
+pgrep -fl wefty-agent   # must print nothing
+```
+
 For helper loss and then full VM stop, leave a live marker workload before the
-fault. Each row must show, in order:
+fault, driven from that one direct helper-client session. Each row must show,
+in order:
 
 1. the old helper control stream fails and local OCI capability becomes
    restrictive;
@@ -287,6 +347,22 @@ fault. Each row must show, in order:
 Reuse the textual agent boot ID in one repetition. Any adopted survivor,
 pre-sweep probe, pre-sweep positive publication, reachable old tunnel, or raw
 containerd host access is FAIL.
+
+For each of `helper_loss`, `vm_loss`, and `sweep_before_recovery`, record
+`session_id`, `command`, and `exit_code: 0` as usual, plus the fields the gate
+checks explicitly for these three: `helper_generations` with at least the
+pre-fault and the post-recovery generation, `capability_revisions` with at
+least the withdrawn and the reopened revision, and `inventories` with at least
+the pre-sweep and the post-sweep independent verification — the gate requires
+two or more entries in each of those three lists.
+
+Once all three rows are recorded, re-install and restart the daemon before
+continuing to the Receipt section's fold-in commands:
+
+```sh
+sudo launchctl bootstrap system /Library/LaunchDaemons/dev.wefty.agent.plist
+sudo launchctl kickstart -k system/dev.wefty.agent
+```
 
 ## Receipt
 
