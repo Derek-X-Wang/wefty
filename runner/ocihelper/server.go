@@ -46,7 +46,15 @@ type ServerConfig struct {
 	AllowedMountRoots     []string
 	Clock                 Clock
 	Logf                  func(string, ...any)
-	beforeRunCreateLock   func()
+	// StartupFailureStateDirectory holds the durable consecutive-startup-
+	// barrier-failure ledger that bounds the helper's restart loop. Empty
+	// disables the bound; the installed helper always sets it to its runtime
+	// root.
+	StartupFailureStateDirectory string
+	// StartupFailureBound overrides systemdpolicy.StartupFailureBound. Tests
+	// set it; the installed helper does not.
+	StartupFailureBound int
+	beforeRunCreateLock func()
 }
 
 type Server struct {
@@ -257,6 +265,14 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	// the complete startup Sweep+Verify succeeds.
 	go func() {
 		err := server.sweepAndVerifyStartup(ctx)
+		if err == nil {
+			server.clearStartupBarrierFailures()
+		} else {
+			// A barrier that keeps failing the same way is a wedge, not a
+			// transient fault. Counting it durably lets the unit stop at a
+			// failed state with a typed reason instead of hot-looping.
+			err = server.recordStartupBarrierFailure(err)
+		}
 		server.sessionMu.Lock()
 		server.startupErr = err
 		close(server.startupDone)
@@ -308,22 +324,22 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	defer cancel()
 	sweepEpoch, err := randomCapability()
 	if err != nil {
-		return errors.New("startup sweep OCI runtime namespace: generate sweep epoch")
+		return &StartupBarrierError{Phase: StartupBarrierSweep, Err: errors.New("startup sweep OCI runtime namespace: generate sweep epoch")}
 	}
 	sweep, err := server.engine.Sweep(sweepContext, SweepRequest{SweepEpoch: sweepEpoch})
 	if err != nil {
-		return fmt.Errorf("startup sweep OCI runtime namespace: %w", err)
+		return &StartupBarrierError{Phase: StartupBarrierSweep, Err: fmt.Errorf("startup sweep OCI runtime namespace: %w", err)}
 	}
 	sweep.SweepEpoch = sweepEpoch
 	verification, err := server.engine.Verify(sweepContext, VerifyRequest{Scope: VerifyNamespace})
 	if err != nil {
-		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
+		return &StartupBarrierError{Phase: StartupBarrierVerify, Err: fmt.Errorf("startup verify OCI runtime namespace: %w", err)}
 	}
 	if err := validateNamespaceVerification("startup verify OCI runtime namespace", verification); err != nil {
-		return err
+		return &StartupBarrierError{Phase: StartupBarrierVerify, Err: err}
 	}
 	if !verification.Absent {
-		return namespaceResidueError("startup verify OCI runtime namespace", verification)
+		return &StartupBarrierError{Phase: StartupBarrierVerify, Err: namespaceResidueError("startup verify OCI runtime namespace", verification)}
 	}
 	server.sessionMu.Lock()
 	server.startupSweep = &sweep

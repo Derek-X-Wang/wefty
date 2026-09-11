@@ -890,6 +890,7 @@ func helperRestartPolicyFromUnit(unit string) (map[string]string, error) {
 	wanted := map[string]struct{}{
 		"Unit.StartLimitIntervalSec": {},
 		"Service.Restart":            {}, "Service.RestartSec": {}, "Service.RestartSteps": {}, "Service.RestartMaxDelaySec": {},
+		"Service.RestartPreventExitStatus": {},
 	}
 	result := make(map[string]string)
 	section := ""

@@ -44,8 +44,8 @@ authority. The socket unit creates
 user is added to that group, while the service runs the private helper mode as
 root with a narrow UID allowlist. Every shipped systemd helper service, native
 Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
-`Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`, and
-`RestartMaxDelaySec=1s` under `[Service]`; systemd versions before 254 use a fixed
+`Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`,
+`RestartMaxDelaySec=1s`, and `RestartPreventExitStatus=78` under `[Service]`; systemd versions before 254 use a fixed
 `RestartSec=1s` because the geometric directives are unavailable. The workflow-written realtiming
 units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
 systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
@@ -60,7 +60,21 @@ reported as a measurement, not treated as a separate unenforced bound.
 This bounds saturated deterministic-failure churn at no more than 0.5 Hz
 instead of sustaining a four-Hz journal loop. Disabling the
 start-limit interval prevents service exhaustion from failing the triggering
-socket with `service-start-limit-hit`. The socket retains systemd's default
+socket with `service-start-limit-hit`.
+
+A rate bound is not a count bound, so the helper bounds the count itself. It
+fsyncs a versioned consecutive-startup-barrier-failure ledger in its runtime
+root; a barrier that succeeds removes it. On the fifth consecutive failure the
+helper exits `78` -- the status the unit names in `RestartPreventExitStatus` --
+so systemd stops restarting and leaves a **failed** unit whose journal carries
+the typed phase (`startup_sweep` or `startup_verify`) and count. The socket unit
+is untouched and stays armed, so an operator repair is picked up by the next
+connection without a `reset-failed`. A ledger that cannot be read or written
+never manufactures a wedge: the helper reports the ordinary failure and
+restarts, because losing the count must not become a refusal to serve. Only the
+boot Sweep+Verify barrier is counted; a helper that reached ready and then
+crashed restarts as often as it needs to, so the seven-delay saturated
+derivation above is unchanged. The socket retains systemd's default
 trigger-limit policy; the current lane proves service recovery and active
 socket topology, but does not claim a separate trigger-limit proof. The lane
 on Debian 12/systemd 252 rejects any `Unknown key` diagnostic from

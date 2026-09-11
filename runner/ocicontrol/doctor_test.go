@@ -232,12 +232,26 @@ func TestDoctorDetectsInstalledHelperUnitPolicyDrift(t *testing.T) {
 func TestDoctorParsesEffectiveRestartPolicyAcrossSystemdDropIns(t *testing.T) {
 	config := healthyDoctorConfig(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC), "")
 	config.InstalledHelperServiceUnit = func(context.Context) (string, error) {
-		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=5s\n" +
+		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=5s\nRestartPreventExitStatus=78\n" +
 			"# /etc/systemd/system/wefty-oci-helper.service.d/restart.conf\n[Service]\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
 	}
 	report := BuildDoctor(t.Context(), config)
 	if item := findDoctorFinding(t, report, "helper-restart-policy"); item.Outcome != DiagnosticOK || item.Code != "oci_helper_restart_policy_current" {
 		t.Fatalf("effective drop-in policy = %+v", item)
+	}
+}
+
+// A drop-in that removes the wedge guard re-arms the #412 hot loop, so doctor
+// must read it as drift on the effective unit, not just on the shipped source.
+func TestDoctorReadsARestartPreventExitStatusOverrideAsDrift(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC), "")
+	config.InstalledHelperServiceUnit = func(context.Context) (string, error) {
+		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\nRestartPreventExitStatus=78\n" +
+			"# /etc/systemd/system/wefty-oci-helper.service.d/loop.conf\n[Service]\nRestartPreventExitStatus=\n", nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if item := findDoctorFinding(t, report, "helper-restart-policy"); item.Outcome != DiagnosticFailed || item.Code != "oci_helper_restart_policy_drift" {
+		t.Fatalf("an override that re-arms the restart loop = %+v", item)
 	}
 }
 

@@ -14,12 +14,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 	"howett.net/plist"
 )
 
@@ -224,6 +226,7 @@ func TestGuestHelperUnitsPinSocketAuthorityAndPrivateMode(t *testing.T) {
 		"--oci-allowed-mount-root=/mnt/wefty-host", "--oci-lima-host-mount-root=/Users/operator/wefty-mounts",
 		"--oci-memory-capacity-bytes=4294967296", "--oci-memory-reserve-bytes=1073741824",
 		"StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=1s",
+		"RestartPreventExitStatus=78",
 	} {
 		if !strings.Contains(service, want) {
 			t.Fatalf("service unit missing %q:\n%s", want, service)
@@ -238,6 +241,24 @@ func TestGuestHelperUnitUsesBoundedLegacySystemdRestartPolicy(t *testing.T) {
 	service := string(renderGuestServiceUnit(GuestHelperInstallConfig{HostMountRoot: "/Users/operator/wefty-mounts", GuestUID: 501, SystemdVersion: 252}))
 	if !strings.Contains(service, "RestartSec=1s") || strings.Contains(service, "RestartSteps=") || strings.Contains(service, "RestartMaxDelaySec=") {
 		t.Fatalf("legacy guest helper policy = %s", service)
+	}
+}
+
+// The Lima guest unit is the one the #412 crash loop was observed on. It must
+// stop restarting once the helper reports the wedged exit status, while keeping
+// StartLimitIntervalSec=0 so the triggering socket is never failed.
+func TestGuestHelperUnitStopsRestartingOnTheWedgedExitStatus(t *testing.T) {
+	want := "RestartPreventExitStatus=" + strconv.Itoa(systemdpolicy.StartupWedgedExitStatus)
+	for _, version := range []int{0, 252, 254, 255} {
+		service := string(renderGuestServiceUnit(GuestHelperInstallConfig{
+			HostMountRoot: "/Users/operator/wefty-mounts", GuestUID: 501, SystemdVersion: version,
+		}))
+		if !strings.Contains(service, want+"\n") {
+			t.Fatalf("systemd %d guest helper unit would hot-loop on a wedged startup barrier:\n%s", version, service)
+		}
+		if !strings.Contains(service, "StartLimitIntervalSec=0\n") || !strings.Contains(service, "Restart=on-failure\n") {
+			t.Fatalf("systemd %d guest helper unit changed socket-activation semantics:\n%s", version, service)
+		}
 	}
 }
 

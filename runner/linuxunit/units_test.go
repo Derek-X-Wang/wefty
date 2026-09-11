@@ -8,6 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
 func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
@@ -32,7 +35,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 			t.Fatalf("agent unit missing %q:\n%s", want, agent)
 		}
 	}
-	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc", "--oci-memory-capacity-bytes=0", "--oci-memory-reserve-bytes=0", "StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=1s"} {
+	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc", "--oci-memory-capacity-bytes=0", "--oci-memory-reserve-bytes=0", "StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=1s", "RestartPreventExitStatus=78"} {
 		if !strings.Contains(helper, want) {
 			t.Fatalf("helper unit missing %q:\n%s", want, helper)
 		}
@@ -65,8 +68,43 @@ func TestRenderUsesBoundedLegacySystemdRestartPolicy(t *testing.T) {
 }
 
 func TestUnknownSystemdVersionUsesConservativeRestartPolicy(t *testing.T) {
-	if got := HelperRestartPolicy(0); got != "RestartSec=1s\n" || HelperRestartPolicyName(0) != "conservative_fixed_1s" {
+	if got := HelperRestartPolicy(0); got != "RestartSec=1s\nRestartPreventExitStatus=78\n" || HelperRestartPolicyName(0) != "conservative_fixed_1s" {
 		t.Fatalf("unknown systemd policy = %q name=%q", got, HelperRestartPolicyName(0))
+	}
+}
+
+// A helper whose boot sweep fails the same way every time used to restart
+// forever (NRestarts 136 in two minutes, #412). The unit must stop restarting
+// once the helper reports the wedged exit status, on every systemd version and
+// on both renderers -- while keeping StartLimitIntervalSec=0, so the triggering
+// socket is never failed with service-start-limit-hit.
+func TestHelperUnitStopsRestartingOnTheWedgedExitStatus(t *testing.T) {
+	config := Config{AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty",
+		OperatorUID: 1001, OperatorGID: 1001, WorkingDirectory: "/var/lib/wefty",
+		ContainerdAddress: "/run/containerd/containerd.sock", ContainerdStateRoot: "/run/containerd",
+		RuntimeRoot: "/var/lib/wefty/oci", AllowedMountRoots: []string{"/srv/wefty"}}
+	want := "RestartPreventExitStatus=" + strconv.Itoa(systemdpolicy.StartupWedgedExitStatus)
+	for _, version := range []int{0, 252, 254, 255} {
+		config.SystemdVersion = version
+		units, err := Render(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service := string(units.HelperService)
+		if !strings.Contains(service, want+"\n") {
+			t.Fatalf("systemd %d helper unit would hot-loop on a wedged startup barrier:\n%s", version, service)
+		}
+		if !strings.Contains(service, "StartLimitIntervalSec=0\n") || !strings.Contains(service, "Restart=on-failure\n") {
+			t.Fatalf("systemd %d helper unit changed socket-activation semantics:\n%s", version, service)
+		}
+		if count := strings.Count(service, "RestartPreventExitStatus="); count != 1 {
+			t.Fatalf("systemd %d helper unit assigns the wedge status %d times", version, count)
+		}
+	}
+	// The bound must leave the injected-fault lane's seven restarts alone:
+	// those are post-ready crashes, not startup-barrier failures.
+	if HelperSaturatedRestartDelaySum != 7*time.Second {
+		t.Fatalf("saturated restart delay sum = %s, want the unchanged 7s derivation", HelperSaturatedRestartDelaySum)
 	}
 }
 
