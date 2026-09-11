@@ -42,6 +42,7 @@ knowledge_base:
       - "CONTEXT.md"
       - "docs/adr/*.md"
       - "docs/contracts/*.md"
+      - "docs/2026-08-06-wefty-v1-design.md"
 
 chat:
   auto_reply: true
