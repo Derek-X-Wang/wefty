@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit is advisory cross review. all-tests-pass stays the only required check.
+language: en-US
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  collapse_walkthrough: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: true
+  path_filters:
+    - "!go.sum"
+    - "!**/package-lock.json"
+  path_instructions:
+    - path: "**/*.go"
+      instructions: |
+        Decision authorities are CONTEXT.md (vocabulary), docs/adr/ (ADR-0001: nothing cloud-specific lands here),
+        docs/2026-08-06-wefty-v1-design.md, and docs/contracts/ (state machines, lease/fencing/dispatch-key rules).
+        Flag any change that contradicts a contract without changing the contract doc in the same PR.
+        Fabric seam: no tailscale.com import outside fabric/tsnet; no Tailscale types, MagicDNS or svc: names on public surfaces.
+        Timing: state logic must use injected clocks; integration tests with real processes need leases of at least 1s.
+        Do not suggest relaxing timeouts, assertions, capacity, lease or retention bounds to make a test pass.
+    - path: ".github/workflows/**"
+      instructions: |
+        contract-gate.yml jobs must stay secretless; all-tests-pass aggregates fail-closed and is the only required check.
+        Any job whose `if:` is event-, OS- or path-gated needs skip-tolerant guards on all transitive dependents
+        (see TestRealtimingSkipGuardPolicy in scripts/acceptance_image_contract_test.go).
+    - path: "workflows/dogfood/**"
+      instructions: |
+        @ai-hero/sandcastle must stay exactly 0.12.0 and only inside workflows/dogfood/. Structured output requires
+        maxIterations: 1; multi-iteration steps use the two-phase pattern.
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "AGENTS.md"
+      - "CONTEXT.md"
+      - "docs/adr/*.md"
+      - "docs/contracts/*.md"
+
+chat:
+  auto_reply: true
