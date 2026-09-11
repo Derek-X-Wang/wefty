@@ -79,14 +79,32 @@ func (s *redactingOutputSink) Flush(ctx context.Context) error {
 	return nil
 }
 
-func (s *redactingOutputSink) safePrefix(stream *redactionStream) []byte {
-	maxLength := 0
+// pendingSecretPrefix returns the earliest offset whose remainder could still
+// become the head of a secret once the next read arrives. Bytes before it can
+// never be part of a straddling occurrence and are safe to emit now.
+//
+// Withholding the longest secret's length minus one byte unconditionally would
+// be simpler, but it stalls every short line behind a long credential: a job
+// that prints one line and then works for minutes would not be tailable. Only
+// a genuine partial prefix needs to wait.
+func (s *redactingOutputSink) pendingSecretPrefix(buffer []byte) int {
+	cut := len(buffer)
 	for _, secret := range s.secrets {
-		if len(secret) > maxLength {
-			maxLength = len(secret)
+		// A remainder as long as the secret is a complete occurrence, not a
+		// partial one; the straddle loop below owns that case.
+		start := max(len(buffer)-len(secret)+1, 0)
+		for index := start; index < min(len(buffer), cut); index++ {
+			if bytes.HasPrefix(secret, buffer[index:]) {
+				cut = index
+				break
+			}
 		}
 	}
-	cut := len(stream.buffer) - maxLength + 1
+	return cut
+}
+
+func (s *redactingOutputSink) safePrefix(stream *redactionStream) []byte {
+	cut := s.pendingSecretPrefix(stream.buffer)
 	if cut <= 0 {
 		return nil
 	}

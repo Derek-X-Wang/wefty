@@ -246,10 +246,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   prestart_terminal_reason TEXT,
   image_resolution_json BLOB,
   image_resolution_hash TEXT,
+  parent_job_id TEXT,
+  parent_attempt_id TEXT,
+  originating_submitter TEXT NOT NULL DEFAULT '',
+  spawn_depth INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0),
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_claim_order ON jobs(state, created_ns, job_id);
+CREATE INDEX IF NOT EXISTS jobs_parent_order ON jobs(parent_job_id, created_ns, job_id);
 CREATE TABLE IF NOT EXISTS job_tags (
   job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
   tag TEXT NOT NULL,
@@ -313,6 +318,19 @@ CREATE TABLE IF NOT EXISTS attempts (
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attempts_job ON attempts(job_id);
+-- attempt_credentials stores only the SHA-256 digest of each minted bearer.
+-- It carries no expiry: liveness is read from the attempt on every request,
+-- so a row can never outlive the authority it names.
+CREATE TABLE IF NOT EXISTS attempt_credentials (
+  token_hash TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  originating_submitter TEXT NOT NULL DEFAULT '',
+  spawn_depth INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0),
+  created_ns INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attempt_credentials_attempt ON attempt_credentials(attempt_id);
 CREATE TABLE IF NOT EXISTS service_jobs (
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped')),
@@ -881,6 +899,20 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	}
 	if err := s.ensureColumn(ctx, "jobs", "completion_replay_attempt_id", "TEXT"); err != nil {
 		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"parent_job_id", "TEXT"},
+		{"parent_attempt_id", "TEXT"},
+		{"originating_submitter", "TEXT NOT NULL DEFAULT ''"},
+		{"spawn_depth", "INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0)"},
+	} {
+		if err := s.ensureColumn(ctx, "jobs", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS jobs_parent_order
+		ON jobs(parent_job_id, created_ns, job_id)`); err != nil {
+		return fmt.Errorf("l1: ensure child job order index: %w", err)
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "lease_loss_count", "INTEGER NOT NULL DEFAULT 0 CHECK(lease_loss_count >= 0)"); err != nil {
 		return err
@@ -1603,12 +1635,46 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 func (s *Store) Close() error { return s.db.Close() }
 
 // CreateJob creates a job or returns the identical dispatch-key replay.
-func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, replayed bool, err error) {
+// JobOrigin records who a job is created for. A root submission carries only
+// the authenticated client principal. A child submission additionally carries
+// the parent facts L1 derived from the presented attempt credential; they are
+// never read from the request body, so parentage cannot be forged.
+type JobOrigin struct {
+	OriginatingSubmitter string
+	Parent               *AttemptCredentialScope
+}
+
+// CreateJob creates a root job with no recorded submitter. It is the shape
+// used by callers that have no authenticated principal to attribute.
+func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (Job, bool, error) {
+	return s.CreateJobAs(ctx, spec, JobOrigin{})
+}
+
+func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin JobOrigin) (job Job, replayed bool, err error) {
 	// Preserve the v1 submission contract: L1 canonicalizes routing tags before
 	// structural validation and persistence.
 	spec.RoutingTags = NormalizeTags(spec.RoutingTags)
 	if err := validateJobSpec(&spec); err != nil {
 		return Job{}, false, err
+	}
+	originatingSubmitter := strings.TrimSpace(origin.OriginatingSubmitter)
+	var parentJobID, parentAttemptID sql.NullString
+	spawnDepth := 0
+	if origin.Parent != nil {
+		// The cap is checked against the parent's recorded depth, so it cannot
+		// be evaded by replaying an old credential: depth is immutable.
+		if origin.Parent.SpawnDepth+1 > MaxSpawnDepth {
+			return Job{}, false, protocolErrorWithDetails(contract.ErrorSpawnDepthExceeded,
+				map[string]any{"spawn_depth": origin.Parent.SpawnDepth, "max_spawn_depth": MaxSpawnDepth},
+				"job %q is at spawn depth %d and may not spawn past the cap of %d",
+				origin.Parent.JobID, origin.Parent.SpawnDepth, MaxSpawnDepth)
+		}
+		parentJobID = sql.NullString{String: origin.Parent.JobID, Valid: true}
+		parentAttemptID = sql.NullString{String: origin.Parent.AttemptID, Valid: true}
+		spawnDepth = origin.Parent.SpawnDepth + 1
+		// A child never widens authority: it inherits the root submitter rather
+		// than adopting whoever happens to hold the credential.
+		originatingSubmitter = origin.Parent.OriginatingSubmitter
 	}
 	if isComputerSpec(spec) {
 		return Job{}, false, protocolError(contract.ErrorComputerResourceRequired,
@@ -1629,9 +1695,18 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	}
 	defer tx.Rollback()
 
+	// Authorization ran before this transaction opened. Re-prove the credential
+	// against the snapshot the write will commit on, so an attempt that lost
+	// authority in that window cannot still persist a child.
+	if origin.Parent != nil {
+		if err := revalidateAttemptCredential(ctx, tx, *origin.Parent, now.UnixNano()); err != nil {
+			return Job{}, false, err
+		}
+	}
+
 	job, storedHash, err := getJobByDispatchKey(ctx, tx, spec.DispatchKey, now)
 	if err == nil {
-		if storedHash != requestHash {
+		if !replayWithinScope(origin, job) || storedHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", spec.DispatchKey)
 		}
 		return job, true, nil
@@ -1641,7 +1716,9 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	}
 	tombstone, err := readServiceTombstoneByDispatchHash(ctx, tx, hashDispatchKey(spec.DispatchKey))
 	if err == nil {
-		if tombstone.requestHash != requestHash {
+		// A tombstone retains no parentage, so an in-job caller can never be
+		// shown one: unverifiable scope is refused, not assumed.
+		if !replayWithinScope(origin, tombstone.job()) || tombstone.requestHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", spec.DispatchKey)
 		}
 		return tombstone.job(), true, nil
@@ -1651,20 +1728,26 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	}
 
 	job = Job{
-		JobID:     newID("job"),
-		State:     contract.JobQueued,
-		Spec:      spec,
-		CreatedAt: now,
-		UpdatedAt: now,
+		JobID:                newID("job"),
+		State:                contract.JobQueued,
+		Spec:                 spec,
+		ParentJobID:          parentJobID.String,
+		ParentAttemptID:      parentAttemptID.String,
+		OriginatingSubmitter: originatingSubmitter,
+		SpawnDepth:           spawnDepth,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state, created_ns, updated_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON, job.State, now.UnixNano(), now.UnixNano())
+INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state,
+                 parent_job_id, parent_attempt_id, originating_submitter, spawn_depth, created_ns, updated_ns)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON, job.State,
+		parentJobID, parentAttemptID, originatingSubmitter, spawnDepth, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		// A concurrent identical submit can win the unique dispatch key. Read
 		// it after rolling this transaction back and preserve replay semantics.
 		_ = tx.Rollback()
-		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, err)
+		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, origin, err)
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
 		return Job{}, false, internalError(err, "initialize authoritative job log")
@@ -1699,19 +1782,37 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 	return job, false, nil
 }
 
-func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, insertErr error) (Job, bool, error) {
+// replayWithinScope decides whether a dispatch-key replay may be handed to
+// this caller. A client principal keeps the historical behaviour. An attempt
+// credential may replay only a key its own job already used, which is what
+// keeps a retried attempt's resubmission idempotent; every other key is
+// reported as a dispatch-key conflict, identical to the mismatched-request
+// answer. Replay is therefore neither a way to read a job outside the
+// credential's scope nor an oracle for which keys exist. The originating
+// submitter must match as well: parentage alone is not identity, and a child
+// always inherits its root submitter, so a divergence means the row is not the
+// one this credential is entitled to.
+func replayWithinScope(origin JobOrigin, replayed Job) bool {
+	if origin.Parent == nil {
+		return true
+	}
+	return replayed.ParentJobID != "" && replayed.ParentJobID == origin.Parent.JobID &&
+		replayed.OriginatingSubmitter == origin.Parent.OriginatingSubmitter
+}
+
+func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {
 	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey, canonicalTime(s.clock.Now()))
 	if err != nil {
 		tombstone, tombstoneErr := readServiceTombstoneByDispatchHash(ctx, s.db, hashDispatchKey(dispatchKey))
 		if tombstoneErr != nil {
 			return Job{}, false, internalError(insertErr, "store job")
 		}
-		if tombstone.requestHash != requestHash {
+		if !replayWithinScope(origin, tombstone.job()) || tombstone.requestHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", dispatchKey)
 		}
 		return tombstone.job(), true, nil
 	}
-	if storedHash != requestHash {
+	if !replayWithinScope(origin, job) || storedHash != requestHash {
 		return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", dispatchKey)
 	}
 	return job, true, nil
@@ -2136,6 +2237,9 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var createdNS int64
 	var imageResolutionJSON []byte
 	var prestartDeadlineNS sql.NullInt64
+	var claimedParentJobID, claimedParentAttemptID sql.NullString
+	var originatingSubmitter string
+	var spawnDepth int
 	// SQLite's immediate writer transaction serializes this count-then-insert.
 	// A Postgres adapter must instead lock the node row or retry serializable
 	// transactions so concurrent claims cannot over-admit either class.
@@ -2231,7 +2335,8 @@ WHERE job_id=(
 )
 AND state=@job_queued
 	RETURNING job_id, spec_json, fence_counter, created_ns,
-	          image_resolution_json, prestart_budget_deadline_ns`
+	          image_resolution_json, prestart_budget_deadline_ns,
+	          parent_job_id, parent_attempt_id, originating_submitter, spawn_depth`
 	claimArguments := []any{
 		sql.Named("job_claimed", contract.JobClaimed),
 		sql.Named("attempt_id", attemptID),
@@ -2251,7 +2356,8 @@ AND state=@job_queued
 	}
 	claimArguments = append(claimArguments, exclusionArguments...)
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(claimQuery, exclusionClause), claimArguments...).
-		Scan(&jobID, &specJSON, &fence, &createdNS, &imageResolutionJSON, &prestartDeadlineNS)
+		Scan(&jobID, &specJSON, &fence, &createdNS, &imageResolutionJSON, &prestartDeadlineNS,
+			&claimedParentJobID, &claimedParentAttemptID, &originatingSubmitter, &spawnDepth)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, internalError(err, "commit empty claim")
@@ -2309,6 +2415,20 @@ AND state=@job_queued
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
 	}
+	// Mint the attempt credential in the claim transaction: a claim either
+	// yields a credential or does not happen. Every class and kind is minted
+	// for uniformly; delivery into the workload is the agent's separate
+	// concern. Only the digest is persisted.
+	attemptToken, attemptTokenHash, err := newAttemptCredential()
+	if err != nil {
+		return nil, internalError(err, "mint attempt credential")
+	}
+	if err := insertAttemptCredential(ctx, tx, attemptTokenHash, AttemptCredentialScope{
+		AttemptID: attemptID, JobID: jobID, NodeID: nodeID,
+		OriginatingSubmitter: originatingSubmitter, SpawnDepth: spawnDepth,
+	}, now.UnixNano()); err != nil {
+		return nil, err
+	}
 	var computerStorage *ComputerStorageClaim
 	if class == contract.JobClassService {
 		bindingResult, err := tx.ExecContext(ctx, `UPDATE service_jobs
@@ -2353,18 +2473,24 @@ AND state=@job_queued
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
 		return nil, err
 	}
+	if err := pruneAttemptCredentials(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, internalError(err, "commit job claim")
 	}
 	claim := &Claim{
 		Job: Job{
 			JobID: jobID, NodeID: nodeID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID,
+			ParentJobID: claimedParentJobID.String, ParentAttemptID: claimedParentAttemptID.String,
+			OriginatingSubmitter: originatingSubmitter, SpawnDepth: spawnDepth,
 			CreatedAt: time.Unix(0, createdNS).UTC(), UpdatedAt: now,
 		},
 		Lease: AttemptLease{
 			AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires,
 			LeaseTTL: leaseExpires.Sub(now),
 		},
+		AttemptToken:    attemptToken,
 		ComputerStorage: computerStorage,
 	}
 	if prestartDeadlineNS.Valid {
@@ -3785,6 +3911,7 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now
 	var requestHash string
 	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
+	var spawnColumns jobSpawnColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
@@ -3808,15 +3935,16 @@ CASE
 				AND publication_attempt.authority_generation=publication_node.authority_generation
 		)
 	THEN 1 ELSE 0
-END
+END,
+jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append([]any{
+WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append(append([]any{
 		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
-	}, serviceColumns.scanDestinations()...)...)
+	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, "", err
 	}
-	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
+	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns, spawnColumns); err != nil {
 		return Job{}, "", err
 	}
 	if failureReason.Valid {
@@ -3837,6 +3965,7 @@ func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Jo
 	var createdNS, updatedNS int64
 	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
+	var spawnColumns jobSpawnColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
@@ -3860,15 +3989,16 @@ CASE
 				AND publication_attempt.authority_generation=publication_node.authority_generation
 		)
 	THEN 1 ELSE 0
-END
+END,
+jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append([]any{
+WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append(append([]any{
 		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
-	}, serviceColumns.scanDestinations()...)...)
+	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, err
 	}
-	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
+	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns, spawnColumns); err != nil {
 		return Job{}, err
 	}
 	if failureReason.Valid {
@@ -3882,7 +4012,8 @@ WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_
 	return job, nil
 }
 
-func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, createdNS, updatedNS int64, serviceColumns serviceJobColumns) error {
+func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, createdNS, updatedNS int64,
+	serviceColumns serviceJobColumns, spawnColumns jobSpawnColumns) error {
 	if err := json.Unmarshal(specJSON, &job.Spec); err != nil {
 		return err
 	}
@@ -3892,6 +4023,7 @@ func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, creat
 	job.CreatedAt = time.Unix(0, createdNS).UTC()
 	job.UpdatedAt = time.Unix(0, updatedNS).UTC()
 	job.ServiceJob = serviceColumns.projection()
+	spawnColumns.apply(job)
 	return nil
 }
 

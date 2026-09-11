@@ -23,6 +23,7 @@ const (
 	ErrorLeaseExpired                ErrorCode = "lease_expired"
 	ErrorAttemptMismatch             ErrorCode = "attempt_mismatch"
 	ErrorDispatchKeyConflict         ErrorCode = "dispatch_key_conflict"
+	ErrorSpawnDepthExceeded          ErrorCode = "spawn_depth_exceeded"
 	ErrorIdempotencyConflict         ErrorCode = "idempotency_conflict"
 	ErrorStaleIntentRevision         ErrorCode = "stale_intent_revision"
 	ErrorStalePolicyRevision         ErrorCode = "stale_policy_revision"

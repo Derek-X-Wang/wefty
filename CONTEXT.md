@@ -66,6 +66,22 @@ One node's leased, fenced execution of a job. A job may outlive a lost
 attempt; an attempt never outlives its lease.
 _Avoid_: try, execution instance
 
+**Attempt credential**:
+An opaque bearer L1 mints when a node agent claims an attempt and delivers to
+the workload. It lets the workload act as a delegate of the job's original
+submitter for exactly three things: submit a child job, read its own job, and
+list or read its children. It is valid only while that attempt is the job's
+live attempt and only from the node holding it.
+_Avoid_: attempt token, job token, run token, in-job identity
+
+**Parent job**:
+The job whose live attempt submitted another job through its attempt
+credential. Recorded on the child together with the parent attempt and the
+originating submitter; derived from the credential, never supplied by the
+caller. Children are independent jobs at job level, so a retried parent
+attempt sees them. Spawn depth counts parent links and is capped.
+_Avoid_: lineage, ancestor, owner
+
 **Node**:
 A machine running the wefty agent, joined through the fabric, with
 control-plane-assigned tags.

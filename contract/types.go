@@ -27,7 +27,9 @@ type ComputerTokenRevocationReceipt struct {
 // credentials in SensitiveEnv so public job projections can redact them.
 const (
 	EnvRunID                     = "WEFTY_RUN_ID"
+	EnvL1Endpoint                = "WEFTY_L1_ENDPOINT"
 	EnvL3Endpoint                = "WEFTY_L3_ENDPOINT"
+	EnvAttemptToken              = "WEFTY_ATTEMPT_TOKEN"
 	EnvRunToken                  = "WEFTY_RUN_TOKEN"
 	EnvHandoffDir                = "WEFTY_HANDOFF_DIR"
 	EnvServiceDir                = "WEFTY_SERVICE_DIR"
@@ -89,7 +91,9 @@ var ociReservedEnvironmentNames = [...]string{
 	EnvHandoffDir,
 	EnvServiceDir,
 	EnvServicePort,
+	EnvL1Endpoint,
 	EnvL3Endpoint,
+	EnvAttemptToken,
 	EnvRunToken,
 	EnvComputerToken,
 	EnvComputerViewPort,
@@ -113,7 +117,7 @@ func IsOCIReservedEnvironmentName(name string) bool {
 // authoritative contents must travel only through the sensitive environment
 // layer. Operator and image values are stripped for every reserved name.
 func IsOCISensitiveReservedEnvironmentName(name string) bool {
-	return name == EnvRunToken || name == EnvComputerToken
+	return name == EnvRunToken || name == EnvComputerToken || name == EnvAttemptToken
 }
 
 // IsComputerExecution is the single cross-layer discriminator for Computer

@@ -71,6 +71,10 @@
             "description": "Absent after removal finalizes; tombstones retain no executable or environment bytes."
           },
           "current_attempt_id": { "type": "string" },
+          "parent_job_id": { "type": "string", "description": "Job whose live attempt submitted this job through its attempt credential. Derived from the credential, never supplied by the caller; absent on a root job." },
+          "parent_attempt_id": { "type": "string", "description": "Exact parent attempt that submitted this job. Absent on a root job." },
+          "originating_submitter": { "type": "string", "description": "Stable Fabric node ID of the client principal that created the root job. Inherited unchanged by every descendant and never widened." },
+          "spawn_depth": { "type": "integer", "minimum": 0, "maximum": 8, "description": "Number of parent links above this job. Zero for a root job; a submission past the fixed cap of 8 is refused with spawn_depth_exceeded." },
           "attempts": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/Attempt" },
@@ -1536,6 +1540,11 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "opaque scoped run token"
+      },
+      "attemptCredential": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque attempt credential"
       },
       "computerToken": {
         "type": "http",

@@ -23,6 +23,14 @@ registration, and whose workload class has capacity; it then creates an attempt,
 fence, establishes a lease, and moves the job to `claimed`. Exactly one
 concurrent claimant commits.
 
+The same transaction mints one attempt credential and returns its opaque bearer
+in the claim response, so a claim either yields a credential or does not happen.
+L1 persists only the SHA-256 digest, bound to the attempt, its job, the holding
+node, the job's originating submitter, and the job's spawn depth. Every job
+class and kind is minted for uniformly; delivery into the workload environment
+is the node agent's separate concern and is described in the run execution
+context.
+
 L1 derives and transactionally persists `RequiredCapabilities(JobSpec)` when it
 creates the job. The normalized set always contains `kind:<name>`, additionally
 contains `runtime_handler:<name>` for a non-empty handler, and contains
@@ -355,6 +363,15 @@ pre-start backoff so a lease-flapping node cannot hot-requeue invisibly. One-sho
 terminally. A partitioned node may still be running non-idempotent work, so
 later authority-changing writes receive `lease_expired` or `stale_fence` and
 cannot alter state. Evidence writes follow the provenance-only rules above.
+
+An attempt credential carries no independent expiry. Every request revalidates
+the live attempt, so the credential stops working at the same instant the
+lease, boot session, or authority generation does, and a request presenting it
+must still arrive with the Fabric identity of the node holding that attempt.
+Authority is never restored by a later renewal or by a different attempt of the
+same job: a fresh claim mints a fresh credential. Deleting a superseded
+credential row is hygiene, not enforcement; refusal is decided by reading the
+live attempt.
 
 Log idempotency is keyed by `(attempt_id, stream, sequence)`. The same bytes and
 timestamp are replay-safe; a different event at an existing key is an

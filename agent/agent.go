@@ -106,8 +106,12 @@ type Config struct {
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
-	fabric              fabric.Fabric
-	runLedgerAddr       string
+	fabric        fabric.Fabric
+	runLedgerAddr string
+	// controlPlaneAddr is the same L1 address the agent's own client dials. The
+	// attempt-credential bridge forwards to it over the agent's authenticated
+	// Fabric connection; L1 still requires the credential.
+	controlPlaneAddr    string
 	registration        contract.NodeRegistration
 	renewalInterval     time.Duration
 	finalizationTimeout time.Duration
@@ -396,7 +400,8 @@ func New(config Config) (*Agent, error) {
 	constructionSucceeded = true
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
-		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
+		controlPlaneAddr: config.ControlPlaneAddress,
+		registration:     registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,

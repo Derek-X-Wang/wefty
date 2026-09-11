@@ -3,7 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -34,6 +37,8 @@ func main() {
 		sleep()
 	case "paced-output":
 		pacedOutput()
+	case "submit-child":
+		submitChild()
 	case "raw-output":
 		rawOutput()
 	default:
@@ -52,6 +57,94 @@ func pacedOutput() {
 	_, _ = os.Stdout.Write([]byte("first\n"))
 	time.Sleep(time.Duration(milliseconds) * time.Millisecond)
 	_, _ = os.Stdout.Write([]byte("second\n"))
+}
+
+// submitChild exercises the attempt credential the way a real workload would:
+// nothing but the two injected variables, no L3, no sidecar. It learns its own
+// job ID from the child's parent_job_id, which is the only self-identification
+// the v1 surface offers.
+func submitChild() {
+	if len(os.Args) != 3 {
+		fatalf("submit-child mode requires a dispatch key")
+	}
+	endpoint := os.Getenv("WEFTY_L1_ENDPOINT")
+	token := os.Getenv("WEFTY_ATTEMPT_TOKEN")
+	if endpoint == "" || token == "" {
+		fatalf("attempt credential context is missing: endpoint=%q token set=%t", endpoint, token != "")
+	}
+	spec := map[string]any{
+		"schema_version": 1,
+		"dispatch_key":   os.Args[2],
+		"kind":           "process",
+		"class":          "one-shot",
+		// A tag no node carries keeps the child queued, so this mode proves
+		// submission and read-back without starting a second execution.
+		"routing_tags": []string{"never-claimed"},
+		"execution": map[string]any{
+			"executable":        map[string]any{"path": "/bin/echo"},
+			"argv":              []string{"echo", "child"},
+			"working_directory": "/tmp",
+			"handoff_directory": "/tmp",
+		},
+	}
+	child := credentialCall(endpoint, token, http.MethodPost, "/v1/jobs", spec)
+	childID, _ := child["job_id"].(string)
+	selfID, _ := child["parent_job_id"].(string)
+	if childID == "" || selfID == "" {
+		fatalf("child job did not record parentage: %v", child)
+	}
+	own := credentialCall(endpoint, token, http.MethodGet, "/v1/jobs/"+selfID, nil)
+	if id, _ := own["job_id"].(string); id != selfID {
+		fatalf("own job read returned %v", own)
+	}
+	page := credentialCall(endpoint, token, http.MethodGet, "/v1/jobs/"+selfID+"/children", nil)
+	jobs, _ := page["jobs"].([]any)
+	if len(jobs) != 1 {
+		fatalf("children page = %v", page)
+	}
+	listed, _ := jobs[0].(map[string]any)
+	if id, _ := listed["job_id"].(string); id != childID {
+		fatalf("listed child = %v, want %s", listed, childID)
+	}
+	// Print the credential on purpose: the node agent must redact it before the
+	// bytes reach a log sink, so this line proves the sensitive routing works.
+	fmt.Printf("child=%s self=%s token=%s\n", childID, selfID, token)
+}
+
+func credentialCall(endpoint, token, method, path string, body any) map[string]any {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			fatalf("encode %s %s: %v", method, path, err)
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequest(method, endpoint+path, reader)
+	if err != nil {
+		fatalf("build %s %s: %v", method, path, err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		fatalf("call %s %s: %v", method, path, err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		fatalf("read %s %s: %v", method, path, err)
+	}
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+		fatalf("%s %s status %d: %s", method, path, response.StatusCode, payload)
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		fatalf("decode %s %s: %v body=%s", method, path, err, payload)
+	}
+	return decoded
 }
 
 func rawOutput() {

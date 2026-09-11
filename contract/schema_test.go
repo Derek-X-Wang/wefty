@@ -396,7 +396,9 @@ func TestOCIReservedEnvironmentNamesAreExact(t *testing.T) {
 		EnvHandoffDir,
 		EnvServiceDir,
 		EnvServicePort,
+		EnvL1Endpoint,
 		EnvL3Endpoint,
+		EnvAttemptToken,
 		EnvRunToken,
 		EnvComputerToken,
 		EnvComputerViewPort,
@@ -411,11 +413,13 @@ func TestOCIReservedEnvironmentNamesAreExact(t *testing.T) {
 		}
 	}
 	if IsOCIReservedEnvironmentName(EnvRunID) || IsOCIReservedEnvironmentName("WEFTY_CUSTOM") {
-		t.Fatal("OCI reserved-name set differs from the eight ratified names")
+		t.Fatal("OCI reserved-name set differs from the ten ratified names")
 	}
 	if !IsOCISensitiveReservedEnvironmentName(EnvRunToken) || !IsOCISensitiveReservedEnvironmentName(EnvComputerToken) ||
-		IsOCISensitiveReservedEnvironmentName(EnvComputerViewPort) {
-		t.Fatal("OCI sensitive reserved-name subset differs from run and Computer tokens")
+		!IsOCISensitiveReservedEnvironmentName(EnvAttemptToken) ||
+		IsOCISensitiveReservedEnvironmentName(EnvComputerViewPort) ||
+		IsOCISensitiveReservedEnvironmentName(EnvL1Endpoint) {
+		t.Fatal("OCI sensitive reserved-name subset differs from the attempt, run, and Computer credentials")
 	}
 }
 

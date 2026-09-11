@@ -1,18 +1,30 @@
 # Run execution context
 
-This document fixes the v0.1 contract delivered to an L3 workflow process.
-The four variable names below are stable API surface; clients must not invent
-aliases or depend on additional variables.
+This document fixes the v0.1 contract delivered to an L3 workflow process and
+the attempt-credential contract delivered to every one-shot attempt. The
+variable names below are stable API surface; clients must not invent aliases or
+depend on additional variables.
 
 | Variable | Visibility | Value |
 | --- | --- | --- |
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
+| `WEFTY_L1_ENDPOINT` | public | An attempt-local HTTP base URL for the L1 attempt-credential surface. |
 | `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
+| `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
 
-L3 places `WEFTY_RUN_TOKEN` only in `ExecutionSpec.SensitiveEnv`; the other
-three variables are in `ExecutionSpec.Env`. L1 client job responses omit the
+The first four L3 variables are delivered only when L3 dispatched the job.
+`WEFTY_L1_ENDPOINT` and `WEFTY_ATTEMPT_TOKEN` are delivered by the node agent
+to every `class=one-shot` attempt it launches, for both `kind=process` and
+`kind=oci`, whether or not L3 is running. In v1 they are **not** delivered to
+`class=service` attempts or to Computer attempts; L1 still mints the attempt
+credential at every claim, so service and Computer delivery is a follow-up that
+changes no authority rule.
+
+L3 places `WEFTY_RUN_TOKEN` only in `ExecutionSpec.SensitiveEnv`, and the agent
+places `WEFTY_ATTEMPT_TOKEN` only there; the other variables are in
+`ExecutionSpec.Env`. L1 client job responses omit the
 entire sensitive environment, while the authenticated agent claim retains it.
 The node agent also replaces sensitive values with `[REDACTED]` before sending
 captured stdout or stderr to a log sink. Workflows must still avoid printing
@@ -22,9 +34,12 @@ The node agent replaces internal `wefty://` service addresses with per-attempt
 `http://127.0.0.1` bridge URLs before starting the workflow process. The bridge
 is torn down with the attempt and forwards L3 calls through the agent's
 authenticated Fabric connection. Run status, lineage, and log reads use L3's
-run-token-scoped endpoints. The bridge exposes no L1 routes, so the agent's
-Fabric identity cannot become an L1 client passthrough. The bridge is transport
-only: callers must still send the run token, and no Fabric tag privilege is
+run-token-scoped endpoints. The same attempt-local bridge also exposes an `/l1`
+surface restricted to the attempt-credential route allowlist. It is transport
+only: the agent's Fabric identity carries the agent principal tag, which no L1
+client route accepts, so a request without a valid attempt credential is
+refused by L1 regardless of how it reached the bridge. Callers must still send
+the run token or the attempt credential, and no Fabric tag privilege is
 projected into the workflow process.
 
 Linux and process workloads receive the loopback bridge URL. A Mac OCI
@@ -38,9 +53,11 @@ loopback and wildcard guest listeners rather than creating an ambient host
 door. No form exposes the bridge on a host wildcard or embeds a fixed gateway.
 
 For `kind=oci`, the exact reserved-name set is `WEFTY_HANDOFF_DIR`,
-`WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L3_ENDPOINT`,
-`WEFTY_RUN_TOKEN`, `WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and
-`WEFTY_COMPUTER_CONTROL_PORT`. The unprivileged adapter removes those names
+`WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L1_ENDPOINT`,
+`WEFTY_L3_ENDPOINT`, `WEFTY_ATTEMPT_TOKEN`, `WEFTY_RUN_TOKEN`,
+`WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and
+`WEFTY_COMPUTER_CONTROL_PORT`. `WEFTY_ATTEMPT_TOKEN` is sensitive alongside
+`WEFTY_RUN_TOKEN` and `WEFTY_COMPUTER_TOKEN`. The unprivileged adapter removes those names
 from generic operator layers, and the privileged helper independently rejects
 any reserved name that crosses in a generic or caller-supplied reserved layer.
 Only closed typed minting inputs and helper-derived mount/endpoint facts may
@@ -69,6 +86,51 @@ at `/wefty/service`; Computers additionally receive read-only
 `/wefty/control`. An operator mount target must be disjoint from all three
 after normalization: it may not equal a target, contain it, or be contained by
 it.
+
+## Attempt-credential authentication and scope
+
+`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, and `GET /v1/jobs/{job_id}/children`
+accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
+`WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
+attempt and stores only its SHA-256 digest. The credential authorizes exactly
+three things: submitting a child job, reading its own job, and listing and
+reading that job's children. No other route accepts it, so no operator-level
+action is reachable with it; the service collection read `GET /v1/jobs` is
+refused with `principal_forbidden` like every other job route.
+
+Reads follow the ordinary class-selector rule rather than a credential-specific
+one: `class=service` is required when the target is a service job and must be
+absent when it is a one-shot, exactly as for a client principal. A job that is
+neither the credential's own nor one of its children receives `forbidden`, and
+so does a job ID that does not exist, so the route cannot be used to discover
+which jobs are present.
+
+Parent job, parent attempt, and originating submitter are derived from the
+credential and can never be supplied by the caller: they live on the job
+resource, not on `JobSpec`, and `JobSpec` decoding rejects unknown members. The
+request must arrive with the Fabric identity of the node holding the attempt,
+and the attempt must still be the job's live attempt; a superseded, expired, or
+replaced-session attempt is refused. Children are a job-level resource, so a
+retried attempt sees children spawned by earlier attempts. v1 is
+fire-and-forget: there is no cascade on parent completion, cancellation, or
+loss. Spawn depth counts parent links and is capped at 8; a deeper submission
+is refused with HTTP 409 `spawn_depth_exceeded`, `retryable: false`, alongside
+the other non-retryable job-creation conflicts.
+
+A child is submitted with the ordinary `JobSpec` body, so the submitter ceiling
+is exactly what a client principal may express: the Computer trait remains
+refused with `computer_resource_required`, and every other structural rule is
+unchanged. The originating submitter is the client principal that created the
+root job; it is recorded on every descendant and is never widened.
+
+Dispatch-key replay stays idempotent within a parent and never crosses one. A
+credential replaying a key its own job already used receives that child again,
+which is what lets a retried attempt resubmit safely. A credential presenting a
+key belonging to any other parent — or to a root job — is refused with
+`dispatch_key_conflict` whether or not the canonical request matches, so replay
+can neither return a job outside the credential's scope nor reveal which keys
+exist. Client-principal replay is unchanged and still does not consider the
+submitter: the replayed job keeps its original submitter and parent.
 
 ## Run-token authentication and scope
 

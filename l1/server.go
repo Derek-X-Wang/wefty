@@ -257,12 +257,15 @@ const (
 
 type identityContextKey struct{}
 
+type attemptCredentialContextKey struct{}
+
 func (s *Server) routes() http.Handler {
 	client := http.NewServeMux()
 	client.HandleFunc("POST /v1/jobs", s.createJob)
 	client.HandleFunc("GET /v1/jobs", s.listJobs)
 	client.HandleFunc("GET /v1/jobs/{$}", s.listJobs)
 	client.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
+	client.HandleFunc("GET /v1/jobs/{job_id}/children", s.listChildJobs)
 	client.HandleFunc("GET /v1/jobs/{job_id}/logs", s.getJobLogs)
 	client.HandleFunc("PUT /v1/jobs/{job_id}/desired-state", s.setServiceDesiredState)
 	client.HandleFunc("POST /v1/jobs/{job_id}/restart", s.restartService)
@@ -347,10 +350,19 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("GET /v1/computers/{computer_id}/takeover", s.getComputerTakeoverAccess)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/submission", s.mutateComputerSubmission)
 
+	// The attempt credential reaches a separate three-route protocol rather
+	// than the client mux. Scope is structural: a route added to the client
+	// protocol later cannot become reachable with a credential by accident.
+	credential := http.NewServeMux()
+	credential.HandleFunc("POST /v1/jobs", s.createChildJob)
+	credential.HandleFunc("GET /v1/jobs/{job_id}", s.getAttemptScopedJob)
+	credential.HandleFunc("GET /v1/jobs/{job_id}/children", s.listAttemptScopedChildJobs)
+	credential.HandleFunc("/", s.attemptCredentialOutOfScope)
+
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
-	root.Handle("/v1/jobs", s.authorize(clientPrincipal, client))
-	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/jobs", s.authorizeJobProtocol(client, credential))
+	root.Handle("/v1/jobs/", s.authorizeJobProtocol(client, credential))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/custody-exports/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/custody-imports/", s.authorize(clientPrincipal, client))
@@ -560,6 +572,156 @@ func (s *Server) writeNodeIntent(w http.ResponseWriter, r *http.Request, request
 		return
 	}
 	writeJSON(w, http.StatusOK, node)
+}
+
+// authorizeJobProtocol splits the job collection by what the caller presents.
+// A bare request is the ordinary client protocol, unchanged. A request
+// carrying a bearer token is an in-job caller and reaches only the
+// attempt-credential protocol, so neither principal can borrow the other's
+// surface.
+func (s *Server) authorizeJobProtocol(client, credential http.Handler) http.Handler {
+	clientHandler := s.authorize(clientPrincipal, client)
+	credentialHandler := s.authorizeAttemptCredential(credential)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if presentedAttemptCredential(r) == "" {
+			clientHandler.ServeHTTP(w, r)
+			return
+		}
+		credentialHandler.ServeHTTP(w, r)
+	})
+}
+
+func presentedAttemptCredential(r *http.Request) string {
+	const prefix = "bearer "
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(value) <= len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(value[len(prefix):])
+}
+
+// authorizeAttemptCredential resolves an in-job caller. The credential travels
+// out through the holding node's authenticated Fabric connection, so the
+// presenter must be an agent principal and must be the exact node holding the
+// attempt: a leaked bearer cannot be replayed from anywhere else. Fabric
+// identity alone grants nothing here, because an agent tag reaches no client
+// route.
+func (s *Server) authorizeAttemptCredential(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
+		if err != nil {
+			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
+			return
+		}
+		if !slices.Contains(NormalizeTags(identity.Tags), s.agentPrincipalTag) {
+			writeError(w, protocolError(contract.ErrorPrincipalForbidden,
+				"an attempt credential is accepted only from the node holding its attempt"))
+			return
+		}
+		scope, err := s.store.ResolveAttemptCredential(r.Context(), presentedAttemptCredential(r), identity.NodeID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		ctx := context.WithValue(r.Context(), identityContextKey{}, identity)
+		ctx = context.WithValue(ctx, attemptCredentialContextKey{}, scope)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func attemptCredentialFromRequest(r *http.Request) AttemptCredentialScope {
+	scope, _ := r.Context().Value(attemptCredentialContextKey{}).(AttemptCredentialScope)
+	return scope
+}
+
+// attemptCredentialOutOfScope answers every route the credential protocol does
+// not publish. It is the reason no operator verb is reachable in-job.
+func (s *Server) attemptCredentialOutOfScope(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, protocolError(contract.ErrorPrincipalForbidden,
+		"an attempt credential may only submit a child job, read its own job, and list or read its children"))
+}
+
+// createChildJob is POST /v1/jobs presented with an attempt credential. Every
+// parent fact comes from the credential; the body supplies only the spec, and
+// JobSpec has nowhere to carry a parent even if a caller tried.
+func (s *Server) createChildJob(w http.ResponseWriter, r *http.Request) {
+	scope := attemptCredentialFromRequest(r)
+	var spec contract.JobSpec
+	if err := decodeJSON(r, &spec); err != nil {
+		writeError(w, err)
+		return
+	}
+	job, replayed, err := s.store.CreateJobAs(r.Context(), spec, JobOrigin{Parent: &scope})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	job, err = s.store.projectJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, status, redactJob(job))
+}
+
+// getAttemptScopedJob is GET /v1/jobs/{job_id} presented with an attempt
+// credential: the credential's own job, or one of that job's children.
+func (s *Server) getAttemptScopedJob(w http.ResponseWriter, r *http.Request) {
+	scope := attemptCredentialFromRequest(r)
+	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	if err != nil && errorCode(err) != contract.ErrorNotFound {
+		writeError(w, err)
+		return
+	}
+	// Absent and out-of-scope answer identically. A distinct not-found would
+	// turn this route into an existence probe over the whole job collection.
+	if err != nil || (job.JobID != scope.JobID && job.ParentJobID != scope.JobID) {
+		writeError(w, protocolError(contract.ErrorForbidden,
+			"an attempt credential may read only its own job and that job's children"))
+		return
+	}
+	s.writeJobProjection(w, r, job)
+}
+
+// listAttemptScopedChildJobs is GET /v1/jobs/{job_id}/children presented with
+// an attempt credential. Children are job-level, so a retried attempt sees the
+// children spawned by earlier attempts of the same job.
+func (s *Server) listAttemptScopedChildJobs(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("job_id") != attemptCredentialFromRequest(r).JobID {
+		writeError(w, protocolError(contract.ErrorForbidden,
+			"an attempt credential may list only its own job's children"))
+		return
+	}
+	s.listChildJobs(w, r)
+}
+
+func (s *Server) listChildJobs(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	parentJobID := r.PathValue("job_id")
+	// Distinguish "no children" from "no such job": an unknown parent is a
+	// 404, not an empty page.
+	if _, err := s.store.GetJob(r.Context(), parentJobID); err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.ListChildJobs(r.Context(), parentJobID, r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for index := range page.Jobs {
+		page.Jobs[index] = redactJob(page.Jobs[index])
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) authorize(principal principal, next http.Handler) http.Handler {
@@ -825,7 +987,8 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	job, replayed, err := s.store.CreateJob(r.Context(), spec)
+	job, replayed, err := s.store.CreateJobAs(r.Context(), spec,
+		JobOrigin{OriginatingSubmitter: identityFromRequest(r).NodeID})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1343,11 +1506,18 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	s.writeJobProjection(w, r, job)
+}
+
+// writeJobProjection is the single job read projection. The class selector
+// rule is shared deliberately: an in-job caller sees exactly what a client
+// principal would see for the same job, never more.
+func (s *Server) writeJobProjection(w http.ResponseWriter, r *http.Request, job Job) {
 	if err := validateJobRouteClass(r, job); err != nil {
 		writeError(w, err)
 		return
 	}
-	job, err = s.store.projectJob(r.Context(), job)
+	job, err := s.store.projectJob(r.Context(), job)
 	if err != nil {
 		writeError(w, err)
 		return

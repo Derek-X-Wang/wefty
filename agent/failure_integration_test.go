@@ -2426,7 +2426,15 @@ func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminal(t *testing.T) 
 	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
 		Job: l1.Job{JobID: "compound-log-finalization", Spec: contract.JobSpec{
 			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
-			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{"secret": "long-secret-value"}},
+			// compoundFinalizationLogSink blocks in WriteOutput until its
+			// context is cancelled, so this test only stays bounded while the
+			// write reaches the sink through redaction *flush*, under the
+			// finalization deadline. The redactor withholds a payload only
+			// when it could still be the head of a secret, so the secret must
+			// begin with instantWorkloadRuntime's "tail" for that to hold.
+			// A secret sharing no prefix would emit during Run, under the
+			// uncancelled run context, and hang forever.
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{"secret": "tail-of-a-long-secret-value"}},
 		}},
 		Lease: l1.AttemptLease{AttemptID: "compound-log-finalization-attempt"},
 	})
@@ -2462,7 +2470,10 @@ func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminalThroughRecovery
 			Executable:       contract.ExecutableSpec{Path: "/bin/true"},
 			Argv:             []string{"true"},
 			WorkingDirectory: t.TempDir(),
-			SensitiveEnv:     map[string]string{"secret": "long-secret-value"},
+			// Shares instantWorkloadRuntime's "tail" prefix for the same reason
+			// as the non-recovery variant: compoundFinalizationLogSink is safe
+			// only when redaction defers the write to the bounded flush.
+			SensitiveEnv: map[string]string{"secret": "tail-of-a-long-secret-value"},
 		},
 	})
 	if err != nil {

@@ -70,13 +70,21 @@ type Job struct {
 	Status     string            `json:"status,omitempty"`
 	// Spec is absent once removal has finalized because tombstones deliberately
 	// retain no executable or environment bytes.
-	Spec                contract.JobSpec `json:"spec,omitzero"`
-	CurrentAttemptID    string           `json:"current_attempt_id,omitempty"`
-	Attempts            []Attempt        `json:"attempts,omitempty"`
-	UnschedulableReason string           `json:"unschedulable_reason,omitempty"`
-	FailureReason       string           `json:"failure_reason,omitempty"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UpdatedAt           time.Time        `json:"updated_at"`
+	Spec             contract.JobSpec `json:"spec,omitzero"`
+	CurrentAttemptID string           `json:"current_attempt_id,omitempty"`
+	// ParentJobID, ParentAttemptID, OriginatingSubmitter, and SpawnDepth are
+	// set once at creation and never mutated. They are derived from the
+	// presented attempt credential, never from the request body, so a caller
+	// cannot forge a parent. A root job has no parent and spawn depth zero.
+	ParentJobID          string    `json:"parent_job_id,omitempty"`
+	ParentAttemptID      string    `json:"parent_attempt_id,omitempty"`
+	OriginatingSubmitter string    `json:"originating_submitter,omitempty"`
+	SpawnDepth           int       `json:"spawn_depth,omitempty"`
+	Attempts             []Attempt `json:"attempts,omitempty"`
+	UnschedulableReason  string    `json:"unschedulable_reason,omitempty"`
+	FailureReason        string    `json:"failure_reason,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 	*ServiceJob
 	Removal *ServiceRemoval `json:"removal,omitempty"`
 }
@@ -251,8 +259,11 @@ const (
 
 // Claim is returned when an eligible queued job is won.
 type Claim struct {
-	Job              Job                   `json:"job"`
-	Lease            AttemptLease          `json:"lease"`
+	Job   Job          `json:"job"`
+	Lease AttemptLease `json:"lease"`
+	// AttemptToken is the attempt credential's opaque bearer, returned exactly
+	// once to the claiming agent. L1 retains only its SHA-256 digest.
+	AttemptToken     string                `json:"attempt_token"`
 	PrestartDeadline *time.Time            `json:"prestart_deadline,omitempty"`
 	ComputerStorage  *ComputerStorageClaim `json:"computer_storage,omitempty"`
 }

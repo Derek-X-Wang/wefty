@@ -2378,6 +2378,12 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	// Reserved names never cross the helper boundary through generic layers.
 	// The only currently minted execution-context values have closed fields,
 	// and their source layer is part of the protocol contract.
+	if value, ok := request.Execution.Env[contract.EnvL1Endpoint]; ok && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL1Endpoint) {
+		input.L1Endpoint = value
+	}
+	if value, ok := request.Execution.SensitiveEnv[contract.EnvAttemptToken]; ok && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvAttemptToken) {
+		input.AttemptToken = value
+	}
 	if value, ok := request.Execution.Env[contract.EnvL3Endpoint]; ok && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL3Endpoint) {
 		input.L3Endpoint = value
 	}
