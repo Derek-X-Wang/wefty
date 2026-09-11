@@ -48,7 +48,9 @@ _Avoid_: calling any future declarative layer a "workflow"
 
 **Capability revision**:
 A boot-scoped monotonic revision over a node's complete observed capability
-set. Only a higher revision can replace the set within that boot session.
+set. Only a higher revision can replace the set within that boot session, and a
+node starts a new boot session above the highest revision it durably recorded,
+so a restart does not replay a revision an operator has already seen.
 _Avoid_: capability version, feature flag, health generation
 
 **OCI intent**:

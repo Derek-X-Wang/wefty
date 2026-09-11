@@ -1187,6 +1187,11 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	}
 	runtime := newOneShotIntentRuntime()
 	deadman := newRecordingDeadmanRenewer()
+	// The durable marker is enabled until the operator stops OCI. Registration
+	// now reads it as intent authority, so a fixture that reports a permanently
+	// disabled marker would never admit the one-shot this test is about.
+	var intentEnabled atomic.Bool
+	intentEnabled.Store(true)
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-oneshot-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -1200,6 +1205,9 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
 		}),
 		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			if intentEnabled.Load() {
+				return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+			}
 			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
 		},
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
@@ -1223,6 +1231,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		t.Fatal("intent-stop OCI one-shot did not start")
 	}
 	deadman.waitForRenewal(t)
+	intentEnabled.Store(false)
 	if err := nodeAgent.StopOCIRuntime(t.Context()); err != nil {
 		cancelRun()
 		t.Fatal(err)

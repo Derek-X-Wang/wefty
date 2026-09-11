@@ -59,12 +59,12 @@ type Config struct {
 	CapabilityProbe CapabilityProbe
 	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
 	CapabilityProbeTimeout time.Duration
-	// CapabilityRevisionPath is the absolute node-local file that carries the
-	// highest Capability revision this node has published. L1 scopes revision
-	// monotonicity to one boot session, so without this durable floor a
-	// restarted agent republishes a revision an operator already saw. Empty
-	// keeps the per-process counter for configurations with no durable
-	// node-local state.
+	// CapabilityRevisionPath overrides where the highest Capability revision
+	// this node has published is durably recorded. L1 scopes revision
+	// monotonicity to one boot session, so without this floor a restarted agent
+	// republishes a revision an operator already saw. Empty derives a
+	// node-scoped path under ManagedRootDirectory; a configuration with neither
+	// keeps the per-process counter.
 	CapabilityRevisionPath string
 	// OCIIntent reads the durable node-local OCI intent marker. It is required
 	// when this configuration offers an OCI runtime or capability; otherwise a
@@ -312,7 +312,11 @@ func New(config Config) (*Agent, error) {
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
-	revisionFloor, err := loadCapabilityRevisionFloor(config.CapabilityRevisionPath, logf)
+	revisionFloorPath := config.CapabilityRevisionPath
+	if revisionFloorPath == "" {
+		revisionFloorPath = defaultCapabilityRevisionPath(config.ManagedRootDirectory, config.NodeID)
+	}
+	revisionFloor, err := loadCapabilityRevisionFloor(revisionFloorPath, logf)
 	if err != nil {
 		_ = outbox.Close()
 		_ = stableNodeLock.Close()
@@ -327,6 +331,7 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
 	session.ociBootBarrier = config.OCIBootBarrier
+	session.ociIntent = config.OCIIntent
 	session.ociImagePins = ociImagePins
 	if session.ociBootBarrier != nil {
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {

@@ -315,6 +315,15 @@ func (state *capabilityState) record(result CapabilityProbeResult, probeErr erro
 }
 
 func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeErr error, probeCompleted bool) {
+	// Persist outside state.mu. The floor write fsyncs, and the value it
+	// records is already monotonic, so no snapshot reader or admission check
+	// needs to wait behind it.
+	state.revisionFloor.record(state.applyObservationLocked(result, probeErr, probeCompleted))
+}
+
+// applyObservationLocked commits the new observation and returns the revision
+// it advanced to, or zero when nothing changed.
+func (state *capabilityState) applyObservationLocked(result CapabilityProbeResult, probeErr error, probeCompleted bool) int64 {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	capabilities := cloneCapabilities(state.base)
@@ -359,11 +368,12 @@ func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeEr
 	}
 	now := wallNow(state.clock).UTC().Round(0)
 	revision := state.current.Revision
+	advanced := int64(0)
 	if !maps.Equal(state.current.Capabilities, capabilities) ||
 		!slices.Equal(state.current.MissingCapabilities, missingCapabilities) || state.current.ReasonCode != reason {
 		revision++
 		state.pendingPublicationRevision = revision
-		state.revisionFloor.record(revision)
+		advanced = revision
 	}
 	state.current = contract.CapabilityObservation{
 		Revision: revision, Capabilities: capabilities,
@@ -373,6 +383,7 @@ func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeEr
 		receipt := cloneCapabilityObservation(state.current)
 		state.lastProbe = &receipt
 	}
+	return advanced
 }
 
 // adoptRestrictive learns the authoritative N+1 that L1 assigned atomically
@@ -387,9 +398,10 @@ func (state *capabilityState) adoptRestrictive(node l1.Node) error {
 	}
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()
+	// The floor write stays outside state.mu for the same reason as recordLocked.
+	defer state.revisionFloor.record(node.CapabilityRevision)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.revisionFloor.record(node.CapabilityRevision)
 	state.current = contract.CapabilityObservation{
 		Revision:            node.CapabilityRevision,
 		Capabilities:        cloneCapabilities(node.Capabilities),

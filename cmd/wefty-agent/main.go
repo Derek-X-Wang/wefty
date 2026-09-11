@@ -483,13 +483,6 @@ func run() error {
 		return err
 	}
 	capabilities := map[string]bool{"kind:process": true}
-	// The durable capability-revision floor lives beside the durable OCI intent
-	// marker: that directory is the node-local operator state the agent already
-	// owns and writes, and it survives agent restarts and reinstalls.
-	capabilityRevisionPath := ""
-	if *ociIntentFile != "" {
-		capabilityRevisionPath = filepath.Join(filepath.Dir(*ociIntentFile), "wefty-capability-revision.json")
-	}
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
@@ -569,7 +562,6 @@ func run() error {
 		Version:                 version,
 		Capabilities:            capabilities,
 		CapabilityProbe:         capabilityProbe,
-		CapabilityRevisionPath:  capabilityRevisionPath,
 		OCIIntent:               ociIntent,
 		OCIBootBarrier:          agentBootBarrier,
 		WorkloadRuntimes:        runtimes,

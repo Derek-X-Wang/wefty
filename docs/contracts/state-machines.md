@@ -600,13 +600,22 @@ tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness and may atomically replace the current
 boot's full capability observation with a higher Capability revision; it does
 not renew attempt leases. Capability revision is durable, not per process: the
-agent persists the highest revision it has published in a node-local file
-beside the durable OCI intent marker and starts each boot session above it, so
-a node never publishes a revision an operator or a cached observer has already
-seen. L1 still scopes replacement to the current boot session and accepts a new
-boot session's observation outright; the agent-side floor is what makes that
-observation strictly newer rather than a replay. An unreadable or malformed
-floor file fails agent start rather than silently restarting the counter.
+agent records the highest revision it has published in a node-local file under
+its managed root and starts each boot session above it, so a restart does not
+replay a revision an operator or a cached observer has already seen. L1 still
+scopes replacement to the current boot session and accepts a new boot session's
+observation outright; the agent-side floor is what makes that observation
+strictly newer rather than a replay.
+
+That floor is best effort by design, and its read and write paths are
+deliberately asymmetric. A malformed marker fails agent start, because
+unparseable content is a bug an operator must see. An unreadable marker — wrong
+owner or mode after an install, say — is logged and degrades to the per-process
+counter rather than bricking a node that may not even run OCI. Writes never
+fail an observation: an unwritable state directory must not withdraw a
+capability the node genuinely earned, so a persist failure lets the next boot
+session restart the counter. Monotonicity across restarts is therefore a strong
+default, not an invariant a reader may assume.
 
 Durable OCI intent is the node-local control surface's verdict, never a
 runtime observation. Only the writer of the durable marker, or a validated read

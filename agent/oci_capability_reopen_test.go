@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -22,9 +23,12 @@ import (
 // oci_intent_disabled until the next Ensure re-runs the supervisor. Fixtures
 // that report no reason at all hid this defect from the unit lanes.
 type staleSupervisorBarrier struct {
-	mu     sync.Mutex
-	ready  bool
-	reason contract.CapabilityReasonCode
+	mu sync.Mutex
+	// intentEnabled mirrors the durable marker the Lima supervisor reads: a
+	// boot sweep under disabled intent fails instead of starting the instance.
+	intentEnabled *atomic.Bool
+	ready         bool
+	reason        contract.CapabilityReasonCode
 }
 
 func (barrier *staleSupervisorBarrier) Ready() bool {
@@ -36,6 +40,11 @@ func (barrier *staleSupervisorBarrier) Ready() bool {
 func (barrier *staleSupervisorBarrier) Ensure(context.Context) error {
 	barrier.mu.Lock()
 	defer barrier.mu.Unlock()
+	if barrier.intentEnabled != nil && !barrier.intentEnabled.Load() {
+		barrier.ready = false
+		barrier.reason = contract.CapabilityReasonOCIIntentDisabled
+		return errors.New("OCI intent is disabled")
+	}
 	barrier.ready = true
 	barrier.reason = ""
 	return nil
@@ -93,7 +102,7 @@ func TestOCIIntentStopThenStartReopensCapabilityWithoutRestart(t *testing.T) {
 	intentEnabled.Store(true)
 	intentRevision.Store(2)
 	var probeCalls atomic.Int32
-	barrier := &staleSupervisorBarrier{}
+	barrier := &staleSupervisorBarrier{intentEnabled: &intentEnabled}
 	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 		probeCalls.Add(1)
 		if !intentEnabled.Load() {
@@ -242,5 +251,139 @@ func TestCapabilityRevisionNeverRegressesAcrossAgentRestart(t *testing.T) {
 	second.SuppressOCIRuntime(contract.CapabilityReasonHelperUnreachable, errors.New("helper unreachable"))
 	if next := second.CapabilitySnapshot().Revision; next <= restarted {
 		t.Fatalf("restarted process revision = %d, want monotonic above %d", next, restarted)
+	}
+}
+
+// TestColdStartUnderDisabledIntentPublishesIntentReason covers the restart and
+// reboot half of #395: a node whose operator ran `wefty node oci stop` must
+// come back publishing oci_intent_disabled with the latch armed. Nothing else
+// re-arms it — Lima is stopped, so the supervisor never asks for background
+// recovery — and without the latch the ADR-0003 guard in recordProbeResult is
+// inert for the whole process.
+func TestColdStartUnderDisabledIntentPublishesIntentReason(t *testing.T) {
+	network := plain.NewNetwork()
+	_, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-cold-disabled": nil})
+	defer stopServer()
+	var intentEnabled atomic.Bool
+	var intentRevision atomic.Uint64
+	intentRevision.Store(3)
+	barrier := &staleSupervisorBarrier{
+		intentEnabled: &intentEnabled, reason: contract.CapabilityReasonOCIIntentDisabled,
+	}
+	var probeCalls atomic.Int32
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		probeCalls.Add(1)
+		if !intentEnabled.Load() {
+			return CapabilityProbeResult{
+				MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonOCIIntentDisabled,
+			}, errors.New("OCI intent is disabled")
+		}
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	agentFabric := network.NewFabric(fabric.Identity{
+		NodeID: "fabric-node-cold-disabled", Tags: []string{l1.DefaultAgentPrincipalTag},
+	})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-cold-disabled",
+		BootSessionID: "boot-cold-disabled", Version: "test", OS: "linux", Architecture: "amd64",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: probe,
+		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: intentEnabled.Load(), Revision: intentRevision.Load()}, nil
+		},
+		OCIBootBarrier: barrier, HeartbeatInterval: time.Hour, ClaimInterval: time.Hour,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	node, err := nodeAgent.Register(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.CapabilityReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("published registration reason = %q, want oci_intent_disabled", node.CapabilityReasonCode)
+	}
+	cold := nodeAgent.CapabilitySnapshot()
+	if cold.Capabilities["kind:oci"] || cold.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("cold start observation = %+v, want restrictive oci_intent_disabled", cold)
+	}
+	if !nodeAgent.capabilities.ociIntentDisabled.Load() {
+		t.Fatal("cold start under a durable disabled marker left the intent latch unarmed")
+	}
+	if err := nodeAgent.capabilities.refresh(t.Context()); !capabilityProbeWasSkipped(err) {
+		t.Fatalf("routine refresh error = %v, want a typed disabled-intent skip", err)
+	}
+
+	// The operator starts OCI again; the same process must reopen.
+	intentEnabled.Store(true)
+	intentRevision.Store(4)
+	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+		t.Fatalf("operator start recovery after cold start: %v", err)
+	}
+	reopened := nodeAgent.CapabilitySnapshot()
+	if !reopened.Capabilities["kind:oci"] || reopened.ReasonCode != "" {
+		t.Fatalf("reopened observation = %+v, want open OCI capability", reopened)
+	}
+	if reopened.Revision <= cold.Revision {
+		t.Fatalf("reopened revision = %d, want greater than %d", reopened.Revision, cold.Revision)
+	}
+}
+
+// TestCapabilityRevisionFloorFailsOnlyOnMalformedContent pins the asymmetry: a
+// marker the agent cannot parse is a bug the operator must see, while one it
+// cannot read is an environment problem that must not brick an unrelated node.
+func TestCapabilityRevisionFloorFailsOnlyOnMalformedContent(t *testing.T) {
+	directory := t.TempDir()
+	malformed := filepath.Join(directory, "malformed.json")
+	if err := os.WriteFile(malformed, []byte(`{"version":1,"capability_revision":0}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCapabilityRevisionFloor(malformed, nil); err == nil {
+		t.Fatal("malformed capability revision floor loaded without an error")
+	}
+
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the unreadable-file branch")
+	}
+	unreadable := filepath.Join(directory, "unreadable.json")
+	if err := os.WriteFile(unreadable, []byte(`{"version":1,"capability_revision":9}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	var logged int
+	floor, err := loadCapabilityRevisionFloor(unreadable, func(string, ...any) { logged++ })
+	if err != nil {
+		t.Fatalf("unreadable capability revision floor failed agent start: %v", err)
+	}
+	if floor != nil {
+		t.Fatal("unreadable capability revision floor was not degraded to per-process mode")
+	}
+	if logged == 0 {
+		t.Fatal("unreadable capability revision floor degraded silently")
+	}
+	if start := floor.start(); start != 1 {
+		t.Fatalf("degraded floor start = %d, want 1", start)
+	}
+}
+
+// TestCapabilityRevisionFloorDefaultsUnderManagedRoot pins that every node with
+// a managed root gets the durable floor, not only OCI-configured ones.
+func TestCapabilityRevisionFloorDefaultsUnderManagedRoot(t *testing.T) {
+	path := defaultCapabilityRevisionPath("/var/lib/wefty", "node-a")
+	if path == "" || filepath.Dir(path) != filepath.Join("/var/lib/wefty", "capability") {
+		t.Fatalf("default capability revision path = %q, want a node-scoped file under the managed root", path)
+	}
+	if same := defaultCapabilityRevisionPath("/var/lib/wefty", "node-b"); same == path {
+		t.Fatal("default capability revision path is not node-scoped")
+	}
+	if empty := defaultCapabilityRevisionPath("", "node-a"); empty != "" {
+		t.Fatalf("default capability revision path without a managed root = %q, want empty", empty)
 	}
 }
