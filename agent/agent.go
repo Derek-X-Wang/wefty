@@ -59,6 +59,13 @@ type Config struct {
 	CapabilityProbe CapabilityProbe
 	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
 	CapabilityProbeTimeout time.Duration
+	// CapabilityRevisionPath overrides where the highest Capability revision
+	// this node has published is durably recorded. L1 scopes revision
+	// monotonicity to one boot session, so without this floor a restarted agent
+	// republishes a revision an operator already saw. Empty derives a
+	// node-scoped path under ManagedRootDirectory; a configuration with neither
+	// keeps the per-process counter.
+	CapabilityRevisionPath string
 	// OCIIntent reads the durable node-local OCI intent marker. It is required
 	// when this configuration offers an OCI runtime or capability; otherwise a
 	// nil reader means the completion fence is not applicable.
@@ -305,7 +312,18 @@ func New(config Config) (*Agent, error) {
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
-	capabilities := newCapabilityState(config.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout)
+	revisionFloorPath := config.CapabilityRevisionPath
+	if revisionFloorPath == "" {
+		revisionFloorPath = defaultCapabilityRevisionPath(config.ManagedRootDirectory, config.NodeID)
+	}
+	revisionFloor, err := loadCapabilityRevisionFloor(revisionFloorPath, logf)
+	if err != nil {
+		_ = outbox.Close()
+		_ = stableNodeLock.Close()
+		client.Close()
+		return nil, err
+	}
+	capabilities := newCapabilityState(config.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout, revisionFloor)
 	registration = applyCapabilityObservation(registration, capabilities.snapshot())
 	session := newAgentSession(
 		client, registration, capabilities, heartbeatInterval, claimInterval, clock, observer, logf,
@@ -313,6 +331,7 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
 	session.ociBootBarrier = config.OCIBootBarrier
+	session.ociIntent = config.OCIIntent
 	session.ociImagePins = ociImagePins
 	if session.ociBootBarrier != nil {
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
@@ -645,7 +664,7 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 			return fmt.Errorf("agent: validate durable OCI intent before recovery: %w", observeErr)
 		}
 		if !observation.Enabled {
-			a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+			a.capabilities.suppressOCIIntent(errOCIIntentDisabled)
 			return nil
 		}
 		return a.session.allowOCIIntentIfUnchanged(suppressionSequence, observation.Revision)
@@ -682,7 +701,7 @@ func (a *Agent) FenceOCIIntentStop(ctx context.Context, revision uint64) (func()
 	// The durable disabled marker is already authoritative at this boundary.
 	// Close local admission before waiting for an enabled completion reader so
 	// lease expiry cannot admit a replacement OCI attempt during the drain.
-	a.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+	a.capabilities.suppressOCIIntent(errOCIIntentDisabled)
 	return a.ociIntentGate.beginStop(ctx, revision)
 }
 

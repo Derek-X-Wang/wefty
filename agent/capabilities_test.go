@@ -45,7 +45,7 @@ func TestConcurrentCapabilityRefreshWaitsForProbeOwnership(t *testing.T) {
 		}
 		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 	})
-	state := newCapabilityState(map[string]bool{"kind:process": true}, probe, systemClock{}, time.Second)
+	state := newCapabilityState(map[string]bool{"kind:process": true}, probe, systemClock{}, time.Second, nil)
 	firstResult := make(chan error, 1)
 	go func() { firstResult <- state.refresh(t.Context()) }()
 	<-firstStarted
@@ -78,7 +78,7 @@ func TestCapabilityRevisionChangesOnlyOnPublishableTransition(t *testing.T) {
 			ReasonCode:          contract.CapabilityReasonProbeFailed,
 		}, nil
 	})
-	state := newCapabilityState(map[string]bool{" PROCESS ": true, "KIND:OCI": true}, probe, clock, 0)
+	state := newCapabilityState(map[string]bool{" PROCESS ": true, "KIND:OCI": true}, probe, clock, 0, nil)
 	if initial := state.snapshot(); initial.Revision != 1 || !initial.Capabilities["kind:process"] || initial.Capabilities["kind:oci"] {
 		t.Fatalf("normalized unprobed snapshot = %#v", initial)
 	}
@@ -102,7 +102,7 @@ func TestComputerCapabilityIsProbeOwnedAndRevisioned(t *testing.T) {
 	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "computer": true}}, nil
 	})
-	state := newCapabilityState(map[string]bool{"kind:process": true, "computer": true}, probe, clock, 0)
+	state := newCapabilityState(map[string]bool{"kind:process": true, "computer": true}, probe, clock, 0, nil)
 	if initial := state.snapshot(); initial.Capabilities["computer"] || initial.Revision != 1 {
 		t.Fatalf("unprobed Computer capability = %+v", initial)
 	}
@@ -131,7 +131,7 @@ func TestComputerCapabilityIsProbeOwnedAndRevisioned(t *testing.T) {
 
 func TestRestrictiveObservationDoesNotFabricateProbeReceipt(t *testing.T) {
 	clock := newManualClock(time.Date(2026, 8, 28, 10, 30, 0, 0, time.UTC))
-	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, clock, 0)
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, clock, 0, nil)
 	state.suppressOCI(contract.CapabilityReasonHelperUnreachable, errors.New("helper unavailable"))
 	snapshot := state.capabilitySnapshot()
 	if snapshot.LastProbe != nil {
@@ -148,8 +148,8 @@ func TestDisabledOCIIntentRequiresExplicitRecoveryBeforeProbe(t *testing.T) {
 		calls.Add(1)
 		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 	})
-	state := newCapabilityState(map[string]bool{"kind:oci": true}, probe, systemClock{}, 0)
-	state.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+	state := newCapabilityState(map[string]bool{"kind:oci": true}, probe, systemClock{}, 0, nil)
+	state.suppressOCIIntent(errOCIIntentDisabled)
 
 	refreshErr := state.refresh(t.Context())
 	var skipped *CapabilityProbeSkippedError
@@ -208,7 +208,7 @@ func TestWatchdogRecoveryCannotReopenDisabledOCIIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	initialProbeCalls := probeCalls.Load()
-	nodeAgent.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+	nodeAgent.capabilities.suppressOCIIntent(errOCIIntentDisabled)
 
 	recoveryErr := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context())
 	var skipped *CapabilityProbeSkippedError
@@ -232,7 +232,7 @@ func TestWatchdogRecoveryCannotReopenDisabledOCIIntent(t *testing.T) {
 }
 
 func TestLegacyConfiguredProcessCapabilityAllowsProcess(t *testing.T) {
-	state := newCapabilityState(map[string]bool{" Process ": true}, nil, systemClock{}, 0)
+	state := newCapabilityState(map[string]bool{" Process ": true}, nil, systemClock{}, 0, nil)
 	processSpec := contract.JobSpec{Kind: contract.JobKindProcess}
 	if !state.allows(processSpec) || state.snapshot().Capabilities["process"] {
 		t.Fatalf("legacy configured process snapshot = %#v", state.snapshot())
@@ -259,7 +259,7 @@ func assertFailedCapabilityProbeSuppressesLocalOCIStartImmediately(t *testing.T)
 		results = results[1:]
 		return result.result, result.err
 	})
-	state := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, probe, clock, 0)
+	state := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, probe, clock, 0, nil)
 	ociSpec := contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example/probe"}}}}
 	if state.allows(ociSpec) {
 		t.Fatal("unprobed static OCI capability allowed a local start")
@@ -299,7 +299,7 @@ func assertFailedCapabilityProbeSuppressesLocalOCIStartImmediately(t *testing.T)
 }
 
 func TestLocalCapabilityAdmissionPreventsRunnerStart(t *testing.T) {
-	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0)
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0, nil)
 	runner := &countingProcessRunner{}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 		runtimes: testRuntimeSet(runner), clock: systemClock{}, allowsStart: state.allows,

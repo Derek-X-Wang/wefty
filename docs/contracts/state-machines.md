@@ -599,7 +599,32 @@ become `alive` only through registration of the current boot session. Routing
 tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness and may atomically replace the current
 boot's full capability observation with a higher Capability revision; it does
-not renew attempt leases.
+not renew attempt leases. Capability revision is durable, not per process: the
+agent records the highest revision it has published in a node-local file under
+its managed root and starts each boot session above it, so a restart does not
+replay a revision an operator or a cached observer has already seen. L1 still
+scopes replacement to the current boot session and accepts a new boot session's
+observation outright; the agent-side floor is what makes that observation
+strictly newer rather than a replay.
+
+That floor is best effort by design, and its read and write paths are
+deliberately asymmetric. A malformed marker fails agent start, because
+unparseable content is a bug an operator must see. An unreadable marker — wrong
+owner or mode after an install, say — is logged and degrades to the per-process
+counter rather than bricking a node that may not even run OCI. Writes never
+fail an observation: an unwritable state directory must not withdraw a
+capability the node genuinely earned, so a persist failure lets the next boot
+session restart the counter. Monotonicity across restarts is therefore a strong
+default, not an invariant a reader may assume.
+
+Durable OCI intent is the node-local control surface's verdict, never a
+runtime observation. Only the writer of the durable marker, or a validated read
+of it, may close capability with `oci_intent_disabled`; a transitional
+restrictive observation taken during recovery reports the barrier's own health
+instead, because a supervisor that has not re-run since a stop still carries the
+stale disabled fact. Re-enabling intent while the runtime is healthy therefore
+reopens OCI capability in the running agent, at a strictly higher Capability
+revision, with no restart.
 Operator claim intent is not a node state: it is durable across registration,
 may be changed while the node is dead, and does not revoke authority already
 bound into a live attempt. The boot-session-scoped agent drain used for

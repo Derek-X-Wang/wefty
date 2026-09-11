@@ -53,8 +53,11 @@ type agentSession struct {
 	logf              func(string, ...any)
 	capabilities      *capabilityState
 	ociBootBarrier    OCIBootBarrier
-	ociImagePins      workloadrunner.OCIImagePinRuntime
-	ociRecoveryMu     sync.Mutex
+	// ociIntent reads the durable node-local OCI intent marker. It is the only
+	// authority allowed to close capability with oci_intent_disabled.
+	ociIntent     func(context.Context) (OCIIntentObservation, error)
+	ociImagePins  workloadrunner.OCIImagePinRuntime
+	ociRecoveryMu sync.Mutex
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -182,6 +185,26 @@ func (session *agentSession) close() {
 	}
 }
 
+// suppressOCIBeforeBootSweep publishes the restrictive observation that must
+// precede a boot sweep. A durable disabled marker is intent authority, not a
+// runtime fact, and reading it here is what arms the process latch on a cold
+// start that follows `wefty node oci stop`: the barrier may no longer speak for
+// intent, and a Lima instance left stopped never asks for background recovery.
+// An inconclusive read falls back to the barrier's own health, which withdraws
+// kind:oci without claiming an intent verdict it could not prove.
+func (session *agentSession) suppressOCIBeforeBootSweep(ctx context.Context) {
+	if session.ociIntent != nil {
+		if observation, err := session.ociIntent(ctx); err == nil && !observation.Enabled {
+			session.capabilities.suppressOCIIntent(errOCIIntentDisabled)
+			return
+		}
+	}
+	session.capabilities.suppressOCI(
+		ociBootBarrierReason(session.ociBootBarrier),
+		errors.New("OCI helper session requires a boot sweep"),
+	)
+}
+
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	if session.computerPolicy != nil {
 		session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
@@ -195,10 +218,7 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 
 	// Establish node authority first, but only with a restrictive observation.
 	// The returned L1 projection is the atomic same-boot revision oracle.
-	session.capabilities.suppressOCI(
-		ociBootBarrierReason(session.ociBootBarrier),
-		errors.New("OCI helper session requires a boot sweep"),
-	)
+	session.suppressOCIBeforeBootSweep(ctx)
 	node, err := session.publishRegistration(ctx)
 	if err != nil {
 		return l1.Node{}, err
@@ -218,7 +238,9 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	}
 
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
-	if barrierErr != nil {
+	if barrierErr != nil && !session.capabilities.ociIntentDisabled.Load() {
+		// A boot sweep that fails only because intent is durably disabled must
+		// keep the intent reason it already published, exactly as recovery does.
 		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
 	}
 	// ADR-0002 removal recovery is independent of OCI readiness and always runs
@@ -1003,7 +1025,7 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 	if session == nil || session.capabilities == nil {
 		return errors.New("agent: OCI runtime control is unavailable")
 	}
-	session.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+	session.capabilities.suppressOCIIntent(errOCIIntentDisabled)
 	// The command must not wait on L1 reachability. Publish immediately when
 	// possible, while the durable marker and local admission remain restrictive
 	// even if this best-effort heartbeat fails.
