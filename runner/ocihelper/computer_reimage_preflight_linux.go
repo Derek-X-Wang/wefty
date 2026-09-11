@@ -258,7 +258,7 @@ func (engine *ContainerdEngine) inspectComputerReimageImage(ctx context.Context,
 		return computerReimageImageFacts{}, reimagePreflightStageError("image_identity", err)
 	}
 	if evidence.TopLevelDigest != request.TargetImage.Digest ||
-		evidence.Platform != request.TargetImage.Platform {
+		!SamePlatform(evidence.Platform, request.TargetImage.Platform) {
 		return computerReimageImageFacts{}, reimagePreflightStageError("image_identity",
 			errors.New("Computer reimage image preflight did not verify exact platform identity"))
 	}

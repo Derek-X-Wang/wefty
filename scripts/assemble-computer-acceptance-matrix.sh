@@ -26,11 +26,15 @@ runner_environment=$6
 # Mac half absent and every Mac row is owned by the owner-hardware ticket.
 mac_absent_issue=128
 mac_absent_reason='no attended owner-hardware session ran; GitHub-hosted macOS cannot boot nested Lima vz'
-# The Lima vz bridge-bind defect. Until it is fixed no Computer payload starts on
-# a Mac at all, so the rows that need a booted Computer would stay unproven even
-# with owner hardware in hand. Named in the gap, never used to launder the skip.
-mac_gateway_issue=394
-mac_gateway_reason='blocked by #394: the Lima vz gateway guard rejects host.lima.internal, so no Computer payload starts on a Mac'
+# The dominant product blocker for a booted Computer on a Mac. It was #394, the
+# Lima vz bridge-bind defect, until that was fixed; the attempts now die one step
+# later on #408, where agent and helper disagree on the arm64 platform variant
+# and every OCI payload fails image_platform_unsupported with no container
+# created. Until it is fixed the rows that need a booted Computer stay unproven
+# even with owner hardware in hand. Named in the gap, never used to launder the
+# skip.
+mac_blocker_issue=408
+mac_blocker_reason='blocked by #408: agent and helper disagree on the arm64 image platform, so no Computer payload starts on a Mac'
 mac_setup_reason='the owner-hardware setup in docs/acceptance/m3.5-mac-computer.md has not been performed for this candidate'
 
 case "$candidate_sha" in
@@ -73,20 +77,21 @@ linux.removal|Removal|10.2 Removal
 SPECIFICATION
 }
 
-# id|proof|spec_refs|blocked_by. A blocked_by of 394 marks a row that cannot be
-# proven on a Mac until the bridge-bind defect is fixed; an empty blocked_by
-# marks a row whose only obstacle is that the owner-hardware setup has not run.
+# id|proof|spec_refs|blocked_by. A blocked_by of 408 marks a row that cannot be
+# proven on a Mac until the arm64 image-platform defect is fixed; an empty
+# blocked_by marks a row whose only obstacle is that the owner-hardware setup has
+# not run.
 mac_row_specification() {
   cat <<'SPECIFICATION'
 mac.create_boot|Create and boot through the M3 helper tunnel in one shared Lima VM|10.2 Create and boot|
-mac.network_egress|Private network outbound, and neither the macOS LAN nor the host outside the sanctioned bridge|10.2 Create and boot|394
-mac.screen_crossover_refused|Screen crossover between two Computers in the one VM refused|10.2 Remote take-over|394
-mac.remote_takeover|A second physical tailnet device watches and controls; viewer input and unauthorized peer denied server-side|10.2 Remote take-over|394
-mac.restart_survival|Runtime, agent and VM stop/start preserve the disk; screen withdraws on loss and returns only after sweep and policy readiness|10.2 Restart survival|394
-mac.reconfiguration|Reimage, reset, grow, detachment and abort, plus loop/ext4/Lima guest residue and cap ceiling facts|10.2 Reconfiguration|394
-mac.storage_provenance|Source-node copy contract with guest-native backup files and managed-root facts|10.2 Storage provenance|394
-mac.guest_authority|Gateway-primary and forced DialHostBridge fallback, never LAN|10.2 Guest authority|394
-mac.removal|Disk, profile, container, task, loop, mount, log, control and publication residue absent; attended inventory retained|10.2 Removal|394
+mac.network_egress|Private network outbound, and neither the macOS LAN nor the host outside the sanctioned bridge|10.2 Create and boot|408
+mac.screen_crossover_refused|Screen crossover between two Computers in the one VM refused|10.2 Remote take-over|408
+mac.remote_takeover|A second physical tailnet device watches and controls; viewer input and unauthorized peer denied server-side|10.2 Remote take-over|408
+mac.restart_survival|Runtime, agent and VM stop/start preserve the disk; screen withdraws on loss and returns only after sweep and policy readiness|10.2 Restart survival|408
+mac.reconfiguration|Reimage, reset, grow, detachment and abort, plus loop/ext4/Lima guest residue and cap ceiling facts|10.2 Reconfiguration|408
+mac.storage_provenance|Source-node copy contract with guest-native backup files and managed-root facts|10.2 Storage provenance|408
+mac.guest_authority|Gateway-primary and forced DialHostBridge fallback, never LAN|10.2 Guest authority|408
+mac.removal|Disk, profile, container, task, loop, mount, log, control and publication residue absent; attended inventory retained|10.2 Removal|408
 mac.reference_image_narrowness|Computer reimage and the optional reference image remain narrow exceptions|11 item 4|
 SPECIFICATION
 }
@@ -106,8 +111,8 @@ if [ "$mac_fragment" = none ]; then
   mac_row_specification | while IFS='|' read -r id proof spec_refs blocked_by; do
     [ -n "$id" ] || continue
     if [ -n "$blocked_by" ]; then
-      row_reason="$mac_absent_reason; $mac_gateway_reason"
-      row_gaps=$(jq -n --arg attended "$mac_absent_reason" --arg defect "$mac_gateway_reason" \
+      row_reason="$mac_absent_reason; $mac_blocker_reason"
+      row_gaps=$(jq -n --arg attended "$mac_absent_reason" --arg defect "$mac_blocker_reason" \
         '{attended_session:$attended, product_defect:$defect}')
     else
       row_reason="$mac_absent_reason; $mac_setup_reason"
@@ -121,10 +126,10 @@ if [ "$mac_fragment" = none ]; then
         not_run_issue:$issue, reason:$reason, source:"attended-absent"}' >> "$rows"
   done
   mac_evidence=$(jq -n --argjson issue "$mac_absent_issue" --arg reason "$mac_absent_reason" \
-    --argjson gateway "$mac_gateway_issue" \
+    --argjson blocker "$mac_blocker_issue" \
     '{source:"absent", session_id:"", commit:"", artifact_sha256:"",
       attended_row_counts:{}, destination_asserted:false, plain_fabric_deviation:false,
-      not_run_issue:$issue, gateway_issue:$gateway, reason:$reason}')
+      not_run_issue:$issue, blocker_issue:$blocker, reason:$reason}')
 else
   test -f "$mac_fragment"
   jq -e '.rows | type == "object"' "$mac_fragment" > /dev/null
@@ -138,13 +143,13 @@ else
           not_run_issue:(.not_run_issue // 0), reason:(.reason // ""),
           source:"attended-owner-hardware"}' "$mac_fragment" >> "$rows"
   done
-  mac_evidence=$(jq --argjson gateway "$mac_gateway_issue" \
+  mac_evidence=$(jq --argjson blocker "$mac_blocker_issue" \
     '{source:"attended-owner-hardware", session_id:(.session_id // ""),
       commit:(.commit // ""), artifact_sha256:(.artifact_sha256 // ""),
       attended_row_counts:(.attended_row_counts // {}),
       destination_asserted:(.destination.asserted // false),
       plain_fabric_deviation:([(.deviations // [])[] | select(.id == "dev.plain_fabric_identity")] | length > 0),
-      not_run_issue:0, gateway_issue:$gateway, reason:""}' "$mac_fragment")
+      not_run_issue:0, blocker_issue:$blocker, reason:""}' "$mac_fragment")
 fi
 
 jq -s --arg candidate "$candidate_sha" --arg source "$evidence_source" \

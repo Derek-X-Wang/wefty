@@ -21,6 +21,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	_ "modernc.org/sqlite"
 )
 
@@ -488,13 +489,24 @@ platform_architecture, platform_variant, snapshotter FROM oci_binding_pins WHERE
 	if err != nil {
 		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: inspect OCI binding pin insert: %w", err)
 	}
-	if stored != pin {
+	if normalizedBindingPin(stored) != normalizedBindingPin(pin) {
 		return stored, false, fmt.Errorf("agent: OCI binding pin for job %q conflicts with its first binding", pin.JobID)
 	}
 	if err := tx.Commit(); err != nil {
 		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: commit OCI binding pin insert: %w", err)
 	}
 	return stored, createdRows == 1, nil
+}
+
+// normalizedBindingPin reads a binding-pin row's platform in containerd's normal
+// form before the row is compared. A row persisted before that normalization
+// landed spells arm64 as "v8" (#408); it names the hardware the node is actually
+// running, so treating it as a conflicting first binding would strand the
+// service on a row nothing can ever satisfy.
+func normalizedBindingPin(pin workloadrunner.OCIImageBindingPin) workloadrunner.OCIImageBindingPin {
+	pin.PlatformOS, pin.PlatformArchitecture, pin.PlatformVariant = ocihelper.NormalizePlatformTriple(
+		pin.PlatformOS, pin.PlatformArchitecture, pin.PlatformVariant)
+	return pin
 }
 
 func (spool *logSpool) DeleteOCIImageBindingPin(ctx context.Context, jobID string) error {

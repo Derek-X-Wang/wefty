@@ -1241,6 +1241,41 @@ func TestSelectedManifestRejectsWrongArchitectureAndMislabeledIndexes(t *testing
 	}
 }
 
+// The platform the helper hands back as image evidence is whatever
+// images.ConfigPlatform produced, which is containerd's normal form. An arm64
+// image index published with the "v8" variant still selects, and the evidence
+// still comes back without the variant — so the agent must compare in that same
+// normal form or it can never match real arm64 hardware (#408).
+func TestSelectedManifestEvidenceIsContainerdNormalForm(t *testing.T) {
+	store, err := contentlocal.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	hardware := ocispec.Platform{OS: "linux", Architecture: "arm64"}
+	published := ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}
+	manifest := testContentManifest(t, ctx, store, published)
+	index := testContentIndex(t, ctx, store, descriptorWithPlatform(manifest, published))
+	for _, test := range []struct {
+		name      string
+		requested ocispec.Platform
+	}{
+		{name: "requested as arm64", requested: hardware},
+		{name: "requested as arm64 v8", requested: published},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			matcher := platforms.OnlyStrict(platforms.Normalize(test.requested))
+			descriptor, platform, err := selectedManifest(ctx, store, index, matcher)
+			if err != nil || descriptor.Digest != manifest.Digest {
+				t.Fatalf("arm64 manifest selection = (%+v, %v)", descriptor, err)
+			}
+			if platform.Architecture != "arm64" || platform.Variant != "" {
+				t.Fatalf("evidence platform = %+v, want containerd's normal form for arm64", platform)
+			}
+		})
+	}
+}
+
 func TestSweepSkipsSpoolOwnedByLiveImageOperation(t *testing.T) {
 	root := t.TempDir()
 	imports := filepath.Join(root, "imports")

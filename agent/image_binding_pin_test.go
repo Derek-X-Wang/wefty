@@ -57,3 +57,33 @@ func TestOCIBindingPinLedgerPreservesFirstBindingIdentity(t *testing.T) {
 		t.Fatalf("changed binding = (%+v, %t, %v)", stored, created, err)
 	}
 }
+
+// A binding pin persisted before the platform normalization landed spells arm64
+// as "v8" (#408). The agent now probes that same hardware as plain "linux/arm64",
+// and the row it writes must be recognised as the same first binding — a
+// conflict here would refuse the service forever on a row that names the very
+// hardware it is running on. A genuinely different platform is still a conflict.
+func TestOCIBindingPinLedgerMatchesALegacyArm64VariantRow(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "cache-pin-arm64", 1024)
+	defer spool.Close()
+	legacy := workloadrunner.OCIImageBindingPin{
+		JobID: "service-1", Reference: "example.test/service:stable",
+		Digest:     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		PlatformOS: "linux", PlatformArchitecture: "arm64", PlatformVariant: "v8", Snapshotter: "overlayfs",
+	}
+	if stored, created, err := spool.PutOCIImageBindingPin(t.Context(), legacy); err != nil || !created || stored != legacy {
+		t.Fatalf("legacy binding = (%+v, %t, %v)", stored, created, err)
+	}
+	probed := legacy
+	probed.PlatformVariant = ""
+	stored, created, err := spool.PutOCIImageBindingPin(t.Context(), probed)
+	if err != nil || created || stored != legacy {
+		t.Fatalf("normal-form rebinding = (%+v, %t, %v), want the legacy row matched", stored, created, err)
+	}
+	other := probed
+	other.PlatformVariant = "v9"
+	if _, _, err := spool.PutOCIImageBindingPin(t.Context(), other); err == nil ||
+		!strings.Contains(err.Error(), "conflicts with its first binding") {
+		t.Fatalf("arm64 v9 rebinding = %v, want a conflict", err)
+	}
+}

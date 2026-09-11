@@ -578,7 +578,7 @@ func (engine *ContainerdEngine) EnsureImage(ctx context.Context, request EnsureI
 	requestedPlatform := ocispec.Platform{OS: request.Platform.OS, Architecture: request.Platform.Architecture, Variant: request.Platform.Variant}
 	requestedPlatform = platforms.Normalize(requestedPlatform)
 	platformMatcher := platforms.OnlyStrict(requestedPlatform)
-	platformKey := platforms.Format(requestedPlatform)
+	platformKey := PlatformString(request.Platform)
 	if source == "" {
 		source = ImageSourceRegistry
 	}

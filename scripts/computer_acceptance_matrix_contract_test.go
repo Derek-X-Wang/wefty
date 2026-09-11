@@ -27,16 +27,18 @@ const computerMatrixCandidate = "0123456789abcdef0123456789abcdef01234567"
 const (
 	// No attended owner-hardware session ran; hosted macOS cannot boot nested vz.
 	computerMatrixAbsentIssue = 128
-	// The Lima vz bridge-bind defect that stops any Computer payload on a Mac.
-	computerMatrixGatewayIssue = 394
+	// The dominant product blocker that stops any Computer payload on a Mac. It
+	// was #394, the Lima vz bridge-bind defect, until that was fixed; the
+	// attempts now die on #408, the arm64 image-platform disagreement.
+	computerMatrixBlockerIssue = 408
 	// The Linux lane's own standing skip: the complete M3 OCI matrix root result.
 	computerMatrixLinuxSkipIssue = 157
 )
 
-// computerMatrixGatewayBlockedRows need a booted Computer, so #394 is named as
-// their blocking cause even when the reason they were not run is the absent
-// attended session. The other two rows can record partial evidence today.
-var computerMatrixGatewayBlockedRows = []string{
+// computerMatrixBlockedRows need a booted Computer, so the current blocker is
+// named as their blocking cause even when the reason they were not run is the
+// absent attended session. The other two rows can record partial evidence today.
+var computerMatrixBlockedRows = []string{
 	"mac.network_egress", "mac.screen_crossover_refused", "mac.remote_takeover",
 	"mac.restart_survival", "mac.reconfiguration", "mac.storage_provenance",
 	"mac.guest_authority", "mac.removal",
@@ -94,16 +96,16 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 						t.Fatalf("row %s does not name the absent attended session", id)
 					}
 					defect, blocked := gaps["product_defect"]
-					wantBlocked := containsComputerRow(computerMatrixGatewayBlockedRows, id)
+					wantBlocked := containsComputerRow(computerMatrixBlockedRows, id)
 					if blocked != wantBlocked {
 						t.Fatalf("row %s product_defect present=%t, want %t", id, blocked, wantBlocked)
 					}
-					if wantBlocked && !strings.Contains(defect.(string), "#394") {
-						t.Fatalf("row %s names %q, want the #394 blocker", id, defect)
+					if wantBlocked && !strings.Contains(defect.(string), "#408") {
+						t.Fatalf("row %s names %q, want the #408 blocker", id, defect)
 					}
 					if !wantBlocked {
 						if _, ok := gaps["owner_hardware_setup"]; !ok {
-							t.Fatalf("row %s is not blocked by #394 and does not name the missing setup", id)
+							t.Fatalf("row %s is not blocked by #408 and does not name the missing setup", id)
 						}
 					}
 				}
@@ -142,7 +144,7 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 				}
 			})
 
-			// The shipping case today: the owner ran the lane, #394 blocked every
+			// The shipping case today: the owner ran the lane, #408 blocked every
 			// row, and the fragment says so honestly. It must pass the gate and it
 			// must not read as a finished matrix.
 			t.Run("an honest blocked attended session passes without completing", func(t *testing.T) {
@@ -157,8 +159,8 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 						continue
 					}
 					row := rows[id].(map[string]any)
-					if row["status"] != "NOT-RUN" || int(row["not_run_issue"].(float64)) != computerMatrixGatewayIssue {
-						t.Fatalf("row %s = %v/#%v, want the attended lane's own #394 skip", id, row["status"], row["not_run_issue"])
+					if row["status"] != "NOT-RUN" || int(row["not_run_issue"].(float64)) != computerMatrixBlockerIssue {
+						t.Fatalf("row %s = %v/#%v, want the attended lane's own #408 skip", id, row["status"], row["not_run_issue"])
 					}
 					if row["source"] != "attended-owner-hardware" {
 						t.Fatalf("row %s is sourced from %v, not the attended artifact", id, row["source"])
@@ -265,7 +267,7 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 				},
 				"skip without a reason": func(matrix map[string]any) {
 					row := matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)
-					row["status"], row["not_run_issue"], row["reason"] = "NOT-RUN", 394, ""
+					row["status"], row["not_run_issue"], row["reason"] = "NOT-RUN", computerMatrixBlockerIssue, ""
 					matrix["status"], matrix["complete"] = "NOT-RUN", false
 				},
 				"false assertion on a passing row": func(matrix map[string]any) {
@@ -286,19 +288,19 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 				},
 				"destination asserted with a Mac row still open": func(matrix map[string]any) {
 					row := matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)
-					row["status"], row["not_run_issue"] = "NOT-RUN", computerMatrixGatewayIssue
-					row["reason"], row["assertions"] = "blocked by #394", map[string]any{}
+					row["status"], row["not_run_issue"] = "NOT-RUN", computerMatrixBlockerIssue
+					row["reason"], row["assertions"] = "blocked by #408", map[string]any{}
 					matrix["status"], matrix["complete"] = "NOT-RUN", false
 				},
 				"aggregate status laundered to PASS": func(matrix map[string]any) {
 					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["status"] = "NOT-RUN"
-					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["not_run_issue"] = 394
-					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["reason"] = "blocked by #394"
+					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["not_run_issue"] = computerMatrixBlockerIssue
+					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["reason"] = "blocked by #408"
 				},
 				"completeness laundered": func(matrix map[string]any) {
 					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["status"] = "NOT-RUN"
-					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["not_run_issue"] = 394
-					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["reason"] = "blocked by #394"
+					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["not_run_issue"] = computerMatrixBlockerIssue
+					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["reason"] = "blocked by #408"
 					matrix["status"] = "NOT-RUN"
 				},
 				"mac_source disagrees with the evidence": func(matrix map[string]any) {
@@ -545,9 +547,9 @@ func conformantMacComputerFragment(t *testing.T, green bool) string {
 		if !green {
 			row["status"] = "NOT-RUN"
 			row["assertions"] = map[string]any{}
-			row["not_run_issue"] = computerMatrixGatewayIssue
-			row["reason"] = "blocked by #394"
-			row["gaps"] = map[string]any{"product_defect": "blocked by #394"}
+			row["not_run_issue"] = computerMatrixBlockerIssue
+			row["reason"] = "blocked by #408"
+			row["gaps"] = map[string]any{"product_defect": "blocked by #408"}
 		}
 		rows[id] = row
 	}

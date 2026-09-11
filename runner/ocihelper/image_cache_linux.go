@@ -302,7 +302,7 @@ func (engine *ContainerdEngine) ReconcileImagePins(ctx context.Context, request 
 		if _, duplicate := wanted[pin.JobID]; duplicate {
 			return ReconcileImagePinsResponse{}, errors.New("binding image pin job ID is duplicated")
 		}
-		key := imageOperationKey{Namespace: ContainerdNamespace, Digest: pin.Digest, Platform: platformString(pin.Platform), Snapshotter: pin.Snapshotter}
+		key := imageOperationKey{Namespace: ContainerdNamespace, Digest: pin.Digest, Platform: PlatformString(pin.Platform), Snapshotter: pin.Snapshotter}
 		leaseID := imageHoldLeaseID("binding", pin.JobID)
 		wanted[pin.JobID] = struct{}{}
 		matcher := platforms.OnlyStrict(platforms.Normalize(ocispec.Platform{OS: pin.Platform.OS, Architecture: pin.Platform.Architecture, Variant: pin.Platform.Variant}))
@@ -399,14 +399,6 @@ func (engine *ContainerdEngine) reconcileCacheInventoryLocked(ctx context.Contex
 		return engine.cache.persistLocked()
 	}
 	return nil
-}
-
-func platformString(platform OCIPlatform) string {
-	value := platform.OS + "/" + platform.Architecture
-	if platform.Variant != "" {
-		value += "/" + platform.Variant
-	}
-	return value
 }
 
 func (engine *ContainerdEngine) ReleaseImagePin(ctx context.Context, request ReleaseImagePinRequest) error {

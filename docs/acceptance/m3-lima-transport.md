@@ -527,9 +527,13 @@ that blocks it.
 The gate then treats those two outcomes differently, by design. A typed
 `NOT-RUN` is an honest "not proven yet" and passes. A `FAIL` is a proof that ran
 and came back red, so **`check-oci-acceptance-matrix.sh` exits non-zero and names
-the failing rows.** Against the 2026-09-11 session it exits 1 on the four rows
-blocked by #394. That is the command working, not the command broken: the matrix
-cannot be green while a Mac cell is red. The six rows the runbook has no procedure for
+the failing rows.** Against the 2026-09-11 session it exits 1 on four rows. Those
+rows were blocked by #394, which has since been fixed (#407); the attempts now
+die one step later, on #408 — agent and helper disagreed on the arm64 platform
+variant, so every OCI payload failed `image_platform_unsupported` and no
+container was created. #408 is the current blocker a rerun should expect to see
+named. Either way the non-zero exit is the command working, not the command
+broken: the matrix cannot be green while a Mac cell is red. The six rows the runbook has no procedure for
 (`task_logs_delete`, `mount_validation`, `host_to_guest`, `helper_loss`,
 `vm_loss`, `sweep_before_recovery`) are typed `runbook_no_procedure` and are
 never attributed to a product defect. Like the artifact itself, the fragment and
