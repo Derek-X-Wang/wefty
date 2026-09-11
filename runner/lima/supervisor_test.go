@@ -133,8 +133,38 @@ func TestSupervisorStartTimeoutUsesInjectedCommandResult(t *testing.T) {
 	if facts := supervisor.Facts(); facts.ReasonCode != contract.CapabilityReasonLimaStartTimeout {
 		t.Fatalf("timeout facts = %+v", facts)
 	}
-	if want := []time.Duration{defaultLimaRecoveryTimeout, defaultLimaCommandTimeout, defaultLimaCommandTimeout}; !reflect.DeepEqual(deadlines, want) {
+	if want := []time.Duration{defaultLimaRecoveryTimeout, defaultLimaCommandTimeout}; !reflect.DeepEqual(deadlines, want) {
 		t.Fatalf("injected deadlines = %v, want %v", deadlines, want)
+	}
+}
+
+// TestSupervisorStartCommandUsesRecoveryBudgetNotCommandTimeout guards
+// against regressing "start" back to the short CommandTimeout. A genuine
+// Lima cold boot routinely exceeds CommandTimeout (30s); "start" must be
+// bounded only by the recovery budget Ensure already placed on ctx, or a
+// slow-but-successful cold boot gets reported to the operator as a failure
+// while the VM keeps booting unsupervised in the background.
+func TestSupervisorStartCommandUsesRecoveryBudgetNotCommandTimeout(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	baseRun := supervisor.config.run
+	var startDeadline time.Time
+	var sawStartDeadline bool
+	supervisor.config.run = func(ctx context.Context, name string, arguments ...string) ([]byte, error) {
+		if len(arguments) > 0 && arguments[0] == "start" {
+			startDeadline, sawStartDeadline = ctx.Deadline()
+		}
+		return baseRun(ctx, name, arguments...)
+	}
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !sawStartDeadline {
+		t.Fatal("start command ran without any deadline from the recovery context")
+	}
+	if remaining := time.Until(startDeadline); remaining <= defaultLimaCommandTimeout {
+		t.Fatalf("start command bounded to %v remaining, want more than CommandTimeout (%v)", remaining, defaultLimaCommandTimeout)
 	}
 }
 
