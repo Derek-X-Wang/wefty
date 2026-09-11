@@ -489,6 +489,12 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 		status.Cache = cache
 		status.CacheRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
 	}
+	if quarantines, quarantineErr := engine.attemptOwnershipQuarantines(); quarantineErr != nil {
+		status.AttemptOwnershipQuarantinesRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorAttemptOwnershipQuarantines}
+	} else {
+		status.AttemptOwnershipQuarantines = quarantines
+		status.AttemptOwnershipQuarantinesRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+	}
 	roots := append([]string(nil), engine.config.AllowedMountRoots...)
 	if engine.config.HostMountRoot != "" {
 		roots = []string{engine.config.HostMountRoot}
@@ -1793,12 +1799,10 @@ func (engine *ContainerdEngine) validateAttemptResourceIdentity(ctx context.Cont
 	if err != nil {
 		return err
 	}
-	expected.HandoffVolumeDirectory = resources.HandoffVolumeDirectory
 	// Handoff volumes are keyed by the stable owner key, not attempt
 	// authority. The authenticated Run request derived this live name before
 	// the engine retained it, so compare the remaining authority-derived names.
-	expected.HandoffVolumeDirectory = resources.HandoffVolumeDirectory
-	if !sameRuntimeResourceNames(resources, expected) {
+	if !sameAuthorityDerivedResourceNames(resources, expected) {
 		return errors.New("attempt runtime resource names do not match fenced authority")
 	}
 	container, err := engine.client.LoadContainer(ctx, resources.ContainerID)
@@ -1837,16 +1841,6 @@ func (engine *ContainerdEngine) validateAttemptResourceIdentity(ctx context.Cont
 		break
 	}
 	return nil
-}
-
-func sameRuntimeResourceNames(left, right ResourceIdentity) bool {
-	return left.LeaseID == right.LeaseID && left.SnapshotID == right.SnapshotID &&
-		left.ContainerID == right.ContainerID && left.TaskID == right.TaskID &&
-		left.ShimID == right.ShimID && left.CgroupID == right.CgroupID &&
-		left.LogSegmentDirectory == right.LogSegmentDirectory &&
-		left.HandoffVolumeDirectory == right.HandoffVolumeDirectory &&
-		left.ServiceVolumeDirectory == right.ServiceVolumeDirectory &&
-		left.ServiceVolumeOwnerRecord == right.ServiceVolumeOwnerRecord
 }
 
 func validateRuntimeResourceLabels(kind, observedID, expectedID string, labels map[string]string, authority AttemptAuthority) error {
@@ -3861,8 +3855,6 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 	return filtered
 }
 
-const durableAttemptOwnershipVersion = 1
-
 type attemptOwnershipEntryOutcome string
 
 const (
@@ -3873,13 +3865,6 @@ const (
 	attemptOwnershipGCFailed       attemptOwnershipEntryOutcome = "gc_failed"
 	attemptOwnershipInventoryRetry attemptOwnershipEntryOutcome = "inventory_retryable"
 )
-
-type durableAttemptOwnership struct {
-	Version    int                `json:"version"`
-	Authority  AttemptAuthority   `json:"authority"`
-	Resources  ResourceIdentity   `json:"resources"`
-	Retentions []DurableRetention `json:"retentions,omitempty"`
-}
 
 type RetentionBoundExceededError struct {
 	Class     RemovalResourceClass
@@ -3904,42 +3889,172 @@ func (engine *ContainerdEngine) attemptOwnershipPath(resources ResourceIdentity)
 	return filepath.Join(engine.attemptOwnershipRoot(), resources.ContainerID+".json")
 }
 
+// ensureAttemptOwnershipRecord publishes, or re-adopts, the durable Attempt
+// ownership record for one fenced authority.
+//
+// `resources` is the live identity on the Run path and the authority-derived
+// identity on the boot sweep, which holds nothing but labelled containerd
+// metadata. Those two differ in exactly one field -- the owner-key-derived
+// handoff volume directory -- so the record left behind by a previous helper
+// generation is re-adopted verbatim rather than compared against a name this
+// generation cannot re-derive. A record that genuinely cannot be reconciled is
+// quarantined with a typed operator receipt, never deleted and never allowed to
+// wedge helper startup.
 func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAuthority, resources ResourceIdentity) error {
 	expected, err := DeterministicResourceIdentity(authority)
 	if err != nil {
 		return err
 	}
-	expected.HandoffVolumeDirectory = resources.HandoffVolumeDirectory
-	if !sameRuntimeResourceNames(resources, expected) {
+	if !sameAuthorityDerivedResourceNames(resources, expected) {
 		return errors.New("durable Attempt ownership resource names do not match fenced authority")
 	}
-	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources}
 	path := engine.attemptOwnershipPath(resources)
+	name := filepath.Base(path)
 	engine.attemptOwnershipMu.Lock()
 	defer engine.attemptOwnershipMu.Unlock()
-	if payload, readErr := os.ReadFile(path); readErr == nil {
+	payload, readErr := os.ReadFile(path)
+	switch {
+	case readErr == nil:
 		var existing durableAttemptOwnership
-		if json.Unmarshal(payload, &existing) != nil || !validDurableAttemptOwnership(existing, filepath.Base(path)) || existing.Authority != authority || !sameRuntimeResourceNames(existing.Resources, resources) {
-			return fmt.Errorf("durable Attempt ownership record %s conflicts with fenced authority", filepath.Base(path))
+		if json.Unmarshal(payload, &existing) != nil {
+			if err := engine.quarantineAttemptOwnershipRecordLocked(name, AttemptOwnershipQuarantineInvalidRecord); err != nil {
+				return err
+			}
+			break
 		}
-		return nil
-	} else if !errors.Is(readErr, os.ErrNotExist) {
-		return readErr
+		switch disposition, reason := attemptOwnershipDispositionFor(existing, name, authority, resources); disposition {
+		case attemptOwnershipQuarantine:
+			if err := engine.quarantineAttemptOwnershipRecordLocked(name, reason); err != nil {
+				return err
+			}
+		case attemptOwnershipDefer:
+			// A version this build cannot interpret is left exactly where it
+			// is. Overwriting it would destroy a newer helper's state, and
+			// quarantining it would empty the ownership root on the first boot
+			// after a rollback. The snapshot path reports it as
+			// unknown_version, keeps it unbound, and GCs it once quiescent.
+			logAttemptOwnershipEntryOutcome(name, attemptOwnershipUnknownVersion)
+			return nil
+		default:
+			// Re-adopt the previous generation's record exactly as written: it
+			// carries the owner-key-derived handoff volume directory and any
+			// retention receipts this generation cannot reconstruct.
+			return nil
+		}
+	case errors.Is(readErr, os.ErrNotExist):
+	default:
+		// The record cannot be read, so it cannot be reconciled -- but it can
+		// still be moved aside without reading it.
+		if err := engine.quarantineAttemptOwnershipRecordLocked(name, AttemptOwnershipQuarantineUnreadable); err != nil {
+			return errors.Join(readErr, err)
+		}
 	}
-	return engine.writeAttemptOwnershipRecordLocked(record)
+	return engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
+		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
+	})
 }
 
-func validDurableAttemptOwnership(record durableAttemptOwnership, filename string) bool {
-	return record.Version == durableAttemptOwnershipVersion && validDurableAttemptOwnershipIdentity(record, filename)
+// quarantineAttemptOwnershipRecordLocked moves one unreconcilable record out of
+// the ownership root into the operator-owned quarantine root and fsyncs a typed
+// receipt beside it. The caller holds attemptOwnershipMu.
+func (engine *ContainerdEngine) quarantineAttemptOwnershipRecordLocked(name string, reason AttemptOwnershipQuarantineReason) error {
+	if name != filepath.Base(name) || name == "" || name == "." || name == ".." {
+		return fmt.Errorf("durable Attempt ownership record name %q is not quarantinable", name)
+	}
+	receiptID, err := randomCapability()
+	if err != nil {
+		return fmt.Errorf("quarantine durable Attempt ownership record %s: generate receipt ID", name)
+	}
+	now := time.Now()
+	if engine.config.Clock != nil {
+		now = engine.config.Clock.Now()
+	}
+	root := engine.attemptOwnershipQuarantineRoot()
+	directory := filepath.Join(root, receiptID)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("create durable Attempt ownership quarantine root: %w", err)
+	}
+	if err := os.Rename(filepath.Join(engine.attemptOwnershipRoot(), name), filepath.Join(directory, attemptOwnershipQuarantinedRecordName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("quarantine durable Attempt ownership record %s: %w", name, err)
+	}
+	receipt := AttemptOwnershipQuarantine{
+		Kind: AttemptOwnershipQuarantineKind, ReceiptID: receiptID, Record: name,
+		Reason: reason, QuarantinedAt: now.UTC(),
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	if err := writeFsyncedFile(filepath.Join(directory, attemptOwnershipQuarantineReceiptName), append(payload, '\n')); err != nil {
+		return fmt.Errorf("publish durable Attempt ownership quarantine receipt: %w", err)
+	}
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
+	if err := syncDirectoryIfPresent(engine.attemptOwnershipRoot()); err != nil {
+		return err
+	}
+	log.Printf("durable Attempt ownership record quarantined name=%q reason=%s receipt_id=%s disposition=operator_owned", name, reason, receiptID)
+	return syncDirectory(root)
 }
 
-func validDurableAttemptOwnershipIdentity(record durableAttemptOwnership, filename string) bool {
-	if record.Authority.validate() != nil {
-		return false
+func (engine *ContainerdEngine) attemptOwnershipQuarantineRoot() string {
+	return filepath.Join(engine.config.RuntimeRoot, "attempt-ownership-quarantine")
+}
+
+// attemptOwnershipQuarantines reads the operator-owned quarantine root. It is a
+// facts-only read: it never mutates or removes a quarantined record.
+func (engine *ContainerdEngine) attemptOwnershipQuarantines() ([]AttemptOwnershipQuarantine, error) {
+	root := engine.attemptOwnershipQuarantineRoot()
+	entries, err := readDirectoryIfPresent(root)
+	if err != nil {
+		return nil, err
 	}
-	expected, err := DeterministicResourceIdentity(record.Authority)
-	expected.HandoffVolumeDirectory = record.Resources.HandoffVolumeDirectory
-	return err == nil && sameRuntimeResourceNames(record.Resources, expected) && filename == expected.ContainerID+".json"
+	quarantines := make([]AttemptOwnershipQuarantine, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		payload, err := os.ReadFile(filepath.Join(root, entry.Name(), attemptOwnershipQuarantineReceiptName))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		var receipt AttemptOwnershipQuarantine
+		if json.Unmarshal(payload, &receipt) != nil || receipt.Kind != AttemptOwnershipQuarantineKind {
+			continue
+		}
+		quarantines = append(quarantines, receipt)
+	}
+	slices.SortFunc(quarantines, func(left, right AttemptOwnershipQuarantine) int {
+		if order := strings.Compare(left.Record, right.Record); order != 0 {
+			return order
+		}
+		return strings.Compare(left.ReceiptID, right.ReceiptID)
+	})
+	return quarantines, nil
+}
+
+func writeFsyncedFile(path string, payload []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".quarantine.tmp-")
+	if err != nil {
+		return err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	writeErr := temporary.Chmod(0o600)
+	if writeErr == nil {
+		_, writeErr = temporary.Write(payload)
+	}
+	if writeErr == nil {
+		writeErr = temporary.Sync()
+	}
+	if writeErr = errors.Join(writeErr, temporary.Close()); writeErr != nil {
+		return writeErr
+	}
+	return os.Rename(temporaryName, path)
 }
 
 func (engine *ContainerdEngine) writeAttemptOwnershipRecord(record durableAttemptOwnership) error {

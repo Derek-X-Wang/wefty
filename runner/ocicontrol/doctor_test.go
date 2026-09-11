@@ -59,6 +59,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					ComputerFirewallPresent: true, ComputerAttemptsLive: true, ComputerFirewallRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
+					AttemptOwnershipQuarantinesRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					LastProfile: &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false, TargetAbstractSocketLive: true, HostAbstractSocketObservedAfterEndpointReady: true,
 						ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", ComputerResolverAddress: "127.0.0.53",
 						ComputerDNSProxyUDP: true, ComputerDNSProxyTCP: true, ComputerDNSUpstreamAddress: "168.63.129.16", ComputerDNSUpstreamSource: "systemd_uplink", ComputerDNSUpstreamReachable: true, ComputerIPv6NATState: ocihelper.ComputerIPv6NATConfigured,
@@ -232,12 +233,26 @@ func TestDoctorDetectsInstalledHelperUnitPolicyDrift(t *testing.T) {
 func TestDoctorParsesEffectiveRestartPolicyAcrossSystemdDropIns(t *testing.T) {
 	config := healthyDoctorConfig(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC), "")
 	config.InstalledHelperServiceUnit = func(context.Context) (string, error) {
-		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=5s\n" +
+		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=5s\nRestartPreventExitStatus=78\n" +
 			"# /etc/systemd/system/wefty-oci-helper.service.d/restart.conf\n[Service]\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
 	}
 	report := BuildDoctor(t.Context(), config)
 	if item := findDoctorFinding(t, report, "helper-restart-policy"); item.Outcome != DiagnosticOK || item.Code != "oci_helper_restart_policy_current" {
 		t.Fatalf("effective drop-in policy = %+v", item)
+	}
+}
+
+// A drop-in that removes the wedge guard re-arms the #412 hot loop, so doctor
+// must read it as drift on the effective unit, not just on the shipped source.
+func TestDoctorReadsARestartPreventExitStatusOverrideAsDrift(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC), "")
+	config.InstalledHelperServiceUnit = func(context.Context) (string, error) {
+		return "# /usr/lib/systemd/system/wefty-oci-helper.service\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\nRestartPreventExitStatus=78\n" +
+			"# /etc/systemd/system/wefty-oci-helper.service.d/loop.conf\n[Service]\nRestartPreventExitStatus=\n", nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if item := findDoctorFinding(t, report, "helper-restart-policy"); item.Outcome != DiagnosticFailed || item.Code != "oci_helper_restart_policy_drift" {
+		t.Fatalf("an override that re-arms the restart loop = %+v", item)
 	}
 }
 
@@ -906,6 +921,65 @@ func TestDoctorComputerFirewallReadAuthority(t *testing.T) {
 						t.Fatalf("missing source not identified: %+v", f)
 					}
 				}
+			}
+		})
+	}
+}
+
+// An empty quarantine list is indistinguishable from a helper that never looked,
+// so the read receipt -- not the list -- decides whether anything was proven.
+func TestDoctorAttemptOwnershipQuarantineNeedsAPositiveRead(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		status  ocihelper.DoctorStatus
+		outcome DiagnosticOutcome
+		code    string
+	}{
+		{
+			name:    "a helper that predates the read is NOT-RUN, never a clean bill",
+			status:  ocihelper.DoctorStatus{},
+			outcome: DiagnosticNotRun, code: "oci_attempt_ownership_quarantine_not_run",
+		},
+		{
+			// A read that ran and failed is FAILED, like every other
+			// unavailable helper read; only a read that never happened is
+			// NOT-RUN.
+			name:    "a failed read is its own failed finding",
+			status:  ocihelper.DoctorStatus{AttemptOwnershipQuarantinesRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadFailed}},
+			outcome: DiagnosticFailed, code: "oci_attempt_ownership_quarantine_unavailable",
+		},
+		{
+			name:    "a positive read of an empty root is OK",
+			status:  ocihelper.DoctorStatus{AttemptOwnershipQuarantinesRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK}},
+			outcome: DiagnosticOK, code: "oci_attempt_ownership_quarantine_absent",
+		},
+		{
+			name: "a quarantined record is a failed finding naming the record and reason",
+			status: ocihelper.DoctorStatus{
+				AttemptOwnershipQuarantinesRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
+				AttemptOwnershipQuarantines: []ocihelper.AttemptOwnershipQuarantine{{
+					Kind: ocihelper.AttemptOwnershipQuarantineKind, ReceiptID: "receipt-1",
+					Record: "wefty-container-abc.json", Reason: ocihelper.AttemptOwnershipQuarantineInvalidRecord,
+					QuarantinedAt: now,
+				}},
+			},
+			outcome: DiagnosticFailed, code: "oci_attempt_ownership_quarantined",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			report := &DoctorResponse{}
+			buildAttemptOwnershipQuarantine(test.status, report)
+			if len(report.Findings) != 1 {
+				t.Fatalf("findings = %+v, want exactly one", report.Findings)
+			}
+			item := report.Findings[0]
+			if item.Outcome != test.outcome || item.Code != test.code {
+				t.Fatalf("finding = %+v, want %s/%s", item, test.outcome, test.code)
+			}
+			if test.code == "oci_attempt_ownership_quarantined" &&
+				!strings.Contains(item.Detail, "wefty-container-abc.json:invalid_record") {
+				t.Fatalf("quarantined finding does not name the record and reason: %q", item.Detail)
 			}
 		})
 	}

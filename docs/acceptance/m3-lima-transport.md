@@ -411,6 +411,14 @@ revisions; per-row PASS/FAIL/NOT-RUN; exact commands and exit codes; and residue
 after sweep, and after delete. NOT-RUN is not destination success and must name
 the missing owner-hardware prerequisite.
 
+Every non-PASS row also carries **`blocked_by`**: the GitHub issue number the
+owner judges to own that row's FAIL or NOT-RUN, recorded at capture time. This
+is the matrix's only attribution authority. A row that omits it is attributed to
+the acceptance-matrix ticket #157 -- honest ("nobody recorded who owns this")
+but useless for triage, so record it. Attribution that once lived in Go source
+went stale twice in three runs (#394, then #408), which is why the receipt row
+now owns it.
+
 The redacted artifact is strict JSON with this shape:
 
 ```json
@@ -521,18 +529,19 @@ scripts/check-oci-acceptance-matrix.sh /absolute/path/to/oci-acceptance-matrix.j
 Unlike the destination-success gate above, the fragment producer does not
 require PASS rows: a red attended session must still produce an honest, typed
 fragment. A failed attended row becomes a matrix `FAIL` carrying the attended
-reason verbatim; a blocked row becomes a typed `NOT-RUN` owned by the ticket
-that blocks it.
+reason verbatim; a blocked row becomes a typed `NOT-RUN`. Either way the owning
+ticket comes from that attended row's own `blocked_by` field, falling back to
+#157 when the owner recorded none.
 
 The gate then treats those two outcomes differently, by design. A typed
 `NOT-RUN` is an honest "not proven yet" and passes. A `FAIL` is a proof that ran
 and came back red, so **`check-oci-acceptance-matrix.sh` exits non-zero and names
 the failing rows.** Against the 2026-09-11 session it exits 1 on four rows. Those
-rows were blocked by #394, which has since been fixed (#407); the attempts now
-die one step later, on #408 — agent and helper disagreed on the arm64 platform
-variant, so every OCI payload failed `image_platform_unsupported` and no
-container was created. #408 is the current blocker a rerun should expect to see
-named. Either way the non-zero exit is the command working, not the command
+rows were blocked by #394, which has since been fixed (#407), then by #408,
+fixed in turn (#411). Naming the run's dominant blocker in source went stale
+both times, so the fragment producer no longer does: record the blocking ticket
+per row in the receipt's `blocked_by` field and it appears in the matrix
+verbatim. Either way the non-zero exit is the command working, not the command
 broken: the matrix cannot be green while a Mac cell is red. The six rows the runbook has no procedure for
 (`task_logs_delete`, `mount_validation`, `host_to_guest`, `helper_loss`,
 `vm_loss`, `sweep_before_recovery`) are typed `runbook_no_procedure` and are

@@ -99,8 +99,17 @@ func main() {
 		}
 		if err := ocihelper.RunInvocation(helperContext, os.Args[:2], engine, ocihelper.ServerConfig{
 			HelperVersion: version, AllowedUIDs: allowedUIDs,
+			StartupFailureStateDirectory: *runtimeRoot,
 		}); err != nil {
 			log.Printf("wefty-agent OCI helper: %v", err)
+			// A startup barrier that has failed its bounded number of times in
+			// a row exits with the status the unit names in
+			// RestartPreventExitStatus, so systemd stops restarting and leaves
+			// a failed unit carrying this typed reason.
+			var wedged *ocihelper.StartupWedgedError
+			if errors.As(err, &wedged) {
+				os.Exit(wedged.ExitStatus())
+			}
 			os.Exit(1)
 		}
 		return

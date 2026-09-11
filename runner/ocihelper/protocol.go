@@ -484,6 +484,8 @@ const (
 	DiagnosticErrorMountRoots        = "mount_roots_unavailable"
 	DiagnosticErrorComputerFirewall  = "computer_firewall_unavailable"
 
+	DiagnosticErrorAttemptOwnershipQuarantines = "attempt_ownership_quarantines_unavailable"
+
 	RuncVersionSourceConfiguredPath         = "configured_absolute_path"
 	RuncVersionSourceContainerdInfo         = "containerd_runtime_info"
 	RuncVersionSourceRuntimeHandlerPath     = "runtime_handler_binary"
@@ -529,6 +531,36 @@ type DoctorStatus struct {
 	LastProfile             *ProfileReceipt             `json:"last_profile,omitempty"`
 	LastAdmission           *ResourceAdmissionReceipt   `json:"last_admission,omitempty"`
 	LastSessionInvalidation *SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
+
+	AttemptOwnershipQuarantines     []AttemptOwnershipQuarantine `json:"attempt_ownership_quarantines,omitempty"`
+	AttemptOwnershipQuarantinesRead DiagnosticReadReceipt        `json:"attempt_ownership_quarantines_read"`
+}
+
+// AttemptOwnershipQuarantineReason is the closed set of typed causes for which
+// a durable Attempt ownership record cannot be reconciled with the fenced
+// authority that its own file name names.
+type AttemptOwnershipQuarantineReason string
+
+const (
+	AttemptOwnershipQuarantineUnreadable        AttemptOwnershipQuarantineReason = "unreadable"
+	AttemptOwnershipQuarantineInvalidRecord     AttemptOwnershipQuarantineReason = "invalid_record"
+	AttemptOwnershipQuarantineAuthorityMismatch AttemptOwnershipQuarantineReason = "authority_mismatch"
+)
+
+// AttemptOwnershipQuarantineKind names this receipt shape on disk and on the
+// doctor surface.
+const AttemptOwnershipQuarantineKind = "attempt_ownership_unreconcilable"
+
+// AttemptOwnershipQuarantine is the operator-visible receipt for one durable
+// Attempt ownership record the boot sweep moved aside instead of wedging
+// helper startup on. The record name is a deterministic digest, so the receipt
+// carries no operator-provided identifier and no raw error text.
+type AttemptOwnershipQuarantine struct {
+	Kind          string                           `json:"kind"`
+	ReceiptID     string                           `json:"receipt_id"`
+	Record        string                           `json:"record"`
+	Reason        AttemptOwnershipQuarantineReason `json:"reason"`
+	QuarantinedAt time.Time                        `json:"quarantined_at"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1

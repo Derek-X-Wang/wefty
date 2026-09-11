@@ -231,8 +231,12 @@ type DoctorResponse struct {
 	LastSessionInvalidation *ocihelper.SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
 	Convergence             ConvergenceDoctorFacts                `json:"convergence"`
 	ComputerStorageRecovery ComputerStorageRecoveryFacts          `json:"computer_storage_recovery"`
-	Findings                []DiagnosticFinding                   `json:"findings"`
-	Limitations             []DoctorLimitation                    `json:"limitations"`
+	// AttemptOwnershipQuarantines names durable Attempt ownership records the
+	// boot sweep moved aside rather than wedge helper startup on. Empty is the
+	// healthy shape.
+	AttemptOwnershipQuarantines []ocihelper.AttemptOwnershipQuarantine `json:"attempt_ownership_quarantines,omitempty"`
+	Findings                    []DiagnosticFinding                    `json:"findings"`
+	Limitations                 []DoctorLimitation                     `json:"limitations"`
 }
 
 type HelperDoctorSource func(context.Context) (HelperDoctorSnapshot, error)
@@ -732,7 +736,50 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		report.Findings = append(report.Findings, finding("resource-admission", diagnosticReceipt{ran: true, passed: receipt.Admitted, code: code, severity: severity, detail: detail}))
 	}
 
+	buildAttemptOwnershipQuarantine(runtimeStatus, report)
 	buildMountRoots(runtimeStatus, report)
+}
+
+// buildAttemptOwnershipQuarantine surfaces durable Attempt ownership records
+// the boot sweep could not reconcile. Quarantine is the deliberate alternative
+// to wedging helper startup, so it must be visible: the helper is serving, and
+// operator-owned state is waiting on a human.
+func buildAttemptOwnershipQuarantine(runtimeStatus ocihelper.DoctorStatus, report *DoctorResponse) {
+	switch runtimeStatus.AttemptOwnershipQuarantinesRead.Outcome {
+	case ocihelper.DiagnosticReadFailed:
+		report.Findings = append(report.Findings, finding("attempt-ownership-quarantine", diagnosticReceipt{
+			ran: true, code: "oci_attempt_ownership_quarantine_unavailable", notRunCause: NotRunSourceUnavailable,
+			detail: "the helper-owned Attempt ownership quarantine root could not be read",
+		}))
+		return
+	case ocihelper.DiagnosticReadOK:
+	default:
+		// An absent outcome is a helper that predates this read, not a clean
+		// one. An empty quarantine list is indistinguishable from "never
+		// looked", so reporting it as absent would be a PASS nobody earned.
+		report.Findings = append(report.Findings, finding("attempt-ownership-quarantine", diagnosticReceipt{
+			code: "oci_attempt_ownership_quarantine_not_run", notRunCause: NotRunSourceUnavailable,
+			detail: "the connected helper did not report an Attempt ownership quarantine read",
+		}))
+		return
+	}
+	quarantines := append([]ocihelper.AttemptOwnershipQuarantine{}, runtimeStatus.AttemptOwnershipQuarantines...)
+	report.AttemptOwnershipQuarantines = quarantines
+	if len(quarantines) == 0 {
+		report.Findings = append(report.Findings, finding("attempt-ownership-quarantine", diagnosticReceipt{
+			ran: true, passed: true, code: "oci_attempt_ownership_quarantine_absent",
+			detail: "every durable Attempt ownership record reconciled with its own fenced authority",
+		}))
+		return
+	}
+	reasons := make([]string, 0, len(quarantines))
+	for _, quarantine := range quarantines {
+		reasons = append(reasons, quarantine.Record+":"+string(quarantine.Reason))
+	}
+	report.Findings = append(report.Findings, finding("attempt-ownership-quarantine", diagnosticReceipt{
+		ran: true, code: "oci_attempt_ownership_quarantined", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
+		detail: fmt.Sprintf("%d durable Attempt ownership record(s) were quarantined instead of wedging helper startup: %s", len(quarantines), strings.Join(reasons, " ")),
+	}))
 }
 
 func appendHelperNotRun(report *DoctorResponse, detail string) {
@@ -756,13 +803,13 @@ func appendComputerStorageRecoveryNotRun(report *DoctorResponse, cause NotRunCau
 }
 
 func appendRuntimeDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "computer-screen-isolation", "resource-admission", "mount-roots"} {
+	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
 
 func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "computer-screen-isolation", "resource-admission", "mount-roots"} {
+	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
@@ -854,6 +901,7 @@ func helperRestartPolicyFromUnit(unit string) (map[string]string, error) {
 	wanted := map[string]struct{}{
 		"Unit.StartLimitIntervalSec": {},
 		"Service.Restart":            {}, "Service.RestartSec": {}, "Service.RestartSteps": {}, "Service.RestartMaxDelaySec": {},
+		"Service.RestartPreventExitStatus": {},
 	}
 	result := make(map[string]string)
 	section := ""
@@ -1016,6 +1064,7 @@ func StableDoctorCodes() []string {
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
 		"oci_helper_restart_policy_not_read", "oci_helper_restart_policy_current", "oci_helper_restart_policy_drift",
+		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
 	}
 }
 
@@ -1058,7 +1107,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "mount-roots", "convergence", "helper-restart-policy"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}

@@ -404,6 +404,7 @@ jobs:
           RestartSec=250ms
           RestartSteps=6
           RestartMaxDelaySec=1s
+          RestartPreventExitStatus=78
           UNIT
           sudo systemctl daemon-reload
           sudo systemctl start wefty-oci-helper-realtiming.socket

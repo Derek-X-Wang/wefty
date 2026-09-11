@@ -534,6 +534,10 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 
 func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 	modernWant := splitQualifiedPolicy(systemdpolicy.UnitPolicy(255))
+	// Every source of a helper unit -- the two shipped renderers and the two
+	// workflow-written realtiming fixtures -- matches the shared authority key
+	// for key. There is no exemption: a lane whose helper can hot-loop its boot
+	// barrier is not running the policy the product ships (#412).
 	for name, path := range map[string]string{
 		"pr-realtiming": "../.github/workflows/service-acceptance-realtiming.yml",
 		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
@@ -735,7 +739,7 @@ func parseHelperServicePolicySections(text string) (map[string]map[string]string
 			continue
 		}
 		switch key {
-		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec":
+		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec", "RestartPreventExitStatus":
 			if installSeen {
 				return nil, fmt.Errorf("helper policy key %s appears after [Install]", key)
 			}

@@ -13,13 +13,38 @@ const (
 	MaximumDelay   = time.Second
 	FailureBurst   = 6
 	TakeoverMargin = 2 * time.Second
+
+	// StartupWedgedExitStatus is the helper's distinguished exit status for a
+	// deterministic startup-barrier failure that has already repeated
+	// StartupFailureBound times. The unit names it in
+	// RestartPreventExitStatus, so the loop stops at a failed unit carrying a
+	// typed reason instead of restarting forever.
+	//
+	// Bounding this in the helper rather than through the systemd start limiter
+	// is deliberate: StartLimitIntervalSec stays 0, so the triggering socket is
+	// never failed with service-start-limit-hit, and a transient crash after a
+	// healthy boot barrier still restarts as many times as it needs to.
+	StartupWedgedExitStatus = 78
+	// StartupFailureBound is the number of consecutive failed startup barriers
+	// the helper will burn before it declares itself wedged. A barrier that
+	// succeeds clears the count.
+	StartupFailureBound = 5
+	// StartupFailureWindow keeps the bound from being a pure count. At the
+	// rendered restart delays five failures can burn inside about 1.25
+	// seconds, so a containerd restart that straddles helper activation would
+	// wedge a perfectly healthy node. A streak therefore only trips once it
+	// has also been failing for this long, and a gap longer than this starts a
+	// new streak rather than continuing a stale one.
+	StartupFailureWindow = 60 * time.Second
 )
 
 func Directives(systemdVersion int) map[string]string {
+	preventRestart := strconv.Itoa(StartupWedgedExitStatus)
 	if systemdVersion >= 254 {
-		return map[string]string{"RestartSec": InitialDelay.String(), "RestartSteps": strconv.Itoa(RestartSteps), "RestartMaxDelaySec": MaximumDelay.String()}
+		return map[string]string{"RestartSec": InitialDelay.String(), "RestartSteps": strconv.Itoa(RestartSteps),
+			"RestartMaxDelaySec": MaximumDelay.String(), "RestartPreventExitStatus": preventRestart}
 	}
-	return map[string]string{"RestartSec": "1s"}
+	return map[string]string{"RestartSec": "1s", "RestartPreventExitStatus": preventRestart}
 }
 
 func Render(systemdVersion int) string {
@@ -28,7 +53,7 @@ func Render(systemdVersion int) string {
 	if steps := directives["RestartSteps"]; steps != "" {
 		result += "RestartSteps=" + steps + "\nRestartMaxDelaySec=" + directives["RestartMaxDelaySec"] + "\n"
 	}
-	return result
+	return result + "RestartPreventExitStatus=" + directives["RestartPreventExitStatus"] + "\n"
 }
 
 func Name(systemdVersion int) string {

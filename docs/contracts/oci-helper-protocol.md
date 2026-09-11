@@ -44,8 +44,8 @@ authority. The socket unit creates
 user is added to that group, while the service runs the private helper mode as
 root with a narrow UID allowlist. Every shipped systemd helper service, native
 Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
-`Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`, and
-`RestartMaxDelaySec=1s` under `[Service]`; systemd versions before 254 use a fixed
+`Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`,
+`RestartMaxDelaySec=1s`, and `RestartPreventExitStatus=78` under `[Service]`; systemd versions before 254 use a fixed
 `RestartSec=1s` because the geometric directives are unavailable. The workflow-written realtiming
 units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
 systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
@@ -60,7 +60,26 @@ reported as a measurement, not treated as a separate unenforced bound.
 This bounds saturated deterministic-failure churn at no more than 0.5 Hz
 instead of sustaining a four-Hz journal loop. Disabling the
 start-limit interval prevents service exhaustion from failing the triggering
-socket with `service-start-limit-hit`. The socket retains systemd's default
+socket with `service-start-limit-hit`.
+
+A rate bound is not a count bound, so the helper bounds the count itself. It
+fsyncs a versioned consecutive-startup-barrier-failure ledger in its runtime
+root; a barrier that succeeds removes it. The streak trips only when it has
+reached **both** five consecutive failures **and** sixty seconds of elapsed
+failing: at the rendered delays five restarts burn in about 1.25 seconds, so a
+pure count would wedge a healthy node whenever a containerd restart straddled
+helper activation. A gap longer than that same window starts a new streak rather
+than resuming a stale one. On the tripping failure the
+helper exits `78` -- the status the unit names in `RestartPreventExitStatus` --
+so systemd stops restarting and leaves a **failed** unit whose journal carries
+the typed phase (`startup_sweep` or `startup_verify`), count, and elapsed time. The socket unit
+is untouched and stays armed, so an operator repair is picked up by the next
+connection without a `reset-failed`. A ledger that cannot be read or written
+never manufactures a wedge: the helper reports the ordinary failure and
+restarts, because losing the count must not become a refusal to serve. Only the
+boot Sweep+Verify barrier is counted; a helper that reached ready and then
+crashed restarts as often as it needs to, so the seven-delay saturated
+derivation above is unchanged. The socket retains systemd's default
 trigger-limit policy; the current lane proves service recovery and active
 socket topology, but does not claim a separate trigger-limit proof. The lane
 on Debian 12/systemd 252 rejects any `Unknown key` diagnostic from
@@ -740,7 +759,42 @@ identities. Publication, snapshot loading, stale-temp cleanup, record removal,
 and unknown-version GC share one engine lock, so no sweep or read-only Verify
 can unlink an in-flight publication. Removing the final record preserves the
 `attempt-ownership` parent directory. Labelled containerd metadata may reconstruct the same record before
-that metadata is deleted during sweep. A deterministic-looking name is never
+that metadata is deleted during sweep.
+
+That reconstruction is deliberately partial. Every resource name in the record
+is derived from the seven-field authority **except** the handoff volume
+directory, which is derived from the stable owner key and therefore cannot be
+re-derived from labels alone. A boot sweep holding nothing but labelled metadata
+compares only the authority-derived names, and **re-adopts** a matching record
+from a previous helper generation verbatim -- keeping the owner-key-derived
+handoff name and any retention receipts it carries -- rather than treating the
+one field it cannot re-derive as a fencing conflict. Re-adoption is not a
+relaxation of fencing: the record's file name is the digest of its complete
+authority tuple, so a matching name with a non-matching tuple is corruption, not
+a superseded writer.
+
+A record that genuinely cannot be reconciled -- unreadable, structurally
+invalid, or a tuple that contradicts its own name -- is **quarantined**, never
+deleted and never allowed to wedge startup. The helper renames it into
+`attempt-ownership-quarantine/<receipt id>/record.json` and fsyncs a typed
+`attempt_ownership_unreconcilable` receipt beside it carrying the receipt ID,
+the record name, one of `unreadable` / `invalid_record` / `authority_mismatch`,
+and the quarantine time. The sweep then publishes a fresh record for the
+authority it just proved from labels and continues, so the helper starts.
+Quarantined bytes are operator-owned durable state, not runnable namespace
+residue: they appear in the node doctor as `oci_attempt_ownership_quarantined`
+and are removed only by a human.
+
+A record whose **version** this build does not know is not quarantined. It is
+left exactly where it is, neither re-adopted nor overwritten, and the sweep
+publishes nothing for that authority: a version bump would otherwise quarantine
+every live Attempt's perfectly valid record on the first boot after an upgrade
+or rollback, discarding retention receipts wholesale. Quarantine is evidence of
+corruption, not of a different vintage. The unknown-version path stated above
+still governs it -- typed `unknown_version`, unbound so it can authorize no
+removal, garbage-collected once its named resources are absent.
+
+A deterministic-looking name is never
 ownership: sweep mutates a log directory or cgroup only when the exact resource
 identity is bound by that durable record and the helper's locked registry says
 the Attempt is no longer live. It rechecks that registry immediately before
