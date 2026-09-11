@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -810,14 +811,23 @@ func TestAdapterServiceCancellationUsesTermBeforeKill(t *testing.T) {
 			started := make(chan struct{})
 			request.Started = func() { close(started) }
 			ctx, cancel := context.WithCancel(t.Context())
+			var trace *terminationTrace
+			if test.name == "graceful term" {
+				trace = &terminationTrace{}
+			}
 			done := make(chan runOutcome, 1)
 			go func() {
-				result, err := adapter.Run(ctx, request, nil)
+				result, err := adapter.runObserved(ctx, request, nil, trace)
 				done <- runOutcome{result: result, err: err}
 			}()
 			<-started
 			cancel()
 			finished := <-done
+			defer func() {
+				if t.Failed() && trace != nil {
+					t.Logf("termination trace: %+v", *trace)
+				}
+			}()
 			if finished.err != nil || finished.result.Outcome.Signal != test.wantResult || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
 				t.Fatalf("cancellation outcome = (%+v, %v)", finished.result.Outcome, finished.err)
 			}
@@ -2410,5 +2420,510 @@ func TestManagedVolumeFinalizationPreservesFrozenStorageAbsence(t *testing.T) {
 	}
 	if len(engine.volumeDeleteRequests) != 1 || !engine.volumeDeleteRequests[0].StorageAbsent || engine.volumeDeleteRequests[0].ComputerStorage.StorageGeneration != 1 {
 		t.Fatalf("frozen absence lost across helper protocol: %+v", engine.volumeDeleteRequests)
+	}
+}
+
+// These controls distinguish delivery of TERM from completion of the whole
+// Watch RPC. They do not assert that either ordering caused a prior CI failure.
+func TestAdapterTERMWithHeldTerminalEvidenceEscalates(t *testing.T) {
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelProbe()
+	engine := newTermWatchProbeEngine(probeCtx)
+	defer func() { t.Logf("term-watch milestones: %+v", engine.milestones()) }()
+	adapter, _ := startTermWatchProbeServer(t, engine)
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 20 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { engine.record("adapter_started", nil); close(started) }
+	runCtx, cancelRun := context.WithCancel(probeCtx)
+	joined := make(chan struct{})
+	var result workloadrunner.Result
+	var runErr error
+	trace := &terminationTrace{}
+	defer func() {
+		cancelRun()
+		cancelProbe()
+		engine.releaseTerminal()
+		<-joined
+	}()
+	go func() {
+		defer close(joined)
+		result, runErr = adapter.runObserved(runCtx, request, nil, trace)
+		engine.record("adapter_run_returned", runErr)
+	}()
+	engine.await(t, started)
+	engine.await(t, engine.watchEntered)
+	cancelRun()
+	engine.await(t, engine.termQueued)
+	engine.await(t, engine.termConsumed)
+	// Terminal completion is unavailable while its publication is held.
+	// KILL entry is the release trigger; no guessed delay seeks the race.
+	engine.await(t, engine.killEntered)
+	select {
+	case <-joined:
+		t.Fatal("Adapter.Run returned before held terminal evidence was released")
+	default:
+	}
+	engine.releaseTerminal()
+	engine.await(t, joined)
+	if runErr != nil || result.Outcome.Signal != "terminated" || result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("held-terminal result=(%+v, %v)", result.Outcome, runErr)
+	}
+	assertTerminationTrace(t, trace, terminationErrorNone, terminationRPCNone, terminationSuccessGraceTimerSelected, true)
+	engine.assertSignals(t, []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL})
+	engine.assertBefore(t, "term_queued", "term_consumed")
+	engine.assertBefore(t, "kill_entered", "terminal_emit_released")
+	engine.assertBefore(t, "terminal_event_acknowledged", "adapter_run_returned")
+	reaped, err := adapter.ReapAndVerify(probeCtx, workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !reaped.RuntimeQuiesced {
+		t.Fatalf("exact-authority reap=%+v err=%v", reaped, err)
+	}
+}
+
+func TestTerminationWaitRecordsTERMRPCFailure(t *testing.T) {
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelProbe()
+	engine := newTermWatchProbeEngine(probeCtx)
+	engine.failTERM = true
+	defer func() { t.Logf("term-watch milestones: %+v", engine.milestones()) }()
+	adapter, barrier := startTermWatchProbeServer(t, engine)
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 20 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { engine.record("adapter_started", nil); close(started) }
+	runCtx, cancelRun := context.WithCancel(probeCtx)
+	joined := make(chan struct{})
+	var result workloadrunner.Result
+	var runErr error
+	trace := &terminationTrace{}
+	defer func() {
+		cancelRun()
+		cancelProbe()
+		engine.releaseTerminal()
+		<-joined
+		if t.Failed() {
+			class, code := classifyTerminationError(runErr)
+			t.Logf("termination trace: %+v; returned class=%d code=%d", *trace, class, code)
+		}
+	}()
+	go func() {
+		defer close(joined)
+		result, runErr = adapter.runObserved(runCtx, request, nil, trace)
+		engine.record("adapter_run_returned", runErr)
+	}()
+	engine.await(t, started)
+	engine.await(t, engine.watchEntered)
+	cancelRun()
+	engine.await(t, engine.termQueued)
+	// Session loss may cancel Watch before it consumes TERM. Join the actual
+	// Adapter return; neither engine KILL nor terminal success follows from loss.
+	engine.await(t, joined)
+	var loss *ocihelper.RuntimeLossError
+	if !errors.As(runErr, &loss) || result.Outcome.RuntimeFailure == nil || result.Outcome.RuntimeFailure.Code != contract.RuntimeFailureUnavailable {
+		t.Fatal("TERM engine failure did not return typed runtime loss/unavailable")
+	}
+	if !trace.termObserved || trace.termRawError != terminationErrorRuntimeLoss || trace.termEffectiveError != terminationErrorRuntimeLoss || trace.termContextError != terminationContextNone || trace.termRPCCode != terminationRPCNone || trace.termAlreadyTerminated {
+		t.Fatal("TERM result trace did not retain the closed runtime-loss categories")
+	}
+	switch trace.decision {
+	case terminationErrorWatchSelected:
+		if trace.killCallEntered {
+			t.Fatal("Watch-selected error branch entered KILL")
+		}
+	case terminationErrorDefaultSelected:
+		if !trace.killCallEntered {
+			t.Fatal("default-selected error branch did not enter KILL")
+		}
+	default:
+		t.Fatal("TERM loss selected a non-error decision")
+	}
+	engine.mu.Lock()
+	got := slices.Clone(engine.signals)
+	engine.mu.Unlock()
+	termOnly := slices.Equal(got, []ocihelper.Signal{ocihelper.SignalTERM})
+	termKill := slices.Equal(got, []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL})
+	if !termOnly && !termKill {
+		t.Fatal("loss control engine signals are outside TERM or TERM,KILL")
+	}
+	if termKill && (trace.decision != terminationErrorDefaultSelected || !trace.killCallEntered) {
+		t.Fatal("engine KILL lacked the corresponding client entry decision")
+	}
+	if trace.decision == terminationErrorWatchSelected && !termOnly {
+		t.Fatal("Watch-selected error branch did not retain exact TERM-only delivery")
+	}
+	var healthLoss *ocihelper.RuntimeLossError
+	if !errors.As(session.HealthError(), &healthLoss) {
+		t.Fatal("TERM engine failure retained healthy session authority")
+	}
+	if current, _, err := barrier.ExecutionSnapshot(); err == nil || current != nil {
+		t.Fatal("TERM engine failure retained ready execution authority")
+	}
+}
+
+func TestTerminationWaitWithWholeWatchCompleteBeforeTERMReturn(t *testing.T) {
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelProbe()
+	engine := newTermWatchProbeEngine(probeCtx)
+	engine.holdTERMResponse = true
+	engine.releaseTerminal()
+	defer func() { t.Logf("term-watch milestones: %+v", engine.milestones()) }()
+	_, barrier := startTermWatchProbeServer(t, engine)
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	authority := HelperAuthority(request.Authority)
+	// Use the real helper's authorization/Run/Watch path. This narrower control
+	// owns watchDone, unlike Adapter.Run, so it can observe whole-RPC completion.
+	response, err := session.Run(probeCtx, ocihelper.RunRequest{
+		Authority: authority, InitialDeadman: request.InitialDeadman, Workload: workloadInput(request),
+	})
+	if err != nil || !response.Started {
+		t.Fatalf("probe Run=%+v err=%v", response, err)
+	}
+	watchDone := make(chan error, 1)
+	joined := make(chan struct{})
+	var terminal *ocihelper.WatchResponse
+	watchCtx, cancelWatch := context.WithCancel(probeCtx)
+	defer func() {
+		cancelWatch()
+		cancelProbe()
+		engine.releaseTerminal()
+		<-joined
+	}()
+	go func() {
+		defer close(joined)
+		err := session.Watch(watchCtx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
+			if event.Result != nil {
+				copy := *event.Result
+				terminal = &copy
+			}
+			return nil
+		})
+		engine.record("whole_session_watch_returned", err)
+		watchDone <- err
+		close(engine.wholeWatchComplete)
+	}()
+	engine.await(t, engine.watchEntered)
+	stopCtx, cancelStop := context.WithCancel(probeCtx)
+	cancelStop()
+	// TERM is real and remains inside the production 1s signal RPC bound.
+	// Its engine response is held until the real Session.Watch has returned
+	// and its result is queued; an engine event ACK alone cannot release it.
+	trace := &terminationTrace{}
+	err = terminateAndWaitObserved(stopCtx, session, authority, 20*time.Millisecond, watchDone, trace)
+	engine.record("termination_wait_returned", err)
+	engine.await(t, joined)
+	if err != nil || terminal == nil || terminal.Signal != ocihelper.SignalTERM || terminal.TerminationCause != "agent" {
+		t.Fatalf("confirmed-Watch terminal=%+v err=%v", terminal, err)
+	}
+	assertTerminationTrace(t, trace, terminationErrorNone, terminationRPCNone, terminationSuccessWatchSelected, false)
+	engine.assertSignals(t, []ocihelper.Signal{ocihelper.SignalTERM})
+	engine.assertBefore(t, "term_consumed", "whole_session_watch_returned")
+	engine.assertBefore(t, "whole_session_watch_returned", "term_engine_returned")
+	engine.assertBefore(t, "term_engine_returned", "termination_wait_returned")
+	if err := session.HealthError(); err != nil {
+		t.Fatalf("confirmed terminal evidence lost helper authority: %v", err)
+	}
+	deleted, err := session.Delete(probeCtx, ocihelper.DeleteRequest{Authority: authority})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("exact-authority Delete=%+v err=%v", deleted, err)
+	}
+	// Successful Delete is positive absence evidence and retires live authority.
+	// VerifyAttempt must reject that retired authority, not mint a new receipt.
+	_, err = session.Verify(probeCtx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyAttempt, Authority: &authority})
+	var rpcErr *ocihelper.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != ocihelper.CodeUnauthorizedAttempt {
+		t.Fatalf("post-Delete VerifyAttempt error=%v, want typed unauthorized_attempt", err)
+	}
+}
+
+type termWatchMilestone struct {
+	Phase string
+	Error string
+}
+
+type termWatchProbeEngine struct {
+	*adapterTestEngine
+	probeCtx           context.Context
+	traceMu            sync.Mutex
+	trace              []termWatchMilestone
+	watchEntered       chan struct{}
+	termQueued         chan struct{}
+	termConsumed       chan struct{}
+	killEntered        chan struct{}
+	terminalRelease    chan struct{}
+	wholeWatchComplete chan struct{}
+	watchOnce          sync.Once
+	termOnce           sync.Once
+	consumedOnce       sync.Once
+	killOnce           sync.Once
+	releaseOnce        sync.Once
+	holdTERMResponse   bool
+	failTERM           bool
+}
+
+func newTermWatchProbeEngine(ctx context.Context) *termWatchProbeEngine {
+	return &termWatchProbeEngine{
+		adapterTestEngine: &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2)},
+		probeCtx:          ctx, watchEntered: make(chan struct{}), termQueued: make(chan struct{}),
+		termConsumed: make(chan struct{}), killEntered: make(chan struct{}), terminalRelease: make(chan struct{}), wholeWatchComplete: make(chan struct{}),
+	}
+}
+
+func (engine *termWatchProbeEngine) record(phase string, err error) {
+	code := "none"
+	if errors.Is(err, context.Canceled) {
+		code = "canceled"
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		code = "deadline"
+	} else if err != nil {
+		code = "other_error"
+	}
+	engine.traceMu.Lock()
+	defer engine.traceMu.Unlock()
+	engine.trace = append(engine.trace, termWatchMilestone{Phase: phase, Error: code})
+}
+
+func (engine *termWatchProbeEngine) milestones() []termWatchMilestone {
+	engine.traceMu.Lock()
+	defer engine.traceMu.Unlock()
+	return slices.Clone(engine.trace)
+}
+
+func (engine *termWatchProbeEngine) releaseTerminal() {
+	engine.releaseOnce.Do(func() { close(engine.terminalRelease) })
+}
+
+func (engine *termWatchProbeEngine) await(t *testing.T, phase <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-phase:
+	case <-engine.probeCtx.Done():
+		t.Fatalf("probe phase did not complete: %v; milestones=%+v", engine.probeCtx.Err(), engine.milestones())
+	}
+}
+
+func (engine *termWatchProbeEngine) assertBefore(t *testing.T, first, second string) {
+	t.Helper()
+	before, after := -1, -1
+	for index, milestone := range engine.milestones() {
+		if milestone.Phase == first {
+			before = index
+		}
+		if milestone.Phase == second {
+			after = index
+		}
+	}
+	if before < 0 || after <= before {
+		t.Fatalf("missing/reversed phases %q before %q: %+v", first, second, engine.milestones())
+	}
+}
+
+func (engine *termWatchProbeEngine) assertSignals(t *testing.T, want []ocihelper.Signal) {
+	t.Helper()
+	engine.mu.Lock()
+	got := slices.Clone(engine.signals)
+	engine.mu.Unlock()
+	if !slices.Equal(got, want) {
+		t.Fatalf("signals=%v want=%v", got, want)
+	}
+}
+
+func (engine *termWatchProbeEngine) Signal(ctx context.Context, request ocihelper.SignalRequest) error {
+	if err := engine.probeCtx.Err(); err != nil {
+		return err
+	}
+	if request.Signal == ocihelper.SignalKILL {
+		engine.record("kill_entered", nil)
+		engine.killOnce.Do(func() { close(engine.killEntered) })
+	}
+	err := engine.adapterTestEngine.Signal(ctx, request)
+	if request.Signal != ocihelper.SignalTERM || err != nil {
+		return err
+	}
+	engine.record("term_queued", nil)
+	engine.termOnce.Do(func() { close(engine.termQueued) })
+	if engine.holdTERMResponse {
+		select {
+		case <-engine.wholeWatchComplete:
+		case <-ctx.Done():
+			engine.record("term_engine_returned", ctx.Err())
+			return ctx.Err()
+		case <-engine.probeCtx.Done():
+			engine.record("term_engine_returned", engine.probeCtx.Err())
+			return engine.probeCtx.Err()
+		}
+	}
+	if engine.failTERM {
+		engine.record("term_engine_returned", errors.New("controlled TERM failure"))
+		return errors.New("controlled TERM failure")
+	}
+	engine.record("term_engine_returned", nil)
+	return nil
+}
+
+func (engine *termWatchProbeEngine) Watch(ctx context.Context, _ ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+	engine.record("engine_watch_entered", nil)
+	engine.watchOnce.Do(func() { close(engine.watchEntered) })
+	// Deliberately establish queue publication before consumption. This gate is
+	// an ordering control, not a replacement for the TERM grace or RPC bound.
+	select {
+	case <-engine.termQueued:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-engine.probeCtx.Done():
+		return engine.probeCtx.Err()
+	}
+	if err := emit(ocihelper.WatchEvent{Kind: ocihelper.WatchProgress, Log: &ocihelper.LogFrame{
+		Stream: "stdout", Sequence: 0, Bytes: []byte("frame"), Checksum: "9dff50df08c635815f4b19da10f756605a34a79a48d4ba48712782502975a70e",
+	}}); err != nil {
+		return err
+	}
+	var signal ocihelper.Signal
+	select {
+	case signal = <-engine.watchSignals:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-engine.probeCtx.Done():
+		return engine.probeCtx.Err()
+	}
+	if signal != ocihelper.SignalTERM {
+		return errors.New("probe expected TERM as the consumed terminal signal")
+	}
+	engine.record("term_consumed", nil)
+	engine.consumedOnce.Do(func() { close(engine.termConsumed) })
+	select {
+	case <-engine.terminalRelease:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-engine.probeCtx.Done():
+		return engine.probeCtx.Err()
+	}
+	engine.record("terminal_emit_released", nil)
+	terminal := ocihelper.WatchResponse{Signal: signal, TerminationCause: "agent"}
+	err := emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &terminal})
+	if err == nil {
+		engine.record("terminal_event_acknowledged", nil)
+	}
+	engine.record("engine_watch_returned", err)
+	return err
+}
+
+// Install cleanup as resources are acquired, including setup-failure paths.
+func startTermWatchProbeServer(t *testing.T, engine *termWatchProbeEngine) (*Adapter, *ocihelper.BootBarrier) {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "woci-term-watch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	listener, err := net.Listen("unix", filepath.Join(directory, "helper.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	server, err := ocihelper.NewServer(engine, ocihelper.ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid())}, HelperChecksum: "adapter-test", HeartbeatTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(serveCtx, listener) }()
+	t.Cleanup(func() {
+		cancelServe()
+		_ = listener.Close()
+		if err := <-served; err != nil {
+			t.Errorf("serve probe helper: %v", err)
+		}
+	})
+	client := ocihelper.NewUnixClient(filepath.Join(directory, "helper.sock"), "adapter-test")
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = barrier.Close() })
+	if err := barrier.Ensure(engine.probeCtx); err != nil {
+		t.Fatal(err)
+	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapterWithPolicy(&adapterSnapshotSource{barrier: barrier}, ImagePolicy{})
+	adapter.probePlatforms[helperSession(session)] = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
+	return adapter, barrier
+}
+
+func assertTerminationTrace(t *testing.T, trace *terminationTrace, raw terminationErrorClass, code terminationRPCCode, decision terminationDecision, kill bool) {
+	t.Helper()
+	if !trace.termObserved || trace.termRawError != raw || trace.termEffectiveError != raw || trace.termRPCCode != code || trace.termContextError != terminationContextNone || trace.termAlreadyTerminated || trace.decision != decision || trace.killCallEntered != kill {
+		t.Fatalf("termination trace = %+v; want raw/effective=%d code=%d decision=%d kill=%t", *trace, raw, code, decision, kill)
+	}
+}
+
+type cyclicTerminationDiagnosticError struct{}
+
+func (*cyclicTerminationDiagnosticError) Error() string     { panic("diagnostic called Error") }
+func (err *cyclicTerminationDiagnosticError) Unwrap() error { return err }
+
+type hostileTerminationDiagnosticError struct{}
+
+func (hostileTerminationDiagnosticError) Error() string { panic("diagnostic called Error") }
+func (hostileTerminationDiagnosticError) Is(error) bool { panic("diagnostic called Is") }
+func (hostileTerminationDiagnosticError) As(any) bool   { panic("diagnostic called As") }
+func (hostileTerminationDiagnosticError) Unwrap() error { panic("diagnostic called Unwrap") }
+
+func TestTerminationObservationPrivacyAndClassification(t *testing.T) {
+	const secret = "private-token-payload-termination"
+	for _, test := range []struct {
+		name  string
+		err   error
+		class terminationErrorClass
+		code  terminationRPCCode
+	}{
+		{name: "nil", class: terminationErrorNone},
+		{name: "canceled", err: context.Canceled, class: terminationErrorCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, class: terminationErrorDeadline},
+		{name: "runtime loss", err: &ocihelper.RuntimeLossError{Cause: errors.New(secret)}, class: terminationErrorRuntimeLoss},
+		{name: "engine RPC", err: &ocihelper.RPCError{Code: ocihelper.CodeEngineFailure, Message: secret}, class: terminationErrorRPC, code: terminationRPCEngineFailure},
+		{name: "unauthorized RPC", err: &ocihelper.RPCError{Code: ocihelper.CodeUnauthorizedAttempt, Message: secret}, class: terminationErrorRPC, code: terminationRPCUnauthorizedAttempt},
+		{name: "stale RPC", err: &ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: secret}, class: terminationErrorRPC, code: terminationRPCSessionStale},
+		{name: "unknown RPC", err: &ocihelper.RPCError{Code: ocihelper.ErrorCode(secret), Message: secret}, class: terminationErrorRPC, code: terminationRPCOther},
+		{name: "unknown", err: errors.New(secret), class: terminationErrorOther},
+		{name: "cyclic", err: &cyclicTerminationDiagnosticError{}, class: terminationErrorOther},
+		{name: "hostile", err: hostileTerminationDiagnosticError{}, class: terminationErrorOther},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			class, code := classifyTerminationError(test.err)
+			if class != test.class || code != test.code {
+				t.Fatalf("class=%d code=%d want=%d/%d", class, code, test.class, test.code)
+			}
+			trace := terminationTrace{termObserved: true, termRawError: class, termEffectiveError: class, termRPCCode: code}
+			if rendered := fmt.Sprintf("%+v", trace); strings.Contains(rendered, secret) {
+				t.Fatal("termination trace retained private error material")
+			}
+		})
+	}
+	for _, test := range []struct {
+		err  error
+		want terminationContextClass
+	}{
+		{nil, terminationContextNone}, {context.Canceled, terminationContextCanceled},
+		{context.DeadlineExceeded, terminationContextDeadline}, {hostileTerminationDiagnosticError{}, terminationContextOther},
+	} {
+		if got := classifyTerminationContext(test.err); got != test.want {
+			t.Fatalf("context class=%d want=%d", got, test.want)
+		}
 	}
 }
