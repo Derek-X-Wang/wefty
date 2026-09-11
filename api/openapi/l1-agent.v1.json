@@ -217,10 +217,15 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["job", "lease"],
+                  "required": ["job", "lease", "attempt_token"],
                   "properties": {
                     "job": { "$ref": "./common.v1.json#/components/schemas/Job" },
                     "lease": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" },
+                    "attempt_token": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Opaque attempt credential for this attempt, minted inside the claim transaction and returned exactly once. L1 persists only its SHA-256 digest. The agent delivers it to a one-shot workload as WEFTY_ATTEMPT_TOKEN through SensitiveEnv, keeps it only in memory, and never writes it to logs, evidence, or the dispatch outbox."
+                    },
                     "prestart_deadline": {
                       "type": "string",
                       "format": "date-time",

@@ -61,11 +61,18 @@ wefty rerun <run_id>              # NEW run from the stored immutable snapshot
 
 A workflow's job process receives the run execution context as env vars
 (documented in `docs/contracts/run-execution-context.md`): `WEFTY_RUN_ID`,
-`WEFTY_L1_ENDPOINT`, `WEFTY_L3_ENDPOINT` (always dialable HTTP URLs),
-`WEFTY_RUN_TOKEN` (scoped to this run — dispatch children, write own
-envelopes/gates; never sibling access), `WEFTY_HANDOFF_DIR` (node-local).
-Dispatch child steps through the same public `POST /v1/runs` with
-`parent_run_id`; hand off across nodes via envelopes, never local files.
+`WEFTY_L3_ENDPOINT` (a dialable HTTP URL), `WEFTY_RUN_TOKEN` (scoped to this
+run — dispatch children, write own envelopes/gates; never sibling access),
+`WEFTY_HANDOFF_DIR` (node-local). Dispatch child steps through the same public
+`POST /v1/runs` with `parent_run_id`; hand off across nodes via envelopes,
+never local files.
+
+Every one-shot attempt — with or without L3 — also receives `WEFTY_L1_ENDPOINT`
+(a dialable HTTP URL) and `WEFTY_ATTEMPT_TOKEN`, the attempt credential. Send
+it as `Authorization: Bearer` to submit a child job (`POST /v1/jobs`), read
+your own job, or list your children (`GET /v1/jobs?parent_job_id=`). It works
+only while your attempt holds the lease. Service and Computer attempts do not
+receive these two variables yet.
 
 ## Judging results
 

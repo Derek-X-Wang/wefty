@@ -155,7 +155,11 @@
       "post": {
         "operationId": "createJob",
         "summary": "Create a job idempotently by dispatch key",
-        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict. A Computer-trait spec must use /v1/computers so the durable authority and first immutable Job are committed together; bare creation returns computer_resource_required.",
+        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict. A Computer-trait spec must use /v1/computers so the durable authority and first immutable Job are committed together; bare creation returns computer_resource_required. A request carrying Authorization: Bearer <attempt credential> submits a child job instead: L1 derives parent_job_id, parent_attempt_id, originating_submitter, and spawn_depth from the credential rather than the body, refuses a spec the originating submitter could not have posted itself, and refuses a spawn depth above the fixed cap of 8 with spawn_depth_exceeded. The credential is accepted only while its attempt is the job's live attempt and only from the Fabric identity of the node holding that attempt.",
+        "security": [
+          { "fabricIdentity": [] },
+          { "fabricIdentity": [], "attemptCredential": [] }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -237,6 +241,11 @@
       "get": {
         "operationId": "getJob",
         "summary": "Read service job status",
+        "description": "class=service is mechanically required for a service job. A request carrying Authorization: Bearer <attempt credential> instead reads the credential's own job or one of that job's children, without a class selector, exactly as an unscoped one-shot read already behaves.",
+        "security": [
+          { "fabricIdentity": [] },
+          { "fabricIdentity": [], "attemptCredential": [] }
+        ],
         "parameters": [
           { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
         ],
@@ -253,6 +262,55 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/children": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "operationId": "listChildJobs",
+        "summary": "List the jobs spawned by one job",
+        "description": "Returns the jobs whose parent_job_id is this job, of either class, in stable creation/job-ID order. Children are a job-level resource: a retried parent attempt sees the children spawned by earlier attempts. An attempt credential may list only its own job's children.",
+        "security": [
+          { "fabricIdentity": [] },
+          { "fabricIdentity": [], "attemptCredential": [] }
+        ],
+        "parameters": [
+          { "name": "cursor", "in": "query", "description": "Opaque cursor returned by the previous page.", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One stable page of child jobs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["jobs"],
+                  "properties": {
+                    "jobs": {
+                      "type": "array",
+                      "items": { "$ref": "./common.v1.json#/components/schemas/Job" }
+                    },
+                    "next_cursor": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
       }
     },
@@ -1586,7 +1644,8 @@
   },
   "components": {
     "securitySchemes": {
-      "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" }
+      "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" },
+      "attemptCredential": { "$ref": "./common.v1.json#/components/securitySchemes/attemptCredential" }
     }
   }
 }

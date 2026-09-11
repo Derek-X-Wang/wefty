@@ -36,6 +36,16 @@ fresh attempt and fence. A stopping service whose quiescence cannot be
 confirmed latches `failed`. The job does not itself use a `lost` state because
 `lost` describes what is known about one execution attempt.
 
+A job created through an attempt credential additionally records its parent
+job, the parent attempt that submitted it, the originating submitter inherited
+from that parent, and a spawn depth one greater than the parent's. All four are
+set once at creation, are never mutated afterward, and are derived from the
+credential rather than the request body. A root job records the submitting
+client principal as its originating submitter and a spawn depth of zero. The
+relationship carries no lifecycle coupling: a child runs, retries, succeeds,
+and fails entirely on its own state machine, and a terminal, cancelled, or lost
+parent neither cancels nor fails its children.
+
 ## Service job
 
 Service-class jobs use their own transition table. This keeps automatic
