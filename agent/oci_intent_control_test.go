@@ -17,7 +17,7 @@ import (
 func TestStopOCIRuntimeSuppressesAndJoinsOnlyOCIResidents(t *testing.T) {
 	capabilities := newCapabilityState(map[string]bool{
 		"kind:process": true, "kind:oci": true,
-	}, nil, systemClock{}, time.Second)
+	}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	ociContext, cancelOCI := context.WithCancelCause(context.Background())
 	processContext, cancelProcess := context.WithCancelCause(context.Background())
@@ -51,7 +51,7 @@ func TestStopOCIRuntimeSuppressesAndJoinsOnlyOCIResidents(t *testing.T) {
 }
 
 func TestStopOCIRuntimeRejectsMissingReapProof(t *testing.T) {
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	ctx, cancel := context.WithCancelCause(context.Background())
 	done := make(chan struct{})
@@ -65,7 +65,7 @@ func TestStopOCIRuntimeRejectsMissingReapProof(t *testing.T) {
 }
 
 func TestStopOCIRuntimeJoinsClaimBeforeResidentPublication(t *testing.T) {
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	session.residentKind["just-claimed"] = contract.JobKindOCI
 	session.residentJobID["just-claimed"] = struct{}{}
@@ -120,7 +120,7 @@ func TestControllerStopReportsResidentSuppressionFailureCreatedDuringTeardown(t 
 		t.Fatal(err)
 	}
 
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	session.residentKind[claim.Job.JobID] = contract.JobKindOCI
 	session.residentJobID[claim.Job.JobID] = struct{}{}
@@ -220,7 +220,7 @@ func TestControllerStopReportsResidentSuppressionFailureCompletedBeforeTeardownS
 		t.Fatal(err)
 	}
 
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	session.residentKind[claim.Job.JobID] = contract.JobKindOCI
 	session.residentJobID[claim.Job.JobID] = struct{}{}
@@ -296,7 +296,7 @@ func TestControllerStopDoesNotReuseSuppressionFailureAfterIntentReopens(t *testi
 		t.Fatal(err)
 	}
 	intentSource := lima.FileIntentSource{Path: intentPath}
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	gate := &ociIntentCompletionGate{
 		observe: func(ctx context.Context) (OCIIntentObservation, error) {
@@ -381,7 +381,7 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 	}
 	defer connectionBlocker.Rollback()
 
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	session.residentKind[claim.Job.JobID] = contract.JobKindOCI
 	session.residentJobID[claim.Job.JobID] = struct{}{}
@@ -537,7 +537,7 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 	}
 	defer connectionBlocker.Rollback()
 
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	session.residentKind[claim.Job.JobID] = contract.JobKindOCI
 	session.residentJobID[claim.Job.JobID] = struct{}{}
@@ -695,7 +695,7 @@ func TestControllerStopReportsResidentSuppressionFailureFromCurrentEpisodeAfterI
 			return OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
 		},
 	}
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	nodeAgent := &Agent{session: session, ociIntentGate: gate, capabilities: capabilities}
 	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{IntentPath: intentPath, Runtime: nodeAgent})
@@ -778,7 +778,7 @@ func TestControllerStopReportsResidentSuppressionFailureFromCurrentEpisodeAfterI
 }
 
 func TestStopOCIRuntimeJoinsSuppressionFailureWithClaimWaitCancellation(t *testing.T) {
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
 	cause := errors.New("suppression persist failed")
 	session.residentSuppressionErrors["completed-job"] = &OCIIntentSuppressionPersistenceError{
@@ -800,7 +800,7 @@ func TestControllerStopJoinsEveryResidentSuppressionFailure(t *testing.T) {
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 2)
 	firstFailure := &OCIIntentSuppressionPersistenceError{
 		AttemptID: "first-attempt", IntentRevision: 2, Err: errors.New("first suppression persist failed"),
@@ -848,7 +848,7 @@ func TestControllerStopDrainsResidentAdmittedAfterSuppressionFailureSnapshot(t *
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second, nil)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 2)
 	cause := errors.New("first suppression persist failed")
 	failure := &OCIIntentSuppressionPersistenceError{AttemptID: "first-attempt", IntentRevision: 2, Err: cause}

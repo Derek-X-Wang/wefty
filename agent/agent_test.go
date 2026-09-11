@@ -162,7 +162,7 @@ func TestMissingWorkloadRuntimeDoesNotAffectProcessSibling(t *testing.T) {
 		runtimes: testRuntimeSet(process),
 		capabilities: newCapabilityState(map[string]bool{
 			"kind:process": true, "kind:future.microvm": true,
-		}, nil, systemClock{}, 0),
+		}, nil, systemClock{}, 0, nil),
 	}
 	result, err := a.runWorkload(context.Background(), l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: "future.microvm", Class: contract.JobClassOneShot}}})
 	var executionError *contract.ExecutionError
