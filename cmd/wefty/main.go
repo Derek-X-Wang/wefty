@@ -288,7 +288,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.SetOutput(stderr)
 	flags.StringVar(&options.fabricMode, "fabric", "plain", "fabric implementation: plain or tsnet")
 	flags.StringVar(&options.l1Address, "l1", l3.DefaultL1Address, "L1 control-plane Fabric address")
-	flags.StringVar(&options.l3Address, "l3", l3.DefaultL3Address, "L3 run-ledger Fabric address")
+	flags.StringVar(&options.l3Address, "l3", l3.DefaultL3Address, "L3 run-ledger Fabric address (default wefty://run-ledger; pass --l3= for an L1-only installation)")
 	flags.StringVar(&options.plainIdentity, "plain-identity", "wefty-cli", "plain Fabric identity node ID")
 	flags.StringVar(&options.plainUserID, "plain-user-id", os.Getenv("WEFTY_DEV_PLAIN_USER_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person user ID")
 	flags.StringVar(&options.plainDeviceID, "plain-device-id", os.Getenv("WEFTY_DEV_PLAIN_DEVICE_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person device ID")
@@ -387,7 +387,7 @@ Commands:
 Global flags:
   --fabric plain|tsnet
   --l1 ADDRESS
-  --l3 ADDRESS
+  --l3 ADDRESS               default wefty://run-ledger; pass --l3= for an L1-only installation
   --plain-user-id USER_ID    DEVELOPMENT ONLY: self-asserted plain person identity
   --plain-device-id DEVICE_ID
   --json
