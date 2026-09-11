@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -542,6 +543,18 @@ func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
 
 func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *testing.T) {
 	uploadedTail := make(chan contract.LogEvent, 1)
+	var boundedAppends, unboundedAppends atomic.Int64
+	var ackResponse, deadlineStages atomic.Uint32
+	const (
+		ackNotSeen uint32 = iota
+		ackWritten
+		ackWriteError
+	)
+	const (
+		deadlineRedaction uint32 = 1 << iota
+		deadlineUpload
+		deadlineUnknown
+	)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if !strings.HasSuffix(request.URL.Path, "/logs") {
 			http.NotFound(w, request)
@@ -557,9 +570,13 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 			return
 		}
 		uploadedTail <- appendRequest.Events[0]
-		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+		if err := json.NewEncoder(w).Encode(l1.AppendLogsResponse{
 			Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0},
-		})
+		}); err != nil {
+			ackResponse.Store(ackWriteError)
+		} else {
+			ackResponse.Store(ackWritten)
+		}
 	})
 	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
 	defer stopServer()
@@ -578,6 +595,14 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 		countStarted <- struct{}{}
 		<-ctx.Done()
 	}
+	outbox.spool.appendCheckpoint = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); bounded {
+			boundedAppends.Add(1)
+		} else {
+			unboundedAppends.Add(1)
+		}
+	}
+	var observedSink *batchingLogSink
 	claim := l1.Claim{
 		Job: l1.Job{JobID: "pending-count-job", Spec: contract.JobSpec{
 			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
@@ -592,6 +617,26 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 		clock: systemClock{}, nodeID: "pending-count-node", bootSessionID: "pending-count-boot",
 		finalizationTimeout: 25 * time.Millisecond,
 		observer:            newLifecycleObserver(systemClock{}),
+		logSinkFactory: func(ctx context.Context, claim l1.Claim) (attemptLogSink, error) {
+			sink, err := outbox.newLogSink(ctx, client, claim)
+			observedSink = sink
+			return sink, err
+		},
+		logf: func(format string, args ...any) {
+			if format != "agent: %s exceeded the bounded finalization deadline for attempt %s" {
+				return
+			}
+			stage := deadlineUnknown
+			if len(args) != 0 {
+				switch args[0] {
+				case logFinalizationStageRedaction:
+					stage = deadlineRedaction
+				case logFinalizationStageUpload:
+					stage = deadlineUpload
+				}
+			}
+			deadlineStages.Or(stage)
+		},
 	})
 
 	result, runErr := lifecycle.runWorkload(t.Context(), claim)
@@ -601,18 +646,51 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 		countWasContended = true
 	default:
 	}
+	// These sequential reads describe observations just after return, not a
+	// simultaneous snapshot or proof that a late append has committed.
+	snapshot := struct {
+		BoundedRecount                   bool
+		BoundedAppends, UnboundedAppends int64
+		UploadReceived                   bool
+		ACKResponse, DeadlineStages      uint32
+		SinkAvailable                    bool
+		PendingEvents                    int64
+		ExitPresent                      bool
+		ExitCode                         int
+		RunError, EvidenceIncomplete     bool
+	}{
+		BoundedRecount: countWasContended,
+		BoundedAppends: boundedAppends.Load(), UnboundedAppends: unboundedAppends.Load(),
+		UploadReceived: len(uploadedTail) != 0,
+		ACKResponse:    ackResponse.Load(), DeadlineStages: deadlineStages.Load(),
+		SinkAvailable: observedSink != nil, ExitPresent: result.ExitCode != nil,
+		RunError: runErr != nil, EvidenceIncomplete: result.LogEvidenceIncomplete,
+	}
+	if observedSink != nil {
+		snapshot.PendingEvents = observedSink.pendingEvents.Load()
+	}
+	if result.ExitCode != nil {
+		snapshot.ExitCode = *result.ExitCode
+	}
+	logSnapshot := func() {
+		t.Logf("return_snapshot=%+v ack_states(not_seen=%d,written=%d,write_error=%d) deadline_flags(redaction=%d,upload=%d,unknown=%d) late_write_durable=unobserved", snapshot, ackNotSeen, ackWritten, ackWriteError, deadlineRedaction, deadlineUpload, deadlineUnknown)
+	}
 	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || result.LogEvidenceIncomplete {
+		logSnapshot()
 		t.Fatalf("healthy attempt under pending-count contention = result %#v err=%v, want exit 0 with complete output evidence", result, runErr)
 	}
 	if countWasContended {
+		logSnapshot()
 		t.Fatal("final redaction flush synchronously recounted pending spool events")
 	}
 	select {
 	case tail := <-uploadedTail:
 		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" {
+			logSnapshot()
 			t.Fatalf("final redaction tail = %#v, want durable stdout sequence 0 with bytes tail", tail)
 		}
 	default:
+		logSnapshot()
 		t.Fatal("final redaction tail did not reach the durable spool and bounded upload")
 	}
 }
