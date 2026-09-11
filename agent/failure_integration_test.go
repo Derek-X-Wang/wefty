@@ -2217,7 +2217,7 @@ func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "shutdown evidence" || page.Events[0].AttemptID != attemptID {
+	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "shutdown evidence\n" || page.Events[0].AttemptID != attemptID {
 		t.Fatalf("shutdown logs = %#v, want one finalized event for %s", page.Events, attemptID)
 	}
 }
@@ -3324,7 +3324,16 @@ func (runner *loggingBlockingRunner) Run(ctx context.Context, request processrun
 	if request.Started != nil {
 		request.Started()
 	}
-	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("shutdown evidence")}); err != nil {
+	// The evidence ends in a newline like every real process line (see
+	// processhelper's paced-output). Every one-shot attempt now carries its
+	// attempt credential in SensitiveEnv, so a redactor is always in the path,
+	// and it withholds any trailing bytes that could still be the head of that
+	// credential. An unterminated line would therefore lose its last character
+	// to the finalization flush whenever the credential's first base64url
+	// character happened to match it — a second event, and a test about
+	// delivery failing over framing. A credential can never contain a newline,
+	// so a terminated line is emitted whole, every time.
+	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("shutdown evidence\n")}); err != nil {
 		return contract.ProcessResult{}, err
 	}
 	runner.started <- request.AttemptID
