@@ -3,6 +3,7 @@ package lima
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -175,6 +176,26 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 
 type readyLimaHelperEngine struct{ ocihelper.UnavailableEngine }
 
+type residueLimaHelperEngine struct {
+	ocihelper.UnavailableEngine
+	mu          sync.Mutex
+	verifyCalls int
+}
+
+type helperServeObservation struct {
+	done chan struct{}
+	err  error
+}
+
+func (observation *helperServeObservation) snapshot() (bool, error) {
+	select {
+	case <-observation.done:
+		return true, observation.err
+	default:
+		return false, nil
+	}
+}
+
 func (readyLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
 	return ocihelper.SweepResponse{SweepEpoch: request.SweepEpoch}, nil
 }
@@ -183,7 +204,27 @@ func (readyLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (o
 	return ocihelper.VerifyResponse{Absent: true}, nil
 }
 
-func startReadyLimaHelper(t *testing.T, checksum string) string {
+func (engine *residueLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
+	return ocihelper.SweepResponse{SweepEpoch: request.SweepEpoch}, nil
+}
+
+func (engine *residueLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.verifyCalls++
+	if engine.verifyCalls == 1 {
+		return ocihelper.VerifyResponse{Absent: true}, nil
+	}
+	const sentinel = "wefty-cgroup-handshake-private-sentinel"
+	residue := ocihelper.ResourceInventory{Cgroups: []string{sentinel}}
+	return ocihelper.VerifyResponse{Inventory: residue, RuntimeResidue: residue}, nil
+}
+
+func startReadyLimaHelper(t *testing.T, checksum string) (string, *helperServeObservation) {
+	return startLimaHelper(t, checksum, readyLimaHelperEngine{})
+}
+
+func startLimaHelper(t *testing.T, checksum string, engine ocihelper.Engine) (string, *helperServeObservation) {
 	t.Helper()
 	temporary, err := os.CreateTemp("/tmp", "wefty-lima-helper-*.sock")
 	if err != nil {
@@ -200,22 +241,84 @@ func startReadyLimaHelper(t *testing.T, checksum string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := ocihelper.NewServer(readyLimaHelperEngine{}, ocihelper.ServerConfig{
+	server, err := ocihelper.NewServer(engine, ocihelper.ServerConfig{
 		HelperVersion: "test", HelperChecksum: checksum, AllowedUIDs: []uint32{uint32(os.Getuid())},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener) }()
+	observation := &helperServeObservation{done: make(chan struct{})}
+	go func() {
+		observation.err = server.Serve(ctx, listener)
+		close(observation.done)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		_ = listener.Close()
-		<-done
+		<-observation.done
 		_ = os.Remove(path)
 	})
-	return path
+	return path, observation
+}
+
+func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *testing.T) {
+	const sentinel = "wefty-cgroup-handshake-private-sentinel"
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	var logMu sync.Mutex
+	var logs []string
+	supervisor.config.Logf = func(format string, arguments ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}
+	supervisor.config.wait = func(context.Context, time.Duration) error {
+		return errors.New("stop after the first readiness diagnostic")
+	}
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath, _ := startLimaHelper(t, checksum, &residueLimaHelperEngine{})
+	client := &ocihelper.Client{
+		Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
+		TakeoverTimeout: 25 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = helperBarrier.Close() })
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	if err := barrier.Ensure(t.Context()); err == nil {
+		t.Fatal("residue readiness attempt unexpectedly succeeded")
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if len(logs) != 1 {
+		t.Fatalf("readiness diagnostic count = %d, want 1: %q", len(logs), logs)
+	}
+	if strings.Contains(logs[0], sentinel) {
+		t.Fatalf("readiness diagnostic exposed runtime inventory: %q", logs[0])
+	}
+	for _, field := range []string{
+		"reason=helper_handshake_failed",
+		"inner_reason=boot_sweep_failed",
+		"error_type=*ocihelper.NamespaceResidueError",
+		"canceled=false",
+		"deadline=false",
+		"eof=false",
+		"timeout=false",
+		"connection_refused=false",
+	} {
+		if !strings.Contains(logs[0], field) {
+			t.Errorf("readiness diagnostic missing %q: %q", field, logs[0])
+		}
+	}
 }
 
 func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T) {
@@ -230,6 +333,7 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 			intent := newMutableIntent(true)
 			runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
 			supervisor := newTestSupervisor(t, intent, runner)
+			supervisor.config.Logf = t.Logf
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			var recoveryContext context.Context
@@ -255,7 +359,8 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 				}
 				t.Logf("repair-phase cleanup socket=%s absent=%t", socketPath, absent)
 			})
-			socketPath = startReadyLimaHelper(t, checksum)
+			var helperServe *helperServeObservation
+			socketPath, helperServe = startReadyLimaHelper(t, checksum)
 			type silentPeer struct {
 				connection net.Conn
 				done       chan struct{}
@@ -266,6 +371,7 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 			var peers []*silentPeer
 			var helperBarrier *ocihelper.BootBarrier
 			t.Cleanup(func() {
+				serveCompleted, serveErr := helperServe.snapshot()
 				cancel()
 				if helperBarrier != nil {
 					_ = helperBarrier.Close()
@@ -274,7 +380,7 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 					_ = peer.connection.Close()
 					<-peer.done
 				}
-				t.Logf("repair-phase cleanup joined_peers=%d barrier_closed=true", len(peers))
+				t.Logf("repair-phase cleanup joined_peers=%d barrier_closed=true helper_serve_completed_before_cleanup=%t helper_serve_error_type=%T helper_serve_error=%v", len(peers), serveCompleted, serveErr, serveErr)
 			})
 			phase := "unavailable"
 			waits, unavailableDials, socketDials := 0, 0, 0
@@ -316,6 +422,7 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 			supervisor.config.wait = func(waitContext context.Context, delay time.Duration) error {
 				waits++
 				reason := helperBarrier.CapabilityReasonCode()
+				helperServeCompleted, helperServeErr := helperServe.snapshot()
 				deadline, hasDeadline := waitContext.Deadline()
 				wantBackoff := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
 				if waitContext != recoveryContext || !hasDeadline || !deadline.Equal(recoveryDeadline) || waitContext.Err() != nil {
@@ -324,7 +431,7 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 				if delay != wantBackoff[min(waits-1, len(wantBackoff)-1)] || helperBarrier.Ready() {
 					t.Fatalf("repair wait=%d delay=%s ready=%t", waits, delay, helperBarrier.Ready())
 				}
-				t.Logf("repair-phase at=%s pid=%d pgid=%d phase=%s wait=%d reason=%s backoff=%s deadline=%s unavailable_dials=%d silent_peers=%d socket_dials=%d", time.Now().UTC().Format(time.RFC3339Nano), os.Getpid(), syscall.Getpgrp(), phase, waits, reason, delay, deadline.Format(time.RFC3339Nano), unavailableDials, len(peers), socketDials)
+				t.Logf("repair-phase at=%s pid=%d pgid=%d phase=%s wait=%d reason=%s backoff=%s deadline=%s unavailable_dials=%d silent_peers=%d socket_dials=%d helper_serve_completed=%t helper_serve_error_type=%T helper_serve_error=%v", time.Now().UTC().Format(time.RFC3339Nano), os.Getpid(), syscall.Getpgrp(), phase, waits, reason, delay, deadline.Format(time.RFC3339Nano), unavailableDials, len(peers), socketDials, helperServeCompleted, helperServeErr, helperServeErr)
 				switch phase {
 				case "unavailable":
 					if reason != contract.CapabilityReasonHelperUnitUnavailable || unavailableDials == 0 || socketDials != 0 || len(peers) != 0 {
@@ -425,7 +532,7 @@ func TestSupervisedBarrierStalledHandshakeRecoversBeforeRecoveryTimeout(t *testi
 	supervisor := newTestSupervisor(t, intent, runner)
 	ready := false
 	checksum := "sha256:" + strings.Repeat("a", 64)
-	socketPath := startReadyLimaHelper(t, checksum)
+	socketPath, _ := startReadyLimaHelper(t, checksum)
 	supervisor.config.wait = func(context.Context, time.Duration) error { ready = true; return nil }
 	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum, Dial: func(ctx context.Context) (net.Conn, error) {
 		if ready {
