@@ -315,6 +315,133 @@ func TestAttemptCredentialAuthorityPredicates(t *testing.T) {
 	}
 }
 
+// Authorization happens before CreateJobAs opens its transaction, so the
+// window between them must not be able to persist a child. The store is
+// driven directly with an already-resolved scope, which is exactly the state
+// that window produces; there is no "pause mid-transaction" seam in the
+// harness, so this reproduces the end state rather than the interleaving.
+func TestAttemptCredentialRevalidatesInsideTheWriteTransaction(t *testing.T) {
+	for _, probe := range []struct {
+		name          string
+		loseAuthority func(*integrationHarness, Node, *Claim)
+	}{
+		{"attempt completed after authorization", func(h *integrationHarness, node Node, claim *Claim) {
+			exitCode := 0
+			if _, err := h.store.CompleteAttempt(t.Context(), node.NodeID, claim.Job.JobID, claim.Lease.AttemptID,
+				CompletionRequest{
+					FencingToken: claim.Lease.FencingToken, IdempotencyKey: "toctou-completion",
+					Result: ProcessResult{ExitCode: &exitCode},
+				}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"lease lost after authorization", func(h *integrationHarness, _ Node, _ *Claim) {
+			h.clock.Advance(2 * time.Minute)
+			if _, err := h.store.Reconcile(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			h, client, agent, node := credentialHarness(t)
+			h.submit(client, "toctou-parent", []string{"linux"})
+			claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+
+			// Resolve the credential while it is still live: this is what the
+			// HTTP layer hands to CreateJobAs.
+			scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+			if err != nil {
+				t.Fatalf("resolve live credential: %v", err)
+			}
+			probe.loseAuthority(h, node, &claim)
+
+			_, _, err = h.store.CreateJobAs(t.Context(),
+				validJobSpec("toctou-child", []string{"linux"}), JobOrigin{Parent: &scope})
+			if errorCode(err) != contract.ErrorUnauthorized {
+				t.Fatalf("create with a stale credential = %v (code %s), want %s",
+					err, errorCode(err), contract.ErrorUnauthorized)
+			}
+			// The refusal must happen before any row is written.
+			page, err := h.store.ListChildJobs(t.Context(), claim.Job.JobID, "", DefaultJobPageLimit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Jobs) != 0 {
+				t.Fatalf("a child was persisted despite lost authority: %#v", page.Jobs)
+			}
+			var consumed int
+			if err := h.store.db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM jobs WHERE dispatch_key=?", "toctou-child").Scan(&consumed); err != nil {
+				t.Fatal(err)
+			}
+			if consumed != 0 {
+				t.Fatal("the refused child's dispatch key was consumed")
+			}
+		})
+	}
+}
+
+// Parentage alone is not identity. A child always inherits its root submitter,
+// so a row whose submitter diverges is not one this credential may replay.
+func TestReplayScopeRequiresBothParentAndSubmitter(t *testing.T) {
+	parent := AttemptCredentialScope{JobID: "job-parent", OriginatingSubmitter: "submitter-a"}
+	for _, probe := range []struct {
+		name     string
+		origin   JobOrigin
+		replayed Job
+		want     bool
+	}{
+		{"client principal is unrestricted", JobOrigin{}, Job{ParentJobID: "anything"}, true},
+		{"own child", JobOrigin{Parent: &parent},
+			Job{ParentJobID: "job-parent", OriginatingSubmitter: "submitter-a"}, true},
+		{"same parent, different submitter", JobOrigin{Parent: &parent},
+			Job{ParentJobID: "job-parent", OriginatingSubmitter: "submitter-b"}, false},
+		{"another parent's child", JobOrigin{Parent: &parent},
+			Job{ParentJobID: "job-other", OriginatingSubmitter: "submitter-a"}, false},
+		{"a root job", JobOrigin{Parent: &parent},
+			Job{ParentJobID: "", OriginatingSubmitter: "submitter-a"}, false},
+	} {
+		if got := replayWithinScope(probe.origin, probe.replayed); got != probe.want {
+			t.Errorf("%s = %t, want %t", probe.name, got, probe.want)
+		}
+	}
+}
+
+// Reads obey the ordinary class-selector rule, not a credential-specific one.
+func TestAttemptCredentialReadsFollowTheClassSelectorRule(t *testing.T) {
+	h, client, agent, node := credentialHarness(t)
+	service := submitRestartService(t, h, client, "class-rule-service", []string{"linux"}, nil)
+	claim := claimClass(t, h, agent, node, contract.JobClassService)
+	if claim.Job.JobID != service.JobID {
+		t.Fatalf("claimed %q, want the service %q", claim.Job.JobID, service.JobID)
+	}
+	status, body := h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+service.JobID, claim.AttemptToken, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("unscoped service read status = %d body=%s, want %d", status, body, http.StatusBadRequest)
+	}
+	status, body = h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+service.JobID+"?class=service", claim.AttemptToken, nil)
+	if status != http.StatusOK {
+		t.Fatalf("class-scoped service read status = %d body=%s", status, body)
+	}
+
+	// A one-shot child is the mirror image: no selector, and a selector is a
+	// not-found rather than a different job.
+	status, body = h.credentialRequest(agent, http.MethodPost, "/v1/jobs", claim.AttemptToken,
+		validJobSpec("class-rule-child", []string{"linux"}))
+	if status != http.StatusCreated {
+		t.Fatalf("child submit status = %d body=%s", status, body)
+	}
+	child := decodeJob(t, body)
+	status, body = h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+child.JobID, claim.AttemptToken, nil)
+	if status != http.StatusOK {
+		t.Fatalf("unscoped one-shot child read status = %d body=%s", status, body)
+	}
+	status, body = h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+child.JobID+"?class=service", claim.AttemptToken, nil)
+	if status != http.StatusNotFound {
+		t.Fatalf("class-scoped one-shot child read status = %d body=%s, want %d", status, body, http.StatusNotFound)
+	}
+}
+
 // One attempt's credential is authority over that attempt's job alone.
 func TestAttemptCredentialCannotActOnAnotherJob(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}, "node-2": {"linux"}})
@@ -479,11 +606,17 @@ func TestAttemptCredentialSpawnDepthIsCapped(t *testing.T) {
 	h.submit(client, "spawn-depth-root", []string{"linux"})
 	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
 
-	// Grow the chain to exactly the cap through the store, then prove the next
-	// hop is refused on the wire.
-	scope := AttemptCredentialScope{
-		AttemptID: claim.Lease.AttemptID, JobID: claim.Job.JobID,
-		NodeID: node.NodeID, OriginatingSubmitter: "submitter",
+	// Walk a real credential up through every depth to the cap, then prove the
+	// next hop is refused. The scope stays the one L1 actually resolved, so the
+	// in-transaction revalidation is satisfied at every step; only the depth
+	// moves, which is the value the cap is about. Building a literal eight-deep
+	// ancestry through claims would test the scheduler, not the cap.
+	scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+	if err != nil {
+		t.Fatalf("resolve live credential: %v", err)
+	}
+	if scope.SpawnDepth != 0 {
+		t.Fatalf("root attempt credential depth = %d, want 0", scope.SpawnDepth)
 	}
 	for depth := 1; depth <= MaxSpawnDepth; depth++ {
 		parent := scope
@@ -491,16 +624,18 @@ func TestAttemptCredentialSpawnDepthIsCapped(t *testing.T) {
 		child, _, err := h.store.CreateJobAs(t.Context(),
 			validJobSpec("spawn-depth-"+strings.Repeat("x", depth), []string{"linux"}), JobOrigin{Parent: &parent})
 		if err != nil {
-			t.Fatalf("create chain job at depth %d: %v", depth, err)
+			t.Fatalf("create job at depth %d: %v", depth, err)
 		}
 		if child.SpawnDepth != depth {
-			t.Fatalf("chain job depth = %d, want %d", child.SpawnDepth, depth)
+			t.Fatalf("job depth = %d, want %d", child.SpawnDepth, depth)
 		}
-		scope.JobID = child.JobID
+		if child.OriginatingSubmitter != "submitter" {
+			t.Fatalf("job at depth %d submitter = %q, want the inherited root submitter", depth, child.OriginatingSubmitter)
+		}
 	}
 	atCap := scope
 	atCap.SpawnDepth = MaxSpawnDepth
-	_, _, err := h.store.CreateJobAs(t.Context(),
+	_, _, err = h.store.CreateJobAs(t.Context(),
 		validJobSpec("spawn-depth-over-cap", []string{"linux"}), JobOrigin{Parent: &atCap})
 	if errorCode(err) != contract.ErrorSpawnDepthExceeded {
 		t.Fatalf("submit past the cap = %v, want %s", err, contract.ErrorSpawnDepthExceeded)

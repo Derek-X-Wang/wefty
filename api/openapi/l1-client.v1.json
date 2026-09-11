@@ -248,7 +248,7 @@
       "get": {
         "operationId": "getJob",
         "summary": "Read service job status",
-        "description": "class=service is mechanically required for a service job. A request carrying Authorization: Bearer <attempt credential> instead reads the credential's own job or one of that job's children, without a class selector, exactly as an unscoped one-shot read already behaves.",
+        "description": "The class selector is mechanically required for a service job and must be absent for a one-shot; an unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found. A request carrying Authorization: Bearer <attempt credential> reads the credential's own job or one of that job's children under exactly that same rule: a service target still requires class=service and a one-shot target still omits it. An attempt credential addressing any other job, or one that does not exist, receives the identical forbidden answer.",
         "security": [
           { "fabricIdentity": [] },
           { "fabricIdentity": [], "attemptCredential": [] }

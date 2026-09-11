@@ -2510,23 +2510,76 @@ func TestIncompleteLoggerEvidencePublishesDiscardedByteGap(t *testing.T) {
 func TestPreparedMacFallbackRewritesEndpointOnlyWhenActivated(t *testing.T) {
 	original := []EnvironmentVariable{{Name: contract.EnvL3Endpoint, Value: "http://host.lima.internal:4242/l3"}}
 	address := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4343}
-	dormant, guestEndpoint, err := fallbackBridgeEnvironment(original, address, false)
+	dormant, endpoints, err := fallbackBridgeEnvironment(original, address, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dormant[0].Value != original[0].Value || guestEndpoint != "http://127.0.0.1:4343/l3" {
-		t.Fatalf("dormant fallback environment=%v guest=%q", dormant, guestEndpoint)
+	if dormant[0].Value != original[0].Value || endpoints.l3 != "http://127.0.0.1:4343/l3" {
+		t.Fatalf("dormant fallback environment=%v guest=%q", dormant, endpoints.l3)
 	}
-	active, guestEndpoint, err := fallbackBridgeEnvironment(original, address, true)
+	active, endpoints, err := fallbackBridgeEnvironment(original, address, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if active[0].Value != guestEndpoint || guestEndpoint != "http://127.0.0.1:4343/l3" {
-		t.Fatalf("active fallback environment=%v guest=%q", active, guestEndpoint)
+	if active[0].Value != endpoints.l3 || endpoints.l3 != "http://127.0.0.1:4343/l3" {
+		t.Fatalf("active fallback environment=%v guest=%q", active, endpoints.l3)
 	}
-	defaultOff, guestEndpoint, err := fallbackBridgeEnvironment(nil, address, false)
-	if err != nil || len(defaultOff) != 0 || guestEndpoint == "" {
-		t.Fatalf("default-off dormant fallback environment=%v guest=%q err=%v", defaultOff, guestEndpoint, err)
+	defaultOff, endpoints, err := fallbackBridgeEnvironment(nil, address, false)
+	if err != nil || len(defaultOff) != 0 || endpoints.l3 == "" {
+		t.Fatalf("default-off dormant fallback environment=%v guest=%q err=%v", defaultOff, endpoints.l3, err)
+	}
+}
+
+// An L1-only OCI attempt has no run-ledger endpoint at all. Retargeting only
+// WEFTY_L3_ENDPOINT would leave the credential surface pointing at a host
+// loopback address that, inside the Lima guest, is the guest itself.
+func TestPreparedMacFallbackRetargetsTheAttemptCredentialEndpoint(t *testing.T) {
+	address := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4343}
+	l1Only := []EnvironmentVariable{{Name: contract.EnvL1Endpoint, Value: "http://host.lima.internal:4242/l1"}}
+
+	dormant, endpoints, err := fallbackBridgeEnvironment(l1Only, address, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dormant[0].Value != l1Only[0].Value {
+		t.Fatalf("dormant fallback rewrote the environment: %v", dormant)
+	}
+	if endpoints.l1 != "http://127.0.0.1:4343/l1" {
+		t.Fatalf("dormant guest L1 endpoint = %q", endpoints.l1)
+	}
+
+	active, endpoints, err := fallbackBridgeEnvironment(l1Only, address, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active[0].Value != "http://127.0.0.1:4343/l1" {
+		t.Fatalf("active fallback L1 environment = %v, want the guest bridge", active)
+	}
+	if endpoints.l1 != "http://127.0.0.1:4343/l1" {
+		t.Fatalf("active guest L1 endpoint = %q", endpoints.l1)
+	}
+
+	// Both surfaces travel together when L3 dispatched an OCI job that also
+	// carries a credential: same host, separate paths.
+	both := []EnvironmentVariable{
+		{Name: contract.EnvL3Endpoint, Value: "http://host.lima.internal:4242/l3"},
+		{Name: contract.EnvL1Endpoint, Value: "http://host.lima.internal:4242/l1"},
+	}
+	rewritten, endpoints, err := fallbackBridgeEnvironment(both, address, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten[0].Value != "http://127.0.0.1:4343/l3" || rewritten[1].Value != "http://127.0.0.1:4343/l1" {
+		t.Fatalf("paired fallback environment = %v", rewritten)
+	}
+	if endpoints.l3 != "http://127.0.0.1:4343/l3" || endpoints.l1 != "http://127.0.0.1:4343/l1" {
+		t.Fatalf("paired guest endpoints = %+v", endpoints)
+	}
+
+	if _, _, err := fallbackBridgeEnvironment([]EnvironmentVariable{
+		{Name: contract.EnvL1Endpoint, Value: "::not-a-url"},
+	}, address, true); err == nil {
+		t.Fatal("an unparseable L1 endpoint was accepted")
 	}
 }
 

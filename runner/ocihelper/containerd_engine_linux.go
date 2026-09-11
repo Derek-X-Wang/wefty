@@ -1016,12 +1016,21 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err != nil {
 			return RunResponse{}, fmt.Errorf("reserve constrained guest-to-host bridge: %w", err)
 		}
-		request.Workload.ReservedEnvironment, hostBridgeEndpoint, err = fallbackBridgeEnvironment(request.Workload.ReservedEnvironment, hostBridge.Addr(), request.ActivateHostBridgeFallback)
+		var fallbackEndpoints fallbackBridgeEndpoints
+		request.Workload.ReservedEnvironment, fallbackEndpoints, err = fallbackBridgeEnvironment(request.Workload.ReservedEnvironment, hostBridge.Addr(), request.ActivateHostBridgeFallback)
 		if err != nil {
 			return RunResponse{}, err
 		}
-		if request.ActivateHostBridgeFallback && request.Workload.L3Endpoint != "" {
-			request.Workload.L3Endpoint = hostBridgeEndpoint
+		// HostBridgeEndpoint keeps naming the run-ledger surface, which is what
+		// existing callers read; the closed minting inputs each follow their own.
+		hostBridgeEndpoint = fallbackEndpoints.l3
+		if request.ActivateHostBridgeFallback {
+			if request.Workload.L3Endpoint != "" {
+				request.Workload.L3Endpoint = fallbackEndpoints.l3
+			}
+			if request.Workload.L1Endpoint != "" {
+				request.Workload.L1Endpoint = fallbackEndpoints.l1
+			}
 		}
 	}
 	request.Workload.helperMintedReserved = true
@@ -1453,30 +1462,52 @@ func (engine *ContainerdEngine) translateOperatorMountSource(source string) (str
 	return translated, nil
 }
 
-func fallbackBridgeEnvironment(environment []EnvironmentVariable, address net.Addr, activate bool) ([]EnvironmentVariable, string, error) {
-	index := -1
-	endpoint := &url.URL{Scheme: "http", Host: address.String(), Path: "/l3"}
-	for position, variable := range environment {
-		if variable.Name != contract.EnvL3Endpoint {
-			continue
+// fallbackBridgeEndpoints carries the guest-visible address of each
+// attempt-local control-plane surface. The agent serves them on one bridge.
+type fallbackBridgeEndpoints struct {
+	l1 string
+	l3 string
+}
+
+// fallbackBridgeEnvironment retargets every reserved control-plane endpoint at
+// the guest-side fallback listener. Both names move to the same address and
+// keep their own path, because the agent serves /l1 and /l3 on one bridge.
+// Rewriting only one would leave the other holding a host 127.0.0.1 address,
+// which inside the guest names a different machine entirely — an L1-only OCI
+// attempt under the fallback would quietly dial its own loopback.
+func fallbackBridgeEnvironment(environment []EnvironmentVariable, address net.Addr, activate bool) ([]EnvironmentVariable, fallbackBridgeEndpoints, error) {
+	result := environment
+	if activate {
+		result = append([]EnvironmentVariable(nil), environment...)
+	}
+	var endpoints fallbackBridgeEndpoints
+	for _, surface := range []struct {
+		name string
+		path string
+		out  *string
+	}{
+		{name: contract.EnvL3Endpoint, path: "/l3", out: &endpoints.l3},
+		{name: contract.EnvL1Endpoint, path: "/l1", out: &endpoints.l1},
+	} {
+		endpoint := &url.URL{Scheme: "http", Host: address.String(), Path: surface.path}
+		for position, variable := range result {
+			if variable.Name != surface.name {
+				continue
+			}
+			parsed, err := url.Parse(variable.Value)
+			if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+				return nil, fallbackBridgeEndpoints{}, fmt.Errorf("Lima host bridge fallback requires a valid HTTP %s", surface.name)
+			}
+			parsed.Host = address.String()
+			endpoint = parsed
+			if activate {
+				result[position].Value = endpoint.String()
+			}
+			break
 		}
-		parsed, err := url.Parse(variable.Value)
-		if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
-			return nil, "", errors.New("Lima host bridge fallback requires a valid HTTP WEFTY_L3_ENDPOINT")
-		}
-		index, endpoint = position, parsed
-		break
+		*surface.out = endpoint.String()
 	}
-	if index < 0 {
-		return environment, endpoint.String(), nil
-	}
-	endpoint.Host = address.String()
-	if !activate {
-		return environment, endpoint.String(), nil
-	}
-	result := append([]EnvironmentVariable(nil), environment...)
-	result[index].Value = endpoint.String()
-	return result, endpoint.String(), nil
+	return result, endpoints, nil
 }
 
 func (engine *ContainerdEngine) Signal(ctx context.Context, request SignalRequest) error {

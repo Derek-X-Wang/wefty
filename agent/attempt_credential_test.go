@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -149,6 +151,61 @@ func TestControlPlaneBridgeAllowsOnlyTheAttemptCredentialRoutes(t *testing.T) {
 			t.Errorf("%s %s allowed = %t, want %t", probe.method, probe.path, got, probe.allowed)
 		}
 	}
+}
+
+// The bridge now exists for every one-shot attempt, which must not hand an
+// L1-only workload a loopback door to the run ledger it could not reach before.
+// Reachability is not authority — L3 still demands a run token — but an attempt
+// with no run context has no business dialling the ledger at all.
+func TestBridgeOmitsTheRunLedgerSurfaceForAnL1OnlyAttempt(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "suppress-node"})
+	agent := &Agent{fabric: participant, controlPlaneAddr: "wefty://control-plane", runLedgerAddr: "wefty://run-ledger"}
+
+	l1Only, err := agent.startWorkflowBridge(t.Context(), contract.JobKindProcess, contract.ExecutionSpec{})
+	if err != nil || l1Only == nil {
+		t.Fatalf("L1-only bridge = (%v, %v), want a bridge", l1Only, err)
+	}
+	defer l1Only.close()
+	if l1Only.l1Endpoint == "" {
+		t.Fatal("L1-only attempt received no attempt-credential surface")
+	}
+	if l1Only.l3Endpoint != "" {
+		t.Fatalf("L1-only attempt was given a run-ledger endpoint %q", l1Only.l3Endpoint)
+	}
+	if status := bridgeProbeStatus(t, l1Only, "/l3/v1/runs"); status != http.StatusNotFound {
+		t.Fatalf("L1-only /l3 probe = %d, want %d", status, http.StatusNotFound)
+	}
+
+	// An L3-dispatched attempt keeps both surfaces.
+	dispatched, err := agent.startWorkflowBridge(t.Context(), contract.JobKindProcess, contract.ExecutionSpec{
+		Env: map[string]string{contract.EnvL3Endpoint: "http://placeholder.invalid/l3"},
+	})
+	if err != nil || dispatched == nil {
+		t.Fatalf("L3-dispatched bridge = (%v, %v), want a bridge", dispatched, err)
+	}
+	defer dispatched.close()
+	if dispatched.l3Endpoint == "" || dispatched.l1Endpoint == "" {
+		t.Fatalf("L3-dispatched bridge endpoints l1=%q l3=%q, want both", dispatched.l1Endpoint, dispatched.l3Endpoint)
+	}
+}
+
+func bridgeProbeStatus(t *testing.T, bridge *workflowBridge, path string) int {
+	t.Helper()
+	connection, err := bridge.dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return connection, nil },
+	}}
+	response, err := client.Get("http://bridge.invalid" + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+	return response.StatusCode
 }
 
 // A short line must not wait behind a long credential: the redactor withholds

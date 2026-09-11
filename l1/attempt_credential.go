@@ -26,9 +26,13 @@ const attemptCredentialBytes = 32
 // attempt credential. Every member is read from L1's own records; none of it
 // can be influenced by the request body.
 type AttemptCredentialScope struct {
-	AttemptID            string
-	JobID                string
-	NodeID               string
+	AttemptID string
+	JobID     string
+	NodeID    string
+	// IdentityNodeID is the Fabric identity the credential was proved against.
+	// Carrying it lets a later transaction re-run the identical liveness
+	// predicates without re-deriving who asked.
+	IdentityNodeID       string
 	OriginatingSubmitter string
 	SpawnDepth           int
 }
@@ -97,7 +101,21 @@ func (s *Store) ResolveAttemptCredential(ctx context.Context, token, identityNod
 		canonicalTime(s.clock.Now()).UnixNano()); err != nil {
 		return AttemptCredentialScope{}, err
 	}
+	scope.IdentityNodeID = identityNodeID
 	return scope, nil
+}
+
+// revalidateAttemptCredential re-runs the same liveness predicates inside a
+// write transaction. Authorization happens before the transaction opens, so an
+// attempt that loses authority in that window would otherwise still persist a
+// child; re-reading through the transaction closes the gap against the same
+// snapshot the write commits on.
+func revalidateAttemptCredential(ctx context.Context, q queryer, scope AttemptCredentialScope, nowNS int64) error {
+	authority, err := readAttemptAuthority(ctx, q, scope.AttemptID)
+	if err != nil {
+		return protocolError(contract.ErrorUnauthorized, "attempt credential is no longer live")
+	}
+	return validateAttemptCredentialAuthority(scope.IdentityNodeID, scope, authority, nowNS)
 }
 
 // validateAttemptCredentialAuthority is validateAttemptAuthority's predicate

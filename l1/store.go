@@ -1695,6 +1695,15 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	}
 	defer tx.Rollback()
 
+	// Authorization ran before this transaction opened. Re-prove the credential
+	// against the snapshot the write will commit on, so an attempt that lost
+	// authority in that window cannot still persist a child.
+	if origin.Parent != nil {
+		if err := revalidateAttemptCredential(ctx, tx, *origin.Parent, now.UnixNano()); err != nil {
+			return Job{}, false, err
+		}
+	}
+
 	job, storedHash, err := getJobByDispatchKey(ctx, tx, spec.DispatchKey, now)
 	if err == nil {
 		if !replayWithinScope(origin, job) || storedHash != requestHash {
@@ -1779,12 +1788,16 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHa
 // keeps a retried attempt's resubmission idempotent; every other key is
 // reported as a dispatch-key conflict, identical to the mismatched-request
 // answer. Replay is therefore neither a way to read a job outside the
-// credential's scope nor an oracle for which keys exist.
+// credential's scope nor an oracle for which keys exist. The originating
+// submitter must match as well: parentage alone is not identity, and a child
+// always inherits its root submitter, so a divergence means the row is not the
+// one this credential is entitled to.
 func replayWithinScope(origin JobOrigin, replayed Job) bool {
 	if origin.Parent == nil {
 		return true
 	}
-	return replayed.ParentJobID != "" && replayed.ParentJobID == origin.Parent.JobID
+	return replayed.ParentJobID != "" && replayed.ParentJobID == origin.Parent.JobID &&
+		replayed.OriginatingSubmitter == origin.Parent.OriginatingSubmitter
 }
 
 func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {

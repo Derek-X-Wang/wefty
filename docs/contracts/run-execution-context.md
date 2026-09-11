@@ -98,6 +98,13 @@ reading that job's children. No other route accepts it, so no operator-level
 action is reachable with it; the service collection read `GET /v1/jobs` is
 refused with `principal_forbidden` like every other job route.
 
+Reads follow the ordinary class-selector rule rather than a credential-specific
+one: `class=service` is required when the target is a service job and must be
+absent when it is a one-shot, exactly as for a client principal. A job that is
+neither the credential's own nor one of its children receives `forbidden`, and
+so does a job ID that does not exist, so the route cannot be used to discover
+which jobs are present.
+
 Parent job, parent attempt, and originating submitter are derived from the
 credential and can never be supplied by the caller: they live on the job
 resource, not on `JobSpec`, and `JobSpec` decoding rejects unknown members. The

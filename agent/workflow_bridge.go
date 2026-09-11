@@ -39,8 +39,13 @@ type workflowBridge struct {
 	l3Endpoint string
 	// l1Endpoint and l1 are present only on a run-surface bridge. A Computer
 	// bridge never carries the attempt-credential surface.
-	l1Endpoint         string
-	l1                 *http.Transport
+	l1Endpoint string
+	l1         *http.Transport
+	// suppressRunLedger keeps the /l3 proxy off a bridge for an attempt L3
+	// never dispatched. The bridge now exists for every one-shot attempt, so
+	// without this an L1-only workload could reach the run ledger's HTTP
+	// surface over loopback, which it could not before.
+	suppressRunLedger  bool
 	server             *http.Server
 	l3                 *http.Transport
 	hostBridgeFallback bool
@@ -94,6 +99,13 @@ func (e *workflowBridgeDrainError) ActiveConnectionCount() int {
 // must never receive the attempt-credential surface.
 type workflowBridgeOption func(*workflowBridge)
 
+// withoutRunLedgerSurface omits /l3 entirely. Reachability is not authority —
+// L3 still demands a run token — but an attempt with no run context has no
+// business being able to dial the ledger at all.
+func withoutRunLedgerSurface() workflowBridgeOption {
+	return func(b *workflowBridge) { b.suppressRunLedger = true }
+}
+
 func withControlPlaneSurface(participant fabric.Fabric, address string) workflowBridgeOption {
 	return func(b *workflowBridge) {
 		if participant == nil || strings.TrimSpace(address) == "" {
@@ -118,6 +130,9 @@ func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution 
 		// or not L3 dispatched it. That is the whole point: an L1-only user
 		// must be able to spawn work from inside work.
 		options = append(options, withControlPlaneSurface(a.fabric, a.controlPlaneAddr))
+		if execution.Env[contract.EnvL3Endpoint] == "" {
+			options = append(options, withoutRunLedgerSurface())
+		}
 	}
 	if kind == contract.JobKindOCI && a.ociBridgeBinder != nil {
 		binding, err := a.ociBridgeBinder.Bind(ctx)
@@ -222,7 +237,9 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		bridge.setReachable(reachable)
 	} else {
 		mux := http.NewServeMux()
-		mux.Handle("/l3/", l3Proxy)
+		if !bridge.suppressRunLedger {
+			mux.Handle("/l3/", l3Proxy)
+		}
 		if bridge.l1 != nil {
 			mux.Handle("/l1/", bridge.controlPlaneHandler(
 				workflowReverseProxy(bridge.l1, "/l1", contract.ErrorInternal)))
@@ -244,7 +261,9 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		},
 	}
 	baseURL := "http://" + net.JoinHostPort(binding.AdvertiseHost, strconv.Itoa(tcpAddress.Port))
-	bridge.l3Endpoint = baseURL + "/l3"
+	if !bridge.suppressRunLedger {
+		bridge.l3Endpoint = baseURL + "/l3"
+	}
 	if bridge.l1 != nil {
 		bridge.l1Endpoint = baseURL + "/l1"
 	}
