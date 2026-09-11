@@ -164,12 +164,33 @@ func TestServiceAcceptanceAttendedLimaGatewayBindingReceipt(t *testing.T) {
 	if instance == "" {
 		instance = DefaultInstanceName
 	}
+	// Which binding is safe depends on how Lima attached this instance, so the
+	// receipt records the arrangement it was actually judged against.
+	vmType, err := instanceVMType(t.Context(), runCommand, "limactl", instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A provenance rejection is returned as an error here, so reaching the
+	// binding at all is the guard's acceptance of the discovered gateway.
 	binding, err := NewBridgeBinder(instance).Bind(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer binding.Listener.Close()
-	if binding.AdvertiseHost != HostGatewayName || binding.HostBridgeFallback {
+	transport := "discovered-gateway-primary-bind"
+	if vmType == vzVMType {
+		// A vz instance's user-mode network lives inside
+		// Virtualization.framework: macOS cannot assign the gateway address to
+		// a socket, so the capability-gated host-loopback bridge is the
+		// transport, not a degraded form of one.
+		transport = "host-loopback-fallback-selected"
+		if !binding.HostBridgeFallback || binding.AdvertiseHost != "127.0.0.1" {
+			t.Fatalf("unsafe attended vz bridge binding: %+v", binding)
+		}
+		if address, ok := binding.Listener.Addr().(*net.TCPAddr); !ok || !address.IP.IsLoopback() {
+			t.Fatalf("vz bridge listener is not host loopback: %v", binding.Listener.Addr())
+		}
+	} else if binding.AdvertiseHost != HostGatewayName || binding.HostBridgeFallback {
 		t.Fatalf("unsafe attended bridge binding: %+v", binding)
 	}
 	marker := "wefty-lima-gateway-roundtrip"
@@ -196,7 +217,27 @@ func TestServiceAcceptanceAttendedLimaGatewayBindingReceipt(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	t.Log(`{"status":"PASS","row":"gateway-discovery-and-constrained-bind"}`)
+	receipt, err := json.Marshal(map[string]any{
+		"status":               "PASS",
+		"row":                  "gateway-discovery-and-constrained-bind",
+		"vm_type":              vmType,
+		"transport":            transport,
+		"advertise_host":       binding.AdvertiseHost,
+		"host_bridge_fallback": binding.HostBridgeFallback,
+		"guest_round_trip":     true,
+		// Say exactly what the round trip went through. It is Lima's own
+		// forwarding of HostGatewayName to the host loopback, not the helper
+		// reverse tunnel, and this probe checks no capability at all.
+		"round_trip_via": "lima host.lima.internal forwarding, not DialHostBridge",
+		// The per-attempt bridge capability is helper-issued at attempt start
+		// from this same selection; DialHostBridge and its wrong-capability and
+		// wrong-attempt refusals are the fallback row's proof, not this one's.
+		"bridge_capability_note": "helper-issued per attempt from host_bridge_fallback; proven by the guest-to-host fallback row, not here",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(string(receipt))
 }
 
 func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
