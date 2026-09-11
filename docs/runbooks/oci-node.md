@@ -418,3 +418,19 @@ Meaning: sizing differs and requires an authorized restart. Evidence: record old
 ## doctor-code-oci-convergence-recreate-required
 
 Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference and positive zero-live-attempt proof. First action: obtain explicit operator confirmation, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory.
+
+## doctor-code-oci-attempt-ownership-quarantine-not-run
+
+Meaning: the dependent helper read did not run, so the Attempt ownership quarantine root was never inspected. Evidence: the helper handshake or mechanics read that failed first. First action: resolve the upstream helper finding. Escalation: attach the helper unit status and journal after secret review.
+
+## doctor-code-oci-attempt-ownership-quarantine-unavailable
+
+Meaning: the helper-owned `attempt-ownership-quarantine` root could not be read. Evidence: record filesystem metadata for `<runtime-root>/attempt-ownership-quarantine`. First action: confirm the runtime root is mounted and root-owned. Escalation: never delete the root to clear this finding.
+
+## doctor-code-oci-attempt-ownership-quarantine-absent
+
+Meaning: every durable Attempt ownership record reconciled with its own fenced authority. Evidence: preserve the doctor snapshot. First action: none. Escalation: none.
+
+## doctor-code-oci-attempt-ownership-quarantined
+
+Meaning: the boot sweep could not reconcile one or more durable Attempt ownership records and moved them aside instead of wedging helper startup; the helper is serving. Evidence: read each `quarantine.json` receipt (kind, receipt ID, record name, typed reason, quarantine time) and the `record.json` beside it. First action: confirm the named Attempt is not live, then decide whether the quarantined bytes name real residue; sweep leaves those resources operator-owned. Escalation: attach the receipts and the runtime inventory; do not copy a quarantined record back into `attempt-ownership`.

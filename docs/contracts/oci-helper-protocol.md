@@ -740,7 +740,33 @@ identities. Publication, snapshot loading, stale-temp cleanup, record removal,
 and unknown-version GC share one engine lock, so no sweep or read-only Verify
 can unlink an in-flight publication. Removing the final record preserves the
 `attempt-ownership` parent directory. Labelled containerd metadata may reconstruct the same record before
-that metadata is deleted during sweep. A deterministic-looking name is never
+that metadata is deleted during sweep.
+
+That reconstruction is deliberately partial. Every resource name in the record
+is derived from the seven-field authority **except** the handoff volume
+directory, which is derived from the stable owner key and therefore cannot be
+re-derived from labels alone. A boot sweep holding nothing but labelled metadata
+compares only the authority-derived names, and **re-adopts** a matching record
+from a previous helper generation verbatim -- keeping the owner-key-derived
+handoff name and any retention receipts it carries -- rather than treating the
+one field it cannot re-derive as a fencing conflict. Re-adoption is not a
+relaxation of fencing: the record's file name is the digest of its complete
+authority tuple, so a matching name with a non-matching tuple is corruption, not
+a superseded writer.
+
+A record that genuinely cannot be reconciled -- unreadable, structurally
+invalid, an unknown version, or a tuple that contradicts its own name -- is
+**quarantined**, never deleted and never allowed to wedge startup. The helper
+renames it into `attempt-ownership-quarantine/<receipt id>/record.json` and
+fsyncs a typed `attempt_ownership_unreconcilable` receipt beside it carrying the
+receipt ID, the record name, one of `unreadable` / `invalid_record` /
+`unknown_version` / `authority_mismatch`, and the quarantine time. The sweep
+then publishes a fresh record for the authority it just proved from labels and
+continues, so the helper starts. Quarantined bytes are operator-owned durable
+state, not runnable namespace residue: they appear in the node doctor as
+`oci_attempt_ownership_quarantined` and are removed only by a human.
+
+A deterministic-looking name is never
 ownership: sweep mutates a log directory or cgroup only when the exact resource
 identity is bound by that durable record and the helper's locked registry says
 the Attempt is no longer live. It rechecks that registry immediately before
