@@ -152,13 +152,6 @@ func TestUnreconcilableOwnershipRecordIsQuarantinedAndStartupProceeds(t *testing
 			}),
 			reason: AttemptOwnershipQuarantineInvalidRecord,
 		},
-		{
-			name: "unknown record version",
-			payload: mustMarshal(t, durableAttemptOwnership{
-				Version: durableAttemptOwnershipVersion + 1, Authority: authority, Resources: live,
-			}),
-			reason: AttemptOwnershipQuarantineUnknownVersion,
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runtimeRoot := t.TempDir()
@@ -206,6 +199,61 @@ func TestUnreconcilableOwnershipRecordIsQuarantinedAndStartupProceeds(t *testing
 				t.Fatalf("startup did not republish a record for the proven authority: %+v", republished)
 			}
 		})
+	}
+}
+
+// A record version this build cannot interpret is a rollback, not corruption.
+// Quarantining it would empty the ownership root on the first boot after an
+// upgrade and throw away every live Attempt's retention receipts, so the sweep
+// leaves it exactly where it is and lets the existing unbound + GC-when-
+// quiescent path handle it.
+func TestAnUnknownRecordVersionIsLeftForTheExistingUnboundGarbageCollector(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	authority := testAuthority()
+	live := liveAttemptResources(t, authority, "job-1:handoff-owner")
+	future := durableAttemptOwnership{
+		Version: durableAttemptOwnershipVersion + 1, Authority: authority, Resources: live,
+		Retentions: []DurableRetention{{
+			Class: RemovalResourceLogSegments, ID: live.LogSegmentDirectory, AttemptID: authority.AttemptID,
+			Reason: DurableRetentionReasonLogSpoolSealing, Bound: 5 * time.Minute,
+			Deadline: time.Date(2026, 9, 11, 21, 6, 51, 0, time.UTC),
+		}},
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot}}
+	if err := engine.writeAttemptOwnershipRecord(future); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(engine.attemptOwnershipPath(live))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.ensureAttemptOwnershipRecord(authority, bootSweepResources(t, authority)); err != nil {
+		t.Fatalf("an unknown record version wedged helper startup: %v", err)
+	}
+
+	after, err := os.ReadFile(engine.attemptOwnershipPath(live))
+	if err != nil {
+		t.Fatalf("the unknown-version record was moved or removed: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("the unknown-version record was rewritten: got %q, want %q", after, before)
+	}
+	quarantines, err := engine.attemptOwnershipQuarantines()
+	if err != nil || len(quarantines) != 0 {
+		t.Fatalf("an unknown record version was quarantined: %+v err=%v", quarantines, err)
+	}
+	// It stays unbound, so it cannot authorize any removal ...
+	records, err := engine.loadAttemptOwnershipRecords()
+	if err != nil || len(records) != 0 {
+		t.Fatalf("an unknown-version record was bound to resources: %+v err=%v", records, err)
+	}
+	// ... and the existing garbage collector still takes it once quiescent.
+	if _, _, err := engine.runtimeAbsenceInventory(ResourceInventory{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(engine.attemptOwnershipPath(live)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the quiescent unknown-version record was not GC'd: %v", err)
 	}
 }
 

@@ -34,21 +34,45 @@ func sameAuthorityDerivedResourceNames(left, right ResourceIdentity) bool {
 		left.ServiceVolumeOwnerRecord == right.ServiceVolumeOwnerRecord
 }
 
-// attemptOwnershipReadoptionRefusal reports the typed reason an existing record
-// cannot be re-adopted under the given fenced authority, or reconcilable=true.
-func attemptOwnershipReadoptionRefusal(existing durableAttemptOwnership, name string, authority AttemptAuthority, resources ResourceIdentity) (AttemptOwnershipQuarantineReason, bool) {
+// attemptOwnershipDisposition is what the boot sweep does with a durable
+// ownership record it found already on disk.
+type attemptOwnershipDisposition string
+
+const (
+	// attemptOwnershipReadopt keeps the record exactly as written.
+	attemptOwnershipReadopt attemptOwnershipDisposition = "readopt"
+	// attemptOwnershipDefer leaves the record untouched and publishes nothing.
+	// It is reserved for a record this build cannot interpret but has no reason
+	// to distrust -- a newer version written by a helper that has since been
+	// rolled back. The existing snapshot path already reports it as
+	// unknown_version, leaves it unbound so it cannot authorize any removal,
+	// and garbage-collects it once its named resources are absent.
+	attemptOwnershipDefer attemptOwnershipDisposition = "defer"
+	// attemptOwnershipQuarantine moves the record aside with a typed receipt.
+	attemptOwnershipQuarantine attemptOwnershipDisposition = "quarantine"
+)
+
+// attemptOwnershipDispositionFor decides what to do with an existing record
+// under the fenced authority the sweep just proved from container labels.
+//
+// A version this build does not know is deliberately NOT quarantined. A record
+// version bump would otherwise quarantine every live Attempt's perfectly valid
+// record on the first boot after an upgrade or rollback, discarding retention
+// receipts wholesale. Quarantine is for a record that contradicts itself or
+// cannot be read -- evidence of corruption, not of a different vintage.
+func attemptOwnershipDispositionFor(existing durableAttemptOwnership, name string, authority AttemptAuthority, resources ResourceIdentity) (attemptOwnershipDisposition, AttemptOwnershipQuarantineReason) {
 	if existing.Version != durableAttemptOwnershipVersion {
-		return AttemptOwnershipQuarantineUnknownVersion, false
+		return attemptOwnershipDefer, ""
 	}
 	if !validDurableAttemptOwnershipIdentity(existing, name) {
-		return AttemptOwnershipQuarantineInvalidRecord, false
+		return attemptOwnershipQuarantine, AttemptOwnershipQuarantineInvalidRecord
 	}
 	// The record's file name is the digest of its complete authority tuple, so
 	// a name that matches while the tuple does not is corruption, not a fence.
 	if existing.Authority != authority || !sameAuthorityDerivedResourceNames(existing.Resources, resources) {
-		return AttemptOwnershipQuarantineAuthorityMismatch, false
+		return attemptOwnershipQuarantine, AttemptOwnershipQuarantineAuthorityMismatch
 	}
-	return "", true
+	return attemptOwnershipReadopt, ""
 }
 
 func validDurableAttemptOwnership(record durableAttemptOwnership, filename string) bool {

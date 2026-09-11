@@ -544,7 +544,6 @@ type AttemptOwnershipQuarantineReason string
 const (
 	AttemptOwnershipQuarantineUnreadable        AttemptOwnershipQuarantineReason = "unreadable"
 	AttemptOwnershipQuarantineInvalidRecord     AttemptOwnershipQuarantineReason = "invalid_record"
-	AttemptOwnershipQuarantineUnknownVersion    AttemptOwnershipQuarantineReason = "unknown_version"
 	AttemptOwnershipQuarantineAuthorityMismatch AttemptOwnershipQuarantineReason = "authority_mismatch"
 )
 

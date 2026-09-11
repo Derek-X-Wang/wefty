@@ -64,10 +64,15 @@ socket with `service-start-limit-hit`.
 
 A rate bound is not a count bound, so the helper bounds the count itself. It
 fsyncs a versioned consecutive-startup-barrier-failure ledger in its runtime
-root; a barrier that succeeds removes it. On the fifth consecutive failure the
+root; a barrier that succeeds removes it. The streak trips only when it has
+reached **both** five consecutive failures **and** sixty seconds of elapsed
+failing: at the rendered delays five restarts burn in about 1.25 seconds, so a
+pure count would wedge a healthy node whenever a containerd restart straddled
+helper activation. A gap longer than that same window starts a new streak rather
+than resuming a stale one. On the tripping failure the
 helper exits `78` -- the status the unit names in `RestartPreventExitStatus` --
 so systemd stops restarting and leaves a **failed** unit whose journal carries
-the typed phase (`startup_sweep` or `startup_verify`) and count. The socket unit
+the typed phase (`startup_sweep` or `startup_verify`), count, and elapsed time. The socket unit
 is untouched and stays armed, so an operator repair is picked up by the next
 connection without a `reset-failed`. A ledger that cannot be read or written
 never manufactures a wedge: the helper reports the ordinary failure and
@@ -769,16 +774,25 @@ authority tuple, so a matching name with a non-matching tuple is corruption, not
 a superseded writer.
 
 A record that genuinely cannot be reconciled -- unreadable, structurally
-invalid, an unknown version, or a tuple that contradicts its own name -- is
-**quarantined**, never deleted and never allowed to wedge startup. The helper
-renames it into `attempt-ownership-quarantine/<receipt id>/record.json` and
-fsyncs a typed `attempt_ownership_unreconcilable` receipt beside it carrying the
-receipt ID, the record name, one of `unreadable` / `invalid_record` /
-`unknown_version` / `authority_mismatch`, and the quarantine time. The sweep
-then publishes a fresh record for the authority it just proved from labels and
-continues, so the helper starts. Quarantined bytes are operator-owned durable
-state, not runnable namespace residue: they appear in the node doctor as
-`oci_attempt_ownership_quarantined` and are removed only by a human.
+invalid, or a tuple that contradicts its own name -- is **quarantined**, never
+deleted and never allowed to wedge startup. The helper renames it into
+`attempt-ownership-quarantine/<receipt id>/record.json` and fsyncs a typed
+`attempt_ownership_unreconcilable` receipt beside it carrying the receipt ID,
+the record name, one of `unreadable` / `invalid_record` / `authority_mismatch`,
+and the quarantine time. The sweep then publishes a fresh record for the
+authority it just proved from labels and continues, so the helper starts.
+Quarantined bytes are operator-owned durable state, not runnable namespace
+residue: they appear in the node doctor as `oci_attempt_ownership_quarantined`
+and are removed only by a human.
+
+A record whose **version** this build does not know is not quarantined. It is
+left exactly where it is, neither re-adopted nor overwritten, and the sweep
+publishes nothing for that authority: a version bump would otherwise quarantine
+every live Attempt's perfectly valid record on the first boot after an upgrade
+or rollback, discarding retention receipts wholesale. Quarantine is evidence of
+corruption, not of a different vintage. The unknown-version path stated above
+still governs it -- typed `unknown_version`, unbound so it can authorize no
+removal, garbage-collected once its named resources are absent.
 
 A deterministic-looking name is never
 ownership: sweep mutates a log directory or cgroup only when the exact resource

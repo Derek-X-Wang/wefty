@@ -40,12 +40,13 @@ type StartupWedgedError struct {
 	Phase       StartupBarrierPhase
 	Consecutive int
 	Bound       int
+	Elapsed     time.Duration
 	Err         error
 }
 
 func (err *StartupWedgedError) Error() string {
-	return fmt.Sprintf("OCI helper startup barrier failed %d consecutive times (bound %d, phase %s); refusing to restart: %v",
-		err.Consecutive, err.Bound, err.Phase, err.Err)
+	return fmt.Sprintf("OCI helper startup barrier failed %d consecutive times over %s (bound %d, phase %s); refusing to restart: %v",
+		err.Consecutive, err.Elapsed, err.Bound, err.Phase, err.Err)
 }
 
 func (err *StartupWedgedError) Unwrap() error { return err.Err }
@@ -62,25 +63,34 @@ type startupFailureLedger struct {
 	Version     int                 `json:"version"`
 	Consecutive int                 `json:"consecutive"`
 	Phase       StartupBarrierPhase `json:"phase"`
-	UpdatedAt   time.Time           `json:"updated_at"`
+	// FirstAt anchors the streak. The wedge needs both a count and elapsed
+	// time, so a short transient cannot burn the whole bound in one breath.
+	FirstAt   time.Time `json:"first_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// recordStartupBarrierFailure counts one consecutive startup-barrier failure
-// and reports the wedge error once the bound is reached. A ledger that cannot
-// be read or written is not converted into a wedge: the helper reports the
-// ordinary failure and restarts, because losing the count must never
-// manufacture a refusal to serve.
+// recordStartupBarrierFailure counts one startup-barrier failure and reports
+// the wedge error once the streak has both reached the bound and lasted the
+// window. A ledger that cannot be read or written is not converted into a
+// wedge: the helper reports the ordinary failure and restarts, because losing
+// the count must never manufacture a refusal to serve.
 func (server *Server) recordStartupBarrierFailure(err error) error {
 	var barrier *StartupBarrierError
 	if !errors.As(err, &barrier) || server.config.StartupFailureStateDirectory == "" {
 		return err
 	}
 	path := filepath.Join(server.config.StartupFailureStateDirectory, startupFailureLedgerName)
-	ledger := startupFailureLedger{Version: startupFailureLedgerVersion}
+	now := server.config.Clock.Now().UTC()
+	window := server.startupFailureWindow()
+	ledger := startupFailureLedger{Version: startupFailureLedgerVersion, FirstAt: now}
 	if payload, readErr := os.ReadFile(path); readErr == nil {
 		var existing startupFailureLedger
-		if json.Unmarshal(payload, &existing) == nil && existing.Version == startupFailureLedgerVersion && existing.Consecutive > 0 {
+		// A gap longer than the window is a new streak, not a continuation of
+		// a stale one left behind by an unrelated incident.
+		if json.Unmarshal(payload, &existing) == nil && existing.Version == startupFailureLedgerVersion &&
+			existing.Consecutive > 0 && !existing.FirstAt.IsZero() && now.Sub(existing.UpdatedAt) <= window {
 			ledger.Consecutive = existing.Consecutive
+			ledger.FirstAt = existing.FirstAt
 		}
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		server.config.Logf("OCI helper startup barrier ledger unreadable; the restart bound cannot be enforced this generation")
@@ -88,17 +98,19 @@ func (server *Server) recordStartupBarrierFailure(err error) error {
 	}
 	ledger.Consecutive++
 	ledger.Phase = barrier.Phase
-	ledger.UpdatedAt = server.config.Clock.Now().UTC()
+	ledger.UpdatedAt = now
 	if writeErr := writeStartupFailureLedger(path, ledger); writeErr != nil {
 		server.config.Logf("OCI helper startup barrier ledger unwritable; the restart bound cannot be enforced this generation")
 		return err
 	}
 	bound := server.startupFailureBound()
-	server.config.Logf("OCI helper startup barrier failed phase=%s consecutive=%d bound=%d", barrier.Phase, ledger.Consecutive, bound)
-	if ledger.Consecutive < bound {
+	elapsed := now.Sub(ledger.FirstAt)
+	server.config.Logf("OCI helper startup barrier failed phase=%s consecutive=%d bound=%d elapsed=%s window=%s",
+		barrier.Phase, ledger.Consecutive, bound, elapsed, window)
+	if ledger.Consecutive < bound || elapsed < window {
 		return err
 	}
-	return &StartupWedgedError{Phase: barrier.Phase, Consecutive: ledger.Consecutive, Bound: bound, Err: err}
+	return &StartupWedgedError{Phase: barrier.Phase, Consecutive: ledger.Consecutive, Bound: bound, Elapsed: elapsed, Err: err}
 }
 
 // clearStartupBarrierFailures resets the count after a barrier that succeeded.
@@ -117,6 +129,13 @@ func (server *Server) startupFailureBound() int {
 		return server.config.StartupFailureBound
 	}
 	return systemdpolicy.StartupFailureBound
+}
+
+func (server *Server) startupFailureWindow() time.Duration {
+	if server.config.StartupFailureWindow > 0 {
+		return server.config.StartupFailureWindow
+	}
+	return systemdpolicy.StartupFailureWindow
 }
 
 func writeStartupFailureLedger(path string, ledger startupFailureLedger) error {

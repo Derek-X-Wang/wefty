@@ -80,30 +80,33 @@ func TestAttemptOwnershipReadoptionDecisionTable(t *testing.T) {
 	foreignResources := ownershipTestResources(t, foreignAuthority, "job-1:handoff-owner")
 
 	for _, test := range []struct {
-		name         string
-		record       durableAttemptOwnership
-		reconcilable bool
-		reason       AttemptOwnershipQuarantineReason
+		name        string
+		record      durableAttemptOwnership
+		disposition attemptOwnershipDisposition
+		reason      AttemptOwnershipQuarantineReason
 	}{
 		{
-			name:         "a record from a previous generation is re-adopted",
-			record:       durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: live},
-			reconcilable: true,
+			name:        "a record from a previous generation is re-adopted",
+			record:      durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: live},
+			disposition: attemptOwnershipReadopt,
 		},
 		{
-			name:         "a record this generation wrote itself is re-adopted",
-			record:       durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: sweep},
-			reconcilable: true,
+			name:        "a record this generation wrote itself is re-adopted",
+			record:      durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: sweep},
+			disposition: attemptOwnershipReadopt,
 		},
 		{
-			name:   "an unknown version is quarantined, not reinterpreted",
-			record: durableAttemptOwnership{Version: durableAttemptOwnershipVersion + 1, Authority: authority, Resources: live},
-			reason: AttemptOwnershipQuarantineUnknownVersion,
+			// A version bump must not quarantine every live Attempt's valid
+			// record on the first boot after an upgrade or rollback.
+			name:        "an unknown version is left alone, not quarantined",
+			record:      durableAttemptOwnership{Version: durableAttemptOwnershipVersion + 1, Authority: authority, Resources: live},
+			disposition: attemptOwnershipDefer,
 		},
 		{
-			name:   "an authority tuple that contradicts the file name is quarantined",
-			record: durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: foreignAuthority, Resources: foreignResources},
-			reason: AttemptOwnershipQuarantineInvalidRecord,
+			name:        "an authority tuple that contradicts the file name is quarantined",
+			record:      durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: foreignAuthority, Resources: foreignResources},
+			disposition: attemptOwnershipQuarantine,
+			reason:      AttemptOwnershipQuarantineInvalidRecord,
 		},
 		{
 			name: "resource names that contradict the record's own authority are quarantined",
@@ -112,23 +115,41 @@ func TestAttemptOwnershipReadoptionDecisionTable(t *testing.T) {
 				mutated.CgroupID = "wefty-cgroup-someone-elses"
 				return mutated
 			}()},
-			reason: AttemptOwnershipQuarantineInvalidRecord,
+			disposition: attemptOwnershipQuarantine,
+			reason:      AttemptOwnershipQuarantineInvalidRecord,
 		},
 		{
-			name:   "an incomplete authority tuple is quarantined",
-			record: durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Resources: live},
-			reason: AttemptOwnershipQuarantineInvalidRecord,
+			name:        "an incomplete authority tuple is quarantined",
+			record:      durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Resources: live},
+			disposition: attemptOwnershipQuarantine,
+			reason:      AttemptOwnershipQuarantineInvalidRecord,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			reason, reconcilable := attemptOwnershipReadoptionRefusal(test.record, name, authority, sweep)
-			if reconcilable != test.reconcilable {
-				t.Fatalf("reconcilable = %t, want %t (reason %q)", reconcilable, test.reconcilable, reason)
+			disposition, reason := attemptOwnershipDispositionFor(test.record, name, authority, sweep)
+			if disposition != test.disposition {
+				t.Fatalf("disposition = %q, want %q (reason %q)", disposition, test.disposition, reason)
 			}
 			if reason != test.reason {
 				t.Fatalf("reason = %q, want %q", reason, test.reason)
 			}
 		})
+	}
+}
+
+// A version bump is the routine upgrade/rollback path, not corruption. It must
+// not reach the quarantine arm for any otherwise-valid record.
+func TestAnUnknownRecordVersionNeverQuarantines(t *testing.T) {
+	authority := testAuthority()
+	sweep := ownershipTestResources(t, authority, "")
+	name := sweep.ContainerID + ".json"
+	for _, resources := range []ResourceIdentity{sweep, ownershipTestResources(t, authority, "job-1:handoff-owner")} {
+		for _, version := range []int{durableAttemptOwnershipVersion + 1, durableAttemptOwnershipVersion + 7, 0} {
+			record := durableAttemptOwnership{Version: version, Authority: authority, Resources: resources}
+			if disposition, reason := attemptOwnershipDispositionFor(record, name, authority, sweep); disposition != attemptOwnershipDefer {
+				t.Fatalf("version %d = %q (reason %q), want the record left alone", version, disposition, reason)
+			}
+		}
 	}
 }
 
@@ -143,8 +164,8 @@ func TestReadoptionRefusesAForeignAuthorityUnderAMatchingName(t *testing.T) {
 	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: foreign, Resources: foreignResources}
 	// The record is internally consistent and correctly named for `foreign`,
 	// but the sweep proved `authority` from the container's own labels.
-	reason, reconcilable := attemptOwnershipReadoptionRefusal(record, foreignResources.ContainerID+".json", authority, ownershipTestResources(t, authority, ""))
-	if reconcilable || reason != AttemptOwnershipQuarantineAuthorityMismatch {
-		t.Fatalf("foreign authority under a matching name = %q reconcilable=%t", reason, reconcilable)
+	disposition, reason := attemptOwnershipDispositionFor(record, foreignResources.ContainerID+".json", authority, ownershipTestResources(t, authority, ""))
+	if disposition != attemptOwnershipQuarantine || reason != AttemptOwnershipQuarantineAuthorityMismatch {
+		t.Fatalf("foreign authority under a matching name = %q/%q", disposition, reason)
 	}
 }

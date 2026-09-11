@@ -54,7 +54,11 @@ type ServerConfig struct {
 	// StartupFailureBound overrides systemdpolicy.StartupFailureBound. Tests
 	// set it; the installed helper does not.
 	StartupFailureBound int
-	beforeRunCreateLock func()
+	// StartupFailureWindow overrides systemdpolicy.StartupFailureWindow, the
+	// minimum time a failing streak must last before it can wedge. Tests set
+	// it; the installed helper does not.
+	StartupFailureWindow time.Duration
+	beforeRunCreateLock  func()
 }
 
 type Server struct {

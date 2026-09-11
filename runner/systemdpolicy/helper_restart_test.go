@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVersionedHelperRestartPolicy(t *testing.T) {
@@ -70,5 +71,17 @@ func TestDeterministicStartupFailureIsBoundedWithoutFailingTheSocket(t *testing.
 	}
 	if StartupFailureBound < 2 {
 		t.Fatalf("startup failure bound %d gives a transient boot fault no room at all", StartupFailureBound)
+	}
+	// The rendered delays burn StartupFailureBound restarts in about 1.25
+	// seconds, so a pure count would wedge on a containerd restart that
+	// straddles helper activation. The window is what makes the bound safe.
+	burst := InitialDelay
+	saturated := time.Duration(0)
+	for step := 0; step < StartupFailureBound; step++ {
+		saturated += min(burst, MaximumDelay)
+		burst *= 2
+	}
+	if StartupFailureWindow <= saturated {
+		t.Fatalf("startup failure window %s does not outlast the %s it takes to burn the bound", StartupFailureWindow, saturated)
 	}
 }

@@ -745,10 +745,21 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 // to wedging helper startup, so it must be visible: the helper is serving, and
 // operator-owned state is waiting on a human.
 func buildAttemptOwnershipQuarantine(runtimeStatus ocihelper.DoctorStatus, report *DoctorResponse) {
-	if runtimeStatus.AttemptOwnershipQuarantinesRead.Outcome == ocihelper.DiagnosticReadFailed {
+	switch runtimeStatus.AttemptOwnershipQuarantinesRead.Outcome {
+	case ocihelper.DiagnosticReadFailed:
 		report.Findings = append(report.Findings, finding("attempt-ownership-quarantine", diagnosticReceipt{
 			ran: true, code: "oci_attempt_ownership_quarantine_unavailable", notRunCause: NotRunSourceUnavailable,
 			detail: "the helper-owned Attempt ownership quarantine root could not be read",
+		}))
+		return
+	case ocihelper.DiagnosticReadOK:
+	default:
+		// An absent outcome is a helper that predates this read, not a clean
+		// one. An empty quarantine list is indistinguishable from "never
+		// looked", so reporting it as absent would be a PASS nobody earned.
+		report.Findings = append(report.Findings, finding("attempt-ownership-quarantine", diagnosticReceipt{
+			code: "oci_attempt_ownership_quarantine_not_run", notRunCause: NotRunSourceUnavailable,
+			detail: "the connected helper did not report an Attempt ownership quarantine read",
 		}))
 		return
 	}

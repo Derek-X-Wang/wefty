@@ -129,6 +129,54 @@ Each finding has `OK`, `FAILED`, or `NOT-RUN`, a stable `oci_*` code, severity, 
 
 Doctor also reports the documented #220 limitation: process-kind payloads currently share the agent user, so local peer credentials do not distinguish those payloads from the operator. Do not treat the operator-only control socket as process-payload UID isolation until #220 lands.
 
+## The helper stopped restarting (wedged startup barrier)
+
+`systemctl status dev.wefty.oci-helper.service` (Lima) or
+`wefty-oci-helper.service` (native Linux) shows `Active: failed` with
+`Main PID: ... (code=exited, status=78/n/a)` and no further restarts. That is a
+deliberate terminal state, not a crash: the helper failed its boot Sweep+Verify
+barrier five times in a row over at least sixty seconds, so it exited with the
+status the unit names in `RestartPreventExitStatus` rather than hot-looping.
+Before this bound existed, the same condition produced 136 restarts in two
+minutes and `kind:oci` stayed false forever (#412).
+
+Read the cause, do not guess it: the helper's own journal
+(`journalctl -u <helper unit> -n 50 --no-pager`) is the authority.
+The last lines carry `OCI helper startup barrier failed phase=<phase>
+consecutive=<n> bound=<n> elapsed=<d> window=<d>`. `phase=startup_sweep` means
+the namespace sweep itself failed; `phase=startup_verify` means the sweep ran
+but the namespace did not verify absent. The streak counter lives in
+`<runtime-root>/startup-barrier-failures.json` (default
+`/var/lib/wefty/oci/startup-barrier-failures.json`); it is helper-owned state,
+and a barrier that succeeds removes it.
+
+You do not need `systemctl reset-failed`. The socket unit is untouched and stays
+armed, so the next client connection retriggers activation and the helper gets a
+fresh attempt at the barrier -- which is why fixing the underlying cause is
+enough, and why the unit may flip back to failed until you do.
+
+What to inspect, in order:
+
+1. `wefty --json node doctor` -- the `attempt-ownership-quarantine` finding. An
+   `oci_attempt_ownership_quarantined` finding names every durable Attempt
+   ownership record the sweep moved aside, with its typed reason. Those records
+   are operator-owned and are not the wedge itself, but they are the closest
+   evidence of what the sweep found.
+2. `<runtime-root>/attempt-ownership-quarantine/<receipt id>/` -- `quarantine.json`
+   for the typed receipt and `record.json` for the record verbatim. Never copy a
+   quarantined record back into `attempt-ownership`.
+3. `<runtime-root>/attempt-ownership/` -- the live records. A record here that
+   the sweep cannot reconcile is quarantined rather than left to wedge startup,
+   so a wedge that persists points at the runtime namespace, not at this
+   directory.
+4. The runtime namespace itself (containers, tasks, snapshots, leases, log
+   spools, cgroups) for residue the sweep could not clear within its
+   `ReapTimeout`.
+
+Preserve all four before changing anything, then escalate with the evidence
+bundle described below. Deleting durable state to clear a wedge destroys the
+only record of what happened.
+
 ## Escalation evidence
 
 For any non-OK finding, preserve the candidate commit, doctor JSON, finding and reason codes, intent revision, capability revision, last probe observation, helper protocol/version/checksum (never its session capability), runtime versions, relevant unit status, and sanitized logs. Do not include credentials, raw environment dumps, `WEFTY_RUN_TOKEN`, helper session capabilities, or secret answer tokens. Escalate with the smallest evidence bundle that establishes the failing boundary.
@@ -421,7 +469,7 @@ Meaning: topology or mount-root change requires instance recreation. Evidence: r
 
 ## doctor-code-oci-attempt-ownership-quarantine-not-run
 
-Meaning: the dependent helper read did not run, so the Attempt ownership quarantine root was never inspected. Evidence: the helper handshake or mechanics read that failed first. First action: resolve the upstream helper finding. Escalation: attach the helper unit status and journal after secret review.
+Meaning: no positive read of the Attempt ownership quarantine root was reported -- either the dependent helper read did not run, or the connected helper predates this read. An empty quarantine list is indistinguishable from never having looked, so this is never reported as a clean root. Evidence: the helper handshake or mechanics read that failed first, plus the helper version. First action: resolve the upstream helper finding, or upgrade the helper to a build that reports it. Escalation: attach the helper unit status and journal after secret review.
 
 ## doctor-code-oci-attempt-ownership-quarantine-unavailable
 
@@ -433,4 +481,4 @@ Meaning: every durable Attempt ownership record reconciled with its own fenced a
 
 ## doctor-code-oci-attempt-ownership-quarantined
 
-Meaning: the boot sweep could not reconcile one or more durable Attempt ownership records and moved them aside instead of wedging helper startup; the helper is serving. Evidence: read each `quarantine.json` receipt (kind, receipt ID, record name, typed reason, quarantine time) and the `record.json` beside it. First action: confirm the named Attempt is not live, then decide whether the quarantined bytes name real residue; sweep leaves those resources operator-owned. Escalation: attach the receipts and the runtime inventory; do not copy a quarantined record back into `attempt-ownership`.
+Meaning: the boot sweep could not reconcile one or more durable Attempt ownership records -- unreadable, structurally invalid, or an authority tuple contradicting its own hashed file name -- and moved them aside instead of wedging helper startup; the helper is serving. A record whose version this build does not know is NOT here: it is left in place and reported as `unknown_version`. Evidence: read each `quarantine.json` receipt (kind, receipt ID, record name, typed reason, quarantine time) and the `record.json` beside it. First action: confirm the named Attempt is not live, then decide whether the quarantined bytes name real residue; sweep leaves those resources operator-owned. Escalation: attach the receipts and the runtime inventory; do not copy a quarantined record back into `attempt-ownership`.

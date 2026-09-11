@@ -29,6 +29,13 @@ const (
 	// the helper will burn before it declares itself wedged. A barrier that
 	// succeeds clears the count.
 	StartupFailureBound = 5
+	// StartupFailureWindow keeps the bound from being a pure count. At the
+	// rendered restart delays five failures can burn inside about 1.25
+	// seconds, so a containerd restart that straddles helper activation would
+	// wedge a perfectly healthy node. A streak therefore only trips once it
+	// has also been failing for this long, and a gap longer than this starts a
+	// new streak rather than continuing a stale one.
+	StartupFailureWindow = 60 * time.Second
 )
 
 func Directives(systemdVersion int) map[string]string {

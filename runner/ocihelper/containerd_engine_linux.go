@@ -3922,16 +3922,25 @@ func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAu
 			}
 			break
 		}
-		if reason, reconcilable := attemptOwnershipReadoptionRefusal(existing, name, authority, resources); !reconcilable {
+		switch disposition, reason := attemptOwnershipDispositionFor(existing, name, authority, resources); disposition {
+		case attemptOwnershipQuarantine:
 			if err := engine.quarantineAttemptOwnershipRecordLocked(name, reason); err != nil {
 				return err
 			}
-			break
+		case attemptOwnershipDefer:
+			// A version this build cannot interpret is left exactly where it
+			// is. Overwriting it would destroy a newer helper's state, and
+			// quarantining it would empty the ownership root on the first boot
+			// after a rollback. The snapshot path reports it as
+			// unknown_version, keeps it unbound, and GCs it once quiescent.
+			logAttemptOwnershipEntryOutcome(name, attemptOwnershipUnknownVersion)
+			return nil
+		default:
+			// Re-adopt the previous generation's record exactly as written: it
+			// carries the owner-key-derived handoff volume directory and any
+			// retention receipts this generation cannot reconstruct.
+			return nil
 		}
-		// Re-adopt the previous generation's record exactly as written: it
-		// carries the owner-key-derived handoff volume directory and any
-		// retention receipts this generation cannot reconstruct.
-		return nil
 	case errors.Is(readErr, os.ErrNotExist):
 	default:
 		// The record cannot be read, so it cannot be reconciled -- but it can
