@@ -29,6 +29,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	eventtypes "github.com/containerd/containerd/api/events"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
@@ -444,12 +445,26 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
 		}
 	} else {
+		// No configured runc binary was given at setup. Discover the binary
+		// the runtime handler itself will invoke and read its version
+		// directly, rather than reporting containerd's own shim version as
+		// runc's: RuntimeInfo's Version field describes the containerd-built
+		// shim, not the runc binary, and the two can drift arbitrarily (a
+		// containerd v2.3.3 shim commonly wraps a runc 1.x binary).
 		runtimeInfo, runcErr := engine.client.RuntimeInfo(runcContext, DefaultRuntimeHandler, nil)
+		binaryName := ""
 		if runcErr == nil && runtimeInfo != nil {
-			status.RuncVersion = strings.TrimSpace(runtimeInfo.Version.Version)
-			status.RuncVersionSource = RuncVersionSourceContainerdInfo
+			if runcOptions, ok := runtimeInfo.Options.(*runcoptions.Options); ok {
+				binaryName = runcOptions.BinaryName
+			}
 		}
-		if runcErr != nil || status.RuncVersion == "" {
+		if runcErr == nil {
+			if version, ok := resolveRuncVersion(runcContext, binaryName, exec.LookPath, runRuncVersion); ok {
+				status.RuncVersion = version
+				status.RuncVersionSource = RuncVersionSourceRuntimeHandlerPath
+			}
+		}
+		if status.RuncVersion == "" {
 			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorRuncVersion}
 		} else {
 			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
@@ -480,6 +495,38 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 	status.AllowedMountRoots = roots
 	status.MountRootsRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
 	return status, nil
+}
+
+// resolveRuncVersion locates the runc binary the containerd runtime handler
+// is actually configured to invoke and reads its own reported version. An
+// empty binaryName means containerd resolves "runc" from PATH, matching the
+// runtime handler's own default lookup. It never derives a runc version from
+// containerd's own version metadata: a failure to locate or execute the
+// binary is reported as unavailable (ok == false) rather than substituting
+// unrelated data.
+func resolveRuncVersion(ctx context.Context, binaryName string, lookPath func(string) (string, error), runVersion func(context.Context, string) ([]byte, error)) (version string, ok bool) {
+	if binaryName == "" {
+		binaryName = "runc"
+	}
+	path := binaryName
+	if !filepath.IsAbs(path) {
+		resolved, err := lookPath(binaryName)
+		if err != nil {
+			return "", false
+		}
+		path = resolved
+	}
+	payload, err := runVersion(ctx, path)
+	if err != nil {
+		return "", false
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(payload)), "\n")
+	version = strings.TrimSpace(strings.TrimPrefix(line, "runc version"))
+	return version, version != ""
+}
+
+func runRuncVersion(ctx context.Context, path string) ([]byte, error) {
+	return exec.CommandContext(ctx, path, "--version").Output()
 }
 
 func engineContext(ctx context.Context) context.Context {

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -2999,6 +3000,105 @@ func TestReadyComputerIsolationObservationFailsClosedAndKeepsAttachmentIdentity(
 			_ = engine.observeReadyComputerIsolation(namespace, 42000)
 			if engine.lastProfile != other {
 				t.Fatal("observation replaced another attachment's profile")
+			}
+		})
+	}
+}
+
+// TestResolveRuncVersionReadsTheRuncBinaryNotContainerd guards #396's D4:
+// the doctor must report the runc binary's own --version, never containerd's
+// unrelated shim version, even when it must discover the binary itself (no
+// --oci-runc-executable configured, matching every Mac/Lima bootstrap).
+func TestResolveRuncVersionReadsTheRuncBinaryNotContainerd(t *testing.T) {
+	var lookedUp, ran []string
+	lookPath := func(name string) (string, error) {
+		lookedUp = append(lookedUp, name)
+		return "/usr/bin/" + name, nil
+	}
+	runVersion := func(_ context.Context, path string) ([]byte, error) {
+		ran = append(ran, path)
+		return []byte("runc version 1.5.1\ncommit: v1.5.1-0-g8f2685a\nspec: 1.2.0\n"), nil
+	}
+	version, ok := resolveRuncVersion(t.Context(), "", lookPath, runVersion)
+	if !ok || version != "1.5.1" {
+		t.Fatalf("resolveRuncVersion = %q ok=%t, want 1.5.1", version, ok)
+	}
+	if !reflect.DeepEqual(lookedUp, []string{"runc"}) {
+		t.Fatalf("empty binary name looked up %v, want a default lookup of \"runc\"", lookedUp)
+	}
+	if !reflect.DeepEqual(ran, []string{"/usr/bin/runc"}) {
+		t.Fatalf("ran %v, want the resolved runc path", ran)
+	}
+}
+
+func TestResolveRuncVersionUsesConfiguredHandlerBinaryName(t *testing.T) {
+	var lookedUp []string
+	lookPath := func(name string) (string, error) {
+		lookedUp = append(lookedUp, name)
+		return "/opt/custom/runc", nil
+	}
+	runVersion := func(_ context.Context, path string) ([]byte, error) {
+		if path != "/opt/custom/runc" {
+			t.Fatalf("ran %q, want the resolved custom binary", path)
+		}
+		return []byte("runc version 1.5.1\n"), nil
+	}
+	version, ok := resolveRuncVersion(t.Context(), "runc.custom", lookPath, runVersion)
+	if !ok || version != "1.5.1" {
+		t.Fatalf("resolveRuncVersion = %q ok=%t, want 1.5.1", version, ok)
+	}
+	if !reflect.DeepEqual(lookedUp, []string{"runc.custom"}) {
+		t.Fatalf("looked up %v, want the handler-configured binary name", lookedUp)
+	}
+}
+
+func TestResolveRuncVersionUsesAbsoluteBinaryNameWithoutPathLookup(t *testing.T) {
+	lookPath := func(name string) (string, error) {
+		t.Fatalf("looked up %q, an absolute binary name must skip PATH resolution", name)
+		return "", nil
+	}
+	runVersion := func(_ context.Context, path string) ([]byte, error) {
+		if path != "/opt/custom/runc" {
+			t.Fatalf("ran %q, want the absolute path unchanged", path)
+		}
+		return []byte("runc version 1.5.1\n"), nil
+	}
+	version, ok := resolveRuncVersion(t.Context(), "/opt/custom/runc", lookPath, runVersion)
+	if !ok || version != "1.5.1" {
+		t.Fatalf("resolveRuncVersion = %q ok=%t, want 1.5.1", version, ok)
+	}
+}
+
+// TestResolveRuncVersionNeverFabricatesFromContainerdData asserts the never-
+// fabricate contract itself: when the real runc binary cannot be located or
+// executed, resolveRuncVersion must report unavailable rather than any
+// substitute value (in particular, it has no containerd version to fall back
+// to at all -- the caller no longer threads one in).
+func TestResolveRuncVersionNeverFabricatesFromContainerdData(t *testing.T) {
+	for name, test := range map[string]struct {
+		lookPath   func(string) (string, error)
+		runVersion func(context.Context, string) ([]byte, error)
+	}{
+		"binary not found on PATH": {
+			lookPath: func(string) (string, error) { return "", errors.New("not found") },
+			runVersion: func(context.Context, string) ([]byte, error) {
+				t.Fatal("must not run a command when PATH lookup fails")
+				return nil, nil
+			},
+		},
+		"binary exists but exits non-zero": {
+			lookPath:   func(name string) (string, error) { return "/usr/bin/" + name, nil },
+			runVersion: func(context.Context, string) ([]byte, error) { return nil, errors.New("exit status 1") },
+		},
+		"binary produced empty output": {
+			lookPath:   func(name string) (string, error) { return "/usr/bin/" + name, nil },
+			runVersion: func(context.Context, string) ([]byte, error) { return []byte(""), nil },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			version, ok := resolveRuncVersion(t.Context(), "", test.lookPath, test.runVersion)
+			if ok || version != "" {
+				t.Fatalf("resolveRuncVersion = %q ok=%t, want unavailable rather than a fabricated version", version, ok)
 			}
 		})
 	}

@@ -484,8 +484,9 @@ const (
 	DiagnosticErrorMountRoots        = "mount_roots_unavailable"
 	DiagnosticErrorComputerFirewall  = "computer_firewall_unavailable"
 
-	RuncVersionSourceConfiguredPath = "configured_absolute_path"
-	RuncVersionSourceContainerdInfo = "containerd_runtime_info"
+	RuncVersionSourceConfiguredPath     = "configured_absolute_path"
+	RuncVersionSourceContainerdInfo     = "containerd_runtime_info"
+	RuncVersionSourceRuntimeHandlerPath = "runtime_handler_binary"
 )
 
 // DiagnosticReadReceipt states whether one helper-side read produced its
