@@ -122,10 +122,8 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	primary.triggerPayloadListenerRestart(t)
 	withdrawalElapsed = primary.waitReachableMeasured(t, false, 5*time.Second)
 	withdrawalObserved = true
-	select {
-	case outcome := <-primary.done:
+	if outcome, ended := primary.finished(); ended {
 		t.Fatalf("helper-tunnel withdrawal killed payload: (%#v, %v)", outcome.result, outcome.err)
-	default:
 	}
 	republicationElapsed = primary.waitReachableMeasured(t, true, nativeOCIRepublicationDeadline)
 	republicationObserved = republicationElapsed >= DefaultPublicationRecoveryWindow
@@ -136,7 +134,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{
 		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 0.1; done`,
 	}, false)
-	outcome := waitServiceOutcome(t, timedOut.done)
+	outcome := timedOut.waitOutcome(t, serviceOutcomeTimeout)
 	startupTimedOut = outcome.err != nil && outcome.result.SpawnError != nil && outcome.result.SpawnError.Code == contract.SpawnFailureStartupReadinessTimeout
 	if !startupTimedOut {
 		t.Fatalf("OCI startup timeout = (%#v, %v)", outcome.result, outcome.err)
@@ -1047,6 +1045,55 @@ type nativeOCIService struct {
 	address          string
 	backendPort      atomic.Uint32
 	reaped           atomic.Bool
+	outcomeMu        sync.Mutex
+	outcome          *serviceRunOutcome
+}
+
+// finished reports a supervised run that has already ended, without consuming
+// it: a run that ended is why reachability will never arrive, and every later
+// waiter still needs the same typed outcome.
+func (service *nativeOCIService) finished() (serviceRunOutcome, bool) {
+	service.outcomeMu.Lock()
+	defer service.outcomeMu.Unlock()
+	if service.outcome != nil {
+		return *service.outcome, true
+	}
+	select {
+	case outcome := <-service.done:
+		service.outcome = &outcome
+		return outcome, true
+	default:
+		return serviceRunOutcome{}, false
+	}
+}
+
+func (service *nativeOCIService) waitOutcome(t *testing.T, timeout time.Duration) serviceRunOutcome {
+	t.Helper()
+	if outcome, ended := service.finished(); ended {
+		return outcome
+	}
+	select {
+	case outcome := <-service.done:
+		service.outcomeMu.Lock()
+		service.outcome = &outcome
+		service.outcomeMu.Unlock()
+		return outcome
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for the supervised OCI service outcome")
+		return serviceRunOutcome{}
+	}
+}
+
+// reachabilityFailure names why reachability never arrived. A run that already
+// ended carries the real answer — a typed spawn failure such as
+// image_platform_unsupported — and reporting only the missing reachability
+// hides it behind a timeout.
+func (service *nativeOCIService) reachabilityFailure(want bool) string {
+	if outcome, ended := service.finished(); ended {
+		return fmt.Sprintf("OCI service reachability did not become %v: the supervised run ended first = (%#v, %v)",
+			want, outcome.result, outcome.err)
+	}
+	return fmt.Sprintf("OCI service reachability did not become %v while the run was still live", want)
 }
 
 func startNativeOCIService(
@@ -1320,7 +1367,7 @@ func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout 
 	t.Helper()
 	reachable, _, matched := service.observeReachability(t, want, timeout)
 	if !matched {
-		t.Fatalf("OCI service reachability did not become %v", want)
+		t.Fatal(service.reachabilityFailure(want))
 	}
 	return reachable
 }
@@ -1329,7 +1376,7 @@ func (service *nativeOCIService) waitReachableMeasured(t *testing.T, want bool, 
 	t.Helper()
 	_, elapsed, matched := service.observeReachability(t, want, timeout)
 	if !matched {
-		t.Fatalf("OCI service reachability did not become %v", want)
+		t.Fatal(service.reachabilityFailure(want))
 	}
 	return elapsed
 }
@@ -1353,6 +1400,9 @@ func (service *nativeOCIService) observeReachability(t *testing.T, want bool, ti
 		if reachable == want {
 			return reachable, time.Since(started), true
 		}
+		if _, ended := service.finished(); ended {
+			return reachable, time.Since(started), false
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	return reachable, time.Since(started), false
@@ -1364,13 +1414,9 @@ func (service *nativeOCIService) stop(t *testing.T, adapter *ocirunner.Adapter) 
 		return true
 	}
 	service.cancel()
-	select {
-	case outcome := <-service.done:
-		if outcome.err != nil || outcome.result.Signal != "terminated" || outcome.result.TerminationCause != contract.TerminationCauseAgent {
-			t.Fatalf("OCI service graceful stop = (%+v, %v)", outcome.result, outcome.err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out stopping OCI service publication acceptance payload")
+	outcome := service.waitOutcome(t, 10*time.Second)
+	if outcome.err != nil || outcome.result.Signal != "terminated" || outcome.result.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("OCI service graceful stop = (%+v, %v)", outcome.result, outcome.err)
 	}
 	service.reap(t, adapter)
 	return true
