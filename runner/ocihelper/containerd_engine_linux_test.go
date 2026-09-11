@@ -3104,6 +3104,76 @@ func TestResolveRuncVersionNeverFabricatesFromContainerdData(t *testing.T) {
 	}
 }
 
+// TestResolveHandlerRuncVersionPrefersFeaturesAnnotationOverExec guards the
+// primary order in #396 D4's follow-up: containerd's runc-v2 shim already
+// ran "<resolved binary> features" against the exact binary it will invoke
+// and republished the result as an annotation. That must win over our own
+// PATH-resolve-and-exec fallback -- both because it can't name a different
+// binary than the shim actually uses, and because it needs no exec of our
+// own at all.
+func TestResolveHandlerRuncVersionPrefersFeaturesAnnotationOverExec(t *testing.T) {
+	lookPath := func(name string) (string, error) {
+		t.Fatalf("looked up %q, want the features annotation used without any fallback resolution", name)
+		return "", nil
+	}
+	runVersion := func(context.Context, string) ([]byte, error) {
+		t.Fatal("ran a command, want the features annotation used without any fallback exec")
+		return nil, nil
+	}
+	annotations := map[string]string{"org.opencontainers.runc.version": "1.5.1"}
+	version, source, ok := resolveHandlerRuncVersion(t.Context(), annotations, "", lookPath, runVersion)
+	if !ok || version != "1.5.1" || source != RuncVersionSourceRuntimeHandlerFeatures {
+		t.Fatalf("resolveHandlerRuncVersion = (%q, %q, %t), want (1.5.1, %q, true)", version, source, ok, RuncVersionSourceRuntimeHandlerFeatures)
+	}
+}
+
+// TestResolveHandlerRuncVersionFallsBackToExecWithoutFeaturesAnnotation
+// guards the fallback order: when the features annotation is unavailable
+// (older containerd, a runtime that doesn't implement "features", or the
+// RuntimeInfo call itself failing to type-assert), resolveHandlerRuncVersion
+// must still resolve and exec the binary itself rather than reporting
+// unavailable outright.
+func TestResolveHandlerRuncVersionFallsBackToExecWithoutFeaturesAnnotation(t *testing.T) {
+	for name, annotations := range map[string]map[string]string{
+		"nil annotations":              nil,
+		"empty annotations":            {},
+		"annotations missing runc key": {"org.opencontainers.runtime-spec.version": "1.2.0"},
+		"annotation present but blank": {"org.opencontainers.runc.version": "  "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var ran []string
+			lookPath := func(name string) (string, error) { return "/usr/bin/" + name, nil }
+			runVersion := func(_ context.Context, path string) ([]byte, error) {
+				ran = append(ran, path)
+				return []byte("runc version 1.5.1\n"), nil
+			}
+			version, source, ok := resolveHandlerRuncVersion(t.Context(), annotations, "", lookPath, runVersion)
+			if !ok || version != "1.5.1" || source != RuncVersionSourceRuntimeHandlerPath {
+				t.Fatalf("resolveHandlerRuncVersion = (%q, %q, %t), want (1.5.1, %q, true)", version, source, ok, RuncVersionSourceRuntimeHandlerPath)
+			}
+			if !reflect.DeepEqual(ran, []string{"/usr/bin/runc"}) {
+				t.Fatalf("ran %v, want exactly one fallback exec of the resolved binary", ran)
+			}
+		})
+	}
+}
+
+// TestResolveHandlerRuncVersionNeverFabricatesFromContainerdData confirms
+// the never-fabricate contract still holds end-to-end: when neither the
+// features annotation nor the fallback exec can produce a version, the
+// result is unavailable, never a substitute value.
+func TestResolveHandlerRuncVersionNeverFabricatesFromContainerdData(t *testing.T) {
+	lookPath := func(string) (string, error) { return "", errors.New("not found") }
+	runVersion := func(context.Context, string) ([]byte, error) {
+		t.Fatal("must not run a command when PATH lookup fails")
+		return nil, nil
+	}
+	version, source, ok := resolveHandlerRuncVersion(t.Context(), nil, "", lookPath, runVersion)
+	if ok || version != "" || source != "" {
+		t.Fatalf("resolveHandlerRuncVersion = (%q, %q, %t), want (\"\", \"\", false)", version, source, ok)
+	}
+}
+
 func TestComputerDisplayDialRefusesMissingIsolationAuthority(t *testing.T) {
 	for _, missing := range []string{"namespace", "view port"} {
 		t.Run(missing, func(t *testing.T) {

@@ -18,11 +18,17 @@ func TestMacBootstrapRejectsRootBeforeAnyWrite(t *testing.T) {
 	defer func() { currentEUID = originalEUID }()
 
 	tempDir := t.TempDir()
-	intentPath := filepath.Join(tempDir, "wefty-oci-intent.json")
 
-	// Root must be rejected even with an otherwise-plausible, fully-formed
-	// argument list -- the check must precede flag-driven validation and
-	// every subsequent write, not merely a missing-flag short circuit.
+	// -intent-file is deliberately relative: runMacBootstrap's own flag
+	// validation ("--intent-file must be absolute") would fatally reject it
+	// too, but only after HelperSocketPath and the facts-path check, well
+	// past where the root check must sit. That later, unrelated error keeps
+	// this test honest: if the root check were removed, this exact argument
+	// list would fail with the flag-validation error instead of the root
+	// rejection, and the Contains(err, "root") assertion below would go red
+	// -- not merely "no error" or some earlier, incidental failure. This
+	// proves the root check runs first, rather than the test happening to
+	// stop at the first error the fixture trips regardless of ordering.
 	arguments := []string{
 		"-operator-user=derekxwang",
 		"-operator-home=" + tempDir,
@@ -35,19 +41,17 @@ func TestMacBootstrapRejectsRootBeforeAnyWrite(t *testing.T) {
 		"-guest-uid=501",
 		"-node-id=node-1",
 		"-host-mount-root=" + tempDir,
-		"-intent-file=" + intentPath,
+		"-minimal-doctor-facts=" + filepath.Join(tempDir, "facts.json"),
+		"-intent-file=relative/wefty-oci-intent.json",
 	}
 	err := runMacBootstrap(arguments)
 	if err == nil {
 		t.Fatal("root invocation returned no error")
 	}
 	if !strings.Contains(err.Error(), "root") {
-		t.Fatalf("error = %q, want it to explain the root rejection", err.Error())
+		t.Fatalf("error = %q, want the root rejection, not a later flag-validation error", err.Error())
 	}
 
-	if _, statErr := os.Stat(intentPath); !os.IsNotExist(statErr) {
-		t.Fatalf("refused root bootstrap left behind an intent file: stat err=%v", statErr)
-	}
 	entries, readErr := os.ReadDir(tempDir)
 	if readErr != nil {
 		t.Fatalf("read temp dir: %v", readErr)

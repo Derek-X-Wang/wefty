@@ -49,6 +49,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	runtimefeatures "github.com/opencontainers/runtime-spec/specs-go/features"
 	"golang.org/x/sys/unix"
 )
 
@@ -452,16 +453,20 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 		// shim, not the runc binary, and the two can drift arbitrarily (a
 		// containerd v2.3.3 shim commonly wraps a runc 1.x binary).
 		runtimeInfo, runcErr := engine.client.RuntimeInfo(runcContext, DefaultRuntimeHandler, nil)
-		binaryName := ""
+		var binaryName string
+		var featuresAnnotations map[string]string
 		if runcErr == nil && runtimeInfo != nil {
 			if runcOptions, ok := runtimeInfo.Options.(*runcoptions.Options); ok {
 				binaryName = runcOptions.BinaryName
 			}
+			if runtimeFeatures, ok := runtimeInfo.Features.(*runtimefeatures.Features); ok {
+				featuresAnnotations = runtimeFeatures.Annotations
+			}
 		}
 		if runcErr == nil {
-			if version, ok := resolveRuncVersion(runcContext, binaryName, exec.LookPath, runRuncVersion); ok {
+			if version, source, ok := resolveHandlerRuncVersion(runcContext, featuresAnnotations, binaryName, exec.LookPath, runRuncVersion); ok {
 				status.RuncVersion = version
-				status.RuncVersionSource = RuncVersionSourceRuntimeHandlerPath
+				status.RuncVersionSource = source
 			}
 		}
 		if status.RuncVersion == "" {
@@ -495,6 +500,35 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 	status.AllowedMountRoots = roots
 	status.MountRootsRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
 	return status, nil
+}
+
+// runcVersionFeatureAnnotation is the OCI runtime "features" annotation key
+// runc populates with its own --version string. containerd's runc-v2 shim
+// runs "<resolved binary> features" against the exact binary it will invoke
+// and republishes the result verbatim in RuntimeInfo.Features, so this
+// annotation names the exact binary the shim uses without our own PATH
+// resolution risking a different one.
+const runcVersionFeatureAnnotation = "org.opencontainers.runc.version"
+
+// resolveHandlerRuncVersion determines the runc version to report for a
+// runtime handler with no explicitly configured --oci-runc-executable. It
+// prefers the version containerd itself already obtained by running
+// "<binary> features" against the exact binary the handler resolved
+// (featuresAnnotations, read from RuntimeInfo.Features): that can't name a
+// different binary than the one the shim actually uses, and needs no exec of
+// our own. Only when that annotation is unavailable does it fall back to
+// locating and executing the binary itself via resolveRuncVersion. It never
+// falls back further to containerd's own version: an unresolved binary and a
+// missing annotation together report unavailable (ok == false), never a
+// version this code did not read from runc.
+func resolveHandlerRuncVersion(ctx context.Context, featuresAnnotations map[string]string, binaryName string, lookPath func(string) (string, error), runVersion func(context.Context, string) ([]byte, error)) (version, source string, ok bool) {
+	if version := strings.TrimSpace(featuresAnnotations[runcVersionFeatureAnnotation]); version != "" {
+		return version, RuncVersionSourceRuntimeHandlerFeatures, true
+	}
+	if version, ok := resolveRuncVersion(ctx, binaryName, lookPath, runVersion); ok {
+		return version, RuncVersionSourceRuntimeHandlerPath, true
+	}
+	return "", "", false
 }
 
 // resolveRuncVersion locates the runc binary the containerd runtime handler
