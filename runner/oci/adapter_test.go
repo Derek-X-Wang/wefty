@@ -340,26 +340,89 @@ func TestAdapterLoadImageBootstrapsPlatformWithoutFunctionalProbe(t *testing.T) 
 	engine.mu.Lock()
 	platform := engine.lastEnsure.Platform
 	engine.mu.Unlock()
-	if platform != (ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v8"}) {
-		t.Fatalf("offline import platform = %+v, want canonical arm64 variant", platform)
+	if platform != (ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}) {
+		t.Fatalf("offline import platform = %+v, want containerd's normal form for arm64", platform)
 	}
 	if _, recorded := adapter.probePlatform(session); recorded {
 		t.Fatal("offline import promoted diagnostic platform mechanics into functional probe evidence")
 	}
 }
 
-func TestCanonicalProbePlatformIncludesDefaultArm64Variant(t *testing.T) {
+// The platform the agent retains is the one it compares every piece of helper
+// image evidence against, and that evidence is always containerd's normal form.
+// Retaining any other spelling of the same hardware — 315ab13 retained
+// "arm64/v8" — makes the comparison unsatisfiable on that architecture.
+func TestCanonicalProbePlatformIsContainerdNormalForm(t *testing.T) {
 	for _, test := range []struct {
 		input ocihelper.OCIPlatform
 		want  ocihelper.OCIPlatform
 	}{
-		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v8"}},
+		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}},
+		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v8"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}},
 		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v9"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v9"}},
 		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}},
 	} {
 		if got, err := canonicalProbePlatform(test.input); err != nil || got != test.want {
 			t.Fatalf("canonicalProbePlatform(%+v) = %+v, %v, want %+v", test.input, got, err, test.want)
 		}
+	}
+}
+
+// arm64HardwareProbePlatform is what real arm64 hardware produces: containerd
+// reports the runtime platform and every image evidence platform through
+// platforms.Normalize, which leaves arm64 without a variant.
+var arm64HardwareProbePlatform = ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}
+
+// TestAdapterRunsOnArm64HardwareEvidence is the happy path the amd64 CI lanes
+// cannot see: on amd64 the probe platform is the identity, so a disagreement
+// between the retained probe platform and helper evidence is invisible. Here the
+// probe, the delivered image, and the Started evidence all carry the real arm64
+// fixture, and every platform comparison in Run must accept it.
+func TestAdapterRunsOnArm64HardwareEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		class string
+	}{
+		{name: "one-shot", class: contract.JobClassOneShot},
+		{name: "service binding", class: contract.JobClassService},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{
+				watch:            ocihelper.WatchResponse{ExitCode: intPointer(0)},
+				responsePlatform: arm64HardwareProbePlatform,
+				runPlatform:      arm64HardwareProbePlatform,
+			}
+			adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+			defer closeAdapter()
+			session, err := barrier.Session()
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter.mu.Lock()
+			delete(adapter.probePlatforms, helperSession(session))
+			adapter.mu.Unlock()
+
+			if err := adapter.Probe(t.Context(), "node", "boot", "example.invalid/image", adapterTestDigest, time.Second); err != nil {
+				t.Fatalf("arm64 functional probe = %v", err)
+			}
+			probed, recorded := adapter.probePlatform(session)
+			if !recorded || probed != arm64HardwareProbePlatform {
+				t.Fatalf("retained probe platform = %+v recorded=%t, want %+v", probed, recorded, arm64HardwareProbePlatform)
+			}
+
+			request := adapterTestRequest()
+			request.Authority.WorkloadClass = test.class
+			result, err := adapter.Run(t.Context(), request, nil)
+			if err != nil || result.Outcome.SpawnError != nil {
+				t.Fatalf("arm64 run = (%+v, %v), want a started attempt", result.Outcome, err)
+			}
+			engine.mu.Lock()
+			delivered := engine.lastEnsure.Platform
+			engine.mu.Unlock()
+			if delivered != arm64HardwareProbePlatform {
+				t.Fatalf("EnsureImage platform = %+v, want the arm64 normal form the helper selects by", delivered)
+			}
+		})
 	}
 }
 
@@ -447,18 +510,41 @@ func TestAdapterBindsImageSelectionToCurrentProbePlatform(t *testing.T) {
 	}
 }
 
+// Normalizing both sides must not blunt the refusal: evidence for hardware the
+// probe did not prove is still refused, including an arm64 variant that
+// containerd's normal form keeps distinct.
 func TestAdapterRejectsImageEvidenceOutsideProbePlatform(t *testing.T) {
-	engine := &adapterTestEngine{responsePlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}}
-	adapter, closeAdapter := startAdapterTestServer(t, engine)
-	defer closeAdapter()
-	request := adapterTestRequest()
-	request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error {
-		t.Fatal("mismatched first-binding evidence reached L1")
-		return nil
-	}
-	result, err := adapter.Run(t.Context(), request, nil)
-	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImagePlatformUnsupported {
-		t.Fatalf("platform mismatch = (%+v, %v)", result.Outcome, err)
+	for _, test := range []struct {
+		name     string
+		probe    ocihelper.OCIPlatform
+		evidence ocihelper.OCIPlatform
+	}{
+		{name: "other architecture", probe: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
+			evidence: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}},
+		{name: "other arm64 variant", probe: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"},
+			evidence: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v9"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{responsePlatform: test.evidence}
+			adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+			defer closeAdapter()
+			session, err := barrier.Session()
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter.mu.Lock()
+			adapter.probePlatforms[helperSession(session)] = test.probe
+			adapter.mu.Unlock()
+			request := adapterTestRequest()
+			request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error {
+				t.Fatal("mismatched first-binding evidence reached L1")
+				return nil
+			}
+			result, err := adapter.Run(t.Context(), request, nil)
+			if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImagePlatformUnsupported {
+				t.Fatalf("platform mismatch = (%+v, %v)", result.Outcome, err)
+			}
+		})
 	}
 }
 
@@ -1761,6 +1847,7 @@ type adapterTestEngine struct {
 	ensureCalls                   int
 	responseDigest                string
 	responsePlatform              ocihelper.OCIPlatform
+	runPlatform                   ocihelper.OCIPlatform
 	ensureEntered                 chan struct{}
 	releaseEnsure                 chan struct{}
 	lastRun                       ocihelper.RunRequest
@@ -1896,6 +1983,9 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 		PlatformManifestDigest: adapterTestDigest, Platform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler, Snapshotter: ocihelper.DefaultSnapshotter,
 	}}
+	if engine.runPlatform.OS != "" {
+		response.Image.Platform = engine.runPlatform
+	}
 	if engine.omitRunImage {
 		response.Image = nil
 	}

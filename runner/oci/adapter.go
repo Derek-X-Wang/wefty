@@ -20,8 +20,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
-	"github.com/containerd/platforms"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // SessionSource returns the currently boot-barrier-pinned helper session.
@@ -781,13 +779,16 @@ func canonicalProbePlatform(platform ocihelper.OCIPlatform) (ocihelper.OCIPlatfo
 	if canonical.OS == "" || canonical.Architecture == "" || canonical != platform {
 		return ocihelper.OCIPlatform{}, errors.New("OCI functional probe returned a non-canonical platform")
 	}
-	normalized := platforms.Normalize(ocispec.Platform{
-		OS: canonical.OS, Architecture: canonical.Architecture, Variant: canonical.Variant,
-	})
-	if normalized.Architecture == "arm64" && normalized.Variant == "" {
-		normalized.Variant = "v8"
-	}
-	return ocihelper.OCIPlatform{OS: normalized.OS, Architecture: normalized.Architecture, Variant: normalized.Variant}, nil
+	// 315ab13 folded the clean-cache diagnostic bootstrap platform into this one
+	// canonical form so an archive import and the later functional probe could
+	// not admit two different arm64 spellings of the same hardware. It spelled
+	// that form "arm64/v8". containerd's normal form is the opposite:
+	// platforms.Normalize maps arm64 "v8"/"8"/"v8.0" onto the empty variant, and
+	// every piece of helper image evidence is produced through Normalize. Keeping
+	// the re-added variant therefore made the agent's retained platform the only
+	// value in the system no image evidence could equal. Normalize alone still
+	// collapses every arm64 spelling onto one value, which is all 315ab13 needed.
+	return ocihelper.NormalizePlatform(canonical), nil
 }
 
 func helperSession(session *ocihelper.Session) ocihelper.HelperSession {
@@ -986,7 +987,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		})
 		if err != nil {
 			storedPlatform := ocihelper.OCIPlatform{OS: stored.PlatformOS, Architecture: stored.PlatformArchitecture, Variant: stored.PlatformVariant}
-			if stored.JobID == request.Authority.JobID && stored.Reference == request.Execution.OCI.Image.Reference && stored.Digest == digest && stored.Snapshotter == ocihelper.DefaultSnapshotter && storedPlatform != probePlatform {
+			if stored.JobID == request.Authority.JobID && stored.Reference == request.Execution.OCI.Image.Reference && stored.Digest == digest && stored.Snapshotter == ocihelper.DefaultSnapshotter && !ocihelper.SamePlatform(storedPlatform, probePlatform) {
 				platformErr := errors.New("service binding image platform differs from the current probed OCI runtime platform")
 				return spawnResult(contract.SpawnFailureImagePlatformUnsupported, platformErr), platformErr
 			}
@@ -994,7 +995,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		}
 		bindingPinCreated = created
 		storedPlatform := ocihelper.OCIPlatform{OS: stored.PlatformOS, Architecture: stored.PlatformArchitecture, Variant: stored.PlatformVariant}
-		if storedPlatform != probePlatform {
+		if !ocihelper.SamePlatform(storedPlatform, probePlatform) {
 			err := errors.New("service binding image platform differs from the current probed OCI runtime platform")
 			return spawnResult(contract.SpawnFailureImagePlatformUnsupported, err), err
 		}
@@ -1008,7 +1009,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	}
 	adapter.markAttemptPinAttached(request.Authority, sweepBaseline{epoch: imageSweepReceipt.SweepEpoch, helper: imageSweepReceipt.HelperSession})
 	image.Evidence.SubmittedReference = request.Execution.OCI.Image.Reference
-	if image.Evidence.Platform != probePlatform {
+	if !ocihelper.SamePlatform(image.Evidence.Platform, probePlatform) {
 		err := errors.New("OCI image selection differs from the current probe platform")
 		return spawnResult(contract.SpawnFailureImagePlatformUnsupported, err), err
 	}
@@ -1044,7 +1045,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
 	currentPlatform, ok := adapter.probePlatform(session)
-	if !ok || currentPlatform != probePlatform {
+	if !ok || !ocihelper.SamePlatform(currentPlatform, probePlatform) {
 		err := errors.New("OCI helper generation changed without matching probe evidence")
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
@@ -1086,7 +1087,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	if request.OCIStartedAt != nil {
 		request.OCIStartedAt(runResponse.StartedAt.UTC().Round(0))
 	}
-	if runResponse.Image.Platform != probePlatform {
+	if !ocihelper.SamePlatform(runResponse.Image.Platform, probePlatform) {
 		err := errors.New("OCI Started evidence differs from the current probe platform")
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureProcessRequest, err), err
