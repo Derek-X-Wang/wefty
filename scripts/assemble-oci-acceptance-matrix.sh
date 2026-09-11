@@ -51,6 +51,18 @@ for receipt in native-linux-oci.txt oci-service-publication-linux.txt \
   fi
 done
 
+provenance="$linux_directory/provenance-receipt.json"
+linux_commit=""
+linux_artifact_run_id=""
+if [ -f "$provenance" ]; then
+  linux_commit=$(jq -r '.commit // ""' "$provenance")
+  linux_artifact_run_id=$(jq -r '.artifact_run_id // ""' "$provenance")
+fi
+linux_variant=""
+if [ -f "$linux_directory/linux-computer-matrix.json" ]; then
+  linux_variant=$(jq -r '.image.variant // ""' "$linux_directory/linux-computer-matrix.json")
+fi
+
 fact() {
   awk -v prefix="$1=" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }' "$facts"
 }
@@ -62,23 +74,26 @@ has_fact() {
 # id|proof|spec_refs|required facts|declared gaps
 #   required fact: NAME (the value must be exactly "true"), NAME=VALUE (exact
 #   match), or the sentinel agent_uid_nonzero. "-" means the row has no live fact.
+#   A leading "!" marks a fact the lane emits as a constant once its product path
+#   has run. Those are attestations, not measurements, and are recorded under
+#   "attested" so they never read as a measured assertion.
 #   declared gap: NAME:REASON, several joined by ";". Reasons carry no ";".
 row_specification() {
   cat <<'SPECIFICATION'
-linux.oneshot.image_identity|Public digest pull and offline tar import with identical top-level and platform digests, tag movement leaves every retry on the original job digest, cache repull after wipe|table Linux/one-shot + bullets 2,3,4|pull_from_empty pull_import_digest_equal registry_disabled_pull_rejected registry_disabled_import import_run node_load_image archive_platform_filtered public_acceptance_image tag_refloat_resolved_once binding_repull_reconciliation|cache_intact_after_reboot:no Linux reboot harness exists, and the only reboot test writes a permanent systemd_reboot_harness NOT-RUN receipt;rerun_under_tag_movement:frozen rerun identity is proven, but never with the tag floated between run and rerun
-linux.oneshot.delivery|Handoff write, one authenticated bridge request, split stdout and stderr markers, exit 0|table Linux/one-shot|oneshot_handoff_marker_bytes oneshot_bridge_once oneshot_split_streams oneshot_digest_evidence ordinary_l3_oci_submission ordinary_l3_frozen_rerun live_log_delivery stdout_log stderr_log|
-linux.oneshot.engine_loss|Pre-start engine loss requeues on the pinned digest, mid-run loss is terminal|table Linux/one-shot + bullet 5|prestart_requeue_pinned wait_before_start shim_loss=runtime_failure containerd_stop=runtime_failure|
-linux.service.publication|Publish health and echo through Fabric on a helper-allocated loopback port|table Linux/service|service_echo_health service_echo_body health echo helper_tunnel portless_started port_collision_avoided startup_timeout|
+linux.oneshot.image_identity|Public digest pull and offline tar import with identical top-level and platform digests, tag movement leaves every retry on the original job digest, cache repull after wipe|table Linux/one-shot + bullets 2,3,4|!pull_from_empty !pull_import_digest_equal registry_disabled_pull_rejected !registry_disabled_import !import_run !node_load_image !archive_platform_filtered !public_acceptance_image !tag_refloat_resolved_once binding_repull_reconciliation|cache_intact_after_reboot:no Linux reboot harness exists, and the only reboot test writes a permanent systemd_reboot_harness NOT-RUN receipt;rerun_under_tag_movement:frozen rerun identity is proven, but never with the tag floated between run and rerun
+linux.oneshot.delivery|Handoff write, one authenticated bridge request, split stdout and stderr markers, exit 0|table Linux/one-shot|oneshot_handoff_marker_bytes !oneshot_bridge_once !oneshot_split_streams !oneshot_digest_evidence !ordinary_l3_oci_submission !ordinary_l3_frozen_rerun !live_log_delivery !stdout_log !stderr_log|
+linux.oneshot.engine_loss|Pre-start engine loss requeues on the pinned digest, mid-run loss is terminal|table Linux/one-shot + bullet 5|!prestart_requeue_pinned !wait_before_start !shim_loss=runtime_failure !containerd_stop=runtime_failure|
+linux.service.publication|Publish health and echo through Fabric on a helper-allocated loopback port, refuse a colliding port, and fail a payload that never reaches its startup readiness deadline|table Linux/service|!service_echo_health !service_echo_body health echo helper_tunnel portless_started port_collision_avoided startup_timeout|
 linux.service.restart|Payload restart with cooperative TERM, KILL escalation, and paired log seals|table Linux/service|fresh_restart fresh_restart_authority term_cooperative_stop term_grace_stop term_kill_escalation term_kill_log_seal_pairing term_kill_stdout_log term_kill_stderr_log|
 linux.service.stop_start|Stop and start reacquires capacity, withdraws and republishes on the retained binding digest|table Linux/service|stop_start slot_saturation retained_binding_digest withdrawal republication|
 linux.service.data|Persistent service data across restart and stop/start, writable rootfs discarded on every restart|table Linux/service|service_data_root_user service_data_numeric_user service_data_named_user service_data_restart_persistent service_data_stop_start_persistent service_rootfs_discarded service_data_same_digest_replacement_fresh|
-linux.service.crash_recovery|Agent, helper and containerd crash, helper loss, stale residue sweep with a reused boot ID|table Linux/service + bullets 6,7,8|service_helper_loss_injected service_helper_loss_observed service_fresh_attempt_readmission service_barrier_prefaced_during_startup service_lost_log_typed control_loss_reaped socket_and_service_active_after_recovery removal_prior_boot_oci_sweep|agent_sigkill_kind_oci:every agent SIGKILL arm submits kind=process, and the OCI lane only tears the agent down in-process;heartbeat_blackhole_live:heartbeat blackhole is proven only against the fake engine harness
-linux.service.removal|Full removal and residue proof from every state, crash injection at every create and delete phase, bind sources untouched and image still cached|table Linux/service + bullets 9,10,11|removal_manifest_complete removal_pending removal_every_attempt removal_service_data_volume removal_service_data_owner_record removal_post_delete_attestation removal_delete_attest_crash_injected removal_completed service_residue_verified_absent service_retained_binding_verified namespace_absent|removal_from_stopped_kind_oci:the stopped-removal arm submits kind=process;removal_from_offline_kind_oci:the offline and force-forget arms submit kind=process;bind_sources_untouched_kind_oci:no live OCI test mounts an operator bind source, and operator_bind_source_untouched is Computer-only;crash_injection_create_phases:create-boundary crash injection exists only against the fake engine;crash_injection_after_quiescence:runtimeRemovalCheckpointAfterQuiescence is never injected in the live lane;delete_attest_restart:removal_delete_attest_restart is NOT-RUN_hosted_lane because a real agent process restart needs owner hardware
+linux.service.crash_recovery|Agent, helper and containerd crash, helper loss, stale residue sweep with a reused boot ID|table Linux/service + bullets 6,7,8|service_helper_loss_injected service_helper_loss_observed service_fresh_attempt_readmission service_barrier_prefaced_during_startup service_lost_log_typed !control_loss_reaped socket_and_service_active_after_recovery removal_prior_boot_oci_sweep|agent_sigkill_kind_oci:every agent SIGKILL arm submits kind=process, and the OCI lane only tears the agent down in-process;heartbeat_blackhole_live:heartbeat blackhole is proven only against the fake engine harness
+linux.service.removal|Full removal and residue proof from every state, crash injection at every create and delete phase, bind sources untouched and image still cached|table Linux/service + bullets 9,10,11|removal_manifest_complete removal_pending removal_every_attempt removal_service_data_volume removal_service_data_owner_record removal_post_delete_attestation removal_delete_attest_crash_injected removal_completed service_residue_verified_absent service_retained_binding_verified !namespace_absent|removal_from_stopped_kind_oci:the stopped-removal arm submits kind=process;removal_from_offline_kind_oci:the offline and force-forget arms submit kind=process;bind_sources_untouched_kind_oci:no live OCI test mounts an operator bind source, and operator_bind_source_untouched is Computer-only;crash_injection_create_phases:create-boundary crash injection exists only against the fake engine;crash_injection_after_quiescence:runtimeRemovalCheckpointAfterQuiescence is never injected in the live lane;delete_attest_restart:removal_delete_attest_restart is NOT-RUN_hosted_lane because a real agent process restart needs owner hardware
 linux.node.capability_claims|Capable and incapable claim pairs for every required capability|bullet 1|-|capable_incapable_claim_pairs:claim pairs exist only in untagged fake-engine tests, no receipt key carries them, and the doctor snapshot in the lane is hand-built
 linux.only.unprivileged_agent|The agent runs unprivileged|Linux-only list|agent_uid_nonzero|
-linux.only.socket_activated_helper|A root socket-activated helper owns every containerd call|Linux-only list|helper_uid=0 helper_socket_root_owned socket_and_service_active_after_recovery|cold_socket_activation:nothing proves a cold inactive unit was started by the first socket connect
-linux.only.cgroup_v2_limits|Opt-in cgroup-v2 memory and CPU limits for an ordinary OCI job|Linux-only list|oom_kill plain_137_exit|memory_max_readback:the memory limit is proven only by an OOM kill, never by reading memory.max back;cpu_millicores_enforcement:CPUMillicores appears only in runtime-spec golden fixtures and no capped container is run
-linux.only.no_raw_containerd|Zero raw containerd access from the agent|Linux-only list|raw_socket_denied|
+linux.only.socket_activated_helper|A root socket-activated helper owns every containerd call|Linux-only list|!helper_uid=0 !helper_socket_root_owned socket_and_service_active_after_recovery|cold_socket_activation:nothing proves a cold inactive unit was started by the first socket connect
+linux.only.cgroup_v2_limits|Opt-in cgroup-v2 memory and CPU limits for an ordinary OCI job|Linux-only list|!oom_kill !plain_137_exit|memory_max_readback:the memory limit is proven only by an OOM kill, never by reading memory.max back;cpu_millicores_enforcement:CPUMillicores appears only in runtime-spec golden fixtures and no capped container is run
+linux.only.no_raw_containerd|Zero raw containerd access from the agent|Linux-only list|!raw_socket_denied|
 SPECIFICATION
 }
 
@@ -117,29 +132,38 @@ pairs_to_object() {
 row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
   [ -n "$id" ] || continue
   status=PASS
-  not_run_reason=
+  reason=
   skip_source=lane
   assertion_pairs="$work_directory/assertions.tsv"
+  attested_pairs="$work_directory/attested.tsv"
   evidence_pairs="$work_directory/evidence.tsv"
   : > "$assertion_pairs"
+  : > "$attested_pairs"
   : > "$evidence_pairs"
 
   for requirement in $required; do
     [ "$requirement" != '-' ] || continue
     passed=true
+    attested=false
+    case "$requirement" in
+      '!'*) attested=true; requirement=${requirement#!} ;;
+    esac
     case "$requirement" in
       agent_uid_nonzero)
         name=agent_uid
         if ! has_fact "$name"; then
           status=MISSING
-          not_run_reason="missing fact $name"
+          reason="missing fact $name"
           continue
         fi
         value=$(fact "$name")
         printf '%s\t%s\n' "$name" "$value" >> "$evidence_pairs"
         case "$value" in ''|*[!0-9]*|0) passed=false ;; esac
         printf '%s\t%s\n' agent_uid_nonzero "$passed" >> "$assertion_pairs"
-        [ "$passed" = true ] || status=FAIL
+        if [ "$passed" != true ] && [ "$status" != MISSING ]; then
+          status=FAIL
+          reason="agent_uid $value is not an unprivileged uid"
+        fi
         continue
         ;;
       *=*)
@@ -154,27 +178,34 @@ row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
 
     if ! has_fact "$name"; then
       status=MISSING
-      not_run_reason="missing fact $name"
+      reason="missing fact $name"
       continue
     fi
     value=$(fact "$name")
     printf '%s\t%s\n' "$name" "$value" >> "$evidence_pairs"
     case "$value" in
       NOT-RUN|NOT-RUN_*)
-        reason=$(fact "${name}_reason")
-        [ -n "$reason" ] || reason="the lane recorded $value"
+        lane_reason=$(fact "${name}_reason")
+        [ -n "$lane_reason" ] || lane_reason="the lane recorded $value"
         if [ "$status" = PASS ]; then
           status='NOT-RUN'
           skip_source=lane
-          not_run_reason="$name: $reason"
+          reason="$name: $lane_reason"
         fi
         ;;
       "$expected")
-        printf '%s\t%s\n' "$name" true >> "$assertion_pairs"
+        if [ "$attested" = true ]; then
+          printf '%s\t%s\n' "$name" "$value" >> "$attested_pairs"
+        else
+          printf '%s\t%s\n' "$name" true >> "$assertion_pairs"
+        fi
         ;;
       *)
         printf '%s\t%s\n' "$name" false >> "$assertion_pairs"
-        status=FAIL
+        if [ "$status" != MISSING ]; then
+          status=FAIL
+          reason="$name is $value, want $expected"
+        fi
         ;;
     esac
   done
@@ -190,7 +221,7 @@ row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
       first_gap=$(printf '%s' "$gaps" | cut -d';' -f1)
       status='NOT-RUN'
       skip_source=gap
-      not_run_reason="${first_gap%%:*}: ${first_gap#*:}"
+      reason="${first_gap%%:*}: ${first_gap#*:}"
     fi
   fi
 
@@ -204,13 +235,14 @@ row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
   fi
 
   jq -n --arg id "$id" --arg proof "$proof" --arg spec_refs "$spec_refs" \
-    --arg status "$status" --arg reason "$not_run_reason" --argjson issue "$not_run_issue" \
+    --arg status "$status" --arg reason "$reason" --argjson issue "$not_run_issue" \
     --argjson assertions "$(pairs_to_object boolean < "$assertion_pairs")" \
+    --argjson attested "$(pairs_to_object string < "$attested_pairs")" \
     --argjson evidence "$(pairs_to_object string < "$evidence_pairs")" \
     --argjson gaps "$(pairs_to_object string < "$gap_pairs")" \
     '{id:$id, proof:$proof, spec_refs:$spec_refs, status:$status,
-      assertions:$assertions, evidence:$evidence, gaps:$gaps,
-      not_run_issue:$issue, not_run_reason:$reason, source:"realtiming-linux"}' >> "$rows"
+      assertions:$assertions, attested:$attested, evidence:$evidence, gaps:$gaps,
+      not_run_issue:$issue, reason:$reason, source:"realtiming-linux"}' >> "$rows"
 done
 
 if [ "$mac_fragment" = none ]; then
@@ -219,12 +251,12 @@ if [ "$mac_fragment" = none ]; then
     jq -n --arg id "$id" --arg proof "$proof" --arg spec_refs "$spec_refs" \
       --argjson issue "$mac_absent_issue" --arg reason "$mac_absent_reason" \
       '{id:$id, proof:$proof, spec_refs:$spec_refs, status:"NOT-RUN",
-        assertions:{}, evidence:{}, gaps:{},
-        not_run_issue:$issue, not_run_reason:$reason, source:"attended-absent"}' >> "$rows"
+        assertions:{}, attested:{}, evidence:{}, gaps:{},
+        not_run_issue:$issue, reason:$reason, source:"attended-absent"}' >> "$rows"
   done
   mac_evidence=$(jq -n --argjson issue "$mac_absent_issue" --arg reason "$mac_absent_reason" \
     '{source:"absent", session_id:"", commit:"", artifact_sha256:"",
-      attended_row_counts:{}, not_run_issue:$issue, not_run_reason:$reason}')
+      attended_row_counts:{}, not_run_issue:$issue, reason:$reason}')
 else
   test -f "$mac_fragment"
   jq -e '.rows | type == "object"' "$mac_fragment" > /dev/null
@@ -233,17 +265,20 @@ else
     jq --arg id "$id" --arg proof "$proof" --arg spec_refs "$spec_refs" \
       '(.rows[$id] // {status:"MISSING"})
        | {id:$id, proof:$proof, spec_refs:$spec_refs, status:.status,
-          assertions:(.assertions // {}), evidence:(.evidence // {}), gaps:(.gaps // {}),
-          not_run_issue:(.not_run_issue // 0), not_run_reason:(.not_run_reason // ""),
+          assertions:(.assertions // {}), attested:(.attested // {}),
+          evidence:(.evidence // {}), gaps:(.gaps // {}),
+          not_run_issue:(.not_run_issue // 0), reason:(.reason // ""),
           source:"attended-owner-hardware"}' "$mac_fragment" >> "$rows"
   done
   mac_evidence=$(jq '{source:"attended-owner-hardware", session_id:(.session_id // ""),
     commit:(.commit // ""), artifact_sha256:(.artifact_sha256 // ""),
-    attended_row_counts:(.attended_row_counts // {}), not_run_issue:0, not_run_reason:""}' "$mac_fragment")
+    attended_row_counts:(.attended_row_counts // {}), not_run_issue:0, reason:""}' "$mac_fragment")
 fi
 
 jq -s --arg candidate "$candidate_sha" --arg source "$evidence_source" \
   --arg environment "$runner_environment" --argjson mac "$mac_evidence" \
+  --arg variant "$linux_variant" --arg linux_commit "$linux_commit" \
+  --arg artifact_run_id "$linux_artifact_run_id" \
   --arg stamped "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   '(reduce .[] as $row ({}; . + {($row.id): $row})) as $rows
    | ([$rows[] | select(.id | startswith("mac.")) | select(.status != "PASS")] | length) as $mac_open
@@ -256,8 +291,8 @@ jq -s --arg candidate "$candidate_sha" --arg source "$evidence_source" \
       evidence_source: $source,
       runner_environment: $environment,
       mac_source: $mac.source,
-      mac_open_rows: $mac_open,
-      linux_evidence: {source: "realtiming"},
+      linux_evidence: {source: "realtiming", variant: $variant,
+                       commit: $linux_commit, artifact_run_id: $artifact_run_id},
       mac_evidence: $mac,
       rows: $rows,
       started_at: $stamped,

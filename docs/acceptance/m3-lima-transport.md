@@ -408,7 +408,14 @@ Unlike the destination-success gate above, the fragment producer does not
 require PASS rows: a red attended session must still produce an honest, typed
 fragment. A failed attended row becomes a matrix `FAIL` carrying the attended
 reason verbatim; a blocked row becomes a typed `NOT-RUN` owned by the ticket
-that blocks it. The six rows the runbook has no procedure for
+that blocks it.
+
+The gate then treats those two outcomes differently, by design. A typed
+`NOT-RUN` is an honest "not proven yet" and passes. A `FAIL` is a proof that ran
+and came back red, so **`check-oci-acceptance-matrix.sh` exits non-zero and names
+the failing rows.** Against the 2026-09-11 session it exits 1 on the four rows
+blocked by #394. That is the command working, not the command broken: the matrix
+cannot be green while a Mac cell is red. The six rows the runbook has no procedure for
 (`task_logs_delete`, `mount_validation`, `host_to_guest`, `helper_loss`,
 `vm_loss`, `sweep_before_recovery`) are typed `runbook_no_procedure` and are
 never attributed to a product defect. Like the artifact itself, the fragment and

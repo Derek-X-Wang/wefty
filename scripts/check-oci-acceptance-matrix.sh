@@ -2,9 +2,12 @@
 set -eu
 
 # Fail-closed gate for the M3 OCI acceptance matrix (spec section 9), assembled by
-# scripts/assemble-oci-acceptance-matrix.sh. Rejects a missing or unknown row, an
-# untyped skip, an unearned PASS, a candidate-commit mismatch, and any Mac row
-# claimed without the attended owner-hardware artifact.
+# scripts/assemble-oci-acceptance-matrix.sh. Rejects a failing row, a missing or
+# unknown row, an untyped skip, an unearned PASS, a commit mismatch on either
+# half, and any Mac row claimed without the attended owner-hardware artifact.
+#
+# A typed skip is an honest "not proven yet" and passes. A FAIL is a proof that
+# ran and came back red, so it fails the gate.
 
 if [ "$#" -ne 4 ]; then
   printf '%s\n' 'usage: check-oci-acceptance-matrix.sh MATRIX CANDIDATE_SHA EVIDENCE_SOURCE RUNNER_ENVIRONMENT' >&2
@@ -56,11 +59,12 @@ verdict=$(jq -r --argjson required "$required_rows" --arg candidate "$candidate_
   | ([$rows[] | select(.status == "NOT-RUN")] | length) as $skipped
   | (.mac_source // "") as $mac_source
   | ([
-      (if (. | type) != "object" then "the matrix is not a JSON object" else empty end),
       (if .version != 1 then "unsupported matrix version \(.version)" else empty end),
       (if .candidate_sha != $candidate then "candidate_sha \(.candidate_sha) does not bind to \($candidate)" else empty end),
       (if .evidence_source != $source then "evidence_source \(.evidence_source) does not bind to \($source)" else empty end),
       (if .runner_environment != $environment then "runner_environment \(.runner_environment) does not bind to \($environment)" else empty end),
+      (if .linux_evidence.commit != $candidate
+        then "the Linux realtiming evidence is bound to \(.linux_evidence.commit // "nothing"), not \($candidate)" else empty end),
 
       ([$required[] | . as $id | select(($rows | has($id)) | not)] | if length > 0 then "required rows missing: \(join(", "))" else empty end),
       ([$required[] | . as $id | select($rows | has($id)) | select($rows[$id].id != $id)] | if length > 0 then "rows do not carry their own stable id: \(join(", "))" else empty end),
@@ -68,9 +72,13 @@ verdict=$(jq -r --argjson required "$required_rows" --arg candidate "$candidate_
 
       (names(.status | IN("PASS", "FAIL", "NOT-RUN") | not)
         | if length > 0 then "rows carry an unknown status: \(.)" else empty end),
-      (names(.status == "NOT-RUN" and ((.not_run_issue // 0) <= 0 or ((.not_run_reason // "") | length) == 0))
+      (names(.status == "FAIL")
+        | if length > 0 then "rows failed: \(.)" else empty end),
+      (names(.status == "FAIL" and ((.reason // "") | length) == 0)
+        | if length > 0 then "rows failed without a reason: \(.)" else empty end),
+      (names(.status == "NOT-RUN" and ((.not_run_issue // 0) <= 0 or ((.reason // "") | length) == 0))
         | if length > 0 then "untyped skips without an owning ticket and reason: \(.)" else empty end),
-      (names(.status == "PASS" and ((.assertions | length) == 0 or ([.assertions[] | select(. == false)] | length) > 0))
+      (names(.status == "PASS" and (((.assertions | length) + (.attested | length)) == 0 or ([.assertions[] | select(. == false)] | length) > 0))
         | if length > 0 then "rows claim PASS without earning it: \(.)" else empty end),
       (names(.status == "PASS" and (.gaps | length) > 0)
         | if length > 0 then "rows claim PASS while declaring a gap: \(.)" else empty end),
@@ -94,10 +102,10 @@ verdict=$(jq -r --argjson required "$required_rows" --arg candidate "$candidate_
           | if length > 0 then "Mac rows were not sourced from the attended artifact: \(.)" else empty end)
         else empty end),
 
-      (if .mac_open_rows != ($mac_open | length) then "mac_open_rows disagrees with the rows" else empty end),
       (if .complete != (($mac_open | length) == 0) then "complete disagrees with the Mac rows" else empty end),
       (if .status != (if $broken > 0 then "FAIL" elif $skipped > 0 then "NOT-RUN" else "PASS" end)
-        then "the aggregate status \(.status) disagrees with the rows" else empty end)
+        then "the aggregate status \(.status) disagrees with the rows" else empty end),
+      (if .status == "FAIL" then "the matrix aggregate is FAIL" else empty end)
     ]) as $violations
   | "violations\t\($violations | length)",
     ($violations[] | "violation\t\(.)"),

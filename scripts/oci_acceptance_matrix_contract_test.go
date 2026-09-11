@@ -71,7 +71,7 @@ func TestOCIAcceptanceMatrixCoversEverySpecCell(t *testing.T) {
 				switch row["status"] {
 				case "PASS":
 				case "NOT-RUN":
-					if row["not_run_issue"].(float64) <= 0 || strings.TrimSpace(row["not_run_reason"].(string)) == "" {
+					if row["not_run_issue"].(float64) <= 0 || strings.TrimSpace(row["reason"].(string)) == "" {
 						t.Fatalf("row %s is an untyped skip: %#v", id, row)
 					}
 				default:
@@ -91,12 +91,12 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				fragment := conformantMacMatrixFragment(t)
 				setMacFragmentRow(t, fragment, "mac.only.headless_reboot", map[string]any{
 					"status": "PASS", "assertions": map[string]bool{"headless_reboot": true},
-					"evidence": map[string]string{}, "gaps": map[string]string{},
-					"not_run_issue": 0, "not_run_reason": "",
+					"attested": map[string]string{}, "evidence": map[string]string{},
+					"gaps": map[string]string{}, "not_run_issue": 0, "reason": "",
 				})
 				matrix := assembleOCIMatrix(t, shell, linux, fragment, "published-artifact", "owner-hardware")
-				if matrix["complete"] != true || matrix["mac_open_rows"].(float64) != 0 {
-					t.Fatalf("complete=%v mac_open_rows=%v", matrix["complete"], matrix["mac_open_rows"])
+				if matrix["complete"] != true {
+					t.Fatalf("complete=%v, want a complete matrix", matrix["complete"])
 				}
 				output, err := runOCIMatrixGate(t, shell, matrix, ociMatrixCandidate, "published-artifact", "owner-hardware")
 				if err != nil {
@@ -151,7 +151,7 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 					"pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published")
 				matrix := assembleOCIMatrix(t, shell, pr, "none", "pr-build", "github-hosted")
 				row := matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)
-				if row["status"] != "NOT-RUN" || !strings.Contains(row["not_run_reason"].(string), "pr-build: image not published") {
+				if row["status"] != "NOT-RUN" || !strings.Contains(row["reason"].(string), "pr-build: image not published") {
 					t.Fatalf("pull-request row = %#v, want a typed skip naming the lane", row)
 				}
 				if got := int(row["not_run_issue"].(float64)); got != ociMatrixLaneSkipIssue {
@@ -170,12 +170,25 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				"unknown extra row": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["linux.service.invented"] = map[string]any{
 						"id": "linux.service.invented", "status": "PASS",
-						"assertions": map[string]any{"invented": true}, "gaps": map[string]any{},
-						"not_run_issue": 0, "not_run_reason": "",
+						"assertions": map[string]any{"invented": true}, "attested": map[string]any{},
+						"gaps": map[string]any{}, "not_run_issue": 0, "reason": "",
 					}
 				},
 				"row does not carry its own id": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)["id"] = "linux.oneshot.other"
+				},
+				"failing row": func(t *testing.T, matrix map[string]any) {
+					matrix["rows"].(map[string]any)["mac.service.removal"].(map[string]any)["status"] = "FAIL"
+					matrix["rows"].(map[string]any)["mac.service.removal"].(map[string]any)["reason"] = "the guest never published"
+					matrix["status"] = "FAIL"
+				},
+				"failing row without a reason": func(t *testing.T, matrix map[string]any) {
+					matrix["rows"].(map[string]any)["mac.service.removal"].(map[string]any)["status"] = "FAIL"
+					matrix["rows"].(map[string]any)["mac.service.removal"].(map[string]any)["reason"] = ""
+					matrix["status"] = "FAIL"
+				},
+				"Linux evidence bound to another commit": func(t *testing.T, matrix map[string]any) {
+					matrix["linux_evidence"].(map[string]any)["commit"] = strings.Repeat("d", 40)
 				},
 				"MISSING row": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["mac.service.data"].(map[string]any)["status"] = "MISSING"
@@ -201,13 +214,14 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 					matrix["rows"].(map[string]any)["linux.node.capability_claims"].(map[string]any)["not_run_issue"] = 0
 				},
 				"skip without a reason": func(t *testing.T, matrix map[string]any) {
-					matrix["rows"].(map[string]any)["linux.node.capability_claims"].(map[string]any)["not_run_reason"] = ""
+					matrix["rows"].(map[string]any)["linux.node.capability_claims"].(map[string]any)["reason"] = ""
 				},
 				"false assertion on a passing row": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)["assertions"] = map[string]any{"oneshot_bridge_once": false}
 				},
-				"passing row with no assertion at all": func(t *testing.T, matrix map[string]any) {
-					matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)["assertions"] = map[string]any{}
+				"passing row with neither an assertion nor an attestation": func(t *testing.T, matrix map[string]any) {
+					row := matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)
+					row["assertions"], row["attested"] = map[string]any{}, map[string]any{}
 				},
 				"passing row that still declares a gap": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)["gaps"] = map[string]any{"unproven": "not actually run"}
@@ -217,9 +231,6 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				},
 				"completeness laundered": func(t *testing.T, matrix map[string]any) {
 					matrix["complete"] = true
-				},
-				"open Mac row count laundered": func(t *testing.T, matrix map[string]any) {
-					matrix["mac_open_rows"] = 0
 				},
 				"mac_source disagrees with the evidence": func(t *testing.T, matrix map[string]any) {
 					matrix["mac_source"] = "absent"
@@ -403,6 +414,14 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"removal_delete_attest_crash_injected=true", "removal_completed=true",
 		"removal_prior_boot_oci_sweep=true")
 	write("helper-restart-timeline.txt", "socket_and_service_active_after_recovery=true")
+	if err := os.WriteFile(filepath.Join(directory, "provenance-receipt.json"), []byte(
+		`{"version":1,"commit":"`+ociMatrixCandidate+`","source":"published-artifact","artifact_run_id":"4242"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "linux-computer-matrix.json"), []byte(
+		`{"image":{"variant":"xfce"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return directory
 }
 
@@ -417,14 +436,14 @@ func conformantMacMatrixFragment(t *testing.T) string {
 		}
 		rows[id] = map[string]any{
 			"status": "PASS", "assertions": map[string]bool{"attended": true},
-			"evidence": map[string]string{"attended_rows": "probe"}, "gaps": map[string]string{},
-			"not_run_issue": 0, "not_run_reason": "",
+			"attested": map[string]string{}, "evidence": map[string]string{"attended_rows": "probe"},
+			"gaps": map[string]string{}, "not_run_issue": 0, "reason": "",
 		}
 	}
 	rows["mac.only.headless_reboot"] = map[string]any{
-		"status": "NOT-RUN", "assertions": map[string]bool{},
+		"status": "NOT-RUN", "assertions": map[string]bool{}, "attested": map[string]string{},
 		"evidence": map[string]string{}, "gaps": map[string]string{"headless_reboot_evidence": "owned by #128"},
-		"not_run_issue": 128, "not_run_reason": "headless cold-reboot evidence is owned by the #128 prototype",
+		"not_run_issue": 128, "reason": "headless cold-reboot evidence is owned by the #128 prototype",
 	}
 	payload, err := json.Marshal(map[string]any{
 		"version": 1, "session_id": "attended-2026-09-11T075000Z", "commit": ociMatrixCandidate,
