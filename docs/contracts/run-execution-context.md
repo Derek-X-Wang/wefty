@@ -89,13 +89,14 @@ it.
 
 ## Attempt-credential authentication and scope
 
-`POST /v1/jobs`, `GET /v1/jobs?parent_job_id=`, and `GET /v1/jobs/{job_id}`
+`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, and `GET /v1/jobs/{job_id}/children`
 accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
 `WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
 attempt and stores only its SHA-256 digest. The credential authorizes exactly
 three things: submitting a child job, reading its own job, and listing and
 reading that job's children. No other route accepts it, so no operator-level
-action is reachable with it.
+action is reachable with it; the service collection read `GET /v1/jobs` is
+refused with `principal_forbidden` like every other job route.
 
 Parent job, parent attempt, and originating submitter are derived from the
 credential and can never be supplied by the caller: they live on the job
@@ -106,7 +107,8 @@ replaced-session attempt is refused. Children are a job-level resource, so a
 retried attempt sees children spawned by earlier attempts. v1 is
 fire-and-forget: there is no cascade on parent completion, cancellation, or
 loss. Spawn depth counts parent links and is capped at 8; a deeper submission
-is refused with `spawn_depth_exceeded`.
+is refused with HTTP 409 `spawn_depth_exceeded`, `retryable: false`, alongside
+the other non-retryable job-creation conflicts.
 
 A child is submitted with the ordinary `JobSpec` body, so the submitter ceiling
 is exactly what a client principal may express: the Computer trait remains
@@ -114,9 +116,14 @@ refused with `computer_resource_required`, and every other structural rule is
 unchanged. The originating submitter is the client principal that created the
 root job; it is recorded on every descendant and is never widened.
 
-Dispatch-key replay is unchanged and does not consider the submitter: a
-dispatch key already used by another submitter still replays the original job,
-and that job keeps its original submitter and parent.
+Dispatch-key replay stays idempotent within a parent and never crosses one. A
+credential replaying a key its own job already used receives that child again,
+which is what lets a retried attempt resubmit safely. A credential presenting a
+key belonging to any other parent — or to a root job — is refused with
+`dispatch_key_conflict` whether or not the canonical request matches, so replay
+can neither return a job outside the credential's scope nor reveal which keys
+exist. Client-principal replay is unchanged and still does not consider the
+submitter: the replayed job keeps its original submitter and parent.
 
 ## Run-token authentication and scope
 

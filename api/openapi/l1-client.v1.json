@@ -191,7 +191,14 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "409": {
+            "description": "dispatch_key_conflict when the key was already used with a different canonical request, or when an attempt credential presents a key belonging to another parent. spawn_depth_exceeded when the credential's job already sits at the fixed spawn-depth cap of 8. Neither is retryable.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
           "422": { "$ref": "./common.v1.json#/components/responses/UnprocessableEntity" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }

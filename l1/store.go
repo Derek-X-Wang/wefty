@@ -1697,7 +1697,7 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 
 	job, storedHash, err := getJobByDispatchKey(ctx, tx, spec.DispatchKey, now)
 	if err == nil {
-		if storedHash != requestHash {
+		if !replayWithinScope(origin, job) || storedHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", spec.DispatchKey)
 		}
 		return job, true, nil
@@ -1707,7 +1707,9 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	}
 	tombstone, err := readServiceTombstoneByDispatchHash(ctx, tx, hashDispatchKey(spec.DispatchKey))
 	if err == nil {
-		if tombstone.requestHash != requestHash {
+		// A tombstone retains no parentage, so an in-job caller can never be
+		// shown one: unverifiable scope is refused, not assumed.
+		if !replayWithinScope(origin, tombstone.job()) || tombstone.requestHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", spec.DispatchKey)
 		}
 		return tombstone.job(), true, nil
@@ -1736,7 +1738,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHa
 		// A concurrent identical submit can win the unique dispatch key. Read
 		// it after rolling this transaction back and preserve replay semantics.
 		_ = tx.Rollback()
-		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, err)
+		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, origin, err)
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
 		return Job{}, false, internalError(err, "initialize authoritative job log")
@@ -1771,19 +1773,33 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHa
 	return job, false, nil
 }
 
-func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, insertErr error) (Job, bool, error) {
+// replayWithinScope decides whether a dispatch-key replay may be handed to
+// this caller. A client principal keeps the historical behaviour. An attempt
+// credential may replay only a key its own job already used, which is what
+// keeps a retried attempt's resubmission idempotent; every other key is
+// reported as a dispatch-key conflict, identical to the mismatched-request
+// answer. Replay is therefore neither a way to read a job outside the
+// credential's scope nor an oracle for which keys exist.
+func replayWithinScope(origin JobOrigin, replayed Job) bool {
+	if origin.Parent == nil {
+		return true
+	}
+	return replayed.ParentJobID != "" && replayed.ParentJobID == origin.Parent.JobID
+}
+
+func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {
 	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey, canonicalTime(s.clock.Now()))
 	if err != nil {
 		tombstone, tombstoneErr := readServiceTombstoneByDispatchHash(ctx, s.db, hashDispatchKey(dispatchKey))
 		if tombstoneErr != nil {
 			return Job{}, false, internalError(insertErr, "store job")
 		}
-		if tombstone.requestHash != requestHash {
+		if !replayWithinScope(origin, tombstone.job()) || tombstone.requestHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", dispatchKey)
 		}
 		return tombstone.job(), true, nil
 	}
-	if storedHash != requestHash {
+	if !replayWithinScope(origin, job) || storedHash != requestHash {
 		return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", dispatchKey)
 	}
 	return job, true, nil

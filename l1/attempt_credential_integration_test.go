@@ -2,6 +2,7 @@ package l1
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -208,6 +209,112 @@ func TestAttemptCredentialSupersessionKeepsJobLevelChildren(t *testing.T) {
 	}
 }
 
+// The credential dies with the attempt's authority, not merely with the
+// wall-clock lease. These two predicates have no wall-clock component at all.
+func TestAttemptCredentialIsRefusedAfterAuthorityLossWithALiveLease(t *testing.T) {
+	t.Run("replaced node registration", func(t *testing.T) {
+		h, client, agent, node := credentialHarness(t)
+		h.submit(client, "credential-replaced-session", []string{"linux"})
+		claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+
+		// A fresh boot session for the same stable node, while the lease is
+		// still comfortably live.
+		registration := contract.NodeRegistration{
+			NodeID: node.NodeID, BootSessionID: "boot-replacement", RootInstanceID: "root-" + node.NodeID,
+			OS: "linux", Architecture: "arm64", AgentVersion: "test",
+			Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+			CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
+		}
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
+		if status != http.StatusOK {
+			t.Fatalf("re-register status = %d body=%s", status, body)
+		}
+		if !claim.Lease.LeaseExpires.After(h.clock.Now()) {
+			t.Fatal("test needs the original lease to still be unexpired")
+		}
+
+		status, body = h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+claim.Job.JobID, claim.AttemptToken, nil)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("replaced-session credential status = %d body=%s, want %d", status, body, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("terminal attempt", func(t *testing.T) {
+		h, client, agent, node := credentialHarness(t)
+		h.submit(client, "credential-terminal-attempt", []string{"linux"})
+		claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+
+		exitCode := 0
+		if _, err := h.store.CompleteAttempt(t.Context(), node.NodeID, claim.Job.JobID, claim.Lease.AttemptID,
+			CompletionRequest{
+				FencingToken: claim.Lease.FencingToken, IdempotencyKey: "credential-terminal-completion",
+				Result: ProcessResult{ExitCode: &exitCode},
+			}); err != nil {
+			t.Fatal(err)
+		}
+		if !claim.Lease.LeaseExpires.After(h.clock.Now()) {
+			t.Fatal("test needs the lease to still be unexpired after completion")
+		}
+
+		status, body := h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+claim.Job.JobID, claim.AttemptToken, nil)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("terminal-attempt credential status = %d body=%s, want %d", status, body, http.StatusUnauthorized)
+		}
+	})
+}
+
+// Each liveness predicate is pinned directly, so a future refactor cannot drop
+// one and still look correct through the routes above.
+func TestAttemptCredentialAuthorityPredicates(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	scope := AttemptCredentialScope{AttemptID: "attempt-1", JobID: "job-1", NodeID: "node-1"}
+	live := func() attemptAuthority {
+		return attemptAuthority{
+			attemptID: "attempt-1", jobID: "job-1", identityNodeID: "node-1",
+			bootSessionID: "boot-1", currentBootSessionID: "boot-1",
+			authorityGeneration: 3, currentAuthorityGeneration: 3,
+			state:          contract.AttemptRunning,
+			currentAttempt: sql.NullString{String: "attempt-1", Valid: true},
+			leaseExpires:   now.Add(30 * time.Second),
+		}
+	}
+	if err := validateAttemptCredentialAuthority("node-1", scope, live(), now.UnixNano()); err != nil {
+		t.Fatalf("live attempt = %v, want authorized", err)
+	}
+
+	for _, probe := range []struct {
+		name    string
+		mutate  func(*attemptAuthority)
+		node    string
+		wantErr contract.ErrorCode
+	}{
+		{"another node", func(*attemptAuthority) {}, "node-2", contract.ErrorForbidden},
+		{"different job", func(a *attemptAuthority) { a.jobID = "job-2" }, "node-1", contract.ErrorUnauthorized},
+		{"superseded attempt", func(a *attemptAuthority) {
+			a.currentAttempt = sql.NullString{String: "attempt-2", Valid: true}
+		}, "node-1", contract.ErrorUnauthorized},
+		{"no current attempt", func(a *attemptAuthority) {
+			a.currentAttempt = sql.NullString{}
+		}, "node-1", contract.ErrorUnauthorized},
+		{"replaced boot session", func(a *attemptAuthority) { a.currentBootSessionID = "boot-2" }, "node-1", contract.ErrorUnauthorized},
+		{"advanced authority generation", func(a *attemptAuthority) { a.currentAuthorityGeneration = 4 }, "node-1", contract.ErrorUnauthorized},
+		{"terminal attempt with a live lease", func(a *attemptAuthority) {
+			a.state = contract.AttemptSucceeded
+		}, "node-1", contract.ErrorUnauthorized},
+		{"lost attempt with a live lease", func(a *attemptAuthority) {
+			a.state = contract.AttemptLost
+		}, "node-1", contract.ErrorUnauthorized},
+		{"expired lease", func(a *attemptAuthority) { a.leaseExpires = now }, "node-1", contract.ErrorUnauthorized},
+	} {
+		authority := live()
+		probe.mutate(&authority)
+		err := validateAttemptCredentialAuthority(probe.node, scope, authority, now.UnixNano())
+		if errorCode(err) != probe.wantErr {
+			t.Errorf("%s = %v (code %s), want %s", probe.name, err, errorCode(err), probe.wantErr)
+		}
+	}
+}
+
 // One attempt's credential is authority over that attempt's job alone.
 func TestAttemptCredentialCannotActOnAnotherJob(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}, "node-2": {"linux"}})
@@ -221,14 +328,22 @@ func TestAttemptCredentialCannotActOnAnotherJob(t *testing.T) {
 	h.submit(client, "credential-job-b", []string{"linux"})
 	claimB := claimClass(t, h, agentTwo, nodeTwo, contract.JobClassOneShot)
 
-	status, body := h.credentialRequest(agentOne, http.MethodGet, "/v1/jobs/"+claimB.Job.JobID, claimA.AttemptToken, nil)
-	if status != http.StatusForbidden {
-		t.Fatalf("cross-job read status = %d body=%s, want %d", status, body, http.StatusForbidden)
+	foreignStatus, foreignBody := h.credentialRequest(agentOne, http.MethodGet, "/v1/jobs/"+claimB.Job.JobID, claimA.AttemptToken, nil)
+	if foreignStatus != http.StatusForbidden {
+		t.Fatalf("cross-job read status = %d body=%s, want %d", foreignStatus, foreignBody, http.StatusForbidden)
 	}
-	status, body = h.credentialRequest(agentOne, http.MethodGet,
+	status, body := h.credentialRequest(agentOne, http.MethodGet,
 		"/v1/jobs/"+claimB.Job.JobID+"/children", claimA.AttemptToken, nil)
 	if status != http.StatusForbidden {
 		t.Fatalf("cross-job children status = %d body=%s, want %d", status, body, http.StatusForbidden)
+	}
+
+	// An absent job answers byte-for-byte like a foreign one, so the read route
+	// is not an existence probe over the whole job collection.
+	absentStatus, absentBody := h.credentialRequest(agentOne, http.MethodGet, "/v1/jobs/job_does_not_exist", claimA.AttemptToken, nil)
+	if absentStatus != foreignStatus || !bytes.Equal(absentBody, foreignBody) {
+		t.Fatalf("absent job answered %d %s but a foreign job answered %d %s; they must be identical",
+			absentStatus, absentBody, foreignStatus, foreignBody)
 	}
 
 	// A leaked bearer replayed from another node is refused even though the
@@ -241,6 +356,91 @@ func TestAttemptCredentialCannotActOnAnotherJob(t *testing.T) {
 	status, body = h.credentialRequest(client, http.MethodGet, "/v1/jobs/"+claimA.Job.JobID, claimA.AttemptToken, nil)
 	if status != http.StatusForbidden {
 		t.Fatalf("client principal with credential status = %d body=%s, want %d", status, body, http.StatusForbidden)
+	}
+}
+
+// Dispatch-key replay must not become a side door around the credential's
+// scope, nor an oracle for which keys exist.
+func TestAttemptCredentialReplayStaysInsideItsOwnParent(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}, "node-2": {"linux"}})
+	client := h.client(fabric.Identity{NodeID: "submitter", Tags: []string{DefaultClientPrincipalTag}})
+	agentOne := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	agentTwo := h.client(fabric.Identity{NodeID: "node-2", Tags: []string{DefaultAgentPrincipalTag}})
+	nodeOne := h.register(agentOne, "node-1")
+	nodeTwo := h.register(agentTwo, "node-2")
+	h.submit(client, "replay-parent-a", []string{"linux"})
+	claimA := claimClass(t, h, agentOne, nodeOne, contract.JobClassOneShot)
+	foreign := h.submit(client, "replay-foreign-root", []string{"linux"})
+	claimB := claimClass(t, h, agentTwo, nodeTwo, contract.JobClassOneShot)
+	if claimB.Job.JobID != foreign.JobID {
+		t.Fatalf("second claim = %q, want the foreign root %q", claimB.Job.JobID, foreign.JobID)
+	}
+
+	// A's credential spawns its own child and may replay that key forever: a
+	// retried attempt resubmitting the same work must stay idempotent.
+	ownKey := "replay-own-child"
+	status, body := h.credentialRequest(agentOne, http.MethodPost, "/v1/jobs", claimA.AttemptToken,
+		validJobSpec(ownKey, []string{"linux"}))
+	if status != http.StatusCreated {
+		t.Fatalf("own child status = %d body=%s", status, body)
+	}
+	child := decodeJob(t, body)
+	status, body = h.credentialRequest(agentOne, http.MethodPost, "/v1/jobs", claimA.AttemptToken,
+		validJobSpec(ownKey, []string{"linux"}))
+	if status != http.StatusOK {
+		t.Fatalf("own-child replay status = %d body=%s, want %d", status, body, http.StatusOK)
+	}
+	if replayed := decodeJob(t, body); replayed.JobID != child.JobID || replayed.ParentJobID != claimA.Job.JobID {
+		t.Fatalf("own-child replay = %#v, want the original child %q", replayed, child.JobID)
+	}
+
+	// Every key outside A's own children is a conflict, and the answer does not
+	// depend on whether the canonical request happens to match.
+	for _, probe := range []struct {
+		name string
+		spec contract.JobSpec
+	}{
+		{"foreign root, matching request", validJobSpec("replay-foreign-root", []string{"linux"})},
+		{"foreign root, different request", func() contract.JobSpec {
+			spec := validJobSpec("replay-foreign-root", []string{"linux"})
+			spec.Execution.Argv = []string{"echo", "different"}
+			return spec
+		}()},
+		{"another parent's child, matching request", func() contract.JobSpec {
+			// B spawns a child, then A tries to replay B's child key.
+			status, body := h.credentialRequest(agentTwo, http.MethodPost, "/v1/jobs", claimB.AttemptToken,
+				validJobSpec("replay-foreign-child", []string{"linux"}))
+			if status != http.StatusCreated {
+				t.Fatalf("foreign child status = %d body=%s", status, body)
+			}
+			return validJobSpec("replay-foreign-child", []string{"linux"})
+		}()},
+		{"never-used key with a colliding request", validJobSpec("replay-unused-key", []string{"linux"})},
+	} {
+		status, body := h.credentialRequest(agentOne, http.MethodPost, "/v1/jobs", claimA.AttemptToken, probe.spec)
+		if probe.name == "never-used key with a colliding request" {
+			// The control: an unused key is a plain creation, so the refusals
+			// above are about scope rather than about every submission failing.
+			if status != http.StatusCreated {
+				t.Fatalf("%s status = %d body=%s, want %d", probe.name, status, body, http.StatusCreated)
+			}
+			continue
+		}
+		if status != http.StatusConflict {
+			t.Fatalf("%s status = %d body=%s, want %d", probe.name, status, body, http.StatusConflict)
+		}
+		if !bytes.Contains(body, []byte(contract.ErrorDispatchKeyConflict)) {
+			t.Fatalf("%s body = %s, want %s", probe.name, body, contract.ErrorDispatchKeyConflict)
+		}
+		if bytes.Contains(body, []byte("\"job_id\"")) || bytes.Contains(body, []byte("\"spec\"")) {
+			t.Fatalf("%s leaked a job projection: %s", probe.name, body)
+		}
+	}
+
+	// The foreign job is untouched and still invisible through the read route.
+	status, body = h.credentialRequest(agentOne, http.MethodGet, "/v1/jobs/"+foreign.JobID, claimA.AttemptToken, nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("foreign read status = %d body=%s, want %d", status, body, http.StatusForbidden)
 	}
 }
 
@@ -311,6 +511,35 @@ func TestAttemptCredentialSpawnDepthIsCapped(t *testing.T) {
 		validJobSpec("spawn-depth-first-hop", []string{"linux"}))
 	if status != http.StatusCreated {
 		t.Fatalf("first hop status = %d body=%s", status, body)
+	}
+}
+
+// The refusal's wire shape is published, so pin it: HTTP 409 and not
+// retryable, like the other job-creation conflicts.
+func TestSpawnDepthExceededIsANonRetryableConflictOnTheWire(t *testing.T) {
+	h, client, agent, node := credentialHarness(t)
+	h.submit(client, "spawn-depth-wire-root", []string{"linux"})
+	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+
+	// Stand this credential at the cap. Its depth is read from the credential
+	// row, so moving it there exercises the real HTTP refusal rather than a
+	// store-level shortcut, without building an eight-deep chain again.
+	if _, err := h.store.db.ExecContext(t.Context(),
+		"UPDATE attempt_credentials SET spawn_depth=? WHERE attempt_id=?", MaxSpawnDepth, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", claim.AttemptToken,
+		validJobSpec("spawn-depth-wire-child", []string{"linux"}))
+	if status != http.StatusConflict {
+		t.Fatalf("over-cap submit status = %d body=%s, want %d", status, body, http.StatusConflict)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode error response: %v body=%s", err, body)
+	}
+	if response.Error.Code != contract.ErrorSpawnDepthExceeded || response.Error.Retryable {
+		t.Fatalf("over-cap error = %#v, want %s and retryable=false", response.Error, contract.ErrorSpawnDepthExceeded)
 	}
 }
 

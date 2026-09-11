@@ -606,6 +606,12 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 	claim := l1.Claim{
 		Job: l1.Job{JobID: "pending-count-job", Spec: contract.JobSpec{
 			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+			// The secret begins with bufferedOutputRunner's "tail" payload on
+			// purpose: redaction withholds bytes that could still be the head
+			// of a secret, so the only write reaches the sink through the
+			// final flush. That is the path this test measures. A secret
+			// sharing no prefix would emit during Run instead and the test
+			// would no longer be about final flush at all.
 			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{
 				contract.EnvRunToken: "tail-secret",
 			}},

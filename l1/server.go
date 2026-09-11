@@ -674,11 +674,13 @@ func (s *Server) createChildJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getAttemptScopedJob(w http.ResponseWriter, r *http.Request) {
 	scope := attemptCredentialFromRequest(r)
 	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
-	if err != nil {
+	if err != nil && errorCode(err) != contract.ErrorNotFound {
 		writeError(w, err)
 		return
 	}
-	if job.JobID != scope.JobID && job.ParentJobID != scope.JobID {
+	// Absent and out-of-scope answer identically. A distinct not-found would
+	// turn this route into an existence probe over the whole job collection.
+	if err != nil || (job.JobID != scope.JobID && job.ParentJobID != scope.JobID) {
 		writeError(w, protocolError(contract.ErrorForbidden,
 			"an attempt credential may read only its own job and that job's children"))
 		return

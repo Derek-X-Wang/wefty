@@ -70,7 +70,10 @@ never local files.
 Every one-shot attempt — with or without L3 — also receives `WEFTY_L1_ENDPOINT`
 (a dialable HTTP URL) and `WEFTY_ATTEMPT_TOKEN`, the attempt credential. Send
 it as `Authorization: Bearer` to submit a child job (`POST /v1/jobs`), read
-your own job, or list your children (`GET /v1/jobs?parent_job_id=`). It works
+your own job or one of its children (`GET /v1/jobs/{job_id}`), or list your
+children (`GET /v1/jobs/{job_id}/children`). Those three are the whole surface;
+every other job route answers `principal_forbidden`. The child's
+`parent_job_id` is your own job ID, which is how a workload learns it. It works
 only while your attempt holds the lease. Service and Computer attempts do not
 receive these two variables yet.
 
