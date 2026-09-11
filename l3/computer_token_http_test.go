@@ -623,7 +623,24 @@ func TestRunTokenLineageFilterErrorNeverReturnsUnfilteredDescendants(t *testing.
 		return false, internalError(context.DeadlineExceeded, "filter visible lineage")
 	}
 	status, _, body := doComputerHTTP(t, h.client("run-node"), http.MethodGet, "/v1/runs/"+root.RunID+"/lineage", token, "", nil)
-	if status != http.StatusInternalServerError {
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != contract.ErrorInternal || !response.Error.Retryable {
+		t.Fatalf("lineage internal retry advice = %+v", response.Error)
+	}
+	if response.Error.Message != "internal server error" || response.Error.Details != nil {
+		t.Fatalf("lineage internal error not sanitized: %+v", response.Error)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope) != 1 || envelope["error"] == nil || bytes.Contains(body, []byte(root.RunID)) || bytes.Contains(body, []byte("filter visible lineage")) {
+		t.Fatalf("lineage failure leaked data: %s", body)
+	}
+	if status != http.StatusServiceUnavailable {
 		t.Fatalf("lineage filter failure status=%d body=%s", status, body)
 	}
 }
