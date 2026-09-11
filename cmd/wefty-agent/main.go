@@ -121,9 +121,23 @@ func main() {
 	}
 }
 
+// currentEUID reports the effective UID of this process. It is a variable so
+// tests can simulate a root invocation without actually running as root.
+var currentEUID = os.Geteuid
+
 func runMacBootstrap(arguments []string) error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("Mac bootstrap is available only on macOS")
+	}
+	// Reject root before any flag is even inspected, let alone before any
+	// durable file is written. limactl's own "must not run as the root
+	// user" refusal fires deep inside supervisor.Ensure, well after
+	// InitializeOCIIntent has already created the intent file -- as root,
+	// since the whole process inherited root's identity from sudo. That
+	// root-owned 0600 file then permanently blocks every later non-root
+	// operator run ("permission denied") until a human removes it by hand.
+	if euid := currentEUID(); euid == 0 {
+		return errors.New("Mac bootstrap must not run as the root user: it writes operator-owned durable state and a root-owned copy permanently blocks later non-root runs")
 	}
 	flags := flag.NewFlagSet(limarunner.BootstrapInvocationArg, flag.ContinueOnError)
 	var agentArguments repeatedStringFlag
