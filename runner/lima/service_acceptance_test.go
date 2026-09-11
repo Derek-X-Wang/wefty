@@ -440,19 +440,7 @@ const (
 	macMatrixGatewayIssue = 394
 	// Headless cold-reboot evidence is owned by the #128 prototype.
 	macMatrixHeadlessIssue = 128
-	// Rows the runbook has no attended procedure for. #403 owns the missing
-	// exclusive-helper-session step; these are never a product defect.
-	macMatrixRunbookIssue  = 403
-	macMatrixRunbookReason = "runbook_no_procedure: the runbook gives no attended procedure for holding an exclusive helper session while the dev.wefty.agent LaunchDaemon runs"
 )
-
-// attendedRowsWithoutProcedure are NOT-RUN because the runbook never describes
-// how to run them, not because of any product defect. They are never attributed
-// to #394.
-var attendedRowsWithoutProcedure = map[string]struct{}{
-	"task_logs_delete": {}, "mount_validation": {}, "host_to_guest": {},
-	"helper_loss": {}, "vm_loss": {}, "sweep_before_recovery": {},
-}
 
 // macMatrixRows is the frozen Mac half of the matrix. Dependencies are listed
 // dominant cause first: the first non-PASS dependency names the row's reason.
@@ -571,13 +559,8 @@ func buildMacMatrixRow(artifact attendedArtifact, id string, attended []string) 
 		row.Evidence["attended_skipped_row"] = firstSkip
 		row.Evidence["attended_reason"] = artifact.Rows[firstSkip].Reason
 		row.Gaps[firstSkip] = artifact.Rows[firstSkip].Reason
-		if _, withoutProcedure := attendedRowsWithoutProcedure[firstSkip]; withoutProcedure {
-			row.NotRunIssue = macMatrixRunbookIssue
-			row.Reason = macMatrixRunbookReason + " (" + firstSkip + ")"
-		} else {
-			row.NotRunIssue = macMatrixGatewayIssue
-			row.Reason = artifact.Rows[firstSkip].Reason
-		}
+		row.NotRunIssue = macMatrixGatewayIssue
+		row.Reason = artifact.Rows[firstSkip].Reason
 	}
 	if row.Status == "NOT-RUN" && strings.TrimSpace(row.Reason) == "" {
 		row.Reason = "the attended lane recorded " + firstSkip + " as NOT-RUN without a reason"
@@ -728,24 +711,32 @@ func TestAttendedMatrixFragmentMapping(t *testing.T) {
 	})
 
 	t.Run("the owning tickets stay distinct", func(t *testing.T) {
-		if macMatrixRunbookIssue != 403 || macMatrixGatewayIssue != 394 || macMatrixHeadlessIssue != 128 {
-			t.Fatalf("matrix ownership = runbook #%d, gateway #%d, headless #%d; re-pointing is a deliberate edit",
-				macMatrixRunbookIssue, macMatrixGatewayIssue, macMatrixHeadlessIssue)
+		if macMatrixGatewayIssue != 394 || macMatrixHeadlessIssue != 128 || macMatrixGatewayIssue == macMatrixHeadlessIssue {
+			t.Fatalf("matrix ownership = gateway #%d, headless #%d; re-pointing is a deliberate edit",
+				macMatrixGatewayIssue, macMatrixHeadlessIssue)
 		}
 	})
 
-	t.Run("a row the runbook cannot drive is never blamed on #394", func(t *testing.T) {
+	// #403 gave the runbook a procedure for task_logs_delete, mount_validation,
+	// host_to_guest, helper_loss, vm_loss, and sweep_before_recovery, so a
+	// NOT-RUN on any of them is no longer a special "no procedure" case: it
+	// falls through like any other skip, to the real dominant blocker and the
+	// attended session's own reason.
+	t.Run("a row that once had no procedure now falls through like any other skip", func(t *testing.T) {
 		artifact := base()
-		for name := range attendedRowsWithoutProcedure {
-			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", Reason: "not executed: the LaunchDaemon holds the exclusive helper session"}
+		for _, name := range []string{
+			"task_logs_delete", "mount_validation", "host_to_guest",
+			"helper_loss", "vm_loss", "sweep_before_recovery",
+		} {
+			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", Reason: "blocked by the run-bridge gateway guard"}
 		}
 		fragment := buildMacMatrixFragment(artifact, "sha")
 		assertMacMatrixFragmentIsTyped(t, fragment)
 		for _, id := range []string{"mac.oneshot.delivery", "mac.oneshot.engine_loss", "mac.service.crash_recovery", "mac.only.dial_attempt_port"} {
 			row := fragment.Rows[id]
-			if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixRunbookIssue ||
-				!strings.HasPrefix(row.Reason, "runbook_no_procedure: ") {
-				t.Fatalf("row %s = %+v, want a runbook_no_procedure skip", id, row)
+			if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixGatewayIssue ||
+				row.Reason != "blocked by the run-bridge gateway guard" {
+				t.Fatalf("row %s = %+v, want NOT-RUN owned by #394 with the attended reason verbatim", id, row)
 			}
 		}
 	})
