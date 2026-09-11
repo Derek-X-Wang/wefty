@@ -142,6 +142,37 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 				}
 			})
 
+			// The shipping case today: the owner ran the lane, #394 blocked every
+			// row, and the fragment says so honestly. It must pass the gate and it
+			// must not read as a finished matrix.
+			t.Run("an honest blocked attended session passes without completing", func(t *testing.T) {
+				matrix := assembleComputerMatrix(t, shell, linux,
+					conformantMacComputerFragment(t, false), "published-artifact", "owner-hardware")
+				if matrix["complete"] != false || matrix["mac_source"] != "attended-owner-hardware" {
+					t.Fatalf("complete=%v mac_source=%v", matrix["complete"], matrix["mac_source"])
+				}
+				rows := matrix["rows"].(map[string]any)
+				for _, id := range computerMatrixRows {
+					if !strings.HasPrefix(id, "mac.") {
+						continue
+					}
+					row := rows[id].(map[string]any)
+					if row["status"] != "NOT-RUN" || int(row["not_run_issue"].(float64)) != computerMatrixGatewayIssue {
+						t.Fatalf("row %s = %v/#%v, want the attended lane's own #394 skip", id, row["status"], row["not_run_issue"])
+					}
+					if row["source"] != "attended-owner-hardware" {
+						t.Fatalf("row %s is sourced from %v, not the attended artifact", id, row["source"])
+					}
+				}
+				output, err := runComputerMatrixGate(t, shell, matrix, computerMatrixCandidate, "published-artifact", "owner-hardware", "")
+				if err != nil {
+					t.Fatalf("an honest blocked attended session was rejected: %v", err)
+				}
+				if !strings.Contains(output, "matrix incomplete: 10 Mac rows not run") {
+					t.Fatalf("summary line = %q; a blocked session must not read as a finished matrix", output)
+				}
+			})
+
 			t.Run("mutation dispatch requires exactly its own row", func(t *testing.T) {
 				mutated := mutatedLinuxComputerEvidence(t, "linux.reconfiguration")
 				matrix := assembleComputerMatrix(t, shell, mutated, "none", "published-artifact", "github-hosted")
@@ -252,6 +283,12 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 				},
 				"destination asserted over a plain-Fabric deviation": func(matrix map[string]any) {
 					matrix["mac_evidence"].(map[string]any)["plain_fabric_deviation"] = true
+				},
+				"destination asserted with a Mac row still open": func(matrix map[string]any) {
+					row := matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)
+					row["status"], row["not_run_issue"] = "NOT-RUN", computerMatrixGatewayIssue
+					row["reason"], row["assertions"] = "blocked by #394", map[string]any{}
+					matrix["status"], matrix["complete"] = "NOT-RUN", false
 				},
 				"aggregate status laundered to PASS": func(matrix map[string]any) {
 					matrix["rows"].(map[string]any)["mac.removal"].(map[string]any)["status"] = "NOT-RUN"

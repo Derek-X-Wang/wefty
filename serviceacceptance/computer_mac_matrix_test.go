@@ -306,6 +306,9 @@ func validateAttendedMacComputerReceipt(payload []byte, candidate string) (*macC
 	if receipt.Host.LimaInstances != 1 {
 		return nil, fmt.Errorf("attended artifact records %d Lima instances; one shared VM is the contract", receipt.Host.LimaInstances)
 	}
+	if err := validateMacComputerSetupEvidence(&receipt); err != nil {
+		return nil, err
+	}
 	if len(receipt.Rows) != len(macComputerMatrixRows) {
 		return nil, fmt.Errorf("attended artifact carries %d rows, want %d", len(receipt.Rows), len(macComputerMatrixRows))
 	}
@@ -347,6 +350,9 @@ func validateAttendedMacComputerReceipt(payload []byte, candidate string) (*macC
 			return nil, fmt.Errorf("row %s carries status %q", required.ID, row.Status)
 		}
 	}
+	if err := validateMacComputerLiveEvidence(&receipt); err != nil {
+		return nil, err
+	}
 	if receipt.Destination.Asserted != receipt.evaluateDestination() {
 		return nil, fmt.Errorf("destination.asserted=%t does not follow from the rows", receipt.Destination.Asserted)
 	}
@@ -354,6 +360,104 @@ func validateAttendedMacComputerReceipt(payload []byte, candidate string) (*macC
 		return nil, fmt.Errorf("destination attestation %q is neither human nor scripted", receipt.Destination.Attestation)
 	}
 	return &receipt, nil
+}
+
+// macComputerRequiredRoles are the four Fabric identities the runbook makes the
+// owner provision. They are setup facts, knowable before any Computer boots, so
+// every attended artifact carries them however blocked the session was.
+var macComputerRequiredRoles = []string{"administrator", "viewer", "second_device", "unauthorized"}
+
+func isSHA256Digest(value string) bool {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
+		return false
+	}
+	for _, character := range value[len(prefix):] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validateMacComputerSetupEvidence checks the facts that exist whether or not a
+// single Computer ever booted: who was on the tailnet, which images were pinned,
+// and the caps the contract fixes. A session blocked by #394 still has all of
+// them, so they are unconditional.
+func validateMacComputerSetupEvidence(receipt *macComputerMatrixReceipt) error {
+	if len(receipt.FabricIdentities) < len(macComputerRequiredRoles) {
+		return fmt.Errorf("attended artifact carries %d Fabric identities, want at least %d",
+			len(receipt.FabricIdentities), len(macComputerRequiredRoles))
+	}
+	devices := make(map[string]string, len(receipt.FabricIdentities))
+	roles := make(map[string]struct{}, len(receipt.FabricIdentities))
+	for _, identity := range receipt.FabricIdentities {
+		if identity.FabricID == "" || identity.UserID == "" || identity.DeviceID == "" {
+			return fmt.Errorf("Fabric identity %+v omits an id", identity)
+		}
+		if owner, taken := devices[identity.DeviceID]; taken {
+			return fmt.Errorf("roles %s and %s share device %s; the denial proofs need distinct devices",
+				owner, identity.Role, identity.DeviceID)
+		}
+		devices[identity.DeviceID] = identity.Role
+		roles[identity.Role] = struct{}{}
+	}
+	for _, role := range macComputerRequiredRoles {
+		if _, ok := roles[role]; !ok {
+			return fmt.Errorf("attended artifact omits the %s Fabric identity", role)
+		}
+	}
+	if !isSHA256Digest(receipt.Image.IndexDigest) || !isSHA256Digest(receipt.Image.PlatformDigest) {
+		return fmt.Errorf("attended artifact image digests are not pinned: %+v", receipt.Image)
+	}
+	caps := receipt.ResourceCaps
+	if caps.MemoryBytes <= 0 || caps.DiskBytes <= 0 {
+		return fmt.Errorf("attended artifact resource caps are unset: %+v", caps)
+	}
+	// The backup cap and the inflight boundary are contract constants (spec
+	// sections 3.2 and 8), not host facts, so they are exact here as on Linux.
+	if caps.BackupCap != 4 || caps.SubmitMaxInflight != 20 {
+		return fmt.Errorf("attended artifact resource caps = %+v, want backup_cap 4 and submit_max_inflight 20", caps)
+	}
+	return nil
+}
+
+// validateMacComputerLiveEvidence checks the facts only a booted Computer can
+// produce. A fully blocked session has none of them and must still be a valid
+// fragment, so these bind to the first PASS row rather than to the artifact.
+func validateMacComputerLiveEvidence(receipt *macComputerMatrixReceipt) error {
+	passed := false
+	for _, row := range receipt.Rows {
+		if row.Status == "PASS" {
+			passed = true
+			break
+		}
+	}
+	if !passed {
+		return nil
+	}
+	if len(receipt.AuthorityGeneration) == 0 {
+		return errors.New("attended artifact passes a row without recording an authority generation")
+	}
+	for _, generation := range receipt.AuthorityGeneration {
+		if generation <= 0 {
+			return fmt.Errorf("attended artifact records authority generation %d", generation)
+		}
+	}
+	for name, identifiers := range map[string][]string{
+		"computer_ids": receipt.ComputerIDs, "job_ids": receipt.JobIDs,
+		"attempt_ids": receipt.AttemptIDs, "storage_ids": receipt.StorageIDs,
+	} {
+		if len(identifiers) == 0 {
+			return fmt.Errorf("attended artifact passes a row with no %s", name)
+		}
+		for _, identifier := range identifiers {
+			if strings.TrimSpace(identifier) == "" {
+				return fmt.Errorf("attended artifact records an empty entry in %s", name)
+			}
+		}
+	}
+	return nil
 }
 
 func TestMacComputerMatrixRowsAreStableAndComplete(t *testing.T) {
@@ -501,6 +605,20 @@ func TestAttendedMacComputerReceiptValidation(t *testing.T) {
 			VMDiskBytes: 34359738368, LimaInstances: 1,
 		}
 		receipt.Rendering = macComputerRenderingEvidence{GPU: false, Renderer: "cpu-xvfb", DRIPresent: false}
+		receipt.Image = linuxComputerImageEvidence{
+			Variant: "xfce", Reference: "ghcr.io/derek-x-wang/wefty-computer-reference",
+			IndexDigest: "sha256:" + strings.Repeat("a", 64), PlatformDigest: "sha256:" + strings.Repeat("b", 64),
+			Archive: "wefty-computer-reference.oci.tar",
+		}
+		receipt.FabricIdentities = []linuxComputerFabricIdentity{
+			{Role: "administrator", FabricID: "fabric-admin", UserID: "owner", DeviceID: "mac-node"},
+			{Role: "viewer", FabricID: "fabric-viewer", UserID: "owner", DeviceID: "second-laptop"},
+			{Role: "second_device", FabricID: "fabric-second", UserID: "owner", DeviceID: "owner-phone"},
+			{Role: "unauthorized", FabricID: "fabric-stranger", UserID: "stranger", DeviceID: "stranger-laptop"},
+		}
+		receipt.ResourceCaps = linuxComputerResourceCaps{
+			MemoryBytes: 1 << 30, DiskBytes: 128 << 20, BackupCap: 4, SubmitMaxInflight: 20,
+		}
 		for _, required := range macComputerMatrixRows {
 			receipt.begin(required.ID)
 			issue := macComputerAbsentIssue
@@ -597,6 +715,42 @@ func TestAttendedMacComputerReceiptValidation(t *testing.T) {
 		"more than one Lima instance": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
 			receipt.Host.LimaInstances = 2
 		},
+		"fewer than four Fabric identities": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.FabricIdentities = receipt.FabricIdentities[:3]
+		},
+		"no second-device identity": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.FabricIdentities[2].Role = "viewer"
+		},
+		"no unauthorized identity": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.FabricIdentities[3].Role = "viewer"
+		},
+		"two roles share one device": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.FabricIdentities[2].DeviceID = receipt.FabricIdentities[0].DeviceID
+		},
+		"Fabric identity without a device id": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.FabricIdentities[1].DeviceID = ""
+		},
+		"Fabric identity without a user id": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.FabricIdentities[1].UserID = ""
+		},
+		"unpinned image index digest": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.Image.IndexDigest = ""
+		},
+		"malformed image platform digest": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.Image.PlatformDigest = "sha256:not-a-digest"
+		},
+		"unset memory cap": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.ResourceCaps.MemoryBytes = 0
+		},
+		"unset disk cap": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.ResourceCaps.DiskBytes = 0
+		},
+		"backup cap off contract": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.ResourceCaps.BackupCap = 3
+		},
+		"inflight boundary off contract": func(_ *testing.T, receipt *macComputerMatrixReceipt) {
+			receipt.ResourceCaps.SubmitMaxInflight = 21
+		},
 	} {
 		t.Run("reject/"+name, func(t *testing.T) {
 			receipt := conformant(t)
@@ -606,6 +760,63 @@ func TestAttendedMacComputerReceiptValidation(t *testing.T) {
 			}
 		})
 	}
+
+	// The live-evidence checks bind to a PASS row, not to the artifact: a fully
+	// blocked session has no Computer, no attempt and no authority generation,
+	// and must still be a valid fragment.
+	withOnePassingRow := func(t *testing.T) *macComputerMatrixReceipt {
+		t.Helper()
+		receipt := conformant(t)
+		receipt.begin("mac.create_boot")
+		if err := receipt.pass("mac.create_boot", map[string]bool{"trait_only_refusal_observed": true}, nil); err != nil {
+			t.Fatal(err)
+		}
+		receipt.AuthorityGeneration = []int64{1}
+		receipt.ComputerIDs, receipt.JobIDs = []string{"computer-1"}, []string{"job-1"}
+		receipt.AttemptIDs, receipt.StorageIDs = []string{"attempt-1"}, []string{"storage-1"}
+		receipt.finish()
+		return receipt
+	}
+
+	t.Run("a session that passed a row carries its live evidence", func(t *testing.T) {
+		if _, err := validateAttendedMacComputerReceipt(marshal(t, withOnePassingRow(t)), candidate); err != nil {
+			t.Fatalf("a green row with full live evidence was rejected: %v", err)
+		}
+	})
+
+	for name, mutate := range map[string]func(*macComputerMatrixReceipt){
+		"no authority generation": func(receipt *macComputerMatrixReceipt) {
+			receipt.AuthorityGeneration = nil
+		},
+		"non-positive authority generation": func(receipt *macComputerMatrixReceipt) {
+			receipt.AuthorityGeneration = []int64{0}
+		},
+		"no computer ids": func(receipt *macComputerMatrixReceipt) { receipt.ComputerIDs = nil },
+		"no job ids":      func(receipt *macComputerMatrixReceipt) { receipt.JobIDs = nil },
+		"no attempt ids":  func(receipt *macComputerMatrixReceipt) { receipt.AttemptIDs = nil },
+		"no storage ids":  func(receipt *macComputerMatrixReceipt) { receipt.StorageIDs = nil },
+		"blank attempt id": func(receipt *macComputerMatrixReceipt) {
+			receipt.AttemptIDs = []string{" "}
+		},
+	} {
+		t.Run("reject/passing row without live evidence/"+name, func(t *testing.T) {
+			receipt := withOnePassingRow(t)
+			mutate(receipt)
+			if _, err := validateAttendedMacComputerReceipt(marshal(t, receipt), candidate); err == nil {
+				t.Fatal("a PASS row was accepted without the evidence only a booted Computer produces")
+			}
+		})
+	}
+
+	t.Run("a fully blocked session needs no live evidence", func(t *testing.T) {
+		receipt := conformant(t)
+		if len(receipt.ComputerIDs) != 0 || len(receipt.AuthorityGeneration) != 0 {
+			t.Fatal("the blocked fixture invented live evidence")
+		}
+		if _, err := validateAttendedMacComputerReceipt(marshal(t, receipt), candidate); err != nil {
+			t.Fatalf("the shipping case was rejected: %v", err)
+		}
+	})
 
 	t.Run("reject/commit mismatch", func(t *testing.T) {
 		receipt := conformant(t)

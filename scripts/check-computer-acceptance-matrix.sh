@@ -111,6 +111,8 @@ verdict=$(jq -r --argjson required "$required_rows" --arg candidate "$candidate_
         else empty end),
       (if ($mac_open | length) == 0 and (.mac_evidence.destination_asserted // false) != true
         then "every Mac row passed without the destination sentence asserted" else empty end),
+      (if ($mac_open | length) > 0 and (.mac_evidence.destination_asserted // false) == true
+        then "the destination sentence is asserted with Mac rows still open: \(names(((.id // "") | startswith("mac.")) and .status != "PASS"))" else empty end),
       (if (.mac_evidence.destination_asserted // false) == true and (.mac_evidence.plain_fabric_deviation // false) == true
         then "the destination sentence is asserted over a plain-Fabric deviation" else empty end),
 
