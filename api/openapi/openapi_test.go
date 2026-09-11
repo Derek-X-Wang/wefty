@@ -825,6 +825,85 @@ func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
 	}
 }
 
+// The attempt credential is published as a per-operation alternative on the
+// three routes it reaches. Document-level security stays Fabric identity alone
+// for both L1 protocols, so no route becomes credential-authorizable by
+// omission.
+func TestL1PublishesAttemptCredentialSurface(t *testing.T) {
+	t.Parallel()
+
+	common := readObject(t, "common.v1.json")
+	schemes := object(t, object(t, common["components"], "components")["securitySchemes"], "securitySchemes")
+	scheme := object(t, schemes["attemptCredential"], "attemptCredential")
+	if scheme["type"] != "http" || scheme["scheme"] != "bearer" {
+		t.Fatalf("attempt credential scheme = %#v, want an http bearer scheme", scheme)
+	}
+
+	job := object(t, object(t, object(t, common["components"], "components")["schemas"], "schemas")["Job"], "Job")
+	properties := object(t, job["properties"], "Job.properties")
+	for _, name := range []string{"parent_job_id", "parent_attempt_id", "originating_submitter", "spawn_depth"} {
+		if _, published := properties[name]; !published {
+			t.Errorf("Job schema omits %q", name)
+		}
+	}
+	if depth := object(t, properties["spawn_depth"], "spawn_depth"); depth["maximum"] != float64(8) {
+		t.Errorf("spawn_depth maximum = %v, want the fixed cap of 8", depth["maximum"])
+	}
+
+	client := readObject(t, "l1-client.v1.json")
+	if _, declared := object(t, object(t, client["components"], "components")["securitySchemes"],
+		"securitySchemes")["attemptCredential"]; !declared {
+		t.Fatal("l1-client does not declare the attempt credential scheme")
+	}
+	paths := object(t, client["paths"], "paths")
+	for _, published := range []struct{ path, method string }{
+		{"/v1/jobs", "post"},
+		{"/v1/jobs/{job_id}", "get"},
+		{"/v1/jobs/{job_id}/children", "get"},
+	} {
+		name := published.method + " " + published.path
+		operation := object(t, object(t, paths[published.path], published.path)[published.method], name)
+		security, ok := operation["security"].([]any)
+		if !ok || len(security) != 2 {
+			t.Fatalf("%s security = %#v, want a bare and a credential alternative", name, operation["security"])
+		}
+		bare := object(t, security[0], name+".security[0]")
+		if _, fabricOnly := bare["fabricIdentity"]; !fabricOnly || len(bare) != 1 {
+			t.Errorf("%s first alternative = %#v, want Fabric identity alone", name, bare)
+		}
+		combined := object(t, security[1], name+".security[1]")
+		if _, ok := combined["fabricIdentity"]; !ok {
+			t.Errorf("%s credential alternative omits Fabric authentication", name)
+		}
+		if _, ok := combined["attemptCredential"]; !ok {
+			t.Errorf("%s credential alternative omits the attempt credential", name)
+		}
+	}
+	// Every other job route stays unreachable in-job.
+	for _, closed := range []struct{ path, method string }{
+		{"/v1/jobs", "get"},
+		{"/v1/jobs/{job_id}/logs", "get"},
+		{"/v1/jobs/{job_id}/remove", "post"},
+		{"/v1/jobs/{job_id}/restart", "post"},
+		{"/v1/jobs/{job_id}/forget", "post"},
+		{"/v1/jobs/{job_id}/desired-state", "put"},
+	} {
+		name := closed.method + " " + closed.path
+		operation := object(t, object(t, paths[closed.path], closed.path)[closed.method], name)
+		if _, scoped := operation["security"]; scoped {
+			t.Errorf("%s publishes its own security requirement; only the three in-job routes may", name)
+		}
+	}
+
+	agent := readObject(t, "l1-agent.v1.json")
+	claim := object(t, object(t, agent["paths"], "paths")["/v1/agent/jobs/claim"], "claim path")
+	response := object(t, object(t, object(t, claim["post"], "claim post")["responses"], "responses")["200"], "claim 200")
+	schema := object(t, object(t, object(t, response["content"], "content")["application/json"], "media")["schema"], "claim schema")
+	if !stringSet(t, schema["required"])["attempt_token"] {
+		t.Fatal("claim response does not require attempt_token")
+	}
+}
+
 func TestL3UsesFabricAuthenticationAndRunTokenAuthorization(t *testing.T) {
 	t.Parallel()
 	doc := readObject(t, "l3.v1.json")
