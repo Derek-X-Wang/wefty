@@ -660,9 +660,22 @@ jobs:
             "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
             "$RUNNER_TEMP/linux-computer-receipt-xfce" \
             none "$RUNNER_ENVIRONMENT"
+      - name: Assemble the agent-computer acceptance matrix
+        if: needs.resolve-published-artifact.outputs.available == 'true'
+        env:
+          COMPUTER_MATRIX_CANDIDATE_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          COMPUTER_MATRIX_EVIDENCE_SOURCE: ${{ needs.resolve-published-artifact.outputs.source }}
+        run: |
+          scripts/assemble-computer-acceptance-matrix.sh \
+            "$RUNNER_TEMP/computer-acceptance-matrix.json" \
+            "$COMPUTER_MATRIX_CANDIDATE_SHA" "$COMPUTER_MATRIX_EVIDENCE_SOURCE" \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce" none "$RUNNER_ENVIRONMENT"
       - name: Fail closed unless the artifact lane executed and passed
         if: ${{ always() }}
         env:
+          COMPUTER_MATRIX_CANDIDATE_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          COMPUTER_MATRIX_EVIDENCE_SOURCE: ${{ needs.resolve-published-artifact.outputs.source }}
+          COMPUTER_MATRIX_MUTATED_ROW: ''
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
           ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}
           REALTIMING_RESULT: ${{ needs.service-acceptance-realtiming.result }}
@@ -709,6 +722,10 @@ jobs:
             "$RUNNER_TEMP/oci-acceptance-matrix.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
             "$WEFTY_REALTIME_EVIDENCE_SOURCE" "$RUNNER_ENVIRONMENT"
+          scripts/check-computer-acceptance-matrix.sh \
+            "$RUNNER_TEMP/computer-acceptance-matrix.json" \
+            "$COMPUTER_MATRIX_CANDIDATE_SHA" "$COMPUTER_MATRIX_EVIDENCE_SOURCE" \
+            "$RUNNER_ENVIRONMENT" "$COMPUTER_MATRIX_MUTATED_ROW"
           for variant in xfce wayland; do
             timeline="$RUNNER_TEMP/linux-computer-receipt-$variant/helper-restart-timeline.txt"
             grep -Fx 'observed_startup_failures=6' "$timeline"
@@ -750,4 +767,11 @@ jobs:
         with:
           name: oci-acceptance-matrix-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/oci-acceptance-matrix.json
+          if-no-files-found: warn
+      - name: Upload the agent-computer acceptance matrix
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: computer-acceptance-matrix-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/computer-acceptance-matrix.json
           if-no-files-found: warn

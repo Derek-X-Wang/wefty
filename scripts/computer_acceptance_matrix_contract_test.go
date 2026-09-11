@@ -286,6 +286,82 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 	}
 }
 
+// TestComputerAcceptanceMatrixIsWiredIntoBothRealtimingLanes keeps the two
+// evidence workflows from drifting: a matrix gated on one lane and not the other
+// is a matrix that can be dodged.
+func TestComputerAcceptanceMatrixIsWiredIntoBothRealtimingLanes(t *testing.T) {
+	assemble := extractComputerMatrixInvocation(t, "assemble-computer-acceptance-matrix.sh")
+	check := extractComputerMatrixInvocation(t, "check-computer-acceptance-matrix.sh")
+	for _, lines := range []map[string][]string{assemble, check} {
+		var reference []string
+		for workflow, extracted := range lines {
+			if reference == nil {
+				reference = extracted
+				continue
+			}
+			if strings.Join(reference, "\n") != strings.Join(extracted, "\n") {
+				t.Fatalf("%s invokes the matrix differently:\n%s\nvs\n%s",
+					workflow, strings.Join(reference, "\n"), strings.Join(extracted, "\n"))
+			}
+		}
+	}
+	for _, workflow := range computerMatrixWorkflows() {
+		payload := readComputerMatrixWorkflow(t, workflow)
+		for _, required := range []string{
+			"COMPUTER_MATRIX_CANDIDATE_SHA:",
+			"COMPUTER_MATRIX_EVIDENCE_SOURCE:",
+			"COMPUTER_MATRIX_MUTATED_ROW:",
+			"name: computer-acceptance-matrix-${{ needs.resolve-published-artifact.outputs.candidate-sha }}",
+			"path: ${{ runner.temp }}/computer-acceptance-matrix.json",
+		} {
+			if !strings.Contains(payload, required) {
+				t.Fatalf("%s does not carry %q", workflow, required)
+			}
+		}
+	}
+}
+
+func computerMatrixWorkflows() []string {
+	return []string{
+		"../.github/workflows/service-acceptance-realtiming.yml",
+		"../.github/workflows/service-acceptance-realtiming-scheduled.yml",
+	}
+}
+
+func readComputerMatrixWorkflow(t *testing.T, path string) string {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(payload)
+}
+
+// extractComputerMatrixInvocation returns the continued shell invocation of the
+// named script from every realtiming workflow, trimmed of indentation.
+func extractComputerMatrixInvocation(t *testing.T, script string) map[string][]string {
+	t.Helper()
+	found := make(map[string][]string, len(computerMatrixWorkflows()))
+	for _, workflow := range computerMatrixWorkflows() {
+		lines := strings.Split(readComputerMatrixWorkflow(t, workflow), "\n")
+		for index, line := range lines {
+			if !strings.HasPrefix(strings.TrimSpace(line), "scripts/"+script) {
+				continue
+			}
+			invocation := []string{strings.TrimSpace(line)}
+			for next := index + 1; next < len(lines) && strings.HasSuffix(invocation[len(invocation)-1], "\\"); next++ {
+				invocation = append(invocation, strings.TrimSpace(lines[next]))
+			}
+			found[workflow] = invocation
+			break
+		}
+		if _, ok := found[workflow]; !ok {
+			t.Fatalf("%s never invokes scripts/%s", workflow, script)
+		}
+	}
+	return found
+}
+
 func containsComputerRow(rows []string, id string) bool {
 	for _, row := range rows {
 		if row == id {
