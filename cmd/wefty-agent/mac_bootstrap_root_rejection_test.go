@@ -1,3 +1,12 @@
+//go:build darwin
+
+// This file exercises runMacBootstrap end to end, which bails out on any
+// non-darwin GOOS before the root check it is testing ever runs (see
+// rootBootstrapRejection in main.go). Constrained to darwin so it is not
+// compiled -- let alone silently wrong -- on other platforms; the shared
+// rejection logic itself has a platform-neutral test in
+// mac_bootstrap_root_rejection_helper_test.go.
+
 package main
 
 import (

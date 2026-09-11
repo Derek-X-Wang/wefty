@@ -125,19 +125,34 @@ func main() {
 // tests can simulate a root invocation without actually running as root.
 var currentEUID = os.Geteuid
 
+// rootBootstrapRejection returns the error a root-invoked Mac bootstrap must
+// return before writing anything, or nil for a non-root identity. It is
+// factored out of runMacBootstrap so the rejection logic itself -- not just
+// runMacBootstrap's darwin-only end-to-end behavior -- can be exercised by a
+// platform-neutral test: runMacBootstrap bails out on any non-darwin GOOS
+// before this check ever runs, so a test that only calls runMacBootstrap
+// cannot observe this rejection on a Linux CI runner.
+func rootBootstrapRejection(euid int) error {
+	if euid != 0 {
+		return nil
+	}
+	// limactl's own "must not run as the root user" refusal fires deep
+	// inside supervisor.Ensure, well after InitializeOCIIntent has already
+	// created the intent file -- as root, since the whole process inherited
+	// root's identity from sudo. That root-owned 0600 file then permanently
+	// blocks every later non-root operator run ("permission denied") until
+	// a human removes it by hand.
+	return errors.New("Mac bootstrap must not run as the root user: it writes operator-owned durable state and a root-owned copy permanently blocks later non-root runs")
+}
+
 func runMacBootstrap(arguments []string) error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("Mac bootstrap is available only on macOS")
 	}
 	// Reject root before any flag is even inspected, let alone before any
-	// durable file is written. limactl's own "must not run as the root
-	// user" refusal fires deep inside supervisor.Ensure, well after
-	// InitializeOCIIntent has already created the intent file -- as root,
-	// since the whole process inherited root's identity from sudo. That
-	// root-owned 0600 file then permanently blocks every later non-root
-	// operator run ("permission denied") until a human removes it by hand.
-	if euid := currentEUID(); euid == 0 {
-		return errors.New("Mac bootstrap must not run as the root user: it writes operator-owned durable state and a root-owned copy permanently blocks later non-root runs")
+	// durable file is written.
+	if err := rootBootstrapRejection(currentEUID()); err != nil {
+		return err
 	}
 	flags := flag.NewFlagSet(limarunner.BootstrapInvocationArg, flag.ContinueOnError)
 	var agentArguments repeatedStringFlag
