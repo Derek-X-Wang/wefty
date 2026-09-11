@@ -34,6 +34,9 @@ func RunComputerServiceRealtiming(
 	}
 	return runComputerService(ctx, runtimeAdapter, request, nil, computerServiceConfig{
 		clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: realtimingComputerAuditor{},
+		publicationOperation: func(parent context.Context) (context.Context, context.CancelFunc) {
+			return context.WithTimeout(parent, DefaultOperationTimeout)
+		},
 		computerID: "reference-computer", jobID: request.Authority.JobID, attemptID: request.Authority.AttemptID,
 		storageID: storageID, storageGeneration: storageGeneration,
 		fencingToken: request.Authority.FencingToken, dial: dial, publish: publish,

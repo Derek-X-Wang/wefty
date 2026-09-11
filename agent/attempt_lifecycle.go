@@ -1180,7 +1180,8 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		result, runErr = runComputerService(ctx, runtimeAdapter, request, sink, computerServiceConfig{
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
-			authorizer: lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
+			publicationOperation: lifecycle.dependencies.client.boundedContext,
+			authorizer:           lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
 			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: computerBridge,
 			controlTokens: lifecycle.dependencies.computerControlTokens,
 			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,

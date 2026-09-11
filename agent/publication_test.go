@@ -277,3 +277,114 @@ func waitPublicationDone(t *testing.T, done <-chan error) error {
 		return nil
 	}
 }
+
+func TestPublicationControllerStopClearsAfterUncertainRepublish(t *testing.T) {
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	ctx, cancel := context.WithCancel(t.Context())
+	requests := make(chan bool, 4)
+	forwarded := make(chan bool, 4)
+	ackFinalFalse := make(chan struct{})
+	joined := make(chan struct{})
+	done := make(chan error, 1)
+	var calls, inFlight atomic.Int32
+	var remoteReady, forwarding atomic.Bool
+	var controller *publicationController
+	controller = newPublicationController(clock, DefaultPublicationRecoveryWindow, DefaultPublicationRetryInterval,
+		func(ctx context.Context, ready bool) error {
+			if inFlight.Add(1) != 1 {
+				t.Error("publication requests overlapped")
+			}
+			defer inFlight.Add(-1)
+			call := calls.Add(1)
+			requests <- ready
+			if call == 3 {
+				// L1 may have committed true even though its response is lost.
+				remoteReady.Store(ready)
+				controller.Stop()
+				return errors.New("transport uncertainty after true mutation")
+			}
+			if call == 4 {
+				select {
+				case <-ackFinalFalse:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			remoteReady.Store(ready)
+			return nil
+		}, func(ready bool) { forwarding.Store(ready); forwarded <- ready })
+	go func() { defer close(joined); done <- controller.Run(ctx) }()
+	defer func() { cancel(); <-joined }()
+	controller.Observe(true)
+	if !waitPublicationRequest(t, requests) || !waitPublicationRequest(t, forwarded) {
+		t.Fatal("initial true was not acknowledged")
+	}
+	controller.Observe(false)
+	if waitPublicationRequest(t, forwarded) || waitPublicationRequest(t, requests) {
+		t.Fatal("readiness loss did not clear")
+	}
+	controller.Observe(true)
+	recoveryDeadline := clock.Now().Add(DefaultPublicationRecoveryWindow)
+	clock.waitForDeadline(t, recoveryDeadline)
+	clock.Advance(DefaultPublicationRecoveryWindow)
+	if !waitPublicationRequest(t, requests) {
+		t.Fatal("expected republish true")
+	}
+	if waitPublicationRequest(t, forwarded) {
+		t.Fatal("Stop enabled forwarding")
+	}
+	select {
+	case ready := <-requests:
+		if ready {
+			t.Fatal("Stop republished true")
+		}
+	case err := <-done:
+		t.Fatalf("CAUSAL RED: Stop skipped final false after uncertain true: calls=%d remote_ready=%t forwarding=%t error=%v", calls.Load(), remoteReady.Load(), forwarding.Load(), err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for final false")
+	}
+	if inFlight.Load() != 1 || forwarding.Load() {
+		t.Fatal("final false must remain serialized with forwarding disabled")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("returned before final false ACK: %v", err)
+	default:
+	}
+	close(ackFinalFalse)
+	if err := waitPublicationDone(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 4 || remoteReady.Load() || forwarding.Load() {
+		t.Fatalf("final state calls=%d remote_ready=%t forwarding=%t", calls.Load(), remoteReady.Load(), forwarding.Load())
+	}
+}
+
+func TestPublicationControllerStopKeepsCurrentFalseAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	requests := make(chan bool, 4)
+	forwarded := make(chan bool, 4)
+	controller := newPublicationController(systemClock{}, DefaultPublicationRecoveryWindow, DefaultPublicationRetryInterval,
+		func(_ context.Context, ready bool) error { requests <- ready; return nil }, func(ready bool) { forwarded <- ready })
+	done := make(chan error, 1)
+	joined := make(chan struct{})
+	go func() { defer close(joined); done <- controller.Run(ctx) }()
+	defer func() { cancel(); <-joined }()
+	controller.Observe(true)
+	if !waitPublicationRequest(t, requests) || !waitPublicationRequest(t, forwarded) {
+		t.Fatal("initial true missing")
+	}
+	controller.Observe(false)
+	if waitPublicationRequest(t, forwarded) || waitPublicationRequest(t, requests) {
+		t.Fatal("current false missing")
+	}
+	controller.Stop()
+	if err := waitPublicationDone(t, done); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ready := <-requests:
+		t.Fatalf("redundant publication after current false ACK: %t", ready)
+	default:
+	}
+}
