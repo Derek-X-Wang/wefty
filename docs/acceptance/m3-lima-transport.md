@@ -421,6 +421,12 @@ cannot be green while a Mac cell is red. The six rows the runbook has no procedu
 never attributed to a product defect. Like the artifact itself, the fragment and
 the assembled matrix stay outside Git.
 
+The attended agent-computer lane in
+[m3.5-mac-computer.md](m3.5-mac-computer.md) sits on top of this one and feeds a
+separate matrix: same fold-a-Mac-half-into-a-versioned-artifact shape, spec §10
+rows rather than §9 cells. It assumes the transport rows here are green on the
+same hardware.
+
 `realtiming-result` assembles the same matrix with `none` for the Mac fragment,
 so every `mac.*` row is a typed `NOT-RUN` and the gate prints
 `matrix incomplete: 18 Mac rows not run`. A GitHub-hosted runner that claims
