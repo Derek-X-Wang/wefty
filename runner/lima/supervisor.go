@@ -260,7 +260,7 @@ func (supervisor *Supervisor) startAndVerify(ctx context.Context, expected OCIIn
 	if err := supervisor.recheckEnabled(ctx, expected); err != nil {
 		return supervisor.cancelToStopped(ctx, InstanceStopped, err)
 	}
-	_, startErr := supervisor.runBounded(ctx, "start", supervisor.config.Instance)
+	_, startErr := supervisor.runWithinRecoveryBudget(ctx, "start", supervisor.config.Instance)
 	if intentErr := supervisor.recheckEnabled(ctx, expected); intentErr != nil {
 		return supervisor.cancelToStopped(ctx, InstanceRunning, errors.Join(startErr, intentErr))
 	}
@@ -380,6 +380,18 @@ func (supervisor *Supervisor) runBounded(ctx context.Context, arguments ...strin
 	commandContext, cancel := supervisor.config.withTimeout(ctx, supervisor.config.CommandTimeout)
 	defer cancel()
 	return supervisor.config.run(commandContext, supervisor.config.Limactl, arguments...)
+}
+
+// runWithinRecoveryBudget runs a long-running Lima command bounded only by
+// whatever deadline the caller already placed on ctx (Ensure wraps every
+// recovery attempt in RecoveryTimeout), rather than the short CommandTimeout
+// meant for quick status queries like "list" or "stop". A genuine Lima cold
+// boot routinely takes longer than CommandTimeout; truncating "start" to it
+// kills the foreground limactl process while the VM it launched keeps
+// booting unsupervised, so the operator sees a false "recovery failed" just
+// before the instance actually finishes coming up.
+func (supervisor *Supervisor) runWithinRecoveryBudget(ctx context.Context, arguments ...string) ([]byte, error) {
+	return supervisor.config.run(ctx, supervisor.config.Limactl, arguments...)
 }
 
 func (supervisor *Supervisor) record(state InstanceState, enabled, recovering bool, reason contract.CapabilityReasonCode, repaired bool) {
