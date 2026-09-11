@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -30,6 +31,27 @@ var ociMatrixRows = []string{
 }
 
 const ociMatrixCandidate = "0123456789abcdef0123456789abcdef01234567"
+
+const (
+	// A Linux cell with no live proof yet. #402 names the row and the missing
+	// evidence.
+	ociMatrixGapIssue = 402
+	// A lane that recorded its own NOT-RUN, such as a pull-request build with no
+	// published image. A lane condition, not a missing capability.
+	ociMatrixLaneSkipIssue = 157
+)
+
+// ociMatrixGapRows are the Linux cells that spec section 9 requires and this
+// repository cannot yet prove against a live engine. Each is a typed skip owned
+// by #402, never a quiet PASS.
+var ociMatrixGapRows = []string{
+	"linux.oneshot.image_identity",
+	"linux.service.crash_recovery",
+	"linux.service.removal",
+	"linux.node.capability_claims",
+	"linux.only.socket_activated_helper",
+	"linux.only.cgroup_v2_limits",
+}
 
 func TestOCIAcceptanceMatrixCoversEverySpecCell(t *testing.T) {
 	for _, shell := range []string{"/bin/sh", "/bin/bash"} {
@@ -99,6 +121,29 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				}
 			})
 
+			t.Run("Linux evidence gaps are owned by #402", func(t *testing.T) {
+				matrix := assembleOCIMatrix(t, shell, linux, conformantMacMatrixFragment(t), "published-artifact", "owner-hardware")
+				rows := matrix["rows"].(map[string]any)
+				for _, id := range ociMatrixGapRows {
+					row := rows[id].(map[string]any)
+					if row["status"] != "NOT-RUN" || int(row["not_run_issue"].(float64)) != ociMatrixGapIssue {
+						t.Fatalf("row %s = %v/#%v, want a NOT-RUN owned by #%d", id, row["status"], row["not_run_issue"], ociMatrixGapIssue)
+					}
+					if len(row["gaps"].(map[string]any)) == 0 {
+						t.Fatalf("row %s is owned by #%d without naming the missing evidence", id, ociMatrixGapIssue)
+					}
+				}
+				for id, value := range rows {
+					row := value.(map[string]any)
+					if !strings.HasPrefix(id, "linux.") || row["status"] != "NOT-RUN" {
+						continue
+					}
+					if len(row["gaps"].(map[string]any)) > 0 && !slices.Contains(ociMatrixGapRows, id) {
+						t.Fatalf("row %s declares a gap but is not tracked by #%d", id, ociMatrixGapIssue)
+					}
+				}
+			})
+
 			t.Run("pull-request lane typed skip", func(t *testing.T) {
 				pr := t.TempDir()
 				copyOCIEvidence(t, linux, pr)
@@ -108,6 +153,9 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				row := matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)
 				if row["status"] != "NOT-RUN" || !strings.Contains(row["not_run_reason"].(string), "pr-build: image not published") {
 					t.Fatalf("pull-request row = %#v, want a typed skip naming the lane", row)
+				}
+				if got := int(row["not_run_issue"].(float64)); got != ociMatrixLaneSkipIssue {
+					t.Fatalf("pull-request skip is owned by #%d, want #%d; a lane condition is not an evidence gap", got, ociMatrixLaneSkipIssue)
 				}
 				if _, err := runOCIMatrixGate(t, shell, matrix, ociMatrixCandidate, "pr-build", "github-hosted"); err != nil {
 					t.Fatalf("typed pull-request skip rejected: %v", err)

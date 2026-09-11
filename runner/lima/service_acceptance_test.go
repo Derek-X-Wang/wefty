@@ -440,9 +440,9 @@ const (
 	macMatrixGatewayIssue = 394
 	// Headless cold-reboot evidence is owned by the #128 prototype.
 	macMatrixHeadlessIssue = 128
-	// Rows the runbook has no attended procedure for. Owned by #157 until the
-	// follow-up documentation ticket is filed.
-	macMatrixRunbookIssue  = 157
+	// Rows the runbook has no attended procedure for. #403 owns the missing
+	// exclusive-helper-session step; these are never a product defect.
+	macMatrixRunbookIssue  = 403
 	macMatrixRunbookReason = "runbook_no_procedure: the runbook gives no attended procedure for holding an exclusive helper session while the dev.wefty.agent LaunchDaemon runs"
 )
 
@@ -709,6 +709,13 @@ func TestAttendedMatrixFragmentMapping(t *testing.T) {
 		if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixGatewayIssue ||
 			row.NotRunReason != "blocked by the run-bridge gateway guard" {
 			t.Fatalf("row = %+v, want NOT-RUN owned by #394", row)
+		}
+	})
+
+	t.Run("the owning tickets stay distinct", func(t *testing.T) {
+		if macMatrixRunbookIssue != 403 || macMatrixGatewayIssue != 394 || macMatrixHeadlessIssue != 128 {
+			t.Fatalf("matrix ownership = runbook #%d, gateway #%d, headless #%d; re-pointing is a deliberate edit",
+				macMatrixRunbookIssue, macMatrixGatewayIssue, macMatrixHeadlessIssue)
 		}
 	})
 

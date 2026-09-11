@@ -19,9 +19,13 @@ linux_directory=$4
 mac_fragment=$5
 runner_environment=$6
 
-# Every Linux cell without live proof, and every typed skip that has no dedicated
-# ticket yet, is owned by this issue until the follow-up tickets are filed.
-pending_issue=157
+# A Linux cell this repository cannot prove live yet. #402 owns the missing
+# evidence and names the row.
+gap_issue=402
+# A lane that recorded its own NOT-RUN in its receipt — a pull-request build with
+# no published image, say. That is a lane condition, not a missing capability, so
+# it stays with the matrix ticket rather than the evidence-gap ticket.
+lane_skip_issue=157
 # The attended Mac lane is owner hardware. GitHub-hosted macOS cannot boot nested
 # Lima vz (spec section 9.1), so a hosted run always reports the Mac half absent.
 mac_absent_issue=128
@@ -114,6 +118,7 @@ row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
   [ -n "$id" ] || continue
   status=PASS
   not_run_reason=
+  skip_source=lane
   assertion_pairs="$work_directory/assertions.tsv"
   evidence_pairs="$work_directory/evidence.tsv"
   : > "$assertion_pairs"
@@ -160,6 +165,7 @@ row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
         [ -n "$reason" ] || reason="the lane recorded $value"
         if [ "$status" = PASS ]; then
           status='NOT-RUN'
+          skip_source=lane
           not_run_reason="$name: $reason"
         fi
         ;;
@@ -183,12 +189,19 @@ row_specification | while IFS='|' read -r id proof spec_refs required gaps; do
     if [ "$status" = PASS ]; then
       first_gap=$(printf '%s' "$gaps" | cut -d';' -f1)
       status='NOT-RUN'
+      skip_source=gap
       not_run_reason="${first_gap%%:*}: ${first_gap#*:}"
     fi
   fi
 
   not_run_issue=0
-  [ "$status" != 'NOT-RUN' ] || not_run_issue=$pending_issue
+  if [ "$status" = 'NOT-RUN' ]; then
+    if [ "$skip_source" = gap ]; then
+      not_run_issue=$gap_issue
+    else
+      not_run_issue=$lane_skip_issue
+    fi
+  fi
 
   jq -n --arg id "$id" --arg proof "$proof" --arg spec_refs "$spec_refs" \
     --arg status "$status" --arg reason "$not_run_reason" --argjson issue "$not_run_issue" \
