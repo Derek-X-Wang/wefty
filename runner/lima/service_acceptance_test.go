@@ -4,6 +4,7 @@ package lima
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -425,4 +426,335 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// --- M3 OCI acceptance matrix (#157): the Mac half -------------------------
+//
+// The attended artifact proves 34 owner-hardware rows. The matrix in spec
+// section 9 is coarser: nine class rows plus a capability row plus the Mac-only
+// list. This maps one onto the other and emits the fragment that
+// scripts/assemble-oci-acceptance-matrix.sh merges with the Linux receipts.
+
+const (
+	// The Lima vz gateway guard that kills every OCI attempt at bridge bind.
+	macMatrixGatewayIssue = 394
+	// Headless cold-reboot evidence is owned by the #128 prototype.
+	macMatrixHeadlessIssue = 128
+	// Rows the runbook has no attended procedure for. #403 owns the missing
+	// exclusive-helper-session step; these are never a product defect.
+	macMatrixRunbookIssue  = 403
+	macMatrixRunbookReason = "runbook_no_procedure: the runbook gives no attended procedure for holding an exclusive helper session while the dev.wefty.agent LaunchDaemon runs"
+)
+
+// attendedRowsWithoutProcedure are NOT-RUN because the runbook never describes
+// how to run them, not because of any product defect. They are never attributed
+// to #394.
+var attendedRowsWithoutProcedure = map[string]struct{}{
+	"task_logs_delete": {}, "mount_validation": {}, "host_to_guest": {},
+	"helper_loss": {}, "vm_loss": {}, "sweep_before_recovery": {},
+}
+
+// macMatrixRows is the frozen Mac half of the matrix. Dependencies are listed
+// dominant cause first: the first non-PASS dependency names the row's reason.
+var macMatrixRows = []struct {
+	ID       string
+	Attended []string
+}{
+	{"mac.oneshot.image_identity", []string{"oci_oneshot_run", "oci_oneshot_rerun_identity"}},
+	{"mac.oneshot.delivery", []string{"oci_oneshot_run", "guest_to_host_primary", "guest_to_host_fallback", "mount_validation", "task_logs_delete"}},
+	{"mac.oneshot.engine_loss", []string{"oci_oneshot_prestarted_loss", "oci_oneshot_poststarted_loss", "vm_loss"}},
+	{"mac.service.publication", []string{"service_health_echo", "service_startup_timeout", "service_port_collision", "service_portless_started"}},
+	{"mac.service.restart", []string{"service_restart_fresh_attempt"}},
+	{"mac.service.stop_start", []string{"service_stop_start_capacity", "service_withdrawal_republication"}},
+	{"mac.service.data", []string{"service_data_guest_native"}},
+	{"mac.service.crash_recovery", []string{"service_failed_quiescence", "helper_loss", "sweep_before_recovery"}},
+	{"mac.service.removal", []string{"service_removal_manifest_offline"}},
+	{"mac.node.capability_claims", []string{"probe", "minimal_doctor", "process_only_degradation"}},
+	{"mac.only.stopped_vm_autostart", []string{"stopped_enabled_recovery", "broken_enabled_recovery", "stopped_disabled_no_recovery"}},
+	{"mac.only.helper_socket_authorization", []string{"helper_install_permissions"}},
+	{"mac.only.raw_containerd_denied", []string{"raw_containerd_denied"}},
+	{"mac.only.dynamic_forwarding_disabled", []string{"dynamic_forwarding_disabled"}},
+	{"mac.only.dial_attempt_port", []string{"host_to_guest"}},
+	{"mac.only.template_convergence", []string{"template_permissions"}},
+	{"mac.only.launch_topology", []string{"launch_daemon", "no_lima_autostart"}},
+	{"mac.only.headless_reboot", nil},
+}
+
+type macMatrixRow struct {
+	Status      string            `json:"status"`
+	Assertions  map[string]bool   `json:"assertions"`
+	Attested    map[string]string `json:"attested"`
+	Evidence    map[string]string `json:"evidence"`
+	Gaps        map[string]string `json:"gaps"`
+	NotRunIssue int               `json:"not_run_issue"`
+	// Reason explains every non-PASS status, not only a skip: a FAIL that
+	// carries no reason is as useless as an untyped skip.
+	Reason string `json:"reason"`
+}
+
+type macMatrixFragment struct {
+	Version           int                     `json:"version"`
+	SessionID         string                  `json:"session_id"`
+	Commit            string                  `json:"commit"`
+	ArtifactSHA256    string                  `json:"artifact_sha256"`
+	AttendedRowCounts map[string]int          `json:"attended_row_counts"`
+	Rows              map[string]macMatrixRow `json:"rows"`
+}
+
+func buildMacMatrixFragment(artifact attendedArtifact, artifactSHA256 string) macMatrixFragment {
+	counts := map[string]int{"pass": 0, "fail": 0, "not_run": 0}
+	for _, row := range artifact.Rows {
+		switch row.Status {
+		case "PASS":
+			counts["pass"]++
+		case "FAIL":
+			counts["fail"]++
+		case "NOT-RUN":
+			counts["not_run"]++
+		}
+	}
+	fragment := macMatrixFragment{
+		Version: 1, SessionID: artifact.SessionID, Commit: artifact.Commit,
+		ArtifactSHA256: artifactSHA256, AttendedRowCounts: counts,
+		Rows: make(map[string]macMatrixRow, len(macMatrixRows)),
+	}
+	for _, specification := range macMatrixRows {
+		fragment.Rows[specification.ID] = buildMacMatrixRow(artifact, specification.ID, specification.Attended)
+	}
+	return fragment
+}
+
+func buildMacMatrixRow(artifact attendedArtifact, id string, attended []string) macMatrixRow {
+	row := macMatrixRow{
+		Status: "PASS", Assertions: map[string]bool{}, Attested: map[string]string{},
+		Evidence: map[string]string{}, Gaps: map[string]string{},
+	}
+	if len(attended) == 0 {
+		row.Status, row.NotRunIssue = "NOT-RUN", macMatrixHeadlessIssue
+		row.Reason = "headless cold-reboot evidence is owned by the #128 prototype and is not part of the attended transport session"
+		row.Gaps["headless_reboot_evidence"] = row.Reason
+		return row
+	}
+	row.Evidence["attended_rows"] = strings.Join(attended, ",")
+	var firstFailure, firstSkip string
+	for _, name := range attended {
+		result, ok := artifact.Rows[name]
+		if !ok {
+			row.Status = "MISSING"
+			row.Assertions, row.Reason = map[string]bool{}, "attended artifact omitted row "+name
+			return row
+		}
+		switch result.Status {
+		case "PASS":
+			row.Assertions[name] = true
+		case "FAIL":
+			row.Assertions[name] = false
+			if firstFailure == "" {
+				firstFailure = name
+			}
+		default:
+			if firstSkip == "" {
+				firstSkip = name
+			}
+		}
+	}
+	switch {
+	case firstFailure != "":
+		row.Status = "FAIL"
+		row.Reason = artifact.Rows[firstFailure].Reason
+		if strings.TrimSpace(row.Reason) == "" {
+			row.Reason = "the attended lane recorded " + firstFailure + " as FAIL without a reason"
+		}
+		row.Evidence["attended_failed_row"] = firstFailure
+	case firstSkip != "":
+		row.Status = "NOT-RUN"
+		row.Evidence["attended_skipped_row"] = firstSkip
+		row.Evidence["attended_reason"] = artifact.Rows[firstSkip].Reason
+		row.Gaps[firstSkip] = artifact.Rows[firstSkip].Reason
+		if _, withoutProcedure := attendedRowsWithoutProcedure[firstSkip]; withoutProcedure {
+			row.NotRunIssue = macMatrixRunbookIssue
+			row.Reason = macMatrixRunbookReason + " (" + firstSkip + ")"
+		} else {
+			row.NotRunIssue = macMatrixGatewayIssue
+			row.Reason = artifact.Rows[firstSkip].Reason
+		}
+	}
+	if row.Status == "NOT-RUN" && strings.TrimSpace(row.Reason) == "" {
+		row.Reason = "the attended lane recorded " + firstSkip + " as NOT-RUN without a reason"
+	}
+	return row
+}
+
+func writeMatrixFragment(path string, fragment macMatrixFragment) error {
+	payload, err := json.MarshalIndent(fragment, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(payload, '\n'), 0o600)
+}
+
+// TestServiceAcceptanceAttendedLimaMatrixFragment folds the attended artifact
+// into the Mac half of the #157 matrix. It runs only during the owner-hardware
+// procedure, and unlike TestServiceAcceptanceAttendedLimaArtifact it does not
+// require destination success: a red attended session must still produce an
+// honest, typed fragment.
+func TestServiceAcceptanceAttendedLimaMatrixFragment(t *testing.T) {
+	path := os.Getenv("WEFTY_LIMA_ACCEPTANCE_ARTIFACT")
+	if path == "" {
+		receipt, _ := json.Marshal(map[string]string{
+			"status": "NOT-RUN", "reason": "set WEFTY_LIMA_ACCEPTANCE_ARTIFACT to the redacted owner-hardware receipt from docs/acceptance/m3-lima-transport.md",
+		})
+		t.Skip(string(receipt))
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var artifact attendedArtifact
+	if err := decoder.Decode(&artifact); err != nil {
+		t.Fatal(err)
+	}
+	if missing := missingRequiredAttendedRow(artifact.Rows); missing != "" {
+		t.Fatalf("attended artifact omitted required row %q", missing)
+	}
+	fragment := buildMacMatrixFragment(artifact, fmt.Sprintf("%x", sha256.Sum256(payload)))
+	assertMacMatrixFragmentIsTyped(t, fragment)
+	t.Logf("attended rows: %d PASS / %d FAIL / %d NOT-RUN", fragment.AttendedRowCounts["pass"],
+		fragment.AttendedRowCounts["fail"], fragment.AttendedRowCounts["not_run"])
+	if out := os.Getenv("WEFTY_LIMA_MATRIX_OUT"); out != "" {
+		if err := writeMatrixFragment(out, fragment); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("wrote Mac matrix fragment to %s", out)
+	}
+}
+
+func assertMacMatrixFragmentIsTyped(t *testing.T, fragment macMatrixFragment) {
+	t.Helper()
+	if len(fragment.Rows) != len(macMatrixRows) {
+		t.Fatalf("Mac matrix fragment carries %d rows, want %d", len(fragment.Rows), len(macMatrixRows))
+	}
+	for _, specification := range macMatrixRows {
+		row, ok := fragment.Rows[specification.ID]
+		if !ok {
+			t.Fatalf("Mac matrix fragment omitted %s", specification.ID)
+		}
+		switch row.Status {
+		case "PASS":
+			if len(row.Assertions)+len(row.Attested) == 0 || len(row.Gaps) != 0 {
+				t.Fatalf("row %s claims PASS without earning it: %+v", specification.ID, row)
+			}
+			for name, passed := range row.Assertions {
+				if !passed {
+					t.Fatalf("row %s claims PASS with a false assertion %s", specification.ID, name)
+				}
+			}
+		case "NOT-RUN":
+			if row.NotRunIssue <= 0 || strings.TrimSpace(row.Reason) == "" {
+				t.Fatalf("row %s is an untyped skip: %+v", specification.ID, row)
+			}
+		case "FAIL":
+			if strings.TrimSpace(row.Reason) == "" {
+				t.Fatalf("row %s fails without a reason", specification.ID)
+			}
+		default:
+			t.Fatalf("row %s carries status %q", specification.ID, row.Status)
+		}
+	}
+}
+
+func TestAttendedMatrixFragmentMapping(t *testing.T) {
+	base := func() attendedArtifact {
+		rows := make(map[string]attendedResult, len(requiredAttendedRows))
+		for _, name := range requiredAttendedRows {
+			rows[name] = attendedResult{Status: "PASS", SessionID: "attended-session"}
+		}
+		return attendedArtifact{SessionID: "attended-session", Commit: strings.Repeat("a", 40), Rows: rows}
+	}
+
+	t.Run("all attended rows PASS yields a complete Mac half", func(t *testing.T) {
+		fragment := buildMacMatrixFragment(base(), "sha")
+		assertMacMatrixFragmentIsTyped(t, fragment)
+		for _, specification := range macMatrixRows {
+			want := "PASS"
+			if specification.ID == "mac.only.headless_reboot" {
+				want = "NOT-RUN"
+			}
+			if got := fragment.Rows[specification.ID].Status; got != want {
+				t.Fatalf("row %s = %s, want %s", specification.ID, got, want)
+			}
+		}
+		if fragment.Rows["mac.only.headless_reboot"].NotRunIssue != macMatrixHeadlessIssue {
+			t.Fatal("headless reboot is not owned by #128")
+		}
+	})
+
+	t.Run("a FAIL always carries a reason, even when the lane gave none", func(t *testing.T) {
+		artifact := base()
+		artifact.Rows["service_data_guest_native"] = attendedResult{Status: "FAIL"}
+		row := buildMacMatrixFragment(artifact, "sha").Rows["mac.service.data"]
+		if row.Status != "FAIL" || strings.TrimSpace(row.Reason) == "" {
+			t.Fatalf("row = %+v, want a FAIL that still explains itself", row)
+		}
+	})
+
+	t.Run("a failed attended row fails exactly its owning matrix rows", func(t *testing.T) {
+		artifact := base()
+		artifact.Rows["oci_oneshot_run"] = attendedResult{Status: "FAIL", Reason: "gateway 192.168.5.2 routes through a physical interface"}
+		fragment := buildMacMatrixFragment(artifact, "sha")
+		assertMacMatrixFragmentIsTyped(t, fragment)
+		for _, id := range []string{"mac.oneshot.image_identity", "mac.oneshot.delivery"} {
+			row := fragment.Rows[id]
+			if row.Status != "FAIL" || row.Reason != "gateway 192.168.5.2 routes through a physical interface" ||
+				row.Evidence["attended_failed_row"] != "oci_oneshot_run" {
+				t.Fatalf("row %s = %+v, want a typed FAIL carrying the attended reason verbatim", id, row)
+			}
+		}
+		if fragment.Rows["mac.service.removal"].Status != "PASS" {
+			t.Fatal("an unrelated row was dragged into FAIL")
+		}
+	})
+
+	t.Run("a blocked attended row is NOT-RUN on #394", func(t *testing.T) {
+		artifact := base()
+		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", Reason: "blocked by the run-bridge gateway guard"}
+		row := buildMacMatrixFragment(artifact, "sha").Rows["mac.service.publication"]
+		if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixGatewayIssue ||
+			row.Reason != "blocked by the run-bridge gateway guard" {
+			t.Fatalf("row = %+v, want NOT-RUN owned by #394", row)
+		}
+	})
+
+	t.Run("the owning tickets stay distinct", func(t *testing.T) {
+		if macMatrixRunbookIssue != 403 || macMatrixGatewayIssue != 394 || macMatrixHeadlessIssue != 128 {
+			t.Fatalf("matrix ownership = runbook #%d, gateway #%d, headless #%d; re-pointing is a deliberate edit",
+				macMatrixRunbookIssue, macMatrixGatewayIssue, macMatrixHeadlessIssue)
+		}
+	})
+
+	t.Run("a row the runbook cannot drive is never blamed on #394", func(t *testing.T) {
+		artifact := base()
+		for name := range attendedRowsWithoutProcedure {
+			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", Reason: "not executed: the LaunchDaemon holds the exclusive helper session"}
+		}
+		fragment := buildMacMatrixFragment(artifact, "sha")
+		assertMacMatrixFragmentIsTyped(t, fragment)
+		for _, id := range []string{"mac.oneshot.delivery", "mac.oneshot.engine_loss", "mac.service.crash_recovery", "mac.only.dial_attempt_port"} {
+			row := fragment.Rows[id]
+			if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixRunbookIssue ||
+				!strings.HasPrefix(row.Reason, "runbook_no_procedure: ") {
+				t.Fatalf("row %s = %+v, want a runbook_no_procedure skip", id, row)
+			}
+		}
+	})
+
+	t.Run("a missing attended row is MISSING, never a silent PASS", func(t *testing.T) {
+		artifact := base()
+		delete(artifact.Rows, "service_data_guest_native")
+		if row := buildMacMatrixFragment(artifact, "sha").Rows["mac.service.data"]; row.Status != "MISSING" {
+			t.Fatalf("row = %+v, want MISSING", row)
+		}
+	})
 }

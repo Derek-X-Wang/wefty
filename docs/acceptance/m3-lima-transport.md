@@ -382,3 +382,47 @@ Fold the complete artifact into the tagged lane with:
 WEFTY_LIMA_ACCEPTANCE_ARTIFACT=/absolute/path/to/redacted-receipt.json \
   go test -tags=service_acceptance -run AttendedLimaArtifact ./runner/lima
 ```
+
+## The Mac half of the OCI acceptance matrix (#157)
+
+The attended artifact proves 34 owner-hardware rows. Spec section 9's matrix is
+coarser: nine class rows under each platform prefix, one capability row, and the
+Mac-only list. `TestServiceAcceptanceAttendedLimaMatrixFragment` maps one onto
+the other and writes the `mac.*` fragment that
+`scripts/assemble-oci-acceptance-matrix.sh` merges with the Linux realtiming
+receipts:
+
+```sh
+WEFTY_LIMA_ACCEPTANCE_ARTIFACT=/absolute/path/to/redacted-receipt.json \
+WEFTY_LIMA_MATRIX_OUT=/absolute/path/to/mac-oci-matrix-rows.json \
+  go test -tags=service_acceptance -run AttendedLimaMatrixFragment ./runner/lima
+
+scripts/assemble-oci-acceptance-matrix.sh /absolute/path/to/oci-acceptance-matrix.json \
+  "$(git rev-parse HEAD)" published-artifact /path/to/linux-evidence \
+  /absolute/path/to/mac-oci-matrix-rows.json owner-hardware
+scripts/check-oci-acceptance-matrix.sh /absolute/path/to/oci-acceptance-matrix.json \
+  "$(git rev-parse HEAD)" published-artifact owner-hardware
+```
+
+Unlike the destination-success gate above, the fragment producer does not
+require PASS rows: a red attended session must still produce an honest, typed
+fragment. A failed attended row becomes a matrix `FAIL` carrying the attended
+reason verbatim; a blocked row becomes a typed `NOT-RUN` owned by the ticket
+that blocks it.
+
+The gate then treats those two outcomes differently, by design. A typed
+`NOT-RUN` is an honest "not proven yet" and passes. A `FAIL` is a proof that ran
+and came back red, so **`check-oci-acceptance-matrix.sh` exits non-zero and names
+the failing rows.** Against the 2026-09-11 session it exits 1 on the four rows
+blocked by #394. That is the command working, not the command broken: the matrix
+cannot be green while a Mac cell is red. The six rows the runbook has no procedure for
+(`task_logs_delete`, `mount_validation`, `host_to_guest`, `helper_loss`,
+`vm_loss`, `sweep_before_recovery`) are typed `runbook_no_procedure` and are
+never attributed to a product defect. Like the artifact itself, the fragment and
+the assembled matrix stay outside Git.
+
+`realtiming-result` assembles the same matrix with `none` for the Mac fragment,
+so every `mac.*` row is a typed `NOT-RUN` and the gate prints
+`matrix incomplete: 18 Mac rows not run`. A GitHub-hosted runner that claims
+attended Mac evidence fails the gate, as does a fragment bound to another
+candidate commit. A green CI therefore never means a finished matrix.
