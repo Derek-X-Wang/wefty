@@ -242,7 +242,7 @@ func TestOCIRuntimeLossReusesNewerSiblingSweep(t *testing.T) {
 }
 
 func TestOCIRuntimeLossEmbargoesSiblingBeforeRunReturns(t *testing.T) {
-	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0)
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0, nil)
 	state.record(CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil)
 	runtime := &pausingRuntimeLossRuntime{reported: make(chan struct{}), release: make(chan struct{})}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
@@ -273,7 +273,7 @@ func TestOCIRuntimeLossEmbargoesSiblingBeforeRunReturns(t *testing.T) {
 }
 
 func TestOCIReapRuntimeLossEmbargoesBeforeRecoveryAndRetries(t *testing.T) {
-	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0)
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0, nil)
 	state.record(CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil)
 	runtime := &reapRuntimeLossRuntime{}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{

@@ -65,7 +65,7 @@ func assertAgentResizesPoolFromHeartbeatGrantedCapacity(t *testing.T) {
 	session := newAgentSession(
 		client,
 		registration,
-		newCapabilityState(registration.Capabilities, nil, clock, 0),
+		newCapabilityState(registration.Capabilities, nil, clock, 0, nil),
 		5*time.Millisecond,
 		time.Second,
 		clock,

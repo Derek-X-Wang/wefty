@@ -44,9 +44,17 @@ type ociBootBarrierInvalidator interface {
 	Invalidate()
 }
 
+// ociBootBarrierReason translates a barrier's own health into the reason for a
+// transitional restrictive observation. CapabilityReasonOCIIntentDisabled is
+// deliberately not adoptable here: durable OCI intent belongs to the node-local
+// control surface, and a barrier that has not re-run since a stop still carries
+// the stale disabled fact. Every caller has already proven intent is enabled,
+// so echoing that fact republished a disabled reason immediately after an
+// operator start and latched the runtime off.
 func ociBootBarrierReason(barrier OCIBootBarrier) contract.CapabilityReasonCode {
 	if reasoner, ok := barrier.(ociBootBarrierReasoner); ok {
-		if reason := reasoner.CapabilityReasonCode(); reason.Valid() {
+		reason := reasoner.CapabilityReasonCode()
+		if reason.Valid() && reason != contract.CapabilityReasonOCIIntentDisabled {
 			return reason
 		}
 	}
@@ -110,9 +118,16 @@ type capabilityState struct {
 	pendingPublicationRevision int64
 	ociSuppressionSequence     atomic.Uint64
 	ociIntentDisabled          atomic.Bool
+	revisionFloor              *capabilityRevisionFloor
 }
 
-func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock Clock, timeout time.Duration) *capabilityState {
+func newCapabilityState(
+	configured map[string]bool,
+	probe CapabilityProbe,
+	clock Clock,
+	timeout time.Duration,
+	revisionFloor *capabilityRevisionFloor,
+) *capabilityState {
 	if timeout <= 0 {
 		timeout = DefaultCapabilityProbeTimeout
 	}
@@ -123,10 +138,15 @@ func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock
 		}
 	}
 	now := wallNow(clock).UTC().Round(0)
+	// Start above every revision a previous process on this node published, so
+	// a restart is a strictly newer observation rather than a replay of one an
+	// operator has already seen.
+	revision := revisionFloor.start()
+	revisionFloor.record(revision)
 	return &capabilityState{
-		clock: clock, probe: probe, timeout: timeout, base: base,
+		clock: clock, probe: probe, timeout: timeout, base: base, revisionFloor: revisionFloor,
 		current: contract.CapabilityObservation{
-			Revision: 1, Capabilities: cloneCapabilities(base), ObservedAt: now, MissingCapabilities: []string{},
+			Revision: revision, Capabilities: cloneCapabilities(base), ObservedAt: now, MissingCapabilities: []string{},
 		},
 	}
 }
@@ -213,11 +233,24 @@ func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReason
 	if err == nil {
 		err = errors.New("OCI runtime is not admitted")
 	}
-	if reason == contract.CapabilityReasonOCIIntentDisabled {
-		state.ociIntentDisabled.Store(true)
-	}
 	state.ociSuppressionSequence.Add(1)
 	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err, false)
+}
+
+// suppressOCIIntent latches the durable disabled decision in addition to
+// recording the restrictive observation. Only a caller holding the node-local
+// OCI intent authority — the control surface that wrote the durable marker, or
+// a validated read of it — may use it. Every other suppression describes a
+// runtime fact that a later probe is allowed to clear on its own, so the latch
+// is never inferred from a reason code that any path could carry.
+func (state *capabilityState) suppressOCIIntent(err error) {
+	if state == nil {
+		return
+	}
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	state.ociIntentDisabled.Store(true)
+	state.suppressOCILocked(contract.CapabilityReasonOCIIntentDisabled, err)
 }
 
 // allowOCIIntent opens positive observation only after the operator has
@@ -282,6 +315,15 @@ func (state *capabilityState) record(result CapabilityProbeResult, probeErr erro
 }
 
 func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeErr error, probeCompleted bool) {
+	// Persist outside state.mu. The floor write fsyncs, and the value it
+	// records is already monotonic, so no snapshot reader or admission check
+	// needs to wait behind it.
+	state.revisionFloor.record(state.applyObservationLocked(result, probeErr, probeCompleted))
+}
+
+// applyObservationLocked commits the new observation and returns the revision
+// it advanced to, or zero when nothing changed.
+func (state *capabilityState) applyObservationLocked(result CapabilityProbeResult, probeErr error, probeCompleted bool) int64 {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	capabilities := cloneCapabilities(state.base)
@@ -326,10 +368,12 @@ func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeEr
 	}
 	now := wallNow(state.clock).UTC().Round(0)
 	revision := state.current.Revision
+	advanced := int64(0)
 	if !maps.Equal(state.current.Capabilities, capabilities) ||
 		!slices.Equal(state.current.MissingCapabilities, missingCapabilities) || state.current.ReasonCode != reason {
 		revision++
 		state.pendingPublicationRevision = revision
+		advanced = revision
 	}
 	state.current = contract.CapabilityObservation{
 		Revision: revision, Capabilities: capabilities,
@@ -339,6 +383,7 @@ func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeEr
 		receipt := cloneCapabilityObservation(state.current)
 		state.lastProbe = &receipt
 	}
+	return advanced
 }
 
 // adoptRestrictive learns the authoritative N+1 that L1 assigned atomically
@@ -353,6 +398,8 @@ func (state *capabilityState) adoptRestrictive(node l1.Node) error {
 	}
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()
+	// The floor write stays outside state.mu for the same reason as recordLocked.
+	defer state.revisionFloor.record(node.CapabilityRevision)
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.current = contract.CapabilityObservation{

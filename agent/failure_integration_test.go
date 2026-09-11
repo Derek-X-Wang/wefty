@@ -1187,6 +1187,11 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	}
 	runtime := newOneShotIntentRuntime()
 	deadman := newRecordingDeadmanRenewer()
+	// The durable marker is enabled until the operator stops OCI. Registration
+	// now reads it as intent authority, so a fixture that reports a permanently
+	// disabled marker would never admit the one-shot this test is about.
+	var intentEnabled atomic.Bool
+	intentEnabled.Store(true)
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-oneshot-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -1200,6 +1205,9 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
 		}),
 		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			if intentEnabled.Load() {
+				return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+			}
 			return OCIIntentObservation{Enabled: false, Revision: 2}, nil
 		},
 		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
@@ -1223,6 +1231,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		t.Fatal("intent-stop OCI one-shot did not start")
 	}
 	deadman.waitForRenewal(t)
+	intentEnabled.Store(false)
 	if err := nodeAgent.StopOCIRuntime(t.Context()); err != nil {
 		cancelRun()
 		t.Fatal(err)
@@ -1612,7 +1621,7 @@ func assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) 
 		Capabilities: map[string]bool{"kind:process": true},
 	}
 	session := newAgentSession(
-		client, registration, newCapabilityState(registration.Capabilities, nil, systemClock{}, 0),
+		client, registration, newCapabilityState(registration.Capabilities, nil, systemClock{}, 0, nil),
 		time.Second, 10*time.Millisecond, systemClock{}, newLifecycleObserver(systemClock{}), nil, 0, 2,
 	)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1699,7 +1708,7 @@ func assertFailedCompletionLeavesSiblingAndSessionRunning(t *testing.T) {
 	session := newAgentSession(
 		client,
 		registration,
-		newCapabilityState(registration.Capabilities, nil, clock, 0),
+		newCapabilityState(registration.Capabilities, nil, clock, 0, nil),
 		time.Second,
 		time.Millisecond,
 		clock,
@@ -2208,7 +2217,7 @@ func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "shutdown evidence" || page.Events[0].AttemptID != attemptID {
+	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "shutdown evidence\n" || page.Events[0].AttemptID != attemptID {
 		t.Fatalf("shutdown logs = %#v, want one finalized event for %s", page.Events, attemptID)
 	}
 }
@@ -3315,7 +3324,16 @@ func (runner *loggingBlockingRunner) Run(ctx context.Context, request processrun
 	if request.Started != nil {
 		request.Started()
 	}
-	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("shutdown evidence")}); err != nil {
+	// The evidence ends in a newline like every real process line (see
+	// processhelper's paced-output). Every one-shot attempt now carries its
+	// attempt credential in SensitiveEnv, so a redactor is always in the path,
+	// and it withholds any trailing bytes that could still be the head of that
+	// credential. An unterminated line would therefore lose its last character
+	// to the finalization flush whenever the credential's first base64url
+	// character happened to match it — a second event, and a test about
+	// delivery failing over framing. A credential can never contain a newline,
+	// so a terminated line is emitted whole, every time.
+	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("shutdown evidence\n")}); err != nil {
 		return contract.ProcessResult{}, err
 	}
 	runner.started <- request.AttemptID
