@@ -477,8 +477,11 @@ func containsString(values []string, want string) bool {
 // scripts/assemble-oci-acceptance-matrix.sh merges with the Linux receipts.
 
 const (
-	// The Lima vz gateway guard that kills every OCI attempt at bridge bind.
-	macMatrixGatewayIssue = 394
+	// The dominant product blocker for every Mac OCI row. #394 (the Lima vz
+	// gateway guard) is fixed, so blaming a NOT-RUN row on it sends a reader to
+	// a closed ticket; the attempts now die one step later, on the arm64
+	// image-platform disagreement that creates zero containers.
+	macMatrixBlockerIssue = 408
 	// Headless cold-reboot evidence is owned by the #128 prototype.
 	macMatrixHeadlessIssue = 128
 )
@@ -600,7 +603,7 @@ func buildMacMatrixRow(artifact attendedArtifact, id string, attended []string) 
 		row.Evidence["attended_skipped_row"] = firstSkip
 		row.Evidence["attended_reason"] = artifact.Rows[firstSkip].Reason
 		row.Gaps[firstSkip] = artifact.Rows[firstSkip].Reason
-		row.NotRunIssue = macMatrixGatewayIssue
+		row.NotRunIssue = macMatrixBlockerIssue
 		row.Reason = artifact.Rows[firstSkip].Reason
 	}
 	if row.Status == "NOT-RUN" && strings.TrimSpace(row.Reason) == "" {
@@ -741,20 +744,20 @@ func TestAttendedMatrixFragmentMapping(t *testing.T) {
 		}
 	})
 
-	t.Run("a blocked attended row is NOT-RUN on #394", func(t *testing.T) {
+	t.Run("a blocked attended row is NOT-RUN on the current blocker", func(t *testing.T) {
 		artifact := base()
-		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", Reason: "blocked by the run-bridge gateway guard"}
+		artifact.Rows["service_health_echo"] = attendedResult{Status: "NOT-RUN", Reason: "blocked by image_platform_unsupported"}
 		row := buildMacMatrixFragment(artifact, "sha").Rows["mac.service.publication"]
-		if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixGatewayIssue ||
-			row.Reason != "blocked by the run-bridge gateway guard" {
-			t.Fatalf("row = %+v, want NOT-RUN owned by #394", row)
+		if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixBlockerIssue ||
+			row.Reason != "blocked by image_platform_unsupported" {
+			t.Fatalf("row = %+v, want NOT-RUN owned by #%d", row, macMatrixBlockerIssue)
 		}
 	})
 
 	t.Run("the owning tickets stay distinct", func(t *testing.T) {
-		if macMatrixGatewayIssue != 394 || macMatrixHeadlessIssue != 128 || macMatrixGatewayIssue == macMatrixHeadlessIssue {
-			t.Fatalf("matrix ownership = gateway #%d, headless #%d; re-pointing is a deliberate edit",
-				macMatrixGatewayIssue, macMatrixHeadlessIssue)
+		if macMatrixBlockerIssue != 408 || macMatrixHeadlessIssue != 128 || macMatrixBlockerIssue == macMatrixHeadlessIssue {
+			t.Fatalf("matrix ownership = blocker #%d, headless #%d; re-pointing is a deliberate edit",
+				macMatrixBlockerIssue, macMatrixHeadlessIssue)
 		}
 	})
 
@@ -769,15 +772,15 @@ func TestAttendedMatrixFragmentMapping(t *testing.T) {
 			"task_logs_delete", "mount_validation", "host_to_guest",
 			"helper_loss", "vm_loss", "sweep_before_recovery",
 		} {
-			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", Reason: "blocked by the run-bridge gateway guard"}
+			artifact.Rows[name] = attendedResult{Status: "NOT-RUN", Reason: "blocked by image_platform_unsupported"}
 		}
 		fragment := buildMacMatrixFragment(artifact, "sha")
 		assertMacMatrixFragmentIsTyped(t, fragment)
 		for _, id := range []string{"mac.oneshot.delivery", "mac.oneshot.engine_loss", "mac.service.crash_recovery", "mac.only.dial_attempt_port"} {
 			row := fragment.Rows[id]
-			if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixGatewayIssue ||
-				row.Reason != "blocked by the run-bridge gateway guard" {
-				t.Fatalf("row %s = %+v, want NOT-RUN owned by #394 with the attended reason verbatim", id, row)
+			if row.Status != "NOT-RUN" || row.NotRunIssue != macMatrixBlockerIssue ||
+				row.Reason != "blocked by image_platform_unsupported" {
+				t.Fatalf("row %s = %+v, want NOT-RUN owned by #%d with the attended reason verbatim", id, row, macMatrixBlockerIssue)
 			}
 		}
 	})
