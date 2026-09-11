@@ -154,13 +154,22 @@ func (ledger *memoryBindingPinLedger) PutOCIImageBindingPin(_ context.Context, p
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
 	if stored, ok := ledger.pins[pin.JobID]; ok {
-		if stored != pin {
+		if normalizedBindingPin(stored) != normalizedBindingPin(pin) {
 			return stored, false, fmt.Errorf("OCI binding pin for job %q conflicts with its first binding", pin.JobID)
 		}
 		return stored, false, nil
 	}
 	ledger.pins[pin.JobID] = pin
 	return pin, true, nil
+}
+
+// normalizedBindingPin reads a binding-pin row's platform in containerd's normal
+// form before the row is compared, so a row written with an older arm64 spelling
+// still names the hardware it was written on (#408).
+func normalizedBindingPin(pin workloadrunner.OCIImageBindingPin) workloadrunner.OCIImageBindingPin {
+	pin.PlatformOS, pin.PlatformArchitecture, pin.PlatformVariant = ocihelper.NormalizePlatformTriple(
+		pin.PlatformOS, pin.PlatformArchitecture, pin.PlatformVariant)
+	return pin
 }
 
 func (ledger *memoryBindingPinLedger) DeleteOCIImageBindingPin(_ context.Context, jobID string) error {

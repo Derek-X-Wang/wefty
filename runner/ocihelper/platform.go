@@ -35,3 +35,12 @@ func PlatformString(platform OCIPlatform) string {
 		OS: normalized.OS, Architecture: normalized.Architecture, Variant: normalized.Variant,
 	})
 }
+
+// NormalizePlatformTriple reduces the loose (os, architecture, variant) triple
+// that persisted rows and wire fields carry into containerd's normal form. It is
+// the same reduction as NormalizePlatform, for callers that hold the three
+// strings rather than an OCIPlatform.
+func NormalizePlatformTriple(os, architecture, variant string) (string, string, string) {
+	normalized := NormalizePlatform(OCIPlatform{OS: os, Architecture: architecture, Variant: variant})
+	return normalized.OS, normalized.Architecture, normalized.Variant
+}
