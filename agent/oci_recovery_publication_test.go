@@ -147,3 +147,61 @@ func TestOperatorRecoveryPublishesInsideTheRecoveryTransaction(t *testing.T) {
 		t.Fatalf("published observation = %+v, want open OCI capability with no reason", published)
 	}
 }
+
+// TestHeartbeatPinnedPublicationIsSerializedWithRecovery covers the same root
+// cause on the heartbeat path. The loop used to pin a generation, then publish
+// it after the recovery mutex was free; a competing recovery retiring that
+// generation mid-publication withdrew OCI and cost a rejoin backoff for a probe
+// that had just passed.
+func TestHeartbeatPinnedPublicationIsSerializedWithRecovery(t *testing.T) {
+	network := plain.NewNetwork()
+	_, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-oci-heartbeat-pin": nil})
+	defer stopServer()
+	barrier := &contendedRecoveryBarrier{}
+	agentFabric := network.NewFabric(fabric.Identity{
+		NodeID: "fabric-node-oci-heartbeat-pin", Tags: []string{l1.DefaultAgentPrincipalTag},
+	})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-heartbeat-pin",
+		BootSessionID: "boot-oci-heartbeat-pin", Version: "test", OS: "linux", Architecture: "amd64",
+		Capabilities: map[string]bool{"kind:process": true},
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+		}),
+		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			return OCIIntentObservation{Enabled: true, Revision: 3}, nil
+		},
+		OCIBootBarrier: barrier, HeartbeatInterval: time.Hour, ClaimInterval: time.Hour,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
+		CapabilityRevisionPath: filepath.Join(t.TempDir(), "wefty-capability-revision.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	if _, err := nodeAgent.Register(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	barrier.recovery = &nodeAgent.session.ociRecoveryMu
+	barrier.armed.Store(true)
+	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// One ordinary heartbeat tick against a healthy barrier.
+	if _, err := nodeAgent.session.heartbeatOCIPinned(t.Context()); err != nil {
+		t.Fatalf("heartbeat with a pinned generation = %v, want success", err)
+	}
+	barrier.armed.Store(false)
+	if barrier.preempted.Load() {
+		t.Fatal("a competing recovery ran between the heartbeat probe and its pinned publication")
+	}
+	published := nodeAgent.CapabilitySnapshot()
+	if !published.Capabilities["kind:oci"] || published.ReasonCode != "" {
+		t.Fatalf("heartbeat observation = %+v, want OCI still open", published)
+	}
+}

@@ -105,6 +105,8 @@ type Supervisor struct {
 	ensureMu sync.Mutex
 	mu       sync.RWMutex
 	facts    SupervisorFacts
+	// trailWarned keeps the dropped-transition warning to one line per process.
+	trailWarned bool
 }
 
 func NewSupervisor(config SupervisorConfig) (*Supervisor, error) {
@@ -455,6 +457,15 @@ func (supervisor *Supervisor) record(state InstanceState, enabled, recovering bo
 // copies rather than appending in place so a SupervisorFacts value already
 // handed to the facts writer can never see the trail mutate under it.
 func (supervisor *Supervisor) appendTransitionLocked(from, to InstanceState) {
+	if !from.Valid() || !to.Valid() {
+		// Never let a malformed entry reach the facts file, where it would cost
+		// the operator the whole snapshot rather than one transition.
+		if !supervisor.trailWarned && supervisor.config.Logf != nil {
+			supervisor.trailWarned = true
+			supervisor.config.Logf("Lima supervisor dropped a transition outside the closed state vocabulary")
+		}
+		return
+	}
 	entry := StateTransition{From: from, To: to, ObservedAt: supervisor.config.now().UTC().Round(0)}
 	trail := make([]StateTransition, 0, len(supervisor.facts.Transitions)+1)
 	trail = append(trail, supervisor.facts.Transitions...)
