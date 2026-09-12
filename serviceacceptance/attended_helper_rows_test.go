@@ -32,6 +32,7 @@ type fakeSession struct {
 	watchFunc   func(ocihelper.AttemptAuthority) []ocihelper.WatchEvent
 	deleteResp  ocihelper.DeleteResponse
 	deleteErr   error
+	verifies    []ocihelper.VerifyRequest
 	verifyResp  ocihelper.VerifyResponse
 	verifyErr   error
 	dialAttempt func(ocihelper.DialAttemptPortRequest) (net.Conn, error)
@@ -65,7 +66,8 @@ func (fake *fakeSession) Delete(context.Context, ocihelper.DeleteRequest) (ocihe
 	return fake.deleteResp, fake.deleteErr
 }
 
-func (fake *fakeSession) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+func (fake *fakeSession) Verify(_ context.Context, request ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	fake.verifies = append(fake.verifies, request)
 	return fake.verifyResp, fake.verifyErr
 }
 
@@ -257,19 +259,239 @@ func TestDriveTaskLogsDeleteFailsWithoutPositiveDelete(t *testing.T) {
 	}
 }
 
-func TestDriveTaskLogsDeleteFailsOnResidue(t *testing.T) {
-	session := &fakeSession{
+func taskLogsIdentity(t *testing.T, config attendedConfig) (ocihelper.AttemptAuthority, ocihelper.ResourceIdentity) {
+	t.Helper()
+	authority := config.authority(contract.JobClassOneShot, "task-logs-delete")
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authority, identity
+}
+
+func taskLogsSession(verification ocihelper.VerifyResponse) *fakeSession {
+	return &fakeSession{
 		runFunc: func(ocihelper.RunRequest) (ocihelper.RunResponse, error) { return startedResponse(), nil },
 		watchFunc: func(ocihelper.AttemptAuthority) []ocihelper.WatchEvent {
 			return logEvents("wefty-attended-task-stdout", "wefty-attended-task-stderr", 0)
 		},
 		deleteResp: ocihelper.DeleteResponse{Deleted: true},
-		verifyResp: ocihelper.VerifyResponse{Absent: false, Inventory: ocihelper.ResourceInventory{Containers: []string{"left-behind"}}},
+		verifyResp: verification,
 	}
-	row := driveTaskLogsDelete(context.Background(), session, testConfig())
+}
+
+func TestDriveTaskLogsDeleteFailsOnResidue(t *testing.T) {
+	config := testConfig()
+	_, identity := taskLogsIdentity(t, config)
+	session := taskLogsSession(ocihelper.VerifyResponse{
+		Inventory:      ocihelper.ResourceInventory{Containers: []string{identity.ContainerID}},
+		RuntimeResidue: ocihelper.ResourceInventory{Containers: []string{identity.ContainerID}},
+	})
+	row := driveTaskLogsDelete(context.Background(), session, config)
 	if row.Status == "PASS" {
 		t.Fatalf("row = %+v, want FAIL when the independent Verify still sees residue", row)
 	}
+}
+
+// The post-delete Verify must not be attempt-scoped: the helper authorizes an
+// attempt-scoped Verify only against a live attempt, which a positive Delete
+// is precisely what ends. A row that asks for one can never pass on hardware.
+func TestDriveTaskLogsDeleteProvesAbsenceThroughTheReadOnlyNamespace(t *testing.T) {
+	session := taskLogsSession(ocihelper.VerifyResponse{})
+	row := driveTaskLogsDelete(context.Background(), session, testConfig())
+	if row.Status != "PASS" {
+		t.Fatalf("row = %+v, want PASS", row)
+	}
+	if len(session.verifies) != 1 {
+		t.Fatalf("row issued %d verifies, want exactly the one independent absence proof", len(session.verifies))
+	}
+	verification := session.verifies[0]
+	if verification.Scope != ocihelper.VerifyNamespaceReadOnly || verification.Authority != nil {
+		t.Fatalf("verify request = %+v, want a read-only namespace scope carrying no attempt authority", verification)
+	}
+}
+
+// The namespace the row reads is shared, so absence has to be asserted over
+// this attempt's own deterministic names and nothing else: another attempt's
+// container, or the image spools the window's own import left behind, must not
+// fail the row, and this attempt's must.
+func TestCheckAttemptAbsenceIsScopedToTheAttemptsOwnResources(t *testing.T) {
+	config := testConfig()
+	authority, identity := taskLogsIdentity(t, config)
+	unrelated := ocihelper.ResourceInventory{
+		Containers:  []string{"wefty-container-" + strings.Repeat("b", 32)},
+		ImageSpools: []string{"spool-from-the-pinned-probe-import"},
+	}
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: unrelated, RuntimeResidue: unrelated}, authority, nil); err != nil {
+		t.Fatalf("another attempt's residue must not fail this row: %v", err)
+	}
+	for name, inventory := range map[string]ocihelper.ResourceInventory{
+		"lease":       {Leases: []string{identity.LeaseID}},
+		"snapshot":    {Snapshots: []string{identity.SnapshotID}},
+		"container":   {Containers: []string{identity.ContainerID}},
+		"task":        {Tasks: []string{identity.TaskID}},
+		"shim":        {Shims: []string{identity.ShimID}},
+		"cgroup":      {Cgroups: []string{"/sys/fs/cgroup/wefty/" + identity.CgroupID + ".scope"}},
+		"log segment": {LogSegments: []string{identity.LogSegmentDirectory}},
+	} {
+		if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: inventory, RuntimeResidue: inventory}, authority, nil); err == nil {
+			t.Fatalf("this attempt's %s left as runtime residue must fail the row", name)
+		}
+		// Not residue, but still observed: only an explicit bounded retention
+		// naming this attempt may explain that, and these have none.
+		if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: inventory}, authority, nil); err == nil {
+			t.Fatalf("this attempt's %s surviving delete unexplained must fail the row", name)
+		}
+	}
+}
+
+func boundRetention(class ocihelper.RemovalResourceClass, id, attemptID string,
+	reason ocihelper.DurableRetentionReason) ocihelper.DurableRetention {
+	recorded := time.Unix(1700000000, 0)
+	return ocihelper.DurableRetention{
+		Class: class, ID: id, Owner: ocihelper.DurableRetentionOwnerOCIHelper, Reason: reason,
+		AttemptID: attemptID, State: ocihelper.DurableRetentionStateUnsealed,
+		Bound: time.Minute, RecordedAt: recorded, Deadline: recorded.Add(time.Minute),
+	}
+}
+
+// A sealing log spool is the one shape the helper may still show after a
+// positive Delete, and only under a bounded retention that names this attempt.
+func TestCheckAttemptAbsenceAcceptsOnlyBoundHelperRetentions(t *testing.T) {
+	config := testConfig()
+	authority, identity := taskLogsIdentity(t, config)
+	observed := ocihelper.ResourceInventory{LogSegments: []string{identity.LogSegmentDirectory}}
+	retention := boundRetention(ocihelper.RemovalResourceLogSegments, identity.LogSegmentDirectory,
+		authority.AttemptID, ocihelper.DurableRetentionReasonLogSpoolSealing)
+
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{
+		Inventory: observed, DurableRetained: observed,
+		DurableRetentions: []ocihelper.DurableRetention{retention},
+	}, authority, nil); err != nil {
+		t.Fatalf("a sealing log spool bound to this attempt must not fail the row: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*ocihelper.DurableRetention){
+		"another attempt":   func(r *ocihelper.DurableRetention) { r.AttemptID = "attended-someone-else" },
+		"another owner":     func(r *ocihelper.DurableRetention) { r.Owner = "operator" },
+		"another reason":    func(r *ocihelper.DurableRetention) { r.Reason = ocihelper.DurableRetentionReasonCgroupReaping },
+		"no bound at all":   func(r *ocihelper.DurableRetention) { r.Bound = 0; r.Deadline = r.RecordedAt },
+		"unclosed deadline": func(r *ocihelper.DurableRetention) { r.Deadline = r.Deadline.Add(time.Hour) },
+	} {
+		broken := retention
+		mutate(&broken)
+		if err := checkAttemptAbsence(ocihelper.VerifyResponse{
+			Inventory: observed, DurableRetained: observed,
+			DurableRetentions: []ocihelper.DurableRetention{broken},
+		}, authority, nil); err == nil {
+			t.Fatalf("a retention with %s cannot explain a survivor", name)
+		}
+	}
+
+	// Even a correctly bound retention cannot excuse the resource still being
+	// runtime residue -- that is the helper saying it is not retained at all.
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{
+		Inventory: observed, RuntimeResidue: observed,
+		DurableRetentions: []ocihelper.DurableRetention{retention},
+	}, authority, nil); err == nil {
+		t.Fatal("a log spool that is still runtime residue must fail the row")
+	}
+}
+
+// A service data volume and its owner record belong to the job, not the
+// attempt, so they may outlive a Delete -- but never as runtime residue.
+func TestCheckAttemptAbsenceLeavesJobScopedVolumesAlone(t *testing.T) {
+	config := testConfig()
+	authority := config.authority(contract.JobClassService, "host-to-guest")
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.ServiceVolumeDirectory == "" || identity.ServiceVolumeOwnerRecord == "" {
+		t.Fatalf("a service attempt must name a service volume and owner record: %+v", identity)
+	}
+	observed := ocihelper.ResourceInventory{
+		ManagedVolumes:       []string{identity.ServiceVolumeDirectory},
+		ManagedVolumeRecords: []string{identity.ServiceVolumeOwnerRecord},
+	}
+	volumes := []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeServiceData}}
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: observed, DurableRetained: observed}, authority, volumes); err != nil {
+		t.Fatalf("the job's service data must not fail an attempt's absence proof: %v", err)
+	}
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: observed, RuntimeResidue: observed}, authority, volumes); err == nil {
+		t.Fatal("service data reported as runtime residue must fail the row")
+	}
+}
+
+// The lookup is driven from the helper's own closed removal registry, so a
+// class added there and not mapped here fails the row loudly instead of
+// silently dropping out of the proof.
+func TestAttemptInventoryEntriesRefusesAnUnmappedResourceClass(t *testing.T) {
+	if _, err := attemptInventoryEntries(ocihelper.ResourceInventory{},
+		ocihelper.RemovalResource{Class: "a_class_this_row_has_never_seen", ID: "x"}); err == nil {
+		t.Fatal("an unmapped resource class must fail the row rather than verify nothing")
+	}
+	identity := mustIdentity(t, testConfig().authority(contract.JobClassService, "registry-coverage"))
+	// Both shapes the registry can take: service data when no Storage is
+	// attached, and the Computer disk classes when one is.
+	storage := &ocihelper.ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1}
+	for _, attached := range []*ocihelper.ComputerStorageReference{nil, storage} {
+		resources := ocihelper.ExpectedRemovalResources(identity, "wefty-handoff-volume-x", attached)
+		if len(resources) == 0 {
+			t.Fatalf("the registry named nothing for storage=%v", attached)
+		}
+		for _, resource := range resources {
+			if _, err := attemptInventoryEntries(ocihelper.ResourceInventory{}, resource); err != nil {
+				t.Fatalf("every class the helper's registry names for an attempt must be looked up: %v", err)
+			}
+		}
+	}
+}
+
+// The handoff and Computer disk names live on the descriptor, not the
+// authority, so a descriptor this row cannot name has to fail the row rather
+// than drop that resource out of the proof.
+func TestAttemptVolumeNamesResolvesWhatTheAuthorityCannot(t *testing.T) {
+	handoff, storage, err := attemptVolumeNames([]ocihelper.ManagedVolumeDescriptor{
+		{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: "an-owner"},
+		{Kind: ocihelper.ManagedVolumeServiceData},
+	})
+	if err != nil || storage != nil {
+		t.Fatalf("names = (%q, %+v, %v)", handoff, storage, err)
+	}
+	expected, err := ocihelper.DeterministicHandoffVolumeDirectory("an-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handoff != expected {
+		t.Fatalf("handoff = %q, want the owner-key name %q the helper uses", handoff, expected)
+	}
+
+	attached := ocihelper.ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1}
+	if _, resolved, err := attemptVolumeNames([]ocihelper.ManagedVolumeDescriptor{
+		{Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: &attached},
+	}); err != nil || resolved == nil || *resolved != attached {
+		t.Fatalf("an attached Computer disk must reach the registry: (%+v, %v)", resolved, err)
+	}
+
+	for name, volumes := range map[string][]ocihelper.ManagedVolumeDescriptor{
+		"a Computer disk with no Storage identity": {{Kind: ocihelper.ManagedVolumeComputerDisk}},
+		"a handoff with no owner key":              {{Kind: ocihelper.ManagedVolumeHandoff}},
+		"a kind this row cannot name":              {{Kind: "some_future_volume_kind"}},
+	} {
+		if _, _, err := attemptVolumeNames(volumes); err == nil {
+			t.Fatalf("%s must fail the row rather than verify nothing", name)
+		}
+	}
+}
+
+func mustIdentity(t *testing.T, authority ocihelper.AttemptAuthority) ocihelper.ResourceIdentity {
+	t.Helper()
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 // ---------------------------------------------------------------------------

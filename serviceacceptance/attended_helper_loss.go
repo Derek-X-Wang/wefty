@@ -41,8 +41,9 @@ func (config attendedConfig) bridgeWait() time.Duration {
 }
 
 const (
-	attendedFallbackRunID    = "attended-fallback-run"
-	attendedFallbackRunToken = "attended-fallback-token"
+	attendedFallbackRunID        = "attended-fallback-run"
+	attendedFallbackRunToken     = "attended-fallback-token"
+	attendedFallbackHandoffOwner = "attended-fallback-handoff-owner"
 	// attendedBridgeWait bounds how long the row waits for the payload's one
 	// authenticated request to reach the host origin after the payload exits.
 	attendedBridgeWait = 30 * time.Second
@@ -61,6 +62,12 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 
 	runID := attendedFallbackRunID
 	runToken := attendedFallbackRunToken
+	// The helper names this volume from the owner key, not from the attempt
+	// digest, so the same slice has to reach Run and the absence proof for the
+	// proof to look at the name the helper actually used.
+	volumes := []ocihelper.ManagedVolumeDescriptor{{
+		Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: attendedFallbackHandoffOwner,
+	}}
 	served := make(chan string, 8)
 	listener, serveErr, err := startHostBridgeOrigin(runID, runToken, served)
 	if err != nil {
@@ -74,13 +81,11 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 		EnableHostBridgeFallback: true, ActivateHostBridgeFallback: true,
 		Workload: ocihelper.WorkloadInput{
 			ImageReference: config.Reference, ImageDigest: config.Digest,
-			Argv:        []string{"/usr/local/bin/wefty-echo-service", "--once"},
-			L3Endpoint:  "http://l3-origin.invalid",
-			RunToken:    runToken,
-			Environment: []ocihelper.EnvironmentVariable{{Name: contract.EnvRunID, Value: runID}},
-			ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{
-				Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: "attended-fallback-handoff-owner",
-			}},
+			Argv:           []string{"/usr/local/bin/wefty-echo-service", "--once"},
+			L3Endpoint:     "http://l3-origin.invalid",
+			RunToken:       runToken,
+			Environment:    []ocihelper.EnvironmentVariable{{Name: contract.EnvRunID, Value: runID}},
+			ManagedVolumes: volumes,
 		},
 	})
 	if err != nil {
@@ -136,10 +141,11 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 		row.fail(err)
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority); err != nil {
+	if err := deleteAndVerify(ctx, session, authority, volumes); err != nil {
 		row.fail(err)
 		return row
 	}
+	row.appendReason(attemptAbsenceNote)
 	row.pass(fmt.Sprintf(
 		"host-loopback bridge with a helper-issued per-attempt capability; one authenticated run-scoped request "+
 			"completed through DialHostBridge; negatives: %s; not exercised by this surface: gateway discovery "+
@@ -378,6 +384,11 @@ type lossObservation struct {
 	// preSweepBarrierPrepared records whether the barrier still held a
 	// verified sweep receipt at the moment the pre-sweep probe was refused.
 	preSweepBarrierPrepared bool
+	// withdrawalEnsureRefused is the bounded re-Ensure the driver runs inside
+	// the fault window, verbatim. It is what gives the withdrawal below a
+	// typed reason at all, so a row whose re-Ensure was not refused has no
+	// observation of a restricted runtime and must fail.
+	withdrawalEnsureRefused string
 	sweepObservedAt         time.Time
 	probeObservedAt         time.Time
 	withdrawn               contract.CapabilityObservation
@@ -441,6 +452,13 @@ func checkLossTransition(observation lossObservation) error {
 	if observation.withdrawn.Revision == 0 || observation.reopened.Revision <= observation.withdrawn.Revision {
 		return fmt.Errorf("local capability observations did not advance: withdrawn=%d reopened=%d",
 			observation.withdrawn.Revision, observation.reopened.Revision)
+	}
+	// The barrier records a typed capability reason only as the outcome of an
+	// Ensure, so the reason the withdrawal carries is only worth anything if
+	// an Ensure was actually refused inside the fault window. A re-Ensure the
+	// runtime accepted is the runtime not being restricted at all.
+	if observation.withdrawalEnsureRefused == "" {
+		return errors.New("the bounded re-Ensure inside the fault window was not refused, so no typed reason describes the restriction")
 	}
 	if !observation.withdrawn.ReasonCode.ValidOCIRestriction() {
 		return fmt.Errorf("withdrawal carried reason code %q, which cannot explain an OCI restriction",
@@ -520,6 +538,21 @@ type lossDependencies struct {
 	// settle bounds how long the driver waits for the injected loss to reach
 	// the client, and for the returned helper to become dialable again.
 	settle time.Duration
+	// withdrawalEnsure bounds the re-Ensure taken inside the fault window to
+	// obtain a typed capability reason. Zero means attendedWithdrawalEnsure.
+	withdrawalEnsure time.Duration
+}
+
+// attendedWithdrawalEnsure is deliberately much shorter than settle: the
+// re-Ensure inside the fault window exists to be refused, and the window is
+// the owner's time.
+const attendedWithdrawalEnsure = 60 * time.Second
+
+func (dependencies lossDependencies) withdrawalBound() time.Duration {
+	if dependencies.withdrawalEnsure > 0 {
+		return dependencies.withdrawalEnsure
+	}
+	return attendedWithdrawalEnsure
 }
 
 func driveLossSequence(ctx context.Context, dependencies lossDependencies) (lossObservation, error) {
@@ -597,6 +630,27 @@ func driveLossSequence(ctx context.Context, dependencies lossDependencies) (loss
 	if health := awaitControlStreamFailure(ctx, session, dependencies.settle); health != nil {
 		observation.controlStreamFailed = health.Error()
 	}
+	// BootBarrier.CapabilityReasonCode reflects the last Ensure outcome and
+	// nothing else, so a loss observed through Run/Verify transport failures on
+	// an already-acquired session leaves it holding the last healthy Ensure's
+	// empty reason. The agent never sees that because its readiness timer
+	// re-Ensures while the runtime is down and classifies the refusal. Do the
+	// same thing here, bounded, and carry that refusal's typed reason into the
+	// withdrawal rather than inventing one.
+	//
+	// Invalidate first, so the re-Ensure below cannot short-circuit. Session
+	// .markLost sets the stream error under the lock and runs the barrier's
+	// loss handler only after releasing it, so barrier.prepared trails
+	// HealthError by that gap. BootBarrier.Ready consults the session's health
+	// as well as prepared, so today that gap does not reach Ensure -- but the
+	// row would fail for a race rather than for anything the runtime did if it
+	// ever did, and an explicit Invalidate costs nothing to rule that out.
+	dependencies.barrier.Invalidate()
+	ensureContext, cancelWithdrawal := context.WithTimeout(ctx, dependencies.withdrawalBound())
+	if refusal := dependencies.barrier.Ensure(ensureContext); refusal != nil {
+		observation.withdrawalEnsureRefused = refusal.Error()
+	}
+	cancelWithdrawal()
 	observation.withdrawn = dependencies.ledger.withdraw(dependencies.barrier.CapabilityReasonCode())
 
 	// 3. the helper/VM is returned, and a fresh acquire produces a new
@@ -712,11 +766,12 @@ func lossRow(config attendedConfig, observation lossObservation, check func(loss
 	row.appendReason(fmt.Sprintf("%s fault execution: %s", observation.kind, strings.Join(observation.commands, " | ")))
 	row.appendReason(fmt.Sprintf(
 		"pre-fault container swept by the recovering generation: %t; helper generation %s/%d -> %s/%d; "+
-			"withdrawal reason %q; boot session id reused: %t",
+			"withdrawal reason %q from the in-window re-Ensure refusal %q; boot session id reused: %t",
 		slices.Contains(observation.sweptInventory.Containers, observation.identity.ContainerID),
 		observation.preGeneration.HelperInstanceID, observation.preGeneration.SessionGeneration,
 		observation.postGeneration.HelperInstanceID, observation.postGeneration.SessionGeneration,
-		observation.withdrawn.ReasonCode, observation.bootSessionReused))
+		observation.withdrawn.ReasonCode, observation.withdrawalEnsureRefused, observation.bootSessionReused))
+	row.appendReason(capabilityReasonNote)
 	row.appendReason(capabilityRevisionNote)
 	row.appendReason(restrictiveObservationNote)
 	if notes != "" {
