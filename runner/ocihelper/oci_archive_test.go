@@ -143,6 +143,32 @@ func TestInspectOCIArchiveRefusesARequestedNameOutsideTheArchiveRepository(t *te
 	}
 }
 
+// The release manifest names the bare probe repository, while the published
+// archive annotates its commit tag: a bare request against a tagged archive
+// names that repository, so the archive's own tag is the answer, never a
+// rename (#433).
+func TestInspectOCIArchiveResolvesABareRequestToATaggedArchivesOwnTag(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, false)
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.Reference != "example.invalid/wefty:test" {
+		t.Fatalf("bare request against tagged archive reference = %q", inspection.Reference)
+	}
+}
+
+// A bare request still names a repository, so one aimed at a tagged archive
+// from another repository is refused rather than re-homed.
+func TestInspectOCIArchiveRefusesABareRequestOutsideATaggedArchivesRepository(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, false)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/other", topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "different repository") {
+		t.Fatalf("cross-repository bare request error = %v", err)
+	}
+}
+
 func TestInspectOCIArchiveRefusesARequestedNameAgainstATaggedExport(t *testing.T) {
 	archive, topDigest, _ := testOCIArchive(t, false, false)
 	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:user-numeric", topDigest.String())
