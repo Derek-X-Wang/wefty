@@ -120,8 +120,10 @@ silently rebound.
 Use `--reference` when the export named no artifact: the archive carries no
 reference at all, or a repository with no tag — bare, or qualified only by a
 digest. The override may name such an archive but not re-home it, so it must
-stay inside the repository the archive names; an archive that already carries
-a tag is named by its exporter, and a `--reference` that disagrees is refused.
+stay inside the repository the archive names. The exception is a bare
+repository request whose repository matches a tagged archive: it selects that
+archive and imports under the archive's own tag. Any other `--reference` that
+disagrees with an archive that already carries a tag is refused.
 
 The two build lanes name the same image differently, so check which artifact
 you have. The published `acceptance-image` archives carry their commit tag

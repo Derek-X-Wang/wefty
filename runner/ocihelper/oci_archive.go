@@ -398,13 +398,17 @@ func selectArchivePlatform(top ocispec.Descriptor, blobs map[digest.Digest]archi
 // repository without a tag -- bare, or qualified only by a digest. It may name
 // such an archive but never re-home it, so a request stays inside the
 // repository the archive names. An archive that already carries a tag is named
-// by its exporter, so a request must agree with it rather than rename it.
+// by its exporter, so a request must agree with it rather than rename it. The
+// one exception is a bare repository request whose repository equals the
+// tagged archive's repository: it selects that archive rather than rename it,
+// so it resolves to the archive's own tag (the release manifest names the bare
+// probe repository while the published archive carries its commit tag, #433).
 func resolveArchiveReference(annotated, requested string) (string, error) {
 	archiveReference, archiveNamesArtifact, err := parseArchiveReference(annotated, true)
 	if err != nil {
 		return "", err
 	}
-	requestedReference, _, err := parseArchiveReference(requested, false)
+	requestedReference, requestedNamesArtifact, err := parseArchiveReference(requested, false)
 	if err != nil {
 		return "", err
 	}
@@ -417,10 +421,12 @@ func resolveArchiveReference(annotated, requested string) (string, error) {
 		return requestedReference.String(), nil
 	case archiveReference.String() == requestedReference.String():
 		return requestedReference.String(), nil
-	case archiveNamesArtifact:
-		return "", errors.New("OCI archive image name does not match the requested reference")
+	case archiveNamesArtifact && !requestedNamesArtifact && distributionref.TrimNamed(archiveReference).String() == distributionref.TrimNamed(requestedReference).String():
+		return archiveReference.String(), nil
 	case distributionref.TrimNamed(archiveReference).String() != distributionref.TrimNamed(requestedReference).String():
 		return "", errors.New("requested reference names a different repository than the OCI archive")
+	case archiveNamesArtifact:
+		return "", errors.New("OCI archive image name does not match the requested reference")
 	}
 	return requestedReference.String(), nil
 }
