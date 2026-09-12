@@ -327,7 +327,7 @@ func (server *Server) startStartupBarrier(ctx context.Context) {
 			// A barrier that keeps failing the same way is a wedge, not a
 			// transient fault. Counting it durably lets the unit stop at a
 			// failed state with a typed reason instead of hot-looping.
-			err = server.recordStartupBarrierFailure(err)
+			err = server.recordStartupBarrierFailure(err, false)
 		}
 		server.sessionMu.Lock()
 		server.startupErr = err

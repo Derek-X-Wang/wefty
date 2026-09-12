@@ -104,7 +104,15 @@ type startupFailureLedger struct {
 // window. A ledger that cannot be read or written is not converted into a
 // wedge: the helper reports the ordinary failure and restarts, because losing
 // the count must never manufacture a refusal to serve.
-func (server *Server) recordStartupBarrierFailure(err error) error {
+//
+// A rearmed failure is one the refusing generation went looking for, a window
+// after the last one. Its gap is therefore always at least the window, so the
+// elapsed-gap test that separates a streak from an unrelated old incident
+// would read every scheduled re-attempt as a brand new streak and clear the
+// trip -- which would let the next generation that replaces this process run
+// the ordinary barrier, fail its process, and restart the #419 storm. A
+// re-attempt continues the streak it was scheduled by, and keeps it tripped.
+func (server *Server) recordStartupBarrierFailure(err error, rearmed bool) error {
 	var barrier *StartupBarrierError
 	if !errors.As(err, &barrier) || server.config.StartupFailureStateDirectory == "" {
 		return err
@@ -116,9 +124,10 @@ func (server *Server) recordStartupBarrierFailure(err error) error {
 	if payload, readErr := os.ReadFile(path); readErr == nil {
 		var existing startupFailureLedger
 		// A gap longer than the window is a new streak, not a continuation of
-		// a stale one left behind by an unrelated incident.
+		// a stale one left behind by an unrelated incident -- unless this
+		// failure is the scheduled re-attempt of that very streak.
 		if json.Unmarshal(payload, &existing) == nil && existing.Version == startupFailureLedgerVersion &&
-			existing.Consecutive > 0 && !existing.FirstAt.IsZero() && now.Sub(existing.UpdatedAt) <= window {
+			existing.Consecutive > 0 && !existing.FirstAt.IsZero() && (rearmed || now.Sub(existing.UpdatedAt) <= window) {
 			ledger.Consecutive = existing.Consecutive
 			ledger.FirstAt = existing.FirstAt
 		}
@@ -134,15 +143,17 @@ func (server *Server) recordStartupBarrierFailure(err error) error {
 	wedged := ledger.Consecutive >= bound && elapsed >= window
 	// The trip is recorded in the same fsynced write as the failure that
 	// caused it, so the generation that starts next cannot see the count
-	// without seeing the verdict.
-	ledger.Tripped = wedged
+	// without seeing the verdict. A re-attempt that failed keeps the trip
+	// whatever the arithmetic says: the bound was already spent, and the
+	// durable record has to say so for a replacing generation to honour it.
+	ledger.Tripped = wedged || rearmed
 	if writeErr := writeStartupFailureLedger(path, ledger); writeErr != nil {
 		server.config.Logf("OCI helper startup barrier ledger unwritable; the restart bound cannot be enforced this generation")
 		return err
 	}
 	server.config.Logf("OCI helper startup barrier failed phase=%s consecutive=%d bound=%d elapsed=%s window=%s",
 		barrier.Phase, ledger.Consecutive, bound, elapsed, window)
-	if !wedged {
+	if !wedged && !rearmed {
 		return err
 	}
 	return &StartupWedgedError{Phase: barrier.Phase, Consecutive: ledger.Consecutive, Bound: bound, Elapsed: elapsed, Err: err}
@@ -175,10 +186,21 @@ func (server *Server) startupBoundTripped() *StartupBoundTrippedError {
 		!ledger.Tripped || ledger.UpdatedAt.IsZero() {
 		return nil
 	}
+	// The schedule is clamped to one window from now. The ledger carries
+	// absolute wall time, so a clock stepped backwards -- a restored VM
+	// snapshot, an NTP correction -- would otherwise refuse for that step plus
+	// a window, and the timer, monotonic from creation, would not shorten when
+	// the clock was corrected again.
+	window := server.startupFailureWindow()
+	now := server.config.Clock.Now().UTC()
+	next := ledger.UpdatedAt.Add(window)
+	if clamped := now.Add(window); clamped.Before(next) {
+		next = clamped
+	}
 	return &StartupBoundTrippedError{Facts: StartupBoundFacts{
 		Tripped: true, Phase: ledger.Phase, Consecutive: ledger.Consecutive,
 		Bound: server.startupFailureBound(), Elapsed: ledger.UpdatedAt.Sub(ledger.FirstAt),
-		NextAttemptAt: ledger.UpdatedAt.Add(server.startupFailureWindow()),
+		NextAttemptAt: next,
 	}}
 }
 
@@ -189,8 +211,12 @@ func (server *Server) startupBoundTripped() *StartupBoundTrippedError {
 func (server *Server) refusalAfterTrippedBarrier(previous StartupBoundFacts, err error) *StartupBoundTrippedError {
 	facts := previous
 	var wedged *StartupWedgedError
-	if errors.As(server.recordStartupBarrierFailure(err), &wedged) {
-		facts.Phase, facts.Consecutive, facts.Bound, facts.Elapsed = wedged.Phase, wedged.Consecutive, wedged.Bound, wedged.Elapsed
+	if errors.As(server.recordStartupBarrierFailure(err, true), &wedged) {
+		facts.Phase, facts.Bound, facts.Elapsed = wedged.Phase, wedged.Bound, wedged.Elapsed
+		// The ledger is the durable authority, but an operator who deleted it
+		// mid-refusal must not make the reported streak shrink below what this
+		// process has actually watched fail.
+		facts.Consecutive = max(facts.Consecutive, wedged.Consecutive)
 	}
 	// An unusable ledger loses the count, never the refusal or the re-arm: the
 	// helper must not relaunch-loop, and it must not refuse forever either.

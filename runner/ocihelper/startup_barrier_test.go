@@ -23,10 +23,18 @@ type wedgedSweepEngine struct {
 	*fakeEngine
 	fail    bool
 	attempt atomic.Int64
+	// clock and sweepDuration make a sweep take time on the injected clock.
+	// A sweep that costs nothing hides every decision that compares the time a
+	// failure is recorded against the time the attempt was scheduled for.
+	clock         *manualClock
+	sweepDuration time.Duration
 }
 
 func (engine *wedgedSweepEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
 	engine.attempt.Add(1)
+	if engine.clock != nil && engine.sweepDuration > 0 {
+		engine.clock.Advance(engine.sweepDuration)
+	}
 	if engine.fail {
 		return SweepResponse{}, errors.New("durable Attempt ownership record conflicts with fenced authority")
 	}
@@ -94,6 +102,12 @@ func runHelperGenerationAt(t *testing.T, engine Engine, stateDirectory string, b
 }
 
 const testStartupFailureWindow = 30 * time.Second
+
+// testSweepDuration is what a real whole-namespace sweep costs before it is
+// denied. The helper records the failure at the end of the sweep, not at the
+// moment the attempt was scheduled for, and that difference decides whether a
+// scheduled re-attempt reads as the same streak or a new one.
+const testSweepDuration = 250 * time.Millisecond
 
 // The #412 unit restarted 136 times in two minutes because a deterministic
 // startup-sweep failure had no count bound. It must now surface as a failed
@@ -343,13 +357,29 @@ func burnStartupBound(t *testing.T, engine *wedgedSweepEngine, state string, bou
 	}
 	// Land the last failure exactly one window after the one before it, so the
 	// streak is both at the count and as old as the window without ever going
-	// stale.
-	clock.Advance(testStartupFailureWindow - time.Second)
+	// stale. The sweep itself costs time on this clock, and that time counts
+	// against the gap.
+	clock.Advance(testStartupFailureWindow - time.Second - engine.sweepDuration)
 	err := runHelperGenerationAt(t, engine, state, bound, clock)
 	var wedged *StartupWedgedError
 	if !errors.As(err, &wedged) {
 		t.Fatalf("the bound never tripped: %v", err)
 	}
+}
+
+// readStartupFailureLedger returns the durable ledger a replacing generation
+// would read.
+func readStartupFailureLedger(t *testing.T, state string) startupFailureLedger {
+	t.Helper()
+	payload, err := os.ReadFile(filepath.Join(state, startupFailureLedgerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ledger startupFailureLedger
+	if err := json.Unmarshal(payload, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	return ledger
 }
 
 // waitForSweepAttempts waits for the engine to reach exactly the expected
@@ -487,8 +517,8 @@ func TestATrippedStartupBoundRefusesSocketActivatedRelaunchesWithoutSweeping(t *
 // barrier, at most once per window, for as long as it keeps failing.
 func TestARefusingHelperReattemptsTheBarrierOncePerWindow(t *testing.T) {
 	state := t.TempDir()
-	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true}
 	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true, clock: clock, sweepDuration: testSweepDuration}
 	burnStartupBound(t, engine, state, 2, clock)
 	sweeps := engine.sweepAttempts()
 
@@ -512,6 +542,14 @@ func TestARefusingHelperReattemptsTheBarrierOncePerWindow(t *testing.T) {
 	if !second.Facts.NextAttemptAt.After(first.Facts.NextAttemptAt) {
 		t.Fatalf("a failed re-attempt did not schedule the next window: %+v then %+v", first.Facts, second.Facts)
 	}
+	// The durable record is what a replacing generation reads. A re-attempt is
+	// scheduled a window out and the sweep costs more time on top, so the gap
+	// that separates streaks always looks stale here: only an explicit
+	// continuation keeps the trip on disk.
+	ledger := readStartupFailureLedger(t, state)
+	if !ledger.Tripped || ledger.Consecutive != second.Facts.Consecutive || ledger.Consecutive <= first.Facts.Consecutive {
+		t.Fatalf("ledger after a failed re-attempt = %+v, want a still-tripped streak grown to %d", ledger, second.Facts.Consecutive)
+	}
 
 	clock.Advance(testStartupFailureWindow)
 	sweeps++
@@ -523,8 +561,8 @@ func TestARefusingHelperReattemptsTheBarrierOncePerWindow(t *testing.T) {
 // sweep, and a denial that has not been fixed buys the next one a window later.
 func TestAStaleTrippedLedgerSweepsOnceAtLaunchAndThenWaitsAWindow(t *testing.T) {
 	state := t.TempDir()
-	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true}
 	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true, clock: clock, sweepDuration: testSweepDuration}
 	burnStartupBound(t, engine, state, 2, clock)
 	sweeps := engine.sweepAttempts()
 
@@ -546,8 +584,8 @@ func TestAStaleTrippedLedgerSweepsOnceAtLaunchAndThenWaitsAWindow(t *testing.T) 
 // and the next re-attempt succeeds, with no restart at all.
 func TestAReArmedBarrierThatSucceedsClearsTheBoundAndServes(t *testing.T) {
 	state := t.TempDir()
-	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true}
 	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true, clock: clock, sweepDuration: testSweepDuration}
 	burnStartupBound(t, engine, state, 2, clock)
 	sweeps := engine.sweepAttempts()
 
@@ -613,4 +651,73 @@ func TestAStaleTrippedLedgerDoesNotRefuseAHealthyGeneration(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(state, startupFailureLedgerName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a verified barrier did not clear the tripped ledger: %v", err)
 	}
+}
+
+// The refusal has to survive the process that serves it. A generation that
+// replaces the refusing one -- crash, restart, reboot -- reads the same tripped
+// ledger and refuses too. If a failed re-attempt had cleared the trip, this
+// generation would run the ordinary barrier, fail its process, and hand the
+// socket back to the #419 activation storm for a whole window.
+func TestAGenerationThatReplacesARefusingOneStillRefuses(t *testing.T) {
+	state := t.TempDir()
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true, clock: clock, sweepDuration: testSweepDuration}
+	burnStartupBound(t, engine, state, 2, clock)
+	sweeps := engine.sweepAttempts()
+
+	_, refusing, stopRefusing := serveHelperGeneration(t, engine, state, 2, clock)
+	waitForRefusal(t, refusing)
+	clock.Advance(testStartupFailureWindow)
+	sweeps++
+	waitForSweepAttempts(t, engine, sweeps)
+	waitForRefusal(t, refusing)
+	stopRefusing()
+
+	// The replacement starts in the window the failed re-attempt just opened.
+	_, replacement, stop := serveHelperGeneration(t, engine, state, 2, clock)
+	defer stop()
+	if engine.sweepAttempts() != sweeps {
+		t.Fatalf("the replacing generation ran the ordinary barrier: %d sweeps, want %d", engine.sweepAttempts(), sweeps)
+	}
+	replacement.sessionMu.Lock()
+	fatalErr := replacement.fatalErr
+	startupErr := replacement.startupErr
+	replacement.sessionMu.Unlock()
+	if fatalErr != nil {
+		t.Fatalf("the replacing generation failed its process: %v", fatalErr)
+	}
+	var tripped *StartupBoundTrippedError
+	if !errors.As(startupErr, &tripped) {
+		t.Fatalf("the replacing generation did not inherit the refusal: %v", startupErr)
+	}
+	if ledger := readStartupFailureLedger(t, state); !ledger.Tripped {
+		t.Fatalf("ledger = %+v, want the trip to have survived the failed re-attempt", ledger)
+	}
+}
+
+// The ledger carries absolute wall time. A clock stepped backwards -- a
+// restored VM snapshot, an NTP correction -- must not buy the refusal that step
+// plus a window, because the timer is monotonic from creation and a later
+// correction cannot shorten it.
+func TestABackwardClockStepCannotStretchTheReArmWindow(t *testing.T) {
+	state := t.TempDir()
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true, clock: clock, sweepDuration: testSweepDuration}
+	burnStartupBound(t, engine, state, 2, clock)
+	sweeps := engine.sweepAttempts()
+
+	clock.Advance(-24 * time.Hour)
+	steppedBack := clock.Now()
+	_, server, stop := serveHelperGeneration(t, engine, state, 2, clock)
+	defer stop()
+	refusal := waitForRefusal(t, server)
+	if refusal.Facts.NextAttemptAt.After(steppedBack.Add(testStartupFailureWindow)) {
+		t.Fatalf("re-arm scheduled at %s, want no later than one window after the stepped-back now %s",
+			refusal.Facts.NextAttemptAt, steppedBack)
+	}
+	requireNoFurtherSweep(t, engine, sweeps)
+
+	clock.Advance(testStartupFailureWindow)
+	sweeps++
+	waitForSweepAttempts(t, engine, sweeps)
 }
