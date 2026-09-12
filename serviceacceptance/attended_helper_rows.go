@@ -265,11 +265,17 @@ type logEvidence struct {
 	sequences      map[string][]uint64
 	gaps           int
 	seals          map[string]bool
-	result         *ocihelper.WatchResponse
+	// sealReasons carries the helper's stated cause for every incomplete seal,
+	// both the stream's own reason and the closed-vocabulary release reason.
+	// Without them an incomplete-evidence row reads the same whether the
+	// streams were never sealed or a real log gap was recorded, and the run
+	// report cannot tell an operator which defect they are looking at.
+	sealReasons map[string]string
+	result      *ocihelper.WatchResponse
 }
 
 func collectLogEvidence(ctx context.Context, session attendedSession, authority ocihelper.AttemptAuthority) (logEvidence, error) {
-	evidence := logEvidence{sequences: map[string][]uint64{}, seals: map[string]bool{}}
+	evidence := logEvidence{sequences: map[string][]uint64{}, seals: map[string]bool{}, sealReasons: map[string]string{}}
 	err := session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 		if frame := event.Log; frame != nil {
 			if frame.Gap != nil {
@@ -285,6 +291,14 @@ func collectLogEvidence(ctx context.Context, session attendedSession, authority 
 		}
 		if seal := event.Seal; seal != nil {
 			evidence.seals[seal.Stream] = seal.Complete
+			switch {
+			case seal.ReleaseReason != "" && seal.Reason != "":
+				evidence.sealReasons[seal.Stream] = seal.ReleaseReason + " (stream: " + seal.Reason + ")"
+			case seal.ReleaseReason != "":
+				evidence.sealReasons[seal.Stream] = seal.ReleaseReason
+			case seal.Reason != "":
+				evidence.sealReasons[seal.Stream] = seal.Reason
+			}
 		}
 		if event.Result != nil {
 			completion := *event.Result
@@ -331,7 +345,7 @@ func checkLogEvidence(evidence logEvidence, stdoutMarker, stderrMarker string) e
 		return fmt.Errorf("terminal result = %+v, want exit 0", *result)
 	}
 	if result.LogEvidenceIncomplete {
-		return errors.New("helper reported incomplete log evidence")
+		return fmt.Errorf("helper reported incomplete log evidence: seals=%v reasons=%v", evidence.seals, evidence.sealReasons)
 	}
 	// The helper seals each stream at its pipe-EOF boundary, Complete when the
 	// tail drained and Complete=false with a reason when it did not. An
@@ -343,7 +357,7 @@ func checkLogEvidence(evidence logEvidence, stdoutMarker, stderrMarker string) e
 			return fmt.Errorf("%s was never sealed", stream)
 		}
 		if !complete {
-			return fmt.Errorf("%s seal is incomplete", stream)
+			return fmt.Errorf("%s seal is incomplete: %s", stream, evidence.sealReasons[stream])
 		}
 	}
 	return nil

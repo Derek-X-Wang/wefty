@@ -1016,6 +1016,57 @@ func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing
 	}
 }
 
+// TestAdapterPostKILLBudgetCoversTaskReleaseThenLogSealing pins the post-KILL
+// Watch budget to both helper bounds, not one. After a KILL the helper retries
+// task deletion for its whole release bound and only then publishes the
+// terminal, which is what starts each stream's log-seal bound; the two are
+// serial. A budget that covered release alone timed out into unconfirmed
+// runtime loss for any helper that needed the sealing bound too, discarding the
+// typed sealing evidence on exactly the path that evidence was built for.
+func TestAdapterPostKILLBudgetCoversTaskReleaseThenLogSealing(t *testing.T) {
+	if postKillWatchBudget < ocihelper.DefaultTaskReleaseTimeout+ocihelper.DefaultLogSealTimeout {
+		t.Fatalf("post-KILL budget %s does not cover the helper's serial release and sealing bounds", postKillWatchBudget)
+	}
+	engine := &adapterTestEngine{
+		watchSignals: make(chan ocihelper.Signal, 2),
+		ignoreTERM:   true,
+		// Past the release bound and its margin, inside the sealing bound:
+		// the window a release-only budget refused to wait through.
+		releaseDelay: ocihelper.DefaultTaskReleaseTimeout + postKillReleaseMargin + 200*time.Millisecond,
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 50 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct {
+		result workloadrunner.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := adapter.Run(ctx, request, nil)
+		done <- struct {
+			result workloadrunner.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	<-started
+	stopStarted := time.Now()
+	cancel()
+	finished := <-done
+	elapsed := time.Since(stopStarted)
+	if finished.err != nil || finished.result.Outcome.Signal != "killed" || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("late-sealing terminal = (%+v, %v), want the helper's own terminal evidence", finished.result.Outcome, finished.err)
+	}
+	if elapsed >= postKillWatchBudget {
+		t.Fatalf("TERM -> grace -> KILL -> release -> seal took %s, want inside the %s post-KILL budget", elapsed, postKillWatchBudget)
+	}
+}
+
 func TestAdapterServiceExitRacesKillAndKeepsTerminalEvidence(t *testing.T) {
 	engine := &adapterTestEngine{
 		watchSignals:   make(chan ocihelper.Signal, 1),

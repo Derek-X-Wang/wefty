@@ -1343,7 +1343,19 @@ task runs and retains each segment until the corresponding events have been
 acknowledged into the agent's `OutputSink`. A corrupt, missing, or truncated
 record emits an exact gap when its discarded byte extent is known and always
 emits an incomplete seal; finalization is anchored on logger pipe EOF or that
-explicit incomplete seal, never file-size stability. The adapter
+explicit incomplete seal, never file-size stability. Pipe EOF is produced by
+deleting the exited task, and the runtime reports a task's exit and its
+task-state transition separately: deletion is refused with a failed
+precondition while the task is still reported running. The helper therefore
+retries deletion inside the task-release bound until the runtime accepts it and
+only then makes the terminal observable, so a clean exit yields complete log
+evidence. If that bound expires with the task still unreleased, every
+incomplete seal carries `task_release_task_never_stopped` in its separate
+release-reason field, a closed vocabulary, leaving the seal's own reason to say
+what that stream observed. An agent therefore separates "no stream could seal
+because the task never stopped" from a stream's own gap or corruption by
+equality on that field, never by matching reason text. The
+adapter
 persists helper-observed image identity and performs the fenced L1 `Started`
 mutation before it exposes local running state; a rejected acknowledgement
 kills and deletes the already-started task.

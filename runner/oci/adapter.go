@@ -1181,7 +1181,8 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		watchDone <- session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 			if event.Seal != nil && request.OCILogSealObserved != nil {
 				request.OCILogSealObserved(workloadrunner.OCILogSealObservation{
-					Stream: contract.LogStream(event.Seal.Stream), Complete: event.Seal.Complete, Reason: event.Seal.Reason,
+					Stream: contract.LogStream(event.Seal.Stream), Complete: event.Seal.Complete,
+					Reason: event.Seal.Reason, ReleaseReason: event.Seal.ReleaseReason,
 				})
 			}
 			if event.Log != nil && sink != nil {
@@ -1280,6 +1281,10 @@ const (
 	defaultTerminationGrace  = 5 * time.Second
 	terminationSignalTimeout = time.Second
 	postKillReleaseMargin    = time.Second
+	// postKillWatchBudget covers the helper's serial task-release and
+	// log-sealing bounds plus one margin, so Watch is given the time the helper
+	// contract actually needs to publish terminal evidence after a KILL.
+	postKillWatchBudget = ocihelper.DefaultTaskReleaseTimeout + ocihelper.DefaultLogSealTimeout + postKillReleaseMargin
 )
 
 // terminationTrace is written only by terminateAndWaitObserved. Its caller
@@ -1486,9 +1491,13 @@ func terminateAndWaitObserved(
 	}
 	// After KILL, payload grace is no longer the relevant bound. Watch is
 	// waiting for the helper to delete the exited task, seal logger pipes, and
-	// publish terminal evidence, so give that fixed release contract its own
-	// margin instead of serializing a second copy of the TERM grace.
-	if err, done := watchResult(ocihelper.DefaultTaskReleaseTimeout+postKillReleaseMargin, false); done {
+	// publish terminal evidence. Those two helper bounds are serial, not
+	// concurrent: the helper retries task deletion for its whole release bound
+	// and only then publishes the terminal, which is what starts each stream's
+	// log-seal bound. Budgeting one of them made a wedged task time out here
+	// into unconfirmed runtime loss instead of delivering the helper's typed
+	// sealing evidence, which is exactly the case that evidence exists for.
+	if err, done := watchResult(postKillWatchBudget, false); done {
 		return err
 	}
 	unconfirmed := errors.New("OCI helper Watch did not confirm exit after KILL")

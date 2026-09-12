@@ -4,14 +4,18 @@ package ocihelper
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
 )
 
 func TestContainerdTerminalPublicationReleasesTaskSealsLogsAndRetainsOOM(t *testing.T) {
@@ -154,5 +158,159 @@ func TestContainerdTerminalPublicationReleasesTaskSealsLogsAndRetainsOOM(t *test
 	index := func(event string) int { return slices.Index(observedOrder, event) }
 	if index("Wait") > index("cancel Wait context") || index("cancel Wait context") > index("Task.Delete") || index("Task.Delete") > index("stdout seal") || index("Task.Delete") > index("stderr seal") || index("stdout seal") > index("terminal completion") || index("stderr seal") > index("terminal completion") {
 		t.Fatalf("terminal ordering = %v", observedOrder)
+	}
+}
+
+// sealedLogSegments writes one framed record plus a pipe-EOF seal to each
+// stream, which is what the binary-v2 logger does once the shim closes its
+// write end -- that is, once the exited task is actually deleted.
+// sealedLogSegments runs on the cacheTerminal goroutine, so every failure is
+// reported with t.Errorf and returned rather than ending the test goroutine.
+func sealedLogSegments(t *testing.T, paths map[string]string) {
+	t.Helper()
+	for stream, path := range paths {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Errorf("open %s segment: %v", stream, err)
+			return
+		}
+		writeErr := writeLogRecord(file, logFrameMagic, 0, []byte(stream+" complete"))
+		if writeErr == nil {
+			writeErr = writeLogRecord(file, logSealMagic, 1, nil)
+		}
+		if writeErr != nil {
+			t.Errorf("seal %s segment: %v", stream, writeErr)
+		}
+		if err := file.Close(); err != nil {
+			t.Errorf("close %s segment: %v", stream, err)
+			return
+		}
+	}
+}
+
+func emptyLogSegments(t *testing.T, root string) map[string]string {
+	t.Helper()
+	paths := map[string]string{"stdout": filepath.Join(root, "stdout.log"), "stderr": filepath.Join(root, "stderr.log")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return paths
+}
+
+func watchTerminalEvidence(t *testing.T, engine *ContainerdEngine, authority AttemptAuthority) (*WatchResponse, map[string]LogSeal) {
+	t.Helper()
+	var events []WatchEvent
+	if err := engine.Watch(t.Context(), WatchRequest{Authority: authority}, func(event WatchEvent) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	seals := map[string]LogSeal{}
+	var result *WatchResponse
+	for _, event := range events {
+		if event.Seal != nil {
+			seals[event.Seal.Stream] = *event.Seal
+		}
+		if event.Result != nil {
+			result = event.Result
+		}
+	}
+	return result, seals
+}
+
+// TestContainerdSealsLogsWhenExitedTaskIsBrieflyStillReportedRunning is the
+// engine-level regression for issue #423. containerd delivers the exit status
+// on Wait before the shim's task state leaves running, so the first Task.Delete
+// is refused with a failed precondition. Publishing the terminal on that
+// refusal left both logger pipes open, so neither stream ever reached pipe EOF
+// and a clean exit-0 payload reported log_evidence_incomplete.
+func TestContainerdSealsLogsWhenExitedTaskIsBrieflyStillReportedRunning(t *testing.T) {
+	root := t.TempDir()
+	paths := emptyLogSegments(t, root)
+	authority := testAuthority()
+	var releases atomic.Int64
+	attempt := &containerdAttempt{
+		authority:       authority,
+		stdout:          paths["stdout"],
+		stderr:          paths["stderr"],
+		terminalReady:   make(chan struct{}),
+		logAcknowledged: make(map[string]uint64),
+		releaseTask: func(context.Context) error {
+			if releases.Add(1) < 3 {
+				return fmt.Errorf("task must be stopped before deletion: running: %w", errdefs.ErrFailedPrecondition)
+			}
+			sealedLogSegments(t, paths)
+			return nil
+		},
+	}
+	engine := &ContainerdEngine{
+		config:   NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 2 * time.Second},
+		attempts: map[string]*containerdAttempt{authority.key(): attempt},
+	}
+	wait := make(chan containerd.ExitStatus, 1)
+	wait <- *containerd.NewExitStatus(0, time.Now(), nil)
+	close(wait)
+	go attempt.cacheTerminal(wait, root, 2*time.Second)
+
+	result, seals := watchTerminalEvidence(t, engine, authority)
+	if result == nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("terminal result = %+v, want exit 0", result)
+	}
+	if result.LogEvidenceIncomplete {
+		t.Fatalf("clean exit 0 reported incomplete log evidence: seals=%+v", seals)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		if !seals[stream].Complete || seals[stream].ReleaseReason != "" {
+			t.Fatalf("%s seal = %+v, want complete with no release reason", stream, seals[stream])
+		}
+	}
+	if got := releases.Load(); got < 2 {
+		t.Fatalf("release attempts = %d, want the refusal to be retried", got)
+	}
+}
+
+// TestContainerdNamesTheCauseWhenExitedTaskNeverStops keeps the bound honest:
+// when the task truly never stops the evidence still says so, but it says it
+// with a typed reason an agent can separate from a real log gap.
+func TestContainerdNamesTheCauseWhenExitedTaskNeverStops(t *testing.T) {
+	root := t.TempDir()
+	paths := emptyLogSegments(t, root)
+	authority := testAuthority()
+	attempt := &containerdAttempt{
+		authority:       authority,
+		stdout:          paths["stdout"],
+		stderr:          paths["stderr"],
+		terminalReady:   make(chan struct{}),
+		logAcknowledged: make(map[string]uint64),
+		releaseTask: func(context.Context) error {
+			return fmt.Errorf("task must be stopped before deletion: running: %w", errdefs.ErrFailedPrecondition)
+		},
+	}
+	engine := &ContainerdEngine{
+		config:   NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 50 * time.Millisecond},
+		attempts: map[string]*containerdAttempt{authority.key(): attempt},
+	}
+	wait := make(chan containerd.ExitStatus, 1)
+	wait <- *containerd.NewExitStatus(0, time.Now(), nil)
+	close(wait)
+	go attempt.cacheTerminal(wait, root, 50*time.Millisecond)
+
+	result, seals := watchTerminalEvidence(t, engine, authority)
+	if result == nil || !result.LogEvidenceIncomplete {
+		t.Fatalf("unreleased task produced result %+v, want incomplete log evidence", result)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		seal := seals[stream]
+		if seal.Complete || seal.ReleaseReason != TaskNeverStoppedSealReason {
+			t.Fatalf("%s seal = %+v, want an incomplete seal released as %q", stream, seal, TaskNeverStoppedSealReason)
+		}
+		// The stream's own reason stays its own observation, so a real
+		// corruption reason is never fronted by the release cause.
+		if seal.Reason == "" || strings.Contains(seal.Reason, TaskNeverStoppedSealReason) {
+			t.Fatalf("%s seal reason = %q, want the stream's own observation", stream, seal.Reason)
+		}
 	}
 }
