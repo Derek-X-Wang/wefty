@@ -159,7 +159,7 @@ func (controller *Controller) Stop(ctx context.Context, request IntentMutationRe
 	return IntentResponse{Intent: intent, RuntimeQuiesced: true}, nil
 }
 
-func (controller *Controller) LoadImage(ctx context.Context, archive io.Reader) (LoadImageResponse, error) {
+func (controller *Controller) LoadImage(ctx context.Context, request LoadImageRequest, archive io.Reader) (LoadImageResponse, error) {
 	controller.mu.Lock()
 	intent, err := controller.Intent(ctx)
 	if err != nil {
@@ -175,7 +175,7 @@ func (controller *Controller) LoadImage(ctx context.Context, archive io.Reader) 
 	if images == nil {
 		return LoadImageResponse{}, runtimeUnavailable("OCI image loading is unavailable", nil)
 	}
-	response, err := images.LoadImage(ctx, "", archive)
+	response, err := images.LoadImage(ctx, request.Reference, archive)
 	if err != nil {
 		return LoadImageResponse{}, err
 	}

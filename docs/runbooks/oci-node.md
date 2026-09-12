@@ -106,7 +106,31 @@ The owner-ratified cache ceiling is 16 GiB. Operation leases, live attempts, dur
 
 ```sh
 wefty node load-image FILE
+wefty node load-image FILE --reference REFERENCE
 ```
+
+The import is keyed by the name the archive itself carries, and that name is
+never invented. An archive annotating `repository:tag` is imported under that
+tag; one annotating only `repository@sha256:…` is imported under that digest;
+only a bare repository takes `:latest`. Two archives exported from one
+repository therefore never collide, and an archive whose name already
+identifies different bytes is refused as `manifest_rejected` rather than
+silently rebound.
+
+Use `--reference` when the export named no artifact: the archive carries no
+reference at all, or a repository with no tag — bare, or qualified only by a
+digest. The override may name such an archive but not re-home it, so it must
+stay inside the repository the archive names; an archive that already carries
+a tag is named by its exporter, and a `--reference` that disagrees is refused.
+
+The two build lanes name the same image differently, so check which artifact
+you have. The published `acceptance-image` archives carry their commit tag
+(`…/wefty-echo-service:<commit>`, `:<commit>-user-numeric`,
+`:<commit>-user-named`), so the three import side by side. A pull-request lane
+archive is assembled by `scripts/assemble-oci-index.sh` from a bare repository
+name and therefore imports as `…/wefty-echo-service:latest`; two pull-request
+archives collide on that one name, and the second needs a `--reference` such as
+`…/wefty-echo-service:<commit>` or it is refused as `manifest_rejected`.
 
 For the acceptance artifact, set `FILE="$ACCEPTANCE_RELEASE/wefty-echo-service.oci.tar"`. The command
 must print the same top-level digest as

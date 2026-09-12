@@ -115,7 +115,7 @@ func TestControllerPersistsIntentBeforeRuntimeEffects(t *testing.T) {
 	if err != nil || stopped.Intent.Enabled || stopped.Intent.Revision != 2 || !stopped.RuntimeQuiesced || runtime.stopped != 1 {
 		t.Fatalf("stop response=%+v runtime=%+v err=%v", stopped, runtime, err)
 	}
-	if _, err := controller.LoadImage(t.Context(), bytes.NewReader([]byte("archive"))); err == nil {
+	if _, err := controller.LoadImage(t.Context(), LoadImageRequest{}, bytes.NewReader([]byte("archive"))); err == nil {
 		t.Fatal("disabled intent admitted image loading")
 	}
 	clock.now = clock.now.Add(time.Minute)
@@ -123,9 +123,15 @@ func TestControllerPersistsIntentBeforeRuntimeEffects(t *testing.T) {
 	if err != nil || !started.Intent.Enabled || started.Intent.Revision != 3 || !started.CapabilityPublished || runtime.recovered != 1 {
 		t.Fatalf("start response=%+v runtime=%+v err=%v", started, runtime, err)
 	}
-	loaded, err := controller.LoadImage(t.Context(), bytes.NewReader([]byte("verified-archive")))
+	loaded, err := controller.LoadImage(t.Context(), LoadImageRequest{}, bytes.NewReader([]byte("verified-archive")))
 	if err != nil || loaded.TopLevelDigest == "" || images.reference != "" || images.archive != "verified-archive" {
 		t.Fatalf("load-image response=%+v reference=%q archive=%q err=%v", loaded, images.reference, images.archive, err)
+	}
+	// The operator's explicit name is what disambiguates two archives one
+	// export left keyed by the same ambiguous reference (#418).
+	named, err := controller.LoadImage(t.Context(), LoadImageRequest{Reference: "ghcr.io/derek-x-wang/wefty-echo-service:user-numeric"}, bytes.NewReader([]byte("variant-archive")))
+	if err != nil || named.TopLevelDigest == "" || images.reference != "ghcr.io/derek-x-wang/wefty-echo-service:user-numeric" || images.archive != "variant-archive" {
+		t.Fatalf("named load-image response=%+v reference=%q archive=%q err=%v", named, images.reference, images.archive, err)
 	}
 }
 

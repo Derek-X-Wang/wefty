@@ -66,7 +66,7 @@ func TestNodeLoadImageCLIReportsHelperMechanics(t *testing.T) {
 
 	socket := filepath.Join(root, "control.sock")
 	var plainFailure atomic.Bool
-	service := ocicontrol.ServiceFuncs{LoadImageFunc: func(_ context.Context, archive io.Reader) (ocicontrol.LoadImageResponse, error) {
+	service := ocicontrol.ServiceFuncs{LoadImageFunc: func(_ context.Context, _ ocicontrol.LoadImageRequest, archive io.Reader) (ocicontrol.LoadImageResponse, error) {
 		header, err := tar.NewReader(archive).Next()
 		if err != nil || header.Name != "./" || !header.FileInfo().IsDir() {
 			return ocicontrol.LoadImageResponse{}, errors.New("CLI did not stream the GNU-shaped archive")
@@ -177,6 +177,7 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var archiveBytes []byte
+	var loadReference string
 	service := ocicontrol.ServiceFuncs{
 		DoctorFunc: func(ctx context.Context) (ocicontrol.DoctorResponse, error) {
 			report := ocicontrol.BuildDoctor(ctx, ocicontrol.DoctorConfig{
@@ -217,10 +218,11 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
 			return ocicontrol.IntentResponse{Intent: intent, RuntimeQuiesced: err == nil}, err
 		},
-		LoadImageFunc: func(_ context.Context, archive io.Reader) (ocicontrol.LoadImageResponse, error) {
+		LoadImageFunc: func(_ context.Context, request ocicontrol.LoadImageRequest, archive io.Reader) (ocicontrol.LoadImageResponse, error) {
 			payload, err := io.ReadAll(archive)
 			mu.Lock()
 			archiveBytes = payload
+			loadReference = request.Reference
 			mu.Unlock()
 			return ocicontrol.LoadImageResponse{
 				TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -309,6 +311,24 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 		t.Fatalf("load-image archive=%q stdout=%q", gotArchive, stdout.String())
 	}
 
+	// An archive the export left ambiguous is named on the command line, and
+	// that name has to survive the socket unchanged (#418).
+	stdout.Reset()
+	stderr.Reset()
+	const variantReference = "ghcr.io/derek-x-wang/wefty-echo-service:candidate-user-numeric"
+	if err := run(t.Context(), []string{
+		"--fabric=invalid-must-not-open", "--node-config=" + configPath,
+		"node", "load-image", archivePath, "--reference", variantReference,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("load-image --reference: %v stderr=%s", err, stderr.String())
+	}
+	mu.Lock()
+	gotReference := loadReference
+	mu.Unlock()
+	if gotReference != variantReference {
+		t.Fatalf("load-image reference=%q", gotReference)
+	}
+
 	stdout.Reset()
 	stderr.Reset()
 	if err := run(t.Context(), []string{
@@ -387,17 +407,18 @@ func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]bool{
-		"bash scripts/install-oci-deps.sh --dry-run": false,
-		"sudo bash scripts/install-oci-deps.sh":      false,
-		"scripts/build-oci-install-manifest.sh ":     false,
-		"sudo wefty node setup-oci":                  false,
-		"wefty node setup-oci":                       false,
-		"wefty node doctor":                          false,
-		"wefty node oci start":                       false,
-		"wefty node oci stop":                        false,
-		"wefty --json node oci removals":             false,
-		"wefty node load-image FILE":                 false,
-		"wefty --json node doctor":                   false,
+		"bash scripts/install-oci-deps.sh --dry-run":       false,
+		"sudo bash scripts/install-oci-deps.sh":            false,
+		"scripts/build-oci-install-manifest.sh ":           false,
+		"sudo wefty node setup-oci":                        false,
+		"wefty node setup-oci":                             false,
+		"wefty node doctor":                                false,
+		"wefty node oci start":                             false,
+		"wefty node oci stop":                              false,
+		"wefty --json node oci removals":                   false,
+		"wefty node load-image FILE":                       false,
+		"wefty node load-image FILE --reference REFERENCE": false,
+		"wefty --json node doctor":                         false,
 	}
 	inShellBlock := false
 	for _, line := range strings.Split(string(payload), "\n") {

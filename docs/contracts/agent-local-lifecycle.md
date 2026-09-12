@@ -221,9 +221,22 @@ allows only the installed operator UID. Process-kind payloads currently share
 that UID with the agent; #220 owns the required payload UID isolation and this
 known pre-existing limitation grants no additional control authority. The agent is the sole writer of
 intent and runtime state. `load-image` streams an OCI archive through this
-surface to the existing helper-owned import/cache seam; it accepts no mutable
-reference override and returns only verified top-level and admitted-platform
-digests plus bounded evidence.
+surface to the existing helper-owned import/cache seam and returns only
+verified top-level and admitted-platform digests plus bounded evidence. The
+import is keyed by the name the archive itself carries and never by an
+invented one: a tagged export keeps its tag, a digest-only export keeps its
+digest, and only a bare repository takes `:latest`, so two archives exported
+from one repository cannot claim one name. `--reference` names only an export
+that named no artifact. It may name an archive carrying no reference, or one
+carrying a repository with no tag — bare, or qualified only by a digest —
+inside that archive's own repository; it cannot rename a tagged export, cannot
+carry a digest, and cannot rebind a name that already identifies different
+bytes, which stays a typed `manifest_rejected` refusal. The reference travels
+as the one `load-image` query parameter, and a repeated or unknown parameter is
+refused rather than ignored. An agent older than this flag ignores it, so a new
+CLI against an old agent imports under the archive's own name with no error;
+compare the printed digests with the artifact receipt when that pairing is
+possible.
 Node-local JSON failures always carry a closed, sanitized `details.reason`:
 typed helper failures retain their helper protocol code, adapter-side platform
 diagnostics use `diagnostic_failure`, other recognized adapter failures use
