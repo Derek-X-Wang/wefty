@@ -129,7 +129,10 @@ second VM supervisor. After bootstrap, capture all of these facts:
   handshake reports the candidate version and protocol major, the guest socket
   is exactly `0660 root:wefty-oci`, and raw containerd remains unforwarded;
 - first-time guest group installation performs one ordinary VM stop/start so
-  the Lima guest agent picks up `wefty-oci`; an already-member rerun does not;
+  the Lima guest agent picks up `wefty-oci`; an already-member rerun does not.
+  This clause has never been exercised on an owner host whose operator has been
+  in `wefty-oci` since a previous run — proving it needs a fresh guest — so the
+  row's evidence must say which clause ran;
 - the probe archive imports to the recorded top-level digest through the helper
   API and the functional create/start/wait/delete probe succeeds.
 
@@ -356,30 +359,33 @@ and the guest socket back to `0660 root:wefty-oci`.
    image receipts must retain distinct repositories, digests, and tar names
    while sharing the candidate commit.
 10. Removal manifest: while the agent is offline, request removal of a bound OCI
-   service and observe L1 at exactly `removal_pending`. Start a poll of the
-   node-local removal read before returning the node, because the whole
-   proof runs and then releases itself in seconds once the agent is back:
-
-   ```sh
-   while sleep 0.2; do
-     printf '%s ' "$(date -u +%FT%TZ)"
-     wefty --json node oci removals
-   done | tee /absolute/path/to/removal-proof.jsonl &
-   ```
-
-   Return the same node through the ordinary boot sweep barrier. The poll
-   captures the immutable job/removal-generation manifest with every attempt
-   lease, task, container, snapshot, shim, cgroup, framed-log directory,
-   service-data volume, and its owner record, the positive prior-boot sweep
-   receipt in `runtime_quiescence`, and the `prepared -> quarantined ->
-   complete` phase history. Require the proof-gated completion path to delete
-   the guest-native service-data bytes and owner record, persist a
-   helper-generation assertion for every manifest row in `absence_attestation`,
-   and only then reach `removed_verified`; the removal leaves the read surface
-   when L1 acknowledges cleanup, so the last record the poll saw before the
-   list empties is the completed proof. Record the guest-native
+   service and observe L1 at exactly `removal_pending`. Return the same node
+   through the ordinary boot sweep barrier, capturing the node-local removal
+   read across the return. Once the agent is back, the whole proof — quiescence
+   receipt, service-data deletion, absence attestation, and the L1
+   acknowledgement that releases the record — completes inside one sub-second
+   pass (the proof alone measured 24 ms on owner hardware, 2026-09-12,
+   candidate `46915f2`), so a `while sleep 0.2` loop of
+   `wefty --json node oci removals` observes nothing; the capture is an
+   in-process poller over the operator control socket, sampling fast enough to
+   see that pass end to end and stopping once it holds one record at
+   `phase=complete`. The record is durable through its phases and leaves the
+   read surface only at the L1 acknowledgement, so the completed record the
+   capture holds is the row's evidence, and it must show: the immutable
+   job/removal-generation identity (`job_id`, `removal_generation`,
+   `cleanup_fence`, `root_instance_id`); `resource_manifests` with every
+   attempt's lease, task, container, snapshot, shim, cgroup, framed-log
+   directory, service-data volume, and its owner record; `runtime_quiescence`
+   with `runtime_quiesced=true` and the positive prior-boot sweep evidence
+   (`evidence`, `boot_session_id`, `sweep_epoch`, `helper_generation`); the
+   `prepared -> quarantined -> complete` phase history as the `prepared_at`,
+   `quiesced_at`, `attested_at`, and `completed_at` timestamps; and an
+   `absence_attestation` carrying one `absent=true` assertion for every
+   manifested resource class. Require the proof-gated completion path to delete
+   the guest-native service-data bytes and owner record and only then reach
+   `removed_verified`. Record the guest-native
    inventories and phase facts in `service_removal_manifest_offline`, taking
-   `resource_manifests` and `removal_assertions` verbatim from that read.
+   `resource_manifests` and `removal_assertions` verbatim from that record.
 
 ### Denied quiescence proof (`service_failed_quiescence`)
 
@@ -739,7 +745,9 @@ include `launch_units`; and the doctor row embeds the redacted minimal snapshot.
 After capture, run the same private bootstrap with `--remove`, instance,
 `limactl`, facts, and intent paths. Preserve its JSON evidence and require the
 host unit, guest helper binary/socket/service, facts, and intent marker to be
-absent. A second removal must report the same absence without failing.
+absent. A second removal must report the same absence without failing. The
+first `--remove` can intermittently report `unloaded:false` while launchd is
+still draining the unit; a second call then succeeds.
 
 Fold the complete artifact into the tagged lane with:
 
