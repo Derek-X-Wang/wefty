@@ -277,12 +277,8 @@ and the guest socket back to `0660 root:wefty-oci`.
    stop→start transition (stop releases the slot but retains the binding,
    digest pin, and service data; start reacquires service capacity through
    `queued` before the counter advances `1` to `2`) to the
-   `service_stop_start_capacity` row. Separately, stop the same service job in
-   a way that the runtime cannot prove quiescence (for example, killing its
-   containerd shim out from under the runtime before requesting stop) and
-   require L1 to latch the job `failed` on the `oci_runtime_quiescence_failed`
-   control error instead of releasing the slot; record that command, exit
-   code, and the returned error in the `service_failed_quiescence` row. Start
+   `service_stop_start_capacity` row. Separately, prove the
+   `service_failed_quiescence` row described below. Start
    a second service job on the same pinned digest;
    require its service data to be empty while the original job remains
    digest-pinned and retains its own counter. The helper-owned backing path must resolve inside the
@@ -313,6 +309,62 @@ and the guest socket back to `0660 root:wefty-oci`.
    and owner record, persist a helper-generation assertion for every manifest
    row, and only then reach `removed_verified`. Record the guest-native
    inventories and phase facts in `service_removal_manifest_offline`.
+
+### Denied quiescence proof (`service_failed_quiescence`)
+
+The row's intent is unchanged: when the runtime cannot prove that a stop was
+clean, L1 must say so instead of reporting `stopped`. What changed is the
+fault. Killing the attempt's containerd shim does **not** deny that proof — it
+was tried twice on owner hardware (2026-09-12, candidate `1e182ff`), once with
+a three-second gap before the stop and once concurrently with it, and both
+times the task terminalized on the KILL, the helper verified the attempt's
+absence, and the Job reached `stopped`.
+
+The proof the runtime actually needs is the helper's `Delete` receipt, and the
+helper refuses that receipt while any resource named in the attempt's frozen
+manifest still exists. Denying exactly one of those resources therefore denies
+the proof without touching the helper session or the namespace. Pin the
+attempt's framed-log directory inside the guest, then request the ordinary
+service stop:
+
+```sh
+limactl shell wefty-oci sudo sh -c '
+  set -eu
+  dir=$(ls -dt /var/lib/wefty/oci/logs/wefty-log-segments-* | head -1)
+  mkdir -p "$dir/wefty-quiescence-pin"
+  mount -t tmpfs -o size=1m none "$dir/wefty-quiescence-pin"
+  printf "pinned=%s\n" "$dir"'
+wefty services stop JOB_ID
+wefty services status JOB_ID
+```
+
+The helper retries deletion for its whole bounded budget, cannot remove the
+pinned directory, and returns a deadline-scoped engine failure. That failure is
+attempt-scoped by construction, so it is never promoted to helper or namespace
+loss: the stop completes with no runtime-quiescence evidence. Require the Job
+to reach `failed` and not `stopped`, desired state to remain `stopped`, the
+recorded failure to name the unverified reap, and the binding, digest pin, and
+service data to be retained. `oci_runtime_quiescence_failed` belongs to the
+node control surface — it is what `wefty node oci stop` returns when the whole
+runtime cannot be quiesced — and must not be expected as the per-job latch.
+
+Release the fault and remove the residue the denied deletion left behind:
+
+```sh
+limactl shell wefty-oci sudo sh -c '
+  set -eu
+  dir=$(ls -dt /var/lib/wefty/oci/logs/wefty-log-segments-* | head -1)
+  umount "$dir/wefty-quiescence-pin"
+  rm -rf "$dir"'
+```
+
+Record the injected fault, the stop command, its exit code, and the observed
+Job state in the `service_failed_quiescence` row.
+
+If the injected fault is nonetheless survived and the runtime proves a clean
+stop, the row records that honestly — the fault was real, the observation was
+real — rather than being retried until it produces the wanted answer. A row
+whose fault was never injected is a failure, never a PASS.
 
 ## Ordinary L3 OCI one-shot
 
@@ -454,11 +506,18 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 
 Ticket #148 additionally requires `service_restart_fresh_attempt`,
 `service_stop_start_capacity`, and `service_failed_quiescence` from the same
-attended session. The gate does not require additional typed fields for these
-three beyond the standard row shape (`session_id`, non-empty `command`, and
-`exit_code=0`); put the restart-identity, capacity-reacquisition, and
-quiescence-latch facts described above in the row's free-form `reason` and
-`inventories` fields.
+attended session. The gate requires no additional typed fields for the first
+two beyond the standard row shape (`session_id`, non-empty `command`, and
+`exit_code=0`); put their restart-identity and capacity-reacquisition facts in
+the row's free-form `reason` and `inventories` fields.
+
+`service_failed_quiescence` additionally requires
+`quiescence_fault_injected=true` — a row whose fault was never injected is not
+a PASS — plus `service_job_state`, which the gate holds to the outcome the row
+claims: `failed` when `quiescence_latched=true`, and `stopped` with a non-empty
+`reason` naming the injected fault and what was observed instead when
+`quiescence_latched=false`. The second shape records an honest negative
+observation of a real fault; it never records a skipped or synthesized one.
 
 Ticket #149 additionally requires `service_data_guest_native` with
 `service_owners` containing `0:0`, `13001:13002`, and `12001:12002`,
