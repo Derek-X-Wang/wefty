@@ -96,6 +96,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	server.listener = authenticated
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/doctor", server.handleDoctor)
+	mux.HandleFunc("GET /v1/oci/removals", server.handleRemovals)
 	mux.HandleFunc("GET /v1/intent", server.handleIntent)
 	mux.HandleFunc("POST /v1/setup", server.handleSetup)
 	mux.HandleFunc("POST /v1/oci/start", server.handleStart)
@@ -186,6 +187,11 @@ func validateUnixSocketPath(path string) error {
 
 func (server *Server) handleDoctor(writer http.ResponseWriter, request *http.Request) {
 	value, err := server.service.Doctor(request.Context())
+	writeControlResponse(writer, value, err)
+}
+
+func (server *Server) handleRemovals(writer http.ResponseWriter, request *http.Request) {
+	value, err := server.service.Removals(request.Context())
 	writeControlResponse(writer, value, err)
 }
 

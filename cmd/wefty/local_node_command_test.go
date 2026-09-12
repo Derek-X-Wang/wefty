@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -226,6 +227,20 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 				PlatformDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			}, err
 		},
+		RemovalsFunc: func(context.Context) (ocicontrol.RemovalsResponse, error) {
+			quiescedAt := time.Unix(0, 1_700_000_000_000_000_000).UTC()
+			return ocicontrol.RemovalsResponse{Version: ocicontrol.RemovalsResponseVersion, Removals: []ocicontrol.RemovalRecord{{
+				JobID: "job-removal", RemovalGeneration: 4, CleanupFence: "fence-4", RootInstanceID: "root-1",
+				Phase: "quarantined", PreparedAt: quiescedAt.Add(-time.Second), QuiescedAt: &quiescedAt,
+				RuntimeQuiescence: ocicontrol.QuiescenceProjection(workloadrunner.ReapReceipt{
+					RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootOCISweep, HelperGeneration: 9,
+				}),
+				ResourceManifests: []workloadrunner.RuntimeResourceManifest{{
+					Version: 1, RuntimeKind: contract.JobKindOCI, JobID: "job-removal", AttemptID: "attempt-1",
+					ServiceDataVolume: "wefty-service-volume-abc", ServiceDataOwnerRecord: "wefty-service-volume-abc.owner",
+				}},
+			}}}, nil
+		},
 	}
 	server, err := ocicontrol.NewServer(socket, service)
 	if err != nil {
@@ -319,6 +334,42 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 		t.Fatalf("start output=%q decoded=%+v err=%v", stdout.String(), started, err)
 	}
 
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(t.Context(), []string{
+		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json",
+		"node", "oci", "removals",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("oci removals: %v stderr=%s", err, stderr.String())
+	}
+	// The operator document must stay snake_case end to end; an untagged
+	// internal receipt would have leaked PascalCase keys into the middle of it.
+	if !strings.Contains(stdout.String(), `"runtime_quiesced": true`) || strings.Contains(stdout.String(), `"RuntimeQuiesced"`) ||
+		!strings.Contains(stdout.String(), `"helper_generation": 9`) {
+		t.Fatalf("removals JSON did not project the quiescence receipt in snake_case: %s", stdout.String())
+	}
+	var removals ocicontrol.RemovalsResponse
+	if err := json.Unmarshal(stdout.Bytes(), &removals); err != nil || removals.Version != ocicontrol.RemovalsResponseVersion ||
+		len(removals.Removals) != 1 || removals.Removals[0].Phase != "quarantined" ||
+		!removals.Removals[0].RuntimeQuiescence.RuntimeQuiesced ||
+		removals.Removals[0].RuntimeQuiescence.Evidence != string(workloadrunner.ReapEvidencePriorBootOCISweep) ||
+		removals.Removals[0].RuntimeQuiescence.HelperGeneration != 9 || removals.Removals[0].QuiescedAt == nil ||
+		len(removals.Removals[0].ResourceManifests) != 1 ||
+		removals.Removals[0].ResourceManifests[0].ServiceDataOwnerRecord != "wefty-service-volume-abc.owner" {
+		t.Fatalf("removals output=%q decoded=%+v err=%v", stdout.String(), removals, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(t.Context(), []string{
+		"--fabric=invalid-must-not-open", "--node-config=" + configPath,
+		"node", "oci", "removals",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("oci removals human: %v stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "job-removal") || !strings.Contains(stdout.String(), "PHASE\tquarantined") {
+		t.Fatalf("removals human output=%q", stdout.String())
+	}
+
 	cancel()
 	select {
 	case err := <-serverDone:
@@ -344,6 +395,7 @@ func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
 		"wefty node doctor":                          false,
 		"wefty node oci start":                       false,
 		"wefty node oci stop":                        false,
+		"wefty --json node oci removals":             false,
 		"wefty node load-image FILE":                 false,
 		"wefty --json node doctor":                   false,
 	}

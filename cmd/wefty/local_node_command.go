@@ -15,7 +15,7 @@ import (
 
 func executeLocalNode(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci start|stop | wefty node load-image FILE")
+		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci start|stop|removals | wefty node load-image FILE")
 	}
 	if handled, err := maybeExecutePrivilegedLinuxSetup(ctx, options, args, stdout, stderr); handled {
 		return err
@@ -108,8 +108,11 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 }
 
 func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout io.Writer) error {
+	if len(args) == 1 && args[0] == "removals" {
+		return executeLocalOCIRemovals(ctx, client, jsonOutput, stdout)
+	}
 	if len(args) != 1 || args[0] != "start" && args[0] != "stop" {
-		return usageError("usage: wefty node oci start | wefty node oci stop")
+		return usageError("usage: wefty node oci start | wefty node oci stop | wefty node oci removals")
 	}
 	current, err := client.Intent(ctx)
 	if err != nil {
@@ -130,6 +133,34 @@ func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonO
 	_, err = fmt.Fprintf(stdout, "OCI intent enabled=%t revision=%d capability_published=%t runtime_quiesced=%t\n",
 		response.Intent.Enabled, response.Intent.Revision, response.CapabilityPublished, response.RuntimeQuiesced)
 	return err
+}
+
+// executeLocalOCIRemovals reads the durable removal proof the node-local agent
+// is carrying. The evidence is structured -- a frozen resource manifest, a
+// quiescence receipt, per-resource absence assertions -- so JSON is the honest
+// rendering and the human line only says which removals exist and where each
+// one has got to.
+func executeLocalOCIRemovals(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, stdout io.Writer) error {
+	response, err := client.Removals(ctx)
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(stdout, response)
+	}
+	if len(response.Removals) == 0 {
+		_, err = fmt.Fprintln(stdout, "no runtime removals are in flight")
+		return err
+	}
+	for _, removal := range response.Removals {
+		attested := removal.Attestation != nil
+		if _, err := fmt.Fprintf(stdout, "JOB\t%s\tGENERATION\t%d\tPHASE\t%s\tQUIESCED\t%t\tATTESTED\t%t\tRESOURCE MANIFESTS\t%d\n",
+			removal.JobID, removal.RemovalGeneration, removal.Phase,
+			removal.RuntimeQuiescence.RuntimeQuiesced, attested, len(removal.ResourceManifests)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout io.Writer) error {

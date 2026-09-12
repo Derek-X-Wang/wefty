@@ -22,6 +22,15 @@ and raw environment dumps must never enter the artifact.
   discovery-only); its OCI archive contains the same
   `/bin/sh`, BusyBox utilities, and `cmd/wefty-echo-service` program used by
   Linux realtiming, including the distinct one-shot stdout/stderr markers;
+- from the same artifact, the two image-user variants of that echo image that
+  `service_data_guest_native` needs: `wefty-echo-service-user-numeric.oci.tar`
+  (image user `13001:13002`) and `wefty-echo-service-user-named.oci.tar`
+  (image user `wefty:wefty`, resolving to `12001:12002`). They differ from the
+  root echo image only in that user, they are published as
+  `<commit>-user-numeric` and `<commit>-user-named` tags of the same public
+  `wefty-echo-service` package, and their index and per-platform digests are
+  recorded in `acceptance-image-receipt.json` under `service_user_variants`.
+  Import each by its `acceptance-image-user-<variant>-index-digest.txt`;
 - the separate `wefty-computer-reference-<candidate-commit>` artifact from
   that exact workflow run. Extract `wefty-computer-reference-release.tar`,
   require its commit to match the echo artifact, and use the repository name
@@ -300,7 +309,10 @@ and the guest socket back to `0660 root:wefty-oci`.
    `WEFTY_SERVICE_DIR=/wefty/service` and the absence of guest or host backing
    paths in the payload environment.
 8. Service data: run root, numeric `13001:13002`, and named `wefty:wefty`
-   (`12001:12002`) image-user variants. For each, require `/wefty/service` to
+   (`12001:12002`) image-user variants, the latter two from the
+   `wefty-echo-service-user-numeric.oci.tar` and
+   `wefty-echo-service-user-named.oci.tar` archives named in the
+   preconditions. For each, require `/wefty/service` to
    begin with exactly that UID:GID and accept a payload write. For one stable
    service job, record attempt counters `0,1,2` across crash restart and
    stop→start while a marker outside `/wefty/service` is absent at the start of
@@ -310,12 +322,8 @@ and the guest socket back to `0660 root:wefty-oci`.
    stop→start transition (stop releases the slot but retains the binding,
    digest pin, and service data; start reacquires service capacity through
    `queued` before the counter advances `1` to `2`) to the
-   `service_stop_start_capacity` row. Separately, stop the same service job in
-   a way that the runtime cannot prove quiescence (for example, killing its
-   containerd shim out from under the runtime before requesting stop) and
-   require L1 to latch the job `failed` on the `oci_runtime_quiescence_failed`
-   control error instead of releasing the slot; record that command, exit
-   code, and the returned error in the `service_failed_quiescence` row. Start
+   `service_stop_start_capacity` row. Separately, prove the
+   `service_failed_quiescence` row described below. Start
    a second service job on the same pinned digest;
    require its service data to be empty while the original job remains
    digest-pinned and retains its own counter. The helper-owned backing path must resolve inside the
@@ -336,16 +344,114 @@ and the guest socket back to `0660 root:wefty-oci`.
    image receipts must retain distinct repositories, digests, and tar names
    while sharing the candidate commit.
 10. Removal manifest: while the agent is offline, request removal of a bound OCI
-   service and observe L1 at exactly `removal_pending`. Return the same
-   node through the ordinary boot sweep barrier, then capture the immutable
-   job/removal-generation manifest with every attempt lease, task, container,
-   snapshot, shim, cgroup, framed-log directory, service-data volume, and its
-   owner record. Require the persisted positive prior-boot sweep receipt and
-   `prepared -> quarantined -> complete` phase history, then require the
-   proof-gated completion path to delete the guest-native service-data bytes
-   and owner record, persist a helper-generation assertion for every manifest
-   row, and only then reach `removed_verified`. Record the guest-native
-   inventories and phase facts in `service_removal_manifest_offline`.
+   service and observe L1 at exactly `removal_pending`. Start a poll of the
+   node-local removal read before returning the node, because the whole
+   proof runs and then releases itself in seconds once the agent is back:
+
+   ```sh
+   while sleep 0.2; do
+     printf '%s ' "$(date -u +%FT%TZ)"
+     wefty --json node oci removals
+   done | tee /absolute/path/to/removal-proof.jsonl &
+   ```
+
+   Return the same node through the ordinary boot sweep barrier. The poll
+   captures the immutable job/removal-generation manifest with every attempt
+   lease, task, container, snapshot, shim, cgroup, framed-log directory,
+   service-data volume, and its owner record, the positive prior-boot sweep
+   receipt in `runtime_quiescence`, and the `prepared -> quarantined ->
+   complete` phase history. Require the proof-gated completion path to delete
+   the guest-native service-data bytes and owner record, persist a
+   helper-generation assertion for every manifest row in `absence_attestation`,
+   and only then reach `removed_verified`; the removal leaves the read surface
+   when L1 acknowledges cleanup, so the last record the poll saw before the
+   list empties is the completed proof. Record the guest-native
+   inventories and phase facts in `service_removal_manifest_offline`, taking
+   `resource_manifests` and `removal_assertions` verbatim from that read.
+
+### Denied quiescence proof (`service_failed_quiescence`)
+
+The row's intent is unchanged: when the runtime cannot prove that a stop was
+clean, L1 must say so instead of reporting `stopped`. What changed is the
+fault. Killing the attempt's containerd shim does **not** deny that proof — it
+was tried twice on owner hardware (2026-09-12, candidate `1e182ff`), once with
+a three-second gap before the stop and once concurrently with it, and both
+times the task terminalized on the KILL, the helper verified the attempt's
+absence, and the Job reached `stopped`.
+
+The proof the runtime actually needs is the helper's `Delete` receipt, and the
+helper refuses that receipt while any resource named in the attempt's frozen
+manifest still exists. Denying exactly one of those resources therefore denies
+the proof without touching the helper session or the namespace. Pin the
+attempt's framed-log directory inside the guest, then request the ordinary
+service stop.
+
+The directory must be the target job's own. Step 8 runs a second service job
+on the same digest, so newest-first guessing can pin a live bystander and latch
+the wrong Job. Every one of the attempt's resource names shares one suffix, and
+the attempt's containerd lease carries the job it belongs to, so derive the
+suffix from that lease rather than from mtime, and require exactly one match:
+
+```sh
+limactl shell wefty-oci sudo sh -c '
+  set -eu
+  job=JOB_ID
+  matches=$(ctr --namespace wefty leases list | grep -F "io.wefty/job_id=$job" | wc -l)
+  test "$matches" -eq 1
+  suffix=$(ctr --namespace wefty leases list | grep -F "io.wefty/job_id=$job" \
+    | sed -n "s/^wefty-lease-\([0-9a-f][0-9a-f]*\).*/\1/p")
+  test -n "$suffix"
+  dir="/var/lib/wefty/oci/logs/wefty-log-segments-$suffix"
+  test -d "$dir"
+  mkdir -p "$dir/wefty-quiescence-pin"
+  mount -t tmpfs -o size=1m none "$dir/wefty-quiescence-pin"
+  printf "pinned=%s\n" "$dir"'
+wefty services stop JOB_ID
+wefty services status JOB_ID
+```
+
+Record the printed `pinned=` path in the row and confirm its suffix matches the
+lease, container, snapshot and cgroup names the target job's attempt is using.
+
+The helper retries deletion for its whole bounded budget, cannot remove the
+pinned directory, and returns a deadline-scoped engine failure. That failure is
+attempt-scoped by construction, so it is never promoted to helper or namespace
+loss: the stop completes with no runtime-quiescence evidence. Require the Job
+to reach `failed` and not `stopped`, desired state to remain `stopped`, the
+recorded failure to name the unverified reap, and the binding, digest pin, and
+service data to be retained. `oci_runtime_quiescence_failed` belongs to the
+node control surface — it is what `wefty node oci stop` returns when the whole
+runtime cannot be quiesced — and must not be expected as the per-job latch.
+
+Release the fault and remove the residue the denied deletion left behind, using
+the same `pinned=` path:
+
+```sh
+limactl shell wefty-oci sudo sh -c '
+  set -eu
+  dir=PINNED_PATH
+  umount "$dir/wefty-quiescence-pin"
+  rm -rf "$dir"'
+```
+
+Unmounting does not undo the denial. The helper runs its verified-attempt
+release only on a `Delete` that succeeded, so the attempt's helper-side entry,
+its image pin, its capacity reservation, and its durable ownership record all
+stay held after the Job has latched `failed`, and nothing retries the reap
+because the Job is terminal. Expect one service slot and one image pin to
+remain held for the rest of the session. Run this row immediately before
+`helper_loss`, whose helper restart and namespace sweep is what clears the
+leftover attempt; if the session order puts it elsewhere, record the retained
+slot and pin in the row's `inventories` so a later capacity or cache
+observation is not read as a defect.
+
+Record the injected fault, the stop command, its exit code, and the observed
+Job state in the `service_failed_quiescence` row.
+
+If the injected fault is nonetheless survived and the runtime proves a clean
+stop, the row records that honestly — the fault was real, the observation was
+real — rather than being retried until it produces the wanted answer. A row
+whose fault was never injected is a failure, never a PASS.
 
 ## Ordinary L3 OCI one-shot
 
@@ -552,11 +658,18 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 
 Ticket #148 additionally requires `service_restart_fresh_attempt`,
 `service_stop_start_capacity`, and `service_failed_quiescence` from the same
-attended session. The gate does not require additional typed fields for these
-three beyond the standard row shape (`session_id`, non-empty `command`, and
-`exit_code=0`); put the restart-identity, capacity-reacquisition, and
-quiescence-latch facts described above in the row's free-form `reason` and
-`inventories` fields.
+attended session. The gate requires no additional typed fields for the first
+two beyond the standard row shape (`session_id`, non-empty `command`, and
+`exit_code=0`); put their restart-identity and capacity-reacquisition facts in
+the row's free-form `reason` and `inventories` fields.
+
+`service_failed_quiescence` additionally requires
+`quiescence_fault_injected=true` — a row whose fault was never injected is not
+a PASS — plus `service_job_state`, which the gate holds to the outcome the row
+claims: `failed` when `quiescence_latched=true`, and `stopped` with a non-empty
+`reason` naming the injected fault and what was observed instead when
+`quiescence_latched=false`. The second shape records an honest negative
+observation of a real fault; it never records a skipped or synthesized one.
 
 Ticket #149 additionally requires `service_data_guest_native` with
 `service_owners` containing `0:0`, `13001:13002`, and `12001:12002`,
@@ -569,12 +682,19 @@ Ticket #150 additionally requires `service_removal_manifest_offline` with
 `removal_phase=complete`, `removal_pending_observed=true`,
 `removal_completed=true`, `runtime_quiesced=true`, and non-empty
 `resource_manifests` naming the service
-data directory and its owner record independently. Hosted macOS runners are
+data directory and its owner record independently. `wefty node oci removals`
+is the surface those fields come from: `removal_phase` is the record's `phase`,
+`runtime_quiesced` is `.runtime_quiescence.runtime_quiesced`, and
+`resource_manifests` is the record's `resource_manifests` array copied
+verbatim. Hosted macOS runners are
 `NOT-RUN`; they do not satisfy this owner-hardware row.
 
 Ticket #151 additionally requires `post_delete_attestation=true`,
 `service_data_bytes_absent=true`, `service_data_owner_record_absent=true`, and
 one `absent=true` assertion for every class/identity in `resource_manifests`.
+The same read carries them: a record whose `absence_attestation` is present
+proves the post-delete attestation, and its `assertions` array is the row's
+`removal_assertions`.
 The attended receipt must set `delete_attest_restart_observed=true` only after
 observing a real agent process restart at the helper-delete/attestation boundary
 without an early L1 acknowledgement. Injected callback errors may be recorded

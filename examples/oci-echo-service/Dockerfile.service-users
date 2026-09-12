@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.18.0@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
+
+# Image-user variants of the acceptance echo service. The OCI service-data row
+# has to prove that helper-owned /wefty/service is initialized for whichever
+# user the image declares, not only for root, so it needs one image whose user
+# is purely numeric and one whose user is a name the image itself defines.
+# Building them here is what lets them be published; the Mac/Lima lane can only
+# import archives this workflow produces.
+#
+# Both variants must stay byte-comparable with the plain echo image apart from
+# the user, so the build stage and the pinned roots below are the same ones
+# examples/oci-echo-service/Dockerfile uses, and a contract test holds them
+# together. Neither variant is a default target: always build with --target.
+ARG GO_IMAGE=docker.io/library/golang@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83
+ARG BUSYBOX_IMAGE=docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+ARG SOURCE_DATE_EPOCH=0
+
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG SOURCE_DATE_EPOCH
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY contract/ ./contract/
+COPY cmd/wefty-echo-service/ ./cmd/wefty-echo-service/
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -buildvcs=false -ldflags='-buildid=' \
+    -o /out/wefty-echo-service ./cmd/wefty-echo-service \
+    && touch -d "@$SOURCE_DATE_EPOCH" /out/wefty-echo-service
+
+FROM ${BUSYBOX_IMAGE} AS service
+LABEL org.opencontainers.image.source="https://github.com/Derek-X-Wang/wefty"
+COPY --from=build --chmod=0755 /out/wefty-echo-service /usr/local/bin/wefty-echo-service
+ENTRYPOINT ["/usr/local/bin/wefty-echo-service"]
+
+FROM service AS numeric
+LABEL org.opencontainers.image.description="Wefty OCI acceptance echo service running as the numeric image user 13001:13002"
+USER 13001:13002
+
+FROM service AS named
+ARG SOURCE_DATE_EPOCH
+LABEL org.opencontainers.image.description="Wefty OCI acceptance echo service running as the named image user wefty:wefty (12001:12002)"
+RUN printf 'wefty:x:12001:12002:wefty:/nonexistent:/bin/sh\n' >> /etc/passwd \
+    && printf 'wefty:x:12002:\n' >> /etc/group \
+    && touch -d "@$SOURCE_DATE_EPOCH" /etc/passwd /etc/group
+USER wefty:wefty

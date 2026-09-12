@@ -52,6 +52,15 @@ func (client *Client) Doctor(ctx context.Context) (DoctorResponse, error) {
 	return response, err
 }
 
+// Removals reads the node-local agent's durable runtime removal records. It
+// mutates nothing; a removal leaves this surface when its cleanup is
+// acknowledged.
+func (client *Client) Removals(ctx context.Context) (RemovalsResponse, error) {
+	var response RemovalsResponse
+	err := client.call(ctx, http.MethodGet, "/v1/oci/removals", nil, "", &response)
+	return response, err
+}
+
 func (client *Client) Setup(ctx context.Context, request SetupRequest) (SetupResponse, error) {
 	var response SetupResponse
 	err := client.callJSON(ctx, "/v1/setup", request, &response)

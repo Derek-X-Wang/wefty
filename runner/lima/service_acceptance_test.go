@@ -35,48 +35,56 @@ type attendedResult struct {
 	// lives in Go source goes stale the moment the named ticket is fixed --
 	// #394 then #408 each went stale within two runs -- so the receipt row is
 	// the authority and the source-level default is only the fallback.
-	BlockedBy              int                 `json:"blocked_by,omitempty"`
-	SessionID              string              `json:"session_id"`
-	Command                []string            `json:"command"`
-	ExitCode               int                 `json:"exit_code"`
-	HelperGenerations      []uint64            `json:"helper_generations"`
-	CapabilityRevisions    []int64             `json:"capability_revisions"`
-	Inventories            []json.RawMessage   `json:"inventories"`
-	RoundTrip              bool                `json:"round_trip"`
-	DynamicListeners       map[string]bool     `json:"dynamic_listeners"`
-	LaunchUnits            []string            `json:"launch_units,omitempty"`
-	LimaStates             []InstanceState     `json:"lima_states,omitempty"`
-	OCIEnabled             *bool               `json:"oci_enabled,omitempty"`
-	ProcessAvailable       bool                `json:"process_available,omitempty"`
-	SocketMode             string              `json:"socket_mode,omitempty"`
-	SocketOwner            string              `json:"socket_owner,omitempty"`
-	SocketGroup            string              `json:"socket_group,omitempty"`
-	MinimalDoctor          *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
-	AttemptIDs             []string            `json:"attempt_ids"`
-	TopLevelDigests        []string            `json:"top_level_digests"`
-	PlatformDigests        []string            `json:"platform_digests"`
-	PayloadExecutions      int                 `json:"payload_executions"`
-	StdoutMarkers          []string            `json:"stdout_markers"`
-	StderrMarkers          []string            `json:"stderr_markers"`
-	HandoffMarkerBytes     []string            `json:"handoff_marker_bytes"`
-	HandoffAbsent          bool                `json:"handoff_absent_after_completion"`
-	ServiceOwners          []string            `json:"service_owners,omitempty"`
-	ServiceAttemptCounts   []int               `json:"service_attempt_counts,omitempty"`
-	GuestNativeData        bool                `json:"guest_native_data,omitempty"`
-	VirtioFSData           *bool               `json:"virtiofs_data,omitempty"`
-	RootfsDiscarded        bool                `json:"rootfs_discarded,omitempty"`
-	RemovalPhase           string              `json:"removal_phase,omitempty"`
-	RemovalPendingObserved bool                `json:"removal_pending_observed,omitempty"`
-	RemovalCompleted       bool                `json:"removal_completed,omitempty"`
-	RuntimeQuiesced        bool                `json:"runtime_quiesced,omitempty"`
-	ResourceManifests      []json.RawMessage   `json:"resource_manifests,omitempty"`
-	PostDeleteAttestation  bool                `json:"post_delete_attestation,omitempty"`
-	ServiceDataBytesAbsent bool                `json:"service_data_bytes_absent,omitempty"`
-	OwnerRecordAbsent      bool                `json:"service_data_owner_record_absent,omitempty"`
-	DeleteAttestRestart    bool                `json:"delete_attest_restart_observed,omitempty"`
-	BindSourcesUntouched   bool                `json:"bind_sources_untouched,omitempty"`
-	ImageCacheRetained     bool                `json:"image_cache_retained,omitempty"`
-	RemovalAssertions      []removalAssertion  `json:"removal_assertions,omitempty"`
+	BlockedBy           int                 `json:"blocked_by,omitempty"`
+	SessionID           string              `json:"session_id"`
+	Command             []string            `json:"command"`
+	ExitCode            int                 `json:"exit_code"`
+	HelperGenerations   []uint64            `json:"helper_generations"`
+	CapabilityRevisions []int64             `json:"capability_revisions"`
+	Inventories         []json.RawMessage   `json:"inventories"`
+	RoundTrip           bool                `json:"round_trip"`
+	DynamicListeners    map[string]bool     `json:"dynamic_listeners"`
+	LaunchUnits         []string            `json:"launch_units,omitempty"`
+	LimaStates          []InstanceState     `json:"lima_states,omitempty"`
+	OCIEnabled          *bool               `json:"oci_enabled,omitempty"`
+	ProcessAvailable    bool                `json:"process_available,omitempty"`
+	SocketMode          string              `json:"socket_mode,omitempty"`
+	SocketOwner         string              `json:"socket_owner,omitempty"`
+	SocketGroup         string              `json:"socket_group,omitempty"`
+	MinimalDoctor       *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
+	AttemptIDs          []string            `json:"attempt_ids"`
+	TopLevelDigests     []string            `json:"top_level_digests"`
+	PlatformDigests     []string            `json:"platform_digests"`
+	PayloadExecutions   int                 `json:"payload_executions"`
+	StdoutMarkers       []string            `json:"stdout_markers"`
+	StderrMarkers       []string            `json:"stderr_markers"`
+	HandoffMarkerBytes  []string            `json:"handoff_marker_bytes"`
+	HandoffAbsent       bool                `json:"handoff_absent_after_completion"`
+	// QuiescenceFaultInjected, QuiescenceLatched and ServiceJobState carry the
+	// service_failed_quiescence outcome. The row keeps its intent -- an
+	// unprovable stop must not be reported as stopped -- while recording what
+	// the injected fault actually produced. A latch and an honest survival are
+	// both real observations; a row whose fault was never injected is neither.
+	QuiescenceFaultInjected bool               `json:"quiescence_fault_injected,omitempty"`
+	QuiescenceLatched       bool               `json:"quiescence_latched,omitempty"`
+	ServiceJobState         string             `json:"service_job_state,omitempty"`
+	ServiceOwners           []string           `json:"service_owners,omitempty"`
+	ServiceAttemptCounts    []int              `json:"service_attempt_counts,omitempty"`
+	GuestNativeData         bool               `json:"guest_native_data,omitempty"`
+	VirtioFSData            *bool              `json:"virtiofs_data,omitempty"`
+	RootfsDiscarded         bool               `json:"rootfs_discarded,omitempty"`
+	RemovalPhase            string             `json:"removal_phase,omitempty"`
+	RemovalPendingObserved  bool               `json:"removal_pending_observed,omitempty"`
+	RemovalCompleted        bool               `json:"removal_completed,omitempty"`
+	RuntimeQuiesced         bool               `json:"runtime_quiesced,omitempty"`
+	ResourceManifests       []json.RawMessage  `json:"resource_manifests,omitempty"`
+	PostDeleteAttestation   bool               `json:"post_delete_attestation,omitempty"`
+	ServiceDataBytesAbsent  bool               `json:"service_data_bytes_absent,omitempty"`
+	OwnerRecordAbsent       bool               `json:"service_data_owner_record_absent,omitempty"`
+	DeleteAttestRestart     bool               `json:"delete_attest_restart_observed,omitempty"`
+	BindSourcesUntouched    bool               `json:"bind_sources_untouched,omitempty"`
+	ImageCacheRetained      bool               `json:"image_cache_retained,omitempty"`
+	RemovalAssertions       []removalAssertion `json:"removal_assertions,omitempty"`
 }
 
 type removalAssertion struct {
@@ -333,6 +341,10 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 			t.Fatalf("row %s lacks generation/revision/inventory transition evidence", name)
 		}
 	}
+	quiescence := artifact.Rows["service_failed_quiescence"]
+	if err := validateFailedQuiescenceRow(quiescence); err != nil {
+		t.Fatalf("failed-quiescence row %+v: %v", quiescence, err)
+	}
 	serviceData := artifact.Rows["service_data_guest_native"]
 	for _, owner := range []string{"0:0", "13001:13002", "12001:12002"} {
 		if !slices.Contains(serviceData.ServiceOwners, owner) {
@@ -440,6 +452,51 @@ func TestServiceAcceptanceAttendedArtifactRejectsMissingServiceRows(t *testing.T
 				t.Fatalf("missing row = %q, want %q", missing, name)
 			}
 			rows[name] = attendedResult{}
+		})
+	}
+}
+
+// validateFailedQuiescenceRow holds the row to the outcome it claims. The
+// injection is mandatory because the row's whole subject is what a real fault
+// produced; the claimed outcome then fixes the Job state the receipt must have
+// observed, so neither a latch nor a survival can be recorded loosely.
+func validateFailedQuiescenceRow(row attendedResult) error {
+	if !row.QuiescenceFaultInjected {
+		return errors.New("row did not inject the quiescence-denying fault")
+	}
+	if row.QuiescenceLatched {
+		if row.ServiceJobState != "failed" {
+			return fmt.Errorf("latched quiescence failure observed job state %q, want failed", row.ServiceJobState)
+		}
+		return nil
+	}
+	if row.ServiceJobState != "stopped" {
+		return fmt.Errorf("unlatched quiescence observed job state %q, want stopped", row.ServiceJobState)
+	}
+	if strings.TrimSpace(row.Reason) == "" {
+		return errors.New("a survived fault must name the fault and what was observed instead")
+	}
+	return nil
+}
+
+func TestServiceAcceptanceFailedQuiescenceRowOutcomes(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		row    attendedResult
+		accept bool
+	}{
+		{name: "latched", row: attendedResult{QuiescenceFaultInjected: true, QuiescenceLatched: true, ServiceJobState: "failed"}, accept: true},
+		{name: "survived", row: attendedResult{QuiescenceFaultInjected: true, ServiceJobState: "stopped", Reason: "framed-log pin survived; stop proved clean"}, accept: true},
+		{name: "no fault", row: attendedResult{QuiescenceLatched: true, ServiceJobState: "failed"}},
+		{name: "latch without failed state", row: attendedResult{QuiescenceFaultInjected: true, QuiescenceLatched: true, ServiceJobState: "stopped"}},
+		{name: "survival without stopped state", row: attendedResult{QuiescenceFaultInjected: true, ServiceJobState: "failed", Reason: "x"}},
+		{name: "survival without reason", row: attendedResult{QuiescenceFaultInjected: true, ServiceJobState: "stopped"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateFailedQuiescenceRow(testCase.row)
+			if testCase.accept != (err == nil) {
+				t.Fatalf("validateFailedQuiescenceRow(%+v) = %v, accept=%t", testCase.row, err, testCase.accept)
+			}
 		})
 	}
 }

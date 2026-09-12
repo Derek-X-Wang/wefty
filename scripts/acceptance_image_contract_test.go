@@ -1387,3 +1387,113 @@ func TestRealtimingDiagnosticShellFailures(t *testing.T) {
 		}
 	}
 }
+
+// TestAcceptanceImageUserVariantsArePublishedAndStayDerivedFromTheEchoImage
+// holds the two image-user variants of the echo service to the same bar as the
+// echo image itself. The Mac/Lima service-data row needs a numeric and a named
+// image user and can only import what this workflow publishes; before they were
+// published they were built inline in /tmp by the Linux realtiming lane and
+// existed nowhere else, which is what left the row unrunnable.
+func TestAcceptanceImageUserVariantsArePublishedAndStayDerivedFromTheEchoImage(t *testing.T) {
+	echo, err := os.ReadFile("../examples/oci-echo-service/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	variants, err := os.ReadFile("../examples/oci-echo-service/Dockerfile.service-users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A variant built from a different toolchain or base root would no longer
+	// differ from the echo image only in its user, and the row would be
+	// comparing service data across two unrelated programs.
+	for _, line := range strings.Split(string(echo), "\n") {
+		if !strings.HasPrefix(line, "ARG GO_IMAGE=") && !strings.HasPrefix(line, "ARG BUSYBOX_IMAGE=") && !strings.HasPrefix(line, "# syntax=") {
+			continue
+		}
+		if !strings.Contains(string(variants), line) {
+			t.Fatalf("image-user variants do not pin the echo image's %q", line)
+		}
+	}
+	buildStage := func(payload []byte) string {
+		text := string(payload)
+		start := strings.Index(text, "FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build")
+		if start < 0 {
+			t.Fatal("Dockerfile has no pinned cross build stage")
+		}
+		rest := text[start:]
+		end := strings.Index(rest, "FROM ${BUSYBOX_IMAGE}")
+		if end < 0 {
+			t.Fatal("Dockerfile has no pinned runtime root")
+		}
+		return strings.TrimSpace(rest[:end])
+	}
+	if buildStage(echo) != buildStage(variants) {
+		t.Fatal("image-user variants build the echo program differently from the echo image")
+	}
+	for _, required := range []string{
+		"FROM service AS numeric", "USER 13001:13002",
+		"FROM service AS named", "wefty:x:12001:12002:", "wefty:x:12002:", "USER wefty:wefty",
+	} {
+		if !strings.Contains(string(variants), required) {
+			t.Fatalf("image-user variants are missing %q", required)
+		}
+	}
+
+	image, _ := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
+	prBuild, _ := readWorkflow(t, "../.github/workflows/acceptance-image-build.yml")
+	// The PR-callable lane runs the same build and the same id/health-check
+	// proof without publishing, so a broken variant Dockerfile fails the pull
+	// request rather than the next push to main.
+	variantSteps := map[string]string{}
+	for name, workflow := range map[string]workflowContract{"publisher": image, "required": prBuild} {
+		for _, step := range workflow.Jobs["reproducible-platform-build"].Steps {
+			if step.Name == "Build and execute the image-user service variants" {
+				variantSteps[name] = step.Run
+			}
+		}
+	}
+	if len(variantSteps) != 2 {
+		t.Fatalf("image-user variant build is present in %d of the two image lanes", len(variantSteps))
+	}
+	for name, build := range variantSteps {
+		for _, required := range []string{
+			"examples/oci-echo-service/Dockerfile.service-users",
+			"--target \"$variant\"",
+			"test \"$observed_owner\" = \"$owner\"",
+			"${ARCH}-user-${variant}.oci.tar",
+			"/healthz",
+		} {
+			if !strings.Contains(build, required) {
+				t.Fatalf("%s image-user variant build does not %q", name, required)
+			}
+		}
+		for _, owner := range []string{"13001:13002", "12001:12002"} {
+			if !strings.Contains(build, owner) {
+				t.Fatalf("%s image-user variant build does not execute owner %s", name, owner)
+			}
+		}
+	}
+	// Only the candidate-commit variable legitimately differs between the two
+	// lanes; anything else drifting means one lane stopped proving what the
+	// other publishes.
+	if strings.ReplaceAll(variantSteps["publisher"], "${GITHUB_SHA}", "${CANDIDATE_SHA}") != variantSteps["required"] {
+		t.Fatal("the PR-callable image-user variant build drifted from the published one")
+	}
+	if strings.Contains(marshalJob(t, prBuild.Jobs["reproducible-platform-build"]), "crane\" push") {
+		t.Fatal("the PR-callable image lane must not publish the image-user variants")
+	}
+	publish := marshalJob(t, image.Jobs["publish"])
+	for _, required := range []string{
+		"${GITHUB_SHA}-user-${variant}",
+		"wefty-echo-service-user-${variant}.oci.tar",
+		"acceptance-image-user-${variant}-index-digest.txt",
+		"service_user_variants",
+	} {
+		if !strings.Contains(publish, required) {
+			t.Fatalf("publisher does not promote the image-user variants with %q", required)
+		}
+	}
+	if strings.Contains(publish, "docker buildx") {
+		t.Fatal("publisher re-solves the image-user variants instead of promoting executed archives")
+	}
+}
