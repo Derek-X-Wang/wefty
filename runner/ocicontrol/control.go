@@ -94,6 +94,29 @@ const RemovalsResponseVersion = 1
 // starts nothing, retries nothing, and changes no phase. A removal disappears
 // from this surface once L1 has acknowledged its cleanup, because that is when
 // the agent releases the record.
+// RemovalQuiescence is the wire projection of the runtime's positive
+// quiescence receipt. The receipt itself is deliberately left untagged: it is
+// the agent's durable spool encoding, and tagging it to suit this operator
+// document would rewrite bytes already on disk. Projecting it here also keeps
+// the control surface's shape its own, so a change to the internal receipt
+// cannot silently reshape what operators and acceptance receipts read.
+type RemovalQuiescence struct {
+	RuntimeQuiesced  bool   `json:"runtime_quiesced"`
+	Evidence         string `json:"evidence,omitempty"`
+	BootSessionID    string `json:"boot_session_id,omitempty"`
+	SweepEpoch       string `json:"sweep_epoch,omitempty"`
+	HelperGeneration uint64 `json:"helper_generation,omitempty"`
+}
+
+// QuiescenceProjection renders a runtime reap receipt on the wire.
+func QuiescenceProjection(receipt workloadrunner.ReapReceipt) RemovalQuiescence {
+	return RemovalQuiescence{
+		RuntimeQuiesced: receipt.RuntimeQuiesced, Evidence: string(receipt.Evidence),
+		BootSessionID: receipt.BootSessionID, SweepEpoch: receipt.SweepEpoch,
+		HelperGeneration: receipt.HelperGeneration,
+	}
+}
+
 type RemovalRecord struct {
 	JobID             string                                    `json:"job_id"`
 	RemovalGeneration uint64                                    `json:"removal_generation"`
@@ -104,7 +127,7 @@ type RemovalRecord struct {
 	QuiescedAt        *time.Time                                `json:"quiesced_at,omitempty"`
 	AttestedAt        *time.Time                                `json:"attested_at,omitempty"`
 	CompletedAt       *time.Time                                `json:"completed_at,omitempty"`
-	RuntimeQuiescence workloadrunner.ReapReceipt                `json:"runtime_quiescence"`
+	RuntimeQuiescence RemovalQuiescence                         `json:"runtime_quiescence"`
 	ResourceManifests []workloadrunner.RuntimeResourceManifest  `json:"resource_manifests"`
 	Attestation       *workloadrunner.RuntimeRemovalAttestation `json:"absence_attestation,omitempty"`
 }

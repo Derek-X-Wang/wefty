@@ -351,18 +351,34 @@ helper refuses that receipt while any resource named in the attempt's frozen
 manifest still exists. Denying exactly one of those resources therefore denies
 the proof without touching the helper session or the namespace. Pin the
 attempt's framed-log directory inside the guest, then request the ordinary
-service stop:
+service stop.
+
+The directory must be the target job's own. Step 8 runs a second service job
+on the same digest, so newest-first guessing can pin a live bystander and latch
+the wrong Job. Every one of the attempt's resource names shares one suffix, and
+the attempt's containerd lease carries the job it belongs to, so derive the
+suffix from that lease rather than from mtime, and require exactly one match:
 
 ```sh
 limactl shell wefty-oci sudo sh -c '
   set -eu
-  dir=$(ls -dt /var/lib/wefty/oci/logs/wefty-log-segments-* | head -1)
+  job=JOB_ID
+  matches=$(ctr --namespace wefty leases list | grep -F "io.wefty/job_id=$job" | wc -l)
+  test "$matches" -eq 1
+  suffix=$(ctr --namespace wefty leases list | grep -F "io.wefty/job_id=$job" \
+    | sed -n "s/^wefty-lease-\([0-9a-f][0-9a-f]*\).*/\1/p")
+  test -n "$suffix"
+  dir="/var/lib/wefty/oci/logs/wefty-log-segments-$suffix"
+  test -d "$dir"
   mkdir -p "$dir/wefty-quiescence-pin"
   mount -t tmpfs -o size=1m none "$dir/wefty-quiescence-pin"
   printf "pinned=%s\n" "$dir"'
 wefty services stop JOB_ID
 wefty services status JOB_ID
 ```
+
+Record the printed `pinned=` path in the row and confirm its suffix matches the
+lease, container, snapshot and cgroup names the target job's attempt is using.
 
 The helper retries deletion for its whole bounded budget, cannot remove the
 pinned directory, and returns a deadline-scoped engine failure. That failure is
@@ -374,15 +390,27 @@ service data to be retained. `oci_runtime_quiescence_failed` belongs to the
 node control surface — it is what `wefty node oci stop` returns when the whole
 runtime cannot be quiesced — and must not be expected as the per-job latch.
 
-Release the fault and remove the residue the denied deletion left behind:
+Release the fault and remove the residue the denied deletion left behind, using
+the same `pinned=` path:
 
 ```sh
 limactl shell wefty-oci sudo sh -c '
   set -eu
-  dir=$(ls -dt /var/lib/wefty/oci/logs/wefty-log-segments-* | head -1)
+  dir=PINNED_PATH
   umount "$dir/wefty-quiescence-pin"
   rm -rf "$dir"'
 ```
+
+Unmounting does not undo the denial. The helper runs its verified-attempt
+release only on a `Delete` that succeeded, so the attempt's helper-side entry,
+its image pin, its capacity reservation, and its durable ownership record all
+stay held after the Job has latched `failed`, and nothing retries the reap
+because the Job is terminal. Expect one service slot and one image pin to
+remain held for the rest of the session. Run this row immediately before
+`helper_loss`, whose helper restart and namespace sweep is what clears the
+leftover attempt; if the session order puts it elsewhere, record the retained
+slot and pin in the row's `inventories` so a later capacity or cache
+observation is not read as a defect.
 
 Record the injected fault, the stop command, its exit code, and the observed
 Job state in the `service_failed_quiescence` row.
@@ -558,7 +586,7 @@ Ticket #150 additionally requires `service_removal_manifest_offline` with
 `resource_manifests` naming the service
 data directory and its owner record independently. `wefty node oci removals`
 is the surface those fields come from: `removal_phase` is the record's `phase`,
-`runtime_quiesced` is `runtime_quiescence.RuntimeQuiesced`, and
+`runtime_quiesced` is `.runtime_quiescence.runtime_quiesced`, and
 `resource_manifests` is the record's `resource_manifests` array copied
 verbatim. Hosted macOS runners are
 `NOT-RUN`; they do not satisfy this owner-hardware row.

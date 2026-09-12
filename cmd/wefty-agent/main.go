@@ -697,8 +697,9 @@ func run() error {
 						CleanupFence: view.CleanupFence, RootInstanceID: view.RootInstanceID,
 						Phase: view.Phase, PreparedAt: view.PreparedAt, QuiescedAt: view.QuiescedAt,
 						AttestedAt: view.AttestedAt, CompletedAt: view.CompletedAt,
-						RuntimeQuiescence: view.Quiescence, ResourceManifests: view.ResourceManifests,
-						Attestation: view.Attestation,
+						RuntimeQuiescence: ocicontrol.QuiescenceProjection(view.Quiescence),
+						ResourceManifests: view.ResourceManifests,
+						Attestation:       view.Attestation,
 					})
 				}
 				return response, nil
