@@ -96,8 +96,10 @@ type HelperDoctorFacts struct {
 	SessionGeneration       uint64            `json:"session_generation,omitempty"`
 	HandshakeStalledWindows uint64            `json:"handshake_stalled_windows"`
 	// StartupBound is the connected helper generation's report of its own
-	// consecutive-startup-barrier-failure bound.
-	StartupBound ocihelper.StartupBoundFacts `json:"startup_bound"`
+	// consecutive-startup-barrier-failure bound, with the handshake time it
+	// was read at: a bound is a fact about one reading, not a standing state.
+	StartupBound           ocihelper.StartupBoundFacts `json:"startup_bound"`
+	StartupBoundObservedAt *time.Time                  `json:"startup_bound_observed_at,omitempty"`
 }
 
 type VersionFacts struct {
@@ -280,7 +282,7 @@ type DoctorConfig struct {
 	// last handshake. It is a barrier-side read on purpose: a helper that
 	// refuses admission because the bound tripped never serves a diagnostic
 	// session, so the handshake is the only place the fact survives.
-	HelperStartupBound         func() ocihelper.StartupBoundFacts
+	HelperStartupBound         func() ocihelper.StartupBoundObservation
 	SetupStatePath             string
 	ReadSetupState             func(string) (SetupState, error)
 	DesiredSetupStatePath      string
@@ -403,19 +405,22 @@ func buildHelperStartupBound(config DoctorConfig, report *DoctorResponse) {
 		}))
 		return
 	}
-	bound := config.HelperStartupBound()
+	observation := config.HelperStartupBound()
+	bound := observation.Facts
 	report.Helper.StartupBound = bound
 	if !bound.Tripped {
 		report.Findings = append(report.Findings, finding("helper-startup-bound", diagnosticReceipt{
 			ran: true, passed: true, code: "oci_helper_startup_bound_clear",
-			detail: "the helper reported no tripped startup-failure bound",
+			detail: "the last helper handshake reported no tripped startup-failure bound",
 		}))
 		return
 	}
+	observedAt := observation.ObservedAt.UTC().Round(0)
+	report.Helper.StartupBoundObservedAt = &observedAt
 	report.Findings = append(report.Findings, finding("helper-startup-bound", diagnosticReceipt{
 		ran: true, code: "oci_helper_startup_bound_tripped", reasonCode: contract.CapabilityReasonBootSweepFailed,
-		detail: fmt.Sprintf("the helper startup barrier failed %d consecutive times over %s in phase %s (bound %d); this helper generation refuses to sweep and admits no session until it is repaired",
-			bound.Consecutive, bound.Elapsed, bound.Phase, bound.Bound),
+		detail: fmt.Sprintf("as of the handshake at %s the helper startup barrier had failed %d consecutive times over %s in phase %s (bound %d); it admits no session and re-attempts the barrier at %s",
+			observedAt.Format(time.RFC3339), bound.Consecutive, bound.Elapsed, bound.Phase, bound.Bound, bound.NextAttemptAt.UTC().Format(time.RFC3339)),
 	}))
 }
 
@@ -587,7 +592,7 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		Outcome: outcomeFor(true, validHandshake), ProtocolVersion: snapshot.ProtocolVersion,
 		Version: snapshot.Version, Checksum: snapshot.Checksum, InstanceID: snapshot.InstanceID,
 		SessionGeneration: snapshot.SessionGeneration, HandshakeStalledWindows: report.Helper.HandshakeStalledWindows,
-		StartupBound: report.Helper.StartupBound,
+		StartupBound: report.Helper.StartupBound, StartupBoundObservedAt: report.Helper.StartupBoundObservedAt,
 	}
 	report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{ran: true, passed: validHandshake, code: code, reasonCode: reason, detail: "the existing authenticated helper handshake was read; no session was acquired"}))
 	if !validHandshake {

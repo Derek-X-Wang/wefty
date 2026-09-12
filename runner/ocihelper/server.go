@@ -267,16 +267,13 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	// fresh generation on every connection, so a generation that sweeps first
 	// and consults the bound afterwards re-runs the denied sweep on every
 	// relaunch -- 81 of them in 63 seconds on hardware (#419). A tripped bound
-	// therefore means: sweep nothing, keep serving, refuse every acquisition
-	// with the typed code. Holding the listener is what stops the relaunches;
-	// the process must not fail.
+	// therefore means: keep serving, refuse every acquisition with the typed
+	// code, and re-attempt the barrier no more than once per window. Holding
+	// the listener is what stops the relaunches; the process must not fail.
 	if tripped := server.startupBoundTripped(); tripped != nil {
-		server.config.Logf("OCI helper startup barrier bound already tripped phase=%s consecutive=%d bound=%d elapsed=%s; serving typed refusals without a startup sweep",
-			tripped.Facts.Phase, tripped.Facts.Consecutive, tripped.Facts.Bound, tripped.Facts.Elapsed)
-		server.sessionMu.Lock()
-		server.startupErr = tripped
-		close(server.startupDone)
-		server.sessionMu.Unlock()
+		server.config.Logf("OCI helper startup barrier bound tripped phase=%s consecutive=%d bound=%d elapsed=%s; refusing sessions and re-attempting the barrier no more than once per %s",
+			tripped.Facts.Phase, tripped.Facts.Consecutive, tripped.Facts.Bound, tripped.Facts.Elapsed, server.startupFailureWindow())
+		server.superviseTrippedStartupBound(ctx, tripped)
 	} else {
 		server.startStartupBarrier(ctx)
 	}
@@ -338,6 +335,58 @@ func (server *Server) startStartupBarrier(ctx context.Context) {
 		server.sessionMu.Unlock()
 		if err != nil {
 			server.fail(err)
+		}
+	}()
+}
+
+// superviseTrippedStartupBound serves a generation that inherited a tripped
+// bound. It never fails the process -- the live listener is what keeps socket
+// activation from starting another generation -- and it re-attempts the barrier
+// at most once per startup-failure window until one succeeds. That budget is
+// the same on a Lima guest and a native Linux node, and on a native node it is
+// the only thing that recovers a cleared denial: nothing there restarts the
+// helper unit for us.
+func (server *Server) superviseTrippedStartupBound(ctx context.Context, tripped *StartupBoundTrippedError) {
+	go func() {
+		published := false
+		publish := func(err error) {
+			server.sessionMu.Lock()
+			server.startupErr = err
+			if !published {
+				published = true
+				close(server.startupDone)
+			}
+			server.sessionMu.Unlock()
+		}
+		refusal := tripped
+		for {
+			// A window that has already elapsed asks for its sweep now. Until
+			// that first attempt resolves, callers wait on the ordinary startup
+			// barrier rather than being refused by a helper about to recover.
+			if server.config.Clock.Now().Before(refusal.Facts.NextAttemptAt) {
+				publish(refusal)
+				timer := server.config.Clock.NewTimerAt(refusal.Facts.NextAttemptAt)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C():
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			err := server.sweepAndVerifyStartup(ctx)
+			if err == nil {
+				server.clearStartupBarrierFailures()
+				server.config.Logf("OCI helper startup barrier succeeded after a tripped bound; admitting sessions again")
+				publish(nil)
+				return
+			}
+			refusal = server.refusalAfterTrippedBarrier(refusal.Facts, err)
+			server.config.Logf("OCI helper re-armed startup barrier failed again phase=%s consecutive=%d bound=%d; still refusing",
+				refusal.Facts.Phase, refusal.Facts.Consecutive, refusal.Facts.Bound)
+			publish(refusal)
 		}
 	}()
 }

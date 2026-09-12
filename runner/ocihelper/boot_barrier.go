@@ -248,10 +248,19 @@ type BootBarrier struct {
 	stalledWindows  uint64
 	lastLossAt      time.Time
 	// startupBound is the last helper handshake's report of its own
-	// startup-barrier bound. It is the only surface on which a tripped bound
-	// is observable, because a helper that refuses admission never serves a
-	// diagnostic session.
-	startupBound StartupBoundFacts
+	// startup-barrier bound, with the time it was read. It is the only surface
+	// on which a tripped bound is observable, because a helper that refuses
+	// admission never serves a diagnostic session -- so it must also be
+	// discarded the moment it stops being an observation of a live helper,
+	// rather than left for the doctor to report about a helper since repaired.
+	startupBound StartupBoundObservation
+}
+
+// StartupBoundObservation is one reading of a helper generation's
+// startup-barrier bound, and when it was taken.
+type StartupBoundObservation struct {
+	Facts      StartupBoundFacts
+	ObservedAt time.Time
 }
 
 func NewBootBarrier(client *Client, request AcquireSessionRequest) (*BootBarrier, error) {
@@ -490,12 +499,13 @@ func (barrier *BootBarrier) CapabilityReasonCode() contract.CapabilityReasonCode
 }
 
 // StartupBound reports the helper's own startup-barrier bound as the last
-// handshake described it. A tripped bound means the connected helper generation
-// refused to run a startup sweep and is serving typed refusals until it is
-// repaired; the node doctor names it.
-func (barrier *BootBarrier) StartupBound() StartupBoundFacts {
+// handshake described it, and when that handshake happened. A tripped bound
+// means the connected helper generation is refusing sessions and retrying its
+// barrier once per window; the node doctor names it with this observation time,
+// because a bound read from a helper is only ever a fact about that reading.
+func (barrier *BootBarrier) StartupBound() StartupBoundObservation {
 	if barrier == nil {
-		return StartupBoundFacts{}
+		return StartupBoundObservation{}
 	}
 	barrier.mu.RLock()
 	defer barrier.mu.RUnlock()
@@ -515,10 +525,15 @@ func (barrier *BootBarrier) HandshakeStalledWindows() uint64 {
 
 func (barrier *BootBarrier) recordCapabilityReason(err error) {
 	reason := contract.CapabilityReasonCode("")
+	// A bound read from a helper describes that helper generation only. A
+	// barrier that succeeded, or one that proved no helper answered at all,
+	// leaves nothing for a stale tripped reading to describe.
+	forget := err == nil
 	if err != nil {
 		var unavailable *HelperUnitUnavailableError
 		if errors.As(err, &unavailable) {
 			reason = contract.CapabilityReasonHelperUnitUnavailable
+			forget = true
 		} else if errors.As(err, new(*HelperHandshakeStalledError)) {
 			reason = contract.CapabilityReasonHelperHandshakeStalled
 		} else {
@@ -531,6 +546,9 @@ func (barrier *BootBarrier) recordCapabilityReason(err error) {
 		barrier.stalledWindows++
 	} else {
 		barrier.stalledWindows = 0
+	}
+	if forget {
+		barrier.startupBound = StartupBoundObservation{}
 	}
 	barrier.mu.Unlock()
 }
@@ -576,7 +594,7 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context, takeoverSt
 			handshakeCompleted = true
 			attemptHandshakeElapsed = time.Since(takeoverStarted)
 			barrier.mu.Lock()
-			barrier.startupBound = handshake.StartupBound
+			barrier.startupBound = StartupBoundObservation{Facts: handshake.StartupBound, ObservedAt: barrier.config.Clock.Now().UTC()}
 			barrier.mu.Unlock()
 			if advertisedReapTimeout == 0 {
 				advertisedReapTimeout = handshake.ReapTimeout

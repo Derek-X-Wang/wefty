@@ -55,22 +55,25 @@ func (err *StartupWedgedError) Unwrap() error { return err.Err }
 // in RestartPreventExitStatus.
 func (err *StartupWedgedError) ExitStatus() int { return systemdpolicy.StartupWedgedExitStatus }
 
-// StartupBoundTrippedError is the refusal a generation that starts while the
-// bound is already tripped returns instead of running the startup sweep again.
+// StartupBoundTrippedError is the refusal a generation serves while the bound
+// is tripped, in place of the startup sweep it did not run.
 //
 // RestartPreventExitStatus stops systemd's own restarts, but the helper is
 // socket-activated: every fresh connection starts another generation, and on
 // hardware that reran the denied sweep 81 times in 63 seconds (#419). A
-// generation that finds the bound tripped therefore sweeps nothing, keeps
-// serving, and answers every connection with this typed refusal -- so the
-// socket has a live listener and systemd activates nothing further.
+// generation that inherits a tripped bound therefore keeps serving and refuses
+// -- the live listener is what keeps systemd from activating another one --
+// and re-attempts the barrier at most once per startup-failure window. One
+// sweep per window per node is the whole post-trip budget, and a node whose
+// denial is cleared recovers on its own, which matters most where nothing
+// restarts the unit for us.
 type StartupBoundTrippedError struct {
 	Facts StartupBoundFacts
 }
 
 func (err *StartupBoundTrippedError) Error() string {
-	return fmt.Sprintf("%s: OCI helper startup barrier already failed %d consecutive times over %s (bound %d, phase %s); this generation refuses to sweep and serves refusals until the helper is repaired",
-		CodeStartupBoundTripped, err.Facts.Consecutive, err.Facts.Elapsed, err.Facts.Bound, err.Facts.Phase)
+	return fmt.Sprintf("%s: OCI helper startup barrier failed %d consecutive times over %s (bound %d, phase %s); refusing until a barrier succeeds, next attempt at %s",
+		CodeStartupBoundTripped, err.Facts.Consecutive, err.Facts.Elapsed, err.Facts.Bound, err.Facts.Phase, err.Facts.NextAttemptAt.Format(time.RFC3339))
 }
 
 // Code is the typed protocol refusal this failure becomes on the wire.
@@ -145,20 +148,19 @@ func (server *Server) recordStartupBarrierFailure(err error) error {
 	return &StartupWedgedError{Phase: barrier.Phase, Consecutive: ledger.Consecutive, Bound: bound, Elapsed: elapsed, Err: err}
 }
 
-// startupBoundTripped reports the already-tripped bound this generation must
-// honour without sweeping, or nil to run the ordinary startup barrier.
+// startupBoundTripped reports the tripped bound this generation inherits, or
+// nil to run the ordinary startup barrier.
 //
-// The ledger must carry the trip the previous generation declared, and the
-// streak must still be live: a last update older than the window is a stale
-// wedge from an earlier incident, not today's. An unreadable or unparseable
-// ledger is never converted into a refusal to serve, for the same reason an
-// unwritable one never manufactures a wedge.
+// The ledger is never consumed here: only a barrier that succeeds clears it.
+// Consuming it would hand the bound to one process's memory, and on a native
+// Linux node nothing restarts that process -- no Lima repair exists there and
+// `wefty node oci start` reaches the same refusing helper -- so a node whose
+// denial had been cleared would stay refused until a human restarted the unit.
+// The next attempt is therefore scheduled from the last failure, and a ledger
+// whose window has already elapsed asks for a sweep immediately.
 //
-// A tripped ledger is consumed. This generation now holds the bound in memory
-// for as long as it lives, and it lives until something restarts the unit --
-// which socket activation cannot do while the listener is held, so only a
-// repair can. Leaving the file behind would make that repair's generation
-// refuse too.
+// An unreadable or unparseable ledger is never converted into a refusal to
+// serve, for the same reason an unwritable one never manufactures a wedge.
 func (server *Server) startupBoundTripped() *StartupBoundTrippedError {
 	if server.config.StartupFailureStateDirectory == "" {
 		return nil
@@ -169,21 +171,32 @@ func (server *Server) startupBoundTripped() *StartupBoundTrippedError {
 		return nil
 	}
 	var ledger startupFailureLedger
-	if json.Unmarshal(payload, &ledger) != nil || ledger.Version != startupFailureLedgerVersion || !ledger.Tripped {
+	if json.Unmarshal(payload, &ledger) != nil || ledger.Version != startupFailureLedgerVersion ||
+		!ledger.Tripped || ledger.UpdatedAt.IsZero() {
 		return nil
-	}
-	now := server.config.Clock.Now().UTC()
-	window := server.startupFailureWindow()
-	if ledger.UpdatedAt.IsZero() || now.Sub(ledger.UpdatedAt) > window {
-		return nil
-	}
-	if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-		server.config.Logf("OCI helper startup barrier ledger could not be consumed by the refusing generation")
 	}
 	return &StartupBoundTrippedError{Facts: StartupBoundFacts{
 		Tripped: true, Phase: ledger.Phase, Consecutive: ledger.Consecutive,
 		Bound: server.startupFailureBound(), Elapsed: ledger.UpdatedAt.Sub(ledger.FirstAt),
+		NextAttemptAt: ledger.UpdatedAt.Add(server.startupFailureWindow()),
 	}}
+}
+
+// refusalAfterTrippedBarrier records a re-armed attempt that failed again and
+// returns the refusal to publish until the next window. The count keeps growing
+// and the ledger stays tripped, so a generation that is replaced mid-refusal
+// inherits the same one-sweep-per-window budget instead of starting over.
+func (server *Server) refusalAfterTrippedBarrier(previous StartupBoundFacts, err error) *StartupBoundTrippedError {
+	facts := previous
+	var wedged *StartupWedgedError
+	if errors.As(server.recordStartupBarrierFailure(err), &wedged) {
+		facts.Phase, facts.Consecutive, facts.Bound, facts.Elapsed = wedged.Phase, wedged.Consecutive, wedged.Bound, wedged.Elapsed
+	}
+	// An unusable ledger loses the count, never the refusal or the re-arm: the
+	// helper must not relaunch-loop, and it must not refuse forever either.
+	facts.Tripped = true
+	facts.NextAttemptAt = server.config.Clock.Now().UTC().Add(server.startupFailureWindow())
+	return &StartupBoundTrippedError{Facts: facts}
 }
 
 // clearStartupBarrierFailures resets the count after a barrier that succeeded.

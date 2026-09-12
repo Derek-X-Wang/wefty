@@ -85,7 +85,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 			return "[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
 		},
 		HelperHandshakeStalledWindows: func() uint64 { return 0 },
-		HelperStartupBound:            func() ocihelper.StartupBoundFacts { return ocihelper.StartupBoundFacts{} },
+		HelperStartupBound:            func() ocihelper.StartupBoundObservation { return ocihelper.StartupBoundObservation{} },
 	}
 }
 
@@ -284,9 +284,14 @@ func TestDoctorReportsNonzeroNativeHelperHandshakeStallCount(t *testing.T) {
 // unreachable when it is in fact refusing on purpose (#419).
 func TestDoctorNamesATrippedHelperStartupBound(t *testing.T) {
 	config := healthyDoctorConfig(time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC), "")
-	config.HelperStartupBound = func() ocihelper.StartupBoundFacts {
-		return ocihelper.StartupBoundFacts{
-			Tripped: true, Phase: ocihelper.StartupBarrierSweep, Consecutive: 5, Bound: 5, Elapsed: 63 * time.Second,
+	observedAt := time.Date(2026, 9, 11, 11, 59, 0, 0, time.UTC)
+	config.HelperStartupBound = func() ocihelper.StartupBoundObservation {
+		return ocihelper.StartupBoundObservation{
+			Facts: ocihelper.StartupBoundFacts{
+				Tripped: true, Phase: ocihelper.StartupBarrierSweep, Consecutive: 5, Bound: 5,
+				Elapsed: 63 * time.Second, NextAttemptAt: observedAt.Add(time.Minute),
+			},
+			ObservedAt: observedAt,
 		}
 	}
 	report := BuildDoctor(t.Context(), config)
@@ -301,8 +306,13 @@ func TestDoctorNamesATrippedHelperStartupBound(t *testing.T) {
 	}
 	item := report.Findings[index]
 	if item.Code != "oci_helper_startup_bound_tripped" || item.Outcome != DiagnosticFailed ||
-		item.ReasonCode != contract.CapabilityReasonBootSweepFailed || !strings.Contains(item.Detail, "startup_sweep") {
+		item.ReasonCode != contract.CapabilityReasonBootSweepFailed || !strings.Contains(item.Detail, "startup_sweep") ||
+		!strings.Contains(item.Detail, observedAt.Format(time.RFC3339)) ||
+		!strings.Contains(item.Detail, observedAt.Add(time.Minute).Format(time.RFC3339)) {
 		t.Fatalf("tripped bound finding = %+v", item)
+	}
+	if report.Helper.StartupBoundObservedAt == nil || !report.Helper.StartupBoundObservedAt.Equal(observedAt) {
+		t.Fatalf("observation time = %v, want %v", report.Helper.StartupBoundObservedAt, observedAt)
 	}
 	if err := report.Validate(); err != nil {
 		t.Fatalf("a report naming the tripped bound failed validation: %v", err)

@@ -648,7 +648,7 @@ func run() error {
 					limaFacts = limaSupervisor.Facts
 				}
 				var stalledWindows func() uint64
-				var startupBound func() ocihelper.StartupBoundFacts
+				var startupBound func() ocihelper.StartupBoundObservation
 				if bootBarrier != nil {
 					stalledWindows = bootBarrier.HandshakeStalledWindows
 					startupBound = bootBarrier.StartupBound

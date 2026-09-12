@@ -287,6 +287,11 @@ type StartupBoundFacts struct {
 	Consecutive int                 `json:"consecutive,omitempty"`
 	Bound       int                 `json:"bound,omitempty"`
 	Elapsed     time.Duration       `json:"elapsed,omitempty"`
+	// NextAttemptAt is when the refusing generation re-attempts the barrier.
+	// A tripped helper retries on its own at most once per startup-failure
+	// window, so a caller can tell a helper that is waiting to recover from
+	// one that needs a human.
+	NextAttemptAt time.Time `json:"next_attempt_at,omitzero"`
 }
 
 // HelperSession identifies one opaque helper process/session generation
