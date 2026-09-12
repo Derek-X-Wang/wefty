@@ -196,7 +196,7 @@ func TestControlSocketForcesCloseAfterGracefulDrainBudget(t *testing.T) {
 	handlerEntered := make(chan struct{})
 	releaseHandler := make(chan struct{})
 	defer close(releaseHandler)
-	server, err := NewServer(socket, ServiceFuncs{LoadImageFunc: func(context.Context, io.Reader) (LoadImageResponse, error) {
+	server, err := NewServer(socket, ServiceFuncs{LoadImageFunc: func(context.Context, LoadImageRequest, io.Reader) (LoadImageResponse, error) {
 		close(handlerEntered)
 		<-releaseHandler
 		return LoadImageResponse{}, nil
@@ -219,7 +219,7 @@ func TestControlSocketForcesCloseAfterGracefulDrainBudget(t *testing.T) {
 	defer client.Close()
 	loadDone := make(chan error, 1)
 	go func() {
-		_, err := client.LoadImage(context.Background(), archive)
+		_, err := client.LoadImage(context.Background(), archive, LoadImageRequest{})
 		loadDone <- err
 	}()
 	select {
@@ -311,5 +311,71 @@ func runControlChild(t *testing.T) {
 	}
 	if err := server.Serve(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The archive is the request body, so the operator's explicit import name is
+// the one field that has to travel beside it. It reaches the service verbatim,
+// and an unknown parameter is refused rather than ignored -- the same contract
+// the JSON requests hold by refusing unknown fields.
+func TestControlSocketCarriesTheExplicitImportReference(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "wefty-control-reference-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	socket := filepath.Join(root, "control.sock")
+	archive := filepath.Join(root, "image.tar")
+	if err := os.WriteFile(archive, []byte("archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var observed string
+	server, err := NewServer(socket, ServiceFuncs{LoadImageFunc: func(_ context.Context, request LoadImageRequest, body io.Reader) (LoadImageResponse, error) {
+		payload, readErr := io.ReadAll(body)
+		observed = request.Reference
+		if readErr != nil || string(payload) != "archive" {
+			return LoadImageResponse{}, fmt.Errorf("archive body=%q err=%w", payload, readErr)
+		}
+		return LoadImageResponse{TopLevelDigest: "sha256:" + strings.Repeat("a", 64)}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ctx) }()
+	waitForControlSocket(t, socket)
+	client, err := NewClient(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	const reference = "ghcr.io/derek-x-wang/wefty-echo-service:candidate-user-numeric"
+	response, err := client.LoadImage(ctx, archive, LoadImageRequest{Reference: reference})
+	if err != nil || response.TopLevelDigest == "" || observed != reference {
+		t.Fatalf("named load-image response=%+v observed=%q err=%v", response, observed, err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://wefty.local/v1/images/load?unknown=1", strings.NewReader("archive"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/vnd.oci.image.layer.v1.tar")
+	result, err := client.http.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Body.Close()
+	if result.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown load-image parameter status=%d", result.StatusCode)
+	}
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve remained blocked")
 	}
 }

@@ -281,6 +281,21 @@ jobs:
             layout="$RUNNER_TEMP/wefty-echo-service-user-${variant}.oci"
             archive="$release/wefty-echo-service-user-${variant}.oci.tar"
             "$crane" pull "$IMAGE_NAME@$index_digest" "$layout" --format=oci --annotate-ref
+            # crane annotates the pulled reference, which is digest-only and so
+            # names nothing an offline import can key by: every variant of this
+            # repository would arrive under one name and collide (#418). Write
+            # the published tag the runbook already tells the operator to expect,
+            # over the digest-selected bytes this step just verified.
+            archive_reference="$IMAGE_NAME:${GITHUB_SHA}-user-${variant}"
+            jq --arg reference "$archive_reference" \
+              '.manifests |= map(.annotations["org.opencontainers.image.ref.name"] = $reference)' \
+              "$layout/index.json" > "$layout/index.json.next"
+            mv "$layout/index.json.next" "$layout/index.json"
+            jq -e --arg reference "$archive_reference" --arg digest "$index_digest" \
+              '(.manifests | length) == 1 and .manifests[0].digest == $digest
+               and .manifests[0].annotations["org.opencontainers.image.ref.name"] == $reference
+               and (.manifests[0].annotations["io.containerd.image.name"] // "") == ""' \
+              "$layout/index.json"
             tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$layout" -cf "$archive" .
             scripts/verify-acceptance-image.sh --archive "$archive" --expected-top-digest "$index_digest" \
               --expected-platform linux/amd64 --expected-platform linux/arm64 \

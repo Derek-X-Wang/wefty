@@ -106,7 +106,22 @@ The owner-ratified cache ceiling is 16 GiB. Operation leases, live attempts, dur
 
 ```sh
 wefty node load-image FILE
+wefty node load-image FILE --reference REFERENCE
 ```
+
+The import is keyed by the name the archive itself carries, and that name is
+never invented. An archive annotating `repository:tag` is imported under that
+tag; one annotating only `repository@sha256:…` is imported under that digest;
+only a bare repository takes `:latest`. Two archives exported from one
+repository therefore never collide, and an archive whose name already
+identifies different bytes is refused as `manifest_rejected` rather than
+silently rebound.
+
+Use `--reference` when the export left the archive ambiguous: it carries no
+reference at all, or only a digest and you want a readable name. The override
+may retag such an archive but not re-home it, so it must stay inside the
+repository the archive names; an archive that already carries a tag is named
+by its exporter, and a `--reference` that disagrees is refused.
 
 For the acceptance artifact, set `FILE="$ACCEPTANCE_RELEASE/wefty-echo-service.oci.tar"`. The command
 must print the same top-level digest as

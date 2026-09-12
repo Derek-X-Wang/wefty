@@ -77,7 +77,7 @@ func TestInspectOCIArchiveRejectsRecomputedDigestMismatch(t *testing.T) {
 	}
 }
 
-func TestInspectOCIArchiveNormalizesDigestExportAnnotationToProvenanceName(t *testing.T) {
+func TestInspectOCIArchiveNamesDigestExportFromTheRequestedReference(t *testing.T) {
 	archive, topDigest, _ := testOCIArchive(t, false, true)
 	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:latest", topDigest.String())
 	if err != nil {
@@ -85,7 +85,77 @@ func TestInspectOCIArchiveNormalizesDigestExportAnnotationToProvenanceName(t *te
 	}
 	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
 	if inspection.Reference != "example.invalid/wefty:latest" {
-		t.Fatalf("normalized archive reference = %q", inspection.Reference)
+		t.Fatalf("requested archive reference = %q", inspection.Reference)
+	}
+}
+
+// A digest-only export names no artifact, so the import keeps the one identity
+// it does carry rather than inventing ":latest" for it. Inventing that name is
+// what made two variants of one repository collide (#418).
+func TestInspectOCIArchiveKeepsDigestExportIdentityWithoutARequestedName(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, true)
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.Reference != "example.invalid/wefty@"+topDigest.String() {
+		t.Fatalf("digest-export archive reference = %q", inspection.Reference)
+	}
+}
+
+// The published image-user echo variants are digest-only exports of one
+// repository. Keying them by a shared invented name made the second import
+// collide with the first and rejected the offline artifacts outright (#418).
+func TestInspectOCIArchiveKeysColocatedDigestExportsByDistinctNames(t *testing.T) {
+	numeric, numericDigest, _ := testOCIArchiveForImageUser(t, false, true, "13001:13002")
+	named, namedDigest, _ := testOCIArchiveForImageUser(t, false, true, "12001:12002")
+	if numericDigest == namedDigest {
+		t.Fatal("image-user variants produced one archive digest")
+	}
+	numericInspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(numeric), "", numericDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(numericInspection.Path) })
+	namedInspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(named), "", namedDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(namedInspection.Path) })
+	if numericInspection.Reference == namedInspection.Reference {
+		t.Fatalf("two image-user variants share the import name %q", numericInspection.Reference)
+	}
+	for _, inspection := range []ociArchiveInspection{numericInspection, namedInspection} {
+		if inspection.Reference != "example.invalid/wefty@"+inspection.TopLevel.Digest.String() {
+			t.Fatalf("variant archive reference = %q for %s", inspection.Reference, inspection.TopLevel.Digest)
+		}
+	}
+}
+
+// An explicit reference names what the export left ambiguous; it may retag a
+// digest-only archive but never move it to another repository.
+func TestInspectOCIArchiveRefusesARequestedNameOutsideTheArchiveRepository(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, true)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/other:user-numeric", topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "different repository") {
+		t.Fatalf("cross-repository requested reference error = %v", err)
+	}
+}
+
+func TestInspectOCIArchiveRefusesARequestedNameAgainstATaggedExport(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, false)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:user-numeric", topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "does not match the requested reference") {
+		t.Fatalf("tagged-export rename error = %v", err)
+	}
+}
+
+func TestInspectOCIArchiveRefusesADigestedRequestedReference(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, true)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty@"+topDigest.String(), topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "must not contain a digest") {
+		t.Fatalf("digested requested reference error = %v", err)
 	}
 }
 
@@ -243,7 +313,18 @@ func testMultiPlatformOCIArchive(t *testing.T) ([]byte, digest.Digest, digest.Di
 
 func testOCIArchive(t *testing.T, corruptConfig, digestedReference bool) ([]byte, digest.Digest, digest.Digest) {
 	t.Helper()
-	config, err := json.Marshal(ocispec.Image{Platform: ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}})
+	return testOCIArchiveForImageUser(t, corruptConfig, digestedReference, "")
+}
+
+// testOCIArchiveForImageUser builds the same archive under a different image
+// user, which is exactly how the published echo variants differ: one
+// repository, one platform, distinct bytes and therefore distinct digests.
+func testOCIArchiveForImageUser(t *testing.T, corruptConfig, digestedReference bool, imageUser string) ([]byte, digest.Digest, digest.Digest) {
+	t.Helper()
+	config, err := json.Marshal(ocispec.Image{
+		Platform: ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH},
+		Config:   ocispec.ImageConfig{User: imageUser},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

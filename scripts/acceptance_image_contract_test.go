@@ -528,8 +528,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "wefty-computer-conformance", "--repair-image", "GPU-free Wayland")
 	assertFileContains(t, "../docs/guides/computer-images.md", "docker buildx create", "tonistiigi/binfmt@sha256:", "--input-oracle-path", "NOT-RUN", "operator-owned")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t", "activeReadinessBudget := activeRequest.InitialDeadman", "time.NewTimer(activeReadinessBudget)")
-	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
-	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
+	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt", "--reference", "keyed by the name the archive itself carries")
+	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds", "carries its own published tag")
 }
 
 func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
@@ -1488,6 +1488,11 @@ func TestAcceptanceImageUserVariantsArePublishedAndStayDerivedFromTheEchoImage(t
 		"wefty-echo-service-user-${variant}.oci.tar",
 		"acceptance-image-user-${variant}-index-digest.txt",
 		"service_user_variants",
+		// Each exported variant archive must name itself with its own
+		// published tag. Shipping them all under crane's digest-only pull
+		// reference is what made offline import reject them (#418).
+		"archive_reference=\"$IMAGE_NAME:${GITHUB_SHA}-user-${variant}\"",
+		"org.opencontainers.image.ref.name",
 	} {
 		if !strings.Contains(publish, required) {
 			t.Fatalf("publisher does not promote the image-user variants with %q", required)

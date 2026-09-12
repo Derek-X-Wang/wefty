@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -15,7 +16,7 @@ import (
 
 func executeLocalNode(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci start|stop|removals | wefty node load-image FILE")
+		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci start|stop|removals | wefty node load-image FILE [--reference REFERENCE]")
 	}
 	if handled, err := maybeExecutePrivilegedLinuxSetup(ctx, options, args, stdout, stderr); handled {
 		return err
@@ -44,7 +45,7 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 	case "oci":
 		return executeLocalOCIIntent(ctx, client, options.jsonOutput, args[1:], stdout)
 	case "load-image":
-		return executeLocalLoadImage(ctx, client, options.jsonOutput, args[1:], stdout)
+		return executeLocalLoadImage(ctx, client, options.jsonOutput, args[1:], stdout, stderr)
 	default:
 		return usageError(fmt.Sprintf("unknown singular node command %q", args[0]))
 	}
@@ -163,11 +164,21 @@ func executeLocalOCIRemovals(ctx context.Context, client *ocicontrol.Client, jso
 	return nil
 }
 
-func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return usageError("usage: wefty node load-image FILE")
+func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
+	args = moveFirstPositionalToEnd(args)
+	flags := flag.NewFlagSet("node load-image", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	// An archive exported by digest alone carries no name the import can be
+	// keyed by. Naming it here is what lets two variants of one repository be
+	// imported offline side by side instead of colliding (#418).
+	reference := flags.String("reference", "", "import name for an archive that annotates no reference or only a digest")
+	if err := flags.Parse(args); err != nil {
+		return usageError(err.Error())
 	}
-	path, err := filepath.Abs(args[0])
+	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
+		return usageError("usage: wefty node load-image FILE [--reference REFERENCE]")
+	}
+	path, err := filepath.Abs(flags.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -178,7 +189,7 @@ func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonO
 	if !info.Mode().IsRegular() {
 		return errors.New("OCI image archive must be a regular file")
 	}
-	response, err := client.LoadImage(ctx, path)
+	response, err := client.LoadImage(ctx, path, ocicontrol.LoadImageRequest{Reference: strings.TrimSpace(*reference)})
 	if err != nil {
 		return err
 	}

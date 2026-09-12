@@ -210,28 +210,15 @@ func inspectOCIArchiveWithSpoolForPlatform(ctx context.Context, runtimeRoot stri
 	// annotation and may put only a short tag (for example "latest") in the
 	// OCI ref-name annotation. Match containerd import precedence so the
 	// provenance comparison cannot reinterpret that tag as a Docker Hub name.
-	reference := top.Annotations[images.AnnotationImageName]
-	if reference == "" {
-		reference = top.Annotations[ocispec.AnnotationRefName]
+	// resolveArchiveReference then keys the import by the identity that
+	// annotation actually carries; it does not invent one.
+	annotated := top.Annotations[images.AnnotationImageName]
+	if annotated == "" {
+		annotated = top.Annotations[ocispec.AnnotationRefName]
 	}
-	if reference != "" {
-		reference, err = normalizeArchiveReference(reference, true)
-		if err != nil {
-			return ociArchiveInspection{}, err
-		}
-	}
-	if requestedReference != "" {
-		requestedReference, err = normalizeArchiveReference(requestedReference, false)
-		if err != nil {
-			return ociArchiveInspection{}, err
-		}
-		if reference != "" && reference != requestedReference {
-			return ociArchiveInspection{}, errors.New("OCI archive image name does not match the requested reference")
-		}
-		reference = requestedReference
-	}
-	if reference == "" {
-		return ociArchiveInspection{}, errors.New("OCI archive image reference is missing")
+	reference, err := resolveArchiveReference(annotated, requestedReference)
+	if err != nil {
+		return ociArchiveInspection{}, err
 	}
 	manifest, platform, err := selectArchiveManifest(top, blobs, matcher)
 	if err != nil {
@@ -395,18 +382,79 @@ func selectArchivePlatform(top ocispec.Descriptor, blobs map[digest.Digest]archi
 	return ocispec.Descriptor{}, ocispec.Platform{}, imageMechanicsError(ImageFailurePlatformMismatch, top.Digest.String(), errors.New("OCI archive has no manifest for the runtime platform"))
 }
 
-func normalizeArchiveReference(raw string, allowDigest bool) (string, error) {
+// resolveArchiveReference decides the one name an offline import is keyed by.
+//
+// The archive's own reference is authoritative when it names an artifact:
+// a tagged reference keeps its tag and a digest-only reference keeps its
+// digest, so two archives exported from one repository can never be keyed by
+// the same invented name. Collapsing a digest-only reference to ":latest" did
+// exactly that, and made the published image-user echo variants unimportable
+// (#418). Only a bare repository, which carries no other identity at all,
+// still takes the registry default tag.
+//
+// An explicit request (`wefty node load-image --reference`) names an archive
+// the export left ambiguous: one carrying no reference, or only a digest. It
+// may retag such an archive but never re-home it, so a digest-only archive
+// keeps its repository. An archive that already carries a tag is named by the
+// exporter, so a request must agree with it rather than rename it.
+func resolveArchiveReference(annotated, requested string) (string, error) {
+	var archiveReference, requestedReference distributionref.Named
+	var err error
+	if annotated != "" {
+		if archiveReference, err = parseArchiveReference(annotated, true); err != nil {
+			return "", err
+		}
+	}
+	if requested != "" {
+		if requestedReference, err = parseArchiveReference(requested, false); err != nil {
+			return "", err
+		}
+	}
+	switch {
+	case archiveReference == nil && requestedReference == nil:
+		return "", errors.New("OCI archive image reference is missing; supply an explicit reference")
+	case requestedReference == nil:
+		return archiveReference.String(), nil
+	case archiveReference == nil:
+		return requestedReference.String(), nil
+	case archiveReference.String() == requestedReference.String():
+		return requestedReference.String(), nil
+	}
+	if _, tagged := archiveReference.(distributionref.Tagged); tagged {
+		return "", errors.New("OCI archive image name does not match the requested reference")
+	}
+	if distributionref.TrimNamed(archiveReference).String() != distributionref.TrimNamed(requestedReference).String() {
+		return "", errors.New("requested reference names a different repository than the OCI archive")
+	}
+	return requestedReference.String(), nil
+}
+
+// parseArchiveReference renders one reference as the name an import is keyed
+// by, preserving whatever identity it carries. Only a request may be refused
+// a digest: the digest an archive carries is its own recomputed identity,
+// while a request supplies a name the export failed to.
+func parseArchiveReference(raw string, allowDigest bool) (distributionref.Named, error) {
 	named, err := distributionref.ParseNormalizedNamed(raw)
 	if err != nil {
-		return "", errors.New("OCI archive image reference is invalid")
+		return nil, errors.New("OCI archive image reference is invalid")
 	}
-	if _, digested := named.(distributionref.Digested); digested {
-		if !allowDigest {
-			return "", errors.New("OCI archive image reference must not contain a digest")
+	_, digested := named.(distributionref.Digested)
+	if digested && !allowDigest {
+		return nil, errors.New("OCI archive image reference must not contain a digest")
+	}
+	if tagged, ok := named.(distributionref.Tagged); ok {
+		// A reference carrying both a tag and a digest is named by its tag;
+		// the digest is already the archive's recomputed top-level identity.
+		retagged, tagErr := distributionref.WithTag(distributionref.TrimNamed(named), tagged.Tag())
+		if tagErr != nil {
+			return nil, errors.New("OCI archive image reference is invalid")
 		}
-		named = distributionref.TrimNamed(named)
+		return retagged, nil
 	}
-	return distributionref.TagNameOnly(named).String(), nil
+	if digested {
+		return named, nil
+	}
+	return distributionref.TagNameOnly(named), nil
 }
 
 func archiveManifestPlatform(descriptor ocispec.Descriptor, blobs map[digest.Digest]archiveBlob, matcher platforms.MatchComparer) (ocispec.Platform, error) {

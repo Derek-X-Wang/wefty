@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -79,7 +80,7 @@ func (client *Client) Stop(ctx context.Context, expected uint64) (IntentResponse
 	return response, err
 }
 
-func (client *Client) LoadImage(ctx context.Context, path string) (LoadImageResponse, error) {
+func (client *Client) LoadImage(ctx context.Context, path string, request LoadImageRequest) (LoadImageResponse, error) {
 	if !filepath.IsAbs(path) {
 		return LoadImageResponse{}, errors.New("OCI image archive path must be absolute")
 	}
@@ -88,8 +89,12 @@ func (client *Client) LoadImage(ctx context.Context, path string) (LoadImageResp
 		return LoadImageResponse{}, fmt.Errorf("open OCI image archive: %w", err)
 	}
 	defer file.Close()
+	target := "/v1/images/load"
+	if request.Reference != "" {
+		target += "?" + url.Values{"reference": []string{request.Reference}}.Encode()
+	}
 	var response LoadImageResponse
-	err = client.call(ctx, http.MethodPost, "/v1/images/load", file, "application/vnd.oci.image.layer.v1.tar", &response)
+	err = client.call(ctx, http.MethodPost, target, file, "application/vnd.oci.image.layer.v1.tar", &response)
 	return response, err
 }
 

@@ -30,7 +30,13 @@ and raw environment dumps must never enter the artifact.
   `<commit>-user-numeric` and `<commit>-user-named` tags of the same public
   `wefty-echo-service` package, and their index and per-platform digests are
   recorded in `acceptance-image-receipt.json` under `service_user_variants`.
-  Import each by its `acceptance-image-user-<variant>-index-digest.txt`;
+  Import each by its `acceptance-image-user-<variant>-index-digest.txt`. Each
+  archive carries its own published tag as its reference, so `wefty node
+  load-image` keys the two variants and the root echo image by three distinct
+  names; an artifact from before #418, which annotates only a digest, imports
+  under that digest or under an explicit `--reference
+  ghcr.io/derek-x-wang/wefty-echo-service:<commit>-user-<variant>` inside the
+  same repository;
 - the separate `wefty-computer-reference-<candidate-commit>` artifact from
   that exact workflow run. Extract `wefty-computer-reference-release.tar`,
   require its commit to match the echo artifact, and use the repository name

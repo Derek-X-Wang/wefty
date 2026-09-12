@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -305,7 +306,21 @@ func (server *Server) handleLoadImage(writer http.ResponseWriter, request *http.
 		writeControlError(writer, http.StatusBadRequest, ErrorInvalidRequest, "load-image requires an OCI tar archive")
 		return
 	}
-	value, err := server.service.LoadImage(request.Context(), request.Body)
+	// The archive is the body, so the one field this request carries travels
+	// in the query. Reject anything else there rather than ignore it, the way
+	// every JSON request here refuses unknown fields.
+	query, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		writeControlError(writer, http.StatusBadRequest, ErrorInvalidRequest, "invalid node-local control request")
+		return
+	}
+	load := LoadImageRequest{Reference: query.Get("reference")}
+	query.Del("reference")
+	if len(query) != 0 {
+		writeControlError(writer, http.StatusBadRequest, ErrorInvalidRequest, "node-local control request carries an unknown parameter")
+		return
+	}
+	value, err := server.service.LoadImage(request.Context(), load, request.Body)
 	writeControlResponse(writer, value, err)
 }
 
