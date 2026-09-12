@@ -411,8 +411,15 @@ func requireNoFurtherSweep(t *testing.T, engine *wedgedSweepEngine, want int64) 
 	}
 }
 
-// waitForRefusal waits until the server has published a tripped-bound refusal.
-func waitForRefusal(t *testing.T, server *Server) *StartupBoundTrippedError {
+// waitForRefusal waits until the server has published a tripped-bound refusal
+// newer than the one already observed; nil accepts the first one.
+//
+// The sweep counter moves when a sweep starts, but a re-attempt only becomes a
+// fact when its failure reaches the ledger, several steps later. Anything that
+// depends on the recorded attempt -- the streak it grew, the schedule it wrote,
+// what a replacing generation would read -- has to wait for the refusal that
+// carries it, not for the sweep that preceded it.
+func waitForRefusal(t *testing.T, server *Server, after *StartupBoundTrippedError) *StartupBoundTrippedError {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -420,11 +427,11 @@ func waitForRefusal(t *testing.T, server *Server) *StartupBoundTrippedError {
 		startupErr := server.startupErr
 		server.sessionMu.Unlock()
 		var tripped *StartupBoundTrippedError
-		if errors.As(startupErr, &tripped) {
+		if errors.As(startupErr, &tripped) && (after == nil || tripped.Facts.NextAttemptAt.After(after.Facts.NextAttemptAt)) {
 			return tripped
 		}
 		if !time.Now().Before(deadline) {
-			t.Fatalf("the helper never published a tripped-bound refusal: %v", startupErr)
+			t.Fatalf("the helper never published a tripped-bound refusal after %+v: %v", after, startupErr)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -524,7 +531,7 @@ func TestARefusingHelperReattemptsTheBarrierOncePerWindow(t *testing.T) {
 
 	_, server, stop := serveHelperGeneration(t, engine, state, 2, clock)
 	defer stop()
-	first := waitForRefusal(t, server)
+	first := waitForRefusal(t, server, nil)
 	requireNoFurtherSweep(t, engine, sweeps)
 
 	// Most of the window is not the window.
@@ -535,7 +542,7 @@ func TestARefusingHelperReattemptsTheBarrierOncePerWindow(t *testing.T) {
 	sweeps++
 	waitForSweepAttempts(t, engine, sweeps)
 	requireNoFurtherSweep(t, engine, sweeps)
-	second := waitForRefusal(t, server)
+	second := waitForRefusal(t, server, first)
 	if second.Facts.Consecutive <= first.Facts.Consecutive {
 		t.Fatalf("a failed re-attempt did not extend the streak: %+v then %+v", first.Facts, second.Facts)
 	}
@@ -571,7 +578,7 @@ func TestAStaleTrippedLedgerSweepsOnceAtLaunchAndThenWaitsAWindow(t *testing.T) 
 	defer stop()
 	sweeps++
 	waitForSweepAttempts(t, engine, sweeps)
-	waitForRefusal(t, server)
+	waitForRefusal(t, server, nil)
 	requireNoFurtherSweep(t, engine, sweeps)
 
 	clock.Advance(testStartupFailureWindow)
@@ -591,7 +598,7 @@ func TestAReArmedBarrierThatSucceedsClearsTheBoundAndServes(t *testing.T) {
 
 	client, server, stop := serveHelperGeneration(t, engine, state, 2, clock)
 	defer stop()
-	waitForRefusal(t, server)
+	waitForRefusal(t, server, nil)
 
 	// The operator clears the denial; nothing restarts the helper.
 	engine.fail = false
@@ -666,11 +673,15 @@ func TestAGenerationThatReplacesARefusingOneStillRefuses(t *testing.T) {
 	sweeps := engine.sweepAttempts()
 
 	_, refusing, stopRefusing := serveHelperGeneration(t, engine, state, 2, clock)
-	waitForRefusal(t, refusing)
+	scheduled := waitForRefusal(t, refusing, nil)
 	clock.Advance(testStartupFailureWindow)
 	sweeps++
 	waitForSweepAttempts(t, engine, sweeps)
-	waitForRefusal(t, refusing)
+	// Wait for the re-attempt's failure to reach the ledger, not merely for its
+	// sweep to start: until it does, the durable schedule is still the one the
+	// refusing generation inherited, and a replacement is genuinely entitled to
+	// the attempt this one has not finished recording.
+	waitForRefusal(t, refusing, scheduled)
 	stopRefusing()
 
 	// The replacement starts in the window the failed re-attempt just opened.
@@ -710,7 +721,7 @@ func TestABackwardClockStepCannotStretchTheReArmWindow(t *testing.T) {
 	steppedBack := clock.Now()
 	_, server, stop := serveHelperGeneration(t, engine, state, 2, clock)
 	defer stop()
-	refusal := waitForRefusal(t, server)
+	refusal := waitForRefusal(t, server, nil)
 	if refusal.Facts.NextAttemptAt.After(steppedBack.Add(testStartupFailureWindow)) {
 		t.Fatalf("re-arm scheduled at %s, want no later than one window after the stepped-back now %s",
 			refusal.Facts.NextAttemptAt, steppedBack)
