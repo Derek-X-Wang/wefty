@@ -273,7 +273,10 @@ the helper positively reaped that attempt while its session stayed live; the
 same positive-reap doctrine that makes `computer_storage_busy` definitive is
 what bounds the refusal to the attempt, so a table of negative `Run` probes on
 one session never reads as session loss. A `Run` failure the helper could not
-positively reap omits the claim and remains runtime-loss evidence. The DNS reason means neither the advertised non-loopback
+positively reap omits the claim and remains runtime-loss evidence; the helper
+writes that refusal to the wire before it invalidates its own session, so the
+agent always reads the typed refusal and then marks loss rather than a bare
+transport EOF. The DNS reason means neither the advertised non-loopback
 resolver nor the Node-loopback stub answered the helper's bounded preflight.
 Raw privileged error text,
 containerd types, and host paths remain local. The Computer reimage preflight
