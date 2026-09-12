@@ -247,6 +247,11 @@ type BootBarrier struct {
 	reason          contract.CapabilityReasonCode
 	stalledWindows  uint64
 	lastLossAt      time.Time
+	// startupBound is the last helper handshake's report of its own
+	// startup-barrier bound. It is the only surface on which a tripped bound
+	// is observable, because a helper that refuses admission never serves a
+	// diagnostic session.
+	startupBound StartupBoundFacts
 }
 
 func NewBootBarrier(client *Client, request AcquireSessionRequest) (*BootBarrier, error) {
@@ -484,6 +489,19 @@ func (barrier *BootBarrier) CapabilityReasonCode() contract.CapabilityReasonCode
 	return barrier.reason
 }
 
+// StartupBound reports the helper's own startup-barrier bound as the last
+// handshake described it. A tripped bound means the connected helper generation
+// refused to run a startup sweep and is serving typed refusals until it is
+// repaired; the node doctor names it.
+func (barrier *BootBarrier) StartupBound() StartupBoundFacts {
+	if barrier == nil {
+		return StartupBoundFacts{}
+	}
+	barrier.mu.RLock()
+	defer barrier.mu.RUnlock()
+	return barrier.startupBound
+}
+
 // HandshakeStalledWindows is the consecutive bounded takeover windows that
 // connected to the helper socket without completing a handshake.
 func (barrier *BootBarrier) HandshakeStalledWindows() uint64 {
@@ -557,6 +575,9 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context, takeoverSt
 		session, err := barrier.client.openSession(ctx, barrier.request, &lastDialConnected, takeoverDeadline, func(handshake AcquireSessionResponse) (time.Time, error) {
 			handshakeCompleted = true
 			attemptHandshakeElapsed = time.Since(takeoverStarted)
+			barrier.mu.Lock()
+			barrier.startupBound = handshake.StartupBound
+			barrier.mu.Unlock()
 			if advertisedReapTimeout == 0 {
 				advertisedReapTimeout = handshake.ReapTimeout
 			} else if handshake.ReapTimeout != advertisedReapTimeout {
@@ -595,6 +616,15 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context, takeoverSt
 		}
 		var rpcErr *RPCError
 		var dialErr *helperDialError
+		if errors.As(err, &rpcErr) && rpcErr.Code == CodeStartupBoundTripped {
+			// The helper completed the handshake and then refused admission
+			// because its startup barrier already burned its bound. That
+			// verdict is the same for every dial in this window, so the window
+			// is spent, not started: report the stall the window would have
+			// reported, immediately, carrying the typed refusal. Recovery is
+			// the unchanged bounded repair the stall already drives.
+			return nil, 0, 0, &HelperHandshakeStalledError{DialAttempts: dialAttempts, Cause: err}
+		}
 		if errors.As(err, &dialErr) && (errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED) || errors.Is(dialErr, syscall.ECONNRESET)) {
 			lastUnavailableError = err
 		} else if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionBusy {

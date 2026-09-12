@@ -648,8 +648,10 @@ func run() error {
 					limaFacts = limaSupervisor.Facts
 				}
 				var stalledWindows func() uint64
+				var startupBound func() ocihelper.StartupBoundFacts
 				if bootBarrier != nil {
 					stalledWindows = bootBarrier.HandshakeStalledWindows
+					startupBound = bootBarrier.StartupBound
 				}
 				installedSystemdVersion := func(ctx context.Context) (int, error) {
 					if runtime.GOOS == "darwin" {
@@ -679,6 +681,7 @@ func run() error {
 					LimaFacts:                     limaFacts,
 					Helper:                        doctorHelperSource(ociAdapter),
 					HelperHandshakeStalledWindows: stalledWindows,
+					HelperStartupBound:            startupBound,
 					SetupStatePath:                *ociSetupState,
 					InstalledSystemdVersion:       installedSystemdVersion,
 					InstalledHelperServiceUnit:    installedHelperServiceUnit,

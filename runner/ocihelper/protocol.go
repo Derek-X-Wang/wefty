@@ -102,6 +102,12 @@ const (
 	CodeDiagnosticFailure    ErrorCode = "diagnostic_failure"
 	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
 	CodeSweepRequired        ErrorCode = "sweep_required"
+	// CodeStartupBoundTripped refuses session admission because the startup
+	// barrier already burned its consecutive-failure bound. This generation
+	// never ran a startup sweep, so the refusal is cheap and repeatable, and
+	// the caller learns the bound from the handshake instead of discovering a
+	// closed connection.
+	CodeStartupBoundTripped ErrorCode = "startup_bound_tripped"
 )
 
 // RPCError is safe to cross the private protocol. Engine failures may include
@@ -266,6 +272,21 @@ type AcquireSessionResponse struct {
 	MaximumAttemptDeadman time.Duration `json:"maximum_attempt_deadman"`
 	ReapTimeout           time.Duration `json:"reap_timeout"`
 	StartupInProgress     bool          `json:"startup_in_progress"`
+	// StartupBound reports this generation's startup-barrier bound. It is
+	// tripped only on a generation that refused to run the startup sweep at
+	// all, so the peer can name the bound in its own diagnostics instead of
+	// inferring a wedge from a dropped connection.
+	StartupBound StartupBoundFacts `json:"startup_bound"`
+}
+
+// StartupBoundFacts is the closed, non-privileged description of the helper's
+// consecutive-startup-barrier-failure bound. It carries no error text.
+type StartupBoundFacts struct {
+	Tripped     bool                `json:"tripped"`
+	Phase       StartupBarrierPhase `json:"phase,omitempty"`
+	Consecutive int                 `json:"consecutive,omitempty"`
+	Bound       int                 `json:"bound,omitempty"`
+	Elapsed     time.Duration       `json:"elapsed,omitempty"`
 }
 
 // HelperSession identifies one opaque helper process/session generation

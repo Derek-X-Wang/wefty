@@ -263,28 +263,23 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	server.listener = listener
 	server.serveCtx = ctx
 	server.sessionMu.Unlock()
-	// A restarted helper has no trustworthy in-memory session history. Accept
-	// connections while startup cleanup runs so an authenticated peer can learn
-	// the helper's configured reap bound, but do not mint session authority until
-	// the complete startup Sweep+Verify succeeds.
-	go func() {
-		err := server.sweepAndVerifyStartup(ctx)
-		if err == nil {
-			server.clearStartupBarrierFailures()
-		} else {
-			// A barrier that keeps failing the same way is a wedge, not a
-			// transient fault. Counting it durably lets the unit stop at a
-			// failed state with a typed reason instead of hot-looping.
-			err = server.recordStartupBarrierFailure(err)
-		}
+	// The bound is read before anything is swept. Socket activation starts a
+	// fresh generation on every connection, so a generation that sweeps first
+	// and consults the bound afterwards re-runs the denied sweep on every
+	// relaunch -- 81 of them in 63 seconds on hardware (#419). A tripped bound
+	// therefore means: sweep nothing, keep serving, refuse every acquisition
+	// with the typed code. Holding the listener is what stops the relaunches;
+	// the process must not fail.
+	if tripped := server.startupBoundTripped(); tripped != nil {
+		server.config.Logf("OCI helper startup barrier bound already tripped phase=%s consecutive=%d bound=%d elapsed=%s; serving typed refusals without a startup sweep",
+			tripped.Facts.Phase, tripped.Facts.Consecutive, tripped.Facts.Bound, tripped.Facts.Elapsed)
 		server.sessionMu.Lock()
-		server.startupErr = err
+		server.startupErr = tripped
 		close(server.startupDone)
 		server.sessionMu.Unlock()
-		if err != nil {
-			server.fail(err)
-		}
-	}()
+	} else {
+		server.startStartupBarrier(ctx)
+	}
 	go func() {
 		<-ctx.Done()
 		server.sessionMu.Lock()
@@ -319,6 +314,32 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 			_ = connection.Close()
 		}
 	}
+}
+
+// startStartupBarrier runs the boot Sweep+Verify barrier in the background.
+// A restarted helper has no trustworthy in-memory session history. Accept
+// connections while startup cleanup runs so an authenticated peer can learn
+// the helper's configured reap bound, but do not mint session authority until
+// the complete startup Sweep+Verify succeeds.
+func (server *Server) startStartupBarrier(ctx context.Context) {
+	go func() {
+		err := server.sweepAndVerifyStartup(ctx)
+		if err == nil {
+			server.clearStartupBarrierFailures()
+		} else {
+			// A barrier that keeps failing the same way is a wedge, not a
+			// transient fault. Counting it durably lets the unit stop at a
+			// failed state with a typed reason instead of hot-looping.
+			err = server.recordStartupBarrierFailure(err)
+		}
+		server.sessionMu.Lock()
+		server.startupErr = err
+		close(server.startupDone)
+		server.sessionMu.Unlock()
+		if err != nil {
+			server.fail(err)
+		}
+	}()
 }
 
 func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
@@ -419,9 +440,17 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		return
 	}
 	startupInProgress := true
+	startupBound := StartupBoundFacts{}
 	select {
 	case <-server.startupDone:
 		startupInProgress = false
+		server.sessionMu.Lock()
+		startupErr := server.startupErr
+		server.sessionMu.Unlock()
+		var tripped *StartupBoundTrippedError
+		if errors.As(startupErr, &tripped) {
+			startupBound = tripped.Facts
+		}
 	default:
 	}
 	handshake := AcquireSessionResponse{
@@ -429,6 +458,7 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		HelperChecksum: server.config.HelperChecksum, HelperInstanceID: server.instanceID,
 		HeartbeatTimeout: server.config.HeartbeatTimeout, MaximumAttemptDeadman: server.config.MaximumAttemptDeadman,
 		ReapTimeout: server.config.ReapTimeout, StartupInProgress: startupInProgress,
+		StartupBound: startupBound,
 	}
 	if err := writeSuccess(wire, handshake); err != nil {
 		return
@@ -439,6 +469,13 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		startupErr := server.startupErr
 		server.sessionMu.Unlock()
 		if startupErr != nil {
+			// A tripped bound is the one startup failure this process outlives,
+			// so the peer gets a typed refusal rather than the dropped
+			// connection a dying generation leaves behind.
+			var tripped *StartupBoundTrippedError
+			if errors.As(startupErr, &tripped) {
+				_ = writeFailure(wire, CodeStartupBoundTripped, tripped.Error())
+			}
 			return
 		}
 	case <-ctx.Done():

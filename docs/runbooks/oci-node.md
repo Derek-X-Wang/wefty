@@ -309,6 +309,18 @@ Meaning: no consecutive bounded helper handshake stall window is recorded. First
 
 Meaning: one or more takeover windows connected without a handshake. Evidence: preserve the count; Lima escalates at `RecoveryTimeout`.
 
+## doctor-code-oci-helper-startup-bound-not-read
+
+Meaning: the helper startup-failure bound was unavailable. First action: rerun doctor from the configured agent process.
+
+## doctor-code-oci-helper-startup-bound-clear
+
+Meaning: the connected helper reported no tripped startup-failure bound. First action: continue with downstream findings.
+
+## doctor-code-oci-helper-startup-bound-tripped
+
+Meaning: the helper's boot Sweep+Verify barrier failed its bounded number of consecutive times, so this helper generation refuses to sweep and admits no session; every helper-dependent finding below is NOT-RUN for that reason. Evidence: preserve the reported phase, count, and elapsed streak, and the helper journal for the failing barrier. First action: repair the cause named in the journal -- the whole-namespace startup sweep is denied by anything pinned inside the OCI runtime root, including a test fixture's mount -- then restart the node's OCI runtime (`wefty node oci start`, or let the agent's bounded Lima repair run). A repair that restarts the helper more than the startup-failure window after the trip clears the bound on the first generation; a faster restart spends one more refusing generation first.
+
 ## doctor-code-oci-computer-storage-recovery-clear
 
 Meaning: the verified sweep retained no deferred or quarantined Computer Storage generation. First action: none.

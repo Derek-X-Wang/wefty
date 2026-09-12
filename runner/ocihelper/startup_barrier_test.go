@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
@@ -19,15 +21,21 @@ import (
 // ownership record failed the startup sweep on every generation.
 type wedgedSweepEngine struct {
 	*fakeEngine
-	fail bool
+	fail    bool
+	attempt atomic.Int64
 }
 
 func (engine *wedgedSweepEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
+	engine.attempt.Add(1)
 	if engine.fail {
 		return SweepResponse{}, errors.New("durable Attempt ownership record conflicts with fenced authority")
 	}
 	return engine.fakeEngine.Sweep(ctx, request)
 }
+
+// sweepAttempts counts every sweep the engine was asked for, denied ones
+// included. The #419 loop is measured here: a tripped bound must add none.
+func (engine *wedgedSweepEngine) sweepAttempts() int64 { return engine.attempt.Load() }
 
 // runHelperGeneration serves one helper process lifetime over its own listener
 // and returns the error that ended it, the way the installed unit's ExecStart
@@ -273,5 +281,189 @@ func TestNoConfiguredStateDirectoryDisablesTheBound(t *testing.T) {
 			t.Fatalf("unconfigured bound = %v, want the ordinary barrier failure", err)
 		}
 		clock.Advance(testStartupFailureWindow)
+	}
+}
+
+// serveHelperGeneration starts one helper lifetime and leaves it running, the
+// way a socket-activated relaunch leaves a live process holding the socket.
+func serveHelperGeneration(t *testing.T, engine Engine, stateDirectory string, bound int, clock Clock) (*Client, *Server, func()) {
+	t.Helper()
+	// macOS caps a unix socket path at 104 bytes; t.TempDir() names are long
+	// enough to blow through it.
+	directory, err := os.MkdirTemp("", "wefty-oci-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	path := filepath.Join(directory, "helper.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(engine, ServerConfig{
+		HelperVersion: "test", HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
+		StartupFailureStateDirectory: stateDirectory, StartupFailureBound: bound,
+		StartupFailureWindow: testStartupFailureWindow, Clock: clock,
+		Logf: func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	select {
+	case <-server.startupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper startup never settled")
+	}
+	client := NewUnixClient(path, "checksum-test")
+	client.disableHeartbeatPump = true
+	return client, server, func() {
+		cancel()
+		_ = listener.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("helper server did not stop")
+		}
+	}
+}
+
+// burnStartupBound drives the ledger to a tripped streak the way the unit
+// does: repeated failing generations, the last one past both the count and the
+// window, exiting with the status RestartPreventExitStatus names.
+func burnStartupBound(t *testing.T, engine *wedgedSweepEngine, state string, bound int, clock *manualClock) {
+	t.Helper()
+	for generation := 1; generation < bound; generation++ {
+		if err := runHelperGenerationAt(t, engine, state, bound, clock); err == nil {
+			t.Fatalf("generation %d served despite a failed startup barrier", generation)
+		}
+		clock.Advance(time.Second)
+	}
+	// Land the last failure exactly one window after the one before it, so the
+	// streak is both at the count and as old as the window without ever going
+	// stale.
+	clock.Advance(testStartupFailureWindow - time.Second)
+	err := runHelperGenerationAt(t, engine, state, bound, clock)
+	var wedged *StartupWedgedError
+	if !errors.As(err, &wedged) {
+		t.Fatalf("the bound never tripped: %v", err)
+	}
+}
+
+// #419: RestartPreventExitStatus stops systemd's own restarts, but the helper
+// is socket activated, so the agent's boot barrier relaunched a fresh
+// generation on every connection -- 81 launches in 63 seconds on hardware,
+// each one rerunning the denied whole-namespace sweep. A generation that finds
+// the bound already tripped must sweep nothing, stay alive holding the socket
+// so nothing else is activated, and answer every acquisition with the typed
+// refusal.
+func TestATrippedStartupBoundRefusesSocketActivatedRelaunchesWithoutSweeping(t *testing.T) {
+	state := t.TempDir()
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true}
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	burnStartupBound(t, engine, state, 3, clock)
+	sweepsAtTrip := engine.sweepAttempts()
+
+	client, server, stop := serveHelperGeneration(t, engine, state, 3, clock)
+	defer stop()
+
+	if engine.sweepAttempts() != sweepsAtTrip {
+		t.Fatalf("the relaunched generation reran the denied startup sweep: %d sweeps, want %d", engine.sweepAttempts(), sweepsAtTrip)
+	}
+	if _, err := os.Stat(filepath.Join(state, startupFailureLedgerName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the refusing generation left the tripped ledger for the repair's generation to honour: %v", err)
+	}
+	server.sessionMu.Lock()
+	fatalErr := server.fatalErr
+	startupErr := server.startupErr
+	server.sessionMu.Unlock()
+	if fatalErr != nil {
+		t.Fatalf("the refusing generation failed its process instead of holding the socket: %v", fatalErr)
+	}
+	var tripped *StartupBoundTrippedError
+	if !errors.As(startupErr, &tripped) || !tripped.Facts.Tripped || tripped.Facts.Bound != 3 ||
+		tripped.Facts.Consecutive < 3 || tripped.Facts.Phase != StartupBarrierSweep || tripped.Facts.Elapsed < testStartupFailureWindow {
+		t.Fatalf("startup error = %v, want a typed tripped-bound refusal naming the streak", startupErr)
+	}
+
+	// Two boot-barrier windows in a row. Each must be refused by the same live
+	// process: a dial that still reaches a listener is the proof that nothing
+	// exited and nothing was relaunched.
+	for window := 1; window <= 2; window++ {
+		barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+			TakeoverTimeout: 2 * time.Second, TakeoverRetry: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ensureErr := barrier.Ensure(context.Background())
+		if ensureErr == nil {
+			t.Fatalf("window %d: the tripped helper admitted a session", window)
+		}
+		var rpcErr *RPCError
+		if !errors.As(ensureErr, &rpcErr) || rpcErr.Code != CodeStartupBoundTripped {
+			t.Fatalf("window %d: refusal = %v, want the typed %s code", window, ensureErr, CodeStartupBoundTripped)
+		}
+		// The repair path is the one a stalled handshake already drives; the
+		// typed refusal reaches it at the first dial instead of after a whole
+		// takeover window.
+		var stalled *HelperHandshakeStalledError
+		if !errors.As(ensureErr, &stalled) || stalled.DialAttempts != 1 {
+			t.Fatalf("window %d: refusal = %v, want one dial reported as a stalled handshake", window, ensureErr)
+		}
+		if reason := barrier.CapabilityReasonCode(); reason != contract.CapabilityReasonHelperHandshakeStalled {
+			t.Fatalf("window %d: capability reason = %q, want the unchanged bounded-repair reason", window, reason)
+		}
+		bound := barrier.StartupBound()
+		if !bound.Tripped || bound.Bound != 3 || bound.Consecutive < 3 || bound.Phase != StartupBarrierSweep {
+			t.Fatalf("window %d: barrier bound facts = %+v, want the tripped bound the doctor names", window, bound)
+		}
+		if engine.sweepAttempts() != sweepsAtTrip {
+			t.Fatalf("window %d: a refused acquisition ran a startup sweep: %d sweeps, want %d", window, engine.sweepAttempts(), sweepsAtTrip)
+		}
+	}
+}
+
+// The bound must clear on the path that repairs the helper today. The refusing
+// generation consumed the ledger, so the restart the repair performs sweeps
+// again and serves.
+func TestRepairingTheHelperClearsTheTrippedStartupBound(t *testing.T) {
+	state := t.TempDir()
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true}
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	burnStartupBound(t, engine, state, 2, clock)
+
+	_, _, stop := serveHelperGeneration(t, engine, state, 2, clock)
+	stop()
+
+	// The repair removes the fault and restarts the unit.
+	engine.fail = false
+	sweepsBeforeRepair := engine.sweepAttempts()
+	if err := runHelperGenerationAt(t, engine, state, 2, clock); err != nil {
+		t.Fatalf("the repaired helper refused to serve: %v", err)
+	}
+	if engine.sweepAttempts() != sweepsBeforeRepair+1 {
+		t.Fatalf("the repaired helper ran %d sweeps, want exactly one", engine.sweepAttempts()-sweepsBeforeRepair)
+	}
+}
+
+// A stale tripped ledger is not today's wedge. A generation that starts long
+// after the streak died sweeps normally rather than inheriting a refusal.
+func TestAStaleTrippedLedgerDoesNotRefuseANewGeneration(t *testing.T) {
+	state := t.TempDir()
+	engine := &wedgedSweepEngine{fakeEngine: newFakeEngine(), fail: true}
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	burnStartupBound(t, engine, state, 2, clock)
+
+	clock.Advance(10 * testStartupFailureWindow)
+	engine.fail = false
+	sweepsBefore := engine.sweepAttempts()
+	if err := runHelperGenerationAt(t, engine, state, 2, clock); err != nil {
+		t.Fatalf("a stale tripped ledger refused a healthy generation: %v", err)
+	}
+	if engine.sweepAttempts() != sweepsBefore+1 {
+		t.Fatal("a stale tripped ledger skipped the startup sweep")
 	}
 }
