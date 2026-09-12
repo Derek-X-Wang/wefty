@@ -246,7 +246,10 @@ digest, and only a bare repository takes `:latest`, so two archives exported
 from one repository cannot claim one name. `--reference` names only an export
 that named no artifact. It may name an archive carrying no reference, or one
 carrying a repository with no tag — bare, or qualified only by a digest —
-inside that archive's own repository; it cannot rename a tagged export, cannot
+inside that archive's own repository. A bare repository request whose
+repository matches a tagged archive resolves to that archive's own tag rather
+than renaming it; every other `--reference` cannot rename a tagged export,
+cannot
 carry a digest, and cannot rebind a name that already identifies different
 bytes, which stays a typed `manifest_rejected` refusal. The reference travels
 as the one `load-image` query parameter, and a repeated or unknown parameter is
