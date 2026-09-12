@@ -1344,9 +1344,6 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if err != nil {
 			reapErr := session.reapAttempt(attempt, true, false)
 			server.createSweep.RUnlock()
-			if reapErr != nil {
-				go session.invalidate("ambiguous Run reap failed")
-			}
 			var rpcErr *RPCError
 			var specRejection *RuntimeSpecRejectionError
 			var serviceDataRejection *ServiceDataRejectionError
@@ -1406,6 +1403,16 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			} else {
 				_ = writeRPCError(wire, withAttemptScopedRunFailure(
 					engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err), err), attemptScoped))
+			}
+			if reapErr != nil {
+				// An ambiguous reap still costs the helper its session, but the
+				// refusal above has to reach the agent first: invalidate() closes
+				// this very operation's connection, so racing it against the write
+				// left the agent reading EOF and reporting runtime loss with no
+				// typed engine_failure to explain it (#438). The frame is on the
+				// wire by the time this spawns; the goroutine is required because
+				// invalidate() waits for this operation to finish.
+				go session.invalidate("ambiguous Run reap failed")
 			}
 			return
 		}
