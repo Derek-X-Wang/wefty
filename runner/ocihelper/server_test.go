@@ -659,6 +659,97 @@ func TestRunEngineFailureWithAmbiguousReapStillProvesRuntimeLoss(t *testing.T) {
 	}
 }
 
+// The attempt-scope claim is only as good as the reap that earned it, and the
+// reap may be performed by another goroutine -- the deadman guardian, most
+// often. Every caller must inherit that one recorded outcome instead of reading
+// a nil error it did not earn. See #424.
+func TestReapAttemptReportsTheVerifiedOutcomeToEveryCaller(t *testing.T) {
+	engine := &blockingReapEngine{fakeEngine: newFakeEngine(), entered: make(chan struct{}), release: make(chan struct{})}
+	engine.attemptReapErr = errors.New("attempt residue could not be verified absent")
+	server, err := NewServer(engine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.serveCtx = context.Background()
+	helperControl, agentControl := net.Pipe()
+	t.Cleanup(func() {
+		_ = helperControl.Close()
+		_ = agentControl.Close()
+	})
+	session := &serverSession{
+		server: server, identity: SessionIdentity{NodeID: "node-1", BootSessionID: "boot-1"},
+		helper:     HelperSession{HelperInstanceID: "helper-test", SessionGeneration: 1},
+		capability: "capability-test", control: helperControl,
+		heartbeatChanged: make(chan struct{}, 1), done: make(chan struct{}),
+		attempts: make(map[string]*serverAttempt), operations: make(map[*sessionOperation]struct{}),
+		sweepVerified: true,
+	}
+	attempt := &serverAttempt{
+		authority: testAuthority(), state: attemptStarting,
+		deadlineChanged: make(chan struct{}, 1), watchDone: make(chan struct{}), reaped: make(chan struct{}),
+	}
+	session.attempts[attempt.authority.key()] = attempt
+
+	guardian := make(chan error, 1)
+	go func() { guardian <- session.reapAttempt(attempt, false, true) }()
+	<-engine.entered
+	concurrent := make(chan error, 1)
+	go func() { concurrent <- session.reapAttempt(attempt, false, false) }()
+	close(engine.release)
+
+	if err := <-guardian; err == nil {
+		t.Fatal("the guardian reap failure was swallowed")
+	}
+	if err := <-concurrent; err == nil {
+		t.Fatal("a caller that lost the reap race read a verified absence nobody proved")
+	}
+	if err := session.reapAttempt(attempt, false, false); err == nil {
+		t.Fatal("the tombstoned attempt reported a verified reap after a failed one")
+	}
+	if session.attemptPositivelyReaped(attempt) {
+		t.Fatal("a failed reap still counted as a positive absence proof")
+	}
+}
+
+// A deadman guardian can reap an attempt whose Run is still in flight. When
+// that reap fails there is no absence proof, so the Run refusal must carry no
+// attempt-scope claim and must still reach the agent as runtime loss.
+func TestGuardianDeadmanReapFailureDeniesAttemptScopeToTheFailedRun(t *testing.T) {
+	engine := newGuardianRecordingEngine()
+	engine.guardianErr = errors.New("guardian absence verification failed")
+	engine.runErr = errors.New("engine create failed")
+	engine.runEntered = make(chan struct{})
+	engine.releaseRun = make(chan struct{})
+	clock := newManualClock(time.Unix(26_000, 0))
+	client, stop := startTestServer(t, engine, ServerConfig{Clock: clock, HeartbeatTimeout: time.Hour, MaximumAttemptDeadman: time.Minute})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	runResult := make(chan error, 1)
+	go func() {
+		_, runErr := session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+		runResult <- runErr
+	}()
+	<-engine.runEntered
+	clock.Advance(time.Second)
+	waitFor(t, time.Second, func() bool { return engine.guardianCount() == 1 }, "failed guardian deadman reap")
+	close(engine.releaseRun)
+
+	err = <-runResult
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) && rpcErr.EngineFailure != nil && rpcErr.EngineFailure.AttemptScoped {
+		t.Fatalf("a Run whose guardian reap failed claimed attempt scope: %v", err)
+	}
+	var loss *RuntimeLossError
+	if !errors.As(err, &loss) {
+		t.Fatalf("Run after a failed guardian reap = %T %v, want typed runtime loss", err, err)
+	}
+}
+
 func TestEngineFailureReasonRejectsUnknownWireValue(t *testing.T) {
 	var response frame
 	err := json.Unmarshal([]byte(`{"version":2,"error":{"code":"engine_failure","message":"failed","engine_failure":{"operation":"Delete","reason":"host_specific"}}}`), &response)
@@ -4536,6 +4627,21 @@ type guardianRecordingEngine struct {
 	pinsReleased     bool
 	capacityReleased bool
 	runtimeReleased  bool
+}
+
+// blockingReapEngine holds the first attempt reap inside the engine so a second
+// caller is guaranteed to find the attempt mid-reap.
+type blockingReapEngine struct {
+	*fakeEngine
+	enterOnce sync.Once
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (engine *blockingReapEngine) ReapAttempt(ctx context.Context, authority AttemptAuthority) error {
+	engine.enterOnce.Do(func() { close(engine.entered) })
+	<-engine.release
+	return engine.fakeEngine.ReapAttempt(ctx, authority)
 }
 
 func newGuardianRecordingEngine() *guardianRecordingEngine {

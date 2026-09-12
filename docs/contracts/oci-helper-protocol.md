@@ -225,14 +225,18 @@ never restores authority or remains indefinitely `session_busy`. The helper
 emits one log line when it admits a session, one when it begins closing one
 naming the close reason and session generation, and one for the reap outcome,
 so an operator can always tell a closed session from a replaced one without
-inferring it from a `session_stale` burst. Those lines carry no capability and
-no raw privileged error text.
+inferring it from a `session_stale` burst. Each attempt reap emits one line
+naming the attempt, whether the deadman guardian performed it, and its outcome
+with a sanitized reason, because that outcome is what decides whether a failed
+`Run` is attempt-scoped. Those lines carry no capability, no host path, and no
+raw privileged error text.
 
 The client boundary exposes runtime loss as a typed error only for an active
-session's transport disappearance, `session_stale`, an `engine_failure` that
-is neither an `attempt_scoped` `Run` refusal, nor a bounded `Delete`
-cancellation/deadline, nor any
-`DeleteManagedVolume` failure, or an explicit image `engine_loss` fact. A typed
+session's transport disappearance, `session_stale`, an explicit image
+`engine_loss` fact, or an `engine_failure` that is none of the following: an
+`attempt_scoped` `Run` refusal, a bounded `Delete` cancellation or deadline, or
+any `DeleteManagedVolume` failure. The `attempt_scoped` claim is written and
+read only for `Run`; the client ignores it on every other operation. A typed
 `Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
 failure. Every `DeleteManagedVolume` failure is scoped to its independently
 authorized durable resource and removal operation. An `operation_failed`

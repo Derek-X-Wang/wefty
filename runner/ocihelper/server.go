@@ -116,6 +116,13 @@ type serverAttempt struct {
 	guardianReaping  bool
 	guardianReaped   bool
 	guardianDelete   bool
+	// reapRecorded and reapErr are the one authoritative outcome of this
+	// attempt's reap, written once by whichever goroutine performed it and read
+	// under session.mu by every other caller. Without them a caller that lost
+	// the race -- a Run whose deadman guardian reaped first, say -- saw a nil
+	// error it had not earned and could claim an absence proof nobody made.
+	reapRecorded bool
+	reapErr      error
 }
 
 func (attempt *serverAttempt) stopWatcher() {
@@ -714,10 +721,15 @@ func resetTimerAt(timer Timer, deadline time.Time) {
 	timer.ResetAt(deadline)
 }
 
-func (session *serverSession) isClosed() bool {
+// attemptPositivelyReaped is the helper's own test for the absence proof that
+// bounds a failed operation to its attempt: this session is still live and a
+// reap it performed tombstoned the attempt without error. Session state and the
+// recorded reap outcome are read together under session.mu, so a concurrent
+// invalidation can never leave a stale positive behind.
+func (session *serverSession) attemptPositivelyReaped(attempt *serverAttempt) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.closed
+	return !session.closed && attempt.state == attemptTombstoned && attempt.reapRecorded && attempt.reapErr == nil
 }
 
 func (session *serverSession) invalidate(reason string) {
@@ -1001,13 +1013,17 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 	}
 	switch attempt.state {
 	case attemptTombstoned:
+		recorded := attempt.reapErr
 		session.mu.Unlock()
-		return nil
+		return recorded
 	case attemptReaping:
 		reaped := attempt.reaped
 		session.mu.Unlock()
 		<-reaped
-		return nil
+		session.mu.Lock()
+		recorded := attempt.reapErr
+		session.mu.Unlock()
+		return recorded
 	case attemptStarting, attemptLive:
 		attempt.state = attemptReaping
 		attempt.guardianReaping = guardian
@@ -1045,9 +1061,21 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 		})
 		_, _ = fmt.Fprintln(os.Stderr, string(payload))
 	}
+	reason := EngineFailureReason("none")
+	if err != nil {
+		reason = engineFailureReason(err)
+	}
+	// The attempt reap now decides whether a failed Run is attempt-scoped or
+	// session loss, so its outcome is legible without a live debugger (#424).
+	session.server.config.Logf(
+		"OCI helper attempt reap attempt_id=%q guardian=%t outcome=%s reason=%s session_generation=%d",
+		attempt.authority.AttemptID, guardian, outcome, reason, session.helper.SessionGeneration,
+	)
 	session.mu.Lock()
 	attempt.guardianReaped = guardian && err == nil
 	attempt.state = attemptTombstoned
+	attempt.reapRecorded = true
+	attempt.reapErr = err
 	attempt.closeReaped.Do(func() { close(attempt.reaped) })
 	session.mu.Unlock()
 	session.internalReaps.Done()
@@ -1331,8 +1359,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			// A failed Run whose attempt the helper positively reaped while its
 			// session stayed live is bounded by that attempt. Saying so on the
 			// wire is what keeps a table of negative Run probes from reading as
-			// helper-session loss and tearing down the shared session.
-			attemptScoped := reapErr == nil && !session.isClosed()
+			// helper-session loss and tearing down the shared session. The claim
+			// comes from the recorded reap outcome, not from reapErr alone, so a
+			// deadman guardian that reaped this attempt first still owns the
+			// answer.
+			attemptScoped := session.attemptPositivelyReaped(attempt)
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, withAttemptScopedRunFailure(rpcErr, attemptScoped))
 			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
