@@ -1440,21 +1440,47 @@ func TestAcceptanceImageUserVariantsArePublishedAndStayDerivedFromTheEchoImage(t
 	}
 
 	image, _ := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
-	build := marshalJob(t, image.Jobs["reproducible-platform-build"])
-	for _, required := range []string{
-		"examples/oci-echo-service/Dockerfile.service-users",
-		"--target \"$variant\"",
-		"test \"$observed_owner\" = \"$owner\"",
-		"${ARCH}-user-${variant}.oci.tar",
-	} {
-		if !strings.Contains(build, required) {
-			t.Fatalf("image-user variant build does not %q", required)
+	prBuild, _ := readWorkflow(t, "../.github/workflows/acceptance-image-build.yml")
+	// The PR-callable lane runs the same build and the same id/health-check
+	// proof without publishing, so a broken variant Dockerfile fails the pull
+	// request rather than the next push to main.
+	variantSteps := map[string]string{}
+	for name, workflow := range map[string]workflowContract{"publisher": image, "required": prBuild} {
+		for _, step := range workflow.Jobs["reproducible-platform-build"].Steps {
+			if step.Name == "Build and execute the image-user service variants" {
+				variantSteps[name] = step.Run
+			}
 		}
 	}
-	for _, owner := range []string{"13001:13002", "12001:12002"} {
-		if !strings.Contains(build, owner) {
-			t.Fatalf("image-user variant build does not execute owner %s", owner)
+	if len(variantSteps) != 2 {
+		t.Fatalf("image-user variant build is present in %d of the two image lanes", len(variantSteps))
+	}
+	for name, build := range variantSteps {
+		for _, required := range []string{
+			"examples/oci-echo-service/Dockerfile.service-users",
+			"--target \"$variant\"",
+			"test \"$observed_owner\" = \"$owner\"",
+			"${ARCH}-user-${variant}.oci.tar",
+			"/healthz",
+		} {
+			if !strings.Contains(build, required) {
+				t.Fatalf("%s image-user variant build does not %q", name, required)
+			}
 		}
+		for _, owner := range []string{"13001:13002", "12001:12002"} {
+			if !strings.Contains(build, owner) {
+				t.Fatalf("%s image-user variant build does not execute owner %s", name, owner)
+			}
+		}
+	}
+	// Only the candidate-commit variable legitimately differs between the two
+	// lanes; anything else drifting means one lane stopped proving what the
+	// other publishes.
+	if strings.ReplaceAll(variantSteps["publisher"], "${GITHUB_SHA}", "${CANDIDATE_SHA}") != variantSteps["required"] {
+		t.Fatal("the PR-callable image-user variant build drifted from the published one")
+	}
+	if strings.Contains(marshalJob(t, prBuild.Jobs["reproducible-platform-build"]), "crane\" push") {
+		t.Fatal("the PR-callable image lane must not publish the image-user variants")
 	}
 	publish := marshalJob(t, image.Jobs["publish"])
 	for _, required := range []string{

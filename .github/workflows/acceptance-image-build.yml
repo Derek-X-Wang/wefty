@@ -122,6 +122,58 @@ jobs:
           jq -n --arg platform "$PLATFORM" --arg digest "$platform_digest" --argjson e_machine "$machine" \
             '{platform: $platform, digest: $digest, executed: true, health: true, echo: true, elf_e_machine: $e_machine}' \
             > "$evidence/${ARCH}-runtime.json"
+      - name: Build and execute the image-user service variants
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/acceptance-image-linux"
+          crane="$(go env GOPATH)/bin/crane"
+          port=18157
+          for variant in numeric named; do
+            case "$variant" in
+              numeric) owner='13001:13002' ;;
+              named) owner='12001:12002' ;;
+              *) printf '%s\n' "::error::unknown image-user variant $variant"; exit 1 ;;
+            esac
+            registry_reference="localhost:5000/wefty-echo-service-user-${variant}:${CANDIDATE_SHA}-${ARCH}"
+            docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+              --build-arg SOURCE_DATE_EPOCH=0 --target "$variant" \
+              --file examples/oci-echo-service/Dockerfile.service-users \
+              --output "type=oci,dest=$RUNNER_TEMP/service-user-${variant}.oci.tar,rewrite-timestamp=true" .
+            docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+              --build-arg SOURCE_DATE_EPOCH=0 --target "$variant" \
+              --file examples/oci-echo-service/Dockerfile.service-users \
+              --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
+            scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/service-user-${variant}.oci.tar" \
+              --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}-user-${variant}.digest" \
+              --receipt-output "$evidence/${ARCH}-user-${variant}-oci.json"
+            cp "$RUNNER_TEMP/service-user-${variant}.oci.tar" "$evidence/${ARCH}-user-${variant}.oci.tar"
+            platform_digest="$(cat "$evidence/${ARCH}-user-${variant}.digest")"
+            test "$("$crane" digest --insecure "$registry_reference")" = "$platform_digest"
+            pinned_reference="${registry_reference}@${platform_digest}"
+            docker pull --platform "$PLATFORM" "$pinned_reference"
+            observed_owner="$(docker run --rm --platform "$PLATFORM" --entrypoint /bin/sh "$pinned_reference" \
+              -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"')"
+            test "$observed_owner" = "$owner"
+            container_id="$(docker run --detach --rm --platform "$PLATFORM" --network host \
+              --env WEFTY_SERVICE_PORT="$port" --env WEFTY_SERVICE_DIR=/tmp/wefty-service "$pinned_reference")"
+            cleanup() { docker stop --time 15 "$container_id" >/dev/null 2>&1 || true; }
+            trap cleanup EXIT
+            for _ in $(seq 1 60); do
+              if curl --fail --silent "http://127.0.0.1:${port}/healthz" > "$evidence/${ARCH}-user-${variant}-health.json"; then break; fi
+              sleep 1
+            done
+            jq -e --argjson port "$port" '.service_directory == "/tmp/wefty-service" and .listening_port == $port and (.pid > 0)' \
+              "$evidence/${ARCH}-user-${variant}-health.json"
+            docker stop --time 15 "$container_id"
+            trap - EXIT
+            jq -n --arg platform "$PLATFORM" --arg digest "$platform_digest" --arg variant "$variant" --arg image_user "$owner" \
+              '{platform: $platform, digest: $digest, variant: $variant, image_user: $image_user, executed: true, health: true}' \
+              > "$evidence/${ARCH}-user-${variant}-runtime.json"
+            port=$((port + 1))
+          done
       - name: Dry-run digest-only release manifest assembly
         env:
           ARCH: ${{ matrix.arch }}
