@@ -214,7 +214,7 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 		config.CgroupRoot = "/sys/fs/cgroup"
 	}
 	if config.LogSealTimeout <= 0 {
-		config.LogSealTimeout = 5 * time.Second
+		config.LogSealTimeout = DefaultLogSealTimeout
 	}
 	if config.LostAttemptRetention <= 0 {
 		config.LostAttemptRetention = defaultLostAttemptRetention
@@ -1636,14 +1636,14 @@ func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest,
 				if !item.event.Seal.Complete {
 					logIncomplete = true
 					// A stream that never reached pipe EOF because the exited
-					// task was never released is not a log gap. Name that cause
-					// in the seal so the agent can separate the two.
+					// task was never released is not a log gap, and it is not
+					// this stream's own failure either. Report that cause in
+					// its own closed-vocabulary field and leave Reason saying
+					// what the stream actually observed.
 					attempt.mu.Lock()
 					sealReason := attempt.sealReason
 					attempt.mu.Unlock()
-					if sealReason != "" {
-						item.event.Seal.Reason = sealReason + ": " + item.event.Seal.Reason
-					}
+					item.event.Seal.ReleaseReason = sealReason
 				}
 			}
 			if item.event.Log != nil && item.event.Log.Gap != nil {
@@ -1705,7 +1705,7 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	if attempt.cancel != nil {
 		attempt.cancel()
 	}
-	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, taskStillReportedRunning, func(sealReason string) {
+	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, taskDeleteRefusedAsPrecondition, func(sealReason string) {
 		attempt.mu.Lock()
 		attempt.sealReason = sealReason
 		attempt.mu.Unlock()
@@ -1715,13 +1715,14 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	}
 }
 
-// taskStillReportedRunning distinguishes the one deletion refusal that is a
-// transient consequence of the exit event racing the runtime's task-state
-// transition. containerd refuses Task.Delete with a failed precondition while
-// the shim still reports the task running, and that refusal changes nothing,
-// so it is safe to retry inside the release budget. Every other error is a
-// real failure and ends the release immediately.
-func taskStillReportedRunning(err error) bool { return errdefs.IsFailedPrecondition(err) }
+// taskDeleteRefusedAsPrecondition reports the one deletion outcome that is
+// worth retrying. containerd checks task state client-side before deleting and
+// refuses with a failed precondition while the task is not stopped -- running,
+// which is the exit-event race this retry exists for, but also paused or
+// holding live exec processes. The refusal has no side effects, so retrying it
+// is safe in every one of those states, and the release budget still bounds the
+// wait. Every other error is a real failure and ends the release immediately.
+func taskDeleteRefusedAsPrecondition(err error) bool { return errdefs.IsFailedPrecondition(err) }
 
 func (engine *ContainerdEngine) ReapAttemptAsGuardian(ctx context.Context, authority AttemptAuthority) error {
 	attempt, err := engine.attempt(authority)
@@ -4279,7 +4280,7 @@ func cgroupAttemptResourceID(name string) (string, bool) {
 func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context, names []string, ownership map[string]durableAttemptOwnership) ([]DurableRetention, []SweepEvidence, error) {
 	timeout := engine.config.LogSealTimeout
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = DefaultLogSealTimeout
 	}
 	budget := remainingSweepPhaseBudget(ctx, timeout, 2)
 	clock := engine.config.Clock

@@ -895,7 +895,14 @@ type LogGapFrame struct {
 type LogSeal struct {
 	Stream   string `json:"stream"`
 	Complete bool   `json:"complete"`
-	Reason   string `json:"reason,omitempty"`
+	// Reason states what this stream observed, in free-form text.
+	Reason string `json:"reason,omitempty"`
+	// ReleaseReason names a cause that lives outside the stream: the attempt's
+	// task was never released, so no stream could reach pipe EOF at all. It is
+	// a closed vocabulary -- currently only TaskNeverStoppedSealReason -- so an
+	// agent separates that cause from a stream's own incompleteness by
+	// equality rather than by matching Reason text.
+	ReleaseReason string `json:"release_reason,omitempty"`
 }
 
 type WatchEventKind string

@@ -353,6 +353,10 @@ type OCILogSealObservation struct {
 	Stream   contract.LogStream
 	Complete bool
 	Reason   string
+	// ReleaseReason names a cause outside the stream, such as an attempt task
+	// that was never released so no stream could reach pipe EOF. Closed
+	// vocabulary; empty when the incompleteness is the stream's own.
+	ReleaseReason string
 }
 
 const (

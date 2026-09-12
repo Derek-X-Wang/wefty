@@ -265,10 +265,11 @@ type logEvidence struct {
 	sequences      map[string][]uint64
 	gaps           int
 	seals          map[string]bool
-	// sealReasons carries the helper's stated cause for every incomplete seal.
-	// Without it an incomplete-evidence row reads the same whether the streams
-	// were never sealed or a real log gap was recorded, and the run report
-	// cannot tell an operator which defect they are looking at.
+	// sealReasons carries the helper's stated cause for every incomplete seal,
+	// both the stream's own reason and the closed-vocabulary release reason.
+	// Without them an incomplete-evidence row reads the same whether the
+	// streams were never sealed or a real log gap was recorded, and the run
+	// report cannot tell an operator which defect they are looking at.
 	sealReasons map[string]string
 	result      *ocihelper.WatchResponse
 }
@@ -290,7 +291,12 @@ func collectLogEvidence(ctx context.Context, session attendedSession, authority 
 		}
 		if seal := event.Seal; seal != nil {
 			evidence.seals[seal.Stream] = seal.Complete
-			if seal.Reason != "" {
+			switch {
+			case seal.ReleaseReason != "" && seal.Reason != "":
+				evidence.sealReasons[seal.Stream] = seal.ReleaseReason + " (stream: " + seal.Reason + ")"
+			case seal.ReleaseReason != "":
+				evidence.sealReasons[seal.Stream] = seal.ReleaseReason
+			case seal.Reason != "":
 				evidence.sealReasons[seal.Stream] = seal.Reason
 			}
 		}

@@ -164,21 +164,26 @@ func TestContainerdTerminalPublicationReleasesTaskSealsLogsAndRetainsOOM(t *test
 // sealedLogSegments writes one framed record plus a pipe-EOF seal to each
 // stream, which is what the binary-v2 logger does once the shim closes its
 // write end -- that is, once the exited task is actually deleted.
+// sealedLogSegments runs on the cacheTerminal goroutine, so every failure is
+// reported with t.Errorf and returned rather than ending the test goroutine.
 func sealedLogSegments(t *testing.T, paths map[string]string) {
 	t.Helper()
 	for stream, path := range paths {
 		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 		if err != nil {
-			t.Fatalf("open %s segment: %v", stream, err)
+			t.Errorf("open %s segment: %v", stream, err)
+			return
 		}
-		if err := writeLogRecord(file, logFrameMagic, 0, []byte(stream+" complete")); err != nil {
-			t.Fatalf("write %s frame: %v", stream, err)
+		writeErr := writeLogRecord(file, logFrameMagic, 0, []byte(stream+" complete"))
+		if writeErr == nil {
+			writeErr = writeLogRecord(file, logSealMagic, 1, nil)
 		}
-		if err := writeLogRecord(file, logSealMagic, 1, nil); err != nil {
-			t.Fatalf("seal %s: %v", stream, err)
+		if writeErr != nil {
+			t.Errorf("seal %s segment: %v", stream, writeErr)
 		}
 		if err := file.Close(); err != nil {
-			t.Fatalf("close %s segment: %v", stream, err)
+			t.Errorf("close %s segment: %v", stream, err)
+			return
 		}
 	}
 }
@@ -258,8 +263,8 @@ func TestContainerdSealsLogsWhenExitedTaskIsBrieflyStillReportedRunning(t *testi
 		t.Fatalf("clean exit 0 reported incomplete log evidence: seals=%+v", seals)
 	}
 	for _, stream := range []string{"stdout", "stderr"} {
-		if !seals[stream].Complete {
-			t.Fatalf("%s seal = %+v, want complete", stream, seals[stream])
+		if !seals[stream].Complete || seals[stream].ReleaseReason != "" {
+			t.Fatalf("%s seal = %+v, want complete with no release reason", stream, seals[stream])
 		}
 	}
 	if got := releases.Load(); got < 2 {
@@ -299,8 +304,13 @@ func TestContainerdNamesTheCauseWhenExitedTaskNeverStops(t *testing.T) {
 	}
 	for _, stream := range []string{"stdout", "stderr"} {
 		seal := seals[stream]
-		if seal.Complete || !strings.HasPrefix(seal.Reason, TaskNeverStoppedSealReason+": ") {
-			t.Fatalf("%s seal = %+v, want an incomplete seal named %q", stream, seal, TaskNeverStoppedSealReason)
+		if seal.Complete || seal.ReleaseReason != TaskNeverStoppedSealReason {
+			t.Fatalf("%s seal = %+v, want an incomplete seal released as %q", stream, seal, TaskNeverStoppedSealReason)
+		}
+		// The stream's own reason stays its own observation, so a real
+		// corruption reason is never fronted by the release cause.
+		if seal.Reason == "" || strings.Contains(seal.Reason, TaskNeverStoppedSealReason) {
+			t.Fatalf("%s seal reason = %q, want the stream's own observation", stream, seal.Reason)
 		}
 	}
 }

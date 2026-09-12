@@ -7,9 +7,15 @@ import (
 	"time"
 )
 
-// DefaultTaskReleaseTimeout bounds exited-task deletion and binary-v2 logger
-// pipe sealing before terminal publication.
+// DefaultTaskReleaseTimeout bounds exited-task deletion before terminal
+// publication.
 const DefaultTaskReleaseTimeout = 5 * time.Second
+
+// DefaultLogSealTimeout bounds how long a stream waits for its binary-v2
+// logger pipe-EOF seal. The wait starts only once the terminal is published,
+// which is after the task release above, so the two bounds are serial: a
+// caller waiting for terminal log evidence must budget for both.
+const DefaultLogSealTimeout = 5 * time.Second
 
 // taskReleaseRetryInterval paces re-deletion of an exited task while the
 // runtime still reports it running. It is a poll cadence inside the existing

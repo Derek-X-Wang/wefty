@@ -1350,8 +1350,11 @@ precondition while the task is still reported running. The helper therefore
 retries deletion inside the task-release bound until the runtime accepts it and
 only then makes the terminal observable, so a clean exit yields complete log
 evidence. If that bound expires with the task still unreleased, every
-incomplete seal names `task_release_task_never_stopped` as its reason, which is
-how an agent separates "the streams were never sealed" from a real log gap. The
+incomplete seal carries `task_release_task_never_stopped` in its separate
+release-reason field, a closed vocabulary, leaving the seal's own reason to say
+what that stream observed. An agent therefore separates "no stream could seal
+because the task never stopped" from a stream's own gap or corruption by
+equality on that field, never by matching reason text. The
 adapter
 persists helper-observed image identity and performs the fenced L1 `Started`
 mutation before it exposes local running state; a rejected acknowledgement
