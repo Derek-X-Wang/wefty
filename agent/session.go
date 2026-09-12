@@ -456,6 +456,39 @@ func (session *agentSession) recoverOCIRuntimeValidated(ctx context.Context, val
 	return session.recoverOCIRuntimeLocked(ctx)
 }
 
+// recoverOCIRuntimePublished runs the whole operator-visible recovery
+// transaction -- intent validation, restrictive publication, barrier takeover,
+// removal resumption, functional probe, and the pinned positive publication --
+// inside the one mutex that serializes recoveries.
+//
+// The pinned publication used to run after that mutex was released (#409). Any
+// recovery already queued on it -- the heartbeat loop's, the background Lima
+// convergence loop's, or an attempt's helper-loss path -- then acquired it and
+// invalidated the helper generation while the positive heartbeat RPC was still
+// in flight. The publication failed its own pinned-generation check, so a
+// recovery that had genuinely succeeded reported "OCI runtime recovery failed"
+// to the operator while the queued recovery quietly finished the same work.
+func (session *agentSession) recoverOCIRuntimePublished(ctx context.Context, validateIntent func() error) error {
+	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
+		return err
+	}
+	defer session.ociRecoveryMu.Unlock()
+	if validateIntent != nil {
+		if err := validateIntent(); err != nil {
+			return err
+		}
+	}
+	generation, err := session.recoverOCIRuntimeLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if session.ociBootBarrier == nil {
+		return nil
+	}
+	_, err = session.publishCapabilityHeartbeat(ctx, &generation)
+	return err
+}
+
 func (session *agentSession) recoverOCIRuntimeAfterLoss(ctx context.Context, observed workloadrunner.RuntimeGeneration) error {
 	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
 		return err

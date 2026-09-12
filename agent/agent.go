@@ -654,7 +654,7 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	if a == nil || a.capabilities == nil || a.session == nil {
 		return nil
 	}
-	generation, err := a.session.recoverOCIRuntimeValidated(ctx, func() error {
+	return a.session.recoverOCIRuntimePublished(ctx, func() error {
 		if a.ociIntentGate == nil || a.ociIntentGate.observe == nil {
 			return nil
 		}
@@ -669,14 +669,6 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 		}
 		return a.session.allowOCIIntentIfUnchanged(suppressionSequence, observation.Revision)
 	})
-	if err != nil {
-		return err
-	}
-	if a.session.ociBootBarrier == nil {
-		return nil
-	}
-	_, err = a.session.publishCapabilityHeartbeat(ctx, &generation)
-	return err
 }
 
 // StopOCIRuntime suppresses OCI admission immediately and joins resident OCI

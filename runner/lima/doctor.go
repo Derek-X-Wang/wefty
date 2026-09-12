@@ -125,6 +125,14 @@ func WriteMinimalDoctorFacts(path string, facts MinimalDoctorFacts) error {
 		!facts.ReasonCode.Valid() && facts.ReasonCode != "" {
 		return errors.New("minimal doctor facts are invalid")
 	}
+	if len(facts.Lima.Transitions) > supervisorTransitionTrail {
+		return errors.New("minimal doctor facts are invalid")
+	}
+	for _, transition := range facts.Lima.Transitions {
+		if !transition.From.Valid() || !transition.To.Valid() {
+			return errors.New("minimal doctor facts are invalid")
+		}
+	}
 	payload, err := json.MarshalIndent(facts, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode minimal doctor facts: %w", err)
