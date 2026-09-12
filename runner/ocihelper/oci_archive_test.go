@@ -77,7 +77,7 @@ func TestInspectOCIArchiveRejectsRecomputedDigestMismatch(t *testing.T) {
 	}
 }
 
-func TestInspectOCIArchiveNormalizesDigestExportAnnotationToProvenanceName(t *testing.T) {
+func TestInspectOCIArchiveNamesDigestExportFromTheRequestedReference(t *testing.T) {
 	archive, topDigest, _ := testOCIArchive(t, false, true)
 	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:latest", topDigest.String())
 	if err != nil {
@@ -85,7 +85,121 @@ func TestInspectOCIArchiveNormalizesDigestExportAnnotationToProvenanceName(t *te
 	}
 	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
 	if inspection.Reference != "example.invalid/wefty:latest" {
-		t.Fatalf("normalized archive reference = %q", inspection.Reference)
+		t.Fatalf("requested archive reference = %q", inspection.Reference)
+	}
+}
+
+// A digest-only export names no artifact, so the import keeps the one identity
+// it does carry rather than inventing ":latest" for it. Inventing that name is
+// what made two variants of one repository collide (#418).
+func TestInspectOCIArchiveKeepsDigestExportIdentityWithoutARequestedName(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, true)
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.Reference != "example.invalid/wefty@"+topDigest.String() {
+		t.Fatalf("digest-export archive reference = %q", inspection.Reference)
+	}
+}
+
+// The published image-user echo variants are digest-only exports of one
+// repository. Keying them by a shared invented name made the second import
+// collide with the first and rejected the offline artifacts outright (#418).
+func TestInspectOCIArchiveKeysColocatedDigestExportsByDistinctNames(t *testing.T) {
+	numeric, numericDigest, _ := testOCIArchiveForImageUser(t, false, true, "13001:13002")
+	named, namedDigest, _ := testOCIArchiveForImageUser(t, false, true, "12001:12002")
+	if numericDigest == namedDigest {
+		t.Fatal("image-user variants produced one archive digest")
+	}
+	numericInspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(numeric), "", numericDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(numericInspection.Path) })
+	namedInspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(named), "", namedDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(namedInspection.Path) })
+	if numericInspection.Reference == namedInspection.Reference {
+		t.Fatalf("two image-user variants share the import name %q", numericInspection.Reference)
+	}
+	for _, inspection := range []ociArchiveInspection{numericInspection, namedInspection} {
+		if inspection.Reference != "example.invalid/wefty@"+inspection.TopLevel.Digest.String() {
+			t.Fatalf("variant archive reference = %q for %s", inspection.Reference, inspection.TopLevel.Digest)
+		}
+	}
+}
+
+// An explicit reference names what the export left ambiguous; it may retag a
+// digest-only archive but never move it to another repository.
+func TestInspectOCIArchiveRefusesARequestedNameOutsideTheArchiveRepository(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, true)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/other:user-numeric", topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "different repository") {
+		t.Fatalf("cross-repository requested reference error = %v", err)
+	}
+}
+
+func TestInspectOCIArchiveRefusesARequestedNameAgainstATaggedExport(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, false)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:user-numeric", topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "does not match the requested reference") {
+		t.Fatalf("tagged-export rename error = %v", err)
+	}
+}
+
+// An export that annotated no reference at all names nothing, so the operator
+// names it -- and without that name the refusal says so rather than inventing
+// one.
+func TestInspectOCIArchiveNamesAnUnannotatedExportFromTheRequestedReference(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, false)
+	archive = unannotatedTestOCIArchive(t, archive)
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/other:user-named", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.Reference != "example.invalid/other:user-named" {
+		t.Fatalf("unannotated archive reference = %q", inspection.Reference)
+	}
+	_, err = inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "", topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "image reference is missing") {
+		t.Fatalf("unnamed archive error = %v", err)
+	}
+}
+
+// A bare repository names a repository, not an artifact: the default tag is
+// invented, so an explicit reference may replace it inside that repository.
+// Pull-request lane archives are assembled exactly this way.
+func TestInspectOCIArchiveRetagsABareRepositoryExport(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, false)
+	archive = retagTestOCIArchive(t, archive, "example.invalid/wefty")
+	bare, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(bare.Path) })
+	if bare.Reference != "example.invalid/wefty:latest" {
+		t.Fatalf("bare repository archive reference = %q", bare.Reference)
+	}
+	named, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:candidate", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(named.Path) })
+	if named.Reference != "example.invalid/wefty:candidate" {
+		t.Fatalf("retagged bare repository archive reference = %q", named.Reference)
+	}
+}
+
+func TestInspectOCIArchiveRefusesADigestedRequestedReference(t *testing.T) {
+	archive, topDigest, _ := testOCIArchive(t, false, true)
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty@"+topDigest.String(), topDigest.String())
+	if err == nil || !strings.Contains(err.Error(), "must not contain a digest") {
+		t.Fatalf("digested requested reference error = %v", err)
 	}
 }
 
@@ -243,7 +357,18 @@ func testMultiPlatformOCIArchive(t *testing.T) ([]byte, digest.Digest, digest.Di
 
 func testOCIArchive(t *testing.T, corruptConfig, digestedReference bool) ([]byte, digest.Digest, digest.Digest) {
 	t.Helper()
-	config, err := json.Marshal(ocispec.Image{Platform: ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}})
+	return testOCIArchiveForImageUser(t, corruptConfig, digestedReference, "")
+}
+
+// testOCIArchiveForImageUser builds the same archive under a different image
+// user, which is exactly how the published echo variants differ: one
+// repository, one platform, distinct bytes and therefore distinct digests.
+func testOCIArchiveForImageUser(t *testing.T, corruptConfig, digestedReference bool, imageUser string) ([]byte, digest.Digest, digest.Digest) {
+	t.Helper()
+	config, err := json.Marshal(ocispec.Image{
+		Platform: ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH},
+		Config:   ocispec.ImageConfig{User: imageUser},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,6 +488,82 @@ func rewriteTestOCIArchive(t *testing.T, source []byte, prefix []tar.Header, rew
 			t.Fatal(err)
 		}
 		if _, err := io.Copy(writer, reader); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+// unannotatedTestOCIArchive drops the name annotations an exporter would have
+// written, leaving an archive that identifies bytes but no image.
+func unannotatedTestOCIArchive(t *testing.T, archive []byte) []byte {
+	t.Helper()
+	return rewriteTestOCIArchiveIndex(t, archive, func(descriptor *ocispec.Descriptor) { descriptor.Annotations = nil })
+}
+
+// retagTestOCIArchive rewrites both name annotations, so a test can express
+// the shapes real exporters produce: a bare repository, or a tagged artifact.
+func retagTestOCIArchive(t *testing.T, archive []byte, reference string) []byte {
+	t.Helper()
+	return rewriteTestOCIArchiveIndex(t, archive, func(descriptor *ocispec.Descriptor) {
+		descriptor.Annotations = map[string]string{images.AnnotationImageName: reference}
+	})
+}
+
+// rewriteTestOCIArchiveIndex edits the layout's index.json, which names the
+// archive's top-level descriptor but is not itself a digested blob.
+func rewriteTestOCIArchiveIndex(t *testing.T, archive []byte, rewrite func(*ocispec.Descriptor)) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	writer := tar.NewWriter(&output)
+	reader := tar.NewReader(bytes.NewReader(archive))
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Name == "index.json" {
+			var index ocispec.Index
+			if err := json.Unmarshal(payload, &index); err != nil {
+				t.Fatal(err)
+			}
+			if len(index.Manifests) != 1 {
+				t.Fatalf("test archive index has %d manifests", len(index.Manifests))
+			}
+			rewrite(&index.Manifests[0])
+			document := map[string]any{}
+			if err := json.Unmarshal(payload, &document); err != nil {
+				t.Fatal(err)
+			}
+			rewritten, err := json.Marshal(index.Manifests)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifests any
+			if err := json.Unmarshal(rewritten, &manifests); err != nil {
+				t.Fatal(err)
+			}
+			document["manifests"] = manifests
+			payload, err = json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			header.Size = int64(len(payload))
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(payload); err != nil {
 			t.Fatal(err)
 		}
 	}

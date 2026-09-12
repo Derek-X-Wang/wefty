@@ -73,6 +73,15 @@ type IntentResponse struct {
 	RuntimeQuiesced     bool           `json:"runtime_quiesced,omitempty"`
 }
 
+// LoadImageRequest carries the operator's explicit import name. An OCI
+// archive whose export left it ambiguous -- one annotating only a digest, or
+// no reference at all -- has no name the import can be keyed by, so the
+// operator supplies one here. An empty Reference keeps the archive's own
+// annotated identity.
+type LoadImageRequest struct {
+	Reference string `json:"reference,omitempty"`
+}
+
 type LoadImageResponse struct {
 	TopLevelDigest string                  `json:"top_level_digest"`
 	PlatformDigest string                  `json:"platform_digest"`
@@ -176,7 +185,7 @@ type Service interface {
 	Setup(context.Context, SetupRequest) (SetupResponse, error)
 	Start(context.Context, IntentMutationRequest) (IntentResponse, error)
 	Stop(context.Context, IntentMutationRequest) (IntentResponse, error)
-	LoadImage(context.Context, io.Reader) (LoadImageResponse, error)
+	LoadImage(context.Context, LoadImageRequest, io.Reader) (LoadImageResponse, error)
 	Removals(context.Context) (RemovalsResponse, error)
 }
 
@@ -186,7 +195,7 @@ type ServiceFuncs struct {
 	SetupFunc     func(context.Context, SetupRequest) (SetupResponse, error)
 	StartFunc     func(context.Context, IntentMutationRequest) (IntentResponse, error)
 	StopFunc      func(context.Context, IntentMutationRequest) (IntentResponse, error)
-	LoadImageFunc func(context.Context, io.Reader) (LoadImageResponse, error)
+	LoadImageFunc func(context.Context, LoadImageRequest, io.Reader) (LoadImageResponse, error)
 	RemovalsFunc  func(context.Context) (RemovalsResponse, error)
 }
 
@@ -225,11 +234,11 @@ func (service ServiceFuncs) Stop(ctx context.Context, request IntentMutationRequ
 	return service.StopFunc(ctx, request)
 }
 
-func (service ServiceFuncs) LoadImage(ctx context.Context, archive io.Reader) (LoadImageResponse, error) {
+func (service ServiceFuncs) LoadImage(ctx context.Context, request LoadImageRequest, archive io.Reader) (LoadImageResponse, error) {
 	if service.LoadImageFunc == nil {
 		return LoadImageResponse{}, runtimeUnavailable("OCI image loading is unavailable", nil)
 	}
-	return service.LoadImageFunc(ctx, archive)
+	return service.LoadImageFunc(ctx, request, archive)
 }
 
 func (service ServiceFuncs) Removals(ctx context.Context) (RemovalsResponse, error) {

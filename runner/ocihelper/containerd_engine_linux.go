@@ -814,26 +814,7 @@ func ensureImageResponse(evidence ImageEvidence) EnsureImageResponse {
 func (engine *ContainerdEngine) bindImportedImage(ctx context.Context, reference string, target ocispec.Descriptor) error {
 	engine.imageNameMu.Lock()
 	defer engine.imageNameMu.Unlock()
-	existing, err := engine.client.ImageService().Get(ctx, reference)
-	if err == nil {
-		if existing.Target.Digest != target.Digest {
-			return imageMechanicsError(ImageFailureManifestRejected, target.Digest.String(), errors.New("OCI image name already identifies different bytes"))
-		}
-		return nil
-	}
-	if !errdefs.IsNotFound(err) {
-		return classifyImageOperationError(err, target.Digest.String())
-	}
-	if _, err := engine.client.ImageService().Create(ctx, images.Image{Name: reference, Target: target}); err != nil {
-		if !errdefs.IsAlreadyExists(err) {
-			return classifyImageOperationError(err, target.Digest.String())
-		}
-		existing, err = engine.client.ImageService().Get(ctx, reference)
-		if err != nil || existing.Target.Digest != target.Digest {
-			return imageMechanicsError(ImageFailureManifestRejected, target.Digest.String(), errors.New("OCI image name already identifies different bytes"))
-		}
-	}
-	return nil
+	return classifyImageOperationError(bindImageName(ctx, engine.client.ImageService(), reference, target), target.Digest.String())
 }
 
 func (engine *ContainerdEngine) imageOperationLease(ctx context.Context, key imageOperationKey) (context.Context, func(), error) {
