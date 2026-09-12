@@ -158,29 +158,62 @@ the helper instance/session generation before each row.
    boot topology section above; it produces the `probe` row and needs no
    further procedure.
 
-### Exclusive helper session for items 2-4
+### Exclusive helper session for items 2-4 and the fallback half of item 6
 
-Items 2-4 below (`task_logs_delete`, `mount_validation`, `host_to_guest`) call
-`Run`/`Mount`/`DialAttemptPort` directly against the helper rather than through
-`wefty submit`, and the helper accepts only one session at a time.
-`dev.wefty.agent` has held that session continuously since it started, and
-until now the runbook gave no way to take it for these three rows (#403). Take
-it the same way [m3.5-mac-computer.md](m3.5-mac-computer.md)'s `mac.removal`
-row takes it from the daemon for its independent removal inventory:
+Items 2-4 below (`task_logs_delete`, `mount_validation`, `host_to_guest`) and
+the bridge half of item 6 (`guest_to_host_fallback`) call
+`Run`/`Mount`/`DialAttemptPort`/`DialHostBridge` directly against the helper
+rather than through `wefty submit`, and the helper accepts only one session at
+a time. `dev.wefty.agent` has held that session continuously since it started,
+so take it the same way [m3.5-mac-computer.md](m3.5-mac-computer.md)'s
+`mac.removal` row takes it from the daemon for its independent removal
+inventory:
 
 ```sh
 sudo launchctl bootout system/dev.wefty.agent
 pgrep -fl wefty-agent   # must print nothing
 ```
 
-With the daemon offline, open one direct helper-client session against the
-guest socket and, in that one session, run items 2, 3, and 4 in order — the
-same `Run`/mount-validate/`DialAttemptPort` operations the runbook already
-describes for each, just issued directly instead of through the agent. For
-each of the three rows, record `session_id` (the artifact's shared session
-ID), the exact `command` you ran, and `exit_code: 0`; the gate
+With the daemon offline, drive all four rows from one direct helper-client
+session with `TestAttendedHelperTransportRows` (#410). Once, before the first
+attended run on this host, create the device-node mount negative, which macOS
+will not let a non-root user make:
+
+```sh
+mkdir -p "$WEFTY_ATTENDED_MOUNT_ROOT/negatives"
+sudo mknod "$WEFTY_ATTENDED_MOUNT_ROOT/negatives/device" c 1 3
+```
+
+Then, inside the window:
+
+```sh
+WEFTY_OCI_HELPER_SOCKET=/path/to/forwarded/oci-helper.sock \
+WEFTY_OCI_HELPER_CHECKSUM=<installed helper sha256> \
+WEFTY_OCI_PROBE_REFERENCE=<pinned probe reference> \
+WEFTY_OCI_PROBE_DIGEST=<pinned probe top-level digest> \
+WEFTY_OCI_PROBE_ARCHIVE=/path/to/acceptance-image.tar \
+WEFTY_ATTENDED_SESSION_ID=<the artifact's shared session ID> \
+WEFTY_ATTENDED_MOUNT_ROOT=<the configured operator host mount root> \
+WEFTY_ATTENDED_ROWS_OUT=/abs/path/transport-rows.json \
+  go test -tags=service_acceptance -run TestAttendedHelperTransportRows \
+  -count=1 -v ./serviceacceptance
+```
+
+It refuses to start unless `pgrep -fl wefty-agent` is empty, performs each
+row's operations in order against the guest socket, and writes
+`task_logs_delete`, `mount_validation`, `host_to_guest` and
+`guest_to_host_fallback` to `WEFTY_ATTENDED_ROWS_OUT` in the receipt's row
+shape, each carrying `session_id`, the exact `command`, `exit_code`, and a
+`reason` recording the typed refusal code every negative returned. The gate
 (`runner/lima/service_acceptance_test.go`) requires no other typed field for
-these three rows beyond that shared shape.
+these rows beyond that shared shape. Fold the fragment into the receipt as the
+Receipt section describes. The mount row proves the host-to-guest translation
+from both sides: the payload's write appears on the host under the operator
+mount root and, read back with `limactl shell`, in the guest under
+`/mnt/wefty-host`. The one clause the entrypoint does not exercise is
+item 6's "discovery failure must fail start and must not select fallback",
+which is agent-side and outside a direct helper-client session; the row's
+`reason` says so verbatim, so judge the row with that in view.
 
 Re-install and restart the daemon immediately afterward, before item 5 and the
 rest of the runtime matrix — service publication, service data, and the
@@ -472,6 +505,62 @@ least the withdrawn and the reopened revision, and `inventories` with at least
 the pre-sweep and the post-sweep independent verification — the gate requires
 two or more entries in each of those three lists.
 
+`TestAttendedHelperLossRows` (#410) drives that whole sequence from one direct
+helper-client session, inside the same daemon-booted-out window:
+
+```sh
+WEFTY_OCI_HELPER_SOCKET=... WEFTY_OCI_HELPER_CHECKSUM=... \
+WEFTY_OCI_PROBE_REFERENCE=... WEFTY_OCI_PROBE_DIGEST=... \
+WEFTY_OCI_PROBE_ARCHIVE=/path/to/acceptance-image.tar \
+WEFTY_ATTENDED_SESSION_ID=<the artifact's shared session ID> \
+WEFTY_LIMA_INSTANCE=wefty-oci \
+WEFTY_ATTENDED_ROWS_OUT=/abs/path/loss-rows.json \
+  go test -tags=service_acceptance -run TestAttendedHelperLossRows \
+  -count=1 -v ./serviceacceptance
+```
+
+Two fault executions produce the three rows. The helper-loss execution
+produces both `helper_loss` (the ordered recovery above) and
+`sweep_before_recovery` (the assertion that the verified sweep precedes the
+functional probe); injecting the same fault twice would prove nothing extra,
+so each row carries its own `session_id`, `command` and `exit_code`, and each
+row's `reason` names the fault execution it came from. The VM-loss execution
+produces `vm_loss` under a fresh textual boot session ID, so the reuse the
+runbook asks for is exercised exactly once, by the helper repetition.
+
+By default the entrypoint takes the faults itself and records the exact
+commands in each row's `reason`:
+
+| Fault | Injected | Returned |
+| --- | --- | --- |
+| helper | `limactl shell --workdir=/ <instance> sudo systemctl stop dev.wefty.oci-helper.socket dev.wefty.oci-helper.service` | `... systemctl start dev.wefty.oci-helper.socket` |
+| VM | `limactl stop <instance>` | `limactl start <instance>` |
+
+Set `WEFTY_ATTENDED_MANUAL_FAULTS=1` to take them by hand instead: the
+entrypoint prints the exact command and waits until you `touch` the
+acknowledgement file it names (`WEFTY_ATTENDED_FAULT_ACK`, default
+`/tmp/wefty-attended-fault-ack`).
+
+`sweep_before_recovery` is a structural claim rather than a timing race, and
+the row says so: `Ensure` acquires the session and completes the verified
+sweep as one step, so between the invalidation and the re-acquire there is no
+session to probe with at all. The row asserts that the pre-sweep probe was
+refused by the unprepared barrier specifically — an unrelated failure does not
+satisfy it — and that the probe then succeeded only against a generation whose
+sweep had completed.
+
+The post-fault "old tunnel unreachable" and "no new claim admitted" entries
+are restrictive observations from a lost session, not typed helper refusals:
+once the control stream is gone the helper answers nothing. The driver
+excludes its own context deadline and cancellation so they cannot masquerade
+as the runtime refusing, and each row's `reason` repeats the qualification.
+
+The `capability_revisions` these rows emit are the driver's own local OCI
+capability observations, carrying the barrier's typed reason code. No L1
+revision exists inside either window, because `dev.wefty.agent` is booted out
+for the whole of it; L1 revision publication is proven separately by the
+Installed boot topology rows. Every row says this in its `reason`.
+
 Once all three rows are recorded, re-install and restart the daemon before
 continuing to the Receipt section's fold-in commands:
 
@@ -517,6 +606,15 @@ The redacted artifact is strict JSON with this shape:
     }
   }
 }
+```
+
+The two exclusive-window entrypoints write their rows to
+`WEFTY_ATTENDED_ROWS_OUT` in exactly this row shape, so folding them into the
+receipt is a merge rather than a transcription:
+
+```sh
+jq -s '.[0] as $receipt | $receipt + {rows: ($receipt.rows + .[1].rows + .[2].rows)}' \
+  receipt.json transport-rows.json loss-rows.json > receipt-merged.json
 ```
 
 It must contain PASS evidence for `template_permissions`, `probe`,
@@ -634,11 +732,13 @@ fixed in turn (#411). Naming the run's dominant blocker in source went stale
 both times, so the fragment producer no longer does: record the blocking ticket
 per row in the receipt's `blocked_by` field and it appears in the matrix
 verbatim. Either way the non-zero exit is the command working, not the command
-broken: the matrix cannot be green while a Mac cell is red. The six rows the runbook has no procedure for
-(`task_logs_delete`, `mount_validation`, `host_to_guest`, `helper_loss`,
-`vm_loss`, `sweep_before_recovery`) are typed `runbook_no_procedure` and are
-never attributed to a product defect. Like the artifact itself, the fragment and
-the assembled matrix stay outside Git.
+broken: the matrix cannot be green while a Mac cell is red. The rows that once
+had no procedure (`task_logs_delete`, `mount_validation`, `host_to_guest`,
+`guest_to_host_fallback`, `helper_loss`, `vm_loss`, `sweep_before_recovery`) now
+have one — #403 gave them the window and #410 gave them the client — so a
+non-PASS on any of them falls through like any other row, to that row's own
+`blocked_by` and reason. Like the artifact itself, the fragment and the
+assembled matrix stay outside Git.
 
 The attended agent-computer lane in
 [m3.5-mac-computer.md](m3.5-mac-computer.md) sits on top of this one and feeds a
