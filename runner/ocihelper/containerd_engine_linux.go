@@ -72,6 +72,7 @@ type containerdAttempt struct {
 	signal           Signal
 	signalCause      string
 	deleted          bool
+	sealReason       string
 	logAcknowledged  map[string]uint64
 	hostBridge       net.Listener
 	bridgeAcceptMu   sync.Mutex
@@ -1632,7 +1633,18 @@ func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest,
 			}
 			if item.event.Seal != nil {
 				sealed++
-				logIncomplete = logIncomplete || !item.event.Seal.Complete
+				if !item.event.Seal.Complete {
+					logIncomplete = true
+					// A stream that never reached pipe EOF because the exited
+					// task was never released is not a log gap. Name that cause
+					// in the seal so the agent can separate the two.
+					attempt.mu.Lock()
+					sealReason := attempt.sealReason
+					attempt.mu.Unlock()
+					if sealReason != "" {
+						item.event.Seal.Reason = sealReason + ": " + item.event.Seal.Reason
+					}
+				}
 			}
 			if item.event.Log != nil && item.event.Log.Gap != nil {
 				logIncomplete = true
@@ -1693,10 +1705,23 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	if attempt.cancel != nil {
 		attempt.cancel()
 	}
-	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, attempt.terminalReady); err != nil {
+	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, taskStillReportedRunning, func(sealReason string) {
+		attempt.mu.Lock()
+		attempt.sealReason = sealReason
+		attempt.mu.Unlock()
+		close(attempt.terminalReady)
+	}); err != nil {
 		log.Printf("release exited OCI task %s before log sealing: %v", attempt.authority.AttemptID, err)
 	}
 }
+
+// taskStillReportedRunning distinguishes the one deletion refusal that is a
+// transient consequence of the exit event racing the runtime's task-state
+// transition. containerd refuses Task.Delete with a failed precondition while
+// the shim still reports the task running, and that refusal changes nothing,
+// so it is safe to retry inside the release budget. Every other error is a
+// real failure and ends the release immediately.
+func taskStillReportedRunning(err error) bool { return errdefs.IsFailedPrecondition(err) }
 
 func (engine *ContainerdEngine) ReapAttemptAsGuardian(ctx context.Context, authority AttemptAuthority) error {
 	attempt, err := engine.attempt(authority)
