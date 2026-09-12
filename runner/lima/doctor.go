@@ -113,6 +113,28 @@ func BuildMinimalDoctorFacts(unitState UnitState, lima SupervisorFacts, handshak
 	return facts
 }
 
+// sanitizedTransitions keeps the newest well-formed transitions and nothing
+// else. The supervisor already refuses to append a malformed entry; this is the
+// same guarantee for a snapshot assembled by any other caller.
+func sanitizedTransitions(transitions []StateTransition) []StateTransition {
+	if len(transitions) == 0 {
+		return nil
+	}
+	kept := make([]StateTransition, 0, len(transitions))
+	for _, transition := range transitions {
+		if transition.From.Valid() && transition.To.Valid() {
+			kept = append(kept, transition)
+		}
+	}
+	if len(kept) > supervisorTransitionTrail {
+		kept = kept[len(kept)-supervisorTransitionTrail:]
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
 // WriteMinimalDoctorFacts atomically replaces one operator-readable JSON
 // snapshot. It never includes raw errors, command output, environment, or
 // helper session capabilities.
@@ -125,6 +147,11 @@ func WriteMinimalDoctorFacts(path string, facts MinimalDoctorFacts) error {
 		!facts.ReasonCode.Valid() && facts.ReasonCode != "" {
 		return errors.New("minimal doctor facts are invalid")
 	}
+	// The trail is supporting evidence, not a verdict. A malformed entry is
+	// dropped rather than allowed to fail the write: blanking the whole
+	// operator surface until the bad entry is evicted would cost far more than
+	// the one transition it hides.
+	facts.Lima.Transitions = sanitizedTransitions(facts.Lima.Transitions)
 	payload, err := json.MarshalIndent(facts, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode minimal doctor facts: %w", err)

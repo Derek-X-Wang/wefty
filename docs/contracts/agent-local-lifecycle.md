@@ -149,7 +149,11 @@ boot sweep, removal resumption, and the functional probe before publication.
 One shared cycle lock covers supervisor inspection/mutation and the helper boot
 barrier, so the watchdog cannot force-stop Lima during sweep. Recovery retires
 the old helper generation, publishes the restrictive revision, then performs
-Lima recovery, handshake/sweep, probe, and pinned positive publication. Every
+Lima recovery, handshake/sweep, probe, and pinned positive publication. The
+pinned positive publication is part of that one serialized recovery
+transaction, not a step after it: a recovery already queued behind it must not
+be able to retire the generation mid-publication and turn a recovery that
+succeeded into a reported failure. Every
 `limactl` call has a command deadline and the complete inspection/start/helper
 readiness cycle has one recovery deadline. Expiry force-stops once and leaves a
 capped-backoff retry for the next cycle, including a Running VM whose helper
@@ -164,7 +168,14 @@ before overwriting the binary.
 The #128 bootstrap facts file is an atomic operator-readable JSON snapshot,
 not a control socket or general doctor UI. It contains only schema version,
 observation time, launch unit, Lima/helper/probe state, Capability revision,
-and one stable reason code. Unit/helper/probe/instance states are closed types;
+the supervisor's monotonic repair counter and its bounded trail of observed
+Lima lifecycle transitions, and one stable reason code. The state field is a
+current value and the writer polls no faster than 20 seconds, so the trail is
+what makes a repair shorter than one observation window provable afterwards;
+it is capped, carries only closed state values and timestamps, and adds no
+polling. The repair counter counts every recovery that mutated a non-Running
+instance back to Running, whichever non-Running state Lima reported.
+Unit/helper/probe/instance states are closed types;
 `unit.state=launched_by_unit` is derived from the installed launch environment.
 The writer checks for content changes and polls no faster than 20 seconds. It
 never contains a raw command error, path detail,

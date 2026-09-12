@@ -357,7 +357,7 @@ func TestOCIRecoveryMutexAcquisitionHonorsContext(t *testing.T) {
 	defer session.ociRecoveryMu.Unlock()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 	defer cancel()
-	if _, err := session.recoverOCIRuntime(ctx); !errors.Is(err, context.DeadlineExceeded) {
+	if err := session.recoverOCIRuntimePublished(ctx, nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("context-aware OCI recovery lock = %v, want deadline", err)
 	}
 }

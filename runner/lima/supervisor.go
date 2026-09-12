@@ -24,6 +24,15 @@ const (
 	defaultLimaRecoveryTimeout    = 5 * time.Minute
 	defaultLimaRepairBackoff      = time.Second
 	maximumLimaRepairBackoff      = 30 * time.Second
+	// brokenFaultReinspectWindow bounds how long after a helper-loss signal one
+	// Stopped inspection is still treated as a fault that may still be
+	// settling. Lima writes Stopped and Broken into the same status file while
+	// a host fault settles, so the first read routinely wins that race and
+	// hides the Broken branch the supervisor is supposed to take -- on owner
+	// hardware the whole Broken window lasted about a second. One extra
+	// `limactl list` per fault resolves it; nothing polls faster, and outside
+	// the window a Stopped instance is just stopped.
+	brokenFaultReinspectWindow = 10 * time.Second
 )
 
 // InstanceState is the closed sanitized Lima lifecycle state.
@@ -45,16 +54,39 @@ func (state InstanceState) Valid() bool {
 	}
 }
 
+// supervisorTransitionTrail bounds the retained lifecycle trail. Eight entries
+// span the longest transition sequence the supervisor can produce in one
+// recovery (running -> broken -> stopped -> running) several times over, while
+// keeping the facts file small.
+const supervisorTransitionTrail = 8
+
+// StateTransition is one observed Lima lifecycle change. The supervisor's
+// State field is a current-value snapshot and the minimal facts file is only
+// rewritten on the 20-second observation floor, so a whole repair can begin and
+// finish between two samples with nothing left behind. The trail is what makes
+// the intermediate states provable after the fact without polling faster.
+type StateTransition struct {
+	From       InstanceState `json:"from"`
+	To         InstanceState `json:"to"`
+	ObservedAt time.Time     `json:"observed_at"`
+}
+
 // SupervisorFacts is the bounded supervisor observation exported to #128.
 type SupervisorFacts struct {
-	Instance       string                        `json:"instance"`
-	State          InstanceState                 `json:"state"`
-	Enabled        bool                          `json:"enabled"`
-	Recovering     bool                          `json:"recovering"`
-	ReasonCode     contract.CapabilityReasonCode `json:"reason_code,omitempty"`
-	ObservedAt     time.Time                     `json:"observed_at"`
-	RepairCount    uint64                        `json:"repair_count"`
-	StalledWindows uint64                        `json:"helper_handshake_stalled_windows"`
+	Instance   string                        `json:"instance"`
+	State      InstanceState                 `json:"state"`
+	Enabled    bool                          `json:"enabled"`
+	Recovering bool                          `json:"recovering"`
+	ReasonCode contract.CapabilityReasonCode `json:"reason_code,omitempty"`
+	ObservedAt time.Time                     `json:"observed_at"`
+	// RepairCount counts completed supervisor lifecycle repairs: every
+	// recovery that mutated a non-Running instance back to Running, plus the
+	// force-stops the helper-readiness deadline performs. It is monotonic for
+	// the life of the process, so a repair is provable long after the states
+	// it passed through have been overwritten.
+	RepairCount    uint64            `json:"repair_count"`
+	StalledWindows uint64            `json:"helper_handshake_stalled_windows"`
+	Transitions    []StateTransition `json:"transitions,omitempty"`
 }
 
 type timeoutContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
@@ -82,6 +114,35 @@ type Supervisor struct {
 	ensureMu sync.Mutex
 	mu       sync.RWMutex
 	facts    SupervisorFacts
+	// trailWarned keeps the dropped-transition warning to one line per process.
+	trailWarned bool
+	// helperLossAt stamps the last helper-loss signal. It is taken once, so a
+	// fault buys exactly one extra inspection however many cycles observe it.
+	helperLossAt time.Time
+}
+
+// noteHelperLoss records that the helper connection was lost, which on this
+// runtime means the instance underneath it faulted.
+func (supervisor *Supervisor) noteHelperLoss() {
+	if supervisor == nil {
+		return
+	}
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	supervisor.helperLossAt = supervisor.config.now()
+}
+
+// takeRecentHelperLoss reports whether a helper loss is recent enough to
+// explain a Stopped reading, and consumes it either way.
+func (supervisor *Supervisor) takeRecentHelperLoss() bool {
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	if supervisor.helperLossAt.IsZero() {
+		return false
+	}
+	elapsed := supervisor.config.now().Sub(supervisor.helperLossAt)
+	supervisor.helperLossAt = time.Time{}
+	return elapsed >= 0 && elapsed <= brokenFaultReinspectWindow
 }
 
 func NewSupervisor(config SupervisorConfig) (*Supervisor, error) {
@@ -135,7 +196,9 @@ func (supervisor *Supervisor) Facts() SupervisorFacts {
 	}
 	supervisor.mu.RLock()
 	defer supervisor.mu.RUnlock()
-	return supervisor.facts
+	facts := supervisor.facts
+	facts.Transitions = append([]StateTransition(nil), supervisor.facts.Transitions...)
+	return facts
 }
 
 func (supervisor *Supervisor) CapabilityReasonCode() contract.CapabilityReasonCode {
@@ -202,13 +265,31 @@ func (supervisor *Supervisor) ensureWithin(ctx context.Context) error {
 	if err := supervisor.recheckEnabled(ctx, intent); err != nil {
 		return supervisor.cancelToStopped(ctx, state, err)
 	}
+	// A Stopped reading just after a helper loss may be Lima's status file
+	// mid-settle rather than a settled instance. Re-inspect once so the Broken
+	// branch -- the bounded `stop --force` plus capped-backoff repair -- is
+	// normally the one that runs, instead of losing a coin flip to a plain
+	// restart that leaves the repair path unexercised (#409).
+	if state == InstanceStopped && supervisor.takeRecentHelperLoss() {
+		if settled, inspectErr := supervisor.inspect(ctx); inspectErr == nil && settled == InstanceBroken {
+			state = settled
+		}
+	}
 	switch state {
 	case InstanceRunning:
 		supervisor.record(state, true, false, "", false)
 		return nil
 	case InstanceStopped:
 		supervisor.record(state, true, true, contract.CapabilityReasonLimaStopped, false)
-		return supervisor.startAndVerify(ctx, intent, false)
+		if err := supervisor.startAndVerify(ctx, intent, false); err != nil {
+			return err
+		}
+		// A stopped instance the supervisor restarted is a completed repair as
+		// much as a Broken one is. Which of the two Lima reports for the same
+		// host fault is a race against Lima's own status file, so counting only
+		// the Broken branch left a real repair with repair_count 0 (#409).
+		supervisor.record(InstanceRunning, true, false, "", true)
+		return nil
 	case InstanceBroken:
 		supervisor.record(state, true, true, contract.CapabilityReasonLimaBroken, false)
 		return supervisor.repair(ctx, intent)
@@ -238,6 +319,7 @@ func (supervisor *Supervisor) recoveryNeeded(ctx context.Context, helperReady bo
 	recovering := state != InstanceRunning || !helperReady
 	if state == InstanceRunning && !helperReady {
 		reason = contract.CapabilityReasonHelperUnreachable
+		supervisor.noteHelperLoss()
 	}
 	supervisor.record(state, true, recovering, reason, false)
 	return recovering
@@ -300,6 +382,10 @@ func (supervisor *Supervisor) repair(ctx context.Context, expected OCIIntent) er
 		supervisor.record(InstanceBroken, true, false, contract.CapabilityReasonLimaBroken, true)
 		return fmt.Errorf("force-stop Broken Lima instance: %w", err)
 	}
+	// Record the stop the supervisor just performed. Without it the trail jumps
+	// straight from broken to running and the bounded `stop --force`/start
+	// repair the runbook asks for has no evidence that it happened (#409).
+	supervisor.record(InstanceStopped, true, true, contract.CapabilityReasonLimaBroken, false)
 	if err := supervisor.recheckEnabled(ctx, expected); err != nil {
 		supervisor.record(InstanceStopped, false, false, contract.CapabilityReasonOCIIntentDisabled, true)
 		return err
@@ -399,6 +485,9 @@ func (supervisor *Supervisor) record(state InstanceState, enabled, recovering bo
 	defer supervisor.mu.Unlock()
 	changed := supervisor.facts.State != state || supervisor.facts.Enabled != enabled ||
 		supervisor.facts.Recovering != recovering || supervisor.facts.ReasonCode != reason
+	if supervisor.facts.State != state {
+		supervisor.appendTransitionLocked(supervisor.facts.State, state)
+	}
 	supervisor.facts.State = state
 	supervisor.facts.Enabled = enabled
 	supervisor.facts.Recovering = recovering
@@ -409,6 +498,29 @@ func (supervisor *Supervisor) record(state InstanceState, enabled, recovering bo
 	if repaired {
 		supervisor.facts.RepairCount++
 	}
+}
+
+// appendTransitionLocked keeps the newest supervisorTransitionTrail entries. It
+// copies rather than appending in place so a SupervisorFacts value already
+// handed to the facts writer can never see the trail mutate under it.
+func (supervisor *Supervisor) appendTransitionLocked(from, to InstanceState) {
+	if !from.Valid() || !to.Valid() {
+		// Never let a malformed entry reach the facts file, where it would cost
+		// the operator the whole snapshot rather than one transition.
+		if !supervisor.trailWarned && supervisor.config.Logf != nil {
+			supervisor.trailWarned = true
+			supervisor.config.Logf("Lima supervisor dropped a transition outside the closed state vocabulary")
+		}
+		return
+	}
+	entry := StateTransition{From: from, To: to, ObservedAt: supervisor.config.now().UTC().Round(0)}
+	trail := make([]StateTransition, 0, len(supervisor.facts.Transitions)+1)
+	trail = append(trail, supervisor.facts.Transitions...)
+	trail = append(trail, entry)
+	if len(trail) > supervisorTransitionTrail {
+		trail = trail[len(trail)-supervisorTransitionTrail:]
+	}
+	supervisor.facts.Transitions = trail
 }
 
 func reasonForInstanceState(state InstanceState) contract.CapabilityReasonCode {
@@ -781,6 +893,7 @@ func (barrier *SupervisedBootBarrier) SetLossHandler(handler func(ocihelper.Help
 	if barrier != nil && barrier.Barrier != nil {
 		barrier.Barrier.SetLossHandler(func(generation ocihelper.HelperSession, err error) {
 			barrier.setReason(contract.CapabilityReasonHelperUnreachable)
+			barrier.Supervisor.noteHelperLoss()
 			if handler != nil {
 				handler(generation, err)
 			}

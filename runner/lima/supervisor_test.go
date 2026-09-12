@@ -883,3 +883,177 @@ func TestDecodeInstanceStateDistinguishesAbsenceFromInvalidInspection(t *testing
 		})
 	}
 }
+
+// TestSupervisorCountsARestartedStoppedInstanceAsARepair is half of the #409
+// gap-2 regression. Which state Lima reports for one host fault -- Stopped or
+// Broken -- is a race against Lima's own status file, and on owner hardware the
+// supervisor kept inspecting Stopped. Counting only the Broken branch left a
+// real, host-visible repair with repair_count 0, so the acceptance row had no
+// typed evidence that any repair had happened at all.
+func TestSupervisorCountsARestartedStoppedInstanceAsARepair(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning, InstanceStopped, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if repairs := supervisor.Facts().RepairCount; repairs != 0 {
+		t.Fatalf("repair count after a healthy cycle = %d, want 0", repairs)
+	}
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	facts := supervisor.Facts()
+	if facts.State != InstanceRunning || facts.Recovering {
+		t.Fatalf("recovered facts = %+v, want a settled running instance", facts)
+	}
+	if facts.RepairCount != 1 {
+		t.Fatalf("repair count after a restarted stopped instance = %d, want 1", facts.RepairCount)
+	}
+}
+
+// TestSupervisorTransitionTrailOutlivesTheTransientStates is the other half of
+// #409 gap 2. SupervisorFacts.State is a current-value snapshot and the minimal
+// facts file is only rewritten on the 20-second observation floor, so a repair
+// that begins and ends between two samples used to leave nothing behind: the
+// operator saw running before and running after, and no proof of the
+// broken -> stopped -> running transition in between.
+func TestSupervisorTransitionTrailOutlivesTheTransientStates(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning, InstanceBroken, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	facts := supervisor.Facts()
+	if facts.State != InstanceRunning {
+		t.Fatalf("state after repair = %q, want the transient states to be gone from the snapshot", facts.State)
+	}
+	if facts.RepairCount != 1 {
+		t.Fatalf("repair count = %d, want 1", facts.RepairCount)
+	}
+	var observed []InstanceState
+	for _, transition := range facts.Transitions {
+		observed = append(observed, transition.To)
+	}
+	if !slices.Contains(observed, InstanceBroken) {
+		t.Fatalf("transition trail = %+v, want the observed broken state retained", facts.Transitions)
+	}
+	tail := []InstanceState{InstanceBroken, InstanceStopped, InstanceRunning}
+	if len(observed) < len(tail) || !slices.Equal(observed[len(observed)-len(tail):], tail) {
+		t.Fatalf("transition trail = %+v, want a broken -> stopped -> running tail", facts.Transitions)
+	}
+	for _, transition := range facts.Transitions {
+		if !transition.From.Valid() || !transition.To.Valid() || transition.ObservedAt.IsZero() {
+			t.Fatalf("transition %+v is not a closed, timestamped fact", transition)
+		}
+	}
+}
+
+// TestSupervisorTransitionTrailIsBounded keeps the #128 facts file small: the
+// trail is evidence, not a log.
+func TestSupervisorTransitionTrailIsBounded(t *testing.T) {
+	intent := newMutableIntent(true)
+	states := make([]InstanceState, 0, 2*supervisorTransitionTrail*2)
+	for range 2 * supervisorTransitionTrail {
+		states = append(states, InstanceStopped, InstanceRunning)
+	}
+	runner := &supervisorRunner{states: states}
+	supervisor := newTestSupervisor(t, intent, runner)
+	for range 2 * supervisorTransitionTrail {
+		if err := supervisor.Ensure(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(supervisor.Facts().Transitions); got != supervisorTransitionTrail {
+		t.Fatalf("retained %d transitions, want the %d newest", got, supervisorTransitionTrail)
+	}
+}
+
+// TestSupervisorReinspectsStoppedAfterHelperLossAndTakesTheBrokenBranch pins
+// the #409 follow-up. Lima writes Stopped and Broken into the same status file
+// while a host fault settles, so the supervisor's single inspection kept
+// winning the race with Stopped and taking a plain restart -- leaving the
+// bounded `stop --force` plus capped-backoff repair path unexercised and the
+// acceptance row with no `broken` to read.
+func TestSupervisorReinspectsStoppedAfterHelperLossAndTakesTheBrokenBranch(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceBroken, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.noteHelperLoss()
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	commands := runner.commandsSnapshot()
+	if !slices.ContainsFunc(commands, func(command []string) bool {
+		return len(command) > 2 && command[1] == "stop" && command[2] == "--force"
+	}) {
+		t.Fatalf("commands = %v, want the Broken branch's bounded force-stop", commands)
+	}
+	facts := supervisor.Facts()
+	if facts.State != InstanceRunning || facts.RepairCount != 1 {
+		t.Fatalf("repaired facts = %+v, want one completed repair back to running", facts)
+	}
+	var observed []InstanceState
+	for _, transition := range facts.Transitions {
+		observed = append(observed, transition.To)
+	}
+	tail := []InstanceState{InstanceBroken, InstanceStopped, InstanceRunning}
+	if len(observed) < len(tail) || !slices.Equal(observed[len(observed)-len(tail):], tail) {
+		t.Fatalf("transition trail = %+v, want a broken -> stopped -> running tail", facts.Transitions)
+	}
+	// Exactly one extra inspection is bought per fault, not one per cycle.
+	if supervisor.takeRecentHelperLoss() {
+		t.Fatal("the helper-loss signal was not consumed by the re-inspection")
+	}
+}
+
+// TestSupervisorReinspectionKeepsAGenuinelyStoppedInstanceOnTheRestartBranch
+// is the other half: the re-inspection is a tie-break for a settling fault, not
+// a licence to claim `broken`. An instance both reads agree is stopped takes the
+// plain restart and leaves no broken entry for the acceptance row to misread.
+func TestSupervisorReinspectionKeepsAGenuinelyStoppedInstanceOnTheRestartBranch(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceStopped, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.noteHelperLoss()
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range runner.commandsSnapshot() {
+		if len(command) > 1 && command[1] == "stop" {
+			t.Fatalf("a stopped instance took the Broken branch: %v", runner.commandsSnapshot())
+		}
+	}
+	facts := supervisor.Facts()
+	if facts.State != InstanceRunning || facts.RepairCount != 1 {
+		t.Fatalf("restarted facts = %+v, want one completed repair back to running", facts)
+	}
+	for _, transition := range facts.Transitions {
+		if transition.From == InstanceBroken || transition.To == InstanceBroken {
+			t.Fatalf("transition trail = %+v, want no broken entry", facts.Transitions)
+		}
+	}
+}
+
+// TestSupervisorDoesNotReinspectAStoppedInstanceWithoutAFault keeps the cost at
+// one extra inspection per fault: an ordinary stopped instance is just stopped.
+func TestSupervisorDoesNotReinspectAStoppedInstanceWithoutAFault(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"limactl", "list", "--json", DefaultInstanceName},
+		{"limactl", "start", DefaultInstanceName},
+		{"limactl", "list", "--json", DefaultInstanceName},
+	}
+	if got := runner.commandsSnapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("commands = %v, want no extra inspection without a fault", got)
+	}
+}

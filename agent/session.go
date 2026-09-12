@@ -271,6 +271,22 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 		}
 		return node, nil
 	}
+	return session.publishRegistrationCapabilityPinned(ctx)
+}
+
+// publishRegistrationCapabilityPinned is registration's own pinned positive
+// publication: probe the generation the barrier is holding, then publish it.
+// Like recovery's, it runs inside the mutex that serializes recoveries. The
+// background Lima convergence loop is already running by the time a
+// re-registration reaches this point, and a recovery that retired the
+// generation mid-publication would withdraw OCI for a boot sweep that had in
+// fact succeeded (#409). The generation is read after the lock is taken, so it
+// is never one a queued recovery has already replaced.
+func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Context) (l1.Node, error) {
+	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
+		return l1.Node{}, err
+	}
+	defer session.ociRecoveryMu.Unlock()
 	generation, ok := session.ociBootBarrier.Generation()
 	if !ok {
 		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper session lost after removal recovery"))
@@ -435,25 +451,37 @@ func (session *agentSession) resumePendingRemovals(ctx context.Context) error {
 	return nil
 }
 
-// recoverOCIRuntime publishes a restrictive observation before reacquiring a
-// lost helper generation, then performs removal resume, binding-pin
-// reconciliation, and the functional probe. Ordinary healthy heartbeats do
-// not scan removals.
-func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.HelperSession, error) {
-	return session.recoverOCIRuntimeValidated(ctx, nil)
-}
-
-func (session *agentSession) recoverOCIRuntimeValidated(ctx context.Context, validateIntent func() error) (ocihelper.HelperSession, error) {
+// recoverOCIRuntimePublished runs the whole operator-visible recovery
+// transaction -- intent validation, restrictive publication, barrier takeover,
+// removal resumption, functional probe, and the pinned positive publication --
+// inside the one mutex that serializes recoveries.
+//
+// The pinned publication used to run after that mutex was released (#409). Any
+// recovery already queued on it -- the heartbeat loop's, the background Lima
+// convergence loop's, or an attempt's helper-loss path -- then acquired it and
+// invalidated the helper generation while the positive heartbeat RPC was still
+// in flight. The publication failed its own pinned-generation check, so a
+// recovery that had genuinely succeeded reported "OCI runtime recovery failed"
+// to the operator while the queued recovery quietly finished the same work.
+func (session *agentSession) recoverOCIRuntimePublished(ctx context.Context, validateIntent func() error) error {
 	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
-		return ocihelper.HelperSession{}, err
+		return err
 	}
 	defer session.ociRecoveryMu.Unlock()
 	if validateIntent != nil {
 		if err := validateIntent(); err != nil {
-			return ocihelper.HelperSession{}, err
+			return err
 		}
 	}
-	return session.recoverOCIRuntimeLocked(ctx)
+	generation, err := session.recoverOCIRuntimeLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if session.ociBootBarrier == nil {
+		return nil
+	}
+	_, err = session.publishCapabilityHeartbeat(ctx, &generation)
+	return err
 }
 
 func (session *agentSession) recoverOCIRuntimeAfterLoss(ctx context.Context, observed workloadrunner.RuntimeGeneration) error {
@@ -1144,6 +1172,45 @@ func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence, inte
 	return nil
 }
 
+// heartbeatOCIPinned runs the OCI half of one heartbeat tick -- revalidate the
+// live helper generation with a probe, or recover a lost one -- and publishes
+// the result inside the mutex that serializes recoveries. Pinning a generation
+// outside that mutex let a queued recovery retire it mid-publication, which
+// withdrew OCI and cost a transient rejoin backoff for a probe or recovery that
+// never failed; it is the same root cause as the operator-visible #409 defect
+// on a different path.
+func (session *agentSession) heartbeatOCIPinned(ctx context.Context) (l1.HeartbeatResponse, error) {
+	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
+		return l1.HeartbeatResponse{}, err
+	}
+	defer session.ociRecoveryMu.Unlock()
+	var pinned *ocihelper.HelperSession
+	if generation, ready := session.ociBootBarrier.Generation(); ready {
+		refreshErr := session.capabilities.refreshValidated(ctx, func() error {
+			return session.validateOCIGeneration(generation)
+		})
+		if refreshErr == nil {
+			pinned = &generation
+		} else if !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
+			session.logf("agent: OCI capability probe before heartbeat: %v", refreshErr)
+		}
+	} else {
+		generation, recoverErr := session.recoverOCIRuntimeLocked(ctx)
+		if recoverErr != nil {
+			if !capabilityProbeWasSkipped(recoverErr) && session.logf != nil {
+				session.logf("agent: OCI barrier recovery before heartbeat: %v", recoverErr)
+			}
+		} else {
+			pinned = &generation
+		}
+	}
+	response, err := session.publishCapabilityHeartbeatResponse(ctx, pinned)
+	if err != nil && pinned != nil {
+		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, err)
+	}
+	return response, err
+}
+
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
 	nextDelay := session.heartbeatInterval
@@ -1154,35 +1221,17 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			stopTimer(timer)
 			return
 		case <-timer.C():
-			var pinned *ocihelper.HelperSession
+			var response l1.HeartbeatResponse
+			var err error
 			if session.ociBootBarrier == nil {
-				if err := session.capabilities.refresh(ctx); err != nil && !capabilityProbeWasSkipped(err) && session.logf != nil {
-					session.logf("agent: capability probe before heartbeat: %v", err)
+				if refreshErr := session.capabilities.refresh(ctx); refreshErr != nil && !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
+					session.logf("agent: capability probe before heartbeat: %v", refreshErr)
 				}
-			} else if generation, ready := session.ociBootBarrier.Generation(); ready {
-				refreshErr := session.capabilities.refreshValidated(ctx, func() error {
-					return session.validateOCIGeneration(generation)
-				})
-				if refreshErr == nil {
-					pinned = &generation
-				} else if !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
-					session.logf("agent: OCI capability probe before heartbeat: %v", refreshErr)
-				}
+				response, err = session.publishCapabilityHeartbeatResponse(ctx, nil)
 			} else {
-				generation, recoverErr := session.recoverOCIRuntime(ctx)
-				if recoverErr != nil {
-					if !capabilityProbeWasSkipped(recoverErr) && session.logf != nil {
-						session.logf("agent: OCI barrier recovery before heartbeat: %v", recoverErr)
-					}
-				} else {
-					pinned = &generation
-				}
+				response, err = session.heartbeatOCIPinned(ctx)
 			}
-			response, err := session.publishCapabilityHeartbeatResponse(ctx, pinned)
 			if err != nil {
-				if pinned != nil {
-					session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, err)
-				}
 				classification := classifyAgentProtocolError(err)
 				if classification.destination == errorDestinationTransient {
 					nextDelay = backoff.next()

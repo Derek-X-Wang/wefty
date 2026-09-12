@@ -140,7 +140,8 @@ second VM supervisor. After bootstrap, capture all of these facts:
 
 Capture the atomic minimal-facts JSON named by
 `--oci-minimal-doctor-facts`. It contains only schema version, observation
-time, unit, Lima/helper/probe state, capability revision, and a stable
+time, unit, Lima/helper/probe state, capability revision, the supervisor's
+repair counter and bounded lifecycle transition trail, and a stable
 sanitized reason code. It must contain no raw error, helper session capability,
 credential, or environment dump. The unit state is `launched_by_unit`, state
 values use the closed contract vocabulary, and unchanged content is not
@@ -149,7 +150,23 @@ rewritten more frequently than the 20-second observation floor.
 Exercise supervision twice from a clean process-only baseline. With an enabled
 intent-file revision, stop Lima and require `stopped -> running`; inject or
 observe `Broken` and require `broken -> stopped -> running` through one bounded
-`stop --force`/capped-backoff repair. Persist a higher disabled intent-file
+`stop --force`/capped-backoff repair. Read both recoveries from the facts file's
+`lima.transitions` trail and `lima.repair_count`, not from the momentary
+`lima.state`: the 20-second observation floor is far coarser than a repair, so
+`lima.state` shows `running` on both sides of one and proves nothing. Each
+recovery must raise `lima.repair_count` by one and must leave a trail whose tail
+is the states the supervisor itself observed and performed —
+`stopped -> running` for the stopped row, `broken -> stopped -> running` for the
+broken row. `broken_enabled_recovery` PASSes only when the agent trail itself
+contains `broken`: that is the only evidence the bounded `stop --force` plus
+capped-backoff repair path ran at all. The supervisor re-inspects once when a
+fault's first reading is `stopped`, so the Broken branch is normally the one
+observed. Which state Lima reports for an injected
+fault is a race against Lima's own status file, so an injection that `limactl`
+recorded as `Broken` while the agent trail shows only `stopped -> running` did
+not produce the state this row tests — record it as NOT-RUN with reason
+`broken_not_observed_by_supervisor`, retry the injection, and never read it as a
+PASS. Record both views either way. Persist a higher disabled intent-file
 revision, stop Lima, and require it to remain stopped with no recovery mutation;
 if the attended harness cannot safely write that fixture, emit structured
 NOT-RUN for `stopped_disabled_no_recovery`. During each
