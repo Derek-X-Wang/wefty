@@ -24,24 +24,41 @@ import (
 // ---------------------------------------------------------------------------
 
 // fakeBarrier models the real BootBarrier's own state machine: a receipt is
-// available only while the barrier is prepared, Invalidate drops that, and
-// Ensure is the single step that acquires and completes the verified sweep.
+// available only while the barrier is prepared, Invalidate drops that, Ensure
+// is the single step that acquires and completes the verified sweep, and the
+// capability reason is written by an Ensure outcome and by nothing else --
+// which is the whole reason the loss driver has to re-Ensure to get one.
 type fakeBarrier struct {
 	session     attendedSession
 	receipts    []ocihelper.VerifiedSweepReceipt
 	prepared    bool
 	ensures     int
 	invalidated int
-	reason      contract.CapabilityReasonCode
-	ensureErr   error
+	// refuseEnsure is the fault window. While it answers true, Ensure fails
+	// with refusal and records refusalReason, exactly as the real barrier's
+	// recordCapabilityReason does on a failed takeover.
+	refuseEnsure  func() bool
+	refusal       error
+	refusalReason contract.CapabilityReasonCode
+	// reason is the last Ensure outcome, never set by anything else.
+	reason    contract.CapabilityReasonCode
+	ensureErr error
 }
 
 func (fake *fakeBarrier) Ensure(context.Context) error {
 	if fake.ensureErr != nil {
+		fake.reason = fake.refusalReason
+		fake.prepared = false
 		return fake.ensureErr
+	}
+	if fake.refuseEnsure != nil && fake.refuseEnsure() {
+		fake.reason = fake.refusalReason
+		fake.prepared = false
+		return fake.refusal
 	}
 	fake.ensures++
 	fake.prepared = true
+	fake.reason = ""
 	return nil
 }
 
@@ -75,6 +92,7 @@ type fakeInjector struct {
 	injected, restored int
 	injectErr          error
 	onInject           func()
+	onRestore          func()
 }
 
 func (fake *fakeInjector) inject(context.Context) ([]string, error) {
@@ -87,6 +105,9 @@ func (fake *fakeInjector) inject(context.Context) ([]string, error) {
 
 func (fake *fakeInjector) restore(context.Context) ([]string, error) {
 	fake.restored++
+	if fake.onRestore != nil {
+		fake.onRestore()
+	}
 	return []string{"fake restore"}, nil
 }
 
@@ -119,6 +140,7 @@ func healthyObservation(t *testing.T) lossObservation {
 		newClaimRefused:         "runtime unavailable",
 		preSweepProbeRefused:    "OCI boot barrier has not completed",
 		preSweepBarrierPrepared: false,
+		withdrawalEnsureRefused: "dial oci helper: connect: connection refused",
 		sweepObservedAt:         sweepAt, probeObservedAt: sweepAt.Add(3 * time.Second),
 		withdrawn: contract.CapabilityObservation{Revision: 1, ReasonCode: contract.CapabilityReasonHelperUnreachable},
 		reopened:  contract.CapabilityObservation{Revision: 2},
@@ -153,6 +175,10 @@ func TestCheckLossTransitionRejectsIncompleteRecoveries(t *testing.T) {
 		"probe never passed":             func(o *lossObservation) { o.probeObservedAt = time.Time{} },
 		"capability did not reopen":      func(o *lossObservation) { o.reopened = contract.CapabilityObservation{} },
 		"withdrawal reason not in vocab": func(o *lossObservation) { o.withdrawn.ReasonCode = "invented_reason" },
+		"withdrawal carries no reason":   func(o *lossObservation) { o.withdrawn.ReasonCode = "" },
+		"in-window re-Ensure was accepted": func(o *lossObservation) {
+			o.withdrawalEnsureRefused = ""
+		},
 	} {
 		observation := healthyObservation(t)
 		mutate(&observation)
@@ -333,7 +359,12 @@ func lossFakes(t *testing.T, config attendedConfig, tunnelSurvives bool) (*fakeB
 		return net.Dial("tcp", origin.Addr().String())
 	}
 	barrier := &fakeBarrier{
-		session: session, prepared: true, reason: contract.CapabilityReasonHelperUnreachable,
+		session: session, prepared: true,
+		// While the fault stands, a re-Ensure cannot reach the helper. That
+		// refusal is what gives the barrier a typed reason at all.
+		refuseEnsure:  func() bool { return faulted },
+		refusal:       errors.New("dial oci helper: connect: connection refused"),
+		refusalReason: contract.CapabilityReasonHelperUnreachable,
 		receipts: []ocihelper.VerifiedSweepReceipt{
 			{HelperSession: helperSession("helper-a", 4),
 				VerifiedInventory: ocihelper.ResourceInventory{Containers: []string{identity.ContainerID}}},
@@ -342,12 +373,16 @@ func lossFakes(t *testing.T, config attendedConfig, tunnelSurvives bool) (*fakeB
 				VerifiedInventory: ocihelper.ResourceInventory{}},
 		},
 	}
-	// The fault lands exactly when the injector runs, and the session stays
-	// lost until the barrier re-acquires.
-	injector := &fakeInjector{onInject: func() {
-		faulted = true
-		session.health = errors.New("OCI helper runtime lost")
-	}}
+	// The fault lands exactly when the injector runs, and the runtime stays
+	// unreachable -- to the old session and to any re-Ensure alike -- until the
+	// injector returns it.
+	injector := &fakeInjector{
+		onInject: func() {
+			faulted = true
+			session.health = errors.New("OCI helper runtime lost")
+		},
+		onRestore: func() { faulted = false },
+	}
 	return barrier, session, injector
 }
 
@@ -390,6 +425,71 @@ func TestDriveLossSequenceProducesBothRows(t *testing.T) {
 	ordering := lossRow(config, observation, checkSweepOrdering, "sweep_before_recovery", sweepOrderingNote)
 	if recovery.Status != "PASS" || ordering.Status != "PASS" {
 		t.Fatalf("rows = %+v %+v, want both PASS from one fault execution", recovery, ordering)
+	}
+}
+
+// The barrier records a capability reason only as an Ensure outcome, so the
+// driver has to take one inside the fault window. Without that the withdrawal
+// carries "" and cannot explain an OCI restriction at all.
+func TestDriveLossSequenceTakesItsTypedReasonFromAnInWindowReEnsure(t *testing.T) {
+	config := testConfig()
+	barrier, _, injector := lossFakes(t, config, false)
+	observation, err := driveLossSequence(context.Background(), lossDependencies{
+		barrier: barrier, config: config, ledger: newCapabilityLedger(nil), injector: injector,
+		kind: faultHelperLoss, settle: 100 * time.Millisecond, probe: barrier.fakeProbe,
+	})
+	if err != nil {
+		t.Fatalf("loss sequence: %v", err)
+	}
+	if observation.withdrawalEnsureRefused == "" {
+		t.Fatal("the in-window re-Ensure must be recorded, refusal and all")
+	}
+	if observation.withdrawn.ReasonCode != contract.CapabilityReasonHelperUnreachable {
+		t.Fatalf("withdrawal reason = %q, want the barrier's classification of the in-window refusal",
+			observation.withdrawn.ReasonCode)
+	}
+	if !observation.withdrawn.ReasonCode.ValidOCIRestriction() {
+		t.Fatalf("withdrawal reason %q must explain an OCI restriction", observation.withdrawn.ReasonCode)
+	}
+	if err := checkLossTransition(observation); err != nil {
+		t.Fatalf("recovery assertion: %v", err)
+	}
+	// The in-window refusal must not be mistaken for the recovery acquire.
+	if barrier.ensures != 1 {
+		t.Fatalf("barrier ensures = %d, want exactly one successful re-acquire", barrier.ensures)
+	}
+	row := lossRow(config, observation, checkLossTransition, "helper_loss", "")
+	if row.Status != "PASS" {
+		t.Fatalf("row = %+v, want PASS", row)
+	}
+	for _, phrase := range []string{capabilityReasonNote, string(contract.CapabilityReasonHelperUnreachable)} {
+		if !strings.Contains(row.Reason, phrase) {
+			t.Fatalf("row reason must say where the typed reason came from, got %q", row.Reason)
+		}
+	}
+}
+
+// A runtime that accepts a re-Ensure mid-fault is not restricted, and the row
+// must fail rather than report a withdrawal it cannot explain.
+func TestDriveLossSequenceFailsWhenTheInWindowReEnsureIsAccepted(t *testing.T) {
+	config := testConfig()
+	barrier, _, injector := lossFakes(t, config, false)
+	barrier.refuseEnsure = nil
+	observation, err := driveLossSequence(context.Background(), lossDependencies{
+		barrier: barrier, config: config, ledger: newCapabilityLedger(nil), injector: injector,
+		kind: faultHelperLoss, settle: 100 * time.Millisecond, probe: barrier.fakeProbe,
+	})
+	if err != nil {
+		t.Fatalf("loss sequence: %v", err)
+	}
+	if observation.withdrawalEnsureRefused != "" || observation.withdrawn.ReasonCode != "" {
+		t.Fatalf("observation = %+v, want no refusal and no typed reason", observation)
+	}
+	if err := checkLossTransition(observation); err == nil {
+		t.Fatal("a withdrawal with no observed refusal behind it must fail the row")
+	}
+	if row := lossRow(config, observation, checkLossTransition, "helper_loss", ""); row.Status == "PASS" {
+		t.Fatalf("row = %+v, want FAIL", row)
 	}
 }
 

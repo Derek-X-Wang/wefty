@@ -227,6 +227,15 @@ func (ledger *capabilityLedger) reopen() contract.CapabilityObservation {
 	return observation
 }
 
+// capabilityReasonNote says where the withdrawal's typed reason came from.
+// Without it a reader could take the reason for something the lost session
+// reported, which it is not: the barrier only ever records a reason as the
+// outcome of an Ensure.
+const capabilityReasonNote = "the withdrawal's typed reason is the boot barrier's own classification of a bounded " +
+	"re-Ensure taken inside the fault window, which is how the agent's readiness timer obtains one; the barrier " +
+	"records a reason on Ensure outcomes only, so a loss observed through transport failures on an " +
+	"already-acquired session carries no reason until something re-Ensures"
+
 const capabilityRevisionNote = "capability_revisions are this driver's own local OCI capability observations " +
 	"during the exclusive window; no L1 revision exists here because dev.wefty.agent is booted out, and L1 " +
 	"revision publication is proven separately by the Installed boot topology rows"
@@ -342,6 +351,20 @@ func checkLogEvidence(evidence logEvidence, stdoutMarker, stderrMarker string) e
 
 // deleteAndVerify is the positive Delete plus the independent absent Verify
 // every attempt-bearing row ends with.
+//
+// The Verify cannot be attempt-scoped. MethodVerify authorizes an
+// attempt-scoped Verify against a live attempt (runner/ocihelper/server.go,
+// authorizeAttempt), and a positive Delete is exactly what leaves the attempt
+// non-live, so a post-delete VerifyAttempt is refused unauthorized_attempt and
+// always will be. The agent never asks for one either: ReapAndVerify
+// (runner/oci/adapter.go) takes absence from the Delete receipt itself, which
+// the helper only reports positive after its own internal attempt
+// verification. That dependence on the receipt is the thing this row exists to
+// break, so absence is proven the other way the helper offers a session with
+// no live attempt: the read-only namespace inventory, projected onto this
+// attempt's deterministic resource names exactly as the helper's own attempt
+// scope projects it (filterInventory in containerd_engine_linux.go), with
+// every one of those names required absent.
 func deleteAndVerify(ctx context.Context, session attendedSession, authority ocihelper.AttemptAuthority) error {
 	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
 	if err != nil {
@@ -350,14 +373,145 @@ func deleteAndVerify(ctx context.Context, session attendedSession, authority oci
 	if !deleted.Deleted {
 		return errors.New("delete did not report positive removal")
 	}
-	verification, err := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyAttempt, Authority: &authority})
+	verification, err := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespaceReadOnly})
 	if err != nil {
 		return fmt.Errorf("verify attempt absence: %w", err)
 	}
-	if !verification.Absent {
-		return fmt.Errorf("attempt residue remains after delete: %+v", verification.Inventory)
+	return checkAttemptAbsence(verification, authority)
+}
+
+// attemptAbsenceNote is the one line every row using deleteAndVerify carries,
+// so a reader of the receipt knows which scope proved absence and why.
+const attemptAbsenceNote = "attempt absence is proven independently of the Delete receipt by a read-only namespace " +
+	"Verify projected onto the attempt's deterministic resource names, because the helper authorizes an " +
+	"attempt-scoped Verify only against a live attempt and a positive Delete is what ends that"
+
+// durableBeyondAttempt are the resource classes the helper's own contract
+// keeps past one attempt: a service data volume and its owner record belong to
+// the job, and a handoff volume is retained for its owner to collect. Their
+// presence in the namespace inventory after a Delete is the contract working,
+// not residue -- but they must still never appear as runtime residue, which is
+// what the residue check above them asserts for every class alike.
+var durableBeyondAttempt = map[ocihelper.RemovalResourceClass]bool{
+	ocihelper.RemovalResourceHandoffVolume:     true,
+	ocihelper.RemovalResourceServiceData:       true,
+	ocihelper.RemovalResourceServiceDataRecord: true,
+}
+
+// retainableAfterDelete are the only two transient classes the helper may
+// still show after a positive Delete, and only under an explicit bounded
+// durable retention naming this attempt. Anything else surviving Delete fails
+// the row outright.
+var retainableAfterDelete = map[ocihelper.RemovalResourceClass]ocihelper.DurableRetentionReason{
+	ocihelper.RemovalResourceLogSegments: ocihelper.DurableRetentionReasonLogSpoolSealing,
+	ocihelper.RemovalResourceCgroup:      ocihelper.DurableRetentionReasonCgroupReaping,
+}
+
+// checkAttemptAbsence asserts every resource the helper's own closed removal
+// registry names for this attempt is gone from the namespace the verification
+// observed. Driving the assertion from ExpectedRemovalResources rather than a
+// hand-written list is deliberate: a resource class added to the helper cannot
+// quietly drop out of this proof, because attemptInventoryEntries fails the
+// row on a class it does not know how to look up.
+func checkAttemptAbsence(verification ocihelper.VerifyResponse, authority ocihelper.AttemptAuthority) error {
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		return err
+	}
+	resources := ocihelper.ExpectedRemovalResources(identity, identity.HandoffVolumeDirectory, nil)
+	if len(resources) == 0 {
+		return errors.New("the helper's removal registry named no resources for this attempt")
+	}
+	for _, resource := range resources {
+		residue, err := attemptInventoryEntries(verification.RuntimeResidue, resource)
+		if err != nil {
+			return err
+		}
+		if len(residue) != 0 {
+			return fmt.Errorf("attempt residue remains after delete: %s %v", resource.Class, residue)
+		}
+		observed, err := attemptInventoryEntries(verification.Inventory, resource)
+		if err != nil {
+			return err
+		}
+		if len(observed) == 0 || durableBeyondAttempt[resource.Class] {
+			continue
+		}
+		reason, retainable := retainableAfterDelete[resource.Class]
+		if !retainable {
+			return fmt.Errorf("%s %v survived delete in the namespace inventory", resource.Class, observed)
+		}
+		for _, name := range observed {
+			if !boundDurableRetention(verification.DurableRetentions, resource.Class, name, reason, authority.AttemptID) {
+				return fmt.Errorf("%s %q survived delete without a bounded helper retention naming attempt %s",
+					resource.Class, name, authority.AttemptID)
+			}
+		}
 	}
 	return nil
+}
+
+// attemptInventoryEntries is this driver's copy of the projection the helper
+// applies for an attempt-scoped Verify: the entries of one inventory list that
+// carry this attempt's deterministic name.
+func attemptInventoryEntries(inventory ocihelper.ResourceInventory, resource ocihelper.RemovalResource) ([]string, error) {
+	var candidates []string
+	switch resource.Class {
+	case ocihelper.RemovalResourceLease:
+		candidates = inventory.Leases
+	case ocihelper.RemovalResourceSnapshot:
+		candidates = inventory.Snapshots
+	case ocihelper.RemovalResourceContainer:
+		candidates = inventory.Containers
+	case ocihelper.RemovalResourceTask:
+		candidates = inventory.Tasks
+	case ocihelper.RemovalResourceShim:
+		candidates = inventory.Shims
+	case ocihelper.RemovalResourceLogSegments:
+		candidates = inventory.LogSegments
+	case ocihelper.RemovalResourceHandoffVolume, ocihelper.RemovalResourceServiceData:
+		candidates = inventory.ManagedVolumes
+	case ocihelper.RemovalResourceServiceDataRecord:
+		candidates = inventory.ManagedVolumeRecords
+	case ocihelper.RemovalResourceCgroup:
+		// Cgroup inventory entries are guest paths and the helper matches their
+		// base name with any .scope suffix trimmed. path, not path/filepath:
+		// these are Linux paths observed from a macOS host.
+		matched := []string{}
+		for _, value := range inventory.Cgroups {
+			if strings.TrimSuffix(path.Base(value), ".scope") == resource.ID {
+				matched = append(matched, value)
+			}
+		}
+		return matched, nil
+	default:
+		return nil, fmt.Errorf(
+			"the helper's removal registry names resource class %q, which this row cannot look up in the namespace inventory",
+			resource.Class)
+	}
+	matched := []string{}
+	for _, value := range candidates {
+		if value == resource.ID {
+			matched = append(matched, value)
+		}
+	}
+	return matched, nil
+}
+
+// boundDurableRetention is the helper's own binding shape, checked here rather
+// than assumed: a retention that does not name this attempt, this class, this
+// resource and a closed bounded deadline explains nothing.
+func boundDurableRetention(retentions []ocihelper.DurableRetention, class ocihelper.RemovalResourceClass,
+	name string, reason ocihelper.DurableRetentionReason, attemptID string) bool {
+	for _, retention := range retentions {
+		if retention.Class == class && retention.ID == name && retention.Reason == reason &&
+			retention.AttemptID == attemptID && retention.Owner == ocihelper.DurableRetentionOwnerOCIHelper &&
+			retention.Bound > 0 && !retention.RecordedAt.IsZero() &&
+			retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) {
+			return true
+		}
+	}
+	return false
 }
 
 // reapAttempt is best-effort cleanup for a row that failed mid-attempt. A
@@ -464,9 +618,11 @@ func driveTaskLogsDelete(ctx context.Context, session attendedSession, config at
 		row.fail(err)
 		return row
 	}
+	row.appendReason(attemptAbsenceNote)
 	row.pass(fmt.Sprintf(
 		"Started with StartedAt %s; %d stdout and %d stderr frames, strictly ordered per stream and distinct; "+
-			"terminal exit 0 with no signal or runtime failure; Delete positive; independent attempt Verify absent",
+			"terminal exit 0 with no signal or runtime failure; Delete positive; every deterministic resource of "+
+			"the attempt independently verified absent",
 		response.StartedAt.UTC().Format(time.RFC3339Nano), len(evidence.sequences["stdout"]), len(evidence.sequences["stderr"])))
 	return row
 }
@@ -706,6 +862,7 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 		row.fail(err)
 		return row
 	}
+	row.appendReason(attemptAbsenceNote)
 	row.pass(fmt.Sprintf(
 		"positive: strict descendant read and written by the payload; the same bytes appear on the host under the "+
 			"operator mount root and in the guest at %s, which is the host-to-guest translation; container mountinfo "+
@@ -854,10 +1011,12 @@ func driveHostToGuest(ctx context.Context, session attendedSession, config atten
 		row.fail(err)
 		return row
 	}
+	row.appendReason(attemptAbsenceNote)
 	row.pass(fmt.Sprintf(
 		"one helper-allocated service endpoint on guest loopback port %d; request marker %q echoed and distinct "+
 			"payload-produced response marker %q returned through DialAttemptPort; negatives: %s; Delete positive "+
-			"and attempt Verify absent", port, exchange.echoed, exchange.responseMarker, observations))
+			"and every deterministic resource of the attempt independently verified absent",
+		port, exchange.echoed, exchange.responseMarker, observations))
 	return row
 }
 

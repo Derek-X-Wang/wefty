@@ -204,7 +204,13 @@ row's operations in order against the guest socket, and writes
 `task_logs_delete`, `mount_validation`, `host_to_guest` and
 `guest_to_host_fallback` to `WEFTY_ATTENDED_ROWS_OUT` in the receipt's row
 shape, each carrying `session_id`, the exact `command`, `exit_code`, and a
-`reason` recording the typed refusal code every negative returned. The gate
+`reason` recording the typed refusal code every negative returned. The
+"independent absent `Verify`" each attempt-bearing row ends with is a
+read-only namespace `Verify` projected onto that attempt's deterministic
+resource names, not an attempt-scoped one: the helper authorizes an
+attempt-scoped `Verify` only against a live attempt, and a positive `Delete`
+is exactly what ends that, so the independence the row claims has to come from
+the namespace side. Each row's `reason` says so. The gate
 (`runner/lima/service_acceptance_test.go`) requires no other typed field for
 these rows beyond that shared shape. Fold the fragment into the receipt as the
 Receipt section describes. The mount row proves the host-to-guest translation
@@ -588,6 +594,15 @@ capability observations, carrying the barrier's typed reason code. No L1
 revision exists inside either window, because `dev.wefty.agent` is booted out
 for the whole of it; L1 revision publication is proven separately by the
 Installed boot topology rows. Every row says this in its `reason`.
+
+The barrier records a typed capability reason as the outcome of an `Ensure`
+and of nothing else, so a loss seen through transport failures on a session
+that was already acquired carries no reason at all. The driver therefore takes
+a bounded re-`Ensure` inside the fault window — which is how the agent's own
+readiness timer obtains one — and the withdrawal carries that refusal's
+classification. A re-`Ensure` the runtime accepts means the runtime was not
+restricted, and fails the row. Each row's `reason` records the refusal
+verbatim alongside the code it produced.
 
 Once all three rows are recorded, re-install and restart the daemon before
 continuing to the Receipt section's fold-in commands:
