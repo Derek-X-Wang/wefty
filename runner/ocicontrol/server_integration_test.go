@@ -356,18 +356,20 @@ func TestControlSocketCarriesTheExplicitImportReference(t *testing.T) {
 	if err != nil || response.TopLevelDigest == "" || observed != reference {
 		t.Fatalf("named load-image response=%+v observed=%q err=%v", response, observed, err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://wefty.local/v1/images/load?unknown=1", strings.NewReader("archive"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Content-Type", "application/vnd.oci.image.layer.v1.tar")
-	result, err := client.http.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer result.Body.Close()
-	if result.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unknown load-image parameter status=%d", result.StatusCode)
+	for _, query := range []string{"unknown=1", "reference=a&reference=b"} {
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, "http://wefty.local/v1/images/load?"+query, strings.NewReader("archive"))
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/vnd.oci.image.layer.v1.tar")
+		result, resultErr := client.http.Do(request)
+		if resultErr != nil {
+			t.Fatal(resultErr)
+		}
+		_ = result.Body.Close()
+		if result.StatusCode != http.StatusBadRequest {
+			t.Fatalf("load-image query %q status=%d", query, result.StatusCode)
+		}
 	}
 	cancel()
 	select {

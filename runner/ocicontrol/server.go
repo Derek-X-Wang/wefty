@@ -314,6 +314,10 @@ func (server *Server) handleLoadImage(writer http.ResponseWriter, request *http.
 		writeControlError(writer, http.StatusBadRequest, ErrorInvalidRequest, "invalid node-local control request")
 		return
 	}
+	if len(query["reference"]) > 1 {
+		writeControlError(writer, http.StatusBadRequest, ErrorInvalidRequest, "load-image accepts one reference")
+		return
+	}
 	load := LoadImageRequest{Reference: query.Get("reference")}
 	query.Del("reference")
 	if len(query) != 0 {

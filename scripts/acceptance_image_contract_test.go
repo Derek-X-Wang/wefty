@@ -1492,6 +1492,9 @@ func TestAcceptanceImageUserVariantsArePublishedAndStayDerivedFromTheEchoImage(t
 		// published tag. Shipping them all under crane's digest-only pull
 		// reference is what made offline import reject them (#418).
 		"archive_reference=\"$IMAGE_NAME:${GITHUB_SHA}-user-${variant}\"",
+		// The echo image itself is exported the same way, so the published
+		// artifact set carries three distinct import names.
+		"archive_reference=\"$IMAGE_NAME:$GITHUB_SHA\"",
 		"org.opencontainers.image.ref.name",
 	} {
 		if !strings.Contains(publish, required) {

@@ -171,7 +171,7 @@ func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonO
 	// An archive exported by digest alone carries no name the import can be
 	// keyed by. Naming it here is what lets two variants of one repository be
 	// imported offline side by side instead of colliding (#418).
-	reference := flags.String("reference", "", "import name for an archive that annotates no reference or only a digest")
+	reference := flags.String("reference", "", "import name for an archive whose export named no artifact (no reference, or a repository with no tag)")
 	if err := flags.Parse(args); err != nil {
 		return usageError(err.Error())
 	}

@@ -226,12 +226,17 @@ verified top-level and admitted-platform digests plus bounded evidence. The
 import is keyed by the name the archive itself carries and never by an
 invented one: a tagged export keeps its tag, a digest-only export keeps its
 digest, and only a bare repository takes `:latest`, so two archives exported
-from one repository cannot claim one name. `--reference` names only what an
-export left ambiguous. It may name an archive carrying no reference, or retag
-one carrying only a digest inside that archive's own repository; it cannot
-rename a tagged export, cannot carry a digest, and cannot rebind a name that
-already identifies different bytes, which stays a typed `manifest_rejected`
-refusal.
+from one repository cannot claim one name. `--reference` names only an export
+that named no artifact. It may name an archive carrying no reference, or one
+carrying a repository with no tag — bare, or qualified only by a digest —
+inside that archive's own repository; it cannot rename a tagged export, cannot
+carry a digest, and cannot rebind a name that already identifies different
+bytes, which stays a typed `manifest_rejected` refusal. The reference travels
+as the one `load-image` query parameter, and a repeated or unknown parameter is
+refused rather than ignored. An agent older than this flag ignores it, so a new
+CLI against an old agent imports under the archive's own name with no error;
+compare the printed digests with the artifact receipt when that pairing is
+possible.
 Node-local JSON failures always carry a closed, sanitized `details.reason`:
 typed helper failures retain their helper protocol code, adapter-side platform
 diagnostics use `diagnostic_failure`, other recognized adapter failures use
