@@ -50,10 +50,8 @@ func resolveMountPath(path string) string {
 func ValidateHostMountRootIsMounted(root string, locations []string) error {
 	if filepath.IsAbs(root) {
 		resolvedRoot := resolveMountPath(root)
-		matchedLocations := make([]string, 0, len(locations))
 		for _, location := range locations {
 			resolvedLocation := resolveMountPath(location)
-			matchedLocations = append(matchedLocations, filepath.Clean(location))
 			if resolvedLocation == resolvedRoot {
 				return nil
 			}
