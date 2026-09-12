@@ -129,6 +129,28 @@ Each finding has `OK`, `FAILED`, or `NOT-RUN`, a stable `oci_*` code, severity, 
 
 Doctor also reports the documented #220 limitation: process-kind payloads currently share the agent user, so local peer credentials do not distinguish those payloads from the operator. Do not treat the operator-only control socket as process-payload UID isolation until #220 lands.
 
+## Read a removal that has not finished
+
+A Job stuck at `removal_pending` is waiting on the node-local agent's removal
+proof, not on L1. `wefty node oci removals` reads that proof:
+
+```sh
+wefty --json node oci removals
+```
+
+Each record carries the frozen job/removal-generation resource manifest (every
+attempt's lease, task, container, snapshot, shim, cgroup, framed-log directory,
+service-data volume and owner record), the phase it has reached
+(`prepared` -> `quarantined` -> `complete`), the positive runtime-quiescence
+receipt and its evidence kind, and, once the proof-gated deletion has run, the
+helper-generation absence attestation with one assertion per manifested
+resource.
+
+The verb is facts-only: it reads the agent's durable records and starts,
+retries or advances nothing. A removal leaves the list when L1 acknowledges its
+cleanup, so an empty list means either nothing is in flight or the removal
+already completed; check the Job in L1 to tell those apart.
+
 ## The helper stopped restarting (wedged startup barrier)
 
 `systemctl status dev.wefty.oci-helper.service` (Lima) or

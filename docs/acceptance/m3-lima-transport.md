@@ -299,16 +299,30 @@ and the guest socket back to `0660 root:wefty-oci`.
    image receipts must retain distinct repositories, digests, and tar names
    while sharing the candidate commit.
 10. Removal manifest: while the agent is offline, request removal of a bound OCI
-   service and observe L1 at exactly `removal_pending`. Return the same
-   node through the ordinary boot sweep barrier, then capture the immutable
-   job/removal-generation manifest with every attempt lease, task, container,
-   snapshot, shim, cgroup, framed-log directory, service-data volume, and its
-   owner record. Require the persisted positive prior-boot sweep receipt and
-   `prepared -> quarantined -> complete` phase history, then require the
-   proof-gated completion path to delete the guest-native service-data bytes
-   and owner record, persist a helper-generation assertion for every manifest
-   row, and only then reach `removed_verified`. Record the guest-native
-   inventories and phase facts in `service_removal_manifest_offline`.
+   service and observe L1 at exactly `removal_pending`. Start a poll of the
+   node-local removal read before returning the node, because the whole
+   proof runs and then releases itself in seconds once the agent is back:
+
+   ```sh
+   while sleep 0.2; do
+     printf '%s ' "$(date -u +%FT%TZ)"
+     wefty --json node oci removals
+   done | tee /absolute/path/to/removal-proof.jsonl &
+   ```
+
+   Return the same node through the ordinary boot sweep barrier. The poll
+   captures the immutable job/removal-generation manifest with every attempt
+   lease, task, container, snapshot, shim, cgroup, framed-log directory,
+   service-data volume, and its owner record, the positive prior-boot sweep
+   receipt in `runtime_quiescence`, and the `prepared -> quarantined ->
+   complete` phase history. Require the proof-gated completion path to delete
+   the guest-native service-data bytes and owner record, persist a
+   helper-generation assertion for every manifest row in `absence_attestation`,
+   and only then reach `removed_verified`; the removal leaves the read surface
+   when L1 acknowledges cleanup, so the last record the poll saw before the
+   list empties is the completed proof. Record the guest-native
+   inventories and phase facts in `service_removal_manifest_offline`, taking
+   `resource_manifests` and `removal_assertions` verbatim from that read.
 
 ### Denied quiescence proof (`service_failed_quiescence`)
 
@@ -530,12 +544,19 @@ Ticket #150 additionally requires `service_removal_manifest_offline` with
 `removal_phase=complete`, `removal_pending_observed=true`,
 `removal_completed=true`, `runtime_quiesced=true`, and non-empty
 `resource_manifests` naming the service
-data directory and its owner record independently. Hosted macOS runners are
+data directory and its owner record independently. `wefty node oci removals`
+is the surface those fields come from: `removal_phase` is the record's `phase`,
+`runtime_quiesced` is `runtime_quiescence.RuntimeQuiesced`, and
+`resource_manifests` is the record's `resource_manifests` array copied
+verbatim. Hosted macOS runners are
 `NOT-RUN`; they do not satisfy this owner-hardware row.
 
 Ticket #151 additionally requires `post_delete_attestation=true`,
 `service_data_bytes_absent=true`, `service_data_owner_record_absent=true`, and
 one `absent=true` assertion for every class/identity in `resource_manifests`.
+The same read carries them: a record whose `absence_attestation` is present
+proves the post-delete attestation, and its `assertions` array is the row's
+`removal_assertions`.
 The attended receipt must set `delete_attest_restart_observed=true` only after
 observing a real agent process restart at the helper-delete/attestation boundary
 without an early L1 acknowledgement. Injected callback errors may be recorded

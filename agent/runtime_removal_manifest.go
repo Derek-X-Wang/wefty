@@ -629,3 +629,63 @@ func validateRuntimeReapReceipt(receipt workloadrunner.ReapReceipt) error {
 func sameLocalRemoval(left, right localRemoval) bool {
 	return left.jobID == right.jobID && left.generation == right.generation && left.cleanupFence == right.cleanupFence && left.rootInstanceID == right.rootInstanceID
 }
+
+// RuntimeRemovalView is one durable runtime removal rendered for an operator
+// read. The removal proof -- the frozen resource manifest, the phase it has
+// reached, the quiescence receipt, and the per-resource absence attestation --
+// has always been durable, but nothing outside this package could see it, so a
+// job sitting at removal_pending was opaque to the operator holding the node.
+//
+// This is a projection, not a second source of truth: the caller gets the rows
+// as persisted, and reading them starts, retries and advances nothing.
+type RuntimeRemovalView struct {
+	JobID             string
+	RemovalGeneration uint64
+	CleanupFence      string
+	RootInstanceID    string
+	Phase             string
+	PreparedAt        time.Time
+	QuiescedAt        *time.Time
+	AttestedAt        *time.Time
+	CompletedAt       *time.Time
+	Quiescence        workloadrunner.ReapReceipt
+	ResourceManifests []workloadrunner.RuntimeResourceManifest
+	Attestation       *workloadrunner.RuntimeRemovalAttestation
+}
+
+// RuntimeRemovals lists every runtime removal this agent still carries, oldest
+// preparation first. A removal leaves the list when L1 acknowledges its
+// cleanup, because that is when the agent releases the durable record.
+func (a *Agent) RuntimeRemovals(ctx context.Context) ([]RuntimeRemovalView, error) {
+	if a == nil || a.outbox == nil {
+		return nil, errors.New("agent: runtime removal inspection is unavailable")
+	}
+	records, err := a.outbox.pendingRuntimeRemovals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]RuntimeRemovalView, 0, len(records))
+	for _, record := range records {
+		view := RuntimeRemovalView{
+			JobID:             record.removal.jobID,
+			RemovalGeneration: record.removal.generation,
+			CleanupFence:      record.removal.cleanupFence,
+			RootInstanceID:    record.removal.rootInstanceID,
+			Phase:             string(record.phase),
+			PreparedAt:        record.preparedAt,
+			QuiescedAt:        record.quiescedAt,
+			AttestedAt:        record.attestedAt,
+			CompletedAt:       record.completedAt,
+			Quiescence:        record.receipt,
+			ResourceManifests: slices.Clone(record.manifest.Attempts),
+		}
+		if record.attestation.Version != 0 {
+			attestation := record.attestation
+			attestation.Attempts = slices.Clone(record.attestation.Attempts)
+			attestation.Assertions = slices.Clone(record.attestation.Assertions)
+			view.Attestation = &attestation
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}

@@ -345,6 +345,7 @@ Commands:
   node setup-oci             Configure the installed node's OCI runtime
   node doctor                Read versioned node-local OCI diagnostics
   node oci start|stop        Set durable node-local OCI intent
+  node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision

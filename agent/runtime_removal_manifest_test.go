@@ -385,3 +385,78 @@ func testRuntimeResourceManifest(jobID, attemptID string) workloadrunner.Runtime
 		ServiceDataOwnerRecord: "service-volume-" + jobID + ".owner",
 	}
 }
+
+func TestAgentRuntimeRemovalsProjectsDurableProofWithoutAdvancingIt(t *testing.T) {
+	outbox, err := newEvidenceOutbox(t.TempDir(), "removal-read-node", 1024, systemClock{}, 1, time.Second, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	nodeAgent := &Agent{outbox: outbox}
+	empty, err := nodeAgent.RuntimeRemovals(t.Context())
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty removal read = %+v err=%v", empty, err)
+	}
+
+	createdAt := time.Date(2026, 9, 12, 9, 0, 0, 0, time.UTC)
+	if err := outbox.spool.storeRuntimeResourceManifest(t.Context(), testRuntimeResourceManifest("read-job", "attempt-a"), createdAt); err != nil {
+		t.Fatal(err)
+	}
+	removal := testRuntimeRemoval("read-job")
+	if err := outbox.spool.beginRemoval(t.Context(), removal, createdAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := nodeAgent.RuntimeRemovals(t.Context())
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared removal read = %+v err=%v", prepared, err)
+	}
+	if prepared[0].Phase != string(runtimeRemovalPrepared) || prepared[0].JobID != "read-job" ||
+		prepared[0].RemovalGeneration != removal.generation || prepared[0].CleanupFence != removal.cleanupFence ||
+		prepared[0].QuiescedAt != nil || prepared[0].Attestation != nil || len(prepared[0].ResourceManifests) != 1 ||
+		prepared[0].ResourceManifests[0].ServiceDataOwnerRecord != "service-volume-read-job.owner" {
+		t.Fatalf("prepared removal projection = %+v", prepared[0])
+	}
+
+	receipt := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootOCISweep, BootSessionID: "prior-boot", SweepEpoch: "epoch-1", HelperGeneration: 7}
+	if err := outbox.spool.recordRuntimeQuiesced(t.Context(), removal, receipt, createdAt.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := outbox.spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found {
+		t.Fatalf("stored removal = %+v found=%t err=%v", record, found, err)
+	}
+	if err := outbox.spool.recordRuntimeAttested(t.Context(), removal, testRuntimeRemovalAttestation(record.manifest), createdAt.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := nodeAgent.RuntimeRemovals(t.Context())
+	if err != nil || len(complete) != 1 {
+		t.Fatalf("complete removal read = %+v err=%v", complete, err)
+	}
+	if complete[0].Phase != string(runtimeRemovalComplete) || complete[0].Quiescence != receipt ||
+		complete[0].QuiescedAt == nil || complete[0].AttestedAt == nil || complete[0].CompletedAt == nil ||
+		complete[0].Attestation == nil || len(complete[0].Attestation.Assertions) == 0 {
+		t.Fatalf("complete removal projection = %+v", complete[0])
+	}
+	for _, assertion := range complete[0].Attestation.Assertions {
+		if !assertion.Absent {
+			t.Fatalf("projected attestation dropped a negative assertion: %+v", assertion)
+		}
+	}
+
+	// The read is a projection: the phase it reported is still the phase the
+	// durable record holds, and the record is still there to be acted on.
+	after, found, err := outbox.spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found || after.phase != runtimeRemovalComplete {
+		t.Fatalf("removal record after read = %+v found=%t err=%v", after, found, err)
+	}
+
+	// Cleanup acknowledgement releases the record, and the read surface stops
+	// claiming a removal the agent no longer carries.
+	if err := outbox.spool.completeRemoval(t.Context(), removal); err != nil {
+		t.Fatal(err)
+	}
+	released, err := nodeAgent.RuntimeRemovals(t.Context())
+	if err != nil || len(released) != 0 {
+		t.Fatalf("released removal read = %+v err=%v", released, err)
+	}
+}

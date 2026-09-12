@@ -38,6 +38,10 @@ type ControllerConfig struct {
 	Setup      SetupFunc
 	Clock      Clock
 	Doctor     func(context.Context) (DoctorResponse, error)
+	// Removals reads the agent's durable runtime removal records. It is a
+	// pure read: the controller's operation mutex is deliberately not held,
+	// because nothing here can race a mutation it does not perform.
+	Removals func(context.Context) (RemovalsResponse, error)
 }
 
 func (controller *Controller) Doctor(ctx context.Context) (DoctorResponse, error) {
@@ -45,6 +49,13 @@ func (controller *Controller) Doctor(ctx context.Context) (DoctorResponse, error
 		return DoctorResponse{}, runtimeUnavailable("OCI doctor is unavailable", nil)
 	}
 	return controller.config.Doctor(ctx)
+}
+
+func (controller *Controller) Removals(ctx context.Context) (RemovalsResponse, error) {
+	if controller.config.Removals == nil {
+		return RemovalsResponse{}, runtimeUnavailable("OCI removal inspection is unavailable", nil)
+	}
+	return controller.config.Removals(ctx)
 }
 
 // Controller is the only writer of durable OCI intent. One operation mutex

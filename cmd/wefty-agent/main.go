@@ -685,6 +685,24 @@ func run() error {
 				})
 				return report, report.Validate()
 			},
+			Removals: func(removalContext context.Context) (ocicontrol.RemovalsResponse, error) {
+				views, err := nodeAgent.RuntimeRemovals(removalContext)
+				if err != nil {
+					return ocicontrol.RemovalsResponse{}, err
+				}
+				response := ocicontrol.RemovalsResponse{Version: ocicontrol.RemovalsResponseVersion, Removals: make([]ocicontrol.RemovalRecord, 0, len(views))}
+				for _, view := range views {
+					response.Removals = append(response.Removals, ocicontrol.RemovalRecord{
+						JobID: view.JobID, RemovalGeneration: view.RemovalGeneration,
+						CleanupFence: view.CleanupFence, RootInstanceID: view.RootInstanceID,
+						Phase: view.Phase, PreparedAt: view.PreparedAt, QuiescedAt: view.QuiescedAt,
+						AttestedAt: view.AttestedAt, CompletedAt: view.CompletedAt,
+						RuntimeQuiescence: view.Quiescence, ResourceManifests: view.ResourceManifests,
+						Attestation: view.Attestation,
+					})
+				}
+				return response, nil
+			},
 			Setup: func(setupContext context.Context, request ocicontrol.SetupRequest) (ocicontrol.SetupResponse, error) {
 				response := ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceLiveSafe}
 				if runtime.GOOS == "linux" {

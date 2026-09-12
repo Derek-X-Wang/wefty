@@ -399,3 +399,32 @@ func TestControlSocketPathBoundary(t *testing.T) {
 		t.Fatalf("overlong Unix socket path error=%#v, want typed length=%d maximum=%d", err, maximum+1, maximum)
 	}
 }
+
+func TestControllerRemovalsReadsTheAgentAndFailsClosedWhenUnwired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	if _, err := lima.InitializeOCIIntent(path, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	unwired, err := NewController(ControllerConfig{IntentPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := unwired.Removals(context.Background())
+	var controlErr *ControlError
+	if !errors.As(err, &controlErr) || controlErr.Code != ErrorRuntimeUnavailable || len(response.Removals) != 0 {
+		t.Fatalf("unwired removal read = (%+v, %v)", response, err)
+	}
+
+	var reads int
+	wired, err := NewController(ControllerConfig{IntentPath: path, Removals: func(context.Context) (RemovalsResponse, error) {
+		reads++
+		return RemovalsResponse{Version: RemovalsResponseVersion, Removals: []RemovalRecord{{JobID: "job-1", Phase: "prepared"}}}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = wired.Removals(context.Background())
+	if err != nil || reads != 1 || len(response.Removals) != 1 || response.Removals[0].JobID != "job-1" {
+		t.Fatalf("wired removal read = (%+v, %v) reads=%d", response, err, reads)
+	}
+}
