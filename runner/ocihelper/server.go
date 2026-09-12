@@ -553,6 +553,7 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 	}
 	server.active = session
 	server.sessionMu.Unlock()
+	server.config.Logf("OCI helper session admitted session_generation=%d node_id=%q boot_session_id=%q", generation, body.NodeID, body.BootSessionID)
 	response := handshake
 	response.SessionCapability = capability
 	response.SessionGeneration = generation
@@ -713,8 +714,23 @@ func resetTimerAt(timer Timer, deadline time.Time) {
 	timer.ResetAt(deadline)
 }
 
+func (session *serverSession) isClosed() bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.closed
+}
+
 func (session *serverSession) invalidate(reason string) {
 	session.invalidateOnce.Do(func() {
+		// Every session close is logged with its reason. Run 5 of the attended
+		// Lima window saw a whole window fail session_stale with no helper log
+		// at all, so the operator could not tell a closed session from a
+		// replaced one (#424). The reason strings are helper-local constants
+		// and carry no capability, path, or privileged error text.
+		session.server.config.Logf(
+			"OCI helper session closing reason=%q session_generation=%d",
+			reason, session.helper.SessionGeneration,
+		)
 		session.mu.Lock()
 		session.closed = true
 		close(session.done)
@@ -742,9 +758,20 @@ func (session *serverSession) invalidate(reason string) {
 		cancel()
 		session.server.createSweep.Unlock()
 		if reapErr != nil {
+			// The session slot stays occupied by this closed session until the
+			// process dies, so every later request reads session_stale. Say so
+			// once instead of leaving the window silent.
+			session.server.config.Logf(
+				"OCI helper session reap failed reason=%q session_generation=%d; the helper is closing its listener and no session will be admitted again",
+				reason, session.helper.SessionGeneration,
+			)
 			session.server.fail(fmt.Errorf("reap OCI helper session after %s: %w", reason, reapErr))
 			return
 		}
+		session.server.config.Logf(
+			"OCI helper session closed reason=%q session_generation=%d; the helper slot is free for a new session",
+			reason, session.helper.SessionGeneration,
+		)
 		session.server.sessionMu.Lock()
 		session.server.rememberReapedBootsLocked(append(reapSweep.PriorBootSessionsSeen, session.identity)...)
 		session.server.sessionReapSweep = mergeSweepResponsePointer(session.server.sessionReapSweep, reapSweep)
@@ -1301,8 +1328,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var storageRetired *computerStorageRetiredError
 			var storageDeferred *ComputerStorageResumeDeferredError
 			var storageQuarantined *ComputerStorageQuarantinedError
+			// A failed Run whose attempt the helper positively reaped while its
+			// session stayed live is bounded by that attempt. Saying so on the
+			// wire is what keeps a table of negative Run probes from reading as
+			// helper-session loss and tearing down the shared session.
+			attemptScoped := reapErr == nil && !session.isClosed()
 			if errors.As(err, &rpcErr) {
-				_ = writeRPCError(wire, rpcErr)
+				_ = writeRPCError(wire, withAttemptScopedRunFailure(rpcErr, attemptScoped))
 			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
 				if reapErr == nil {
 					// A live owner refusing a second Computer attachment is an
@@ -1341,7 +1373,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
-				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err), err))
+				_ = writeRPCError(wire, withAttemptScopedRunFailure(
+					engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err), err), attemptScoped))
 			}
 			return
 		}
@@ -2155,6 +2188,21 @@ func engineFailureRPC(method Method, message string, reason EngineFailureReason,
 		}
 	}
 	return &RPCError{Code: CodeEngineFailure, Message: message, EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}}
+}
+
+// withAttemptScopedRunFailure stamps the helper's positive attempt-scope claim
+// onto a Run engine failure. It copies rather than mutates because the causal
+// RPCError may be owned by the engine or by a shared error value.
+func withAttemptScopedRunFailure(rpcErr *RPCError, attemptScoped bool) *RPCError {
+	if !attemptScoped || rpcErr == nil || rpcErr.Code != CodeEngineFailure ||
+		rpcErr.EngineFailure == nil || rpcErr.EngineFailure.Operation != MethodRun {
+		return rpcErr
+	}
+	scoped := *rpcErr
+	fact := *rpcErr.EngineFailure
+	fact.AttemptScoped = true
+	scoped.EngineFailure = &fact
+	return &scoped
 }
 
 func engineFailureReason(err error) EngineFailureReason {

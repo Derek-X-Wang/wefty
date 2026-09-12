@@ -221,11 +221,17 @@ operations and connections, joins them, takes the exclusive create/sweep gate,
 then calls the engine's boot-session reap. A new session is not issued until
 that reap succeeds. If reap fails, the listener closes and `Serve` fails so
 socket activation can start a fresh helper and boot sweep; the failed process
-never restores authority or remains indefinitely `session_busy`.
+never restores authority or remains indefinitely `session_busy`. The helper
+emits one log line when it admits a session, one when it begins closing one
+naming the close reason and session generation, and one for the reap outcome,
+so an operator can always tell a closed session from a replaced one without
+inferring it from a `session_stale` burst. Those lines carry no capability and
+no raw privileged error text.
 
 The client boundary exposes runtime loss as a typed error only for an active
 session's transport disappearance, `session_stale`, an `engine_failure` that
-is neither a bounded `Delete` cancellation/deadline nor any
+is neither an `attempt_scoped` `Run` refusal, nor a bounded `Delete`
+cancellation/deadline, nor any
 `DeleteManagedVolume` failure, or an explicit image `engine_loss` fact. A typed
 `Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
 failure. Every `DeleteManagedVolume` failure is scoped to its independently
@@ -258,7 +264,12 @@ failed quiescence proof and does not authorize a namespace sweep.
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
 `permission_denied`, `retention_bound_exceeded`, `egress_dns_unavailable`, or
-`operation_failed`). The DNS reason means neither the advertised non-loopback
+`operation_failed`). A failed `Run` additionally carries `attempt_scoped` when
+the helper positively reaped that attempt while its session stayed live; the
+same positive-reap doctrine that makes `computer_storage_busy` definitive is
+what bounds the refusal to the attempt, so a table of negative `Run` probes on
+one session never reads as session loss. A `Run` failure the helper could not
+positively reap omits the claim and remains runtime-loss evidence. The DNS reason means neither the advertised non-loopback
 resolver nor the Node-loopback stub answered the helper's bounded preflight.
 Raw privileged error text,
 containerd types, and host paths remain local. The Computer reimage preflight

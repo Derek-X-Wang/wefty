@@ -128,6 +128,12 @@ type RPCError struct {
 type EngineFailureFact struct {
 	Operation Method              `json:"operation"`
 	Reason    EngineFailureReason `json:"reason"`
+	// AttemptScoped is the helper's positive claim that this failure is bounded
+	// by the one attempt it names: the helper reaped that attempt's runtime
+	// resources successfully and its exclusive session remained live, so the
+	// session capability the caller holds is still authoritative. Absent the
+	// claim the failure remains runtime-loss evidence.
+	AttemptScoped bool `json:"attempt_scoped,omitempty"`
 }
 
 // EngineFailureReason is the closed, sanitized mechanics vocabulary allowed
