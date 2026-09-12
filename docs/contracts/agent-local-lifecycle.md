@@ -174,7 +174,13 @@ current value and the writer polls no faster than 20 seconds, so the trail is
 what makes a repair shorter than one observation window provable afterwards;
 it is capped, carries only closed state values and timestamps, and adds no
 polling. The repair counter counts every recovery that mutated a non-Running
-instance back to Running, whichever non-Running state Lima reported.
+instance back to Running, whichever non-Running state Lima reported. The trail
+carries the states the supervisor itself read and performed and nothing else:
+Lima's status for a host-level fault is not a stable readable state — two
+`limactl list` invocations against the same instance in the same second have
+returned Broken and Stopped — so a bounded repair is proven by the counter delta
+plus the trail pair, and a Broken reading taken by an operator is recorded as the
+host observation it is, never as a state the supervisor is required to have seen.
 Unit/helper/probe/instance states are closed types;
 `unit.state=launched_by_unit` is derived from the installed launch environment.
 The writer checks for content changes and polls no faster than 20 seconds. It

@@ -27,11 +27,19 @@ const (
 	// brokenFaultReinspectWindow bounds how long after a helper-loss signal one
 	// Stopped inspection is still treated as a fault that may still be
 	// settling. Lima writes Stopped and Broken into the same status file while
-	// a host fault settles, so the first read routinely wins that race and
-	// hides the Broken branch the supervisor is supposed to take -- on owner
-	// hardware the whole Broken window lasted about a second. One extra
-	// `limactl list` per fault resolves it; nothing polls faster, and outside
-	// the window a Stopped instance is just stopped.
+	// a host fault settles, so the first read can win that race and hide the
+	// Broken branch; the second read catches an instance that settles to a
+	// durable Broken, which is the case this exists for.
+	//
+	// It does not rescue a killed hostagent, and no window can: measured on
+	// owner hardware, that fault's Broken reading lasts one to two seconds at
+	// an offset that moved between +1 s and +5 s after the kill, and one run
+	// caught `limactl list` reporting Broken and the supervisor's own
+	// inspection 0.39 s later in the same second reporting Stopped (#435). The
+	// window governs whether the extra read is allowed, not when it happens --
+	// it follows the first read by about one `limactl list` -- so widening it
+	// buys nothing. `broken_enabled_recovery` therefore proves the repair from
+	// the counter delta and the trail pair rather than from a `broken` reading.
 	brokenFaultReinspectWindow = 10 * time.Second
 )
 
@@ -266,10 +274,11 @@ func (supervisor *Supervisor) ensureWithin(ctx context.Context) error {
 		return supervisor.cancelToStopped(ctx, state, err)
 	}
 	// A Stopped reading just after a helper loss may be Lima's status file
-	// mid-settle rather than a settled instance. Re-inspect once so the Broken
-	// branch -- the bounded `stop --force` plus capped-backoff repair -- is
-	// normally the one that runs, instead of losing a coin flip to a plain
-	// restart that leaves the repair path unexercised (#409).
+	// mid-settle rather than a settled instance. Re-inspect once so an instance
+	// that settles to a durable Broken takes the Broken branch -- the bounded
+	// `stop --force` plus capped-backoff repair -- rather than a plain restart
+	// (#409). A fault whose Broken reading is transient is repaired by the
+	// Stopped branch below and counted the same; #435 has the measurements.
 	if state == InstanceStopped && supervisor.takeRecentHelperLoss() {
 		if settled, inspectErr := supervisor.inspect(ctx); inspectErr == nil && settled == InstanceBroken {
 			state = settled

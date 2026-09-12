@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -35,31 +36,42 @@ type attendedResult struct {
 	// lives in Go source goes stale the moment the named ticket is fixed --
 	// #394 then #408 each went stale within two runs -- so the receipt row is
 	// the authority and the source-level default is only the fallback.
-	BlockedBy           int                 `json:"blocked_by,omitempty"`
-	SessionID           string              `json:"session_id"`
-	Command             []string            `json:"command"`
-	ExitCode            int                 `json:"exit_code"`
-	HelperGenerations   []uint64            `json:"helper_generations"`
-	CapabilityRevisions []int64             `json:"capability_revisions"`
-	Inventories         []json.RawMessage   `json:"inventories"`
-	RoundTrip           bool                `json:"round_trip"`
-	DynamicListeners    map[string]bool     `json:"dynamic_listeners"`
-	LaunchUnits         []string            `json:"launch_units,omitempty"`
-	LimaStates          []InstanceState     `json:"lima_states,omitempty"`
-	OCIEnabled          *bool               `json:"oci_enabled,omitempty"`
-	ProcessAvailable    bool                `json:"process_available,omitempty"`
-	SocketMode          string              `json:"socket_mode,omitempty"`
-	SocketOwner         string              `json:"socket_owner,omitempty"`
-	SocketGroup         string              `json:"socket_group,omitempty"`
-	MinimalDoctor       *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
-	AttemptIDs          []string            `json:"attempt_ids"`
-	TopLevelDigests     []string            `json:"top_level_digests"`
-	PlatformDigests     []string            `json:"platform_digests"`
-	PayloadExecutions   int                 `json:"payload_executions"`
-	StdoutMarkers       []string            `json:"stdout_markers"`
-	StderrMarkers       []string            `json:"stderr_markers"`
-	HandoffMarkerBytes  []string            `json:"handoff_marker_bytes"`
-	HandoffAbsent       bool                `json:"handoff_absent_after_completion"`
+	BlockedBy           int               `json:"blocked_by,omitempty"`
+	SessionID           string            `json:"session_id"`
+	Command             []string          `json:"command"`
+	ExitCode            int               `json:"exit_code"`
+	HelperGenerations   []uint64          `json:"helper_generations"`
+	CapabilityRevisions []int64           `json:"capability_revisions"`
+	Inventories         []json.RawMessage `json:"inventories"`
+	RoundTrip           bool              `json:"round_trip"`
+	DynamicListeners    map[string]bool   `json:"dynamic_listeners"`
+	LaunchUnits         []string          `json:"launch_units,omitempty"`
+	LimaStates          []InstanceState   `json:"lima_states,omitempty"`
+	OCIEnabled          *bool             `json:"oci_enabled,omitempty"`
+	// RepairCountDelta, HostObservedStates and HostObservedAt carry the
+	// broken_enabled_recovery proof. Lima's status for a host-level fault is
+	// not a state the supervisor can be required to read -- two `limactl list`
+	// invocations against the same instance in the same second returned Broken
+	// and Stopped on owner hardware (#435) -- so the durable record of the
+	// bounded repair is the counter delta plus the trail pair, and the Broken
+	// reading is kept as what it is: the operator's own host observation, with
+	// the timestamp at which they took it.
+	RepairCountDelta   int                 `json:"repair_count_delta,omitempty"`
+	HostObservedStates []InstanceState     `json:"host_observed_states,omitempty"`
+	HostObservedAt     string              `json:"host_observed_at,omitempty"`
+	ProcessAvailable   bool                `json:"process_available,omitempty"`
+	SocketMode         string              `json:"socket_mode,omitempty"`
+	SocketOwner        string              `json:"socket_owner,omitempty"`
+	SocketGroup        string              `json:"socket_group,omitempty"`
+	MinimalDoctor      *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
+	AttemptIDs         []string            `json:"attempt_ids"`
+	TopLevelDigests    []string            `json:"top_level_digests"`
+	PlatformDigests    []string            `json:"platform_digests"`
+	PayloadExecutions  int                 `json:"payload_executions"`
+	StdoutMarkers      []string            `json:"stdout_markers"`
+	StderrMarkers      []string            `json:"stderr_markers"`
+	HandoffMarkerBytes []string            `json:"handoff_marker_bytes"`
+	HandoffAbsent      bool                `json:"handoff_absent_after_completion"`
 	// QuiescenceFaultInjected, QuiescenceLatched and ServiceJobState carry the
 	// service_failed_quiescence outcome. The row keeps its intent -- an
 	// unprovable stop must not be reported as stopped -- while recording what
@@ -423,7 +435,9 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if disabled.Status == "PASS" && (disabled.OCIEnabled == nil || *disabled.OCIEnabled || !slices.Equal(disabled.LimaStates, []InstanceState{InstanceStopped})) {
 		t.Fatalf("disabled recovery receipt = %+v", disabled)
 	}
-	assertStateSequence(t, artifact.Rows["broken_enabled_recovery"], InstanceBroken, InstanceStopped, InstanceRunning)
+	if err := validateBrokenRecoveryRow(artifact.Rows["broken_enabled_recovery"]); err != nil {
+		t.Fatalf("broken recovery receipt = %+v: %v", artifact.Rows["broken_enabled_recovery"], err)
+	}
 	degraded := artifact.Rows["process_only_degradation"]
 	if !degraded.ProcessAvailable || len(degraded.CapabilityRevisions) == 0 {
 		t.Fatalf("process-only degradation receipt = %+v", degraded)
@@ -496,6 +510,92 @@ func TestServiceAcceptanceFailedQuiescenceRowOutcomes(t *testing.T) {
 			err := validateFailedQuiescenceRow(testCase.row)
 			if testCase.accept != (err == nil) {
 				t.Fatalf("validateFailedQuiescenceRow(%+v) = %v, accept=%t", testCase.row, err, testCase.accept)
+			}
+		})
+	}
+}
+
+// validateBrokenRecoveryRow accepts the broken_enabled_recovery row on the
+// evidence a supervisor can actually produce. Requiring `broken` in the agent
+// trail made a repair that demonstrably happened unprovable: on owner hardware
+// the fault's Broken reading lasts one to two seconds at an offset that moved
+// between +1 s and +5 s across injections, and run 4 caught `limactl list`
+// reporting Broken at 02:46:32Z while the supervisor's own inspection 0.39 s
+// later in the same second reported Stopped (#435). Being inside the window is
+// therefore not even sufficient to read it. What the repair does leave is
+// durable: one counted repair, the supervisor's own `stopped -> running` pair,
+// and the operator's host observation of Broken. A supervisor that did read
+// `broken` still passes -- that trail proves the fault on its own.
+func validateBrokenRecoveryRow(row attendedResult) error {
+	if row.OCIEnabled == nil || !*row.OCIEnabled {
+		return errors.New("enabled recovery row lacks enabled intent")
+	}
+	if row.RepairCountDelta != 1 {
+		return fmt.Errorf("repair_count delta = %d, want exactly 1 bounded repair", row.RepairCountDelta)
+	}
+	switch {
+	case slices.Equal(row.LimaStates, []InstanceState{InstanceBroken, InstanceStopped, InstanceRunning}):
+		return nil
+	case slices.Equal(row.LimaStates, []InstanceState{InstanceStopped, InstanceRunning}):
+		if !slices.Contains(row.HostObservedStates, InstanceBroken) {
+			return errors.New("a fault the supervisor read as stopped needs the operator's own host Broken observation")
+		}
+		if _, err := time.Parse(time.RFC3339, row.HostObservedAt); err != nil {
+			return fmt.Errorf("host Broken observation needs an RFC3339 timestamp: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("Lima state sequence = %v, want stopped -> running or broken -> stopped -> running", row.LimaStates)
+	}
+}
+
+func TestServiceAcceptanceBrokenRecoveryRowOutcomes(t *testing.T) {
+	enabled := true
+	disabled := false
+	for _, testCase := range []struct {
+		name   string
+		row    attendedResult
+		accept bool
+	}{
+		{name: "supervisor read broken", accept: true, row: attendedResult{
+			OCIEnabled: &enabled, RepairCountDelta: 1,
+			LimaStates: []InstanceState{InstanceBroken, InstanceStopped, InstanceRunning},
+		}},
+		{name: "supervisor read stopped with host broken", accept: true, row: attendedResult{
+			OCIEnabled: &enabled, RepairCountDelta: 1,
+			LimaStates:         []InstanceState{InstanceStopped, InstanceRunning},
+			HostObservedStates: []InstanceState{InstanceStopped, InstanceBroken, InstanceRunning},
+			HostObservedAt:     "2026-09-12T15:34:48Z",
+		}},
+		{name: "stopped without any host broken observation", row: attendedResult{
+			OCIEnabled: &enabled, RepairCountDelta: 1,
+			LimaStates:         []InstanceState{InstanceStopped, InstanceRunning},
+			HostObservedStates: []InstanceState{InstanceStopped, InstanceRunning},
+			HostObservedAt:     "2026-09-12T15:34:48Z",
+		}},
+		{name: "host broken without a timestamp", row: attendedResult{
+			OCIEnabled: &enabled, RepairCountDelta: 1,
+			LimaStates:         []InstanceState{InstanceStopped, InstanceRunning},
+			HostObservedStates: []InstanceState{InstanceBroken},
+		}},
+		{name: "repair not counted", row: attendedResult{
+			OCIEnabled: &enabled, LimaStates: []InstanceState{InstanceStopped, InstanceRunning},
+			HostObservedStates: []InstanceState{InstanceBroken}, HostObservedAt: "2026-09-12T15:34:48Z",
+		}},
+		{name: "never left running", row: attendedResult{
+			OCIEnabled: &enabled, RepairCountDelta: 1,
+			LimaStates:         []InstanceState{InstanceRunning},
+			HostObservedStates: []InstanceState{InstanceBroken}, HostObservedAt: "2026-09-12T15:34:48Z",
+		}},
+		{name: "disabled intent", row: attendedResult{
+			OCIEnabled: &disabled, RepairCountDelta: 1,
+			LimaStates: []InstanceState{InstanceBroken, InstanceStopped, InstanceRunning},
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateBrokenRecoveryRow(testCase.row)
+			if testCase.accept != (err == nil) {
+				t.Fatalf("validateBrokenRecoveryRow(%+v) = %v, accept=%t", testCase.row, err, testCase.accept)
 			}
 		})
 	}
