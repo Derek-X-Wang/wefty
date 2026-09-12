@@ -838,6 +838,15 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		return true
 	}
 	if err.Code == CodeEngineFailure {
+		// A Run the helper refused after positively reaping that attempt, with
+		// its exclusive session still live, is bounded by the attempt. Without
+		// this, an ordinary refusal -- an out-of-root operator mount, say --
+		// made the client close its own control connection, which invalidated
+		// the helper session and turned every later request in the window into
+		// session_stale (#424).
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodRun && err.EngineFailure.AttemptScoped {
+			return false
+		}
 		// Attempt-port and host-bridge backend refusals are scoped to the
 		// already-authorized live attempt. The helper process and exclusive
 		// session remain authoritative while the attempt backend republishes.

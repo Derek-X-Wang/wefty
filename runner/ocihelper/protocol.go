@@ -128,6 +128,12 @@ type RPCError struct {
 type EngineFailureFact struct {
 	Operation Method              `json:"operation"`
 	Reason    EngineFailureReason `json:"reason"`
+	// AttemptScoped is the helper's positive claim that this failure is bounded
+	// by the one attempt it names: the helper reaped that attempt's runtime
+	// resources successfully and its exclusive session remained live, so the
+	// session capability the caller holds is still authoritative. Absent the
+	// claim the failure remains runtime-loss evidence.
+	AttemptScoped bool `json:"attempt_scoped,omitempty"`
 }
 
 // EngineFailureReason is the closed, sanitized mechanics vocabulary allowed
@@ -889,7 +895,14 @@ type LogGapFrame struct {
 type LogSeal struct {
 	Stream   string `json:"stream"`
 	Complete bool   `json:"complete"`
-	Reason   string `json:"reason,omitempty"`
+	// Reason states what this stream observed, in free-form text.
+	Reason string `json:"reason,omitempty"`
+	// ReleaseReason names a cause that lives outside the stream: the attempt's
+	// task was never released, so no stream could reach pipe EOF at all. It is
+	// a closed vocabulary -- currently only TaskNeverStoppedSealReason -- so an
+	// agent separates that cause from a stream's own incompleteness by
+	// equality rather than by matching Reason text.
+	ReleaseReason string `json:"release_reason,omitempty"`
 }
 
 type WatchEventKind string

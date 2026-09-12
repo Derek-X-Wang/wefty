@@ -229,7 +229,13 @@ func TestAdapterCarriesHelperStartedEdgeAcrossL1Acknowledgement(t *testing.T) {
 }
 
 func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
-	engine := &adapterTestEngine{runErr: errors.New("containerd stopped before task start")}
+	// A stopped containerd fails the attempt reap as well as the Run. That
+	// missing positive-absence proof is what makes the refusal runtime loss
+	// rather than an attempt-scoped rejection the live session survives.
+	engine := &adapterTestEngine{
+		runErr:         errors.New("containerd stopped before task start"),
+		reapAttemptErr: errors.New("containerd stopped before the attempt could be reaped"),
+	}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
 	request := adapterTestRequest()
@@ -259,6 +265,44 @@ func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
 	}
 	if recoveries != 1 {
 		t.Fatalf("pre-Run helper loss recovery calls = %d, want 1", recoveries)
+	}
+}
+
+// The other half of the same edge: a Run the helper refuses and then positively
+// reaps is bounded by that attempt, so the agent keeps its helper session and
+// never declares the runtime generation unavailable. Without this the attended
+// mount-validation negatives tore down the shared session and every later row
+// in the window failed session_stale (#424).
+func TestAdapterRefusedRunWithPositiveReapRetainsHelperSession(t *testing.T) {
+	engine := &adapterTestEngine{
+		runErr: errors.New("operator mount source is outside the configured host mount root"),
+		watch:  ocihelper.WatchResponse{ExitCode: intPointer(0)},
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	refused := adapterTestRequest()
+	recoveries := 0
+	refused.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	refused.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		t.Fatal("refused Run reached Started")
+		return nil
+	}
+	if result, err := adapter.Run(t.Context(), refused, nil); err == nil || result.Outcome.SpawnError == nil {
+		t.Fatalf("refused Run outcome = (%+v, %v)", result.Outcome, err)
+	}
+	if recoveries != 0 {
+		t.Fatalf("attempt-scoped Run refusal declared the runtime generation unavailable %d times", recoveries)
+	}
+
+	// The same helper session must still admit the next attempt in the window.
+	engine.mu.Lock()
+	engine.runErr = nil
+	engine.mu.Unlock()
+	next := adapterTestRequest()
+	next.Authority.AttemptID = "attempt-after-refusal"
+	next.Authority.FencingToken = "fence-after-refusal"
+	if result, err := adapter.Run(t.Context(), next, nil); err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("Run after an attempt-scoped refusal = (%+v, %v)", result.Outcome, err)
 	}
 }
 
@@ -969,6 +1013,57 @@ func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing
 	engine.mu.Unlock()
 	if !slices.Equal(got, []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL}) {
 		t.Fatalf("signals = %v, want TERM then KILL", got)
+	}
+}
+
+// TestAdapterPostKILLBudgetCoversTaskReleaseThenLogSealing pins the post-KILL
+// Watch budget to both helper bounds, not one. After a KILL the helper retries
+// task deletion for its whole release bound and only then publishes the
+// terminal, which is what starts each stream's log-seal bound; the two are
+// serial. A budget that covered release alone timed out into unconfirmed
+// runtime loss for any helper that needed the sealing bound too, discarding the
+// typed sealing evidence on exactly the path that evidence was built for.
+func TestAdapterPostKILLBudgetCoversTaskReleaseThenLogSealing(t *testing.T) {
+	if postKillWatchBudget < ocihelper.DefaultTaskReleaseTimeout+ocihelper.DefaultLogSealTimeout {
+		t.Fatalf("post-KILL budget %s does not cover the helper's serial release and sealing bounds", postKillWatchBudget)
+	}
+	engine := &adapterTestEngine{
+		watchSignals: make(chan ocihelper.Signal, 2),
+		ignoreTERM:   true,
+		// Past the release bound and its margin, inside the sealing bound:
+		// the window a release-only budget refused to wait through.
+		releaseDelay: ocihelper.DefaultTaskReleaseTimeout + postKillReleaseMargin + 200*time.Millisecond,
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 50 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct {
+		result workloadrunner.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := adapter.Run(ctx, request, nil)
+		done <- struct {
+			result workloadrunner.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	<-started
+	stopStarted := time.Now()
+	cancel()
+	finished := <-done
+	elapsed := time.Since(stopStarted)
+	if finished.err != nil || finished.result.Outcome.Signal != "killed" || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("late-sealing terminal = (%+v, %v), want the helper's own terminal evidence", finished.result.Outcome, finished.err)
+	}
+	if elapsed >= postKillWatchBudget {
+		t.Fatalf("TERM -> grace -> KILL -> release -> seal took %s, want inside the %s post-KILL budget", elapsed, postKillWatchBudget)
 	}
 }
 
@@ -1841,6 +1936,7 @@ type adapterTestEngine struct {
 	runtimeDeletes                int
 	refuseDelete                  bool
 	runErr                        error
+	reapAttemptErr                error
 	omitRunImage                  bool
 	startedAt                     time.Time
 	ensureErrors                  []error
@@ -2128,7 +2224,11 @@ func (engine *adapterTestEngine) DialHostBridge(_ context.Context, _ ocihelper.D
 	engine.bridgeExchange <- err
 	return err
 }
-func (*adapterTestEngine) ReapAttempt(context.Context, ocihelper.AttemptAuthority) error { return nil }
+func (engine *adapterTestEngine) ReapAttempt(context.Context, ocihelper.AttemptAuthority) error {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return engine.reapAttemptErr
+}
 func (*adapterTestEngine) ReapSession(context.Context, ocihelper.SessionIdentity) (ocihelper.SweepResponse, error) {
 	return ocihelper.SweepResponse{}, nil
 }
