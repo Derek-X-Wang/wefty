@@ -156,17 +156,31 @@ observe `Broken` and require `broken -> stopped -> running` through one bounded
 `lima.state` shows `running` on both sides of one and proves nothing. Each
 recovery must raise `lima.repair_count` by one and must leave a trail whose tail
 is the states the supervisor itself observed and performed —
-`stopped -> running` for the stopped row, `broken -> stopped -> running` for the
-broken row. `broken_enabled_recovery` PASSes only when the agent trail itself
-contains `broken`: that is the only evidence the bounded `stop --force` plus
-capped-backoff repair path ran at all. The supervisor re-inspects once when a
-fault's first reading is `stopped`, so the Broken branch is normally the one
-observed. Which state Lima reports for an injected
-fault is a race against Lima's own status file, so an injection that `limactl`
-recorded as `Broken` while the agent trail shows only `stopped -> running` did
-not produce the state this row tests — record it as NOT-RUN with reason
-`broken_not_observed_by_supervisor`, retry the injection, and never read it as a
-PASS. Record both views either way. Persist a higher disabled intent-file
+`stopped -> running` for the stopped row, and for the broken row either
+`stopped -> running` or `broken -> stopped -> running`, whichever the supervisor
+read.
+
+`broken_enabled_recovery` proves the repair, not the name Lima gave the fault.
+Record, with timestamps, both views of the injection: the host's own
+`limactl list` states in `host_observed_states` with the time of the reading in
+`host_observed_at`, and the agent's `lima.transitions` tail in `lima_states`.
+The row PASSes when the intent was enabled, `repair_count` rose by exactly one,
+the agent trail carries the fault's `stopped -> running` pair, capability is
+re-earned — and either the agent trail itself contains `broken` or the host
+observation does. It FAILs when that repair evidence is missing. It is NOT-RUN
+only when the fault never landed at all, meaning the host never saw the instance
+leave `Running`.
+
+Do not require `broken` in the agent trail. Lima's status for a killed-hostagent
+fault is not a state the supervisor can be asked to read: the Broken reading
+lasts one to two seconds at an offset that moved between +1 s and +5 s after the
+kill across attended injections, and in run 4 `limactl list` reported `Broken`
+at 02:46:32Z while the supervisor's own inspection at 02:46:32.390652Z — the
+same second — reported `Stopped`. Landing inside the window is not even
+sufficient to read it. The supervisor still re-inspects once when a fault's
+first reading is `stopped`, which is how a durably Broken instance reaches the
+Broken branch; for this fault profile it changes nothing, and widening that
+window cannot (#435). Persist a higher disabled intent-file
 revision, stop Lima, and require it to remain stopped with no recovery mutation;
 if the attended harness cannot safely write that fixture, emit structured
 NOT-RUN for `stopped_disabled_no_recovery`. During each
@@ -757,7 +771,9 @@ Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,
 `stopped_enabled_recovery`, `stopped_disabled_no_recovery`,
 `broken_enabled_recovery`, `process_only_degradation`, and `minimal_doctor`.
-The recovery rows include `oci_enabled` and exact `lima_states`; the permission
+The recovery rows include `oci_enabled` and exact `lima_states`, and
+`broken_enabled_recovery` additionally includes `repair_count_delta` and its
+host observation (`host_observed_states`, `host_observed_at`); the permission
 row includes `socket_mode`, `socket_owner`, and `socket_group`; the launch rows
 include `launch_units`; and the doctor row embeds the redacted minimal snapshot.
 
