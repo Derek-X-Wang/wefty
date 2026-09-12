@@ -59,6 +59,17 @@ func InstallGuestHelper(ctx context.Context, config GuestHelperInstallConfig) er
 	return (guestHelperInstaller{run: runCommand}).install(ctx, config)
 }
 
+// instanceMountLocations reads the instance's configured mounts through the
+// same inventory path the removal path uses, keeping stdout free of Lima's
+// stderr warnings before JSON decoding.
+func (installer guestHelperInstaller) instanceMountLocations(ctx context.Context, config GuestHelperInstallConfig) ([]string, error) {
+	payload, err := runGuestHelperInventory(ctx, config.Limactl, installer.inventoryExecute, "list", "--json", config.Instance)
+	if err != nil {
+		return nil, fmt.Errorf("inspect Lima before guest helper installation: %w", err)
+	}
+	return parseInstanceMountLocations(payload, config.Instance)
+}
+
 func (installer guestHelperInstaller) install(ctx context.Context, config GuestHelperInstallConfig) error {
 	if err := ValidateGuestHelperInstall(config); err != nil {
 		return err
@@ -68,6 +79,17 @@ func (installer guestHelperInstaller) install(ctx context.Context, config GuestH
 	}
 	if installer.run == nil {
 		installer.run = runCommand
+	}
+	// Refuse before any unit is staged or installed if the requested host
+	// mount root would translate the helper onto a directory the instance
+	// does not virtiofs-mount: every later operator mount would otherwise
+	// fail oci_spec_rejected with nothing naming the divergence.
+	locations, locationsErr := installer.instanceMountLocations(ctx, config)
+	if locationsErr != nil {
+		return locationsErr
+	}
+	if err := ValidateHostMountRootIsMounted(config.HostMountRoot, locations); err != nil {
+		return err
 	}
 	if _, err := installer.run(ctx, config.Limactl, "--tty=false", "shell", "--workdir=/", config.Instance, "command", "-v", "e2fsck"); err != nil {
 		return errors.New("Lima guest requires e2fsprogs (e2fsck) before helper installation")

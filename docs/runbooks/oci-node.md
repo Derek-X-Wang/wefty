@@ -100,7 +100,7 @@ Hosted macOS tests do not prove nested Lima `vz`, cold reboot, no-login return, 
 
 ## Mounts, cache, and image import
 
-An operator mount makes work Pinned. Its source must be a strict descendant of the configured allowed root, contain no symlink component, and stay disjoint from `/wefty/handoff`, `/wefty/service`, and `/wefty/control`. The helper validates and translates it; bind sources are never traversed for deletion. Mac mounts cross only through the configured `/mnt/wefty-host` mapping. Use doctor to compare desired setup state with the helper's recorded allowlist.
+An operator mount makes work Pinned. Its source must be a strict descendant of the configured allowed root, contain no symlink component, and stay disjoint from `/wefty/handoff`, `/wefty/service`, and `/wefty/control`. The helper validates and translates it; bind sources are never traversed for deletion. Mac mounts cross only through the configured `/mnt/wefty-host` mapping. Use doctor to compare desired setup state with the helper's recorded allowlist. Mac bootstrap refuses a `host-mount-root` the Lima instance does not virtiofs-mount before installing the guest helper unit, with typed reason `host_mount_root_not_mounted` naming the requested root and the instance's configured mount locations.
 
 The owner-ratified cache ceiling is 16 GiB. Operation leases, live attempts, durable service bindings, and evictable entries are distinct holds. A bound service image is not evictable, and external cache loss triggers a digest-pinned repull instead of tag re-resolution. Import an offline OCI archive only through the live agent:
 

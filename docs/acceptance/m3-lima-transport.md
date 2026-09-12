@@ -67,7 +67,9 @@ requires explicit operator/home/Lima/work/log paths, the helper checksum,
 guest user and UID, probe reference/digest/archive, node ID, mount root, and
 repeatable `--agent-arg` values. `--intent-file` is optional and defaults under
 `LIMA_HOME`; bootstrap creates its initial enabled marker only when absent. It
-starts the existing configured instance,
+starts the existing configured instance, verifies the requested host mount
+root against that instance's configured mounts and refuses the helper install
+with typed reason `host_mount_root_not_mounted` before staging any unit,
 installs and verifies the helper and probe, then installs and starts the system
 LaunchDaemon. Record the complete command with credential values omitted from
 the artifact.
