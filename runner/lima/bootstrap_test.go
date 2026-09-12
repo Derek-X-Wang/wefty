@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -318,6 +319,7 @@ func TestGuestHelperRefreshesNewGroupMembershipOnlyOnce(t *testing.T) {
 				}
 				return nil, nil
 			}}
+			installer.inventoryExecute = inventoryMountedInstanceFake(t, installer.run)
 			if err := installer.install(t.Context(), config); err == nil {
 				t.Fatal("fixture unexpectedly passed socket verification")
 			}
@@ -348,6 +350,7 @@ func TestGuestHelperStopsUnitsBeforeVersionReplacementAndDropsUnusedSidecar(t *t
 		}
 		return nil, nil
 	}}
+	installer.inventoryExecute = inventoryMountedInstanceFake(t, installer.run)
 	if err := installer.install(t.Context(), config); err == nil {
 		t.Fatal("fixture unexpectedly passed socket verification")
 	}
@@ -536,6 +539,19 @@ func testLaunchDaemonConfig(t *testing.T) LaunchDaemonConfig {
 		OperatorUser: "operator", Home: filepath.Join(root, "home"), LimaHome: filepath.Join(root, "home", ".lima"),
 		PATH: DefaultLaunchPATH, WorkingDirectory: root,
 		StandardOutPath: filepath.Join(root, "logs", "agent.log"), StandardErrorPath: filepath.Join(root, "logs", "agent.err"),
+	}
+}
+
+func inventoryMountedInstanceFake(t *testing.T, run commandRunner) func(*exec.Cmd) error {
+	t.Helper()
+	base := inventoryLegacyFake(t, run)
+	return func(cmd *exec.Cmd) error {
+		if slices.Contains(cmd.Args, "list") {
+			payload := `{"name":"` + DefaultInstanceName + `","config":{"mounts":[{"location":"/Users/operator/wefty-mounts","mountPoint":"/mnt/wefty-host"}]}}`
+			_, err := fmt.Fprint(cmd.Stdout, payload)
+			return err
+		}
+		return base(cmd)
 	}
 }
 
