@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -36,6 +37,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -178,7 +180,7 @@ func (live *liveBarrier) Session() (attendedSession, error) {
 func newLiveProbe(barrier *ocihelper.BootBarrier, config attendedConfig) func(context.Context) error {
 	adapter := ocirunner.NewAdapter(barrier)
 	return func(ctx context.Context) error {
-		return adapter.Probe(ctx, config.NodeID, config.BootSessionID, config.Reference, config.Digest, config.Deadman)
+		return adapter.Probe(ctx, config.NodeID, config.BootSessionID, config.Reference, config.Digest, config.ProbeDeadman)
 	}
 }
 
@@ -322,6 +324,19 @@ func checkLogEvidence(evidence logEvidence, stdoutMarker, stderrMarker string) e
 	if result.LogEvidenceIncomplete {
 		return errors.New("helper reported incomplete log evidence")
 	}
+	// The helper seals each stream at its pipe-EOF boundary, Complete when the
+	// tail drained and Complete=false with a reason when it did not. An
+	// unsealed or incomplete stream means the frames above are not the whole
+	// stream, which is exactly what this row claims to have observed.
+	for _, stream := range []string{"stdout", "stderr"} {
+		complete, sealed := evidence.seals[stream]
+		if !sealed {
+			return fmt.Errorf("%s was never sealed", stream)
+		}
+		if !complete {
+			return fmt.Errorf("%s seal is incomplete", stream)
+		}
+	}
 	return nil
 }
 
@@ -363,8 +378,23 @@ type attendedConfig struct {
 	Digest        string
 	MountRoot     string
 	LimaInstance  string
-	Deadman       time.Duration
-	Now           func() time.Time
+	// Deadman is the attempt deadman requested for row workloads. It is
+	// deliberately generous because nothing here renews it, and boundedDeadman
+	// clamps it to whatever ceiling the helper advertises.
+	Deadman time.Duration
+	// BridgeWait bounds how long the fallback row waits for the payload's one
+	// authenticated request to reach the host origin. Zero means the default.
+	BridgeWait time.Duration
+	// ProbeDeadman is separate because ocirunner.Adapter.Probe passes its
+	// deadman straight through without clamping, and the helper refuses a
+	// request above its ceiling outright.
+	ProbeDeadman time.Duration
+	// GuestPath reads a path inside the Lima guest, so the mount row can prove
+	// the host-to-guest translation from the guest's own side rather than
+	// inferring it. It is required: without it the mount row cannot make the
+	// claim its reason states.
+	GuestPath func(context.Context, string) (string, error)
+	Now       func() time.Time
 }
 
 func (config attendedConfig) authority(class, id string) ocihelper.AttemptAuthority {
@@ -588,7 +618,8 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 			ImageReference: config.Reference, ImageDigest: config.Digest,
 			OperatorMounts: []ocihelper.OperatorMount{{NodePath: fixtures.positiveDirectory, ContainerPath: "/data"}},
 			Argv: []string{"/bin/sh", "-c", fmt.Sprintf(
-				"set -e; cat /data/%s; printf '%s\\n'; printf '%s' >/data/%s",
+				"set -e; cat /data/%s; printf '%s\\n'; printf '%s' >/data/%s; "+
+					"grep ' /data ' /proc/self/mountinfo",
 				filepath.Base(fixtures.positiveFile), readMarker, attendedMountProbeBytes, writtenName)},
 		},
 	})
@@ -617,6 +648,11 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 		row.fail(fmt.Errorf("positive mount payload result = %+v, want exit 0", evidence.result))
 		return row
 	}
+	mountLine, err := containerMountLine(stdout, "/data")
+	if err != nil {
+		row.fail(err)
+		return row
+	}
 	row.PayloadExecutions = 1
 	written, err := os.ReadFile(filepath.Join(fixtures.positiveDirectory, writtenName))
 	if err != nil {
@@ -625,6 +661,29 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 	}
 	if string(written) != attendedMountProbeBytes {
 		row.fail(fmt.Errorf("payload write = %q, want %q", written, attendedMountProbeBytes))
+		return row
+	}
+	// The host sees the payload's write under the operator mount root; the
+	// guest must see the same bytes under the Lima guest mount root. That pair
+	// is the translation this row claims, observed from both sides rather than
+	// inferred from the container's own mountinfo, whose source field for a
+	// bind names the backing filesystem rather than the translated path.
+	guestPath, err := translatedGuestPath(config.MountRoot, filepath.Join(fixtures.positiveDirectory, writtenName))
+	if err != nil {
+		row.fail(err)
+		return row
+	}
+	if config.GuestPath == nil {
+		row.fail(errors.New("the mount row requires a guest-side path reader to prove host-to-guest translation"))
+		return row
+	}
+	guestBytes, err := config.GuestPath(ctx, guestPath)
+	if err != nil {
+		row.fail(fmt.Errorf("read %s inside the guest: %w", guestPath, err))
+		return row
+	}
+	if guestBytes != attendedMountProbeBytes {
+		row.fail(fmt.Errorf("guest %s = %q, want the bytes the payload wrote", guestPath, guestBytes))
 		return row
 	}
 	if err := deleteAndVerify(ctx, session, authority); err != nil {
@@ -647,9 +706,35 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 		row.fail(err)
 		return row
 	}
-	row.pass("positive: strict descendant translated into the guest mount root, read and written by the payload, " +
-		"host bind source byte-identical and present after deletion; negatives: " + observed)
+	row.pass(fmt.Sprintf(
+		"positive: strict descendant read and written by the payload; the same bytes appear on the host under the "+
+			"operator mount root and in the guest at %s, which is the host-to-guest translation; container mountinfo "+
+			"for /data: %q; host bind source byte-identical and present after deletion; negatives: %s",
+		guestPath, mountLine, observed))
 	return row
+}
+
+// translatedGuestPath is where the helper's Lima translation puts a host path:
+// the same relative path under the guest mount root.
+func translatedGuestPath(hostRoot, hostPath string) (string, error) {
+	relative, err := filepath.Rel(hostRoot, hostPath)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%q is not a strict descendant of the operator mount root %q", hostPath, hostRoot)
+	}
+	return path.Join(limarunner.GuestAllowedMountRoot, filepath.ToSlash(relative)), nil
+}
+
+// containerMountLine returns the payload's own mountinfo line for target. It
+// is recorded as supporting evidence: it proves the bind is a real mount
+// point in the payload's namespace, while the translated path itself is
+// proven from the guest side.
+func containerMountLine(stdout, target string) (string, error) {
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.Contains(line, " "+target+" ") {
+			return strings.TrimSpace(line), nil
+		}
+	}
+	return "", fmt.Errorf("payload mountinfo carried no mount at %s", target)
 }
 
 // mountNegatives is the complete refusal table the runbook names.

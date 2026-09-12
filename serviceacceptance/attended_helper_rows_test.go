@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
@@ -86,7 +88,8 @@ func testConfig() attendedConfig {
 		SessionID: "attended-test", Command: []string{"go", "test", "-run", "Attended"},
 		NodeID: "attended-node", BootSessionID: "attended-boot",
 		Reference: "registry.invalid/echo:test", Digest: "sha256:" + strings.Repeat("a", 64),
-		MountRoot: "/mount/root", LimaInstance: "wefty-oci", Deadman: 30 * time.Second,
+		MountRoot: "/mount/root", LimaInstance: "wefty-oci",
+		Deadman: 10 * time.Minute, ProbeDeadman: 30 * time.Second,
 	}
 }
 
@@ -102,6 +105,8 @@ func logEvents(stdout, stderr string, exitCode int) []ocihelper.WatchEvent {
 	return []ocihelper.WatchEvent{
 		{Kind: ocihelper.WatchProgress, Log: &ocihelper.LogFrame{Stream: "stdout", Sequence: 1, Bytes: []byte(stdout + "\n")}},
 		{Kind: ocihelper.WatchProgress, Log: &ocihelper.LogFrame{Stream: "stderr", Sequence: 1, Bytes: []byte(stderr + "\n")}},
+		{Kind: ocihelper.WatchProgress, Seal: &ocihelper.LogSeal{Stream: "stdout", Complete: true}},
+		{Kind: ocihelper.WatchProgress, Seal: &ocihelper.LogSeal{Stream: "stderr", Complete: true}},
 		{Kind: ocihelper.WatchComplete, Result: &ocihelper.WatchResponse{ExitCode: &code}},
 	}
 }
@@ -201,6 +206,18 @@ func TestCheckLogEvidence(t *testing.T) {
 	if err := checkLogEvidence(missing, "out-marker", "err-marker"); err == nil {
 		t.Fatal("no terminal result must fail the row")
 	}
+
+	unsealed := base()
+	delete(unsealed.seals, "stderr")
+	if err := checkLogEvidence(unsealed, "out-marker", "err-marker"); err == nil {
+		t.Fatal("a stream that was never sealed must fail the row")
+	}
+
+	partial := base()
+	partial.seals["stdout"] = false
+	if err := checkLogEvidence(partial, "out-marker", "err-marker"); err == nil {
+		t.Fatal("an incomplete seal must fail the row")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +276,7 @@ func TestDriveTaskLogsDeleteFailsOnResidue(t *testing.T) {
 // mount_validation -- an accepted negative must fail the row
 // ---------------------------------------------------------------------------
 
-func mountFixturesForTest(t *testing.T) *mountFixtures {
+func mountFixturesForTest(t *testing.T) (*mountFixtures, string) {
 	t.Helper()
 	root := t.TempDir()
 	positive := filepath.Join(root, "positive")
@@ -277,7 +294,26 @@ func mountFixturesForTest(t *testing.T) *mountFixtures {
 		socketPath:  filepath.Join(root, "negatives", "socket"),
 		fifoPath:    filepath.Join(root, "negatives", "fifo"),
 		devicePath:  filepath.Join(root, "negatives", "device"),
+	}, root
+}
+
+// mountConfigForTest points the config at the fixture root and answers the
+// guest-side read with the bytes the payload is meant to have written.
+func mountConfigForTest(t *testing.T, fixtures *mountFixtures, root string) attendedConfig {
+	t.Helper()
+	config := testConfig()
+	config.MountRoot = root
+	expected, err := translatedGuestPath(root, filepath.Join(fixtures.positiveDirectory, "wefty-attended-mount-write.txt"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	config.GuestPath = func(_ context.Context, guestPath string) (string, error) {
+		if guestPath != expected {
+			return "", fmt.Errorf("guest read %q, want %q", guestPath, expected)
+		}
+		return attendedMountProbeBytes, nil
+	}
+	return config
 }
 
 // mountSession answers the positive run truthfully and every negative with the
@@ -310,17 +346,24 @@ func mountSession(t *testing.T, fixtures *mountFixtures, config attendedConfig, 
 		return ocihelper.RunResponse{}, &ocihelper.RPCError{Code: code, Message: "refused"}
 	}
 	session.watchFunc = func(ocihelper.AttemptAuthority) []ocihelper.WatchEvent {
-		return logEvents(attendedMountProbeBytes+"wefty-attended-mount-read", "unused", 0)
+		return logEvents(attendedMountProbeBytes+"wefty-attended-mount-read\n"+
+			"57 41 0:39 /positive /data rw,relatime - virtiofs wefty-host rw", "unused", 0)
 	}
 	return session
 }
 
 func TestDriveMountValidationPasses(t *testing.T) {
-	config := testConfig()
-	fixtures := mountFixturesForTest(t)
+	fixtures, root := mountFixturesForTest(t)
+	config := mountConfigForTest(t, fixtures, root)
 	row := driveMountValidation(context.Background(), mountSession(t, fixtures, config, nil), config, fixtures)
 	if row.Status != "PASS" || row.ExitCode != 0 {
 		t.Fatalf("row = %+v, want PASS", row)
+	}
+	if !strings.Contains(row.Reason, limarunner.GuestAllowedMountRoot) {
+		t.Fatalf("row reason must record the guest-side translated path: %s", row.Reason)
+	}
+	if !strings.Contains(row.Reason, "/data") {
+		t.Fatalf("row reason must record the payload's own mountinfo line: %s", row.Reason)
 	}
 	for _, target := range reservedMountTargets() {
 		if !strings.Contains(row.Reason, target) {
@@ -330,8 +373,8 @@ func TestDriveMountValidationPasses(t *testing.T) {
 }
 
 func TestDriveMountValidationFailsWhenANegativeIsAccepted(t *testing.T) {
-	config := testConfig()
-	fixtures := mountFixturesForTest(t)
+	fixtures, root := mountFixturesForTest(t)
+	config := mountConfigForTest(t, fixtures, root)
 	for _, negative := range mountNegatives(config, fixtures) {
 		accepted := map[string]bool{negative.nodePath + "\x00" + negative.containerPath: true}
 		row := driveMountValidation(context.Background(), mountSession(t, fixtures, config, accepted), config, fixtures)
@@ -346,8 +389,8 @@ func TestDriveMountValidationFailsWhenANegativeIsAccepted(t *testing.T) {
 }
 
 func TestDriveMountValidationFailsWhenTheHostSourceIsNotPreserved(t *testing.T) {
-	config := testConfig()
-	fixtures := mountFixturesForTest(t)
+	fixtures, root := mountFixturesForTest(t)
+	config := mountConfigForTest(t, fixtures, root)
 	session := mountSession(t, fixtures, config, nil)
 	inner := session.runFunc
 	session.runFunc = func(request ocihelper.RunRequest) (ocihelper.RunResponse, error) {
@@ -365,9 +408,47 @@ func TestDriveMountValidationFailsWhenTheHostSourceIsNotPreserved(t *testing.T) 
 	}
 }
 
+func TestDriveMountValidationFailsWithoutAProvenGuestTranslation(t *testing.T) {
+	fixtures, root := mountFixturesForTest(t)
+
+	noReader := mountConfigForTest(t, fixtures, root)
+	noReader.GuestPath = nil
+	row := driveMountValidation(context.Background(), mountSession(t, fixtures, noReader, nil), noReader, fixtures)
+	if row.Status == "PASS" {
+		t.Fatalf("row = %+v, want FAIL without a guest-side reader", row)
+	}
+
+	wrongBytes := mountConfigForTest(t, fixtures, root)
+	wrongBytes.GuestPath = func(context.Context, string) (string, error) { return "something else", nil }
+	row = driveMountValidation(context.Background(), mountSession(t, fixtures, wrongBytes, nil), wrongBytes, fixtures)
+	if row.Status == "PASS" {
+		t.Fatalf("row = %+v, want FAIL when the guest does not see the payload's bytes", row)
+	}
+
+	missingMount := mountConfigForTest(t, fixtures, root)
+	session := mountSession(t, fixtures, missingMount, nil)
+	session.watchFunc = func(ocihelper.AttemptAuthority) []ocihelper.WatchEvent {
+		return logEvents(attendedMountProbeBytes+"wefty-attended-mount-read", "unused", 0)
+	}
+	row = driveMountValidation(context.Background(), session, missingMount, fixtures)
+	if row.Status == "PASS" {
+		t.Fatalf("row = %+v, want FAIL when the payload reported no mount at /data", row)
+	}
+}
+
+func TestTranslatedGuestPathRefusesNonDescendants(t *testing.T) {
+	if _, err := translatedGuestPath("/mount/root", "/elsewhere/file"); err == nil {
+		t.Fatal("a path outside the operator mount root has no translation")
+	}
+	got, err := translatedGuestPath("/mount/root", "/mount/root/positive/file")
+	if err != nil || got != limarunner.GuestAllowedMountRoot+"/positive/file" {
+		t.Fatalf("translatedGuestPath = (%q, %v)", got, err)
+	}
+}
+
 func TestMountNegativesCoverEveryRequiredRefusal(t *testing.T) {
-	config := testConfig()
-	fixtures := mountFixturesForTest(t)
+	fixtures, root := mountFixturesForTest(t)
+	config := mountConfigForTest(t, fixtures, root)
 	negatives := mountNegatives(config, fixtures)
 	labels := map[string]bool{}
 	for _, negative := range negatives {

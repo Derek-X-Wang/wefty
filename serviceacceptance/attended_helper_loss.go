@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -31,6 +32,21 @@ import (
 // ---------------------------------------------------------------------------
 // Row 6: guest_to_host_fallback
 // ---------------------------------------------------------------------------
+
+func (config attendedConfig) bridgeWait() time.Duration {
+	if config.BridgeWait > 0 {
+		return config.BridgeWait
+	}
+	return attendedBridgeWait
+}
+
+const (
+	attendedFallbackRunID    = "attended-fallback-run"
+	attendedFallbackRunToken = "attended-fallback-token"
+	// attendedBridgeWait bounds how long the row waits for the payload's one
+	// authenticated request to reach the host origin after the payload exits.
+	attendedBridgeWait = 30 * time.Second
+)
 
 // driveGuestToHostFallback proves the helper-issued per-attempt bridge
 // capability and its wrong-capability and wrong-attempt refusals. The payload
@@ -43,8 +59,8 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 	authority := config.authority(contract.JobClassOneShot, "guest-to-host-fallback")
 	row.AttemptIDs = []string{authority.AttemptID}
 
-	runID := "attended-fallback-run"
-	runToken := "attended-fallback-token"
+	runID := attendedFallbackRunID
+	runToken := attendedFallbackRunToken
 	served := make(chan string, 8)
 	listener, serveErr, err := startHostBridgeOrigin(runID, runToken, served)
 	if err != nil {
@@ -105,7 +121,7 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 	case path := <-served:
 		row.RoundTrip = true
 		row.appendReason("host bridge origin served " + path)
-	default:
+	case <-time.After(config.bridgeWait()):
 		row.fail(errors.New("the host-side bridge origin served no authenticated request"))
 		return row
 	}
@@ -140,16 +156,26 @@ func startHostBridgeOrigin(runID, runToken string, served chan<- string) (net.Li
 	if err != nil {
 		return nil, nil, err
 	}
+	// The handler runs on the server's own goroutine and serveErr is read from
+	// the caller's, so the rejection needs a lock rather than a bare variable.
+	var rejectionMu sync.Mutex
 	var rejection error
+	reject := func(err error) {
+		rejectionMu.Lock()
+		defer rejectionMu.Unlock()
+		if rejection == nil {
+			rejection = err
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer "+runToken {
-			rejection = errors.New("bridge request carried no run-scoped bearer credential")
+			reject(errors.New("bridge request carried no run-scoped bearer credential"))
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		if !strings.HasSuffix(request.URL.Path, "/"+runID) {
-			rejection = fmt.Errorf("bridge request path %q did not name run %q", request.URL.Path, runID)
+			reject(fmt.Errorf("bridge request path %q did not name run %q", request.URL.Path, runID))
 			writer.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -162,7 +188,11 @@ func startHostBridgeOrigin(runID, runToken string, served chan<- string) (net.Li
 	})
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = server.Serve(listener) }()
-	return listener, func() error { return rejection }, nil
+	return listener, func() error {
+		rejectionMu.Lock()
+		defer rejectionMu.Unlock()
+		return rejection
+	}, nil
 }
 
 // pumpAttendedHostBridge is the attended equivalent of the agent's own host
@@ -345,11 +375,14 @@ type lossObservation struct {
 	oldTunnelRefused     string
 	newClaimRefused      string
 	preSweepProbeRefused string
-	sweepObservedAt      time.Time
-	probeObservedAt      time.Time
-	withdrawn            contract.CapabilityObservation
-	reopened             contract.CapabilityObservation
-	bootSessionReused    bool
+	// preSweepBarrierPrepared records whether the barrier still held a
+	// verified sweep receipt at the moment the pre-sweep probe was refused.
+	preSweepBarrierPrepared bool
+	sweepObservedAt         time.Time
+	probeObservedAt         time.Time
+	withdrawn               contract.CapabilityObservation
+	reopened                contract.CapabilityObservation
+	bootSessionReused       bool
 }
 
 // checkLossTransition is the recovery assertion: a genuinely new helper
@@ -416,11 +449,49 @@ func checkLossTransition(observation lossObservation) error {
 	return nil
 }
 
+// unpreparedBarrierRefusals are the boot barrier's own words for "this
+// session has no verified sweep behind it". Matching them keeps an unrelated
+// failure -- a dial timeout, an image problem -- from satisfying the
+// pre-sweep refusal.
+var unpreparedBarrierRefusals = []string{
+	"OCI boot barrier has not completed",
+	"OCI boot barrier is unavailable",
+	"OCI helper session is not configured",
+}
+
+func isUnpreparedBarrierRefusal(text string) bool {
+	for _, phrase := range unpreparedBarrierRefusals {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepOrderingNote is this row's honesty line. The pre-sweep probe cannot
+// race the sweep: BootBarrier.Ensure acquires the session and completes the
+// verified sweep as one step, so between Invalidate and Ensure there is no
+// session to probe with and the refusal is structural. That structure is the
+// row's real content -- a probe cannot reach a helper generation whose sweep
+// has not completed -- rather than a timing observation, and the assertions
+// below check exactly that structure held rather than pretending to have
+// observed a race.
+const sweepOrderingNote = "sweep_before_recovery is a structural claim, not a timing race: Ensure's acquire and " +
+	"verified sweep are one step, so the pre-sweep probe is refused by the unprepared barrier itself and the " +
+	"probe can only succeed against a generation whose sweep already completed"
+
 // checkSweepOrdering is sweep_before_recovery: nothing may probe positively,
 // and no publication may succeed, before the verified sweep.
 func checkSweepOrdering(observation lossObservation) error {
 	if observation.preSweepProbeRefused == "" {
 		return errors.New("the functional probe passed before the verified sweep")
+	}
+	if !isUnpreparedBarrierRefusal(observation.preSweepProbeRefused) {
+		return fmt.Errorf("the pre-sweep probe failed for an unrelated reason rather than the unprepared barrier: %s",
+			observation.preSweepProbeRefused)
+	}
+	if observation.preSweepBarrierPrepared {
+		return errors.New("the barrier still held a verified sweep receipt when the pre-sweep probe was refused")
 	}
 	if !observation.verifiedAbsent {
 		return errors.New("there was no verified sweep for the probe to follow")
@@ -509,7 +580,7 @@ func driveLossSequence(ctx context.Context, dependencies lossDependencies) (loss
 	// new claim is admitted.
 	if _, dialErr := session.DialAttemptPort(ctx, ocihelper.DialAttemptPortRequest{
 		Authority: authority, Name: "service",
-	}); dialErr != nil {
+	}); restrictiveFailure(dialErr) {
 		observation.oldTunnelRefused = dialErr.Error()
 	}
 	claimAuthority := config.authority(contract.JobClassOneShot, "loss-"+string(dependencies.kind)+"-post-fault-claim")
@@ -518,9 +589,9 @@ func driveLossSequence(ctx context.Context, dependencies lossDependencies) (loss
 		Workload: ocihelper.WorkloadInput{
 			ImageReference: config.Reference, ImageDigest: config.Digest, Argv: []string{"/bin/true"},
 		},
-	}); claimErr != nil {
+	}); restrictiveFailure(claimErr) {
 		observation.newClaimRefused = claimErr.Error()
-	} else {
+	} else if claimErr == nil {
 		reapAttempt(session, claimAuthority)
 	}
 	if health := awaitControlStreamFailure(ctx, session, dependencies.settle); health != nil {
@@ -536,6 +607,7 @@ func driveLossSequence(ctx context.Context, dependencies lossDependencies) (loss
 		return observation, fmt.Errorf("restore after the %s fault: %w", dependencies.kind, err)
 	}
 	dependencies.barrier.Invalidate()
+	_, observation.preSweepBarrierPrepared = dependencies.barrier.SweepReceipt()
 	if probeErr := dependencies.probe(ctx); probeErr != nil {
 		observation.preSweepProbeRefused = probeErr.Error()
 	}
@@ -562,6 +634,22 @@ func driveLossSequence(ctx context.Context, dependencies lossDependencies) (loss
 	observation.reopened = dependencies.ledger.reopen()
 	return observation, nil
 }
+
+// restrictiveFailure reports whether err is the runtime refusing, rather than
+// this driver's own context running out. A deadline or cancellation says
+// nothing about whether the old tunnel was still reachable, so it must not be
+// recorded as though it did.
+func restrictiveFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
+}
+
+const restrictiveObservationNote = "the post-fault tunnel and claim entries are restrictive observations from a " +
+	"lost session, not typed helper refusals: once the control stream is gone the helper answers nothing, so what " +
+	"is recorded is the transport failure verbatim, with this driver's own context deadline and cancellation " +
+	"excluded so they cannot masquerade as the runtime refusing"
 
 func awaitControlStreamFailure(ctx context.Context, session attendedSession, bound time.Duration) error {
 	if bound <= 0 {
@@ -592,7 +680,7 @@ func (config attendedConfig) now() time.Time {
 
 // lossRow renders one observation into one receipt row. check is the
 // row-specific assertion; narrative says what this row claims.
-func lossRow(config attendedConfig, observation lossObservation, check func(lossObservation) error, narrative string) attendedRow {
+func lossRow(config attendedConfig, observation lossObservation, check func(lossObservation) error, narrative, notes string) attendedRow {
 	row := newAttendedRow(config.SessionID, config.Command)
 	row.AttemptIDs = []string{"attended-loss-" + string(observation.kind)}
 	generations := []uint64{}
@@ -630,6 +718,10 @@ func lossRow(config attendedConfig, observation lossObservation, check func(loss
 		observation.postGeneration.HelperInstanceID, observation.postGeneration.SessionGeneration,
 		observation.withdrawn.ReasonCode, observation.bootSessionReused))
 	row.appendReason(capabilityRevisionNote)
+	row.appendReason(restrictiveObservationNote)
+	if notes != "" {
+		row.appendReason(notes)
+	}
 	if err := check(observation); err != nil {
 		row.fail(err)
 		return row

@@ -171,6 +171,7 @@ attended run on this host, create the device-node mount negative, which macOS
 will not let a non-root user make:
 
 ```sh
+mkdir -p "$WEFTY_ATTENDED_MOUNT_ROOT/negatives"
 sudo mknod "$WEFTY_ATTENDED_MOUNT_ROOT/negatives/device" c 1 3
 ```
 
@@ -189,14 +190,18 @@ WEFTY_ATTENDED_ROWS_OUT=/abs/path/transport-rows.json \
   -count=1 -v ./serviceacceptance
 ```
 
-It performs each row's operations in order against the guest socket and writes
+It refuses to start unless `pgrep -fl wefty-agent` is empty, performs each
+row's operations in order against the guest socket, and writes
 `task_logs_delete`, `mount_validation`, `host_to_guest` and
 `guest_to_host_fallback` to `WEFTY_ATTENDED_ROWS_OUT` in the receipt's row
 shape, each carrying `session_id`, the exact `command`, `exit_code`, and a
 `reason` recording the typed refusal code every negative returned. The gate
 (`runner/lima/service_acceptance_test.go`) requires no other typed field for
 these rows beyond that shared shape. Fold the fragment into the receipt as the
-Receipt section describes. The one clause the entrypoint does not exercise is
+Receipt section describes. The mount row proves the host-to-guest translation
+from both sides: the payload's write appears on the host under the operator
+mount root and, read back with `limactl shell`, in the guest under
+`/mnt/wefty-host`. The one clause the entrypoint does not exercise is
 item 6's "discovery failure must fail start and must not select fallback",
 which is agent-side and outside a direct helper-client session; the row's
 `reason` says so verbatim, so judge the row with that in view.
@@ -457,6 +462,20 @@ Set `WEFTY_ATTENDED_MANUAL_FAULTS=1` to take them by hand instead: the
 entrypoint prints the exact command and waits until you `touch` the
 acknowledgement file it names (`WEFTY_ATTENDED_FAULT_ACK`, default
 `/tmp/wefty-attended-fault-ack`).
+
+`sweep_before_recovery` is a structural claim rather than a timing race, and
+the row says so: `Ensure` acquires the session and completes the verified
+sweep as one step, so between the invalidation and the re-acquire there is no
+session to probe with at all. The row asserts that the pre-sweep probe was
+refused by the unprepared barrier specifically — an unrelated failure does not
+satisfy it — and that the probe then succeeded only against a generation whose
+sweep had completed.
+
+The post-fault "old tunnel unreachable" and "no new claim admitted" entries
+are restrictive observations from a lost session, not typed helper refusals:
+once the control stream is gone the helper answers nothing. The driver
+excludes its own context deadline and cancellation so they cannot masquerade
+as the runtime refusing, and each row's `reason` repeats the qualification.
 
 The `capability_revisions` these rows emit are the driver's own local OCI
 capability observations, carrying the barrier's typed reason code. No L1
