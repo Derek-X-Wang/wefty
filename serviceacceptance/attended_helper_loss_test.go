@@ -142,7 +142,7 @@ func healthyObservation(t *testing.T) lossObservation {
 		preSweepBarrierPrepared: false,
 		withdrawalEnsureRefused: "dial oci helper: connect: connection refused",
 		sweepObservedAt:         sweepAt, probeObservedAt: sweepAt.Add(3 * time.Second),
-		withdrawn: contract.CapabilityObservation{Revision: 1, ReasonCode: contract.CapabilityReasonHelperUnreachable},
+		withdrawn: contract.CapabilityObservation{Revision: 1, ReasonCode: contract.CapabilityReasonHelperUnitUnavailable},
 		reopened:  contract.CapabilityObservation{Revision: 2},
 	}
 }
@@ -361,10 +361,14 @@ func lossFakes(t *testing.T, config attendedConfig, tunnelSurvives bool) (*fakeB
 	barrier := &fakeBarrier{
 		session: session, prepared: true,
 		// While the fault stands, a re-Ensure cannot reach the helper. That
-		// refusal is what gives the barrier a typed reason at all.
+		// refusal is what gives the barrier a typed reason at all, and the
+		// reason is one BootBarrier.recordCapabilityReason actually emits: it
+		// only ever yields helper_unit_unavailable, helper_handshake_stalled or
+		// boot_sweep_failed, so pinning anything else would be a fake the real
+		// barrier could not produce.
 		refuseEnsure:  func() bool { return faulted },
 		refusal:       errors.New("dial oci helper: connect: connection refused"),
-		refusalReason: contract.CapabilityReasonHelperUnreachable,
+		refusalReason: contract.CapabilityReasonHelperUnitUnavailable,
 		receipts: []ocihelper.VerifiedSweepReceipt{
 			{HelperSession: helperSession("helper-a", 4),
 				VerifiedInventory: ocihelper.ResourceInventory{Containers: []string{identity.ContainerID}}},
@@ -411,8 +415,10 @@ func TestDriveLossSequenceProducesBothRows(t *testing.T) {
 		t.Fatalf("injector = %+v, want exactly one fault and one restore", injector)
 	}
 	// The initial acquire happens in the entrypoint, so the sequence itself
-	// invalidates once and re-acquires exactly once.
-	if barrier.invalidated != 1 || barrier.ensures != 1 {
+	// invalidates twice -- once before the in-window re-Ensure that produces
+	// the typed reason, once before the recovery -- and re-acquires exactly
+	// once, since the in-window Ensure is refused.
+	if barrier.invalidated != 2 || barrier.ensures != 1 {
 		t.Fatalf("barrier invalidated=%d ensures=%d, want one re-acquire", barrier.invalidated, barrier.ensures)
 	}
 	if err := checkLossTransition(observation); err != nil {
@@ -444,7 +450,7 @@ func TestDriveLossSequenceTakesItsTypedReasonFromAnInWindowReEnsure(t *testing.T
 	if observation.withdrawalEnsureRefused == "" {
 		t.Fatal("the in-window re-Ensure must be recorded, refusal and all")
 	}
-	if observation.withdrawn.ReasonCode != contract.CapabilityReasonHelperUnreachable {
+	if observation.withdrawn.ReasonCode != contract.CapabilityReasonHelperUnitUnavailable {
 		t.Fatalf("withdrawal reason = %q, want the barrier's classification of the in-window refusal",
 			observation.withdrawn.ReasonCode)
 	}
@@ -462,7 +468,7 @@ func TestDriveLossSequenceTakesItsTypedReasonFromAnInWindowReEnsure(t *testing.T
 	if row.Status != "PASS" {
 		t.Fatalf("row = %+v, want PASS", row)
 	}
-	for _, phrase := range []string{capabilityReasonNote, string(contract.CapabilityReasonHelperUnreachable)} {
+	for _, phrase := range []string{capabilityReasonNote, string(contract.CapabilityReasonHelperUnitUnavailable)} {
 		if !strings.Contains(row.Reason, phrase) {
 			t.Fatalf("row reason must say where the typed reason came from, got %q", row.Reason)
 		}
@@ -644,6 +650,51 @@ func fallbackSession(t *testing.T, accept string) *fakeSession {
 		return helper, nil
 	}
 	return session
+}
+
+// The helper names a handoff volume from the descriptor's OwnerKey, not from
+// the attempt digest. This is the only row that requests one, so it is the
+// only place the distinction can be caught: a proof written against the
+// attempt-derived name would look at a name that can never appear and pass
+// over a real leak.
+func TestDriveGuestToHostFallbackNamesTheHandoffVolumeFromItsOwnerKey(t *testing.T) {
+	ownerName, err := ocihelper.DeterministicHandoffVolumeDirectory(attendedFallbackHandoffOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig()
+	identity, err := ocihelper.DeterministicResourceIdentity(
+		config.authority(contract.JobClassOneShot, "guest-to-host-fallback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerName == identity.HandoffVolumeDirectory {
+		t.Fatal("the owner-key and attempt-digest handoff names must differ for this row to mean anything")
+	}
+
+	leaked := ocihelper.ResourceInventory{ManagedVolumes: []string{ownerName}}
+	session := fallbackSession(t, "")
+	session.verifyResp = ocihelper.VerifyResponse{Inventory: leaked, RuntimeResidue: leaked}
+	if row := driveGuestToHostFallback(context.Background(), session, config); row.Status == "PASS" {
+		t.Fatalf("row = %+v, want FAIL when the attempt's own handoff volume is left as runtime residue", row)
+	}
+
+	// Observed but not residue is the helper retaining it for its owner to
+	// collect, which is the contract working rather than a leak.
+	retained := fallbackSession(t, "")
+	retained.verifyResp = ocihelper.VerifyResponse{Inventory: leaked, DurableRetained: leaked}
+	if row := driveGuestToHostFallback(context.Background(), retained, config); row.Status != "PASS" {
+		t.Fatalf("row = %+v, want PASS when the handoff volume is merely retained", row)
+	}
+
+	// The attempt-digest name is not this attempt's handoff volume at all, so
+	// a proof pinned to it would have been vacuous.
+	digestNamed := ocihelper.ResourceInventory{ManagedVolumes: []string{identity.HandoffVolumeDirectory}}
+	vacuous := fallbackSession(t, "")
+	vacuous.verifyResp = ocihelper.VerifyResponse{Inventory: digestNamed, RuntimeResidue: digestNamed}
+	if row := driveGuestToHostFallback(context.Background(), vacuous, config); row.Status != "PASS" {
+		t.Fatalf("row = %+v: the attempt-digest handoff name names nothing this attempt owns", row)
+	}
 }
 
 func TestDriveGuestToHostFallbackPasses(t *testing.T) {

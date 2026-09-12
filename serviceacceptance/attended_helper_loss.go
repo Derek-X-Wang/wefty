@@ -41,8 +41,9 @@ func (config attendedConfig) bridgeWait() time.Duration {
 }
 
 const (
-	attendedFallbackRunID    = "attended-fallback-run"
-	attendedFallbackRunToken = "attended-fallback-token"
+	attendedFallbackRunID        = "attended-fallback-run"
+	attendedFallbackRunToken     = "attended-fallback-token"
+	attendedFallbackHandoffOwner = "attended-fallback-handoff-owner"
 	// attendedBridgeWait bounds how long the row waits for the payload's one
 	// authenticated request to reach the host origin after the payload exits.
 	attendedBridgeWait = 30 * time.Second
@@ -61,6 +62,12 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 
 	runID := attendedFallbackRunID
 	runToken := attendedFallbackRunToken
+	// The helper names this volume from the owner key, not from the attempt
+	// digest, so the same slice has to reach Run and the absence proof for the
+	// proof to look at the name the helper actually used.
+	volumes := []ocihelper.ManagedVolumeDescriptor{{
+		Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: attendedFallbackHandoffOwner,
+	}}
 	served := make(chan string, 8)
 	listener, serveErr, err := startHostBridgeOrigin(runID, runToken, served)
 	if err != nil {
@@ -74,13 +81,11 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 		EnableHostBridgeFallback: true, ActivateHostBridgeFallback: true,
 		Workload: ocihelper.WorkloadInput{
 			ImageReference: config.Reference, ImageDigest: config.Digest,
-			Argv:        []string{"/usr/local/bin/wefty-echo-service", "--once"},
-			L3Endpoint:  "http://l3-origin.invalid",
-			RunToken:    runToken,
-			Environment: []ocihelper.EnvironmentVariable{{Name: contract.EnvRunID, Value: runID}},
-			ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{
-				Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: "attended-fallback-handoff-owner",
-			}},
+			Argv:           []string{"/usr/local/bin/wefty-echo-service", "--once"},
+			L3Endpoint:     "http://l3-origin.invalid",
+			RunToken:       runToken,
+			Environment:    []ocihelper.EnvironmentVariable{{Name: contract.EnvRunID, Value: runID}},
+			ManagedVolumes: volumes,
 		},
 	})
 	if err != nil {
@@ -136,7 +141,7 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 		row.fail(err)
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority); err != nil {
+	if err := deleteAndVerify(ctx, session, authority, volumes); err != nil {
 		row.fail(err)
 		return row
 	}
@@ -632,6 +637,15 @@ func driveLossSequence(ctx context.Context, dependencies lossDependencies) (loss
 	// re-Ensures while the runtime is down and classifies the refusal. Do the
 	// same thing here, bounded, and carry that refusal's typed reason into the
 	// withdrawal rather than inventing one.
+	//
+	// Invalidate first, so the re-Ensure below cannot short-circuit. Session
+	// .markLost sets the stream error under the lock and runs the barrier's
+	// loss handler only after releasing it, so barrier.prepared trails
+	// HealthError by that gap. BootBarrier.Ready consults the session's health
+	// as well as prepared, so today that gap does not reach Ensure -- but the
+	// row would fail for a race rather than for anything the runtime did if it
+	// ever did, and an explicit Invalidate costs nothing to rule that out.
+	dependencies.barrier.Invalidate()
 	ensureContext, cancelWithdrawal := context.WithTimeout(ctx, dependencies.withdrawalBound())
 	if refusal := dependencies.barrier.Ensure(ensureContext); refusal != nil {
 		observation.withdrawalEnsureRefused = refusal.Error()

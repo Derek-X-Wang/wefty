@@ -365,7 +365,15 @@ func checkLogEvidence(evidence logEvidence, stdoutMarker, stderrMarker string) e
 // attempt's deterministic resource names exactly as the helper's own attempt
 // scope projects it (filterInventory in containerd_engine_linux.go), with
 // every one of those names required absent.
-func deleteAndVerify(ctx context.Context, session attendedSession, authority ocihelper.AttemptAuthority) error {
+//
+// volumes is the exact ManagedVolumes slice the row's own Run request carried.
+// Two of the attempt's resource names cannot be derived from the authority
+// alone -- a handoff volume is named from the descriptor's OwnerKey and a
+// Computer disk from the descriptor's Storage identity -- so passing the row's
+// own descriptors is what keeps those two halves of the proof from naming
+// something that can never appear.
+func deleteAndVerify(ctx context.Context, session attendedSession, authority ocihelper.AttemptAuthority,
+	volumes []ocihelper.ManagedVolumeDescriptor) error {
 	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
 	if err != nil {
 		return fmt.Errorf("delete attempt: %w", err)
@@ -377,7 +385,7 @@ func deleteAndVerify(ctx context.Context, session attendedSession, authority oci
 	if err != nil {
 		return fmt.Errorf("verify attempt absence: %w", err)
 	}
-	return checkAttemptAbsence(verification, authority)
+	return checkAttemptAbsence(verification, authority, volumes)
 }
 
 // attemptAbsenceNote is the one line every row using deleteAndVerify carries,
@@ -388,14 +396,25 @@ const attemptAbsenceNote = "attempt absence is proven independently of the Delet
 
 // durableBeyondAttempt are the resource classes the helper's own contract
 // keeps past one attempt: a service data volume and its owner record belong to
-// the job, and a handoff volume is retained for its owner to collect. Their
-// presence in the namespace inventory after a Delete is the contract working,
-// not residue -- but they must still never appear as runtime residue, which is
-// what the residue check above them asserts for every class alike.
+// the job, a handoff volume is retained for its owner to collect, and a
+// Computer disk is durable Storage that the helper projects out of runtime
+// absence while a manifest backs it. Their presence in the namespace inventory
+// after a Delete is the contract working, not residue -- but they must still
+// never appear as runtime residue, which is what the residue check above them
+// asserts for every class alike.
 var durableBeyondAttempt = map[ocihelper.RemovalResourceClass]bool{
-	ocihelper.RemovalResourceHandoffVolume:     true,
-	ocihelper.RemovalResourceServiceData:       true,
-	ocihelper.RemovalResourceServiceDataRecord: true,
+	ocihelper.RemovalResourceHandoffVolume:          true,
+	ocihelper.RemovalResourceServiceData:            true,
+	ocihelper.RemovalResourceServiceDataRecord:      true,
+	ocihelper.RemovalResourceComputerDiskImage:      true,
+	ocihelper.RemovalResourceComputerDiskAllocation: true,
+	ocihelper.RemovalResourceComputerDiskQuota:      true,
+	ocihelper.RemovalResourceComputerDiskManifest:   true,
+	ocihelper.RemovalResourceComputerDiskMount:      true,
+	ocihelper.RemovalResourceComputerDiskLoop:       true,
+	ocihelper.RemovalResourceComputerAttachment:     true,
+	ocihelper.RemovalResourceComputerResetManifest:  true,
+	ocihelper.RemovalResourceComputerQuarantine:     true,
 }
 
 // retainableAfterDelete are the only two transient classes the helper may
@@ -413,12 +432,17 @@ var retainableAfterDelete = map[ocihelper.RemovalResourceClass]ocihelper.Durable
 // hand-written list is deliberate: a resource class added to the helper cannot
 // quietly drop out of this proof, because attemptInventoryEntries fails the
 // row on a class it does not know how to look up.
-func checkAttemptAbsence(verification ocihelper.VerifyResponse, authority ocihelper.AttemptAuthority) error {
+func checkAttemptAbsence(verification ocihelper.VerifyResponse, authority ocihelper.AttemptAuthority,
+	volumes []ocihelper.ManagedVolumeDescriptor) error {
 	identity, err := ocihelper.DeterministicResourceIdentity(authority)
 	if err != nil {
 		return err
 	}
-	resources := ocihelper.ExpectedRemovalResources(identity, identity.HandoffVolumeDirectory, nil)
+	handoff, storage, err := attemptVolumeNames(volumes)
+	if err != nil {
+		return err
+	}
+	resources := ocihelper.ExpectedRemovalResources(identity, handoff, storage)
 	if len(resources) == 0 {
 		return errors.New("the helper's removal registry named no resources for this attempt")
 	}
@@ -451,6 +475,43 @@ func checkAttemptAbsence(verification ocihelper.VerifyResponse, authority ocihel
 	return nil
 }
 
+// attemptVolumeNames resolves the two identities the attempt authority cannot
+// name on its own. The helper names a handoff volume from the descriptor's
+// OwnerKey rather than the attempt digest (server.go MethodRun, and the
+// agent's own removal manifest in runner/oci/adapter.go does the same), so
+// passing the attempt-derived name would match something that can never appear
+// and prove nothing. A Computer disk is likewise named by its Storage
+// reference. A descriptor this row cannot name fails the row rather than
+// dropping that resource out of the proof.
+func attemptVolumeNames(volumes []ocihelper.ManagedVolumeDescriptor) (string, *ocihelper.ComputerStorageReference, error) {
+	handoff := ""
+	var storage *ocihelper.ComputerStorageReference
+	for _, volume := range volumes {
+		switch volume.Kind {
+		case ocihelper.ManagedVolumeHandoff:
+			name, err := ocihelper.DeterministicHandoffVolumeDirectory(volume.OwnerKey)
+			if err != nil {
+				return "", nil, fmt.Errorf("name the handoff volume this attempt requested: %w", err)
+			}
+			handoff = name
+		case ocihelper.ManagedVolumeComputerDisk:
+			if volume.ComputerStorage == nil {
+				return "", nil, errors.New("this attempt requested a Computer disk with no Storage identity, so its resources cannot be named")
+			}
+			reference := *volume.ComputerStorage
+			storage = &reference
+		case ocihelper.ManagedVolumeServiceData:
+			// Named from the stable job identity, which the attempt authority
+			// already carries into DeterministicResourceIdentity.
+		default:
+			return "", nil, fmt.Errorf(
+				"this attempt requested managed volume kind %q, which this row cannot name in the namespace inventory",
+				volume.Kind)
+		}
+	}
+	return handoff, storage, nil
+}
+
 // attemptInventoryEntries is this driver's copy of the projection the helper
 // applies for an attempt-scoped Verify: the entries of one inventory list that
 // carry this attempt's deterministic name.
@@ -473,6 +534,26 @@ func attemptInventoryEntries(inventory ocihelper.ResourceInventory, resource oci
 		candidates = inventory.ManagedVolumes
 	case ocihelper.RemovalResourceServiceDataRecord:
 		candidates = inventory.ManagedVolumeRecords
+	// The helper matches every Computer disk class against the one disk name
+	// its Storage reference produces, so these are plain equality lookups.
+	case ocihelper.RemovalResourceComputerDiskImage:
+		candidates = inventory.ComputerDiskImages
+	case ocihelper.RemovalResourceComputerDiskAllocation:
+		candidates = inventory.ComputerDiskAllocations
+	case ocihelper.RemovalResourceComputerDiskQuota:
+		candidates = inventory.ComputerDiskQuotas
+	case ocihelper.RemovalResourceComputerDiskManifest:
+		candidates = inventory.ComputerDiskManifests
+	case ocihelper.RemovalResourceComputerDiskMount:
+		candidates = inventory.ComputerDiskMounts
+	case ocihelper.RemovalResourceComputerDiskLoop:
+		candidates = inventory.ComputerDiskLoops
+	case ocihelper.RemovalResourceComputerAttachment:
+		candidates = inventory.ComputerAttachments
+	case ocihelper.RemovalResourceComputerResetManifest:
+		candidates = inventory.ComputerResetManifests
+	case ocihelper.RemovalResourceComputerQuarantine:
+		candidates = inventory.ComputerQuarantines
 	case ocihelper.RemovalResourceCgroup:
 		// Cgroup inventory entries are guest paths and the helper matches their
 		// base name with any .scope suffix trimmed. path, not path/filepath:
@@ -614,7 +695,7 @@ func driveTaskLogsDelete(ctx context.Context, session attendedSession, config at
 	row.StdoutMarkers = []string{stdoutMarker}
 	row.StderrMarkers = []string{stderrMarker}
 	row.PayloadExecutions = 1
-	if err := deleteAndVerify(ctx, session, authority); err != nil {
+	if err := deleteAndVerify(ctx, session, authority, nil); err != nil {
 		row.fail(err)
 		return row
 	}
@@ -842,7 +923,7 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 		row.fail(fmt.Errorf("guest %s = %q, want the bytes the payload wrote", guestPath, guestBytes))
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority); err != nil {
+	if err := deleteAndVerify(ctx, session, authority, nil); err != nil {
 		row.fail(err)
 		return row
 	}
@@ -959,13 +1040,16 @@ func driveHostToGuest(ctx context.Context, session attendedSession, config atten
 	row := newAttendedRow(config.SessionID, config.Command)
 	authority := config.authority(contract.JobClassService, "host-to-guest")
 	row.AttemptIDs = []string{authority.AttemptID}
+	// The same slice reaches Run and the absence proof, so the proof can never
+	// name a volume the attempt did not actually request.
+	volumes := []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeServiceData}}
 
 	response, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: boundedDeadman(session, config.Deadman),
 		AllocateEndpoints: []string{"service"},
 		Workload: ocihelper.WorkloadInput{
 			ImageReference: config.Reference, ImageDigest: config.Digest,
-			ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeServiceData}},
+			ManagedVolumes: volumes,
 			// The payload binds only guest loopback on the helper-allocated
 			// port and answers one distinct request marker with one distinct
 			// response marker.
@@ -1007,7 +1091,7 @@ func driveHostToGuest(ctx context.Context, session attendedSession, config atten
 		row.fail(err)
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority); err != nil {
+	if err := deleteAndVerify(ctx, session, authority, volumes); err != nil {
 		row.fail(err)
 		return row
 	}
