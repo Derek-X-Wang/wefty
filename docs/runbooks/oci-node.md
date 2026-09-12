@@ -307,7 +307,19 @@ Meaning: no consecutive bounded helper handshake stall window is recorded. First
 
 ## doctor-code-oci-helper-handshake-stalls-observed
 
-Meaning: one or more takeover windows connected without a handshake. Evidence: preserve the count; Lima escalates at `RecoveryTimeout`.
+Meaning: one or more bounded takeover windows reached the helper socket without reaching an admitted session — either a window that connected and never completed a handshake, or a handshake the helper answered with a typed `startup_bound_tripped` refusal, which ends its window at the first dial. Evidence: preserve the count, and read `oci_helper_startup_bound_tripped` to tell the two apart; Lima escalates at `RecoveryTimeout`.
+
+## doctor-code-oci-helper-startup-bound-not-read
+
+Meaning: the helper startup-failure bound was unavailable. First action: rerun doctor from the configured agent process.
+
+## doctor-code-oci-helper-startup-bound-clear
+
+Meaning: the connected helper reported no tripped startup-failure bound. First action: continue with downstream findings.
+
+## doctor-code-oci-helper-startup-bound-tripped
+
+Meaning: the helper's boot Sweep+Verify barrier failed its bounded number of consecutive times, so this helper generation admits no session and re-attempts the barrier at most once per startup-failure window; every helper-dependent finding below is NOT-RUN for that reason. The finding names the handshake it was read at and the next attempt time — a bound read minutes ago may already be cleared. Evidence: preserve the reported phase, count, and elapsed streak, and the helper journal for the failing barrier. First action: fix the denial named in the journal — the whole-namespace startup sweep is denied by anything pinned inside the OCI runtime root, including a test fixture's mount. The helper then recovers on its own at the next attempt time, with no restart at all; re-run doctor after it. Escalation: restarting the helper unit (`systemctl restart dev.wefty.oci-helper.service` inside the guest or on a native Linux node, `wefty node oci start` on a Lima node) does **not** shorten the wait — the new generation inherits the same schedule, which is exactly what bounds the relaunch loop. To force an immediate attempt, delete the helper's failure ledger (`/var/lib/wefty/oci/startup-barrier-failures.json`, under the configured OCI runtime root) and then restart the unit; do that only after the denial itself is fixed, or the loop starts over.
 
 ## doctor-code-oci-computer-storage-recovery-clear
 
