@@ -22,6 +22,15 @@ and raw environment dumps must never enter the artifact.
   discovery-only); its OCI archive contains the same
   `/bin/sh`, BusyBox utilities, and `cmd/wefty-echo-service` program used by
   Linux realtiming, including the distinct one-shot stdout/stderr markers;
+- from the same artifact, the two image-user variants of that echo image that
+  `service_data_guest_native` needs: `wefty-echo-service-user-numeric.oci.tar`
+  (image user `13001:13002`) and `wefty-echo-service-user-named.oci.tar`
+  (image user `wefty:wefty`, resolving to `12001:12002`). They differ from the
+  root echo image only in that user, they are published as
+  `<commit>-user-numeric` and `<commit>-user-named` tags of the same public
+  `wefty-echo-service` package, and their index and per-platform digests are
+  recorded in `acceptance-image-receipt.json` under `service_user_variants`.
+  Import each by its `acceptance-image-user-<variant>-index-digest.txt`;
 - the separate `wefty-computer-reference-<candidate-commit>` artifact from
   that exact workflow run. Extract `wefty-computer-reference-release.tar`,
   require its commit to match the echo artifact, and use the repository name
@@ -267,7 +276,10 @@ and the guest socket back to `0660 root:wefty-oci`.
    `WEFTY_SERVICE_DIR=/wefty/service` and the absence of guest or host backing
    paths in the payload environment.
 8. Service data: run root, numeric `13001:13002`, and named `wefty:wefty`
-   (`12001:12002`) image-user variants. For each, require `/wefty/service` to
+   (`12001:12002`) image-user variants, the latter two from the
+   `wefty-echo-service-user-numeric.oci.tar` and
+   `wefty-echo-service-user-named.oci.tar` archives named in the
+   preconditions. For each, require `/wefty/service` to
    begin with exactly that UID:GID and accept a payload write. For one stable
    service job, record attempt counters `0,1,2` across crash restart and
    stop→start while a marker outside `/wefty/service` is absent at the start of

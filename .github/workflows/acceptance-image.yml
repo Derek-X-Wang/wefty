@@ -106,6 +106,58 @@ jobs:
           jq -n --arg platform "$PLATFORM" --arg digest "$platform_digest" --argjson e_machine "$machine" \
             '{platform: $platform, digest: $digest, executed: true, health: true, echo: true, elf_e_machine: $e_machine}' \
             > "$evidence/${ARCH}-runtime.json"
+      - name: Build and execute the image-user service variants
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/acceptance-image-linux"
+          crane="$(go env GOPATH)/bin/crane"
+          port=18157
+          for variant in numeric named; do
+            case "$variant" in
+              numeric) owner='13001:13002' ;;
+              named) owner='12001:12002' ;;
+              *) printf '%s\n' "::error::unknown image-user variant $variant"; exit 1 ;;
+            esac
+            registry_reference="localhost:5000/wefty-echo-service-user-${variant}:${GITHUB_SHA}-${ARCH}"
+            docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+              --build-arg SOURCE_DATE_EPOCH=0 --target "$variant" \
+              --file examples/oci-echo-service/Dockerfile.service-users \
+              --output "type=oci,dest=$RUNNER_TEMP/service-user-${variant}.oci.tar,rewrite-timestamp=true" .
+            docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+              --build-arg SOURCE_DATE_EPOCH=0 --target "$variant" \
+              --file examples/oci-echo-service/Dockerfile.service-users \
+              --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
+            scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/service-user-${variant}.oci.tar" \
+              --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}-user-${variant}.digest" \
+              --receipt-output "$evidence/${ARCH}-user-${variant}-oci.json"
+            cp "$RUNNER_TEMP/service-user-${variant}.oci.tar" "$evidence/${ARCH}-user-${variant}.oci.tar"
+            platform_digest="$(cat "$evidence/${ARCH}-user-${variant}.digest")"
+            test "$("$crane" digest --insecure "$registry_reference")" = "$platform_digest"
+            pinned_reference="${registry_reference}@${platform_digest}"
+            docker pull --platform "$PLATFORM" "$pinned_reference"
+            observed_owner="$(docker run --rm --platform "$PLATFORM" --entrypoint /bin/sh "$pinned_reference" \
+              -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"')"
+            test "$observed_owner" = "$owner"
+            container_id="$(docker run --detach --rm --platform "$PLATFORM" --network host \
+              --env WEFTY_SERVICE_PORT="$port" --env WEFTY_SERVICE_DIR=/tmp/wefty-service "$pinned_reference")"
+            cleanup() { docker stop --time 15 "$container_id" >/dev/null 2>&1 || true; }
+            trap cleanup EXIT
+            for _ in $(seq 1 60); do
+              if curl --fail --silent "http://127.0.0.1:${port}/healthz" > "$evidence/${ARCH}-user-${variant}-health.json"; then break; fi
+              sleep 1
+            done
+            jq -e --argjson port "$port" '.service_directory == "/tmp/wefty-service" and .listening_port == $port and (.pid > 0)' \
+              "$evidence/${ARCH}-user-${variant}-health.json"
+            docker stop --time 15 "$container_id"
+            trap - EXIT
+            jq -n --arg platform "$PLATFORM" --arg digest "$platform_digest" --arg variant "$variant" --arg image_user "$owner" \
+              '{platform: $platform, digest: $digest, variant: $variant, image_user: $image_user, executed: true, health: true}' \
+              > "$evidence/${ARCH}-user-${variant}-runtime.json"
+            port=$((port + 1))
+          done
       - name: Upload reproducibility and runtime evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -196,6 +248,51 @@ jobs:
             printf '%s\n' '::error title=Public GHCR verification failed::Set the repository-linked wefty-echo-service package visibility to Public, then rerun acceptance-image.' >&2
             exit 1
           fi
+      - name: Promote and prove the image-user service variants
+        run: |
+          set -euo pipefail
+          crane="$(go env GOPATH)/bin/crane"
+          release="$RUNNER_TEMP/acceptance-image-release"
+          mkdir -p "$release"
+          for variant in numeric named; do
+            case "$variant" in
+              numeric) owner='13001:13002' ;;
+              named) owner='12001:12002' ;;
+              *) printf '%s\n' "::error::unknown image-user variant $variant"; exit 1 ;;
+            esac
+            for arch in amd64 arm64; do
+              layout="$RUNNER_TEMP/echo-user-${variant}-${arch}.oci"
+              mkdir -p "$layout"
+              tar -xf "$RUNNER_TEMP/platforms/${arch}-user-${variant}.oci.tar" -C "$layout"
+              "$crane" push "$layout" "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}-${arch}"
+              test "$("$crane" digest "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}-${arch}")" = "$(cat "$RUNNER_TEMP/platforms/${arch}-user-${variant}.digest")"
+              jq -e --arg digest "$(cat "$RUNNER_TEMP/platforms/${arch}-user-${variant}.digest")" --arg image_user "$owner" \
+                '.digest == $digest and .image_user == $image_user and .executed and .health' \
+                "$RUNNER_TEMP/platforms/${arch}-user-${variant}-runtime.json"
+            done
+            "$crane" index append \
+              -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/amd64-user-${variant}.digest")" \
+              -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/arm64-user-${variant}.digest")" \
+              -t "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}"
+            index_digest="$("$crane" digest "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}")"
+            printf '%s\n' "$index_digest" > "$release/acceptance-image-user-${variant}-index-digest.txt"
+            "$crane" manifest "$IMAGE_NAME@$index_digest" > "$release/acceptance-image-user-${variant}-index.json"
+            test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$release/acceptance-image-user-${variant}-index.json")" = 2
+            layout="$RUNNER_TEMP/wefty-echo-service-user-${variant}.oci"
+            archive="$release/wefty-echo-service-user-${variant}.oci.tar"
+            "$crane" pull "$IMAGE_NAME@$index_digest" "$layout" --format=oci --annotate-ref
+            tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$layout" -cf "$archive" .
+            scripts/verify-acceptance-image.sh --archive "$archive" --expected-top-digest "$index_digest" \
+              --expected-platform linux/amd64 --expected-platform linux/arm64 \
+              --expected-platform-digest "linux/amd64=$(cat "$RUNNER_TEMP/platforms/amd64-user-${variant}.digest")" \
+              --expected-platform-digest "linux/arm64=$(cat "$RUNNER_TEMP/platforms/arm64-user-${variant}.digest")" \
+              --receipt-output "$release/acceptance-image-user-${variant}-archive-receipt.json"
+            mkdir -p "$RUNNER_TEMP/anonymous-docker"
+            if ! DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker" "$crane" manifest "$IMAGE_NAME@$index_digest" >/dev/null; then
+              printf '%s\n' "::error title=Public GHCR verification failed::The ${variant} image-user variant is not anonymously pullable; set the repository-linked wefty-echo-service package visibility to Public, then rerun acceptance-image." >&2
+              exit 1
+            fi
+          done
       - name: Assemble digest-pinned runnable release trees
         run: |
           set -euo pipefail
@@ -219,7 +316,17 @@ jobs:
           cp "$RUNNER_TEMP/acceptance-image-index-digest.txt" "$release/acceptance-image-index-digest.txt"
           jq -n --arg commit "$GITHUB_SHA" --arg reference "$IMAGE_NAME" --arg index_digest "$index_digest" \
             --arg amd64_digest "$(cat "$RUNNER_TEMP/platforms/amd64.digest")" --arg arm64_digest "$(cat "$RUNNER_TEMP/platforms/arm64.digest")" \
-            '{version: 1, commit: $commit, reference: $reference, index_digest: $index_digest, platforms: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}, public_pull: true, archive_verified: true, runtime_verified: {"linux/amd64": true, "linux/arm64": true}}' \
+            --arg numeric_index "$(cat "$release/acceptance-image-user-numeric-index-digest.txt")" \
+            --arg numeric_amd64 "$(cat "$RUNNER_TEMP/platforms/amd64-user-numeric.digest")" \
+            --arg numeric_arm64 "$(cat "$RUNNER_TEMP/platforms/arm64-user-numeric.digest")" \
+            --arg named_index "$(cat "$release/acceptance-image-user-named-index-digest.txt")" \
+            --arg named_amd64 "$(cat "$RUNNER_TEMP/platforms/amd64-user-named.digest")" \
+            --arg named_arm64 "$(cat "$RUNNER_TEMP/platforms/arm64-user-named.digest")" \
+            '{version: 1, commit: $commit, reference: $reference, index_digest: $index_digest, platforms: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}, public_pull: true, archive_verified: true, runtime_verified: {"linux/amd64": true, "linux/arm64": true},
+              service_user_variants: {
+                numeric: {image_user: "13001:13002", tag: ($commit + "-user-numeric"), index_digest: $numeric_index, archive: "wefty-echo-service-user-numeric.oci.tar", platforms: {"linux/amd64": $numeric_amd64, "linux/arm64": $numeric_arm64}},
+                named: {image_user: "12001:12002", tag: ($commit + "-user-named"), index_digest: $named_index, archive: "wefty-echo-service-user-named.oci.tar", platforms: {"linux/amd64": $named_amd64, "linux/arm64": $named_arm64}}
+              }}' \
             > "$release/acceptance-image-receipt.json"
           package="$RUNNER_TEMP/acceptance-image-package"
           mkdir -p "$package"
