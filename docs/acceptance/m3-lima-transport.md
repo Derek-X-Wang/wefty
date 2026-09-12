@@ -157,7 +157,9 @@ is the states the supervisor itself observed and performed —
 `stopped -> running` for the stopped row, `broken -> stopped -> running` for the
 broken row. `broken_enabled_recovery` PASSes only when the agent trail itself
 contains `broken`: that is the only evidence the bounded `stop --force` plus
-capped-backoff repair path ran at all. Which state Lima reports for an injected
+capped-backoff repair path ran at all. The supervisor re-inspects once when a
+fault's first reading is `stopped`, so the Broken branch is normally the one
+observed. Which state Lima reports for an injected
 fault is a race against Lima's own status file, so an injection that `limactl`
 recorded as `Broken` while the agent trail shows only `stopped -> running` did
 not produce the state this row tests — record it as NOT-RUN with reason

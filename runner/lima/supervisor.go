@@ -24,6 +24,15 @@ const (
 	defaultLimaRecoveryTimeout    = 5 * time.Minute
 	defaultLimaRepairBackoff      = time.Second
 	maximumLimaRepairBackoff      = 30 * time.Second
+	// brokenFaultReinspectWindow bounds how long after a helper-loss signal one
+	// Stopped inspection is still treated as a fault that may still be
+	// settling. Lima writes Stopped and Broken into the same status file while
+	// a host fault settles, so the first read routinely wins that race and
+	// hides the Broken branch the supervisor is supposed to take -- on owner
+	// hardware the whole Broken window lasted about a second. One extra
+	// `limactl list` per fault resolves it; nothing polls faster, and outside
+	// the window a Stopped instance is just stopped.
+	brokenFaultReinspectWindow = 10 * time.Second
 )
 
 // InstanceState is the closed sanitized Lima lifecycle state.
@@ -107,6 +116,33 @@ type Supervisor struct {
 	facts    SupervisorFacts
 	// trailWarned keeps the dropped-transition warning to one line per process.
 	trailWarned bool
+	// helperLossAt stamps the last helper-loss signal. It is taken once, so a
+	// fault buys exactly one extra inspection however many cycles observe it.
+	helperLossAt time.Time
+}
+
+// noteHelperLoss records that the helper connection was lost, which on this
+// runtime means the instance underneath it faulted.
+func (supervisor *Supervisor) noteHelperLoss() {
+	if supervisor == nil {
+		return
+	}
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	supervisor.helperLossAt = supervisor.config.now()
+}
+
+// takeRecentHelperLoss reports whether a helper loss is recent enough to
+// explain a Stopped reading, and consumes it either way.
+func (supervisor *Supervisor) takeRecentHelperLoss() bool {
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	if supervisor.helperLossAt.IsZero() {
+		return false
+	}
+	elapsed := supervisor.config.now().Sub(supervisor.helperLossAt)
+	supervisor.helperLossAt = time.Time{}
+	return elapsed >= 0 && elapsed <= brokenFaultReinspectWindow
 }
 
 func NewSupervisor(config SupervisorConfig) (*Supervisor, error) {
@@ -229,6 +265,16 @@ func (supervisor *Supervisor) ensureWithin(ctx context.Context) error {
 	if err := supervisor.recheckEnabled(ctx, intent); err != nil {
 		return supervisor.cancelToStopped(ctx, state, err)
 	}
+	// A Stopped reading just after a helper loss may be Lima's status file
+	// mid-settle rather than a settled instance. Re-inspect once so the Broken
+	// branch -- the bounded `stop --force` plus capped-backoff repair -- is
+	// normally the one that runs, instead of losing a coin flip to a plain
+	// restart that leaves the repair path unexercised (#409).
+	if state == InstanceStopped && supervisor.takeRecentHelperLoss() {
+		if settled, inspectErr := supervisor.inspect(ctx); inspectErr == nil && settled == InstanceBroken {
+			state = settled
+		}
+	}
 	switch state {
 	case InstanceRunning:
 		supervisor.record(state, true, false, "", false)
@@ -273,6 +319,7 @@ func (supervisor *Supervisor) recoveryNeeded(ctx context.Context, helperReady bo
 	recovering := state != InstanceRunning || !helperReady
 	if state == InstanceRunning && !helperReady {
 		reason = contract.CapabilityReasonHelperUnreachable
+		supervisor.noteHelperLoss()
 	}
 	supervisor.record(state, true, recovering, reason, false)
 	return recovering
@@ -846,6 +893,7 @@ func (barrier *SupervisedBootBarrier) SetLossHandler(handler func(ocihelper.Help
 	if barrier != nil && barrier.Barrier != nil {
 		barrier.Barrier.SetLossHandler(func(generation ocihelper.HelperSession, err error) {
 			barrier.setReason(contract.CapabilityReasonHelperUnreachable)
+			barrier.Supervisor.noteHelperLoss()
 			if handler != nil {
 				handler(generation, err)
 			}

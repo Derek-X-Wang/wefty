@@ -972,3 +972,88 @@ func TestSupervisorTransitionTrailIsBounded(t *testing.T) {
 		t.Fatalf("retained %d transitions, want the %d newest", got, supervisorTransitionTrail)
 	}
 }
+
+// TestSupervisorReinspectsStoppedAfterHelperLossAndTakesTheBrokenBranch pins
+// the #409 follow-up. Lima writes Stopped and Broken into the same status file
+// while a host fault settles, so the supervisor's single inspection kept
+// winning the race with Stopped and taking a plain restart -- leaving the
+// bounded `stop --force` plus capped-backoff repair path unexercised and the
+// acceptance row with no `broken` to read.
+func TestSupervisorReinspectsStoppedAfterHelperLossAndTakesTheBrokenBranch(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceBroken, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.noteHelperLoss()
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	commands := runner.commandsSnapshot()
+	if !slices.ContainsFunc(commands, func(command []string) bool {
+		return len(command) > 2 && command[1] == "stop" && command[2] == "--force"
+	}) {
+		t.Fatalf("commands = %v, want the Broken branch's bounded force-stop", commands)
+	}
+	facts := supervisor.Facts()
+	if facts.State != InstanceRunning || facts.RepairCount != 1 {
+		t.Fatalf("repaired facts = %+v, want one completed repair back to running", facts)
+	}
+	var observed []InstanceState
+	for _, transition := range facts.Transitions {
+		observed = append(observed, transition.To)
+	}
+	tail := []InstanceState{InstanceBroken, InstanceStopped, InstanceRunning}
+	if len(observed) < len(tail) || !slices.Equal(observed[len(observed)-len(tail):], tail) {
+		t.Fatalf("transition trail = %+v, want a broken -> stopped -> running tail", facts.Transitions)
+	}
+	// Exactly one extra inspection is bought per fault, not one per cycle.
+	if supervisor.takeRecentHelperLoss() {
+		t.Fatal("the helper-loss signal was not consumed by the re-inspection")
+	}
+}
+
+// TestSupervisorReinspectionKeepsAGenuinelyStoppedInstanceOnTheRestartBranch
+// is the other half: the re-inspection is a tie-break for a settling fault, not
+// a licence to claim `broken`. An instance both reads agree is stopped takes the
+// plain restart and leaves no broken entry for the acceptance row to misread.
+func TestSupervisorReinspectionKeepsAGenuinelyStoppedInstanceOnTheRestartBranch(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceStopped, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.noteHelperLoss()
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range runner.commandsSnapshot() {
+		if len(command) > 1 && command[1] == "stop" {
+			t.Fatalf("a stopped instance took the Broken branch: %v", runner.commandsSnapshot())
+		}
+	}
+	facts := supervisor.Facts()
+	if facts.State != InstanceRunning || facts.RepairCount != 1 {
+		t.Fatalf("restarted facts = %+v, want one completed repair back to running", facts)
+	}
+	for _, transition := range facts.Transitions {
+		if transition.From == InstanceBroken || transition.To == InstanceBroken {
+			t.Fatalf("transition trail = %+v, want no broken entry", facts.Transitions)
+		}
+	}
+}
+
+// TestSupervisorDoesNotReinspectAStoppedInstanceWithoutAFault keeps the cost at
+// one extra inspection per fault: an ordinary stopped instance is just stopped.
+func TestSupervisorDoesNotReinspectAStoppedInstanceWithoutAFault(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	if err := supervisor.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"limactl", "list", "--json", DefaultInstanceName},
+		{"limactl", "start", DefaultInstanceName},
+		{"limactl", "list", "--json", DefaultInstanceName},
+	}
+	if got := runner.commandsSnapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("commands = %v, want no extra inspection without a fault", got)
+	}
+}
