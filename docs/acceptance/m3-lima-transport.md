@@ -446,6 +446,10 @@ limactl shell wefty-oci sudo sh -c '
   rm -rf "$dir"'
 ```
 
+The pin is not attempt-scoped: while it is held it also denies the helper's
+whole-namespace startup sweep, so any helper restart in this window fails its
+boot barrier — not just the attempt's own delete.
+
 Unmounting does not undo the denial. The helper runs its verified-attempt
 release only on a `Delete` that succeeded, so the attempt's helper-side entry,
 its image pin, its capacity reservation, and its durable ownership record all

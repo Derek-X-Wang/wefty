@@ -74,7 +74,35 @@ helper exits `78` -- the status the unit names in `RestartPreventExitStatus` --
 so systemd stops restarting and leaves a **failed** unit whose journal carries
 the typed phase (`startup_sweep` or `startup_verify`), count, and elapsed time. The socket unit
 is untouched and stays armed, so an operator repair is picked up by the next
-connection without a `reset-failed`. A ledger that cannot be read or written
+connection without a `reset-failed`.
+
+`RestartPreventExitStatus` stops systemd's restarts but not socket activation:
+the next connection still starts a fresh generation, and a generation that
+swept before consulting the ledger reran the denied sweep every time -- 81
+launches in 63 seconds on hardware. Each generation therefore reads the ledger
+**before** it sweeps, and the tripping generation records the trip in the same
+fsynced write as the failure that caused it. **After a trip, at most one
+startup sweep runs per window, per node, until one succeeds.** A generation
+that inherits a tripped ledger keeps serving, reports the bound and its next
+attempt time in every authority-free handshake preface, and refuses every
+session admission with `startup_bound_tripped`. Holding the listener is what
+ends the relaunches -- systemd activates nothing while a live process owns the
+socket -- so this generation must not exit. It re-attempts the barrier one
+window after the last failure, and immediately at launch if that window has
+already elapsed; a re-attempt that fails extends the streak in the ledger and
+schedules the next one a window later. Only a barrier that succeeds clears the
+ledger. The ledger is never consumed by a refusal: on a native Linux node
+nothing restarts the helper unit -- there is no Lima repair, and
+`wefty node oci start` reaches the same refusing process -- so a bound held
+only in one process's memory would outlive the repair that cleared the denial.
+Re-arming is what lets such a node recover with no restart at all. The refusal
+is a completed handshake without admission, so the agent's boot barrier reports
+it as a stalled handshake at the first dial rather than after a whole takeover
+window, and the unchanged bounded repair proceeds. The node doctor names the
+tripped bound as `oci_helper_startup_bound_tripped` from that handshake, with
+the time the handshake was read, because a helper that admits no session serves
+no diagnostic read and a bound is a fact about one reading. A ledger
+that cannot be read or written
 never manufactures a wedge: the helper reports the ordinary failure and
 restarts, because losing the count must not become a refusal to serve. Only the
 boot Sweep+Verify barrier is counted; a helper that reached ready and then
@@ -175,7 +203,8 @@ The closed wire error-code vocabulary is `invalid_request`,
 `attempt_outside_session`, `unauthorized_port`, `unauthorized_bridge`,
 `oci_spec_rejected`, `image_unavailable`, `insufficient_memory`,
 `insufficient_disk`, `engine_failure`, `diagnostic_failure`,
-`unsupported_operation`, and `sweep_required`. Adding a code requires changing
+`unsupported_operation`, `sweep_required`, and `startup_bound_tripped`.
+Adding a code requires changing
 this contract in the same commit as the wire implementation.
 
 The acquisition connection remains the control connection. Strictly increasing

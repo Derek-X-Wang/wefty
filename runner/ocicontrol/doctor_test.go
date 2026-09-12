@@ -85,6 +85,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 			return "[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
 		},
 		HelperHandshakeStalledWindows: func() uint64 { return 0 },
+		HelperStartupBound:            func() ocihelper.StartupBoundObservation { return ocihelper.StartupBoundObservation{} },
 	}
 }
 
@@ -274,6 +275,55 @@ func TestDoctorReportsNonzeroNativeHelperHandshakeStallCount(t *testing.T) {
 		return item.Check == "helper-handshake-stalls" && item.Code == "oci_helper_handshake_stalls_observed" && item.Outcome == DiagnosticFailed
 	}) {
 		t.Fatalf("nonzero stall count was not typed: helper=%+v findings=%+v", report.Helper, report.Findings)
+	}
+}
+
+// A helper whose startup bound tripped is running and answering connections
+// but admits no session, so every helper-dependent finding reads NOT-RUN. The
+// doctor has to name the bound, or the report says only that the helper is
+// unreachable when it is in fact refusing on purpose (#419).
+func TestDoctorNamesATrippedHelperStartupBound(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC), "")
+	observedAt := time.Date(2026, 9, 11, 11, 59, 0, 0, time.UTC)
+	config.HelperStartupBound = func() ocihelper.StartupBoundObservation {
+		return ocihelper.StartupBoundObservation{
+			Facts: ocihelper.StartupBoundFacts{
+				Tripped: true, Phase: ocihelper.StartupBarrierSweep, Consecutive: 5, Bound: 5,
+				Elapsed: 63 * time.Second, NextAttemptAt: observedAt.Add(time.Minute),
+			},
+			ObservedAt: observedAt,
+		}
+	}
+	report := BuildDoctor(t.Context(), config)
+	if !report.Helper.StartupBound.Tripped || report.Helper.StartupBound.Consecutive != 5 {
+		t.Fatalf("helper facts = %+v, want the tripped bound", report.Helper.StartupBound)
+	}
+	index := slices.IndexFunc(report.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "helper-startup-bound"
+	})
+	if index < 0 {
+		t.Fatalf("no helper-startup-bound finding: %+v", report.Findings)
+	}
+	item := report.Findings[index]
+	if item.Code != "oci_helper_startup_bound_tripped" || item.Outcome != DiagnosticFailed ||
+		item.ReasonCode != contract.CapabilityReasonBootSweepFailed || !strings.Contains(item.Detail, "startup_sweep") ||
+		!strings.Contains(item.Detail, observedAt.Format(time.RFC3339)) ||
+		!strings.Contains(item.Detail, observedAt.Add(time.Minute).Format(time.RFC3339)) {
+		t.Fatalf("tripped bound finding = %+v", item)
+	}
+	if report.Helper.StartupBoundObservedAt == nil || !report.Helper.StartupBoundObservedAt.Equal(observedAt) {
+		t.Fatalf("observation time = %v, want %v", report.Helper.StartupBoundObservedAt, observedAt)
+	}
+	if err := report.Validate(); err != nil {
+		t.Fatalf("a report naming the tripped bound failed validation: %v", err)
+	}
+
+	config.HelperStartupBound = nil
+	notRead := BuildDoctor(t.Context(), config)
+	if !slices.ContainsFunc(notRead.Findings, func(item DiagnosticFinding) bool {
+		return item.Code == "oci_helper_startup_bound_not_read" && item.Outcome == DiagnosticNotRun
+	}) {
+		t.Fatalf("an unavailable bound was not reported as NOT-RUN: %+v", notRead.Findings)
 	}
 }
 
