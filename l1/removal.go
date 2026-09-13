@@ -445,11 +445,19 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if err != nil {
 		return Job{}, internalError(err, "read service removal acknowledgement")
 	}
-	if removal.status == contract.JobRemovedVerified {
+	finalizedRetainedComputer := false
+	if removal.removedAt != nil && removal.acknowledgedAt != nil {
+		_, mapped, mapErr := computerIDForJob(ctx, tx, jobID)
+		if mapErr != nil {
+			return Job{}, mapErr
+		}
+		finalizedRetainedComputer = mapped
+	}
+	if finalizedRetainedComputer {
 		// Computer removals retain their immutable Job and removal row instead
-		// of becoming an ordinary-service tombstone. Preserve acknowledgement
-		// replay across a later boot exactly as the tombstone path does, while
-		// still requiring the same stable Fabric identity and accepted body.
+		// of becoming an ordinary-service tombstone. removed_ns plus the positive
+		// cleanup acknowledgement distinguish that finalized retained row even
+		// when a prior stall deliberately preserved its unverified terminal state.
 		var storedIdentity string
 		if err := tx.QueryRowContext(ctx, `SELECT identity_node_id FROM nodes WHERE node_id=?`, removal.boundNodeID).
 			Scan(&storedIdentity); err != nil {
@@ -460,12 +468,23 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 				"authenticated node does not own this finalized Computer removal")
 		}
 		if request.RemovalGeneration != removal.generation || request.RootInstanceID != removal.rootInstanceID {
-			return Job{}, protocolError(contract.ErrorConflict,
+			return Job{}, protocolError(contract.ErrorStaleFence,
 				"finalized Computer removal acknowledgement does not match the removal")
 		}
-		if request.CleanupQuarantine != nil || request.CleanupStall != nil || removal.acknowledgedAt == nil {
+		if request.CleanupQuarantine != nil {
 			return Job{}, protocolError(contract.ErrorConflict,
 				"finalized Computer removal cannot accept this acknowledgement shape")
+		}
+		if request.CleanupStall != nil {
+			payload, err := json.Marshal(request.CleanupStall)
+			if err != nil {
+				return Job{}, internalError(err, "encode finalized Computer removal stall evidence")
+			}
+			if !removal.stallKey.Valid || removal.stallKey.String != request.IdempotencyKey ||
+				!removal.stallHash.Valid || removal.stallHash.String != hashServiceRemovalStall(payload) {
+				return Job{}, protocolError(contract.ErrorIdempotencyConflict,
+					"finalized stalled Computer removal replay does not match the accepted declaration")
+			}
 		}
 		job, err := getJobByID(ctx, tx, jobID, now)
 		if err != nil {
@@ -1293,9 +1312,6 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 	return nil
 }
 
-// hashServiceRemovalStall hashes the frozen declaration alone. Using the
-// enclosing acknowledgement body instead would make an otherwise identical
-// replay from a later boot look like a different declaration.
 // serviceWorkloadKind reads the immutable workload kind from the Job's own
 // frozen specification.
 func serviceWorkloadKind(ctx context.Context, q queryer, jobID string) (string, error) {
@@ -1310,6 +1326,9 @@ func serviceWorkloadKind(ctx context.Context, q queryer, jobID string) (string, 
 	return spec.Kind, nil
 }
 
+// hashServiceRemovalStall hashes the frozen declaration alone. Using the
+// enclosing acknowledgement body instead would make an otherwise identical
+// replay from a later boot look like a different declaration.
 func hashServiceRemovalStall(payload []byte) string {
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:])

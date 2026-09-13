@@ -468,6 +468,13 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 		}
 		ineligible = append(ineligible, row)
 	}
+	appendDeclared := func(detail string) string {
+		if len(declared) == 0 {
+			return detail
+		}
+		return detail + fmt.Sprintf("; %d further record(s) are declared stalled and hold no node service slot "+
+			"(job:phase:refusal:attempts:age): %s", len(declared), strings.Join(declared, " "))
+	}
 	switch {
 	case len(unreadable) != 0:
 		detail := fmt.Sprintf("%d durable runtime removal record(s) cannot be validated and hold their node service slots: %s",
@@ -476,6 +483,7 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 			detail += fmt.Sprintf("; %d further record(s) have not finished within %s: %s",
 				len(remaining), removalStallBound, strings.Join(remaining, " "))
 		}
+		detail = appendDeclared(detail)
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, code: "oci_removal_unreadable", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
 			detail: detail,
@@ -494,6 +502,7 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 				"consecutive ones, so the cause is whatever is failing untyped (job:phase:refusal:attempts:age): %s",
 				len(ineligible), minimumStallAttempts, strings.Join(ineligible, " "))
 		}
+		detail = appendDeclared(detail)
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, code: "oci_removal_stalled", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
 			detail: detail,
@@ -502,7 +511,7 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, passed: true, code: "oci_removal_stalled_declared",
 			detail: fmt.Sprintf("%d durable runtime removal record(s) are declared stalled and hold no node service slot "+
-				"(job:phase:refusal:age): %s. Cleanup is still outstanding and the deletion directive still stands; "+
+				"(job:phase:refusal:attempts:age): %s. Cleanup is still outstanding and the deletion directive still stands; "+
 				"no Slot waits on it", len(declared), strings.Join(declared, " ")),
 		}))
 	default:

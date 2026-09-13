@@ -743,4 +743,35 @@ func TestRecoveryFinalizesAStalledComputerRemovalExactlyOnce(t *testing.T) {
 	if state != contract.JobStalledCleanupUnverified {
 		t.Fatalf("finalized Computer state = %q, want stalled_cleanup_unverified", state)
 	}
+	returning := contract.NodeRegistration{
+		NodeID: node.NodeID, BootSessionID: "boot-computer-returning", RootInstanceID: node.RootInstanceID,
+		OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{
+			"kind:oci": true, "cgroup_v2": true, "computer": true,
+		}, CapabilityRevision: 2, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
+	}
+	if _, err := h.store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-computer-node"}, returning,
+		NodePolicy{Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1}, true); err != nil {
+		t.Fatalf("register returning Computer boot: %v", err)
+	}
+	replay := completion
+	replay.BootSessionID = returning.BootSessionID
+	replay.CleanupFence = "boot-derived-returning-fence"
+	replay.IdempotencyKey = "removal:computer-returning"
+	if job, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, replay); err != nil || job.State != contract.JobStalledCleanupUnverified {
+		t.Fatalf("returning-boot bare Computer acknowledgement = %#v, %v", job, err)
+	}
+	quarantine := replay
+	quarantine.CleanupQuarantine = &ComputerStorageCleanupQuarantine{}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, quarantine); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("finalized Computer quarantine replay = %v, want conflict", err)
+	}
+	stallReplay := declaration
+	stallReplay.BootSessionID = returning.BootSessionID
+	stallReplay.CleanupFence = "boot-derived-returning-fence"
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, stallReplay); err != nil {
+		t.Fatalf("finalized Computer frozen stall replay: %v", err)
+	}
 }

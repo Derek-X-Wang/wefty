@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +162,104 @@ func TestDeclaredRemovalRetriesWithDurableBackoffAndLogsStateChanges(t *testing.
 	record, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
 	if err != nil || !found || record.lastAttemptedAt == nil {
 		t.Fatalf("durable retry state = %+v found=%t err=%v", record, found, err)
+	}
+	if record.stallRetryAttempts == 0 {
+		t.Fatal("declared retry cadence was not persisted independently of the refusal streak")
+	}
+}
+
+func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "transition-node", 1024)
+	defer spool.Close()
+	removal := testRuntimeRemoval("transition-job")
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	if err := spool.storeRuntimeResourceManifest(t.Context(), testRuntimeResourceManifest(removal.jobID, "attempt"), prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, prepared); err != nil {
+		t.Fatal(err)
+	}
+	now := prepared.Add(l1.DefaultRemovalStallBound)
+	for range l1.MinimumServiceRemovalStallAttempts {
+		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	declaration, err := json.Marshal(l1.ServiceRemovalStallEvidence{
+		Kind: l1.ServiceRemovalStallEvidenceKind, JobID: removal.jobID,
+		LastRefusalCode: string(ocihelper.CodeUnauthorizedAttempt), Attempts: l1.MinimumServiceRemovalStallAttempts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := spool.freezeRuntimeRemovalStallDeclaration(t.Context(), removal, declaration, "stall-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordRuntimeRemovalStallDeclared(t.Context(), removal, now); err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	controller := &removalController{nodeID: "transition-node", stallBound: l1.DefaultRemovalStallBound,
+		now: func() time.Time { return now }, logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }}
+	controller.loadRuntimeRemoval = spool.runtimeRemoval
+	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+	}
+	directive := l1.RemovalDirective{JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: contract.JobKindOCI,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID}
+
+	causes := []error{
+		&ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"},
+		&ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"},
+		wedgeRefusal(),
+	}
+	delays := []time.Duration{15 * time.Second, 30 * time.Second, time.Minute}
+	for index, cause := range causes {
+		record, _, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		controller.now = func() time.Time { return record.lastAttemptedAt.Add(delays[index] - time.Second) }
+		if !controller.declaredRemovalRetryDeferred(record) {
+			t.Fatalf("retry %d ran before its %s durable delay", index+1, delays[index])
+		}
+		now = record.lastAttemptedAt.Add(delays[index])
+		controller.now = func() time.Time { return now }
+		if controller.declaredRemovalRetryDeferred(record) {
+			t.Fatalf("retry %d stayed deferred at its %s deadline", index+1, delays[index])
+		}
+		_, _ = controller.noteRemovalFailure(t.Context(), directive, cause)
+		record, _, err = spool.runtimeRemoval(t.Context(), removal.jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.stallRetryAttempts != index+1 {
+			t.Fatalf("retry %d durable cadence = %d", index+1, record.stallRetryAttempts)
+		}
+		controller.now = func() time.Time { return record.lastAttemptedAt.Add(time.Second) }
+		if !controller.declaredRemovalRetryDeferred(record) {
+			t.Fatalf("retry %d did not retain a bounded delay after refusal transition", index+1)
+		}
+		controller.now = func() time.Time { return now }
+	}
+	if len(logs) != 2 {
+		t.Fatalf("refusal transitions logged %d times, want B then A exactly once: %v", len(logs), logs)
+	}
+	if !strings.Contains(logs[0], string(ocihelper.CodeSessionStale)) ||
+		!strings.Contains(logs[1], string(ocihelper.CodeUnauthorizedAttempt)) {
+		t.Fatalf("refusal transition logs = %v, want B then A", logs)
+	}
+	record, _, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.failedAttempts != 1 || record.lastRefusalCode != string(ocihelper.CodeUnauthorizedAttempt) {
+		t.Fatalf("qualifying streak after A,A,A -> B,B -> A = %d/%q", record.failedAttempts, record.lastRefusalCode)
+	}
+	record.stallRetryAttempts = 99
+	controller.now = func() time.Time { return record.lastAttemptedAt.Add(declaredRemovalRetryMax - time.Second) }
+	if !controller.declaredRemovalRetryDeferred(record) {
+		t.Fatal("declared retry delay was not capped at three minutes")
 	}
 }
 
@@ -460,6 +559,48 @@ func TestADeclaredStallSuppressesOnlyItsOwnRefusal(t *testing.T) {
 				t.Fatalf("suppressed = %t, want %t", got, testCase.suppress)
 			}
 		})
+	}
+}
+
+func TestFrozenDeclarationAcceptanceStillPropagatesCurrentDifferentRefusal(t *testing.T) {
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	removal := testRuntimeRemoval("lost-response-different-refusal")
+	declaration, err := json.Marshal(l1.ServiceRemovalStallEvidence{
+		Kind: l1.ServiceRemovalStallEvidenceKind, JobID: removal.jobID,
+		LastRefusalCode: string(ocihelper.CodeUnauthorizedAttempt), Attempts: l1.MinimumServiceRemovalStallAttempts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := runtimeRemovalRecord{removal: removal, phase: runtimeRemovalPrepared, preparedAt: prepared,
+		failedAttempts: l1.MinimumServiceRemovalStallAttempts, lastRefusalCode: string(ocihelper.CodeUnauthorizedAttempt),
+		stallDeclaration: declaration, stallDeclarationKey: "frozen-key"}
+	controller := &removalController{nodeID: "node", stallBound: l1.DefaultRemovalStallBound,
+		now: func() time.Time { return prepared.Add(l1.DefaultRemovalStallBound) }}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) { return record, true, nil }
+	controller.recordRemovalFailure = func(_ context.Context, _ localRemoval, code, detail string) error {
+		record.failedAttempts = 1
+		record.lastRefusalCode = code
+		record.lastRefusalDetail = detail
+		return nil
+	}
+	replayed := false
+	controller.ackRemovalStall = func(_ context.Context, _ localRemoval, got runtimeRemovalRecord) error {
+		replayed = declaredRefusalCode(got) == string(ocihelper.CodeUnauthorizedAttempt)
+		return nil
+	}
+	controller.recordStallDeclared = func(context.Context, localRemoval) error {
+		declared := controller.now()
+		record.stallDeclaredAt = &declared
+		return nil
+	}
+	suppressed, err := controller.noteRemovalFailure(t.Context(), l1.RemovalDirective{
+		JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: contract.JobKindOCI,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
+	}, &ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"})
+	if err != nil || suppressed || !replayed || record.stallDeclaredAt == nil {
+		t.Fatalf("frozen A acceptance under current B = suppressed:%t replayed:%t declared:%t err:%v",
+			suppressed, replayed, record.stallDeclaredAt != nil, err)
 	}
 }
 

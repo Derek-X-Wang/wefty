@@ -104,6 +104,10 @@ retains its node-local binding image pin, which the standing directive still
 needs, until that positive cleanup releases it. The node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is
 released.
+Retries after declaration use a separate durable monotonic counter, independent
+of the qualifying refusal streak, to back off from fifteen seconds to a
+three-minute cap. The agent logs refusal-code transitions once, including a
+return to an earlier code, rather than logging every identical retry.
 After positive cleanup is finalized, a returning boot may replay a bare
 positive acknowledgement when the authenticated identity, node, removal
 generation, and root instance match; its boot-derived key and cleanup fence

@@ -5,6 +5,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -42,6 +44,14 @@ type stalledRemovalFixture struct {
 }
 
 func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
+	return newStalledRemovalFixtureForKind(t, false)
+}
+
+func newStalledComputerRemovalFixture(t *testing.T) stalledRemovalFixture {
+	return newStalledRemovalFixtureForKind(t, true)
+}
+
+func newStalledRemovalFixtureForKind(t *testing.T, computerKind bool) stalledRemovalFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	network := plain.NewNetwork()
@@ -56,8 +66,10 @@ func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
 		cancel()
 		t.Fatal(err)
 	}
+	policy := l1.DefaultNodePolicy("linux")
+	policy.Tags = append(policy.Tags, contract.StableNodeTagPrefix+"stall-node")
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{
-		NodePolicies: map[string]l1.NodePolicy{"stall-node": l1.DefaultNodePolicy("linux")},
+		NodePolicies: map[string]l1.NodePolicy{"stall-node": policy},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +125,7 @@ func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
 		OS: "linux", Architecture: "arm64", AgentVersion: "test", CapabilityRevision: 1,
 		CapabilityObservedAt: time.Now(), MissingCapabilities: []string{},
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true,
-			"runtime_handler:io.containerd.runc.v2": true},
+			"runtime_handler:io.containerd.runc.v2": true, "cgroup_v2": true, "computer": true},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -126,15 +138,37 @@ func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest", Digest: &digest}}},
 	}
+	var computer l1.Computer
+	if computerKind {
+		memoryBytes := int64(64 << 20)
+		spec.DispatchKey = "computer:stall-delivery"
+		spec.RoutingTags = []string{contract.StableNodeTagPrefix + "stall-node"}
+		spec.RuntimeHandler = ""
+		spec.Execution.OCI.Limits = &contract.OCILimits{MemoryBytes: &memoryBytes}
+		spec.Execution.OCI.Computer = &contract.OCIComputerSpec{
+			Display:   contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1},
+			DiskBytes: 1 << 30,
+		}
+	}
 	if err := contract.ValidateJobSpec(&spec); err != nil {
 		t.Fatalf("OCI service fixture does not satisfy the public contract: %v", err)
 	}
-	job, _, err := store.CreateJob(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
+	jobID := ""
+	if computerKind {
+		computer, _, err = store.CreateComputer(ctx, l1.CreateComputerRequest{Name: "stall-delivery", Spec: spec, Actor: "operator"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobID = computer.CurrentJobID
+	} else {
+		job, _, createErr := store.CreateJob(ctx, spec)
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		jobID = job.JobID
 	}
 	claim, err := agentClient.Claim(ctx, "stall-node", "stall-boot", contract.JobClassService)
-	if err != nil || claim == nil || claim.Job.JobID != job.JobID {
+	if err != nil || claim == nil || claim.Job.JobID != jobID {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
 	outbox, err := newEvidenceOutbox(t.TempDir(), "stall-node", 1<<20, systemClock{}, 1, time.Second, time.Second)
@@ -144,11 +178,24 @@ func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
 	if err := outbox.spool.ensureAttempt(ctx, *claim); err != nil {
 		t.Fatal(err)
 	}
-	if err := outbox.spool.storeRuntimeResourceManifest(ctx,
-		testRuntimeResourceManifest(job.JobID, claim.Lease.AttemptID), time.Now()); err != nil {
+	manifest := testRuntimeResourceManifest(jobID, claim.Lease.AttemptID)
+	if computerKind {
+		manifest.ServiceDataVolume = ""
+		manifest.ServiceDataOwnerRecord = ""
+		manifest.ComputerStorage = &workloadrunner.ComputerStorage{ComputerID: computer.ComputerID,
+			StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration, DiskBytes: computer.DesiredDiskBytes}
+	}
+	if err := outbox.spool.storeRuntimeResourceManifest(ctx, manifest, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RemoveService(ctx, job.JobID); err != nil {
+	if computerKind {
+		if _, err := store.RemoveComputer(ctx, computer.ComputerID, l1.ComputerRemoveRequest{
+			ComputerMutationPrecondition: l1.ComputerMutationPrecondition{IntentRevision: computer.IntentRevision,
+				StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration, Actor: "operator"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := store.RemoveService(ctx, jobID); err != nil {
 		t.Fatal(err)
 	}
 	directives, err := store.ListNodeRemovalDirectives(ctx, "fabric-agent", "stall-node", "stall-boot")
@@ -170,7 +217,7 @@ func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
 
 	return stalledRemovalFixture{
 		ctx: ctx, store: store, client: agentClient, controller: controller, directive: directives[0],
-		jobID: job.JobID, root: root, accepted: &accepted,
+		jobID: jobID, root: root, accepted: &accepted,
 		close: func() {
 			cancel()
 			_ = httpServer.Close()
@@ -329,6 +376,66 @@ func TestRestartAfterADeclaredStallStillRestoresTheRetainedImagePin(t *testing.T
 	}
 }
 
+func TestDeclaredStorageOnlyRemovalDefersRefreshSoRegistrationReconcilesPins(t *testing.T) {
+	fixture := newStalledRemovalFixture(t)
+	defer fixture.close()
+	fixture.declareStall(t)
+	record, found, err := fixture.controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID)
+	if err != nil || !found || record.stallDeclaredAt == nil {
+		t.Fatalf("declared runtime removal = %+v found=%t err=%v", record, found, err)
+	}
+	storage := &workloadrunner.ComputerStorage{
+		ComputerID: "computer-storage-only", StorageID: "storage-only", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}
+	attempt := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: fixture.controller.nodeID,
+		BootSessionID: fixture.controller.bootSessionID, JobID: fixture.jobID,
+		AttemptID: contract.StorageOnlyRemovalAttemptID(storage.StorageGeneration), FencingToken: record.removal.cleanupFence,
+		WorkloadClass: contract.JobClassService, RemovalGeneration: fmt.Sprint(record.removal.generation),
+		StorageOnly: true, ComputerStorage: storage,
+		StoragePreparation: &contract.ComputerStoragePreparationWitness{
+			Kind: contract.ComputerStorageCopyVerifiedKind, ReceiptID: "storage-only-receipt",
+			NodeID: fixture.controller.nodeID, RootInstanceID: record.removal.rootInstanceID, JobID: fixture.jobID,
+			ComputerID: storage.ComputerID, StorageID: storage.StorageID, StorageGeneration: storage.StorageGeneration,
+			Revision: 1, Fence: "storage-only-fence", HelperGeneration: 1,
+		},
+	}
+	payload, err := json.Marshal(runtimeRemovalManifest{Version: 1, JobID: fixture.jobID,
+		RemovalGeneration: record.removal.generation, Attempts: []workloadrunner.RuntimeResourceManifest{attempt}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.outbox.spool.db.ExecContext(fixture.ctx,
+		`UPDATE runtime_removal_manifests SET manifest_json=? WHERE job_id=?`, payload, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.outbox.spool.db.ExecContext(fixture.ctx,
+		`DELETE FROM runtime_service_manifests WHERE job_id=?`, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	pins := &stallPinRuntime{pinned: map[string]struct{}{fixture.jobID: {}}}
+	session := fixture.rebootSession(t, pins)
+	reconstructCalls := 0
+	session.removals.reconstructRuntime = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		reconstructCalls++
+		return nil, wedgeRefusal()
+	}
+	node, err := session.register(fixture.ctx)
+	if err != nil || !node.Capabilities["kind:oci"] || !session.capabilities.snapshot().Capabilities["kind:oci"] {
+		t.Fatalf("registration suppressed OCI around declared Storage-only refresh: node=%+v err=%v", node, err)
+	}
+	if reconstructCalls != 0 {
+		t.Fatalf("declared Storage-only removal reconstructed %d times before durable deferral", reconstructCalls)
+	}
+	if pins.reconciles != 1 {
+		t.Fatalf("image-pin reconciliation ran %d times, want 1", pins.reconciles)
+	}
+	if _, retained := pins.pinned[fixture.jobID]; !retained {
+		t.Fatal("declared Storage-only removal lost its retained image pin")
+	}
+}
+
 func (fixture stalledRemovalFixture) completeManagedRootRemoval(t *testing.T) {
 	t.Helper()
 	record, found, err := fixture.controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID)
@@ -435,5 +542,47 @@ func TestRestartAfterFinalizedCleanupClearsSurvivingLocalRecord(t *testing.T) {
 	}
 	if pins.reconciles != 1 || len(pins.pinned) != 0 {
 		t.Fatalf("pin reconciliation after finalized replay = %+v", pins)
+	}
+}
+
+func TestRestartAfterFinalizedStalledComputerCleanupClearsSurvivingLocalRecord(t *testing.T) {
+	fixture := newStalledComputerRemovalFixture(t)
+	defer fixture.close()
+	fixture.declareStall(t)
+	fixture.completeManagedRootRemoval(t)
+	controller := fixture.controller
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			BootSessionID: controller.bootSessionID}, nil
+	}
+	controller.finalizeVolumes = func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, Attempts: request.Attempts}), nil
+	}
+	controller.finishRemoval = func(context.Context, localRemoval) error { return errInjectedRuntimeRemovalCrash }
+	for attempt := 0; attempt < 2; attempt++ {
+		_ = controller.reconcile(fixture.ctx, fixture.directive)
+	}
+	job, err := fixture.store.GetJob(fixture.ctx, fixture.jobID)
+	if err != nil || job.State != contract.JobStalledCleanupUnverified {
+		t.Fatalf("finalized stalled Computer Job = %+v, %v", job, err)
+	}
+	record, found, err := controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID)
+	if err != nil || !found || record.phase != runtimeRemovalComplete {
+		t.Fatalf("surviving stalled Computer local record = %+v found=%t err=%v", record, found, err)
+	}
+	pins := &stallPinRuntime{pinned: map[string]struct{}{fixture.jobID: {}}}
+	session := fixture.rebootSession(t, pins)
+	node, err := session.register(fixture.ctx)
+	if err != nil || !node.Capabilities["kind:oci"] {
+		t.Fatalf("returning stalled Computer registration suppressed OCI: node=%+v err=%v", node, err)
+	}
+	if _, found, err := controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID); err != nil || found {
+		t.Fatalf("stalled Computer local record survived reboot acknowledgement: found=%t err=%v", found, err)
+	}
+	if pins.reconciles != 1 || len(pins.pinned) != 0 {
+		t.Fatalf("pin reconciliation after finalized stalled Computer replay = %+v", pins)
 	}
 }
