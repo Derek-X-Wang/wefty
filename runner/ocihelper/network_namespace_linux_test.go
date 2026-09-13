@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -776,11 +777,21 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	peerPort := peerListener.Addr().(*net.TCPAddr).Port
 	peerAddress := net.JoinHostPort(attachmentB.guestAddress, strconv.Itoa(peerPort))
 	assertNamespaceTCPRefused(t, namespaceA, "tcp4", peerAddress)
-	interiorReject := []string{"-w", "5", "-D", computerFirewallForward, "-i", computerHostLinkPrefix + "+", "-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"}
-	if output, err := exec.CommandContext(t.Context(), iptablesPath, interiorReject...).CombinedOutput(); err != nil {
-		t.Fatalf("delete interior Computer crossover rejection: %v: %s", err, strings.TrimSpace(string(output)))
-	}
+	crossoverRefusals := computerCrossoverRefusals(t, iptablesPath, ip6tablesPath, []computerNetworkAttachment{*attachmentA, *attachmentB}, attachmentB.guestAddress)
 	t.Cleanup(func() { _ = ensureComputerFirewallFamilies(context.Background(), iptablesPath, ip6tablesPath) })
+	for index, rule := range crossoverRefusals {
+		arguments := append([]string{"-w", "5", "-D", computerFirewallForward}, rule...)
+		if output, err := exec.CommandContext(t.Context(), iptablesPath, arguments...).CombinedOutput(); err != nil {
+			t.Fatalf("delete Computer crossover refusal %q: %v: %s", rule, err, strings.TrimSpace(string(output)))
+		}
+		// Each refusal holds the crossover shut on its own, so the crossover
+		// only opens once the last of them is gone. Deleting one and expecting
+		// traffic is what stopped being true when the destination policy
+		// started refusing the Computer network as well.
+		if index < len(crossoverRefusals)-1 {
+			assertNamespaceTCPRefused(t, namespaceA, "tcp4", peerAddress)
+		}
+	}
 	assertNamespaceTCPConnected(t, namespaceA, "tcp4", peerAddress)
 	present, err = observeComputerFirewall(t.Context(), iptablesPath, ip6tablesPath, []computerNetworkAttachment{*attachmentA, *attachmentB})
 	if err != nil || present {
@@ -858,6 +869,82 @@ func TestComputerFirewallObservationAndRepairRequireFirstJump(t *testing.T) {
 			})
 		}
 	}
+}
+
+// computerCrossoverRefusals names every installed IPv4 forward rule that stands
+// between one Computer and another Computer's guest address, read out of the
+// canonical chain body the reconcile itself installs.
+//
+// A Computer's crossover is refused twice over. The interior rule refuses it by
+// interface — anything arriving on a Computer link and leaving on one. Since
+// #440 the destination policy refuses it a second time: guest addresses are
+// carved out of the RFC 2544 benchmarking range, and that range is one of the
+// reserved destinations forwarded Computer egress refuses outright. Deleting
+// only the interior rule therefore no longer opens the crossover, so tampering
+// that way proves nothing about what the reconcile repairs.
+//
+// Deleting exactly this set is what makes "the crossover now connects" mean
+// every rule that was holding it shut is gone — and the assertions on the set
+// are the honesty check: if the boundary ever stops refusing the Computer
+// network, or the interior rule loses its shape, the tamper falls out of step
+// with the policy and this test says so rather than quietly proving less.
+func computerCrossoverRefusals(t *testing.T, iptablesPath, ip6tablesPath string, attachments []computerNetworkAttachment, peer string) [][]string {
+	t.Helper()
+	peerAddress, err := netip.ParseAddr(peer)
+	if err != nil {
+		t.Fatalf("parse peer Computer guest address %q: %v", peer, err)
+	}
+	boundary, err := observeComputerEgressBoundary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	interior := []string{"-i", computerHostLinkPrefix + "+", "-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"}
+	var refusals [][]string
+	interiorFound, destinationFound := false, false
+	for _, chain := range computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, attachments, boundary) {
+		if chain.executable != iptablesPath || chain.table != "" || chain.name != computerFirewallForward {
+			continue
+		}
+		for _, rule := range chain.rules {
+			if !slices.Contains(rule, "REJECT") {
+				continue
+			}
+			switch {
+			case slices.Equal(rule, interior):
+				interiorFound = true
+			case computerFirewallRuleRefusesDestination(rule, peerAddress):
+				destinationFound = true
+			default:
+				continue
+			}
+			refusals = append(refusals, slices.Clone(rule))
+		}
+	}
+	if !interiorFound {
+		t.Fatalf("canonical Computer forward chain carries no interior crossover rejection %q", interior)
+	}
+	if !destinationFound {
+		t.Fatalf("canonical Computer forward chain refuses no destination covering the Computer network address %s", peerAddress)
+	}
+	return refusals
+}
+
+// computerFirewallRuleRefusesDestination reports whether a rendered forward rule
+// refuses traffic bound for the address, which for the boundary refusals means
+// its -d prefix covers it. A rule with no -d is scoped by interface alone and is
+// not a destination refusal.
+func computerFirewallRuleRefusesDestination(rule []string, address netip.Addr) bool {
+	for index := 0; index+1 < len(rule); index++ {
+		if rule[index] != "-d" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(rule[index+1])
+		if err != nil {
+			return false
+		}
+		return prefix.Contains(address)
+	}
+	return false
 }
 
 func prependForeignAccept(t *testing.T, executable, table, chain string) {
