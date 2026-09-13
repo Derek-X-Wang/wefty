@@ -48,7 +48,6 @@ var ociMatrixGapRows = []string{
 	"linux.oneshot.image_identity",
 	"linux.service.crash_recovery",
 	"linux.service.removal",
-	"linux.node.capability_claims",
 	"linux.only.socket_activated_helper",
 	"linux.only.cgroup_v2_limits",
 }
@@ -211,10 +210,10 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 					matrix["rows"].(map[string]any)["mac.only.launch_topology"].(map[string]any)["source"] = "realtiming-linux"
 				},
 				"untyped skip": func(t *testing.T, matrix map[string]any) {
-					matrix["rows"].(map[string]any)["linux.node.capability_claims"].(map[string]any)["not_run_issue"] = 0
+					matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)["not_run_issue"] = 0
 				},
 				"skip without a reason": func(t *testing.T, matrix map[string]any) {
-					matrix["rows"].(map[string]any)["linux.node.capability_claims"].(map[string]any)["reason"] = ""
+					matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)["reason"] = ""
 				},
 				"false assertion on a passing row": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)["assertions"] = map[string]any{"oneshot_bridge_once": false}
@@ -417,6 +416,13 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 	write("oci-service-agent-sigkill-linux.txt", "service_oci_payload_sigkill_survived=true")
 	write("oci-service-removal-stopped-linux.txt", "service_removal_from_stopped_kind_oci=true")
 	write("oci-service-removal-offline-linux.txt", "service_removal_from_offline_kind_oci=true")
+	// The revision facts are receipt evidence, not matrix assertions: the live
+	// test is what proves after > before, and a matrix row cannot assert a
+	// number it has no prior reading of.
+	write("oci-node-capability-claims-linux.txt",
+		"capability_claim_pair_oci_capable=true", "capability_claim_pair_oci_incapable=true",
+		"capability_claim_pair_doctor_source=cli",
+		"capability_revision_before=4", "capability_revision_after=6")
 	if err := os.WriteFile(filepath.Join(directory, "provenance-receipt.json"), []byte(
 		`{"version":1,"commit":"`+ociMatrixCandidate+`","source":"published-artifact","artifact_run_id":"4242"}`), 0o600); err != nil {
 		t.Fatal(err)
