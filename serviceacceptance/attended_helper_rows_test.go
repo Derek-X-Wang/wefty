@@ -317,12 +317,13 @@ func TestDriveTaskLogsDeleteProvesAbsenceThroughTheReadOnlyNamespace(t *testing.
 // fail the row, and this attempt's must.
 func TestCheckAttemptAbsenceIsScopedToTheAttemptsOwnResources(t *testing.T) {
 	config := testConfig()
+	now := config.now()
 	authority, identity := taskLogsIdentity(t, config)
 	unrelated := ocihelper.ResourceInventory{
 		Containers:  []string{"wefty-container-" + strings.Repeat("b", 32)},
 		ImageSpools: []string{"spool-from-the-pinned-probe-import"},
 	}
-	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: unrelated, RuntimeResidue: unrelated}, authority, nil); err != nil {
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: unrelated, RuntimeResidue: unrelated}, authority, nil, now); err != nil {
 		t.Fatalf("another attempt's residue must not fail this row: %v", err)
 	}
 	for name, inventory := range map[string]ocihelper.ResourceInventory{
@@ -334,12 +335,12 @@ func TestCheckAttemptAbsenceIsScopedToTheAttemptsOwnResources(t *testing.T) {
 		"cgroup":      {Cgroups: []string{"/sys/fs/cgroup/wefty/" + identity.CgroupID + ".scope"}},
 		"log segment": {LogSegments: []string{identity.LogSegmentDirectory}},
 	} {
-		if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: inventory, RuntimeResidue: inventory}, authority, nil); err == nil {
+		if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: inventory, RuntimeResidue: inventory}, authority, nil, now); err == nil {
 			t.Fatalf("this attempt's %s left as runtime residue must fail the row", name)
 		}
 		// Not residue, but still observed: only an explicit bounded retention
 		// naming this attempt may explain that, and these have none.
-		if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: inventory}, authority, nil); err == nil {
+		if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: inventory}, authority, nil, now); err == nil {
 			t.Fatalf("this attempt's %s surviving delete unexplained must fail the row", name)
 		}
 	}
@@ -359,6 +360,7 @@ func boundRetention(class ocihelper.RemovalResourceClass, id, attemptID string,
 // positive Delete, and only under a bounded retention that names this attempt.
 func TestCheckAttemptAbsenceAcceptsOnlyBoundHelperRetentions(t *testing.T) {
 	config := testConfig()
+	now := time.Unix(1700000000, 0)
 	authority, identity := taskLogsIdentity(t, config)
 	observed := ocihelper.ResourceInventory{LogSegments: []string{identity.LogSegmentDirectory}}
 	retention := boundRetention(ocihelper.RemovalResourceLogSegments, identity.LogSegmentDirectory,
@@ -367,7 +369,7 @@ func TestCheckAttemptAbsenceAcceptsOnlyBoundHelperRetentions(t *testing.T) {
 	if err := checkAttemptAbsence(ocihelper.VerifyResponse{
 		Inventory: observed, DurableRetained: observed,
 		DurableRetentions: []ocihelper.DurableRetention{retention},
-	}, authority, nil); err != nil {
+	}, authority, nil, now); err != nil {
 		t.Fatalf("a sealing log spool bound to this attempt must not fail the row: %v", err)
 	}
 
@@ -377,13 +379,20 @@ func TestCheckAttemptAbsenceAcceptsOnlyBoundHelperRetentions(t *testing.T) {
 		"another reason":    func(r *ocihelper.DurableRetention) { r.Reason = ocihelper.DurableRetentionReasonCgroupReaping },
 		"no bound at all":   func(r *ocihelper.DurableRetention) { r.Bound = 0; r.Deadline = r.RecordedAt },
 		"unclosed deadline": func(r *ocihelper.DurableRetention) { r.Deadline = r.Deadline.Add(time.Hour) },
+		"zero deadline":     func(r *ocihelper.DurableRetention) { r.Deadline = time.Time{} },
+		// Still a closed bound whose shape holds; only the deadline lies in
+		// the past relative to now.
+		"expired deadline": func(r *ocihelper.DurableRetention) {
+			r.Deadline = now.Add(-time.Second)
+			r.RecordedAt = r.Deadline.Add(-r.Bound)
+		},
 	} {
 		broken := retention
 		mutate(&broken)
 		if err := checkAttemptAbsence(ocihelper.VerifyResponse{
 			Inventory: observed, DurableRetained: observed,
 			DurableRetentions: []ocihelper.DurableRetention{broken},
-		}, authority, nil); err == nil {
+		}, authority, nil, now); err == nil {
 			t.Fatalf("a retention with %s cannot explain a survivor", name)
 		}
 	}
@@ -393,7 +402,7 @@ func TestCheckAttemptAbsenceAcceptsOnlyBoundHelperRetentions(t *testing.T) {
 	if err := checkAttemptAbsence(ocihelper.VerifyResponse{
 		Inventory: observed, RuntimeResidue: observed,
 		DurableRetentions: []ocihelper.DurableRetention{retention},
-	}, authority, nil); err == nil {
+	}, authority, nil, now); err == nil {
 		t.Fatal("a log spool that is still runtime residue must fail the row")
 	}
 }
@@ -415,10 +424,10 @@ func TestCheckAttemptAbsenceLeavesJobScopedVolumesAlone(t *testing.T) {
 		ManagedVolumeRecords: []string{identity.ServiceVolumeOwnerRecord},
 	}
 	volumes := []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeServiceData}}
-	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: observed, DurableRetained: observed}, authority, volumes); err != nil {
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: observed, DurableRetained: observed}, authority, volumes, time.Unix(1700000001, 0)); err != nil {
 		t.Fatalf("the job's service data must not fail an attempt's absence proof: %v", err)
 	}
-	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: observed, RuntimeResidue: observed}, authority, volumes); err == nil {
+	if err := checkAttemptAbsence(ocihelper.VerifyResponse{Inventory: observed, RuntimeResidue: observed}, authority, volumes, time.Unix(1700000001, 0)); err == nil {
 		t.Fatal("service data reported as runtime residue must fail the row")
 	}
 }

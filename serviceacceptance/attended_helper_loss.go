@@ -141,7 +141,7 @@ func driveGuestToHostFallback(ctx context.Context, session attendedSession, conf
 		row.fail(err)
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority, volumes); err != nil {
+	if err := deleteAndVerify(ctx, session, config, authority, volumes); err != nil {
 		row.fail(err)
 		return row
 	}
