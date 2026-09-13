@@ -88,6 +88,29 @@ and record the refusal through receipts.
   namespace before exercising Computer egress.
   Routable resolvers use the veth. Ordinary
   OCI remains on shared networking.
+- #440 (amended 2026-09-14) makes the boundary a destination policy, not only
+  an interface one.
+  Rejecting Node listeners on INPUT never covered a destination the Node merely
+  routes to, so on a Lima vz guest a Computer reached the macOS host's sshd at
+  both the vz gateway and the owner LAN address, and its own Mac-side view door
+  behind that gateway. Forwarded Computer egress now refuses the reserved
+  ranges — private, loopback, link-local, carrier-grade NAT, the Computer
+  benchmarking range, multicast and reserved space — plus every address the Node
+  holds and every next hop it routes through, which is how the virtual machine
+  host appears from inside a guest. Public egress is unchanged. The single
+  destination-scoped hole is a routable Node resolver on port 53; the Node's own
+  loopback resolver and the capability-gated host bridge need none, because both
+  are served inside the Computer's own namespace and never cross the veth. The
+  boundary is proven before forwarding is enabled: a Node whose addresses cannot
+  be enumerated starts no Computer and the refusal is typed
+  `egress_boundary_unproven`. The deliberate edge is a Node on public addresses:
+  the Node's own address and its next hop are refused, but the rest of its
+  on-link subnet is treated as public internet and stays reachable, so a
+  Computer on a cloud host can reach that host's neighbours. Refusing a whole
+  public subnet on the strength of a netmask would be a guess about somebody
+  else's network; the boundary this decision owns is the owner's side of it.
+  Rule bodies are written in the order iptables prints them, because the
+  canonical chain comparison is what proves the policy is still installed.
 - Computer networking uses disjoint `/30` allocations in the RFC 2544
   benchmarking range `198.18.0.0/15`; the endpoint range is therefore capped at
   32,768 ports. Helper startup refuses a conflicting non-Wefty Node route, and

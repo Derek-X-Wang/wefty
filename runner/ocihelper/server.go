@@ -2246,6 +2246,7 @@ func withAttemptScopedRunFailure(rpcErr *RPCError, attemptScoped bool) *RPCError
 func engineFailureReason(err error) EngineFailureReason {
 	var retentionBound interface{ RetentionBoundExceeded() bool }
 	var egressDNSUnavailable interface{ EgressDNSUnavailable() bool }
+	var egressBoundaryUnproven interface{ EgressBoundaryUnproven() bool }
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return EngineFailureDeadlineExceeded
@@ -2257,6 +2258,8 @@ func engineFailureReason(err error) EngineFailureReason {
 		return EngineFailureRetentionBound
 	case errors.As(err, &egressDNSUnavailable) && egressDNSUnavailable.EgressDNSUnavailable():
 		return EngineFailureEgressDNS
+	case errors.As(err, &egressBoundaryUnproven) && egressBoundaryUnproven.EgressBoundaryUnproven():
+		return EngineFailureEgressBoundary
 	default:
 		return EngineFailureOperationFailed
 	}
