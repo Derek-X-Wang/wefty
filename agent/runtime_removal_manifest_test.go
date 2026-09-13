@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -458,5 +460,144 @@ func TestAgentRuntimeRemovalsProjectsDurableProofWithoutAdvancingIt(t *testing.T
 	released, err := nodeAgent.RuntimeRemovals(t.Context())
 	if err != nil || len(released) != 0 {
 		t.Fatalf("released removal read = %+v err=%v", released, err)
+	}
+}
+
+// testComputerAttemptManifest is the shape #196 run 1 froze for a Computer:
+// an ordinary runtime attempt manifest whose durable service-data class is a
+// Computer disk, not a Storage-only removal inventory.
+func testComputerAttemptManifest(jobID, attemptID string) workloadrunner.RuntimeResourceManifest {
+	manifest := testRuntimeResourceManifest(jobID, attemptID)
+	manifest.ServiceDataVolume = ""
+	manifest.ServiceDataOwnerRecord = ""
+	manifest.ComputerStorage = &workloadrunner.ComputerStorage{
+		ComputerID: "computer-" + jobID, StorageID: "storage-" + jobID, StorageGeneration: 1, DiskBytes: 160 << 20,
+	}
+	return manifest
+}
+
+// A Computer whose helper `Run` never entered is reaped with positive
+// `no_runtime_resources` evidence against that ordinary attempt manifest. The
+// record used to demand a Storage-only manifest for that evidence kind, so the
+// receipt persisted and then made its own row unreadable: the removal loop
+// re-read "runtime removal record is invalid" every heartbeat forever and the
+// Computer pinned its node service slot (#443).
+func TestComputerRemovalRecordCompletesOnNeverEnteredRunNoRuntimeReceipt(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "never-entered-node", 1024)
+	defer spool.Close()
+	createdAt := time.Date(2026, 9, 13, 2, 0, 0, 0, time.UTC)
+	if err := spool.storeRuntimeResourceManifest(t.Context(), testComputerAttemptManifest("computer-job", "attempt-a"), createdAt); err != nil {
+		t.Fatal(err)
+	}
+	removal := testRuntimeRemoval("computer-job")
+	if err := spool.beginRemoval(t.Context(), removal, createdAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	receipt := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: "boot"}
+	if err := spool.recordRuntimeQuiesced(t.Context(), removal, receipt, createdAt.Add(2*time.Minute)); err != nil {
+		t.Fatalf("never-entered-Run quiescence receipt rejected: %v", err)
+	}
+	record, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found || record.phase != runtimeRemovalQuarantined {
+		t.Fatalf("quiesced Computer removal = %+v found=%t err=%v", record, found, err)
+	}
+	if err := spool.recordRuntimeAttested(t.Context(), removal, testRuntimeRemovalAttestation(record.manifest), createdAt.Add(3*time.Minute)); err != nil {
+		t.Fatalf("never-entered-Run removal could not attest: %v", err)
+	}
+	completed, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found || completed.phase != runtimeRemovalComplete {
+		t.Fatalf("completed Computer removal = %+v found=%t err=%v", completed, found, err)
+	}
+}
+
+// The boot session is what a no-runtime receipt may still be held to: it can
+// only speak for attempts frozen under the same boot. A record that breaks
+// that says which field disagreed.
+func TestRuntimeRemovalRecordRejectsForeignBootNoRuntimeReceiptByField(t *testing.T) {
+	removal := testRuntimeRemoval("computer-job")
+	manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation,
+		Attempts: []workloadrunner.RuntimeResourceManifest{testComputerAttemptManifest(removal.jobID, "attempt-a")}}
+	quiescedAt := time.Date(2026, 9, 13, 2, 2, 0, 0, time.UTC)
+	record := runtimeRemovalRecord{removal: removal, manifest: manifest, phase: runtimeRemovalQuarantined,
+		receipt:    workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: "another-boot"},
+		quiescedAt: &quiescedAt}
+	err := validateRuntimeRemovalRecord(record)
+	if err == nil {
+		t.Fatal("no-runtime receipt from another boot was accepted")
+	}
+	for _, want := range []string{"boot_session_id", "attempt-a"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("rejection %q does not name %q", err, want)
+		}
+	}
+	record.receipt.BootSessionID = "boot"
+	if err := validateRuntimeRemovalRecord(record); err != nil {
+		t.Fatalf("boot-bound no-runtime receipt rejected: %v", err)
+	}
+}
+
+// A durable row this agent cannot validate is the row an operator most needs
+// to read. It used to fail the whole listing, so `node oci removals` went red
+// exactly when a removal was stuck, taking every well-formed record with it.
+func TestRuntimeRemovalReadListsUnvalidatableRecordWithoutFailingTheVerb(t *testing.T) {
+	outbox, err := newEvidenceOutbox(t.TempDir(), "removal-read-node", 1024, systemClock{}, 1, time.Second, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	nodeAgent := &Agent{outbox: outbox}
+	createdAt := time.Date(2026, 9, 13, 2, 0, 0, 0, time.UTC)
+	for index, jobID := range []string{"broken-job", "healthy-job"} {
+		if err := outbox.spool.storeRuntimeResourceManifest(t.Context(), testComputerAttemptManifest(jobID, "attempt-"+jobID), createdAt.Add(time.Duration(index)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := outbox.spool.beginRemoval(t.Context(), testRuntimeRemoval(jobID), createdAt.Add(time.Minute+time.Duration(index)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Durable rows outlive the code that wrote them, so the read path has to
+	// survive a receipt this build would never persist.
+	foreign, err := json.Marshal(workloadrunner.ReapReceipt{RuntimeQuiesced: true,
+		Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: "another-boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbox.spool.db.ExecContext(t.Context(), `UPDATE runtime_removal_manifests
+SET runtime_quiescence_json=?, phase=?, quiesced_ns=? WHERE job_id=?`, foreign, runtimeRemovalQuarantined,
+		createdAt.Add(2*time.Minute).UnixNano(), "broken-job"); err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := nodeAgent.RuntimeRemovals(t.Context())
+	if err != nil || len(views) != 2 {
+		t.Fatalf("removal read with one unvalidatable row = %+v err=%v", views, err)
+	}
+	byJob := make(map[string]RuntimeRemovalView, len(views))
+	for _, view := range views {
+		byJob[view.JobID] = view
+	}
+	if healthy := byJob["healthy-job"]; healthy.InvalidReason != "" || healthy.Phase != string(runtimeRemovalPrepared) {
+		t.Fatalf("well-formed record was reported red: %+v", healthy)
+	}
+	broken := byJob["broken-job"]
+	if broken.InvalidReason == "" || !strings.Contains(broken.InvalidReason, "boot_session_id") {
+		t.Fatalf("unvalidatable record did not name its field: %+v", broken)
+	}
+	if broken.Phase != string(runtimeRemovalQuarantined) || broken.RemovalGeneration == 0 {
+		t.Fatalf("unvalidatable record was not rendered as persisted: %+v", broken)
+	}
+
+	// Nothing resumes an unvalidatable row, so it can never pin a slot behind
+	// a retry loop; it stays visible until an operator acts on it.
+	controller := &removalController{listRuntimeRemovals: outbox.spool.pendingRuntimeRemovals}
+	resumed := make([]string, 0, 1)
+	controller.purgeJob = func(_ context.Context, jobID string) error { resumed = append(resumed, jobID); return nil }
+	if err := controller.resume(t.Context()); err != nil {
+		t.Fatalf("resume over an unvalidatable row = %v", err)
+	}
+	for _, jobID := range resumed {
+		if jobID == "broken-job" {
+			t.Fatal("resume acted on an unvalidatable removal record")
+		}
 	}
 }

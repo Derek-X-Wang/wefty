@@ -703,6 +703,7 @@ func run() error {
 						RuntimeQuiescence: ocicontrol.QuiescenceProjection(view.Quiescence),
 						ResourceManifests: view.ResourceManifests,
 						Attestation:       view.Attestation,
+						InvalidReason:     view.InvalidReason,
 					})
 				}
 				return response, nil

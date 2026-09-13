@@ -1092,3 +1092,39 @@ func TestComputerFinalizationKeepsFrozenAbsenceRestrictive(t *testing.T) {
 		})
 	}
 }
+
+// The adapter returns `no_runtime_resources` for an attempt whose helper `Run`
+// never entered, but that attempt still prepared a managed service directory
+// on this node. Only the Storage-only no-runtime proof skips deleting it.
+func TestNeverEnteredRunNoRuntimeReceiptStillDeletesTheManagedServiceResource(t *testing.T) {
+	removal := localRemoval{jobID: "computer-job", kind: contract.JobKindOCI, generation: 1, rootInstanceID: "root", cleanupFence: "cleanup"}
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 160 << 20}
+	attempt := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot",
+		JobID: removal.jobID, AttemptID: "attempt-a", FencingToken: "fence-a", WorkloadClass: contract.JobClassService,
+		RemovalGeneration: "1", LeaseID: "lease", TaskID: "task", ContainerID: "container", SnapshotID: "snapshot",
+		ShimID: "shim", CgroupID: "cgroup", LogSegmentDirectory: "logs", ComputerStorage: storage}
+	manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation,
+		Attempts: []workloadrunner.RuntimeResourceManifest{attempt}}
+	record := runtimeRemovalRecord{removal: removal, manifest: manifest, phase: runtimeRemovalQuarantined,
+		receipt: workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: "boot"}}
+	removedResource := false
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { removedResource = true; return nil }
+	controller.finalizeVolumes = func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, Attempts: request.Attempts}), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+
+	if err := controller.completeLocalRemoval(t.Context(), removal, &record, []*workloadrunner.ComputerStorage{storage}); err != nil {
+		t.Fatalf("never-entered-Run Computer removal = %v", err)
+	}
+	if !removedResource {
+		t.Fatal("never-entered-Run removal skipped the local managed service resource")
+	}
+}

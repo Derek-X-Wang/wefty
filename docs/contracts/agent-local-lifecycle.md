@@ -757,6 +757,14 @@ When delivery fails before the helper `Run` RPC is entered, the OCI adapter
 returns positive `no_runtime_resources` reap evidence without calling helper
 `Delete`. Finalization therefore preserves the image/runtime spawn code instead
 of replacing it with `output_error` merely because no attempt was ever created.
+That receipt is frozen against an ordinary attempt manifest whose runtime
+identifiers were reserved and never created, not against a Storage-only
+inventory, and the durable removal record accepts it on exactly that shape: a
+`no_runtime_resources` receipt binds every frozen attempt by boot session, and
+requires Storage-only attempts only when the session's complete-generation
+shortcut produced it. Only that Storage-only shortcut skips the local managed
+service-resource deletion step; a removal reaped by the never-entered-`Run`
+receipt still deletes the managed service resource this attempt prepared.
 
 ## Authority clock
 
