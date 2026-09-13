@@ -184,6 +184,14 @@ service slot until a human intervenes; the listing shows it rather than going
 red, and doctor raises `oci_removal_unreadable` for it so the slot does not
 stay pinned unseen.
 
+A record the agent reads perfectly well but cannot finish pins the same slot
+and looks healthy in every other surface. Doctor therefore also raises
+`oci_removal_stalled` for any record that has not completed within ten minutes
+of being prepared, naming `job:phase:age` for each. Read the agent log for the
+job it names: a removal repeating one typed refusal is the shape to look for.
+The bound is a reporting threshold only; nothing waits on it and nothing is
+retried or abandoned because of it.
+
 ## The helper stopped restarting (wedged startup barrier)
 
 `systemctl status dev.wefty.oci-helper.service` (Lima) or
@@ -561,3 +569,7 @@ Meaning: every durable runtime removal the agent is carrying validated against i
 ## doctor-code-oci-removal-unreadable
 
 Meaning: one or more durable removal records cannot be validated, so the agent acts on none of them and each holds its node service slot for as long as the row exists; the finding names every job ID and the field that disagreed. Evidence: read the full record with `wefty --json node oci removals` -- the frozen resource manifest, phase, quiescence receipt and `invalid_reason` are all there. First action: confirm from L1 whether the Job is still `removal_pending` and whether its node has free service slots; the record is durable, so nothing is lost by reading first. Escalation: attach the record and the agent log lines naming the removal; do not hand-edit the agent spool.
+
+## doctor-code-oci-removal-stalled
+
+Meaning: one or more durable removal records validate cleanly but have not completed within ten minutes of being prepared, so each still holds its node service slot; the finding names `job:phase:age` for every one. The bound is a reporting threshold only -- nothing waits on it, retries because of it, or abandons a removal when it trips. Evidence: `wefty --json node oci removals` for the record, then the agent log for that job ID; a removal repeating one typed helper refusal every heartbeat is the shape that produced this finding (#450). First action: read the repeated error -- a refusal the removal cannot recover from is a defect in the removal path, not something to clear by hand. Escalation: attach the record, the repeated agent log line, and the Job state from L1; do not hand-edit the agent spool.

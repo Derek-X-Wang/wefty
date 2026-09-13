@@ -394,16 +394,26 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildHelperHandshakeStalls(config, &report)
 	buildHelperStartupBound(config, &report)
 	buildHelper(ctx, config, &report)
-	buildRemovalRecords(ctx, config, &report)
+	buildRemovalRecords(ctx, config, now, &report)
 	return report
 }
+
+// removalStallBound is how long a durable removal row may sit unfinished
+// before the doctor calls it stalled. It is not a tunable and nothing waits on
+// it: it only decides when a pinned node service slot becomes a finding. The
+// value mirrors the ten-minute prestart infrastructure budget L1 already
+// grants one bounded infrastructure step, which is roughly forty agent
+// heartbeats -- long enough that an ordinary removal, including helper
+// attestation and disk finalization, is never named, short enough that an
+// operator learns about a wedged slot in the same sitting.
+const removalStallBound = 10 * time.Minute
 
 // buildRemovalRecords surfaces durable removal rows the agent refuses to act
 // on. Such a row is not a helper fault and not a sweep fault: it is the
 // agent's own durable evidence disagreeing with itself, and its cost is a node
 // service slot that stays pinned until a human looks. Reading it starts,
 // retries and advances nothing.
-func buildRemovalRecords(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
+func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time, report *DoctorResponse) {
 	if config.Removals == nil {
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			code: "oci_removal_records_not_read", notRunCause: NotRunNotConfigured,
@@ -420,23 +430,47 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, report *Docto
 		return
 	}
 	unreadable := make([]string, 0, len(removals))
+	// A row the agent can read perfectly well still pins a node service slot
+	// for as long as it does not finish, and a removal that retries forever
+	// against a refusal it cannot recover from looks exactly like a healthy
+	// one in every other surface (#450). Age against the row's own prepared
+	// time is the one signal that separates them without guessing at a cause.
+	stalled := make([]string, 0, len(removals))
 	for _, removal := range removals {
 		if removal.InvalidReason != "" {
 			unreadable = append(unreadable, removal.JobID+":"+removal.InvalidReason)
+			continue
 		}
+		if removal.CompletedAt != nil || removal.PreparedAt.IsZero() || now.Sub(removal.PreparedAt) < removalStallBound {
+			continue
+		}
+		stalled = append(stalled, fmt.Sprintf("%s:%s:%s", removal.JobID, removal.Phase,
+			now.Sub(removal.PreparedAt).Round(time.Minute)))
 	}
-	if len(unreadable) == 0 {
+	switch {
+	case len(unreadable) != 0:
+		detail := fmt.Sprintf("%d durable runtime removal record(s) cannot be validated and hold their node service slots: %s",
+			len(unreadable), strings.Join(unreadable, " "))
+		if len(stalled) != 0 {
+			detail += fmt.Sprintf("; %d further record(s) have not finished within %s: %s",
+				len(stalled), removalStallBound, strings.Join(stalled, " "))
+		}
+		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+			ran: true, code: "oci_removal_unreadable", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
+			detail: detail,
+		}))
+	case len(stalled) != 0:
+		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+			ran: true, code: "oci_removal_stalled", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
+			detail: fmt.Sprintf("%d durable runtime removal record(s) have not finished within %s and hold their node service slots (job:phase:age): %s",
+				len(stalled), removalStallBound, strings.Join(stalled, " ")),
+		}))
+	default:
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, passed: true, code: "oci_removal_records_readable",
-			detail: fmt.Sprintf("every durable runtime removal validated against its own frozen evidence (%d in flight)", len(removals)),
+			detail: fmt.Sprintf("every durable runtime removal validated against its own frozen evidence and is within its completion bound (%d in flight)", len(removals)),
 		}))
-		return
 	}
-	report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
-		ran: true, code: "oci_removal_unreadable", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
-		detail: fmt.Sprintf("%d durable runtime removal record(s) cannot be validated and hold their node service slots: %s",
-			len(unreadable), strings.Join(unreadable, " ")),
-	}))
 }
 
 // buildHelperStartupBound names a startup-failure bound that has already
@@ -1157,7 +1191,7 @@ func StableDoctorCodes() []string {
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
 		"oci_helper_restart_policy_not_read", "oci_helper_restart_policy_current", "oci_helper_restart_policy_drift",
 		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
-		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable",
+		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable", "oci_removal_stalled",
 	}
 }
 

@@ -1100,3 +1100,55 @@ func TestDoctorRaisesUnreadableRemovalRecordAgainstItsJob(t *testing.T) {
 		t.Fatalf("absent removal reader was not reported NOT-RUN: %+v", blind.Findings)
 	}
 }
+
+// A removal the agent reads perfectly well but can never finish pins the same
+// node service slot as an unreadable one and is invisible everywhere else:
+// run 1 of #196 carried one for hours while `removals` and doctor both looked
+// healthy (#450). Age against the row's own prepared time is what separates it
+// from an ordinary in-flight removal.
+func TestDoctorRaisesARemovalRecordThatNeverFinishes(t *testing.T) {
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{
+			{JobID: "in-flight-job", RemovalGeneration: 1, Phase: "prepared", PreparedAt: now.Add(-time.Minute)},
+			{JobID: "wedged-job", RemovalGeneration: 1, Phase: "prepared", PreparedAt: now.Add(-3 * time.Hour)},
+		}, nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	index := slices.IndexFunc(report.Findings, func(item DiagnosticFinding) bool { return item.Check == "removal-records" })
+	if index < 0 {
+		t.Fatalf("doctor reported no removal finding: %+v", report.Findings)
+	}
+	item := report.Findings[index]
+	if item.Code != "oci_removal_stalled" || item.Outcome != DiagnosticFailed {
+		t.Fatalf("stalled removal finding = %+v", item)
+	}
+	for _, want := range []string{"wedged-job", "prepared", "3h0m0s", "node service slot"} {
+		if !strings.Contains(item.Detail, want) {
+			t.Fatalf("stalled removal detail %q does not name %q", item.Detail, want)
+		}
+	}
+	if strings.Contains(item.Detail, "in-flight-job") {
+		t.Fatalf("stalled removal finding named a removal still within its bound: %q", item.Detail)
+	}
+
+	// A completed row is evidence waiting for acknowledgement, not a stall.
+	completed := now.Add(-3 * time.Hour)
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{{JobID: "done-job", RemovalGeneration: 1, Phase: "complete",
+			PreparedAt: completed, CompletedAt: &completed}}, nil
+	}
+	clean := BuildDoctor(t.Context(), config)
+	if err := clean.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(clean.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "removal-records" && item.Code == "oci_removal_records_readable" && item.Outcome == DiagnosticOK
+	}) {
+		t.Fatalf("a completed removal was reported stalled: %+v", clean.Findings)
+	}
+}
