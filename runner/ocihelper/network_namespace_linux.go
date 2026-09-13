@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,12 +30,8 @@ import (
 
 const (
 	computerNetworkBase     = uint32(198)<<24 | uint32(18)<<16
-	computerHostLinkPrefix  = "wftch"
 	computerGuestLinkPrefix = "wftcg"
 	computerGuestLinkName   = "eth0"
-	computerFirewallInput   = "WEFTY-COMPUTER-IN"
-	computerFirewallForward = "WEFTY-COMPUTER-FWD"
-	computerFirewallNAT     = "WEFTY-COMPUTER-NAT"
 	computerEgressProbeBody = "wefty-computer-egress-v1\n"
 	computerResolverUplink  = "/run/systemd/resolve/resolv.conf"
 )
@@ -817,22 +814,6 @@ func ensureComputerFirewall(ctx context.Context, iptablesPath string) error {
 	return ensureComputerFirewallFamilies(ctx, iptablesPath, ip6tablesPath)
 }
 
-type computerFirewallRule struct {
-	executable string
-	table      string
-	chain      string
-	arguments  []string
-	insert     bool
-	first      bool
-}
-
-func (rule computerFirewallRule) prefix() []string {
-	if rule.table == "" || rule.table == "filter" {
-		return nil
-	}
-	return []string{"-t", rule.table}
-}
-
 func runComputerFirewallCommand(ctx context.Context, executable string, arguments ...string) error {
 	output, err := exec.CommandContext(ctx, executable, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
 	if err != nil {
@@ -921,6 +902,13 @@ func ensureComputerFirewallFamiliesWithAttachments(ctx context.Context, iptables
 	if iptablesPath == "" || ip6tablesPath == "" {
 		return "", errors.New("Computer firewall requires iptables and ip6tables")
 	}
+	// The boundary is proven before anything is opened: forwarding stays off and
+	// no chain is created when the helper cannot say which destinations are the
+	// Node's and its host's.
+	boundary, err := observeComputerEgressBoundary()
+	if err != nil {
+		return "", err
+	}
 	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0); err != nil {
 		return "", fmt.Errorf("enable Computer IPv4 forwarding: %w", err)
 	}
@@ -965,7 +953,7 @@ func ensureComputerFirewallFamiliesWithAttachments(ctx context.Context, iptables
 			}
 		}
 	}
-	for _, chain := range computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, attachments) {
+	for _, chain := range computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, attachments, boundary) {
 		if chain.executable == ip6tablesPath && chain.table == "nat" && ipv6NATState == ComputerIPv6NATUnavailableIPv6Disabled {
 			continue
 		}
@@ -974,6 +962,44 @@ func ensureComputerFirewallFamiliesWithAttachments(ctx context.Context, iptables
 		}
 	}
 	return ipv6NATState, nil
+}
+
+// observeComputerEgressBoundary learns the Node side of the Computer boundary
+// from the kernel: every address the Node holds, and every next hop it routes
+// through. The second half is what #440 turned on. On a Lima vz guest the
+// macOS host is not a Node address at all — it is the guest's default-route
+// gateway, and the owner's LAN sits behind it — so a policy that only knew the
+// Node's own addresses left the host reachable through the forward path.
+//
+// It is a variable so tests can supply a boundary without a live kernel.
+var observeComputerEgressBoundary = func() (computerEgressBoundary, error) {
+	addresses, err := netlink.AddrList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return computerEgressBoundary{}, &ComputerEgressBoundaryError{Cause: "enumerate Node addresses: " + err.Error()}
+	}
+	nodeAddresses := make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		if address.IPNet == nil {
+			continue
+		}
+		if parsed, ok := netip.AddrFromSlice(address.IPNet.IP); ok {
+			nodeAddresses = append(nodeAddresses, parsed)
+		}
+	}
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return computerEgressBoundary{}, &ComputerEgressBoundaryError{Cause: "enumerate Node route next hops: " + err.Error()}
+	}
+	gateways := make([]netip.Addr, 0, len(routes))
+	for _, route := range routes {
+		if route.Gw == nil {
+			continue
+		}
+		if parsed, ok := netip.AddrFromSlice(route.Gw); ok {
+			gateways = append(gateways, parsed)
+		}
+	}
+	return newComputerEgressBoundary(nodeAddresses, gateways)
 }
 
 func computerIPv6NATUnavailable(err error) bool {
@@ -993,7 +1019,7 @@ type computerFirewallChain struct {
 	rules      [][]string
 }
 
-func computerCanonicalFirewallChains(iptablesPath, ip6tablesPath string, attachments []computerNetworkAttachment) []computerFirewallChain {
+func computerCanonicalFirewallChains(iptablesPath, ip6tablesPath string, attachments []computerNetworkAttachment, boundary computerEgressBoundary) []computerFirewallChain {
 	chains := []computerFirewallChain{
 		{executable: iptablesPath, name: computerFirewallInput},
 		{executable: iptablesPath, name: computerFirewallForward},
@@ -1011,10 +1037,14 @@ func computerCanonicalFirewallChains(iptablesPath, ip6tablesPath string, attachm
 			appendComputerCanonicalRule(chains, rule)
 		}
 	}
-	for _, rule := range computerBaseFirewallRules(iptablesPath, "icmp-port-unreachable") {
+	resolverAddresses := make([]string, 0, len(orderedAttachments))
+	for _, attachment := range orderedAttachments {
+		resolverAddresses = append(resolverAddresses, attachment.resolverAddress)
+	}
+	for _, rule := range computerBaseFirewallRules(iptablesPath, "icmp-port-unreachable", boundary.refusedIPv4, computerRoutableResolvers(resolverAddresses)) {
 		appendComputerCanonicalRule(chains, rule)
 	}
-	for _, rule := range computerIPv6BaseFirewallRules(ip6tablesPath) {
+	for _, rule := range computerIPv6BaseFirewallRules(ip6tablesPath, boundary.refusedIPv6) {
 		appendComputerCanonicalRule(chains, rule)
 	}
 	return chains
@@ -1099,24 +1129,6 @@ func computerFirewallChainsMatch(ctx context.Context, chains []computerFirewallC
 		}
 	}
 	return true, nil
-}
-
-func computerBaseFirewallRules(executable, rejectWith string) []computerFirewallRule {
-	return []computerFirewallRule{
-		{executable: executable, chain: computerFirewallInput, arguments: []string{"-i", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
-		{executable: executable, chain: computerFirewallForward, arguments: []string{"-i", computerHostLinkPrefix + "+", "-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
-		{executable: executable, chain: computerFirewallForward, arguments: []string{"-o", computerHostLinkPrefix + "+", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
-		{executable: executable, chain: computerFirewallForward, arguments: []string{"-i", computerHostLinkPrefix + "+", "-j", "ACCEPT"}},
-		{executable: executable, chain: computerFirewallForward, arguments: []string{"-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
-	}
-}
-
-func computerIPv6BaseFirewallRules(executable string) []computerFirewallRule {
-	rules := computerBaseFirewallRules(executable, "icmp6-port-unreachable")
-	return append([]computerFirewallRule{
-		{executable: executable, chain: computerFirewallInput, arguments: []string{"-i", computerHostLinkPrefix + "+", "-p", "ipv6-icmp", "-m", "icmp6", "--icmpv6-type", "135", "-j", "ACCEPT"}, insert: true},
-		{executable: executable, chain: computerFirewallInput, arguments: []string{"-i", computerHostLinkPrefix + "+", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"}, insert: true},
-	}, rules...)
 }
 
 func computerAttemptFirewallRules(attachment *computerNetworkAttachment) []computerFirewallRule {
@@ -1213,7 +1225,11 @@ func observeComputerFirewall(ctx context.Context, iptablesPath, ip6tablesPath st
 			return false, nil
 		}
 	}
-	return computerFirewallChainsMatch(ctx, computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, attachments))
+	boundary, err := observeComputerEgressBoundary()
+	if err != nil {
+		return false, err
+	}
+	return computerFirewallChainsMatch(ctx, computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, attachments, boundary))
 }
 
 func (engine *ContainerdEngine) closeComputerFirewall(ctx context.Context) error {
