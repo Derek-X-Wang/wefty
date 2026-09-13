@@ -2676,6 +2676,143 @@ func TestExclusiveSessionEOFAndHeartbeatBlackholeFailClosed(t *testing.T) {
 	assertRPCCode(t, err, CodeSessionStale)
 }
 
+// The live #456 arm needs a client that goes quiet without hanging up, so that
+// the helper is forced to end the session on its own heartbeat deadline. This
+// is the untagged half of that proof: the suppression really stops the frames,
+// the client never closes the control connection itself, and an untouched
+// session keeps the cadence it always had.
+func TestSuppressedHeartbeatsStopSendingWithoutClosingTheControlConnection(t *testing.T) {
+	engine := newFakeEngine()
+	clock := newManualClock(time.Unix(40_000, 0))
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 5 * time.Second, Clock: clock})
+	defer stop()
+	control := &observedControlConn{}
+	dial := client.Dial
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		connection, err := dial(ctx)
+		if err != nil || !control.adopt(connection) {
+			return connection, err
+		}
+		return control, nil
+	}
+	const interval = 20 * time.Millisecond
+	// startTestServer parks the pump by default so manual-clock tests can drive
+	// heartbeats themselves. This test is about the pump, so it runs for real.
+	client.disableHeartbeatPump = false
+	client.HeartbeatInterval = interval
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if session.heartbeatsSuppressed.Load() {
+		t.Fatal("a freshly opened session was born suppressed")
+	}
+	waitFor(t, 2*time.Second, func() bool { return control.writeCount() >= 3 }, "the production heartbeat cadence")
+
+	session.suppressHeartbeats()
+	silenced := control.writeCount()
+	// Twenty-five intervals of real time. An unsuppressed pump writes a frame
+	// on every one of them, so a suppression that merely slowed the cadence
+	// would still be caught here.
+	time.Sleep(25 * interval)
+	if blackholed := control.writeCount(); blackholed != silenced {
+		t.Fatalf("suppressed session wrote %d control frames, want none after %d", blackholed-silenced, silenced)
+	}
+	if control.closedByClient() {
+		t.Fatal("suppression closed the control connection; the blackhole must leave it open")
+	}
+	select {
+	case <-session.pumpDone:
+		t.Fatal("suppression stopped the heartbeat pump instead of silencing it")
+	default:
+	}
+	if err := session.HealthError(); err != nil {
+		t.Fatalf("suppression reported client-side session loss = %v, want a session the client still believes in", err)
+	}
+
+	// Only the helper's own heartbeat deadline ends this session.
+	clock.Advance(5 * time.Second)
+	waitFor(t, 2*time.Second, func() bool { return engine.sessionReapCount() == 1 }, "the helper's heartbeat-deadline reap")
+	if control.closedByClient() {
+		t.Fatal("the client closed the control connection; the reap must be the helper's own")
+	}
+	err = session.EnsureImage(t.Context(), EnsureImageRequest{
+		Reference: "example.invalid/probe", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Platform: testImagePlatform,
+	}, nil)
+	assertRPCCode(t, err, CodeSessionStale)
+	var loss *RuntimeLossError
+	if !errors.As(err, &loss) {
+		t.Fatalf("blackholed session error = %v, want the typed runtime loss the attempt lands as runtime_failure", err)
+	}
+}
+
+// The lane unit starts the helper with no heartbeat flag, so the live blackhole
+// waits on whatever a zero-valued ServerConfig compiles to and reads it back
+// from the handshake. Prove an unflagged helper really publishes that default.
+func TestUnflaggedHelperPublishesItsCompiledHeartbeatTimeout(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if got := session.Handshake().HeartbeatTimeout; got != defaultHeartbeatTimeout {
+		t.Fatalf("unflagged helper heartbeat timeout = %s, want the compiled default %s", got, defaultHeartbeatTimeout)
+	}
+	if got := NewUnixClient("/dev/null", "checksum-test").HeartbeatInterval; got != 0 {
+		t.Fatalf("NewUnixClient heartbeat interval = %s, want the unchanged zero default", got)
+	}
+}
+
+// observedControlConn wraps one session control connection so a test can see
+// how many frames the client wrote and whether the client -- rather than the
+// helper -- ever closed it.
+type observedControlConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes int
+	closed bool
+}
+
+func (connection *observedControlConn) adopt(inner net.Conn) bool {
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	if connection.Conn != nil {
+		return false
+	}
+	connection.Conn = inner
+	return true
+}
+
+func (connection *observedControlConn) Write(payload []byte) (int, error) {
+	connection.mu.Lock()
+	connection.writes++
+	connection.mu.Unlock()
+	return connection.Conn.Write(payload)
+}
+
+func (connection *observedControlConn) Close() error {
+	connection.mu.Lock()
+	connection.closed = true
+	connection.mu.Unlock()
+	return connection.Conn.Close()
+}
+
+func (connection *observedControlConn) writeCount() int {
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	return connection.writes
+}
+
+func (connection *observedControlConn) closedByClient() bool {
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	return connection.closed
+}
+
 func TestFailedSessionReapStopsHelperForFreshProcessRecovery(t *testing.T) {
 	engine := newFakeEngine()
 	engine.sessionReapErr = errors.New("residue remains")

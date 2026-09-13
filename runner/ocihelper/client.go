@@ -55,6 +55,14 @@ type Session struct {
 	controlWire *framedConn
 	response    AcquireSessionResponse
 
+	// heartbeatsSuppressed is the acceptance-lane heartbeat blackhole switch.
+	// It is never written on a production path: the only writer is
+	// suppressHeartbeats, whose single exported wrapper lives in a file built
+	// only under the service_acceptance_realtiming tag. Its zero value is the
+	// production behaviour, so an untouched session keeps exactly the heartbeat
+	// cadence it had before this field existed.
+	heartbeatsSuppressed atomic.Bool
+
 	controlMu   sync.Mutex
 	queueMu     sync.Mutex
 	pending     map[string]pendingRenewal
@@ -309,6 +317,20 @@ func (session *Session) QueueAttemptRenewalUntil(authority AttemptAuthority, exp
 	return nil
 }
 
+// suppressHeartbeats makes this session stop SENDING heartbeat frames while
+// leaving the control connection open and the Session usable. It exists only so
+// acceptance tests can reproduce a real heartbeat blackhole -- the client goes
+// quiet, the helper's server-side heartbeat deadline expires, and the helper
+// reaps this session's attempts -- which is the one failure a closed connection
+// cannot stand in for. No production caller exists, no default changes, and the
+// only exported entry point is built under service_acceptance_realtiming.
+func (session *Session) suppressHeartbeats() {
+	if session == nil {
+		return
+	}
+	session.heartbeatsSuppressed.Store(true)
+}
+
 func (session *Session) heartbeatPump() {
 	defer close(session.pumpDone)
 	interval := session.client.HeartbeatInterval
@@ -326,6 +348,15 @@ func (session *Session) heartbeatPump() {
 			return
 		case <-session.queued:
 		case <-timer.C:
+		}
+		if session.heartbeatsSuppressed.Load() {
+			// Heartbeat blackhole: stop SENDING while the control connection
+			// stays open, unread and undeadlined, so what ends this session is
+			// the helper's own server-side heartbeat deadline rather than an
+			// EOF the client caused. See suppressHeartbeats; nothing in
+			// production reaches this branch.
+			timer.Reset(interval)
+			continue
 		}
 		ctx, cancel := context.WithTimeout(session.pumpCtx, interval)
 		err := session.flushHeartbeat(ctx)
