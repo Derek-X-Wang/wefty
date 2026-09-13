@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -648,7 +649,19 @@ func (engine *ContainerdEngine) resumeComputerStorageGrow(ctx context.Context, r
 		return false, &computerDiskRecoveryStructuralError{Reason: "image_not_regular", Cause: errors.New("Computer Storage grow image is not regular")}
 	}
 	if manifest.Storage.DiskBytes == request.NewDiskBytes {
-		if err := verifyComputerDiskAllocation(imagePath, request.NewDiskBytes); err != nil {
+		// The grow already published this budget, so its bytes are charged.
+		// An image that went sparse under the helper is repaired, never made
+		// structural: a structural verdict here quarantines a Computer over
+		// blocks that can simply be taken back.
+		reasserted, allocationErr := ensureComputerDiskAllocation(imagePath, request.NewDiskBytes)
+		if reasserted > 0 {
+			log.Printf("Computer disk allocation re-asserted computer=%s disk=%s short_bytes=%d budget_bytes=%d origin=grow_resume",
+				manifest.Storage.ComputerID, name, reasserted, request.NewDiskBytes)
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerDiskAllocation, ID: name, Action: SweepActionAllocationReasserted, Method: "allocation_short",
+			})
+		}
+		if err := allocationErr; err != nil {
 			if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
 				return false, err
 			}
@@ -680,6 +693,11 @@ func (engine *ContainerdEngine) resumeComputerStorageGrow(ctx context.Context, r
 			return false, err
 		}
 	}
+	// The resumed grow attaches no loop device: resize2fs runs against the
+	// image file, where e2fsprogs' own discard punches holes directly and
+	// growExt4's closing re-assertion is the repair. Every loop this helper
+	// does attach goes through the one attachAndMount seam, which refuses
+	// discard before anything is mounted on it.
 	if err := engine.resizeComputerStorage(ctx, imagePath, "", request.Storage.DiskBytes, request.NewDiskBytes); err != nil {
 		return false, err
 	}

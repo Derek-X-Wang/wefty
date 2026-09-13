@@ -146,6 +146,7 @@ const (
 	EngineFailurePermissionDenied EngineFailureReason = "permission_denied"
 	EngineFailureRetentionBound   EngineFailureReason = "retention_bound_exceeded"
 	EngineFailureEgressDNS        EngineFailureReason = "egress_dns_unavailable"
+	EngineFailureLoopDiscard      EngineFailureReason = "loop_discard_not_disabled"
 	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
 )
 
@@ -1459,6 +1460,7 @@ const (
 	SweepActionQuarantineGCFailed       SweepAction = "quarantine_gc_failed"
 	SweepActionQuarantineGCEscalated    SweepAction = "quarantine_gc_escalated"
 	SweepActionPreenCorrected           SweepAction = "preen_corrected"
+	SweepActionAllocationReasserted     SweepAction = "allocation_reasserted"
 )
 
 // SweepEvidence is assertion-derived mechanics evidence for a helper-owned
