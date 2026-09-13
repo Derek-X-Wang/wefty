@@ -156,6 +156,21 @@ func computerResolverDestination(address string) (string, bool) {
 	return netip.PrefixFrom(parsed, parsed.BitLen()).String(), true
 }
 
+// computerFirewallChainProbeArguments is the existence probe the helper falls
+// back to when creating a chain reports that it already exists. It is listed
+// numerically: without -n iptables reverse-resolves every address in the chain,
+// which on a Node whose resolver is not instant took 9.87 s once a first
+// Computer's MASQUERADE rule was present — past the helper's command deadline,
+// so every later Computer on that Node was refused at namespace preparation
+// forever. Nothing here reads the listing; only its exit status matters.
+func computerFirewallChainProbeArguments(table, chain string) []string {
+	arguments := []string{}
+	if table != "" && table != "filter" {
+		arguments = append(arguments, "-t", table)
+	}
+	return append(arguments, "-n", "-L", chain)
+}
+
 type computerFirewallRule struct {
 	executable string
 	table      string

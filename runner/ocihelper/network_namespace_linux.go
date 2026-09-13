@@ -918,7 +918,7 @@ func ensureComputerFirewallFamiliesWithAttachments(ctx context.Context, iptables
 			arguments = append(arguments, "-t", table)
 		}
 		if err := runComputerFirewallCommand(ctx, executable, append(arguments, "-N", chain)...); err != nil {
-			if checkErr := runComputerFirewallCommand(ctx, executable, append(arguments, "-L", chain)...); checkErr != nil {
+			if checkErr := runComputerFirewallCommand(ctx, executable, computerFirewallChainProbeArguments(table, chain)...); checkErr != nil {
 				return err
 			}
 		}

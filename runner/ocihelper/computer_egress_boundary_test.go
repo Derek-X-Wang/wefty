@@ -204,3 +204,25 @@ func TestComputerIPv6EgressMirrorsTheRefusals(t *testing.T) {
 		t.Errorf("IPv6 forward verdict for a public address = %s; want ACCEPT", verdict)
 	}
 }
+
+// A second Computer on a Node can only start if the chain existence probe is
+// listed numerically; reverse DNS on a chain that already carries a Computer's
+// MASQUERADE rule outruns the helper's command deadline.
+func TestComputerFirewallChainProbeIsListedNumerically(t *testing.T) {
+	for _, probe := range []struct {
+		table string
+		want  []string
+	}{
+		{table: "", want: []string{"-n", "-L", computerFirewallForward}},
+		{table: "filter", want: []string{"-n", "-L", computerFirewallForward}},
+		{table: "nat", want: []string{"-t", "nat", "-n", "-L", computerFirewallForward}},
+	} {
+		arguments := computerFirewallChainProbeArguments(probe.table, computerFirewallForward)
+		if !slices.Equal(arguments, probe.want) {
+			t.Errorf("chain probe for table %q = %q; want %q", probe.table, arguments, probe.want)
+		}
+		if !slices.Contains(arguments, "-n") {
+			t.Errorf("chain probe for table %q omits -n and would reverse-resolve every address in the chain", probe.table)
+		}
+	}
+}
