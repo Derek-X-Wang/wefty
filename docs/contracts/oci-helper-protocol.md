@@ -268,7 +268,14 @@ failed quiescence proof and does not authorize a namespace sweep.
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
 `permission_denied`, `retention_bound_exceeded`, `egress_dns_unavailable`,
-`egress_boundary_unproven`, or `operation_failed`). A failed `Run` additionally carries `attempt_scoped` when
+`egress_boundary_unproven`, `loop_discard_not_disabled`, or
+`operation_failed`). `loop_discard_not_disabled` is the attach refusal for a
+Computer disk whose loop device the helper could not prove will refuse
+discard: the image is fully allocated because its bytes are charged, and a
+loop that honours discard lets the guest filesystem give them back. A short
+allocation is not a refusal — attach and boot sweep re-assert the charged
+budget and record it — so only a host that cannot honour the budget refuses.
+A failed `Run` additionally carries `attempt_scoped` when
 the helper positively reaped that attempt while its session stayed live; the
 same positive-reap doctrine that makes `computer_storage_busy` definitive is
 what bounds the refusal to the attempt, so a table of negative `Run` probes on

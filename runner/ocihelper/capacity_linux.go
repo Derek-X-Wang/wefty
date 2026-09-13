@@ -128,6 +128,11 @@ func materializedComputerDisk(workload WorkloadInput, diskRoot string) bool {
 		if err != nil {
 			return false
 		}
+		// Verify only, never repair: capacity asks what the disk has
+		// materialized, and answering it must not write. An image that went
+		// sparse therefore reads unmaterialized and is charged twice — the
+		// durable budget and the live reservation — until the next attach or
+		// sweep re-asserts its allocation. Over-charging is the safe error.
 		return verifyComputerDiskAllocation(filepath.Join(diskRoot, name, "disk.ext4"), volume.ComputerStorage.DiskBytes) == nil
 	}
 	return false
