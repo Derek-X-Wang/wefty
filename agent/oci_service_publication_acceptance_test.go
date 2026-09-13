@@ -798,6 +798,22 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
+	bindMountRemoved := false
+	t.Cleanup(func() {
+		// Best-effort, same idiom as the OCI SIGKILL arm's cleanup
+		// (serviceacceptance/realtiming_test.go): a t.Fatal between job
+		// creation and the normal removal path below must not leave this
+		// test's container running past the test binary's own exit. The
+		// normal path disarms this by setting bindMountRemoved once it
+		// observes removed_verified; this only fires when that path was
+		// never reached.
+		if bindMountRemoved {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _ = store.RemoveService(ctx, bindMountJob.JobID)
+	})
 	bindMountRunning := waitNativeServiceState(t, store, bindMountJob.JobID, contract.JobRunning, 45*time.Second)
 	if bindMountRunning.CurrentAttemptID == "" {
 		t.Fatalf("operator bind-mount service did not reach running: %+v", bindMountRunning)
@@ -837,10 +853,12 @@ while :; do sleep 1; done
 	if _, err := store.RemoveService(t.Context(), bindMountJob.JobID); err != nil {
 		t.Fatal(err)
 	}
-	bindMountRemoved := waitNativeServiceState(t, store, bindMountJob.JobID, contract.JobRemovedVerified, 45*time.Second)
-	if bindMountRemoved.State != contract.JobRemovedVerified {
-		t.Fatalf("operator bind-mount service removal did not complete: %+v", bindMountRemoved)
+	bindMountRemovedJob := waitNativeServiceState(t, store, bindMountJob.JobID, contract.JobRemovedVerified, 45*time.Second)
+	if bindMountRemovedJob.State != contract.JobRemovedVerified {
+		t.Fatalf("operator bind-mount service removal did not complete: %+v", bindMountRemovedJob)
 	}
+	// The normal removal path completed: disarm the best-effort cleanup above.
+	bindMountRemoved = true
 
 	bindSourceInfo, bindSourceStatErr := os.Stat(bindSourceDirectory)
 	bindSourceContentsAfter := hashDirectoryContents(t, bindSourceDirectory)
@@ -851,6 +869,11 @@ while :; do sleep 1; done
 	if !sourceUntouched {
 		t.Fatalf("operator bind-mount source altered after removal: before=%+v after=%+v stat_err=%v managed_root=%s spool_directory=%s source=%s",
 			bindSourceContentsBefore, bindSourceContentsAfter, bindSourceStatErr, managedRoot, spoolDirectory, bindSourceDirectory)
+	}
+	// The preservation assertion above passed: this test-owned fixture
+	// directory under the shared operator mount root is no longer needed.
+	if err := os.RemoveAll(bindSourceDirectory); err != nil {
+		t.Logf("cleanup operator bind-mount source %s: %v", bindSourceDirectory, err)
 	}
 	return sourceUntouched, contentVerified
 }
