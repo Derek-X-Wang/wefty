@@ -171,9 +171,22 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
+	// A waived or stalled removal that a returning node finally cleaned is
+	// acknowledged but not finalized, and its directive no longer redispatches
+	// to try again, so a crash between the two commits would strand it here
+	// forever unless recovery reconciles it too.
+	// A Computer removal keeps its row after finalization rather than becoming
+	// a tombstone, so only removed_ns separates it from one still awaiting
+	// finalization; without that exclusion every pass would finalize it again.
+	// An ordinary service keeps no row to reselect, and force-forget sets
+	// removed_ns while still owing its tombstone, so the exclusion is narrowed
+	// to Computer-projecting rows.
 	removalRows, err := tx.QueryContext(ctx, `SELECT job_id FROM service_removals
-		WHERE status=? OR (status=? AND agent_cleaned_ns IS NOT NULL)
-		ORDER BY requested_ns, job_id`, contract.JobAgentCleaned, contract.JobForgottenCleanupUnverified)
+		WHERE (status=? OR (status IN (?, ?) AND cleanup_status=? AND agent_cleaned_ns IS NOT NULL))
+		AND (removed_ns IS NULL OR NOT EXISTS (
+			SELECT 1 FROM computer_job_projections WHERE computer_job_projections.job_id=service_removals.job_id))
+		ORDER BY requested_ns, job_id`, contract.JobAgentCleaned, contract.JobForgottenCleanupUnverified,
+		contract.JobStalledCleanupUnverified, ServiceRemovalCleanupAcknowledged)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "select acknowledged service removals")
 	}

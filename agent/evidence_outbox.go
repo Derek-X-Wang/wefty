@@ -140,6 +140,27 @@ func (outbox *evidenceOutbox) recordRuntimeQuiesced(ctx context.Context, removal
 	return outbox.spool.recordRuntimeQuiesced(ctx, removal, receipt, outbox.clock.Now())
 }
 
+func (outbox *evidenceOutbox) recordRuntimeRemovalFailure(ctx context.Context, removal localRemoval, refusalCode, refusalDetail, bootSessionID string) error {
+	return outbox.spool.recordRuntimeRemovalFailure(ctx, removal, refusalCode, refusalDetail, bootSessionID, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) recordRuntimeRemovalUntypedFailure(ctx context.Context, removal localRemoval, bootSessionID string) error {
+	return outbox.spool.recordRuntimeRemovalUntypedFailure(ctx, removal, bootSessionID, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) freezeRuntimeRemovalStallDeclaration(ctx context.Context, removal localRemoval,
+	declaration []byte, key string) ([]byte, string, error) {
+	return outbox.spool.freezeRuntimeRemovalStallDeclaration(ctx, removal, declaration, key)
+}
+
+func (outbox *evidenceOutbox) removalStartedAt(ctx context.Context, jobID string) (time.Time, error) {
+	return outbox.spool.removalStartedAt(ctx, jobID)
+}
+
+func (outbox *evidenceOutbox) recordRuntimeRemovalStallDeclared(ctx context.Context, removal localRemoval) error {
+	return outbox.spool.recordRuntimeRemovalStallDeclared(ctx, removal, outbox.clock.Now())
+}
+
 func (outbox *evidenceOutbox) recordRuntimeAttested(ctx context.Context, removal localRemoval, attestation workloadrunner.RuntimeRemovalAttestation) error {
 	return outbox.spool.recordRuntimeAttested(ctx, removal, attestation, outbox.clock.Now())
 }

@@ -15,6 +15,7 @@ const (
 	JobAgentCleaned               JobState = "agent_cleaned"
 	JobRemovedVerified            JobState = "removed_verified"
 	JobForgottenCleanupUnverified JobState = "forgotten_cleanup_unverified"
+	JobStalledCleanupUnverified   JobState = "stalled_cleanup_unverified"
 )
 
 // JobTransitions includes claimed -> queued for the OCI one-shot pre-start
@@ -32,6 +33,7 @@ var JobTransitions = map[JobState][]JobState{
 	JobAgentCleaned:               {},
 	JobRemovedVerified:            {},
 	JobForgottenCleanupUnverified: {},
+	JobStalledCleanupUnverified:   {},
 }
 
 // ServiceJobTransitions is the observed-state machine for service-class jobs.
@@ -45,10 +47,11 @@ var ServiceJobTransitions = map[JobState][]JobState{
 	JobStopping:                   {JobStopped, JobFailed, JobRemovalPending},
 	JobStopped:                    {JobQueued, JobFailed, JobRemovalPending},
 	JobFailed:                     {JobQueued, JobRemovalPending},
-	JobRemovalPending:             {JobAgentCleaned, JobForgottenCleanupUnverified},
+	JobRemovalPending:             {JobAgentCleaned, JobForgottenCleanupUnverified, JobStalledCleanupUnverified},
 	JobAgentCleaned:               {JobRemovedVerified, JobForgottenCleanupUnverified},
 	JobRemovedVerified:            {},
 	JobForgottenCleanupUnverified: {},
+	JobStalledCleanupUnverified:   {},
 }
 
 type ServiceDesiredState string

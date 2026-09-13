@@ -578,6 +578,15 @@ func executeServiceRemove(
 		if err != nil {
 			return err
 		}
+		// The removal is terminal either way, so the projection is written
+		// before the outcome decides the exit code.
+		if outcomeErr := awaitedServiceRemovalOutcome(job); outcomeErr != nil {
+			if writeErr := writeServiceResultWithWorkingDirectory(stdout, job,
+				prior.Spec.Execution.WorkingDirectory, jsonOutput); writeErr != nil {
+				return writeErr
+			}
+			return outcomeErr
+		}
 	}
 	return writeServiceResultWithWorkingDirectory(stdout, job, prior.Spec.Execution.WorkingDirectory, jsonOutput)
 }
@@ -736,8 +745,36 @@ func serviceIsQuiescent(job l1.Job) bool {
 		(job.State == contract.JobFailed && job.DesiredState == contract.ServiceDesiredStopped && !job.SlotHeld)
 }
 
+// serviceRemovalComplete includes the stalled outcome: it is terminal and the
+// Slot is already released, so a caller that kept waiting would be waiting for
+// a state that can never arrive -- the wedge #450 named. Terminal is not the
+// same as successful; see awaitedServiceRemovalOutcome.
 func serviceRemovalComplete(job l1.Job) bool {
-	return job.State == contract.JobRemovedVerified || job.State == contract.JobForgottenCleanupUnverified
+	return job.State == contract.JobRemovedVerified || job.State == contract.JobForgottenCleanupUnverified ||
+		job.State == contract.JobStalledCleanupUnverified
+}
+
+// awaitedServiceRemovalOutcome refuses to report unverified cleanup as a
+// successful removal. Automation reads the exit code, and exit zero here would
+// say the service's runtime state is gone when nothing proved that.
+func awaitedServiceRemovalOutcome(job l1.Job) error {
+	if job.State != contract.JobStalledCleanupUnverified {
+		return nil
+	}
+	details := map[string]any{"job_id": job.JobID, "job_state": job.State,
+		"removal_outcome": string(l1.ServiceRemovalOutcomeCleanupStalled), "holds_slot": false}
+	message := "service removal stalled"
+	if job.Removal != nil && job.Removal.Stall != nil {
+		stall := job.Removal.Stall
+		message += ": " + stall.LastRefusalCode
+		details["last_refusal_code"] = stall.LastRefusalCode
+		details["last_refusal_detail"] = stall.LastRefusalDetail
+		details["attempts"] = stall.Attempts
+		details["phase"] = stall.Phase
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: contract.ErrorConflict, Message: message, Retryable: false, Details: details,
+	}}
 }
 
 func serviceDispatchKey(canonicalScriptPath string) string {

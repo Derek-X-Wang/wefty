@@ -187,10 +187,29 @@ stay pinned unseen.
 A record the agent reads perfectly well but cannot finish pins the same slot
 and looks healthy in every other surface. Doctor therefore also raises
 `oci_removal_stalled` for any record that has not completed within ten minutes
-of being prepared, naming `job:phase:age` for each. Read the agent log for the
-job it names: a removal repeating one typed refusal is the shape to look for.
-The bound is a reporting threshold only; nothing waits on it and nothing is
-retried or abandoned because of it.
+of being prepared and has not been declared stalled, naming
+`job:phase:refusal:attempts:age` for each.
+
+The recovery path is the agent's own: after the same ten-minute bound, and
+after at least three consecutive identical typed refusals, the bound agent
+declares the removal stalled to L1. That releases the service slot with a
+durable record of why -- Job state `stalled_cleanup_unverified`, removal
+outcome `cleanup_stalled`, carrying the refusal code, the attempt count and
+the elapsed time. It claims nothing about cleanup: the deletion directive
+still stands, the agent keeps retrying it, and a returning node that finally
+succeeds records the fact without ever upgrading the unverified outcome. Such
+a record reports as `oci_removal_stalled_declared` (green) because the harm
+this check names -- a pinned slot -- is gone. Those retries back off durably
+from the ordinary heartbeat cadence to at most one attempt every three minutes;
+the agent logs refusal-code transitions and eventual success rather than every
+identical retry.
+
+So a record still listed under `oci_removal_stalled` has either not accumulated
+eligible evidence (no typed refusal or fewer than three consecutive identical
+typed refusals), or has eligible/frozen evidence but the declaration delivery
+is failing. The finding says which clause applies. For delivery failure, read
+the agent log for the job it names: `declare stalled removal for service` names
+the L1 refusal, and the repeated typed refusal under it is the cause to fix.
 
 ## The helper stopped restarting (wedged startup barrier)
 
@@ -572,4 +591,8 @@ Meaning: one or more durable removal records cannot be validated, so the agent a
 
 ## doctor-code-oci-removal-stalled
 
-Meaning: one or more durable removal records validate cleanly but have not completed within ten minutes of being prepared, so each still holds its node service slot; the finding names `job:phase:age` for every one. The bound is a reporting threshold only -- nothing waits on it, retries because of it, or abandons a removal when it trips. Evidence: `wefty --json node oci removals` for the record, then the agent log for that job ID; a removal repeating one typed helper refusal every heartbeat is the shape that produced this finding (#450). First action: read the repeated error -- a refusal the removal cannot recover from is a defect in the removal path, not something to clear by hand. Escalation: attach the record, the repeated agent log line, and the Job state from L1; do not hand-edit the agent spool.
+Meaning: one or more durable removal records validate cleanly but have not completed within ten minutes of being prepared and have not been declared stalled, so each still holds its node service slot; the finding names `job:phase:refusal:attempts:age` for every one. The recovery path is the bound agent's own declaration (L1 `removal_outcome` `cleanup_stalled`, Job state `stalled_cleanup_unverified`), which releases the slot without claiming cleanup succeeded. The finding distinguishes records that are ineligible because they have no typed refusal or fewer than three consecutive identical refusals from records whose eligible or frozen declaration is failing delivery. Evidence: `wefty --json node oci removals` for the record, then the agent log for that job ID when delivery is failing; `declare stalled removal for service` names the L1 refusal, and the repeated typed helper refusal under it is the original cause (#450). First action: read the named clause and repeated error -- a refusal the removal cannot recover from is a defect in the removal path, not something to clear by hand. Escalation: attach the record, the repeated agent log line when present, and the Job state from L1; do not hand-edit the agent spool.
+
+## doctor-code-oci-removal-stalled-declared
+
+Meaning: one or more durable removal records have been declared stalled and accepted by L1, so cleanup is still outstanding but no node service slot waits on it; the finding names `job:phase:refusal:attempts:age` for every one. This is a pass for capacity only: the Job is terminal `stalled_cleanup_unverified` with `removal_outcome` `cleanup_stalled`, nothing about runtime or Storage absence was proven, and the deletion directive still stands so a returning node may yet finish it. Evidence: `wefty --json node oci removals` for the record and its refusal code, and `wefty --json computer status` for the Job's own stall evidence. First action: treat the named refusal as the defect to fix; a declared stall is a reported failure, not a completed removal. Escalation: attach the record, the refusal code and attempt count, and the Job state from L1.

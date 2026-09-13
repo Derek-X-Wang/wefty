@@ -502,7 +502,8 @@ func waitForComputerRemoval(ctx context.Context, clients *apiClients, computerID
 		if readErr != nil {
 			return false, readErr
 		}
-		return computerRemovalTerminal(observed) || computerRemovalQuarantine(observed) != nil, nil
+		return computerRemovalTerminal(observed) || computerRemovalQuarantine(observed) != nil ||
+			computerRemovalStalled(observed), nil
 	})
 	return observed, observation, err
 }
@@ -539,9 +540,45 @@ func computerRemovalQuarantine(computer l1.Computer) *l1.ComputerStorageCleanupQ
 	return nil
 }
 
+// computerRemovalStalled reports the terminal fact alone. Polling stops on
+// this and never on the evidence beside it: a declaration whose stored receipt
+// cannot be decoded projects nil evidence, and waiting for evidence that will
+// never arrive would turn a prompt typed answer into a timeout.
+func computerRemovalStalled(computer l1.Computer) bool {
+	removal := computer.CurrentJob.Removal
+	return removal != nil && computer.DesiredState == contract.ServiceDesiredRemoved &&
+		computer.CurrentJob.State == contract.JobStalledCleanupUnverified &&
+		removal.RemovalOutcome == l1.ServiceRemovalOutcomeCleanupStalled
+}
+
+// computerRemovalStall is the evidence beside that fact, absent when the
+// stored receipt could not be decoded.
+func computerRemovalStall(computer l1.Computer) *l1.ServiceRemovalStall {
+	if !computerRemovalStalled(computer) {
+		return nil
+	}
+	return computer.CurrentJob.Removal.Stall
+}
+
 func awaitedComputerRemovalOutcome(computer l1.Computer) error {
 	if computerRemovalTerminal(computer) {
 		return nil
+	}
+	if computer.CurrentJob.State == contract.JobStalledCleanupUnverified {
+		stall := computerRemovalStall(computer)
+		if stall == nil || stall.LastRefusalCode == "" || stall.Attempts < l1.MinimumServiceRemovalStallAttempts {
+			return computerRemovalOutcomeMismatch(computer, "stalled Computer removal lacks its typed non-completion evidence")
+		}
+		// The Slot is released and the deletion directive still stands, so
+		// this is an answer, not a timeout: removal did not complete, and
+		// nothing about the Computer's Storage was proven absent.
+		return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+			Code: contract.ErrorConflict, Message: "Computer removal stalled: " + stall.LastRefusalCode, Retryable: false,
+			Details: map[string]any{"removal_computer_id": computer.ComputerID, "job_id": computer.CurrentJobID,
+				"removal_outcome": string(l1.ServiceRemovalOutcomeCleanupStalled), "custody_outcome": computer.RemovalOutcome,
+				"last_refusal_code": stall.LastRefusalCode, "last_refusal_detail": stall.LastRefusalDetail,
+				"attempts": stall.Attempts, "phase": stall.Phase, "holds_slot": false},
+		}}
 	}
 	if quarantine := computerRemovalQuarantine(computer); quarantine != nil {
 		if quarantine.Kind != "managed_volume_cleanup_quarantined" || quarantine.ReceiptID == "" ||
@@ -671,12 +708,43 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 			computer.Capacity.ActiveFailure.Status+"("+computer.Capacity.ActiveFailure.Code+")",
 			boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
 			computer.ControllerTenure,
-			jsonOrNA(job.LastFailure), valueOrNA(computer.RemovalOutcome), boolPointerOrNA(computer.MutationApplied),
+			jsonOrNA(job.LastFailure), computerRemovalColumn(computer.RemovalOutcome, job.Removal), boolPointerOrNA(computer.MutationApplied),
 			boolPointerOrNA(computer.IdempotentReplay)); err != nil {
 			return err
 		}
 	}
 	return table.Flush()
+}
+
+// computerRemovalColumn never shows a bare custody outcome for a Job whose
+// removal was declared stalled. `removal_pending` is the truthful custody
+// claim -- nothing about the disk was proven and a returning node may still
+// prove it -- but on its own it reads as "still working", which is exactly the
+// signal that made #450 invisible. The stall is rendered beside it so an
+// operator sees the refusal, the attempt count, and how long it ran.
+func computerRemovalColumn(outcome string, removal *l1.ServiceRemoval) string {
+	rendered := valueOrNA(outcome)
+	if removal == nil || removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupStalled {
+		return rendered
+	}
+	code := "unknown_refusal"
+	attempts := 0
+	if removal.Stall != nil {
+		if strings.TrimSpace(removal.Stall.LastRefusalCode) != "" {
+			code = removal.Stall.LastRefusalCode
+		}
+		attempts = removal.Stall.Attempts
+	}
+	return fmt.Sprintf("%s(stalled:%s:%d:%s)", rendered, code, attempts, computerRemovalStallElapsed(removal))
+}
+
+// computerRemovalStallElapsed reports the wait L1's own bound measured:
+// directive requested to declaration accepted.
+func computerRemovalStallElapsed(removal *l1.ServiceRemoval) string {
+	if removal.StalledAt == nil || removal.RemovalRequestedAt.IsZero() {
+		return "N/A"
+	}
+	return removal.StalledAt.Sub(removal.RemovalRequestedAt).Round(time.Minute).String()
 }
 
 func int64PointerOrNA(value *int64) string {

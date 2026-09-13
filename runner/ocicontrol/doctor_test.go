@@ -1152,3 +1152,114 @@ func TestDoctorRaisesARemovalRecordThatNeverFinishes(t *testing.T) {
 		t.Fatalf("a completed removal was reported stalled: %+v", clean.Findings)
 	}
 }
+
+// TestDoctorStopsFailingOnceARemovalIsDeclaredStalled closes the finding on
+// the harm it actually names. A declared stall is still outstanding cleanup,
+// but its node service slot is free, and a check that stays red once the thing
+// it warns about is fixed teaches an operator to ignore it.
+func TestDoctorStopsFailingOnceARemovalIsDeclaredStalled(t *testing.T) {
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	declared := now.Add(-2 * time.Hour)
+	config := healthyDoctorConfig(now, "")
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{{JobID: "declared-job", RemovalGeneration: 1, Phase: "prepared",
+			PreparedAt: now.Add(-3 * time.Hour), FailedAttempts: 7,
+			LastRefusalCode: "unauthorized_attempt", StallDeclaredAt: &declared}}, nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	index := slices.IndexFunc(report.Findings, func(item DiagnosticFinding) bool { return item.Check == "removal-records" })
+	if index < 0 {
+		t.Fatalf("doctor reported no removal finding: %+v", report.Findings)
+	}
+	item := report.Findings[index]
+	if item.Code != "oci_removal_stalled_declared" || item.Outcome != DiagnosticOK {
+		t.Fatalf("declared stall finding = %+v", item)
+	}
+	for _, want := range []string{"declared-job", "unauthorized_attempt", "hold no node service slot"} {
+		if !strings.Contains(item.Detail, want) {
+			t.Fatalf("declared stall detail %q does not name %q", item.Detail, want)
+		}
+	}
+
+	// An undeclared record of the same age is still the failure, and its
+	// detail must name the outcome that releases the slot.
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{{JobID: "wedged-job", RemovalGeneration: 1, Phase: "prepared",
+			PreparedAt: now.Add(-3 * time.Hour), FailedAttempts: 7, LastRefusalCode: "unauthorized_attempt"}}, nil
+	}
+	pinned := BuildDoctor(t.Context(), config)
+	index = slices.IndexFunc(pinned.Findings, func(item DiagnosticFinding) bool { return item.Check == "removal-records" })
+	if index < 0 {
+		t.Fatalf("doctor reported no removal finding: %+v", pinned.Findings)
+	}
+	item = pinned.Findings[index]
+	if item.Code != "oci_removal_stalled" || item.Outcome != DiagnosticFailed {
+		t.Fatalf("undeclared stall finding = %+v", item)
+	}
+	for _, want := range []string{"wedged-job", "unauthorized_attempt", "cleanup_stalled", "stalled_cleanup_unverified"} {
+		if !strings.Contains(item.Detail, want) {
+			t.Fatalf("undeclared stall detail %q does not name %q", item.Detail, want)
+		}
+	}
+	for name, companion := range map[string]RemovalRecord{
+		"another stalled row": {JobID: "other-stalled", RemovalGeneration: 1, Phase: "prepared",
+			PreparedAt: now.Add(-3 * time.Hour)},
+		"an unreadable row": {JobID: "unreadable", RemovalGeneration: 1, Phase: "prepared",
+			PreparedAt: now.Add(-3 * time.Hour), InvalidReason: "unreadable_json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config.Removals = func(context.Context) ([]RemovalRecord, error) {
+				return []RemovalRecord{
+					{JobID: "declared-job", RemovalGeneration: 1, Phase: "prepared",
+						PreparedAt: now.Add(-3 * time.Hour), FailedAttempts: 7,
+						LastRefusalCode: "unauthorized_attempt", StallDeclaredAt: &declared},
+					companion,
+				}, nil
+			}
+			mixed := BuildDoctor(t.Context(), config)
+			index := slices.IndexFunc(mixed.Findings, func(item DiagnosticFinding) bool { return item.Check == "removal-records" })
+			if index < 0 || !strings.Contains(mixed.Findings[index].Detail, "declared-job:prepared:unauthorized_attempt:7:") ||
+				!strings.Contains(mixed.Findings[index].Detail, "hold no node service slot") {
+				t.Fatalf("declared row vanished beside %s: %+v", name, mixed.Findings)
+			}
+		})
+	}
+}
+
+// TestDoctorSeparatesIneligibleEvidenceFromFailedDeclaration keeps the finding
+// from sending an operator to read a delivery failure that does not exist.
+func TestDoctorSeparatesIneligibleEvidenceFromFailedDeclaration(t *testing.T) {
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	aged := now.Add(-3 * time.Hour)
+	config := healthyDoctorConfig(now, "")
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{
+			{JobID: "eligible-job", RemovalGeneration: 1, Phase: "prepared", PreparedAt: aged,
+				FailedAttempts: 7, LastRefusalCode: "unauthorized_attempt"},
+			{JobID: "untyped-job", RemovalGeneration: 1, Phase: "prepared", PreparedAt: aged},
+			{JobID: "short-streak-job", RemovalGeneration: 1, Phase: "prepared", PreparedAt: aged,
+				FailedAttempts: 1, LastRefusalCode: "session_stale"},
+		}, nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	index := slices.IndexFunc(report.Findings, func(item DiagnosticFinding) bool { return item.Check == "removal-records" })
+	if index < 0 {
+		t.Fatalf("doctor reported no removal finding: %+v", report.Findings)
+	}
+	item := report.Findings[index]
+	if item.Code != "oci_removal_stalled" || item.Outcome != DiagnosticFailed {
+		t.Fatalf("mixed stall finding = %+v", item)
+	}
+	for _, want := range []string{"the declaration itself is failing", "eligible-job",
+		"cannot be declared yet", "untyped-job", "short-streak-job"} {
+		if !strings.Contains(item.Detail, want) {
+			t.Fatalf("mixed stall detail %q does not name %q", item.Detail, want)
+		}
+	}
+}

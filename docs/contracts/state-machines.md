@@ -60,26 +60,67 @@ resumable.
 | `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed` |
 | `stopped` | Desired stopped and no live attempt remains. | `queued` through explicit operator start or restart only |
 | `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only |
-| `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified` |
+| `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified`, `stalled_cleanup_unverified` |
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
 | `removed_verified` | Remaining attempt/service rows were deleted and the verified tombstone was committed. Terminal. | none |
 | `forgotten_cleanup_unverified` | The operator waived proof. The deletion directive remains until a returning node cleans it, and the tombstone warning is permanent. Terminal operator outcome. | none |
+| `stalled_cleanup_unverified` | The bound agent declared, after the removal retried past the ten-minute bound against the same refusal, that cleanup cannot complete. The service slot is released and nothing claims runtime cleanup succeeded. The deletion directive remains for a returning node and the unverified outcome is permanent. Terminal agent outcome. | none |
 
 Legal desired/observed pairings are: desired `running` with `queued`,
 `claimed`, `running`, or `failed`; and desired `stopped` with `stopping`,
 `stopped`, or `failed`. Desired `removed` is projected from the durable
 `service_removals` row with `removal_pending`, `agent_cleaned`,
-`removed_verified`, or `forgotten_cleanup_unverified`; the narrower
+`removed_verified`, `forgotten_cleanup_unverified`, or
+`stalled_cleanup_unverified`; the narrower
 `service_jobs.desired_state` column remains the pre-removal running/stopped
 state until final deletion. `restart-pending` is never persisted. It is computed
 when a service is `queued`, desired `running`, and its `next_restart_at` is in
 the future.
 
+A removal that cannot complete ends in `stalled_cleanup_unverified` with
+`removal_outcome=cleanup_stalled`. It is agent-declared non-completion, not an
+operator waiver and not a quarantine: it releases the service slot, and it
+records the last refusal code, the consecutive attempt count, and the elapsed
+time as typed evidence that asserts no deletion. L1 admits the declaration
+only once its own durable removal request has stood for the ten-minute
+prestart budget, measured against L1's clock rather than any reported elapsed
+time; the bound agent declares it only once its own durable removal record has
+retried past that bound against at least three consecutive identical typed
+refusals. A quarantined cleanup, which deliberately keeps its slot and has its
+own resolution path, can never be declared stalled. `cleanup_status` stays
+`pending`, so the deletion directive keeps being dispatched to the bound node.
+The declaration is scoped to runtime removals -- `kind=oci` services and
+Computers -- because only a runtime cleanup can be refused with the typed code
+the evidence is built from; a process service has no such record and its
+removal can never be declared stalled.
+The bound agent freezes the exact declaration durably before it first sends it
+and replays those bytes until L1 accepts them, under an idempotency key that
+does not vary with the boot session, so a lost response cannot turn an accepted
+declaration into a permanent conflict.
+A later positive cleanup acknowledgement records the acknowledgement and, for
+a Computer, still earns the separate Storage-custody outcome, but it never
+upgrades the removal's own unverified terminal outcome. A stalled removal also
+retains its node-local binding image pin, which the standing directive still
+needs, until that positive cleanup releases it. The node doctor's
+`oci_removal_stalled` finding names this outcome as the way a pinned slot is
+released.
+Retries after declaration, except a complete record's one returning-boot
+acknowledgement replay, use a separate durable monotonic counter, independent
+of the qualifying refusal streak, to back off from fifteen seconds to a
+three-minute cap. The agent logs refusal-code transitions once, including a
+return to an earlier code, rather than logging every identical retry.
+After positive cleanup is finalized, a returning boot may replay a bare
+positive acknowledgement when the authenticated identity, node, removal
+generation, and root instance match; its boot-derived key and cleanup fence
+may differ because L1 could have committed before the prior agent cleared its
+local record. Quarantine remains a conflicting shape, and a stall declaration
+still replays only when its frozen declaration key and body hash match exactly.
+
 A service binding is also its service-slot reservation and, for `kind=oci`, a
 durable node-local image pin. A bound service holds
 the slot while queued for restart, claimed, running, or stopping. It releases
-the slot only after reaching stopped, latched failed, or verified removal; the
-binding itself remains durable. For non-Computer services, reaching stopped
+the slot only after reaching stopped, latched failed, verified removal, or an
+agent-declared stalled cleanup; the binding itself remains durable. For non-Computer services, reaching stopped
 never clears `current_attempt_id`; the terminal attempt remains the
 runtime-history projection.
 

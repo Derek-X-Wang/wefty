@@ -650,10 +650,16 @@ func run() error {
 					CleanupFence: view.CleanupFence, RootInstanceID: view.RootInstanceID,
 					Phase: view.Phase, PreparedAt: view.PreparedAt, QuiescedAt: view.QuiescedAt,
 					AttestedAt: view.AttestedAt, CompletedAt: view.CompletedAt,
-					RuntimeQuiescence: ocicontrol.QuiescenceProjection(view.Quiescence),
-					ResourceManifests: view.ResourceManifests,
-					Attestation:       view.Attestation,
-					InvalidReason:     view.InvalidReason,
+					RuntimeQuiescence:      ocicontrol.QuiescenceProjection(view.Quiescence),
+					ResourceManifests:      view.ResourceManifests,
+					Attestation:            view.Attestation,
+					InvalidReason:          view.InvalidReason,
+					FailedAttempts:         view.FailedAttempts,
+					LastRefusalCode:        view.LastRefusalCode,
+					LastRefusalDetail:      view.LastRefusalDetail,
+					LastAttemptedAt:        view.LastAttemptedAt,
+					StallDeclaredAt:        view.StallDeclaredAt,
+					StallDeclarationFrozen: view.StallDeclarationFrozen,
 				})
 			}
 			return records, nil

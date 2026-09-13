@@ -256,7 +256,16 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	  prepared_ns INTEGER NOT NULL,
 	  quiesced_ns INTEGER,
 	  attested_ns INTEGER,
-	  completed_ns INTEGER
+	  completed_ns INTEGER,
+	  failed_attempts INTEGER NOT NULL DEFAULT 0,
+	  stall_retry_attempts INTEGER NOT NULL DEFAULT 0,
+	  last_refusal_code TEXT,
+	  last_refusal_detail TEXT,
+	  last_attempted_ns INTEGER,
+	  last_attempt_boot_session_id TEXT,
+	  stall_declaration_json BLOB,
+	  stall_declaration_key TEXT,
+	  stall_declared_ns INTEGER
 	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
@@ -278,6 +287,15 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		{table: "spool_completion_receipts", column: "terminal_audit_json", definition: "BLOB"},
 		{table: "runtime_removal_manifests", column: "absence_attestation_json", definition: "BLOB"},
 		{table: "runtime_removal_manifests", column: "attested_ns", definition: "INTEGER"},
+		{table: "runtime_removal_manifests", column: "failed_attempts", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "runtime_removal_manifests", column: "stall_retry_attempts", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "runtime_removal_manifests", column: "last_refusal_code", definition: "TEXT"},
+		{table: "runtime_removal_manifests", column: "last_refusal_detail", definition: "TEXT"},
+		{table: "runtime_removal_manifests", column: "last_attempted_ns", definition: "INTEGER"},
+		{table: "runtime_removal_manifests", column: "last_attempt_boot_session_id", definition: "TEXT"},
+		{table: "runtime_removal_manifests", column: "stall_declaration_json", definition: "BLOB"},
+		{table: "runtime_removal_manifests", column: "stall_declaration_key", definition: "TEXT"},
+		{table: "runtime_removal_manifests", column: "stall_declared_ns", definition: "INTEGER"},
 	} {
 		if err := ensureLogSpoolColumn(ctx, spool.db, migration.table, migration.column, migration.definition); err != nil {
 			return fmt.Errorf("agent: migrate log spool %s.%s: %w", migration.table, migration.column, err)

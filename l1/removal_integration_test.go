@@ -21,6 +21,61 @@ func TestServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 	assertServiceRemovalControllerTransactionAndAttestation(t)
 }
 
+func TestLegacyFinalizedRemovalAcceptsBareAcknowledgementAfterMigration(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	ack := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "legacy-positive-cleanup",
+	}
+	if _, err := harness.h.store.AcknowledgeServiceRemoval(t.Context(), "fabric-agent", harness.job.JobID, ack); err != nil {
+		t.Fatal(err)
+	}
+	if _, finalized, err := harness.h.store.FinalizeServiceRemoval(t.Context(), harness.job.JobID); err != nil || !finalized {
+		t.Fatalf("finalize legacy fixture: finalized=%t err=%v", finalized, err)
+	}
+	var sequence int
+	var name, databasePath string
+	if err := harness.h.store.db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &name, &databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{"cleanup_acknowledgement_key", "cleanup_acknowledgement_hash"} {
+		if _, err := legacy.Exec(`ALTER TABLE service_tombstones DROP COLUMN ` + column); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := OpenStore(databasePath, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var key, hash sql.NullString
+	if err := migrated.db.QueryRow(`SELECT cleanup_acknowledgement_key, cleanup_acknowledgement_hash
+		FROM service_tombstones WHERE job_id=?`, harness.job.JobID).Scan(&key, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if key.Valid || hash.Valid {
+		t.Fatal("migration unexpectedly invented boot-specific replay identity")
+	}
+	ack.BootSessionID = "returning-boot"
+	ack.IdempotencyKey = "returning-positive-cleanup"
+	ack.CleanupFence = "returning-cleanup-fence"
+	job, err := migrated.AcknowledgeServiceRemoval(t.Context(), "fabric-agent", harness.job.JobID, ack)
+	if err != nil || job.State != contract.JobRemovedVerified {
+		t.Fatalf("legacy finalized bare acknowledgement = %+v, %v", job, err)
+	}
+}
+
 func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 	t.Helper()
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
@@ -240,15 +295,26 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 		t.Fatalf("already-removed replay = %d body=%s", status, body)
 	}
 
-	// After finalization there is no mutable state for an idempotency key to
-	// protect. The tombstone's retained authority fields make this a constant
-	// success without resurrecting or changing anything.
-	ack.IdempotencyKey = "different-after-finalization"
-	ack.CleanupFence = "not-retained-after-finalization"
+	// A finalized bare acknowledgement is the positive-cleanup shape already
+	// accepted. A returning boot may regenerate its key and fence after L1
+	// committed but before the old agent cleared its local record.
 	status, _, body = h.do(agent, http.MethodPost, ackPath, ack)
 	if status != http.StatusOK {
 		t.Fatalf("post-finalization acknowledgement replay = %d body=%s", status, body)
 	}
+	changedAfterFinalization := ack
+	changedAfterFinalization.BootSessionID = "returning-after-finalization"
+	changedAfterFinalization.IdempotencyKey = "different-after-finalization"
+	changedAfterFinalization.CleanupFence = "not-retained-after-finalization"
+	status, _, body = h.do(agent, http.MethodPost, ackPath, changedAfterFinalization)
+	if status != http.StatusOK {
+		t.Fatalf("different-boot finalized acknowledgement replay = %d body=%s", status, body)
+	}
+	changedAfterFinalization.CleanupStall = &ServiceRemovalStallEvidence{
+		Kind: ServiceRemovalStallEvidenceKind,
+	}
+	status, _, body = h.do(agent, http.MethodPost, ackPath, changedAfterFinalization)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorIdempotencyConflict)
 
 	status, headers, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
 	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {

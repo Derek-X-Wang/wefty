@@ -522,7 +522,7 @@
       "post": {
         "operationId": "acknowledgeServiceRemoval",
         "summary": "Attest that bound service cleanup completed",
-        "description": "Acknowledgement strictly follows local deletion. L1 validates Fabric identity, current boot session, bound node, generation, opaque cleanup fence, root-instance ID, idempotency key, and body hash in one transaction, then finalizes the tombstone in a separate crash-recoverable transaction.",
+        "description": "Acknowledgement strictly follows local deletion. L1 validates Fabric identity, current boot session, bound node, generation, opaque cleanup fence, root-instance ID, idempotency key, and body hash in one transaction, then finalizes the tombstone in a separate crash-recoverable transaction. cleanup_quarantine and cleanup_stall are mutually exclusive with each other and with an ordinary completion acknowledgement: a body carrying neither attests that cleanup completed, cleanup_quarantine records a Computer-disk cleanup that is quarantined and keeps its service slot, and cleanup_stall declares a runtime removal that cannot complete and releases the slot without claiming cleanup succeeded. A stall declaration uses its own idempotency-key namespace and is replayed byte for byte until accepted.",
         "requestBody": {
           "required": true,
           "content": {
@@ -538,8 +538,10 @@
                   "cleanup_fence": { "type": "string", "minLength": 1 },
                   "root_instance_id": { "type": "string", "minLength": 1 },
                   "idempotency_key": { "type": "string", "minLength": 1 },
-                  "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" }
-                }
+                  "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" },
+                  "cleanup_stall": { "$ref": "./common.v1.json#/components/schemas/ServiceRemovalStallEvidence" }
+                },
+                "not": { "required": ["cleanup_quarantine", "cleanup_stall"] }
               }
             }
           }
