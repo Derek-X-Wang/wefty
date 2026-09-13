@@ -241,8 +241,14 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	}()
 
 	network := plain.NewNetwork()
+	// #457's operator bind-mount arm requires RequiresPinnedPlacement's exactly
+	// one wefty:node:<stable-node-id> routing tag (contract/job_spec.go), so
+	// this node's policy must advertise that tag alongside its ordinary one.
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
-		"native-service-node": {Tags: []string{"native-service"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+		"native-service-node": {
+			Tags:            []string{"native-service", contract.StableNodeTagPrefix + "native-service-node"},
+			MaxOneshotSlots: 1, MaxServiceSlots: 1,
+		},
 	}, l1.DefaultLeaseDuration)
 	defer stopServer()
 	publishedPort := reserveNativePublishedPort(t)
@@ -766,7 +772,12 @@ func verifyNativeOCIOperatorBindMountUntouchedAfterRemoval(
 	bindMountJob, _, err := store.CreateJob(t.Context(), contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "native-service-operator-bind-mount",
 		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
-		RoutingTags: []string{"native-service"}, RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+		// RequiresPinnedPlacement (contract/job_spec.go) requires exactly one
+		// wefty:node:<stable-node-id> tag on any OCI job with mounts, pinning
+		// it to the node that owns the bind source; "native-service-node" is
+		// this test's registered stable node id (see the NodePolicy above).
+		RoutingTags:    []string{"native-service", contract.StableNodeTagPrefix + "native-service-node"},
+		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: reference, Digest: &digest},
 			Mounts: []contract.OCIMount{{
