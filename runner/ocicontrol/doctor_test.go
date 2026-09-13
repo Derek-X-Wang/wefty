@@ -86,6 +86,11 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		},
 		HelperHandshakeStalledWindows: func() uint64 { return 0 },
 		HelperStartupBound:            func() ocihelper.StartupBoundObservation { return ocihelper.StartupBoundObservation{} },
+		// The production doctor is never built without a removal reader:
+		// cmd/wefty-agent wires the same reader into the doctor and the
+		// removals verb from one place. A healthy node therefore reads its
+		// removals, and an empty listing is a fact, not a missing source.
+		Removals: func(context.Context) ([]RemovalRecord, error) { return []RemovalRecord{}, nil },
 	}
 }
 
