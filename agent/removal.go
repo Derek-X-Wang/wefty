@@ -165,15 +165,7 @@ func (controller *removalController) enqueue(
 // boot sweep gates image-pin restoration, which is the one thing a stalled
 // removal must keep until cleanup finally succeeds.
 func (controller *removalController) reconcile(ctx context.Context, directive l1.RemovalDirective) error {
-	err := controller.process(ctx, directive)
-	if err == nil || ctx.Err() != nil {
-		return err
-	}
-	if controller.noteRemovalFailure(ctx, directive, err) {
-		controller.log("agent: remove service %q still refused after a declared stall: %v", directive.JobID, err)
-		return nil
-	}
-	return err
+	return controller.process(ctx, directive)
 }
 
 // declaredRefusalCode is the exact helper refusal an accepted declaration
@@ -442,6 +434,34 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	if len(computerStorages) != 0 && removal.kind != contract.JobKindOCI {
 		return errors.New("agent: frozen Computer removal inventory requires OCI workload kind")
 	}
+	if controller.declaredRemovalRetryDeferred(*runtimeRemoval) {
+		return nil
+	}
+	err := controller.continueRuntimeRemovalAttempt(ctx, removal, runtimeRemoval, computerStorages)
+	if err == nil {
+		if runtimeRemoval.stallDeclaredAt != nil {
+			controller.log("agent: service %q cleanup succeeded after its declared stall", removal.jobID)
+		}
+		return nil
+	}
+	if ctx.Err() != nil {
+		return err
+	}
+	suppressed, acknowledgementErr := controller.noteRemovalFailure(ctx, l1.RemovalDirective{
+		JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: removal.kind,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
+		RootInstanceID: removal.rootInstanceID,
+	}, err)
+	if acknowledgementErr != nil {
+		return acknowledgementErr
+	}
+	if suppressed {
+		return nil
+	}
+	return err
+}
+
+func (controller *removalController) continueRuntimeRemovalAttempt(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
 	switch runtimeRemoval.phase {
 	case runtimeRemovalComplete:
 		// The post-delete receipt is already durable; continue to pin release
@@ -466,6 +486,37 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	}
 	removal.processTreeReaped = true
 	return controller.completeLocalRemoval(ctx, removal, runtimeRemoval, computerStorages)
+}
+
+const (
+	declaredRemovalRetryBase = 15 * time.Second
+	declaredRemovalRetryMax  = 3 * time.Minute
+)
+
+// declaredRemovalRetryDeferred is the durable retry gate shared by directive
+// processing and both boot-resume paths. The last attempted time and refusal
+// count live in the spool, so a restart cannot reset the cadence.
+func (controller *removalController) declaredRemovalRetryDeferred(record runtimeRemovalRecord) bool {
+	if record.stallDeclaredAt == nil || record.lastAttemptedAt == nil {
+		return false
+	}
+	var declaration l1.ServiceRemovalStallEvidence
+	if json.Unmarshal(record.stallDeclaration, &declaration) != nil {
+		return false
+	}
+	retries := record.failedAttempts - declaration.Attempts
+	delay := declaredRemovalRetryBase
+	for retry := 0; retry < retries && delay < declaredRemovalRetryMax; retry++ {
+		delay *= 2
+		if delay > declaredRemovalRetryMax {
+			delay = declaredRemovalRetryMax
+		}
+	}
+	now := controller.now
+	if now == nil {
+		now = time.Now
+	}
+	return now().UTC().Before(record.lastAttemptedAt.Add(delay))
 }
 
 func storageOnlyManifestNeedsRefresh(manifest runtimeRemovalManifest, bootSessionID string) bool {
@@ -535,16 +586,6 @@ func (controller *removalController) resume(ctx context.Context) error {
 				// Computer removal needs the authoritative generation inventory
 				// carried by the standing L1 directive. Heartbeat processing will
 				// resume it without guessing from historical attempts.
-				continue
-			}
-			if record.stallDeclaredAt != nil {
-				// The declaration already told L1 this cleanup keeps being
-				// refused, and the standing directive is what keeps retrying
-				// it. Repeating the refusal here would fail the boot sweep on
-				// every restart, and the boot sweep is what restores the image
-				// pin this removal must keep (#450).
-				controller.log("agent: runtime removal %q is declared stalled; deferring to its standing directive",
-					record.removal.jobID)
 				continue
 			}
 			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, computerStorages); err != nil {
@@ -745,9 +786,9 @@ func (controller *removalController) acknowledge(ctx context.Context, removal lo
 //
 // It reports whether this removal is already declared stalled, so the caller
 // can stop treating an expected refusal as a boot failure.
-func (controller *removalController) noteRemovalFailure(ctx context.Context, directive l1.RemovalDirective, cause error) bool {
+func (controller *removalController) noteRemovalFailure(ctx context.Context, directive l1.RemovalDirective, cause error) (bool, error) {
 	if controller.recordRemovalFailure == nil || controller.loadRuntimeRemoval == nil {
-		return false
+		return false, nil
 	}
 	removal := localRemoval{
 		jobID: directive.JobID, kind: directive.Kind, generation: directive.RemovalGeneration,
@@ -767,40 +808,54 @@ func (controller *removalController) noteRemovalFailure(ctx context.Context, dir
 		// An untyped failure is never the refusal a declaration stood for, so
 		// it stays the caller's problem however long ago the stall was
 		// declared.
-		return false
+		return false, nil
+	}
+	before, beforeFound, beforeErr := controller.loadRuntimeRemoval(ctx, removal.jobID)
+	if beforeErr != nil {
+		return false, nil
 	}
 	if err := controller.recordRemovalFailure(ctx, removal, refusalCode, refusalDetail); err != nil {
 		controller.log("agent: record removal failure for service %q: %v", directive.JobID, err)
-		return false
+		return false, nil
 	}
 	record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
 	if err != nil || !found || record.invalidReason != "" {
-		return false
+		return false, nil
 	}
 	if record.stallDeclaredAt != nil {
-		return refusalCode == declaredRefusalCode(record)
+		if beforeFound && before.stallDeclaredAt != nil && before.failedAttempts == declarationAttemptCount(before) {
+			controller.log("agent: service %q cleanup remains refused after its declared stall: %s", directive.JobID, refusalCode)
+		}
+		return refusalCode == declaredRefusalCode(record), nil
 	}
 	// A frozen declaration means a previous send may already have been
 	// committed by L1 and only its response was lost, so the retry replays it
 	// rather than weighing the bound again.
 	if len(record.stallDeclaration) == 0 && !controller.removalIsStalled(ctx, record) {
-		return false
+		return false, nil
 	}
 	if controller.ackRemovalStall == nil {
-		return false
+		return false, nil
 	}
 	if err := controller.ackRemovalStall(ctx, removal, record); err != nil {
-		controller.log("agent: declare stalled removal for service %q: %v", directive.JobID, err)
-		return false
+		return false, err
 	}
 	if controller.recordStallDeclared != nil {
 		if err := controller.recordStallDeclared(ctx, removal); err != nil {
-			controller.log("agent: record declared removal stall for service %q: %v", directive.JobID, err)
+			return false, err
 		}
 	}
 	controller.log("agent: service %q removal declared stalled after %d consecutive %q refusals; Slot released without cleanup proof",
 		directive.JobID, record.failedAttempts, record.lastRefusalCode)
-	return true
+	return true, nil
+}
+
+func declarationAttemptCount(record runtimeRemovalRecord) int {
+	var declaration l1.ServiceRemovalStallEvidence
+	if json.Unmarshal(record.stallDeclaration, &declaration) != nil {
+		return -1
+	}
+	return declaration.Attempts
 }
 
 // removalIsStalled is the agent half of the two-sided bound. L1 can see how

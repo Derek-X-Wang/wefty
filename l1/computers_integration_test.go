@@ -948,6 +948,14 @@ func assertComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 		computer.CurrentJobID, acknowledgement); err != nil || replayed.State != contract.JobRemovedVerified {
 		t.Fatalf("finalized Computer acknowledgement replay = %#v err=%v", replayed, err)
 	}
+	returningAcknowledgement := acknowledgement
+	returningAcknowledgement.BootSessionID = "returning-computer-boot"
+	returningAcknowledgement.IdempotencyKey = "returning-computer-cleaned"
+	returningAcknowledgement.CleanupFence = "returning-computer-fence"
+	if replayed, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, returningAcknowledgement); err != nil || replayed.State != contract.JobRemovedVerified {
+		t.Fatalf("returning-boot finalized Computer acknowledgement = %#v err=%v", replayed, err)
+	}
 	currentNode, err := getNode(context.Background(), h.store.db, node.NodeID)
 	if err != nil {
 		t.Fatal(err)

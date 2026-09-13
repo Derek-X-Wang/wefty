@@ -5,7 +5,6 @@ package agent
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -277,27 +276,16 @@ func TestRestartAfterADeclaredStallStillRestoresTheRetainedImagePin(t *testing.T
 	fixture := newStalledRemovalFixture(t)
 	defer fixture.close()
 	fixture.declareStall(t)
+	fixture.completeManagedRootRemoval(t)
 
-	// Boot: the record is durable, the directive still stands, and the helper
-	// still refuses. None of that may fail registration.
+	// Boot through agentSession.register: the runtime record is quarantined,
+	// managed-root resume returns its completed tombstone, and the helper still
+	// refuses. Every path must share the declared-removal deferral.
 	pins := &stallPinRuntime{pinned: map[string]struct{}{fixture.jobID: {}}}
-	session := &agentSession{
-		client: fixture.client, ociImagePins: pins, removals: fixture.controller, logf: t.Logf,
-		registration: contract.NodeRegistration{NodeID: "stall-node", BootSessionID: "stall-boot"},
-	}
-	directives, err := fixture.store.ListNodeRemovalDirectives(fixture.ctx, "fabric-agent", "stall-node", "stall-boot")
-	if err != nil {
-		t.Fatal(err)
-	}
-	bootErr := errors.Join(
-		session.resumePendingRemovals(fixture.ctx),
-		session.processRemovalDirectives(fixture.ctx, directives),
-	)
-	if bootErr != nil {
-		t.Fatalf("boot recovery failed on an expected refusal, so pin restoration is skipped: %v", bootErr)
-	}
-	if err := session.reconcileOCIImagePins(fixture.ctx); err != nil {
-		t.Fatalf("reconcile image pins: %v", err)
+	session := fixture.rebootSession(t, pins)
+	node, err := session.register(fixture.ctx)
+	if err != nil || !node.Capabilities["kind:oci"] || !session.capabilities.snapshot().Capabilities["kind:oci"] {
+		t.Fatalf("registration suppressed OCI after declared cleanup refusal: node=%+v err=%v", node, err)
 	}
 	if pins.reconciles != 1 {
 		t.Fatalf("image-pin reconciliation ran %d times, want 1", pins.reconciles)
@@ -320,22 +308,132 @@ func TestRestartAfterADeclaredStallStillRestoresTheRetainedImagePin(t *testing.T
 	// The fixture's L1 clock jumped past the stall bound, so the node must
 	// heartbeat before it can claim again; liveness is not what this asserts.
 	if _, err := fixture.client.Heartbeat(fixture.ctx, "stall-node", l1.HeartbeatRequest{
-		BootSessionID: "stall-boot", CapabilityRevision: 1, CapabilityObservedAt: time.Now(),
-		MissingCapabilities: []string{},
+		BootSessionID: session.registration.BootSessionID, CapabilityRevision: node.CapabilityRevision,
+		CapabilityObservedAt: node.CapabilityObservedAt,
+		MissingCapabilities:  []string{},
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true,
 			"runtime_handler:io.containerd.runc.v2": true},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := fixture.client.Claim(fixture.ctx, "stall-node", "stall-boot", contract.JobClassService)
+	claim, err := fixture.client.Claim(fixture.ctx, "stall-node", session.registration.BootSessionID, contract.JobClassService)
 	if err != nil || claim == nil || claim.Job.JobID != successor.JobID {
 		t.Fatalf("fresh service placement after a declared stall = %+v, %v", claim, err)
 	}
 
 	// The obligation ends only when positive cleanup does.
 	bound, err := fixture.store.ProveServiceBinding(fixture.ctx, "fabric-agent", fixture.jobID,
-		l1.ServiceBindingProofRequest{NodeID: "stall-node", BootSessionID: "stall-boot"})
+		l1.ServiceBindingProofRequest{NodeID: "stall-node", BootSessionID: session.registration.BootSessionID})
 	if err != nil || !bound {
 		t.Fatalf("binding proof before cleanup = %t, %v", bound, err)
+	}
+}
+
+func (fixture stalledRemovalFixture) completeManagedRootRemoval(t *testing.T) {
+	t.Helper()
+	record, found, err := fixture.controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID)
+	if err != nil || !found {
+		t.Fatalf("load stalled runtime record: found=%t err=%v", found, err)
+	}
+	_, cleanup, err := fixture.controller.managed.prepareAttempt(fixture.jobID, "managed-attempt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	if record.phase == runtimeRemovalPrepared {
+		if err := fixture.controller.recordRuntimeQuiesced(fixture.ctx, record.removal, workloadrunner.ReapReceipt{
+			RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			BootSessionID: fixture.controller.bootSessionID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removal := record.removal
+	removal.processTreeReaped = true
+	if err := fixture.controller.managed.remove(fixture.ctx, removal); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := fixture.controller.managed.resumeRemovals(fixture.ctx)
+	if err != nil || len(completed) != 1 {
+		t.Fatalf("completed managed-root tombstone = %+v, %v", completed, err)
+	}
+	fixture.controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error {
+		return wedgeRefusal()
+	}
+	fixture.controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, Attempts: request.Attempts}), nil
+	}
+}
+
+func (fixture stalledRemovalFixture) rebootSession(t *testing.T, pins *stallPinRuntime) *agentSession {
+	t.Helper()
+	bootSessionID := "stall-reboot"
+	managed, err := initializeManagedResource(fixture.root, "stall-node", bootSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := newRemovalController(fixture.client, fixture.controller.outbox, managed, nil,
+		"stall-node", bootSessionID, t.Logf)
+	controller.reapService = fixture.controller.reapService
+	controller.deleteRuntimeData = fixture.controller.deleteRuntimeData
+	controller.attestRuntimeRemoval = fixture.controller.attestRuntimeRemoval
+	controller.releaseImagePin = pins.ReleaseOCIImageBindingPin
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		return CapabilityProbeResult{Capabilities: map[string]bool{
+			"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+		}}, nil
+	})
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true}, probe, systemClock{}, time.Second, nil)
+	session := newAgentSession(fixture.client, contract.NodeRegistration{
+		NodeID: "stall-node", BootSessionID: bootSessionID, RootInstanceID: managed.rootInstanceID(),
+		OS: "linux", Architecture: "arm64", AgentVersion: "test",
+	}, capabilities, 15*time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), t.Logf, 1, 2)
+	session.ociBootBarrier = readyOCIBootBarrier{}
+	session.ociImagePins = pins
+	session.removals = controller
+	t.Cleanup(session.computerPolicy.Close)
+	return session
+}
+
+func TestRestartAfterFinalizedCleanupClearsSurvivingLocalRecord(t *testing.T) {
+	fixture := newStalledRemovalFixture(t)
+	defer fixture.close()
+	// Accept the directive once so its helper-owned runtime inventory is frozen.
+	_ = fixture.controller.reconcile(fixture.ctx, fixture.directive)
+	fixture.completeManagedRootRemoval(t)
+	controller := fixture.controller
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			BootSessionID: controller.bootSessionID}, nil
+	}
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, Attempts: request.Attempts}), nil
+	}
+	controller.finishRemoval = func(context.Context, localRemoval) error { return errInjectedRuntimeRemovalCrash }
+	for attempt := 0; attempt < 2; attempt++ {
+		_ = controller.reconcile(fixture.ctx, fixture.directive)
+	}
+	job, err := fixture.store.GetJob(fixture.ctx, fixture.jobID)
+	if err != nil || job.State != contract.JobRemovedVerified {
+		t.Fatalf("finalized Job = %+v, %v", job, err)
+	}
+	record, found, err := controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID)
+	if err != nil || !found || record.phase != runtimeRemovalComplete {
+		t.Fatalf("surviving local record = %+v found=%t err=%v", record, found, err)
+	}
+	pins := &stallPinRuntime{pinned: map[string]struct{}{fixture.jobID: {}}}
+	session := fixture.rebootSession(t, pins)
+	node, err := session.register(fixture.ctx)
+	if err != nil || !node.Capabilities["kind:oci"] {
+		t.Fatalf("returning registration suppressed OCI: node=%+v err=%v", node, err)
+	}
+	if _, found, err := controller.loadRuntimeRemoval(fixture.ctx, fixture.jobID); err != nil || found {
+		t.Fatalf("local record survived reboot acknowledgement: found=%t err=%v", found, err)
+	}
+	if pins.reconciles != 1 || len(pins.pinned) != 0 {
+		t.Fatalf("pin reconciliation after finalized replay = %+v", pins)
 	}
 }

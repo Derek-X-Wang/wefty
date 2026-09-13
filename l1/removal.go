@@ -459,11 +459,13 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 			return Job{}, protocolError(contract.ErrorAttemptNotOwned,
 				"authenticated node does not own this finalized Computer removal")
 		}
-		if request.RemovalGeneration != removal.generation || request.RootInstanceID != removal.rootInstanceID ||
-			!removal.acknowledgementKey.Valid || removal.acknowledgementKey.String != request.IdempotencyKey ||
-			!removal.acknowledgementHash.Valid || removal.acknowledgementHash.String != bodyHash {
+		if request.RemovalGeneration != removal.generation || request.RootInstanceID != removal.rootInstanceID {
 			return Job{}, protocolError(contract.ErrorConflict,
-				"finalized Computer removal acknowledgement does not match the accepted request")
+				"finalized Computer removal acknowledgement does not match the removal")
+		}
+		if request.CleanupQuarantine != nil || request.CleanupStall != nil || removal.acknowledgedAt == nil {
+			return Job{}, protocolError(contract.ErrorConflict,
+				"finalized Computer removal cannot accept this acknowledgement shape")
 		}
 		job, err := getJobByID(ctx, tx, jobID, now)
 		if err != nil {
@@ -1264,10 +1266,11 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 	if request.RemovalGeneration != tombstone.removalGeneration || request.RootInstanceID != tombstone.rootInstanceID {
 		return protocolError(contract.ErrorStaleFence, "finalized removal acknowledgement does not match the tombstone")
 	}
-	// A finalized removal accepts replays, never new claims, so the replay is
-	// validated by the exact shape that was accepted. Dropping the declaration
-	// and sending a bare acknowledgement is a different assertion -- that
-	// cleanup completed -- and must not inherit the declaration's acceptance.
+	// Shape remains strict after finalization. Quarantine is never replayable;
+	// a stall replays only the exact declaration. A bare positive acknowledgement
+	// may come from a later boot after L1 committed but before the agent removed
+	// its local record, so its boot-derived key and cleanup fence are not replay
+	// identity once stable node, generation, root and prior positive cleanup match.
 	if request.CleanupQuarantine != nil {
 		return protocolError(contract.ErrorConflict, "a finalized service removal cannot accept cleanup quarantine evidence")
 	}
@@ -1283,22 +1286,9 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 		}
 		return nil
 	}
-	if !tombstone.acknowledgementKey.Valid {
-		// Nothing positive was ever accepted for this removal -- it was waived,
-		// or its only acceptance was a declaration -- so a bare acknowledgement
-		// is a fresh claim against a finalized row.
+	if tombstone.cleanupAcknowledgedAt == nil {
 		return protocolError(contract.ErrorIdempotencyConflict,
 			"finalized service removal accepted no cleanup acknowledgement to replay")
-	}
-	payload, err := json.Marshal(request)
-	if err != nil {
-		return internalError(err, "encode finalized removal acknowledgement")
-	}
-	digest := sha256.Sum256(payload)
-	if tombstone.acknowledgementKey.String != request.IdempotencyKey || !tombstone.acknowledgementHash.Valid ||
-		tombstone.acknowledgementHash.String != hex.EncodeToString(digest[:]) {
-		return protocolError(contract.ErrorIdempotencyConflict,
-			"finalized removal acknowledgement replay does not match the accepted request")
 	}
 	return nil
 }

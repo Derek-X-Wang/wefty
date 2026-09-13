@@ -199,7 +199,10 @@ the elapsed time. It claims nothing about cleanup: the deletion directive
 still stands, the agent keeps retrying it, and a returning node that finally
 succeeds records the fact without ever upgrading the unverified outcome. Such
 a record reports as `oci_removal_stalled_declared` (green) because the harm
-this check names -- a pinned slot -- is gone.
+this check names -- a pinned slot -- is gone. Those retries back off durably
+from the ordinary heartbeat cadence to at most one attempt every three minutes;
+the agent logs the first repeated refusal, a refusal-code change, and eventual
+success rather than every identical retry.
 
 So a record still listed under `oci_removal_stalled` means the declaration
 itself is failing. Read the agent log for the job it names: `declare stalled

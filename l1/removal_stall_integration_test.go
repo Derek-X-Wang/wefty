@@ -602,10 +602,10 @@ func TestAProcessServiceRemovalCannotBeDeclaredStalled(t *testing.T) {
 	}
 }
 
-// TestAFinalizedStalledRemovalRefusesABareAcknowledgement closes the shape
-// bypass: dropping the declaration and sending a plain acknowledgement asserts
-// that cleanup completed, which the accepted declaration never said.
-func TestAFinalizedStalledRemovalRefusesABareAcknowledgement(t *testing.T) {
+// TestAFinalizedStalledRemovalKeepsReplayShapesSeparate permits a returning
+// boot to repeat accepted positive cleanup while keeping the frozen stall
+// declaration exact.
+func TestAFinalizedStalledRemovalKeepsReplayShapesSeparate(t *testing.T) {
 	harness := newRemovalStallHarness(t)
 	harness.advancePastStallBound(t)
 	declaration := harness.declaration("shape")
@@ -630,14 +630,14 @@ func TestAFinalizedStalledRemovalRefusesABareAcknowledgement(t *testing.T) {
 	forged := completion
 	forged.IdempotencyKey = "removal:forged"
 	forged.CleanupFence = "cleanup_forged"
-	if _, err := harness.declare(t, forged); errorCode(err) != contract.ErrorStaleFence &&
-		errorCode(err) != contract.ErrorIdempotencyConflict {
-		t.Fatalf("forged finalized acknowledgement = %v, want a typed refusal", err)
+	forged.BootSessionID = "returning-boot"
+	if _, err := harness.declare(t, forged); err != nil {
+		t.Fatalf("returning-boot positive acknowledgement = %v", err)
 	}
 	sameFence := completion
 	sameFence.IdempotencyKey = "removal:another-key"
-	if _, err := harness.declare(t, sameFence); errorCode(err) != contract.ErrorIdempotencyConflict {
-		t.Fatalf("unmatched finalized acknowledgement = %v, want idempotency_conflict", err)
+	if _, err := harness.declare(t, sameFence); err != nil {
+		t.Fatalf("new-key positive acknowledgement = %v", err)
 	}
 }
 

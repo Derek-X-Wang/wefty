@@ -104,6 +104,12 @@ retains its node-local binding image pin, which the standing directive still
 needs, until that positive cleanup releases it. The node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is
 released.
+After positive cleanup is finalized, a returning boot may replay a bare
+positive acknowledgement when the authenticated identity, node, removal
+generation, and root instance match; its boot-derived key and cleanup fence
+may differ because L1 could have committed before the prior agent cleared its
+local record. Quarantine remains a conflicting shape, and a stall declaration
+still replays only when its frozen declaration key and body hash match exactly.
 
 A service binding is also its service-slot reservation and, for `kind=oci`, a
 durable node-local image pin. A bound service holds
