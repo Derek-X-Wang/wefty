@@ -311,6 +311,14 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		"job_id": primary.JobID, "attempt_ids": attemptIDs, "payload_pids": payloadPIDs,
 	})
 
+	// Re-read health rather than trust the copy captured before the agent
+	// restart: primary's own JobLimits give its current attempt a 30s
+	// MaxRuntimeSeconds/IdleTimeoutSeconds budget (runner/process/runner.go,
+	// enforced on the real wall clock in this binary), and the OCI SIGKILL
+	// arm above spends real time on a different job without touching
+	// primary, which can outlast that budget and rotate the payload PID this
+	// captured before it ran.
+	primaryHealth = waitForHealth(t, primaryClient, "http://primary.invalid", harness.agent)
 	groupID, err := syscall.Getpgid(primaryHealth.PID)
 	if err != nil {
 		t.Fatalf("read payload process group: %v", err)
