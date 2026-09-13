@@ -791,7 +791,11 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	}
 	present, err = observeComputerFirewall(t.Context(), iptablesPath, ip6tablesPath, []computerNetworkAttachment{*attachmentA, *attachmentB})
 	if err != nil || !present {
-		for _, chain := range computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, []computerNetworkAttachment{*attachmentA, *attachmentB}) {
+		boundary, boundaryErr := observeComputerEgressBoundary()
+		if boundaryErr != nil {
+			t.Fatal(boundaryErr)
+		}
+		for _, chain := range computerCanonicalFirewallChains(iptablesPath, ip6tablesPath, []computerNetworkAttachment{*attachmentA, *attachmentB}, boundary) {
 			actual, readErr := computerFirewallChainRules(t.Context(), chain)
 			t.Logf("canonical chain %s/%s through %s actual=%q expected=%q err=%v", chain.table, chain.name, chain.executable, actual, chain.rules, readErr)
 		}
