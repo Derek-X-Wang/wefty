@@ -86,6 +86,11 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		},
 		HelperHandshakeStalledWindows: func() uint64 { return 0 },
 		HelperStartupBound:            func() ocihelper.StartupBoundObservation { return ocihelper.StartupBoundObservation{} },
+		// The production doctor is never built without a removal reader:
+		// cmd/wefty-agent wires the same reader into the doctor and the
+		// removals verb from one place. A healthy node therefore reads its
+		// removals, and an empty listing is a fact, not a missing source.
+		Removals: func(context.Context) ([]RemovalRecord, error) { return []RemovalRecord{}, nil },
 	}
 }
 
@@ -1032,5 +1037,66 @@ func TestDoctorAttemptOwnershipQuarantineNeedsAPositiveRead(t *testing.T) {
 				t.Fatalf("quarantined finding does not name the record and reason: %q", item.Detail)
 			}
 		})
+	}
+}
+
+// A removal the agent refuses holds its Computer's node service slot for as
+// long as the row exists. Before this finding that reached an operator only if
+// they thought to run the removals verb (#443).
+func TestDoctorRaisesUnreadableRemovalRecordAgainstItsJob(t *testing.T) {
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{
+			{JobID: "healthy-job", RemovalGeneration: 1, Phase: "quarantined"},
+			{JobID: "wedged-job", RemovalGeneration: 1, Phase: "quarantined",
+				InvalidReason: `runtime removal record is invalid: attempt "attempt-a" field boot_session_id does not match the no_runtime_resources receipt boot session`},
+		}, nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	index := slices.IndexFunc(report.Findings, func(item DiagnosticFinding) bool { return item.Check == "removal-records" })
+	if index < 0 {
+		t.Fatalf("doctor reported no removal finding: %+v", report.Findings)
+	}
+	item := report.Findings[index]
+	if item.Code != "oci_removal_unreadable" || item.Outcome != DiagnosticFailed {
+		t.Fatalf("unreadable removal finding = %+v", item)
+	}
+	for _, want := range []string{"wedged-job", "boot_session_id", "node service slot"} {
+		if !strings.Contains(item.Detail, want) {
+			t.Fatalf("removal finding detail %q does not name %q", item.Detail, want)
+		}
+	}
+	if strings.Contains(item.Detail, "healthy-job") {
+		t.Fatalf("removal finding named a record the agent can act on: %q", item.Detail)
+	}
+
+	config.Removals = func(context.Context) ([]RemovalRecord, error) {
+		return []RemovalRecord{{JobID: "healthy-job", RemovalGeneration: 1, Phase: "quarantined"}}, nil
+	}
+	clean := BuildDoctor(t.Context(), config)
+	if err := clean.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(clean.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "removal-records" && item.Code == "oci_removal_records_readable" && item.Outcome == DiagnosticOK
+	}) {
+		t.Fatalf("validated removals were not reported clean: %+v", clean.Findings)
+	}
+
+	// No reader is NOT-RUN, never a pass: an unvalidatable removal would be
+	// invisible rather than absent.
+	config.Removals = nil
+	blind := BuildDoctor(t.Context(), config)
+	if err := blind.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(blind.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "removal-records" && item.Code == "oci_removal_records_not_read" && item.Outcome == DiagnosticNotRun
+	}) {
+		t.Fatalf("absent removal reader was not reported NOT-RUN: %+v", blind.Findings)
 	}
 }

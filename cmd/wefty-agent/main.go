@@ -635,6 +635,29 @@ func run() error {
 		if supervisedBootBarrier != nil {
 			stopCycle = supervisedBootBarrier
 		}
+		// One reader serves both the removals verb and the doctor finding, so
+		// the operator surface and the diagnostic can never disagree about
+		// which removals the agent is carrying.
+		removalRecords := func(removalContext context.Context) ([]ocicontrol.RemovalRecord, error) {
+			views, err := nodeAgent.RuntimeRemovals(removalContext)
+			if err != nil {
+				return nil, err
+			}
+			records := make([]ocicontrol.RemovalRecord, 0, len(views))
+			for _, view := range views {
+				records = append(records, ocicontrol.RemovalRecord{
+					JobID: view.JobID, RemovalGeneration: view.RemovalGeneration,
+					CleanupFence: view.CleanupFence, RootInstanceID: view.RootInstanceID,
+					Phase: view.Phase, PreparedAt: view.PreparedAt, QuiescedAt: view.QuiescedAt,
+					AttestedAt: view.AttestedAt, CompletedAt: view.CompletedAt,
+					RuntimeQuiescence: ocicontrol.QuiescenceProjection(view.Quiescence),
+					ResourceManifests: view.ResourceManifests,
+					Attestation:       view.Attestation,
+					InvalidReason:     view.InvalidReason,
+				})
+			}
+			return records, nil
+		}
 		controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{
 			IntentPath: *ociIntentFile, Runtime: nodeAgent, Images: ociAdapter, StopCycle: stopCycle,
 			Doctor: func(doctorContext context.Context) (ocicontrol.DoctorResponse, error) {
@@ -685,27 +708,16 @@ func run() error {
 					SetupStatePath:                *ociSetupState,
 					InstalledSystemdVersion:       installedSystemdVersion,
 					InstalledHelperServiceUnit:    installedHelperServiceUnit,
+					Removals:                      removalRecords,
 				})
 				return report, report.Validate()
 			},
 			Removals: func(removalContext context.Context) (ocicontrol.RemovalsResponse, error) {
-				views, err := nodeAgent.RuntimeRemovals(removalContext)
+				records, err := removalRecords(removalContext)
 				if err != nil {
 					return ocicontrol.RemovalsResponse{}, err
 				}
-				response := ocicontrol.RemovalsResponse{Version: ocicontrol.RemovalsResponseVersion, Removals: make([]ocicontrol.RemovalRecord, 0, len(views))}
-				for _, view := range views {
-					response.Removals = append(response.Removals, ocicontrol.RemovalRecord{
-						JobID: view.JobID, RemovalGeneration: view.RemovalGeneration,
-						CleanupFence: view.CleanupFence, RootInstanceID: view.RootInstanceID,
-						Phase: view.Phase, PreparedAt: view.PreparedAt, QuiescedAt: view.QuiescedAt,
-						AttestedAt: view.AttestedAt, CompletedAt: view.CompletedAt,
-						RuntimeQuiescence: ocicontrol.QuiescenceProjection(view.Quiescence),
-						ResourceManifests: view.ResourceManifests,
-						Attestation:       view.Attestation,
-					})
-				}
-				return response, nil
+				return ocicontrol.RemovalsResponse{Version: ocicontrol.RemovalsResponseVersion, Removals: records}, nil
 			},
 			Setup: func(setupContext context.Context, request ocicontrol.SetupRequest) (ocicontrol.SetupResponse, error) {
 				response := ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceLiveSafe}

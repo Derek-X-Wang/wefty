@@ -177,6 +177,13 @@ retries or advances nothing. A removal leaves the list when L1 acknowledges its
 cleanup, so an empty list means either nothing is in flight or the removal
 already completed; check the Job in L1 to tell those apart.
 
+A record the agent cannot validate against its own frozen evidence carries
+`invalid_reason` (an `INVALID` line in the human rendering) naming the field
+that disagreed. The agent acts on no such record, so its Computer holds a node
+service slot until a human intervenes; the listing shows it rather than going
+red, and doctor raises `oci_removal_unreadable` for it so the slot does not
+stay pinned unseen.
+
 ## The helper stopped restarting (wedged startup barrier)
 
 `systemctl status dev.wefty.oci-helper.service` (Lima) or
@@ -542,3 +549,15 @@ Meaning: every durable Attempt ownership record reconciled with its own fenced a
 ## doctor-code-oci-attempt-ownership-quarantined
 
 Meaning: the boot sweep could not reconcile one or more durable Attempt ownership records -- unreadable, structurally invalid, or an authority tuple contradicting its own hashed file name -- and moved them aside instead of wedging helper startup; the helper is serving. A record whose version this build does not know is NOT here: it is left in place and reported as `unknown_version`. Evidence: read each `quarantine.json` receipt (kind, receipt ID, record name, typed reason, quarantine time) and the `record.json` beside it. First action: confirm the named Attempt is not live, then decide whether the quarantined bytes name real residue; sweep leaves those resources operator-owned. Escalation: attach the receipts and the runtime inventory; do not copy a quarantined record back into `attempt-ownership`.
+
+## doctor-code-oci-removal-records-not-read
+
+Meaning: durable runtime removals were not available to the doctor -- either no node-local removal reader was configured, or the read failed. This is NOT-RUN, not a clean result: an unvalidatable removal would be invisible here. Evidence: preserve the doctor snapshot and try `wefty --json node oci removals`. First action: confirm the agent is serving its control socket. Escalation: attach the doctor snapshot and the agent log.
+
+## doctor-code-oci-removal-records-readable
+
+Meaning: every durable runtime removal the agent is carrying validated against its own frozen evidence. Evidence: preserve the doctor snapshot. First action: none. Escalation: none.
+
+## doctor-code-oci-removal-unreadable
+
+Meaning: one or more durable removal records cannot be validated, so the agent acts on none of them and each holds its node service slot for as long as the row exists; the finding names every job ID and the field that disagreed. Evidence: read the full record with `wefty --json node oci removals` -- the frozen resource manifest, phase, quiescence receipt and `invalid_reason` are all there. First action: confirm from L1 whether the Job is still `removal_pending` and whether its node has free service slots; the record is durable, so nothing is lost by reading first. Escalation: attach the record and the agent log lines naming the removal; do not hand-edit the agent spool.

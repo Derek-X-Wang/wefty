@@ -139,6 +139,11 @@ type RemovalRecord struct {
 	RuntimeQuiescence RemovalQuiescence                         `json:"runtime_quiescence"`
 	ResourceManifests []workloadrunner.RuntimeResourceManifest  `json:"resource_manifests"`
 	Attestation       *workloadrunner.RuntimeRemovalAttestation `json:"absence_attestation,omitempty"`
+	// InvalidReason names the field that makes this durable row unusable to
+	// the agent. It is absent for every record the agent can act on, and it is
+	// why the verb answers at all for a removal that is stuck: a row the agent
+	// refuses is exactly the row the operator came here to read.
+	InvalidReason string `json:"invalid_reason,omitempty"`
 }
 
 type RemovalsResponse struct {

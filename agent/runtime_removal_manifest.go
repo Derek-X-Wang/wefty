@@ -45,10 +45,16 @@ type runtimeRemovalRecord struct {
 	receipt     workloadrunner.ReapReceipt
 	attestation workloadrunner.RuntimeRemovalAttestation
 	phase       runtimeRemovalPhase
-	preparedAt  time.Time
-	quiescedAt  *time.Time
-	attestedAt  *time.Time
-	completedAt *time.Time
+	// invalidReason is set only on the read path, and only for a durable row
+	// this agent cannot validate. Such a row is never acted on, but it is
+	// still listed: an operator whose Computer sits in removal_pending needs
+	// the broken record to be the thing they can see, not the thing that
+	// blanks the whole read verb.
+	invalidReason string
+	preparedAt    time.Time
+	quiescedAt    *time.Time
+	attestedAt    *time.Time
+	completedAt   *time.Time
 }
 
 func (spool *logSpool) storeRuntimeResourceManifest(ctx context.Context, manifest workloadrunner.RuntimeResourceManifest, createdAt time.Time) error {
@@ -311,7 +317,7 @@ func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
 }
 
 func (spool *logSpool) runtimeRemoval(ctx context.Context, jobID string) (runtimeRemovalRecord, bool, error) {
-	row := spool.db.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id,
+	row := spool.db.QueryRowContext(ctx, `SELECT job_id, removal_generation, cleanup_fence, root_instance_id,
 manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns
 FROM runtime_removal_manifests WHERE job_id=?`, jobID)
 	record, err := scanRuntimeRemoval(row)
@@ -333,24 +339,29 @@ func scanRuntimeRemoval(row rowScanner) (runtimeRemovalRecord, error) {
 	var manifestJSON, receiptJSON, attestationJSON []byte
 	var preparedNS int64
 	var quiescedNS, attestedNS, completedNS sql.NullInt64
-	if err := row.Scan(&record.removal.generation, &record.removal.cleanupFence, &record.removal.rootInstanceID,
+	// job_id is read from its own column rather than from the manifest it
+	// indexes, so a row whose stored JSON no longer parses still has the one
+	// identity an operator can act on.
+	if err := row.Scan(&record.removal.jobID, &record.removal.generation, &record.removal.cleanupFence, &record.removal.rootInstanceID,
 		&manifestJSON, &receiptJSON, &attestationJSON, &record.phase, &preparedNS, &quiescedNS, &attestedNS, &completedNS); err != nil {
 		return runtimeRemovalRecord{}, err
 	}
-	if err := json.Unmarshal(manifestJSON, &record.manifest); err != nil || !validRuntimeRemovalManifest(record.manifest) {
-		return runtimeRemovalRecord{}, errors.New("runtime removal manifest is corrupt")
-	}
-	record.removal.jobID = record.manifest.JobID
 	record.removal.kind = contract.JobKindOCI
 	record.preparedAt = time.Unix(0, preparedNS).UTC()
+	if err := json.Unmarshal(manifestJSON, &record.manifest); err != nil || !validRuntimeRemovalManifest(record.manifest) {
+		return record, errors.New("runtime removal manifest is unreadable_json")
+	}
+	if record.manifest.JobID != record.removal.jobID {
+		return record, fmt.Errorf("runtime removal manifest names job %q, not the row it is stored under", record.manifest.JobID)
+	}
 	if len(receiptJSON) != 0 {
 		if err := json.Unmarshal(receiptJSON, &record.receipt); err != nil {
-			return runtimeRemovalRecord{}, errors.New("runtime quiescence receipt is corrupt")
+			return record, errors.New("runtime quiescence receipt is unreadable_json")
 		}
 	}
 	if len(attestationJSON) != 0 {
 		if err := json.Unmarshal(attestationJSON, &record.attestation); err != nil {
-			return runtimeRemovalRecord{}, errors.New("runtime absence attestation is corrupt")
+			return record, errors.New("runtime absence attestation is unreadable_json")
 		}
 	}
 	if quiescedNS.Valid {
@@ -365,8 +376,8 @@ func scanRuntimeRemoval(row rowScanner) (runtimeRemovalRecord, error) {
 		value := time.Unix(0, completedNS.Int64).UTC()
 		record.completedAt = &value
 	}
-	if !validRuntimeRemovalRecord(record) {
-		return runtimeRemovalRecord{}, errors.New("runtime removal record is invalid")
+	if err := validateRuntimeRemovalRecord(record); err != nil {
+		return record, fmt.Errorf("runtime removal record is invalid: %w", err)
 	}
 	return record, nil
 }
@@ -386,46 +397,97 @@ func validRuntimeRemovalManifest(manifest runtimeRemovalManifest) bool {
 	return true
 }
 
-func validRuntimeRemovalRecord(record runtimeRemovalRecord) bool {
+// validateRuntimeRemovalRecord names the exact field that makes a durable
+// removal record unusable. It returns an error rather than a bool because a
+// record that fails here stops a Computer removal for as long as the row
+// exists: the operator reading `node oci removals`, and the agent log line that
+// repeats every heartbeat, both need to say which field disagreed rather than
+// only that something did.
+func validateRuntimeRemovalRecord(record runtimeRemovalRecord) error {
 	if record.removal.jobID == "" || record.removal.generation == 0 || record.removal.cleanupFence == "" || record.removal.rootInstanceID == "" ||
 		record.manifest.JobID != record.removal.jobID || record.manifest.RemovalGeneration != record.removal.generation {
-		return false
+		return errors.New("removal identity (job_id/removal_generation/cleanup_fence/root_instance_id) does not match the frozen manifest")
 	}
 	for _, attempt := range record.manifest.Attempts {
-		if attempt.StorageOnly {
-			if attempt.FencingToken != record.removal.cleanupFence {
-				return false
+		if !attempt.StorageOnly {
+			continue
+		}
+		if attempt.FencingToken != record.removal.cleanupFence {
+			return fmt.Errorf("Storage-only attempt %q field fencing_token does not carry the removal cleanup fence", attempt.AttemptID)
+		}
+		if attempt.StorageAbsent {
+			if attempt.StoragePreparation != nil {
+				return fmt.Errorf("already-absent Storage attempt %q field storage_preparation must be empty", attempt.AttemptID)
 			}
-			if attempt.StorageAbsent {
-				if attempt.StoragePreparation != nil {
-					return false
-				}
-			} else if attempt.StoragePreparation == nil || attempt.StoragePreparation.RootInstanceID != record.removal.rootInstanceID {
-				return false
-			}
+		} else if attempt.StoragePreparation == nil || attempt.StoragePreparation.RootInstanceID != record.removal.rootInstanceID {
+			return fmt.Errorf("Storage-only attempt %q field storage_preparation.root_instance_id does not match the removal root instance", attempt.AttemptID)
 		}
 	}
+	// `no_runtime_resources` has two contract-legal producers, and the record
+	// must accept both. The session records it for a complete Storage-only
+	// generation inventory that proves no guardian exists; the OCI adapter
+	// records it when image delivery failed before the helper `Run` RPC was
+	// entered, and that manifest is an ordinary attempt manifest with runtime
+	// identifiers that were reserved but never created. What binds either shape
+	// is the boot session: a no-runtime receipt can only speak for attempts
+	// frozen under the same boot.
 	if record.receipt.Evidence == workloadrunner.ReapEvidenceNoRuntime {
 		for _, attempt := range record.manifest.Attempts {
-			if !attempt.StorageOnly || attempt.BootSessionID != record.receipt.BootSessionID {
-				return false
+			if attempt.BootSessionID != record.receipt.BootSessionID {
+				return fmt.Errorf("attempt %q field boot_session_id does not match the no_runtime_resources receipt boot session", attempt.AttemptID)
 			}
 		}
 	}
 	switch record.phase {
 	case runtimeRemovalPrepared:
-		return !record.receipt.RuntimeQuiesced && record.receipt.Evidence == "" && record.attestation.Version == 0 && record.quiescedAt == nil && record.attestedAt == nil && record.completedAt == nil
+		if record.receipt.RuntimeQuiesced || record.receipt.Evidence != "" || record.attestation.Version != 0 ||
+			record.quiescedAt != nil || record.attestedAt != nil || record.completedAt != nil {
+			return errors.New("phase \"prepared\" carries quiescence, attestation or completion evidence")
+		}
+		return nil
 	case runtimeRemovalQuarantined:
-		return validateRuntimeReapReceipt(record.receipt) == nil && record.attestation.Version == 0 && record.quiescedAt != nil && record.attestedAt == nil && record.completedAt == nil
+		if err := validateRuntimeReapReceipt(record.receipt); err != nil {
+			return fmt.Errorf("phase \"quarantined\" field runtime_quiescence: %w", err)
+		}
+		if record.attestation.Version != 0 || record.quiescedAt == nil || record.attestedAt != nil || record.completedAt != nil {
+			return errors.New("phase \"quarantined\" requires quiesced_ns alone, without attestation or completion")
+		}
+		return nil
 	case runtimeRemovalComplete:
-		return validateRuntimeReapReceipt(record.receipt) == nil && validateRuntimeRemovalAttestation(record.manifest, record.attestation) == nil && record.quiescedAt != nil && record.attestedAt != nil && record.completedAt != nil
+		if err := validateRuntimeReapReceipt(record.receipt); err != nil {
+			return fmt.Errorf("phase \"complete\" field runtime_quiescence: %w", err)
+		}
+		if err := validateRuntimeRemovalAttestation(record.manifest, record.attestation); err != nil {
+			return fmt.Errorf("phase \"complete\" field absence_attestation: %w", err)
+		}
+		if record.quiescedAt == nil || record.attestedAt == nil || record.completedAt == nil {
+			return errors.New("phase \"complete\" requires quiesced_ns, attested_ns and completed_ns")
+		}
+		return nil
 	default:
-		return false
+		return fmt.Errorf("field phase %q is unsupported", record.phase)
 	}
 }
 
+// storageOnlyNoRuntimeReceipt reports whether a positive quiescence receipt is
+// the Storage-only no-runtime proof -- the only one the contract lets skip the
+// local managed service-resource deletion step. The adapter's never-entered-Run
+// receipt carries the same evidence kind but leaves a prepared managed service
+// directory behind, so it takes the ordinary deletion path.
+func storageOnlyNoRuntimeReceipt(receipt workloadrunner.ReapReceipt, attempts []workloadrunner.RuntimeResourceManifest) bool {
+	if receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime || len(attempts) == 0 {
+		return false
+	}
+	for _, attempt := range attempts {
+		if !attempt.StorageOnly {
+			return false
+		}
+	}
+	return true
+}
+
 func (spool *logSpool) pendingRuntimeRemovals(ctx context.Context) ([]runtimeRemovalRecord, error) {
-	rows, err := spool.db.QueryContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id,
+	rows, err := spool.db.QueryContext(ctx, `SELECT job_id, removal_generation, cleanup_fence, root_instance_id,
 manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns
 FROM runtime_removal_manifests WHERE phase IN (?, ?, ?) ORDER BY prepared_ns, job_id`,
 		runtimeRemovalPrepared, runtimeRemovalQuarantined, runtimeRemovalComplete)
@@ -437,7 +499,13 @@ FROM runtime_removal_manifests WHERE phase IN (?, ?, ?) ORDER BY prepared_ns, jo
 	for rows.Next() {
 		record, err := scanRuntimeRemoval(rows)
 		if err != nil {
-			return nil, fmt.Errorf("agent: scan pending runtime removal: %w", err)
+			// One unreadable row used to fail the whole listing, so the single
+			// read verb that explains a stuck removal went red exactly when a
+			// removal was stuck. Carry the reason on the row instead.
+			if record.removal.jobID == "" {
+				return nil, fmt.Errorf("agent: scan pending runtime removal: %w", err)
+			}
+			record.invalidReason = err.Error()
 		}
 		records = append(records, record)
 	}
@@ -651,6 +719,9 @@ type RuntimeRemovalView struct {
 	Quiescence        workloadrunner.ReapReceipt
 	ResourceManifests []workloadrunner.RuntimeResourceManifest
 	Attestation       *workloadrunner.RuntimeRemovalAttestation
+	// InvalidReason names the field that makes this durable row unusable. It
+	// is empty for every record the agent can act on.
+	InvalidReason string
 }
 
 // RuntimeRemovals lists every runtime removal this agent still carries, oldest
@@ -678,6 +749,7 @@ func (a *Agent) RuntimeRemovals(ctx context.Context) ([]RuntimeRemovalView, erro
 			CompletedAt:       record.completedAt,
 			Quiescence:        record.receipt,
 			ResourceManifests: slices.Clone(record.manifest.Attempts),
+			InvalidReason:     record.invalidReason,
 		}
 		if record.attestation.Version != 0 {
 			attestation := record.attestation

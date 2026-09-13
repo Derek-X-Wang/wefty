@@ -241,6 +241,12 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 					Version: 1, RuntimeKind: contract.JobKindOCI, JobID: "job-removal", AttemptID: "attempt-1",
 					ServiceDataVolume: "wefty-service-volume-abc", ServiceDataOwnerRecord: "wefty-service-volume-abc.owner",
 				}},
+			}, {
+				// A row the agent refuses reaches this listing looking like
+				// any other quarantined removal (#443).
+				JobID: "job-wedged", RemovalGeneration: 1, CleanupFence: "fence-1", RootInstanceID: "root-1",
+				Phase: "quarantined", PreparedAt: quiescedAt,
+				InvalidReason: "runtime removal record is invalid: attempt \"attempt-a\" field boot_session_id does not match the no_runtime_resources receipt boot session",
 			}}}, nil
 		},
 	}
@@ -370,12 +376,13 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	}
 	var removals ocicontrol.RemovalsResponse
 	if err := json.Unmarshal(stdout.Bytes(), &removals); err != nil || removals.Version != ocicontrol.RemovalsResponseVersion ||
-		len(removals.Removals) != 1 || removals.Removals[0].Phase != "quarantined" ||
+		len(removals.Removals) != 2 || removals.Removals[0].Phase != "quarantined" ||
 		!removals.Removals[0].RuntimeQuiescence.RuntimeQuiesced ||
 		removals.Removals[0].RuntimeQuiescence.Evidence != string(workloadrunner.ReapEvidencePriorBootOCISweep) ||
 		removals.Removals[0].RuntimeQuiescence.HelperGeneration != 9 || removals.Removals[0].QuiescedAt == nil ||
 		len(removals.Removals[0].ResourceManifests) != 1 ||
-		removals.Removals[0].ResourceManifests[0].ServiceDataOwnerRecord != "wefty-service-volume-abc.owner" {
+		removals.Removals[0].ResourceManifests[0].ServiceDataOwnerRecord != "wefty-service-volume-abc.owner" ||
+		removals.Removals[0].InvalidReason != "" || removals.Removals[1].InvalidReason == "" {
 		t.Fatalf("removals output=%q decoded=%+v err=%v", stdout.String(), removals, err)
 	}
 	stdout.Reset()
@@ -388,6 +395,11 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "job-removal") || !strings.Contains(stdout.String(), "PHASE\tquarantined") {
 		t.Fatalf("removals human output=%q", stdout.String())
+	}
+	// Without its own line the refused row is indistinguishable from the
+	// healthy quarantined one above it.
+	if !strings.Contains(stdout.String(), "\tINVALID\truntime removal record is invalid: attempt \"attempt-a\" field boot_session_id") {
+		t.Fatalf("removals human output hid the unvalidatable record: %q", stdout.String())
 	}
 
 	cancel()

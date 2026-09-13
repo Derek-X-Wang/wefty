@@ -208,6 +208,11 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 	if runtimeRemoval != nil {
 		attempts = runtimeRemoval.manifest.Attempts
 	}
+	// Only the Storage-only no-runtime proof may skip deleting the local
+	// managed service resource. The adapter returns the same evidence kind
+	// when image delivery failed before the helper `Run` RPC was entered, and
+	// that attempt still prepared a managed service directory on this node.
+	skipManagedResource := noRuntime && storageOnlyNoRuntimeReceipt(runtimeRemoval.receipt, attempts)
 	// A no-runtime receipt skips guardian reaping, so it is authoritative
 	// only for the exact Storage generations in the frozen helper inventory.
 	// Refuse incomplete coverage before any durable cleanup begins. A real
@@ -241,7 +246,7 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
-	if !noRuntime {
+	if !skipManagedResource {
 		if err := controller.removeResource(ctx, removal); err != nil {
 			return fmt.Errorf("delete managed service resource: %w", err)
 		}
@@ -456,6 +461,12 @@ func (controller *removalController) resume(ctx context.Context) error {
 			return fmt.Errorf("resume runtime service removals: %w", err)
 		}
 		for _, record := range removals {
+			if record.invalidReason != "" {
+				// The listing carries rows this agent cannot validate so the
+				// operator can read them. Resume acts on none of them.
+				controller.log("agent: runtime removal %q is not resumable: %s", record.removal.jobID, record.invalidReason)
+				continue
+			}
 			computerStorages, err := removalComputerStorages(record.manifest, nil)
 			if err != nil {
 				return err
