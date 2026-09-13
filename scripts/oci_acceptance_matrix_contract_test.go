@@ -415,6 +415,8 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"removal_prior_boot_oci_sweep=true")
 	write("helper-restart-timeline.txt", "socket_and_service_active_after_recovery=true")
 	write("oci-service-agent-sigkill-linux.txt", "service_oci_payload_sigkill_survived=true")
+	write("oci-service-removal-stopped-linux.txt", "service_removal_from_stopped_kind_oci=true")
+	write("oci-service-removal-offline-linux.txt", "service_removal_from_offline_kind_oci=true")
 	if err := os.WriteFile(filepath.Join(directory, "provenance-receipt.json"), []byte(
 		`{"version":1,"commit":"`+ociMatrixCandidate+`","source":"published-artifact","artifact_run_id":"4242"}`), 0o600); err != nil {
 		t.Fatal(err)

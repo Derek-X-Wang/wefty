@@ -389,6 +389,59 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	evidence.write("create-stopped-removal-replay.json", replayBody)
 	assertNoServiceResidue(t, harness, primary.JobID)
 
+	// Mirrors the process-kind stopped-removal arm above onto a real kind=oci
+	// service: stop, remove --wait, removed_verified, residue check. Proves
+	// linux.service.removal's removal_from_stopped_kind_oci gap (#458).
+	var ociStopped l1.Job
+	var ociStoppedRemoved bool
+	if runtime.GOOS == "linux" {
+		ociStopped = harness.submitPersistentOCIService(t)
+		t.Cleanup(func() {
+			// Best-effort: an early t.Fatal below must not leave this
+			// container running past the test, the same bounded cleanup
+			// already registered for the agent-SIGKILL arm's OCI job.
+			if ociStoppedRemoved || ociStopped.JobID == "" {
+				return
+			}
+			if harness.agent.exited() {
+				t.Logf("skipping bounded cleanup remove for %s: agent already exited, lane residue sweep is the only remaining backstop", ociStopped.JobID)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = exec.CommandContext(ctx, weftyBinaryPath,
+				"--fabric=plain", "--l1="+harness.controlPlaneAddress, "--plain-identity=realtiming-cli", "--json",
+				"services", "remove", ociStopped.JobID, "--wait=15s").Run()
+		})
+		ociStoppedRunning := harness.waitForJobState(t, ociStopped.JobID, contract.JobClassService, contract.JobRunning, 45*time.Second)
+		evidence.recordJob(t, harness, "status-oci-stopped-before-stop.json", ociStopped.JobID)
+		// Captured while the attempt is known live, so the absence checks
+		// below prove this specific container is gone, not merely that some
+		// container matching the job id can't currently be found.
+		ociStoppedContainerID := liveOCIAttemptContainerID(t, ociStopped.JobID, ociStoppedRunning.CurrentAttemptID)
+		ociStopResponse := runServiceCLI(t, harness, "services", "stop", ociStopped.JobID, "--wait=45s")
+		evidence.write("cli-stop-oci.json", ociStopResponse)
+		harness.waitForJobState(t, ociStopped.JobID, contract.JobClassService, contract.JobStopped, 10*time.Second)
+		// JobStopped alone does not prove the container actually quiesced: a
+		// stop that wrongly reported quiescence while the container stayed
+		// live would let the remove below merely kill a running container,
+		// and the fact written after it would read "removed from stopped"
+		// for what was operationally a removal from running. Require
+		// containerd to already refuse the pre-stop container id here,
+		// before removal runs at all.
+		assertOCIContainerAbsent(t, ociStoppedContainerID)
+		ociStoppedRemoval := runServiceCLI(t, harness, "services", "remove", ociStopped.JobID, "--wait=90s")
+		evidence.write("remove-stopped-oci.json", ociStoppedRemoval)
+		harness.waitForJobState(t, ociStopped.JobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
+		assertNoServiceResidue(t, harness, ociStopped.JobID)
+		// assertNoServiceResidue only walks wefty-managed filesystem roots;
+		// the container is helper-owned and independently named, so
+		// re-assert its absence directly before crediting the fact.
+		assertOCIContainerAbsent(t, ociStoppedContainerID)
+		ociStoppedRemoved = true
+		evidence.write("oci-service-removal-stopped-linux.txt", []byte("service_removal_from_stopped_kind_oci=true\n"))
+	}
+
 	var failed l1.Job
 	if runtime.GOOS == "linux" {
 		failed = harness.submitFailedOCIService(t)
@@ -423,6 +476,47 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	offlineHealth := waitForHealth(t, offlineClient, "http://offline.invalid", harness.agent)
 	harness.waitForJobState(t, offline.JobID, contract.JobClassService, contract.JobRunning, 45*time.Second)
 	offlineRoot := managedServiceRoot(harness, offline.JobID)
+
+	// A real kind=oci service takes the same node-loss/force-forget path
+	// alongside the process-kind offline job above, sharing its single
+	// agent-kill/restart cycle. Proves linux.service.removal's
+	// removal_from_offline_kind_oci gap (#458).
+	var ociOffline l1.Job
+	var ociOfflineRemoved bool
+	var ociOfflineRoot string
+	var ociOfflineContainerID string
+	if runtime.GOOS == "linux" {
+		ociOffline = harness.submitPersistentOCIService(t)
+		t.Cleanup(func() {
+			if ociOfflineRemoved || ociOffline.JobID == "" {
+				return
+			}
+			if harness.agent.exited() {
+				t.Logf("skipping bounded cleanup remove for %s: agent already exited, lane residue sweep is the only remaining backstop", ociOffline.JobID)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = exec.CommandContext(ctx, weftyBinaryPath,
+				"--fabric=plain", "--l1="+harness.controlPlaneAddress, "--plain-identity=realtiming-cli", "--json",
+				"services", "remove", ociOffline.JobID, "--wait=15s").Run()
+		})
+		ociOfflineRunning := harness.waitForJobState(t, ociOffline.JobID, contract.JobClassService, contract.JobRunning, 45*time.Second)
+		evidence.recordJob(t, harness, "status-oci-offline-ready.json", ociOffline.JobID)
+		ociOfflineRoot = managedServiceRoot(harness, ociOffline.JobID)
+		// Captured while the attempt is known live, so the terminal-state
+		// absence check below (after force-forget and the returning agent's
+		// cleanup) proves this specific container is gone.
+		ociOfflineContainerID = liveOCIAttemptContainerID(t, ociOffline.JobID, ociOfflineRunning.CurrentAttemptID)
+	}
+
+	// Re-read health immediately before the kill rather than trust the copy
+	// captured above: the offline job carries the same 30s
+	// MaxRuntimeSeconds/IdleTimeoutSeconds budget as primary and sibling
+	// (submitEchoServiceWithDispatchKey), and the OCI job's own readiness
+	// wait just above can spend up to 45s of real time before reaching here
+	// -- the same "refresh right before use" pattern as 03321dd.
+	offlineHealth = waitForHealth(t, offlineClient, "http://offline.invalid", harness.agent)
 	offlineKillStarted := time.Now()
 	harness.agent.kill(t)
 	waitForProcessAbsent(t, offlineHealth.PID, 10*time.Second)
@@ -435,6 +529,10 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	})
 	pendingRemoval := runServiceCLI(t, harness, "services", "remove", offline.JobID)
 	evidence.write("remove-offline-pending.json", pendingRemoval)
+	if runtime.GOOS == "linux" {
+		ociPendingRemoval := runServiceCLI(t, harness, "services", "remove", ociOffline.JobID)
+		evidence.write("remove-oci-offline-pending.json", ociPendingRemoval)
+	}
 	time.Sleep(l1.DefaultLeaseDuration + time.Second)
 	pending := evidence.recordJob(t, harness, "status-offline-still-pending.json", offline.JobID)
 	if pending.State != contract.JobRemovalPending || strings.Contains(pending.Status, "clean") {
@@ -443,8 +541,21 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	if _, err := os.Stat(offlineRoot); err != nil {
 		t.Fatalf("offline removal deleted managed root before node returned: %v", err)
 	}
+	if runtime.GOOS == "linux" {
+		ociPending := evidence.recordJob(t, harness, "status-oci-offline-still-pending.json", ociOffline.JobID)
+		if ociPending.State != contract.JobRemovalPending || strings.Contains(ociPending.Status, "clean") {
+			t.Fatalf("oci offline removal projection is not truthfully pending: %#v", ociPending)
+		}
+		if _, err := os.Stat(ociOfflineRoot); err != nil {
+			t.Fatalf("oci offline removal deleted managed root before node returned: %v", err)
+		}
+	}
 	forgottenResponse := runServiceCLI(t, harness, "services", "forget", offline.JobID, "--force")
 	evidence.write("force-forget-offline.json", forgottenResponse)
+	if runtime.GOOS == "linux" {
+		ociForgottenResponse := runServiceCLI(t, harness, "services", "forget", ociOffline.JobID, "--force")
+		evidence.write("force-forget-oci-offline.json", ociForgottenResponse)
+	}
 	harness.restartAgent(t)
 	forgotten, tombstoneBefore := waitForForgottenCleanup(t, harness, offline.JobID, offlineRoot, 45*time.Second)
 	evidence.recordJSON("force-forgotten-after-return.json", forgotten)
@@ -459,12 +570,41 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	}
 	assertNoServiceResidue(t, harness, offline.JobID)
 
+	if runtime.GOOS == "linux" {
+		ociForgotten, ociTombstoneBefore := waitForForgottenCleanup(t, harness, ociOffline.JobID, ociOfflineRoot, 45*time.Second)
+		evidence.recordJSON("oci-force-forgotten-after-return.json", ociForgotten)
+		evidence.recordJSON("oci-removal-tombstone-before-ack-replay.json", ociTombstoneBefore)
+		ociReplayed := replayFinalizedAcknowledgement(t, harness, ociOffline.JobID, ociTombstoneBefore)
+		evidence.recordJSON("oci-removal-ack-replay-response.json", ociReplayed)
+		ociTombstoneAfter := readRemovalTombstone(t, harness.l1Database, ociOffline.JobID)
+		evidence.recordJSON("oci-removal-tombstone-after-ack-replay.json", ociTombstoneAfter)
+		if ociTombstoneAfter != ociTombstoneBefore {
+			t.Fatalf("oci offline finalized acknowledgement replay changed tombstone: before %#v after %#v",
+				ociTombstoneBefore, ociTombstoneAfter)
+		}
+		assertNoServiceResidue(t, harness, ociOffline.JobID)
+		// assertNoServiceResidue only walks wefty-managed filesystem roots;
+		// the container is helper-owned and independently named, so a
+		// regression that acknowledged removal while leaving it running
+		// would still pass that check. Require containerd to positively
+		// refuse the pre-kill container id too before crediting the fact.
+		assertOCIContainerAbsent(t, ociOfflineContainerID)
+		ociOfflineRemoved = true
+		evidence.write("oci-service-removal-offline-linux.txt", []byte("service_removal_from_offline_kind_oci=true\n"))
+	}
+
 	allJobIDs := []string{primary.JobID, sibling.JobID, failed.JobID, offline.JobID}
 	if backoff.JobID != "" {
 		allJobIDs = append(allJobIDs, backoff.JobID)
 	}
 	if ociSigkillJob.JobID != "" {
 		allJobIDs = append(allJobIDs, ociSigkillJob.JobID)
+	}
+	if ociStopped.JobID != "" {
+		allJobIDs = append(allJobIDs, ociStopped.JobID)
+	}
+	if ociOffline.JobID != "" {
+		allJobIDs = append(allJobIDs, ociOffline.JobID)
 	}
 	for _, jobID := range allJobIDs {
 		assertWorkingDirectoryUntouched(t, harness.workingDirectories[jobID])
