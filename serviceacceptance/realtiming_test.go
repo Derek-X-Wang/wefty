@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -487,7 +488,14 @@ func liveOCIAttemptContainerID(t *testing.T, jobID, attemptID string) string {
 	for _, candidate := range strings.Fields(string(list)) {
 		info, infoErr := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
 			"containers", "info", candidate).CombinedOutput()
-		if infoErr == nil && strings.Contains(string(info), jobID) && strings.Contains(string(info), attemptID) {
+		if infoErr != nil {
+			continue
+		}
+		var container struct {
+			Labels map[string]string
+		}
+		if json.Unmarshal(info, &container) == nil &&
+			container.Labels["io.wefty/job_id"] == jobID && container.Labels["io.wefty/attempt_id"] == attemptID {
 			return candidate
 		}
 	}
@@ -495,16 +503,21 @@ func liveOCIAttemptContainerID(t *testing.T, jobID, attemptID string) string {
 	return ""
 }
 
-// assertOCIContainerAbsent requires containerd to positively refuse the given
-// container id, proving the crash-recovery reap deleted the runtime resource
-// rather than merely admitting a fresh attempt over a still-running orphan.
+// assertOCIContainerAbsent requires a successful containerd namespace list
+// (proving connectivity, so a transport failure cannot masquerade as
+// absence) that positively excludes the given container id, proving the
+// crash-recovery reap deleted the runtime resource rather than merely
+// admitting a fresh attempt over a still-running orphan.
 func assertOCIContainerAbsent(t *testing.T, containerID string) {
 	t.Helper()
 	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
-	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
-		"containers", "info", containerID).CombinedOutput()
-	if err == nil {
-		t.Fatalf("pre-kill kind=oci attempt container %s is still present after agent SIGKILL recovery:\n%s", containerID, output)
+	list, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"containers", "list", "--quiet").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list live OCI containers to prove absence: %v\n%s", err, list)
+	}
+	if slices.Contains(strings.Fields(string(list)), containerID) {
+		t.Fatalf("pre-kill kind=oci attempt container %s is still present after agent SIGKILL recovery:\n%s", containerID, list)
 	}
 }
 
