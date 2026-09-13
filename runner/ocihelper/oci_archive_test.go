@@ -606,3 +606,121 @@ func descriptor(mediaType string, payload []byte) ocispec.Descriptor {
 func removeTestArchive(path string) error {
 	return os.Remove(path)
 }
+
+// testUnannotatedSingleManifestOCIArchive builds the archive shape a plain
+// `docker buildx --output type=oci` platform export produces: index.json's
+// single child is the image manifest itself and carries no reference
+// annotation at all (#444).
+func testUnannotatedSingleManifestOCIArchive(t *testing.T) ([]byte, digest.Digest) {
+	t.Helper()
+	configBytes, err := json.Marshal(ocispec.Image{Platform: ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := descriptor(ocispec.MediaTypeImageConfig, configBytes)
+	manifestBytes, err := json.Marshal(ocispec.Manifest{
+		Versioned: ocispec.Manifest{}.Versioned,
+		Config:    config,
+		Layers:    []ocispec.Descriptor{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifestDocument map[string]any
+	if err := json.Unmarshal(manifestBytes, &manifestDocument); err != nil {
+		t.Fatal(err)
+	}
+	manifestDocument["schemaVersion"] = float64(2)
+	manifestBytes, err = json.Marshal(manifestDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := descriptor(ocispec.MediaTypeImageManifest, manifestBytes)
+	manifest.Platform = &ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	rootIndex, err := json.Marshal(map[string]any{"schemaVersion": float64(2), "manifests": []ocispec.Descriptor{manifest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := map[string][]byte{
+		"oci-layout": []byte(`{"imageLayoutVersion":"1.0.0"}`),
+		"index.json": rootIndex,
+		"blobs/sha256/" + manifest.Digest.Encoded(): manifestBytes,
+		"blobs/sha256/" + config.Digest.Encoded():   configBytes,
+	}
+	var output bytes.Buffer
+	writer := tar.NewWriter(&output)
+	for name, payload := range entries {
+		if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(payload)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes(), manifest.Digest
+}
+
+func TestInspectOCIArchiveAnnotatesAnUnannotatedExportForItsOfflineImport(t *testing.T) {
+	archive, manifestDigest := testUnannotatedSingleManifestOCIArchive(t)
+	for _, scenario := range []struct {
+		name       string
+		request    string
+		importName string
+	}{
+		{name: "tagged request", request: "example.invalid/wefty-computer-reference:test", importName: "example.invalid/wefty-computer-reference:test"},
+		{name: "bare repository request", request: "example.invalid/wefty-computer-reference", importName: "example.invalid/wefty-computer-reference:latest"},
+	} {
+		inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), scenario.request, "")
+		if err != nil {
+			t.Fatalf("%s: %v", scenario.name, err)
+		}
+		t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+		if inspection.Reference != scenario.importName || inspection.PlatformDigest != manifestDigest {
+			t.Fatalf("%s: archive inspection = %+v, want reference %s", scenario.name, inspection, scenario.importName)
+		}
+		file, err := os.Open(inspection.Path)
+		if err != nil {
+			t.Fatalf("%s: %v", scenario.name, err)
+		}
+		reader := tar.NewReader(file)
+		var annotated map[string]any
+		for {
+			header, err := reader.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("%s: %v", scenario.name, err)
+			}
+			if header.Name != "index.json" {
+				continue
+			}
+			payload, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatalf("%s: %v", scenario.name, err)
+			}
+			if err := json.Unmarshal(payload, &annotated); err != nil {
+				t.Fatalf("%s: filtered index.json is invalid: %v", scenario.name, err)
+			}
+		}
+		_ = file.Close()
+		if annotated == nil {
+			t.Fatalf("%s: filtered import archive is missing index.json", scenario.name)
+		}
+		children, ok := annotated["manifests"].([]any)
+		if !ok || len(children) != 1 {
+			t.Fatalf("%s: filtered index.json declares %d images", scenario.name, len(children))
+		}
+		child, ok := children[0].(map[string]any)
+		if !ok || child["digest"] != manifestDigest.String() {
+			t.Fatalf("%s: filtered index.json child = %v", scenario.name, child)
+		}
+		annotations, ok := child["annotations"].(map[string]any)
+		if !ok || annotations["org.opencontainers.image.ref.name"] != scenario.importName {
+			t.Fatalf("%s: containerd would import no image record: filtered index.json child annotations = %v", scenario.name, child["annotations"])
+		}
+	}
+}
