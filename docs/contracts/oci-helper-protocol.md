@@ -268,13 +268,14 @@ failed quiescence proof and does not authorize a namespace sweep.
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
 `permission_denied`, `retention_bound_exceeded`, `egress_dns_unavailable`,
-`loop_discard_not_disabled`, or `operation_failed`). `loop_discard_not_disabled`
-is the attach refusal for a Computer disk whose loop device the helper could
-not prove will refuse discard: the image is fully allocated because its bytes
-are charged, and a loop that honours discard lets the guest filesystem give
-them back. A short allocation is not a refusal — attach and boot sweep
-re-assert the charged budget and record it — so only a host that cannot honour
-the budget refuses. A failed `Run` additionally carries `attempt_scoped` when
+`egress_boundary_unproven`, `loop_discard_not_disabled`, or
+`operation_failed`). `loop_discard_not_disabled` is the attach refusal for a
+Computer disk whose loop device the helper could not prove will refuse
+discard: the image is fully allocated because its bytes are charged, and a
+loop that honours discard lets the guest filesystem give them back. A short
+allocation is not a refusal — attach and boot sweep re-assert the charged
+budget and record it — so only a host that cannot honour the budget refuses.
+A failed `Run` additionally carries `attempt_scoped` when
 the helper positively reaped that attempt while its session stayed live; the
 same positive-reap doctrine that makes `computer_storage_busy` definitive is
 what bounds the refusal to the attempt, so a table of negative `Run` probes on
@@ -284,6 +285,10 @@ writes that refusal to the wire before it invalidates its own session, so the
 agent always reads the typed refusal and then marks loss rather than a bare
 transport EOF. The DNS reason means neither the advertised non-loopback
 resolver nor the Node-loopback stub answered the helper's bounded preflight.
+The egress-boundary reason means the helper could not enumerate the Node's own
+addresses and route next hops, so it could not prove which destinations lie on
+the owner's side of the Computer boundary; forwarding is left off and the
+Computer does not start rather than run behind an unproven boundary.
 Raw privileged error text,
 containerd types, and host paths remain local. The Computer reimage preflight
 may additionally report the fixed positive-detachment refusal so native

@@ -146,13 +146,14 @@ const (
 	EngineFailurePermissionDenied EngineFailureReason = "permission_denied"
 	EngineFailureRetentionBound   EngineFailureReason = "retention_bound_exceeded"
 	EngineFailureEgressDNS        EngineFailureReason = "egress_dns_unavailable"
+	EngineFailureEgressBoundary   EngineFailureReason = "egress_boundary_unproven"
 	EngineFailureLoopDiscard      EngineFailureReason = "loop_discard_not_disabled"
 	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
 )
 
 func (reason EngineFailureReason) valid() bool {
 	switch reason {
-	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureEgressDNS, EngineFailureOperationFailed:
+	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureEgressDNS, EngineFailureEgressBoundary, EngineFailureLoopDiscard, EngineFailureOperationFailed:
 		return true
 	default:
 		return false
