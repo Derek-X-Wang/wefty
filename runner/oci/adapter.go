@@ -1761,7 +1761,26 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 		// positive. Prove absence the non-attempt-scoped way instead of
 		// retrying forever against a pinned slot (#450).
 		if tracked && errors.As(err, &rpcErr) && rpcErr.Code == ocihelper.CodeUnauthorizedAttempt {
-			if absenceErr := adapter.verifyNonLiveAttemptAbsent(ctx, session, request.Authority, entry.volumes); absenceErr != nil {
+			verification, verifyErr := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespaceReadOnly})
+			if verifyErr != nil {
+				// A Verify that never completed observed nothing, so it is not
+				// evidence about this attempt either way. The agent latches the
+				// first reap outcome for a job and replays it for the rest of
+				// the boot (agent/session.go, serviceReaps), so folding a
+				// transport failure into the refusal would turn one bad tick
+				// into a second permanent wedge with a new cause. Keep the run
+				// entry and hand back the typed loss the caller already knows
+				// how to recover from and retry.
+				if requiresOCIRuntimeRecovery(verifyErr) {
+					return workloadrunner.ReapReceipt{}, reapRuntimeLoss(entry.sweep.helper, verifyErr)
+				}
+				return workloadrunner.ReapReceipt{}, fmt.Errorf("verify attempt absence after a non-live Delete refusal: %w", verifyErr)
+			}
+			// Only a completed Verify can refuse absence, and that refusal is
+			// durable: the resources it named are really there.
+			// time.Now: the adapter carries no clock, and the helper's own
+			// retention deadlines are wall-clock times it recorded.
+			if absenceErr := attemptAbsentFromNamespace(verification, HelperAuthority(request.Authority), entry.volumes, time.Now().UTC()); absenceErr != nil {
 				return workloadrunner.ReapReceipt{}, errors.Join(err, absenceErr)
 			}
 			adapter.consumeRunEntry(request.Authority)

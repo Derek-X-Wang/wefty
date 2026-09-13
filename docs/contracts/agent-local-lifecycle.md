@@ -773,14 +773,17 @@ deadman already completed it. That refusal is not absence and no later
 helper offers a session holding no live attempt: a read-only namespace `Verify`
 projected onto that attempt's deterministic resource names, with every
 transient name required absent from both the inventory and the runtime residue,
-and a surviving log-segment or cgroup name accepted only under a bounded
-helper retention that names the attempt. The classes the contract keeps past an
+and a surviving log-segment or cgroup name accepted only under a bounded,
+unexpired helper retention that names the attempt. The classes the contract keeps past an
 attempt -- service data and its owner record, a handoff volume, and every
 Computer disk class -- are exempt from that inventory check and are deleted by
 the removal's own attested step. The resulting receipt is ordinary `attempt`
 evidence, because it speaks for exactly one attempt authority. A projection
 that cannot name every resource, or that finds one present, fails the reap
-rather than granting absence.
+rather than granting absence. A `Verify` that never completed is not evidence
+either way: it stays a recoverable runtime loss the caller retries, because the
+agent latches one reap outcome per job and a transport failure folded into the
+refusal would wedge the removal just as permanently.
 
 ## Authority clock
 

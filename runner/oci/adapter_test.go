@@ -1976,6 +1976,12 @@ type adapterTestEngine struct {
 	storageCopyErr                error
 	verifyResponses               []ocihelper.VerifyResponse
 	verifyCalls                   int
+	// readOnlyVerifies and readOnlyVerifyErrs answer only the read-only
+	// namespace scope, so a test can drive the agent's absence proof without
+	// counting the boot barrier's own verifications.
+	readOnlyVerifies    []ocihelper.VerifyResponse
+	readOnlyVerifyErrs  []error
+	readOnlyVerifyCalls int
 }
 
 type endpointAdapterTestEngine struct{ *adapterTestEngine }
@@ -2189,7 +2195,17 @@ func (engine *adapterTestEngine) AttestRemoval(context.Context, ocihelper.Attest
 	return engine.attestRemoval, engine.attestErr
 }
 
-func (engine *adapterTestEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+func (engine *adapterTestEngine) Verify(_ context.Context, request ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	if request.Scope == ocihelper.VerifyNamespaceReadOnly && (len(engine.readOnlyVerifies) != 0 || len(engine.readOnlyVerifyErrs) != 0) {
+		index := engine.readOnlyVerifyCalls
+		engine.readOnlyVerifyCalls++
+		if index < len(engine.readOnlyVerifyErrs) && engine.readOnlyVerifyErrs[index] != nil {
+			return ocihelper.VerifyResponse{}, engine.readOnlyVerifyErrs[index]
+		}
+		if index < len(engine.readOnlyVerifies) {
+			return engine.readOnlyVerifies[index], nil
+		}
+	}
 	if engine.verifyCalls < len(engine.verifyResponses) {
 		response := engine.verifyResponses[engine.verifyCalls]
 		engine.verifyCalls++

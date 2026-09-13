@@ -3818,48 +3818,16 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 	return nil
 }
 
+// filterInventory is the helper-side name for the shared attempt projection.
+// The rule itself lives in ProjectAttemptInventory so the agent can apply the
+// identical one when it proves an attempt absent from a read-only namespace
+// inventory.
 func filterInventory(inventory ResourceInventory, resources ResourceIdentity, attachment *computerDiskAttachment) ResourceInventory {
-	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{}, ComputerStorageQuarantined: []ComputerStorageRecoveryInventoryEntry{}, ComputerDiskAnomalies: []string{}}
-	for _, pair := range []struct {
-		values []string
-		target string
-		output *[]string
-	}{{inventory.Leases, resources.LeaseID, &filtered.Leases}, {inventory.Snapshots, resources.SnapshotID, &filtered.Snapshots}, {inventory.Containers, resources.ContainerID, &filtered.Containers}, {inventory.Tasks, resources.ContainerID, &filtered.Tasks}, {inventory.Shims, resources.ContainerID, &filtered.Shims}, {inventory.LogSegments, resources.LogSegmentDirectory, &filtered.LogSegments}, {inventory.ManagedVolumes, resources.HandoffVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumes, resources.ServiceVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumeRecords, resources.ServiceVolumeOwnerRecord, &filtered.ManagedVolumeRecords}} {
-		for _, value := range pair.values {
-			if value == pair.target {
-				*pair.output = append(*pair.output, value)
-			}
-		}
-	}
-	for _, value := range inventory.Cgroups {
-		if logical, managed := cgroupAttemptResourceID(filepath.Base(value)); managed && logical == resources.CgroupID {
-			filtered.Cgroups = append(filtered.Cgroups, value)
-		}
-	}
+	name := ""
 	if attachment != nil {
-		for _, pair := range []struct {
-			values []string
-			target string
-			output *[]string
-		}{{inventory.ComputerDiskImages, attachment.name, &filtered.ComputerDiskImages}, {inventory.ComputerDiskAllocations, attachment.name, &filtered.ComputerDiskAllocations}, {inventory.ComputerDiskQuotas, attachment.name, &filtered.ComputerDiskQuotas}, {inventory.ComputerDiskManifests, attachment.name, &filtered.ComputerDiskManifests}, {inventory.ComputerDiskMounts, attachment.name, &filtered.ComputerDiskMounts}, {inventory.ComputerDiskLoops, attachment.name, &filtered.ComputerDiskLoops}, {inventory.ComputerAttachments, attachment.name, &filtered.ComputerAttachments}, {inventory.ComputerResetManifests, attachment.name, &filtered.ComputerResetManifests}, {inventory.ComputerQuarantines, attachment.name, &filtered.ComputerQuarantines}} {
-			for _, value := range pair.values {
-				if value == pair.target {
-					*pair.output = append(*pair.output, value)
-				}
-			}
-		}
-		for _, entry := range inventory.ComputerStorageDeferred {
-			if entry.DiskName == attachment.name {
-				filtered.ComputerStorageDeferred = append(filtered.ComputerStorageDeferred, entry)
-			}
-		}
-		for _, entry := range inventory.ComputerStorageQuarantined {
-			if entry.DiskName == attachment.name {
-				filtered.ComputerStorageQuarantined = append(filtered.ComputerStorageQuarantined, entry)
-			}
-		}
+		name = attachment.name
 	}
-	return filtered
+	return ProjectAttemptInventory(inventory, resources, name)
 }
 
 type attemptOwnershipEntryOutcome string
@@ -4269,14 +4237,6 @@ func (engine *ContainerdEngine) clearAttemptRetention(record durableAttemptOwner
 	return engine.writeAttemptOwnershipRecord(record)
 }
 
-func cgroupAttemptResourceID(name string) (string, bool) {
-	logical := name
-	if strings.HasSuffix(logical, ".scope") {
-		logical = strings.TrimSuffix(logical, ".scope")
-	}
-	return logical, managedAttemptResourceName(logical, "wefty-cgroup-")
-}
-
 func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context, names []string, ownership map[string]durableAttemptOwnership) ([]DurableRetention, []SweepEvidence, error) {
 	timeout := engine.config.LogSealTimeout
 	if timeout <= 0 {
@@ -4430,21 +4390,6 @@ func helperOwnedAttemptDirectory(path, prefix, name string) (bool, error) {
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == uint32(os.Geteuid()), nil
-}
-
-func managedAttemptResourceName(name, prefix string) bool {
-	suffix, found := strings.CutPrefix(name, prefix)
-	if !found || len(suffix) != 32 {
-		return false
-	}
-	for _, character := range suffix {
-		if character < '0' || character > '9' {
-			if character < 'a' || character > 'f' {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 type logSealScanState struct {
