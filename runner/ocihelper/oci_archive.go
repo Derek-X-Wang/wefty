@@ -2,6 +2,7 @@ package ocihelper
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -233,11 +234,34 @@ func inspectOCIArchiveWithSpoolForPlatform(ctx context.Context, runtimeRoot stri
 	if !found {
 		return ociArchiveInspection{}, errors.New("OCI archive selected manifest is not reachable from its top-level descriptor")
 	}
-	if err := filterOCIArchiveForPlatform(file, archivePath, reachable); err != nil {
+	if err := filterOCIArchiveForPlatform(file, archivePath, reachable, indexBytes, reference); err != nil {
 		return ociArchiveInspection{}, err
 	}
 	file = nil
 	return ociArchiveInspection{Path: archivePath, Reference: reference, TopLevel: top, Platform: platform, PlatformDigest: manifest.Digest}, nil
+}
+
+// annotateArchiveIndex writes the reference this import resolves to onto the
+// filtered layout's exported image descriptor. containerd's importer only
+// records an image whose annotation names something, so an export that
+// carries no reference at all -- a raw `docker buildx --output type=oci`
+// platform archive (#444) -- would otherwise be imported with no image
+// record and the digest-keyed post-import lookup would report it
+// unavailable. The import name was already resolved by resolveArchiveReference;
+// this stamps it into the layout the engine hands to containerd.
+func annotateArchiveIndex(rootIndex []byte, reference string) ([]byte, error) {
+	var index ocispec.Index
+	if err := json.Unmarshal(rootIndex, &index); err != nil || index.SchemaVersion != 2 {
+		return nil, errors.New("OCI archive has an invalid index.json")
+	}
+	if len(index.Manifests) != 1 {
+		return nil, errors.New("OCI archive must contain exactly one top-level image")
+	}
+	if index.Manifests[0].Annotations == nil {
+		index.Manifests[0].Annotations = make(map[string]string)
+	}
+	index.Manifests[0].Annotations[ocispec.AnnotationRefName] = reference
+	return json.Marshal(index)
 }
 
 // archiveReachableBlobs returns the descriptor graph required to import one
@@ -283,9 +307,17 @@ func archiveReachableBlobs(descriptor ocispec.Descriptor, selected digest.Digest
 	return nil, false, nil
 }
 
-func filterOCIArchiveForPlatform(source *os.File, archivePath string, reachable map[digest.Digest]struct{}) (returnErr error) {
+func filterOCIArchiveForPlatform(source *os.File, archivePath string, reachable map[digest.Digest]struct{}, rootIndex []byte, annotatedReference string) (returnErr error) {
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return err
+	}
+	var filteredIndex []byte
+	if annotatedReference != "" {
+		rewritten, err := annotateArchiveIndex(rootIndex, annotatedReference)
+		if err != nil {
+			return err
+		}
+		filteredIndex = rewritten
 	}
 	filtered, err := os.CreateTemp(filepath.Dir(archivePath), "wefty-image-filtered-*.tar")
 	if err != nil {
@@ -317,10 +349,15 @@ func filterOCIArchiveForPlatform(source *os.File, archivePath string, reachable 
 		}
 		copyHeader := *header
 		copyHeader.Name = name
+		payload := io.Reader(reader)
+		if name == "index.json" && filteredIndex != nil {
+			copyHeader.Size = int64(len(filteredIndex))
+			payload = bytes.NewReader(filteredIndex)
+		}
 		if err := writer.WriteHeader(&copyHeader); err != nil {
 			return err
 		}
-		if _, err := io.CopyN(writer, reader, header.Size); err != nil {
+		if _, err := io.CopyN(writer, payload, copyHeader.Size); err != nil {
 			return err
 		}
 	}
