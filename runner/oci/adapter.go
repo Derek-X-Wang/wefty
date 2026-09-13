@@ -111,6 +111,12 @@ type runEntry struct {
 	entered            bool
 	attemptPinAttached bool
 	sweep              sweepBaseline
+	// volumes are the exact managed-volume descriptors this attempt's own Run
+	// request carried. Two of the attempt's deterministic resource names
+	// cannot be derived from the authority alone -- a handoff volume is named
+	// from the descriptor's OwnerKey and a Computer disk from its Storage
+	// identity -- so the non-attempt-scoped absence proof needs them.
+	volumes []ocihelper.ManagedVolumeDescriptor
 }
 
 type sweepBaseline struct {
@@ -1058,7 +1064,10 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		err := errors.New("OCI helper generation changed without matching probe evidence")
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
-	entry := runEntry{entered: true, sweep: sweepBaseline{epoch: sweepReceipt.SweepEpoch, helper: sweepReceipt.HelperSession}}
+	entry := runEntry{
+		entered: true, sweep: sweepBaseline{epoch: sweepReceipt.SweepEpoch, helper: sweepReceipt.HelperSession},
+		volumes: helperManagedVolumes(request),
+	}
 	if entry.sweep.epoch == "" || entry.sweep.helper.HelperInstanceID == "" || entry.sweep.helper.SessionGeneration == 0 {
 		err := errors.New("OCI execution snapshot omitted sweep or helper-generation evidence")
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
@@ -1747,6 +1756,17 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 				return replacement, nil
 			}
 		}
+		// The helper no longer holds this attempt as live -- its own guardian
+		// or deadman completed it -- and no later Delete can turn that refusal
+		// positive. Prove absence the non-attempt-scoped way instead of
+		// retrying forever against a pinned slot (#450).
+		if tracked && errors.As(err, &rpcErr) && rpcErr.Code == ocihelper.CodeUnauthorizedAttempt {
+			if absenceErr := adapter.verifyNonLiveAttemptAbsent(ctx, session, request.Authority, entry.volumes); absenceErr != nil {
+				return workloadrunner.ReapReceipt{}, errors.Join(err, absenceErr)
+			}
+			adapter.consumeRunEntry(request.Authority)
+			return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: request.Authority.BootSessionID}, nil
+		}
 		if requiresOCIRuntimeRecovery(err) {
 			return workloadrunner.ReapReceipt{}, reapRuntimeLoss(entry.sweep.helper, err)
 		}
@@ -1791,6 +1811,7 @@ func (adapter *Adapter) trackRun(authority workloadrunner.AttemptAuthority, entr
 	} else if entry.entered {
 		current.entered = true
 		current.sweep = entry.sweep
+		current.volumes = entry.volumes
 	}
 	adapter.runEntered[authority] = current
 	adapter.mu.Unlock()
@@ -2350,18 +2371,11 @@ func adapterAuthorityKey(authority workloadrunner.AttemptAuthority) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", authority.NodeID, authority.BootSessionID, authority.JobID, authority.AttemptID, authority.FencingToken, authority.WorkloadClass, authority.RemovalGeneration)
 }
 
-func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
-	execution := request.Execution.OCI
-	digest := ""
-	if execution.Image.Digest != nil {
-		digest = *execution.Image.Digest
-	}
-	workingDirectory := ""
-	if execution.WorkingDirectory != nil {
-		workingDirectory = *execution.WorkingDirectory
-	}
-	public := unreservedEnvironment(request.Execution.Env)
-	sensitive := unreservedEnvironment(request.Execution.SensitiveEnv)
+// helperManagedVolumes translates the agent-level managed volumes of one
+// request into the helper descriptors its Run carries. It is shared with the
+// run entry the adapter keeps for removal, because the attempt's handoff and
+// Computer-disk resource names live only in these descriptors.
+func helperManagedVolumes(request workloadrunner.Request) []ocihelper.ManagedVolumeDescriptor {
 	managedVolumes := make([]ocihelper.ManagedVolumeDescriptor, 0, len(request.ManagedVolumes))
 	for _, volume := range request.ManagedVolumes {
 		switch volume.Kind {
@@ -2387,6 +2401,22 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 			})
 		}
 	}
+	return managedVolumes
+}
+
+func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
+	execution := request.Execution.OCI
+	digest := ""
+	if execution.Image.Digest != nil {
+		digest = *execution.Image.Digest
+	}
+	workingDirectory := ""
+	if execution.WorkingDirectory != nil {
+		workingDirectory = *execution.WorkingDirectory
+	}
+	public := unreservedEnvironment(request.Execution.Env)
+	sensitive := unreservedEnvironment(request.Execution.SensitiveEnv)
+	managedVolumes := helperManagedVolumes(request)
 	input := ocihelper.WorkloadInput{
 		ImageReference: execution.Image.Reference, ImageDigest: digest,
 		Computer: contract.IsComputerExecution(request.Execution),

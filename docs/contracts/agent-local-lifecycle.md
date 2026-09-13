@@ -766,6 +766,22 @@ shortcut produced it. Only that Storage-only shortcut skips the local managed
 service-resource deletion step; a removal reaped by the never-entered-`Run`
 receipt still deletes the managed service resource this attempt prepared.
 
+A helper that refuses `Delete` with `unauthorized_attempt` is saying the
+authority no longer names a live attempt, typically because its own guardian or
+deadman already completed it. That refusal is not absence and no later
+`Delete` can become positive, so the removal proves absence the one way the
+helper offers a session holding no live attempt: a read-only namespace `Verify`
+projected onto that attempt's deterministic resource names, with every
+transient name required absent from both the inventory and the runtime residue,
+and a surviving log-segment or cgroup name accepted only under a bounded
+helper retention that names the attempt. The classes the contract keeps past an
+attempt -- service data and its owner record, a handoff volume, and every
+Computer disk class -- are exempt from that inventory check and are deleted by
+the removal's own attested step. The resulting receipt is ordinary `attempt`
+evidence, because it speaks for exactly one attempt authority. A projection
+that cannot name every resource, or that finds one present, fails the reap
+rather than granting absence.
+
 ## Authority clock
 
 Each claim and renewal establishes a local authority deadline from the
