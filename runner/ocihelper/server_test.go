@@ -636,6 +636,27 @@ func TestRunEngineFailureKeepsSessionAuthorityForLaterRuns(t *testing.T) {
 // the failed attempt it does invalidate its own session, and that refusal must
 // still reach the agent as runtime loss.
 func TestRunEngineFailureWithAmbiguousReapStillProvesRuntimeLoss(t *testing.T) {
+	requireAmbiguousReapRunRefusal(t)
+}
+
+// The helper writes the ambiguous refusal and then kills its own session, and
+// the invalidation closes the very connection the refusal travels on. One pass
+// cannot tell a fixed ordering from a race that happened to be won, so repeat
+// the whole exchange on fresh sessions. See #438.
+func TestRunEngineFailureWithAmbiguousReapDeliversTheRefusalUnderRepetition(t *testing.T) {
+	for iteration := 0; iteration < 16; iteration++ {
+		t.Run(fmt.Sprintf("exchange-%d", iteration), func(t *testing.T) {
+			requireAmbiguousReapRunRefusal(t)
+		})
+	}
+}
+
+// requireAmbiguousReapRunRefusal drives one Run whose engine failure cannot be
+// positively reaped and requires the typed engine_failure refusal -- with no
+// attempt-scope claim -- to arrive before the session invalidation tears the
+// connection down, and the agent to read it as runtime loss.
+func requireAmbiguousReapRunRefusal(t *testing.T) {
+	t.Helper()
 	engine := newFakeEngine()
 	engine.runErr = errors.New("engine create failed")
 	engine.attemptReapErr = errors.New("attempt residue could not be reaped")
