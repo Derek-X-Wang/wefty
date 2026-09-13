@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -149,6 +150,10 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		leaseDuration:     l1.DefaultLeaseDuration,
 		productionTimings: true,
 		agentArguments:    agentArguments,
+		// The Linux-only kind=oci agent-SIGKILL arm runs a third service-class
+		// job alongside primary and sibling; the default two-slot pool would
+		// leave it queued instead of running.
+		maxServiceSlots: 3,
 	})
 	t.Cleanup(func() {
 		evidence.recordProcessOutput("control-plane.log", harness.controlPlane)
@@ -220,6 +225,33 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		t, harness, siblingClient, sibling.JobID, siblingRunning.CurrentAttemptID, siblingHealth.PID,
 	)
 
+	var ociSigkillJob, ociSigkillRunning l1.Job
+	var ociSigkillPreKillContainerID string
+	var ociSigkillRemoved bool
+	if runtime.GOOS == "linux" {
+		ociSigkillJob = harness.submitPersistentOCIService(t)
+		t.Cleanup(func() {
+			// Best-effort: an early t.Fatal must not leave a persistent
+			// container running past this test, waiting out the agent's own
+			// shutdown drain. The normal removal path below clears this flag
+			// on success; this only fires when that path was never reached.
+			if ociSigkillRemoved || ociSigkillJob.JobID == "" || harness.agent.exited() {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = exec.CommandContext(ctx, weftyBinaryPath,
+				"--fabric=plain", "--l1="+harness.controlPlaneAddress, "--plain-identity=realtiming-cli", "--json",
+				"services", "remove", ociSigkillJob.JobID).Run()
+		})
+		ociSigkillRunning = harness.waitForJobState(t, ociSigkillJob.JobID, contract.JobClassService, contract.JobRunning, 45*time.Second)
+		evidence.recordJob(t, harness, "status-oci-before-agent-sigkill.json", ociSigkillJob.JobID)
+		// The pre-kill attempt's own container id, captured before the SIGKILL,
+		// is what proves the crash-recovery reap deleted a runtime resource
+		// rather than merely admitting a fresh attempt over a surviving orphan.
+		ociSigkillPreKillContainerID = liveOCIAttemptContainerID(t, ociSigkillJob.JobID, ociSigkillRunning.CurrentAttemptID)
+	}
+
 	evidence.recordJob(t, harness, "status-before-agent-sigkill.json", primary.JobID)
 	guardianStarted := time.Now()
 	harness.agent.kill(t)
@@ -251,6 +283,27 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	if siblingAfterAgentRestart.CurrentAttemptID == siblingRunning.CurrentAttemptID {
 		t.Fatal("sibling did not receive a fresh attempt after agent SIGKILL")
 	}
+	if runtime.GOOS == "linux" {
+		ociSigkillAfterRestart := waitForFreshRunningAttempt(
+			t, harness, ociSigkillJob.JobID, ociSigkillRunning.CurrentAttemptID, 75*time.Second,
+		)
+		evidence.recordJob(t, harness, "status-oci-after-agent-sigkill.json", ociSigkillJob.JobID)
+		if ociSigkillAfterRestart.CurrentAttemptID == ociSigkillRunning.CurrentAttemptID {
+			t.Fatal("kind=oci service did not receive a fresh attempt after agent SIGKILL")
+		}
+		// A fresh attempt alone does not prove reaping: a session-loss
+		// regression that leaves the pre-kill container running while a new
+		// attempt is admitted would still satisfy the check above. Require
+		// containerd to positively refuse the old attempt's container id too.
+		assertOCIContainerAbsent(t, ociSigkillPreKillContainerID)
+		evidence.write("oci-service-agent-sigkill-linux.txt", []byte("service_oci_payload_sigkill_survived=true\n"))
+
+		ociSigkillRemoval := runServiceCLI(t, harness, "services", "remove", ociSigkillJob.JobID, "--wait=90s")
+		evidence.write("remove-oci-sigkill-arm.json", ociSigkillRemoval)
+		harness.waitForJobState(t, ociSigkillJob.JobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
+		assertNoServiceResidue(t, harness, ociSigkillJob.JobID)
+		ociSigkillRemoved = true
+	}
 
 	logs := waitForAttemptLogs(t, harness, primary.JobID, attemptIDs, 30*time.Second)
 	evidence.recordJSON("logs-all-attempts.json", logs)
@@ -258,6 +311,14 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		"job_id": primary.JobID, "attempt_ids": attemptIDs, "payload_pids": payloadPIDs,
 	})
 
+	// Re-read health rather than trust the copy captured before the agent
+	// restart: primary's own JobLimits give its current attempt a 30s
+	// MaxRuntimeSeconds/IdleTimeoutSeconds budget (runner/process/runner.go,
+	// enforced on the real wall clock in this binary), and the OCI SIGKILL
+	// arm above spends real time on a different job without touching
+	// primary, which can outlast that budget and rotate the payload PID this
+	// captured before it ran.
+	primaryHealth = waitForHealth(t, primaryClient, "http://primary.invalid", harness.agent)
 	groupID, err := syscall.Getpgid(primaryHealth.PID)
 	if err != nil {
 		t.Fatalf("read payload process group: %v", err)
@@ -402,6 +463,9 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	if backoff.JobID != "" {
 		allJobIDs = append(allJobIDs, backoff.JobID)
 	}
+	if ociSigkillJob.JobID != "" {
+		allJobIDs = append(allJobIDs, ociSigkillJob.JobID)
+	}
 	for _, jobID := range allJobIDs {
 		assertWorkingDirectoryUntouched(t, harness.workingDirectories[jobID])
 		assertManagedServiceAbsent(t, harness, jobID)
@@ -412,6 +476,57 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	}
 	assertSpoolRowsAbsent(t, harness.spoolDirectory, allJobIDs)
 	evidence.recordResidue(t, harness)
+}
+
+// liveOCIAttemptContainerID finds the containerd container labeled with both
+// the given job and attempt identity (runner/ocihelper sets io.wefty/job_id
+// and io.wefty/attempt_id on every container it creates). It talks to
+// containerd directly through ctr rather than the agent's exclusive OCI
+// helper session -- the same read-only path probeComputerNetworkEgress and
+// liveComputerContainerID already use -- so it is safe to call while the
+// agent still owns that session.
+func liveOCIAttemptContainerID(t *testing.T, jobID, attemptID string) string {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	list, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"containers", "list", "--quiet").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list live OCI containers: %v\n%s", err, list)
+	}
+	for _, candidate := range strings.Fields(string(list)) {
+		info, infoErr := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+			"containers", "info", candidate).CombinedOutput()
+		if infoErr != nil {
+			continue
+		}
+		var container struct {
+			Labels map[string]string
+		}
+		if json.Unmarshal(info, &container) == nil &&
+			container.Labels["io.wefty/job_id"] == jobID && container.Labels["io.wefty/attempt_id"] == attemptID {
+			return candidate
+		}
+	}
+	t.Fatalf("no live container carried job %s attempt %s", jobID, attemptID)
+	return ""
+}
+
+// assertOCIContainerAbsent requires a successful containerd namespace list
+// (proving connectivity, so a transport failure cannot masquerade as
+// absence) that positively excludes the given container id, proving the
+// crash-recovery reap deleted the runtime resource rather than merely
+// admitting a fresh attempt over a still-running orphan.
+func assertOCIContainerAbsent(t *testing.T, containerID string) {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	list, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"containers", "list", "--quiet").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list live OCI containers to prove absence: %v\n%s", err, list)
+	}
+	if slices.Contains(strings.Fields(string(list)), containerID) {
+		t.Fatalf("pre-kill kind=oci attempt container %s is still present after agent SIGKILL recovery:\n%s", containerID, list)
+	}
 }
 
 func importRealtimeProbeImage(t *testing.T, archivePath, helperSocket, helperChecksum, reference, digest string, recordResidue func(*ocihelper.NamespaceResidueError)) {

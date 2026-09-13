@@ -107,6 +107,10 @@ type acceptanceHarnessOptions struct {
 	productionTimings bool
 	agentArguments    []string
 	computerLane      bool
+	// maxServiceSlots overrides the node's service-class slot pool (default 2,
+	// the count TestClassPoolsRunAtCapacityAndIsolateSiblings relies on) for a
+	// harness that must run more than two service-class jobs at once.
+	maxServiceSlots int
 }
 
 func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOptions) *acceptanceHarness {
@@ -124,6 +128,10 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 	l1Database := filepath.Join(directory, "l1.sqlite")
 	spoolDirectory := filepath.Join(directory, "agent-spool")
 	readyFile := filepath.Join(directory, "l1-ready.json")
+	serviceSlots := options.maxServiceSlots
+	if serviceSlots <= 0 {
+		serviceSlots = 2
+	}
 	controlPlaneArguments := []string{
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
@@ -131,7 +139,7 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 		"--lease-duration=" + options.leaseDuration.String(),
 		"--node-tags=acceptance-node=service-acceptance," + contract.StableNodeTagPrefix + "acceptance-node",
 		"--node-max-oneshot-slots=acceptance-node=4",
-		"--node-max-service-slots=acceptance-node=2",
+		"--node-max-service-slots=acceptance-node=" + strconv.Itoa(serviceSlots),
 		"--ready-file=" + readyFile,
 	}
 	var runLedgerAddress string
@@ -329,19 +337,30 @@ func (h *acceptanceHarness) submitFailedService(t *testing.T) l1.Job {
 }
 
 func (h *acceptanceHarness) submitBackoffService(t *testing.T) l1.Job {
-	return h.submitOCIExitService(t, "backoff", nil)
+	return h.submitOCIExitService(t, "backoff", nil, nil)
 }
 
 func (h *acceptanceHarness) submitFailedOCIService(t *testing.T) l1.Job {
 	maximum := 1
-	return h.submitOCIExitService(t, "failed", &maximum)
+	return h.submitOCIExitService(t, "failed", &maximum, nil)
 }
 
-func (h *acceptanceHarness) submitOCIExitService(t *testing.T, suffix string, maxRestartStreak *int) l1.Job {
+// submitPersistentOCIService submits a long-running kind=oci service on the
+// canonical echo/probe image that only exits on its agent's TERM, so a real
+// agent SIGKILL leaves the payload running rather than self-exiting first.
+func (h *acceptanceHarness) submitPersistentOCIService(t *testing.T) l1.Job {
+	return h.submitOCIExitService(t, "persistent", nil,
+		[]string{"/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"})
+}
+
+func (h *acceptanceHarness) submitOCIExitService(t *testing.T, suffix string, maxRestartStreak *int, argv []string) l1.Job {
 	t.Helper()
 	workingDirectory := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workingDirectory, "operator-owned"), []byte("untouched"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	if argv == nil {
+		argv = []string{"/bin/sh", "-c", "exit 7"}
 	}
 	spec := contract.JobSpec{
 		SchemaVersion:    contract.SchemaVersionV1,
@@ -358,7 +377,7 @@ func (h *acceptanceHarness) submitOCIExitService(t *testing.T, suffix string, ma
 					Reference: os.Getenv("WEFTY_OCI_PROBE_REFERENCE"),
 					Digest:    stringPointer(os.Getenv("WEFTY_OCI_PROBE_DIGEST")),
 				},
-				Argv: []string{"/bin/sh", "-c", "exit 7"},
+				Argv: argv,
 			},
 		},
 	}
