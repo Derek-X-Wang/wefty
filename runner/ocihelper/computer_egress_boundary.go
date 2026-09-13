@@ -171,6 +171,26 @@ func computerFirewallChainProbeArguments(table, chain string) []string {
 	return append(arguments, "-n", "-L", chain)
 }
 
+// parseComputerFirewallChainRules reads rule bodies for one chain out of
+// `iptables -S` output. It is the single parser the reconcile, the rule
+// position lookup and the canonical comparison all go through, so a rule this
+// package renders is held to the shape iptables prints back.
+func parseComputerFirewallChainRules(output, chain string) [][]string {
+	var rules [][]string
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "-A" || fields[1] != chain {
+			continue
+		}
+		body := fields[2:]
+		for index := range body {
+			body[index] = strings.Trim(body[index], "\"")
+		}
+		rules = append(rules, body)
+	}
+	return rules
+}
+
 type computerFirewallRule struct {
 	executable string
 	table      string
@@ -205,17 +225,21 @@ func computerBaseFirewallRules(executable, rejectWith string, refused, resolvers
 		{executable: executable, chain: computerFirewallForward, arguments: []string{"-i", computerHostLinkPrefix + "+", "-o", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith}},
 		{executable: executable, chain: computerFirewallForward, arguments: []string{"-o", computerHostLinkPrefix + "+", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
 	}
+	// Argument order is not free: iptables prints a rule with the addresses
+	// before the interfaces, so a canonical body written the other way round
+	// never compares equal to what -S reads back and every reconcile would
+	// rebuild the chain and report the isolation contradicted.
 	for _, resolver := range resolvers {
 		for _, protocol := range []string{"udp", "tcp"} {
 			rules = append(rules, computerFirewallRule{executable: executable, chain: computerFirewallForward, arguments: []string{
-				"-i", computerHostLinkPrefix + "+", "-d", resolver, "-p", protocol, "-m", protocol, "--dport", "53",
+				"-d", resolver, "-i", computerHostLinkPrefix + "+", "-p", protocol, "-m", protocol, "--dport", "53",
 				"-m", "comment", "--comment", computerResolverRuleComment, "-j", "ACCEPT",
 			}})
 		}
 	}
 	for _, destination := range refused {
 		rules = append(rules, computerFirewallRule{executable: executable, chain: computerFirewallForward, arguments: []string{
-			"-i", computerHostLinkPrefix + "+", "-d", destination, "-j", "REJECT", "--reject-with", rejectWith,
+			"-d", destination, "-i", computerHostLinkPrefix + "+", "-j", "REJECT", "--reject-with", rejectWith,
 		}})
 	}
 	return append(rules,

@@ -876,18 +876,9 @@ func computerFirewallRulePositions(ctx context.Context, rule computerFirewallRul
 		return nil, fmt.Errorf("%s %s: %w: %s", rule.executable, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
 	}
 	var positions []int
-	position := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || fields[0] != "-A" || fields[1] != rule.chain {
-			continue
-		}
-		position++
-		for index := range fields[2:] {
-			fields[index+2] = strings.Trim(fields[index+2], "\"")
-		}
-		if slices.Equal(fields[2:], rule.arguments) {
-			positions = append(positions, position)
+	for position, body := range parseComputerFirewallChainRules(string(output), rule.chain) {
+		if slices.Equal(body, rule.arguments) {
+			positions = append(positions, position+1)
 		}
 	}
 	return positions, nil
@@ -991,15 +982,35 @@ var observeComputerEgressBoundary = func() (computerEgressBoundary, error) {
 		return computerEgressBoundary{}, &ComputerEgressBoundaryError{Cause: "enumerate Node route next hops: " + err.Error()}
 	}
 	gateways := make([]netip.Addr, 0, len(routes))
-	for _, route := range routes {
-		if route.Gw == nil {
-			continue
-		}
-		if parsed, ok := netip.AddrFromSlice(route.Gw); ok {
+	appendNextHop := func(hop net.IP) {
+		if parsed, ok := netip.AddrFromSlice(hop); ok {
 			gateways = append(gateways, parsed)
 		}
 	}
+	for _, route := range routes {
+		appendNextHop(route.Gw)
+		appendNextHop(routeViaAddress(route.Via))
+		// A multipath route names its next hops in its own list rather than in
+		// Gw, so a Node that balances across two uplinks fences both.
+		for _, hop := range route.MultiPath {
+			if hop == nil {
+				continue
+			}
+			appendNextHop(hop.Gw)
+			appendNextHop(routeViaAddress(hop.Via))
+		}
+	}
 	return newComputerEgressBoundary(nodeAddresses, gateways)
+}
+
+// routeViaAddress reads the next hop of a route that crosses address families,
+// where the gateway lives in the RTA_VIA attribute instead of Gw.
+func routeViaAddress(destination netlink.Destination) net.IP {
+	via, ok := destination.(*netlink.Via)
+	if !ok || via == nil {
+		return nil
+	}
+	return via.Addr
 }
 
 func computerIPv6NATUnavailable(err error) bool {
@@ -1069,18 +1080,7 @@ func computerFirewallChainRules(ctx context.Context, chain computerFirewallChain
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w: %s", chain.executable, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
 	}
-	var rules [][]string
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || fields[0] != "-A" || fields[1] != chain.name {
-			continue
-		}
-		for index := range fields[2:] {
-			fields[index+2] = strings.Trim(fields[index+2], "\"")
-		}
-		rules = append(rules, fields[2:])
-	}
-	return rules, nil
+	return parseComputerFirewallChainRules(string(output), chain.name), nil
 }
 
 func ensureComputerFirewallChain(ctx context.Context, chain computerFirewallChain) error {

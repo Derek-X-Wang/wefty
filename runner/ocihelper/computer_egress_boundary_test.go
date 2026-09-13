@@ -23,11 +23,17 @@ func forwardVerdict(t *testing.T, rules []computerFirewallRule, destination, pro
 			continue
 		}
 		arguments := rule.arguments
-		if len(arguments) < 2 || arguments[0] != "-i" || arguments[1] != computerHostLinkPrefix+"+" {
-			continue
-		}
 		if slices.Contains(arguments, "-o") {
 			// Computer-to-Computer, handled by its own rule and not this path.
+			continue
+		}
+		inbound := ""
+		for index := 0; index+1 < len(arguments); index++ {
+			if arguments[index] == "-i" {
+				inbound = arguments[index+1]
+			}
+		}
+		if inbound != computerHostLinkPrefix+"+" {
 			continue
 		}
 		matched := true
@@ -194,6 +200,19 @@ func TestComputerIPv6EgressMirrorsTheRefusals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	global, err := newComputerEgressBoundary(
+		[]netip.Addr{netip.MustParseAddr("2001:db8:1::15")},
+		[]netip.Addr{netip.MustParseAddr("2001:db8:1::2")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(global.refusedIPv6, "2001:db8:1::15/128") || !slices.Contains(global.refusedIPv6, "2001:db8:1::2/128") {
+		t.Fatalf("global IPv6 refusals = %q; want the Node address and its next hop", global.refusedIPv6)
+	}
+	if verdict := forwardVerdict(t, computerIPv6BaseFirewallRules("ip6tables", global.refusedIPv6), "2001:db8:1::2", "tcp", 22); verdict != "REJECT" {
+		t.Errorf("IPv6 forward verdict for a global host next hop = %s; want REJECT", verdict)
+	}
 	rules := computerIPv6BaseFirewallRules("ip6tables", boundary.refusedIPv6)
 	for _, destination := range []string{"fd00::2", "fe80::1", "::1"} {
 		if verdict := forwardVerdict(t, rules, destination, "tcp", 22); verdict != "REJECT" {
@@ -223,6 +242,58 @@ func TestComputerFirewallChainProbeIsListedNumerically(t *testing.T) {
 		}
 		if !slices.Contains(arguments, "-n") {
 			t.Errorf("chain probe for table %q omits -n and would reverse-resolve every address in the chain", probe.table)
+		}
+	}
+}
+
+// The canonical body is compared against what `iptables -S` prints, so a rule
+// this package renders has to come back through that parser unchanged. iptables
+// prints the addresses before the interfaces and quotes comment values; a body
+// written in any other order silently loses every comparison, which would flush
+// and rebuild both chains on every reconcile and read as isolation contradicted
+// while a Computer is live.
+func TestComputerFirewallRulesRoundTripThroughTheSavedForm(t *testing.T) {
+	boundary := testComputerEgressBoundary(t, "192.168.5.15", "192.168.5.2")
+	rules := computerBaseFirewallRules("iptables", "icmp-port-unreachable", boundary.refusedIPv4, []string{"192.168.5.3/32"})
+	var saved strings.Builder
+	var expected [][]string
+	for _, rule := range rules {
+		if rule.chain != computerFirewallForward {
+			continue
+		}
+		expected = append(expected, rule.arguments)
+		saved.WriteString("-A " + rule.chain)
+		for index, argument := range rule.arguments {
+			if index > 0 && rule.arguments[index-1] == "--comment" {
+				argument = "\"" + argument + "\""
+			}
+			saved.WriteString(" " + argument)
+		}
+		saved.WriteString("\n")
+	}
+	parsed := parseComputerFirewallChainRules("-P FORWARD ACCEPT\n-N "+computerFirewallForward+"\n"+saved.String(), computerFirewallForward)
+	if !slices.EqualFunc(parsed, expected, slices.Equal) {
+		t.Fatalf("canonical body did not survive the saved form:\n parsed   %q\n expected %q", parsed, expected)
+	}
+}
+
+// The saved form is not a guess: this is the shape iptables prints, and the
+// repo's pre-existing attempt rule already writes -d before -i for that reason.
+func TestComputerFirewallRulesMatchTheShapeIPTablesPrints(t *testing.T) {
+	boundary := testComputerEgressBoundary(t, "192.168.5.15", "192.168.5.2")
+	rules := computerBaseFirewallRules("iptables", "icmp-port-unreachable", boundary.refusedIPv4, []string{"192.168.5.3/32"})
+	fixture := `-A ` + computerFirewallForward + ` -d 192.168.5.3/32 -i wftch+ -p udp -m udp --dport 53 -m comment --comment "WEFTY-COMPUTER-RESOLVER" -j ACCEPT
+-A ` + computerFirewallForward + ` -d 192.168.0.0/16 -i wftch+ -j REJECT --reject-with icmp-port-unreachable`
+	for _, want := range parseComputerFirewallChainRules(fixture, computerFirewallForward) {
+		found := false
+		for _, rule := range rules {
+			if rule.chain == computerFirewallForward && slices.Equal(rule.arguments, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no canonical rule renders as %q", want)
 		}
 	}
 }
