@@ -104,7 +104,8 @@ retains its node-local binding image pin, which the standing directive still
 needs, until that positive cleanup releases it. The node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is
 released.
-Retries after declaration use a separate durable monotonic counter, independent
+Retries after declaration, except a complete record's one returning-boot
+acknowledgement replay, use a separate durable monotonic counter, independent
 of the qualifying refusal streak, to back off from fifteen seconds to a
 three-minute cap. The agent logs refusal-code transitions once, including a
 return to an earlier code, rather than logging every identical retry.

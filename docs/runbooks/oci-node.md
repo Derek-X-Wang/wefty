@@ -201,8 +201,8 @@ succeeds records the fact without ever upgrading the unverified outcome. Such
 a record reports as `oci_removal_stalled_declared` (green) because the harm
 this check names -- a pinned slot -- is gone. Those retries back off durably
 from the ordinary heartbeat cadence to at most one attempt every three minutes;
-the agent logs the first repeated refusal, a refusal-code change, and eventual
-success rather than every identical retry.
+the agent logs refusal-code transitions and eventual success rather than every
+identical retry.
 
 So a record still listed under `oci_removal_stalled` has either not accumulated
 eligible evidence (no typed refusal or fewer than three consecutive identical

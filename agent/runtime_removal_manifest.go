@@ -314,17 +314,32 @@ WHERE job_id=? AND phase=?`, payload, preparedAt.UTC().Round(0).UnixNano(), remo
 }
 
 func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
-	if left.JobID != right.JobID || left.RemovalGeneration != right.RemovalGeneration || len(left.Attempts) != len(right.Attempts) {
+	if left.JobID != right.JobID || left.RemovalGeneration != right.RemovalGeneration || len(right.Attempts) < len(left.Attempts) {
 		return false
 	}
-	for index := range left.Attempts {
-		oldAttempt, newAttempt := left.Attempts[index], right.Attempts[index]
-		if !oldAttempt.StorageOnly || !newAttempt.StorageOnly || oldAttempt.ComputerStorage == nil || newAttempt.ComputerStorage == nil ||
-			oldAttempt.StorageAbsent != newAttempt.StorageAbsent || *oldAttempt.ComputerStorage != *newAttempt.ComputerStorage {
+	refreshed := make(map[string]workloadrunner.RuntimeResourceManifest, len(right.Attempts))
+	for _, attempt := range right.Attempts {
+		if !attempt.StorageOnly || attempt.ComputerStorage == nil {
 			return false
 		}
-		if oldAttempt.StorageAbsent {
-			if oldAttempt.StoragePreparation != nil || newAttempt.StoragePreparation != nil {
+		storage := attempt.ComputerStorage
+		key := fmt.Sprintf("%s\x00%s\x00%d", storage.ComputerID, storage.StorageID, storage.StorageGeneration)
+		if _, duplicate := refreshed[key]; duplicate {
+			return false
+		}
+		refreshed[key] = attempt
+	}
+	for _, oldAttempt := range left.Attempts {
+		if !oldAttempt.StorageOnly || oldAttempt.ComputerStorage == nil {
+			return false
+		}
+		storage := oldAttempt.ComputerStorage
+		newAttempt, found := refreshed[fmt.Sprintf("%s\x00%s\x00%d", storage.ComputerID, storage.StorageID, storage.StorageGeneration)]
+		if !found || *oldAttempt.ComputerStorage != *newAttempt.ComputerStorage || oldAttempt.StorageAbsent && !newAttempt.StorageAbsent {
+			return false
+		}
+		if newAttempt.StorageAbsent {
+			if newAttempt.StoragePreparation != nil {
 				return false
 			}
 		} else if oldAttempt.StoragePreparation == nil || newAttempt.StoragePreparation == nil || *oldAttempt.StoragePreparation != *newAttempt.StoragePreparation {

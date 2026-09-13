@@ -168,6 +168,78 @@ func TestDeclaredRemovalRetriesWithDurableBackoffAndLogsStateChanges(t *testing.
 	}
 }
 
+func TestCompleteDeclaredRemovalUsesBackoffForSameBootAcknowledgementConflicts(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "complete-backoff-node", 1024)
+	defer spool.Close()
+	removal := testRuntimeRemoval("complete-backoff-job")
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	manifest := testRuntimeResourceManifest(removal.jobID, "attempt")
+	if err := spool.storeRuntimeResourceManifest(t.Context(), manifest, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, prepared); err != nil {
+		t.Fatal(err)
+	}
+	lastAttempt := prepared.Add(l1.DefaultRemovalStallBound)
+	for range l1.MinimumServiceRemovalStallAttempts {
+		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", lastAttempt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	declaration, _ := json.Marshal(l1.ServiceRemovalStallEvidence{Kind: l1.ServiceRemovalStallEvidenceKind,
+		JobID: removal.jobID, LastRefusalCode: string(ocihelper.CodeUnauthorizedAttempt)})
+	if _, _, err := spool.freezeRuntimeRemovalStallDeclaration(t.Context(), removal, declaration, "stall-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordRuntimeRemovalStallDeclared(t.Context(), removal, lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+	receipt := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: "same-boot"}
+	if err := spool.recordRuntimeQuiesced(t.Context(), removal, receipt, lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordRuntimeAttested(t.Context(), removal,
+		testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: removal.jobID,
+			RemovalGeneration: removal.generation, Attempts: []workloadrunner.RuntimeResourceManifest{manifest}}), lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+
+	now := lastAttempt
+	acknowledgements := 0
+	controller := &removalController{nodeID: "complete-backoff-node", bootSessionID: receipt.BootSessionID,
+		now: func() time.Time { return now }}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.loadRuntimeRemoval = spool.runtimeRemoval
+	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+	}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error {
+		acknowledgements++
+		return &ProtocolError{APIError: contract.APIError{Code: contract.ErrorConflict,
+			Message: "Computer removal requires positive absence for every Backup copy"}}
+	}
+	controller.finishRemoval = func(context.Context, localRemoval) error {
+		t.Fatal("a refused acknowledgement finished the removal")
+		return nil
+	}
+	directive := l1.RemovalDirective{JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: removal.kind,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID}
+	const heartbeats = 40
+	for range heartbeats {
+		_ = controller.reconcile(t.Context(), directive)
+		now = now.Add(15 * time.Second)
+	}
+	if acknowledgements == 0 || acknowledgements >= heartbeats/2 {
+		t.Fatalf("complete-phase acknowledgement attempts after %d heartbeats = %d, want bounded retries", heartbeats, acknowledgements)
+	}
+	record, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found || record.phase != runtimeRemovalComplete || record.stallRetryAttempts == 0 {
+		t.Fatalf("complete-phase durable retry state = %+v found=%t err=%v", record, found, err)
+	}
+}
+
 func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "transition-node", 1024)
 	defer spool.Close()
@@ -195,26 +267,39 @@ func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.
 	if _, _, err := spool.freezeRuntimeRemovalStallDeclaration(t.Context(), removal, declaration, "stall-key"); err != nil {
 		t.Fatal(err)
 	}
-	if err := spool.recordRuntimeRemovalStallDeclared(t.Context(), removal, now); err != nil {
-		t.Fatal(err)
-	}
 	var logs []string
-	controller := &removalController{nodeID: "transition-node", stallBound: l1.DefaultRemovalStallBound,
+	controller := &removalController{nodeID: "transition-node", bootSessionID: "boot", stallBound: l1.DefaultRemovalStallBound,
+		managed: &recordingResumeResource{}, outbox: &evidenceOutbox{}, inflight: make(map[string]struct{}),
 		now: func() time.Time { return now }, logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
 	controller.loadRuntimeRemoval = spool.runtimeRemoval
 	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
 		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
 	}
+	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error { return nil }
+	controller.recordStallDeclared = func(ctx context.Context, target localRemoval) error {
+		return spool.recordRuntimeRemovalStallDeclared(ctx, target, now)
+	}
 	directive := l1.RemovalDirective{JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: contract.JobKindOCI,
 		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID}
+	if suppressed, err := controller.noteRemovalFailure(t.Context(), directive, wedgeRefusal()); err != nil || !suppressed {
+		t.Fatalf("declare A refusal = suppressed:%t err:%v", suppressed, err)
+	}
 
 	causes := []error{
 		&ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"},
 		&ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"},
 		wedgeRefusal(),
 	}
+	causeIndex := 0
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		cause := causes[causeIndex]
+		causeIndex++
+		return workloadrunner.ReapReceipt{}, cause
+	}
 	delays := []time.Duration{15 * time.Second, 30 * time.Second, time.Minute}
-	for index, cause := range causes {
+	failures := make(chan destinationError, len(causes))
+	for index := range causes {
 		record, _, err := spool.runtimeRemoval(t.Context(), removal.jobID)
 		if err != nil {
 			t.Fatal(err)
@@ -228,7 +313,8 @@ func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.
 		if controller.declaredRemovalRetryDeferred(record) {
 			t.Fatalf("retry %d stayed deferred at its %s deadline", index+1, delays[index])
 		}
-		_, _ = controller.noteRemovalFailure(t.Context(), directive, cause)
+		controller.enqueue(t.Context(), directive, failures)
+		controller.wait()
 		record, _, err = spool.runtimeRemoval(t.Context(), removal.jobID)
 		if err != nil {
 			t.Fatal(err)
@@ -242,12 +328,16 @@ func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.
 		}
 		controller.now = func() time.Time { return now }
 	}
-	if len(logs) != 2 {
-		t.Fatalf("refusal transitions logged %d times, want B then A exactly once: %v", len(logs), logs)
+	if len(failures) != 0 {
+		t.Fatalf("refusal transitions reached the session fence: %+v", <-failures)
 	}
-	if !strings.Contains(logs[0], string(ocihelper.CodeSessionStale)) ||
-		!strings.Contains(logs[1], string(ocihelper.CodeUnauthorizedAttempt)) {
-		t.Fatalf("refusal transition logs = %v, want B then A", logs)
+	if len(logs) != 3 {
+		t.Fatalf("declaration and refusal transitions logged %d times, want declaration, B, A: %v", len(logs), logs)
+	}
+	if !strings.Contains(logs[0], "removal declared stalled") ||
+		!strings.Contains(logs[1], string(ocihelper.CodeSessionStale)) ||
+		!strings.Contains(logs[2], string(ocihelper.CodeUnauthorizedAttempt)) {
+		t.Fatalf("declaration/refusal transition logs = %v, want declaration then B then A", logs)
 	}
 	record, _, err := spool.runtimeRemoval(t.Context(), removal.jobID)
 	if err != nil {
