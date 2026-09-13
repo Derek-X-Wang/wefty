@@ -386,7 +386,7 @@ func checkLogEvidence(evidence logEvidence, stdoutMarker, stderrMarker string) e
 // Computer disk from the descriptor's Storage identity -- so passing the row's
 // own descriptors is what keeps those two halves of the proof from naming
 // something that can never appear.
-func deleteAndVerify(ctx context.Context, session attendedSession, authority ocihelper.AttemptAuthority,
+func deleteAndVerify(ctx context.Context, session attendedSession, config attendedConfig, authority ocihelper.AttemptAuthority,
 	volumes []ocihelper.ManagedVolumeDescriptor) error {
 	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
 	if err != nil {
@@ -399,7 +399,7 @@ func deleteAndVerify(ctx context.Context, session attendedSession, authority oci
 	if err != nil {
 		return fmt.Errorf("verify attempt absence: %w", err)
 	}
-	return checkAttemptAbsence(verification, authority, volumes)
+	return checkAttemptAbsence(verification, authority, volumes, config.now())
 }
 
 // attemptAbsenceNote is the one line every row using deleteAndVerify carries,
@@ -447,7 +447,7 @@ var retainableAfterDelete = map[ocihelper.RemovalResourceClass]ocihelper.Durable
 // quietly drop out of this proof, because attemptInventoryEntries fails the
 // row on a class it does not know how to look up.
 func checkAttemptAbsence(verification ocihelper.VerifyResponse, authority ocihelper.AttemptAuthority,
-	volumes []ocihelper.ManagedVolumeDescriptor) error {
+	volumes []ocihelper.ManagedVolumeDescriptor, now time.Time) error {
 	identity, err := ocihelper.DeterministicResourceIdentity(authority)
 	if err != nil {
 		return err
@@ -480,7 +480,7 @@ func checkAttemptAbsence(verification ocihelper.VerifyResponse, authority ocihel
 			return fmt.Errorf("%s %v survived delete in the namespace inventory", resource.Class, observed)
 		}
 		for _, name := range observed {
-			if !boundDurableRetention(verification.DurableRetentions, resource.Class, name, reason, authority.AttemptID) {
+			if !boundDurableRetention(verification.DurableRetentions, resource.Class, name, reason, authority.AttemptID, now) {
 				return fmt.Errorf("%s %q survived delete without a bounded helper retention naming attempt %s",
 					resource.Class, name, authority.AttemptID)
 			}
@@ -595,14 +595,19 @@ func attemptInventoryEntries(inventory ocihelper.ResourceInventory, resource oci
 
 // boundDurableRetention is the helper's own binding shape, checked here rather
 // than assumed: a retention that does not name this attempt, this class, this
-// resource and a closed bounded deadline explains nothing.
+// resource and a closed, still-live bounded deadline explains nothing. As in
+// the helper's own expired-sweep rule (runner/ocihelper/boot_barrier.go), a
+// bound only excuses a survivor while its deadline is still strictly in the
+// future; a zero deadline is not a bound and fails the row just like an
+// unbounded retention.
 func boundDurableRetention(retentions []ocihelper.DurableRetention, class ocihelper.RemovalResourceClass,
-	name string, reason ocihelper.DurableRetentionReason, attemptID string) bool {
+	name string, reason ocihelper.DurableRetentionReason, attemptID string, now time.Time) bool {
 	for _, retention := range retentions {
 		if retention.Class == class && retention.ID == name && retention.Reason == reason &&
 			retention.AttemptID == attemptID && retention.Owner == ocihelper.DurableRetentionOwnerOCIHelper &&
-			retention.Bound > 0 && !retention.RecordedAt.IsZero() &&
-			retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) {
+			retention.Bound > 0 && !retention.RecordedAt.IsZero() && !retention.Deadline.IsZero() &&
+			retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) &&
+			retention.Deadline.After(now) {
 			return true
 		}
 	}
@@ -709,7 +714,7 @@ func driveTaskLogsDelete(ctx context.Context, session attendedSession, config at
 	row.StdoutMarkers = []string{stdoutMarker}
 	row.StderrMarkers = []string{stderrMarker}
 	row.PayloadExecutions = 1
-	if err := deleteAndVerify(ctx, session, authority, nil); err != nil {
+	if err := deleteAndVerify(ctx, session, config, authority, nil); err != nil {
 		row.fail(err)
 		return row
 	}
@@ -937,7 +942,7 @@ func driveMountValidation(ctx context.Context, session attendedSession, config a
 		row.fail(fmt.Errorf("guest %s = %q, want the bytes the payload wrote", guestPath, guestBytes))
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority, nil); err != nil {
+	if err := deleteAndVerify(ctx, session, config, authority, nil); err != nil {
 		row.fail(err)
 		return row
 	}
@@ -1105,7 +1110,7 @@ func driveHostToGuest(ctx context.Context, session attendedSession, config atten
 		row.fail(err)
 		return row
 	}
-	if err := deleteAndVerify(ctx, session, authority, volumes); err != nil {
+	if err := deleteAndVerify(ctx, session, config, authority, volumes); err != nil {
 		row.fail(err)
 		return row
 	}
