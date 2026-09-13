@@ -149,6 +149,10 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		leaseDuration:     l1.DefaultLeaseDuration,
 		productionTimings: true,
 		agentArguments:    agentArguments,
+		// The Linux-only kind=oci agent-SIGKILL arm runs a third service-class
+		// job alongside primary and sibling; the default two-slot pool would
+		// leave it queued instead of running.
+		maxServiceSlots: 3,
 	})
 	t.Cleanup(func() {
 		evidence.recordProcessOutput("control-plane.log", harness.controlPlane)
@@ -220,6 +224,13 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		t, harness, siblingClient, sibling.JobID, siblingRunning.CurrentAttemptID, siblingHealth.PID,
 	)
 
+	var ociSigkillJob, ociSigkillRunning l1.Job
+	if runtime.GOOS == "linux" {
+		ociSigkillJob = harness.submitPersistentOCIService(t)
+		ociSigkillRunning = harness.waitForJobState(t, ociSigkillJob.JobID, contract.JobClassService, contract.JobRunning, 45*time.Second)
+		evidence.recordJob(t, harness, "status-oci-before-agent-sigkill.json", ociSigkillJob.JobID)
+	}
+
 	evidence.recordJob(t, harness, "status-before-agent-sigkill.json", primary.JobID)
 	guardianStarted := time.Now()
 	harness.agent.kill(t)
@@ -250,6 +261,16 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	evidence.recordJob(t, harness, "status-sibling-after-agent-restart.json", sibling.JobID)
 	if siblingAfterAgentRestart.CurrentAttemptID == siblingRunning.CurrentAttemptID {
 		t.Fatal("sibling did not receive a fresh attempt after agent SIGKILL")
+	}
+	if runtime.GOOS == "linux" {
+		ociSigkillAfterRestart := waitForFreshRunningAttempt(
+			t, harness, ociSigkillJob.JobID, ociSigkillRunning.CurrentAttemptID, 75*time.Second,
+		)
+		evidence.recordJob(t, harness, "status-oci-after-agent-sigkill.json", ociSigkillJob.JobID)
+		if ociSigkillAfterRestart.CurrentAttemptID == ociSigkillRunning.CurrentAttemptID {
+			t.Fatal("kind=oci service did not receive a fresh attempt after agent SIGKILL")
+		}
+		evidence.write("oci-service-agent-sigkill-linux.txt", []byte("service_oci_payload_sigkill_survived=true\n"))
 	}
 
 	logs := waitForAttemptLogs(t, harness, primary.JobID, attemptIDs, 30*time.Second)
