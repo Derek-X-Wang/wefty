@@ -23,6 +23,51 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
+// linuxRootFaultBound is the window the lane gives the root fault supervisor to
+// acknowledge one action.
+const linuxRootFaultBound = 90 * time.Second
+
+// requestLinuxRootFault writes one action to the lane's root fault FIFO and
+// waits for the supervisor's acknowledgement file. The context is the caller's
+// on purpose: a restoration that has to survive its own test cannot be bounded
+// by t.Context(), which Go cancels before cleanup functions run -- such a
+// restoration could never even start its FIFO write, and the helper units would
+// stay down for every later test in this sequential lane.
+func requestLinuxRootFault(ctx context.Context, fifo, directory, action string) error {
+	done := filepath.Join(directory, action+".done")
+	failure := filepath.Join(directory, action+".failed")
+	_ = os.Remove(done)
+	_ = os.Remove(failure)
+	command := exec.CommandContext(ctx, "sh", "-c", `printf '%s\n' "$1" > "$2"`, "wefty-fault", action, fifo)
+	if output, err := command.CombinedOutput(); err != nil {
+		return fmt.Errorf("trigger fault %s: %w\n%s", action, err, output)
+	}
+	for ctx.Err() == nil {
+		if _, err := os.Stat(done); err == nil {
+			return nil
+		}
+		if payload, err := os.ReadFile(failure); err == nil {
+			return fmt.Errorf("root assertion %s failed: %s", action, payload)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("fault %s did not complete", action)
+}
+
+// claimPairFaultSupervisor is the lane's root fault channel, resolved once in
+// the test body so the restoration cleanup never has to look up an environment
+// variable (and so never has to report a missing one through a t.Fatalf that
+// would abort the harness's own teardown).
+type claimPairFaultSupervisor struct{ fifo, directory string }
+
+// run bounds every action independently of the test context, so the same call
+// works from the test body and from a cleanup.
+func (supervisor claimPairFaultSupervisor) run(action string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), linuxRootFaultBound)
+	defer cancel()
+	return requestLinuxRootFault(ctx, supervisor.fifo, supervisor.directory, action)
+}
+
 // ociClaimPairSettleBudget bounds one claim transition. A withdrawal costs the
 // heartbeat that reaches barrier recovery, the bounded takeover-and-verify
 // window that recovery spends proving the unit is gone, and the heartbeat that
@@ -65,6 +110,10 @@ func TestOCINodeCapabilityClaimPairAtProductionTimings(t *testing.T) {
 	probeReference := requiredClaimPairEnvironment(t, "WEFTY_OCI_PROBE_REFERENCE")
 	probeDigest := requiredClaimPairEnvironment(t, "WEFTY_OCI_PROBE_DIGEST")
 	probeArchive := requiredClaimPairEnvironment(t, "WEFTY_OCI_PROBE_ARCHIVE")
+	supervisor := claimPairFaultSupervisor{
+		fifo:      requiredClaimPairEnvironment(t, "WEFTY_OCI_FAULT_FIFO"),
+		directory: requiredClaimPairEnvironment(t, "WEFTY_OCI_FAULT_DIR"),
+	}
 	importRealtimeProbeImage(t, probeArchive, helperSocket, helperChecksum, probeReference, probeDigest, nil)
 
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
@@ -104,8 +153,30 @@ func TestOCINodeCapabilityClaimPairAtProductionTimings(t *testing.T) {
 		},
 	})
 	t.Cleanup(func() {
+		// L1-side evidence matters as much as the agent's: a claim that never
+		// reached the control plane looks identical from the agent log alone.
+		evidence.recordProcessOutput("capability-claims-control-plane.log", harness.controlPlane)
 		for index, process := range harness.agents {
 			evidence.recordProcessOutput(fmt.Sprintf("capability-claims-agent-%02d.log", index+1), process)
+		}
+	})
+
+	// Arm the restoration before anything can stop the units, and after the
+	// harness exists so LIFO cleanup brings the helper back before the agent and
+	// control plane are torn down. start-helper-topology is idempotent -- the
+	// supervisor starts both units and asserts them active -- so it is a no-op
+	// assertion if nothing was stopped and exactly the repair needed if a stop
+	// was applied but never acknowledged.
+	helperTopologyRestored := false
+	t.Cleanup(func() {
+		if helperTopologyRestored {
+			return
+		}
+		if err := supervisor.run("start-helper-topology"); err != nil {
+			// Errorf, not Fatalf: a Goexit here would skip the harness's own
+			// process teardown, and a lane left with both a down helper and a
+			// stray agent is strictly worse than a failed test.
+			t.Errorf("restore the helper topology: %v", err)
 		}
 	})
 
@@ -117,13 +188,9 @@ func TestOCINodeCapabilityClaimPairAtProductionTimings(t *testing.T) {
 	// The fault class is the lane's existing root-supervised one: an
 	// unprivileged test step cannot drive systemctl, so it asks the root fault
 	// supervisor to stop both helper units and waits for the acknowledgement.
-	triggerLinuxComputerFault(t, harness, "stop-helper-topology")
-	topologyStopped := true
-	t.Cleanup(func() {
-		if topologyStopped {
-			triggerLinuxComputerFault(t, harness, "start-helper-topology")
-		}
-	})
+	if err := supervisor.run("stop-helper-topology"); err != nil {
+		t.Fatal(err)
+	}
 
 	incapable := waitForNodeDoctorClaim(t, nodeConfig,
 		"kind:oci withdrawn with "+string(contract.CapabilityReasonHelperUnitUnavailable),
@@ -140,8 +207,10 @@ func TestOCINodeCapabilityClaimPairAtProductionTimings(t *testing.T) {
 			incapable.revision, capable.revision)
 	}
 
-	triggerLinuxComputerFault(t, harness, "start-helper-topology")
-	topologyStopped = false
+	if err := supervisor.run("start-helper-topology"); err != nil {
+		t.Fatal(err)
+	}
+	helperTopologyRestored = true
 
 	reearned := waitForNodeDoctorClaim(t, nodeConfig,
 		fmt.Sprintf("kind:oci re-earned above capability revision %d", incapable.revision),
@@ -171,9 +240,18 @@ type nodeDoctorClaim struct {
 	process    bool
 	reasonCode contract.CapabilityReasonCode
 	revision   int64
+	pending    int64
 	missing    []string
 	payload    []byte
 }
+
+// settled is the difference between a revision the node holds and a revision L1
+// has acknowledged. A non-zero pending publication is the agent's own statement
+// that its local observation has not reached the control plane yet, and the
+// doctor labels such a report oci_capability_revision_pending. Accepting one
+// would let this receipt claim an L1-orderable pair while its own published JSON
+// says the revision was still in flight.
+func (claim nodeDoctorClaim) settled() bool { return claim.pending == 0 }
 
 func requiredClaimPairEnvironment(t *testing.T, name string) string {
 	t.Helper()
@@ -211,6 +289,7 @@ func readNodeDoctorClaim(ctx context.Context, nodeConfig string) (nodeDoctorClai
 		process:    report.Probe.Capabilities["kind:process"],
 		reasonCode: report.Probe.CapabilityReasonCode,
 		revision:   report.Probe.CapabilityRevision,
+		pending:    report.Probe.PendingPublicationRevision,
 		missing:    report.Probe.MissingCapabilities,
 		payload:    payload,
 	}, nil
@@ -226,15 +305,16 @@ func waitForNodeDoctorClaim(t *testing.T, nodeConfig, want string, satisfied fun
 		claim, err := readNodeDoctorClaim(ctx, nodeConfig)
 		if err == nil {
 			last, lastErr = claim, nil
-			if satisfied(claim) {
+			if claim.settled() && satisfied(claim) {
 				return claim
 			}
 		} else if ctx.Err() == nil {
 			lastErr = err
 		}
 		if ctx.Err() != nil {
-			t.Fatalf("wefty node doctor never reported %s within %s: capable=%t kind:process=%t reason=%q revision=%d missing=%v last error: %v",
-				want, ociClaimPairSettleBudget, last.capable, last.process, last.reasonCode, last.revision, last.missing, lastErr)
+			t.Fatalf("wefty node doctor never reported %s within %s: capable=%t kind:process=%t reason=%q revision=%d pending=%d missing=%v last error: %v",
+				want, ociClaimPairSettleBudget, last.capable, last.process, last.reasonCode,
+				last.revision, last.pending, last.missing, lastErr)
 		}
 		select {
 		case <-ctx.Done():
