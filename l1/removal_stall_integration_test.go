@@ -73,8 +73,8 @@ func (harness removalStallHarness) declaration(key string) RemovalAcknowledgemen
 		IdempotencyKey: ServiceRemovalStallKeyPrefix + key,
 		CleanupStall: &ServiceRemovalStallEvidence{
 			Kind: ServiceRemovalStallEvidenceKind, JobID: harness.job.JobID, NodeID: harness.node.NodeID,
-			BootSessionID: harness.node.BootSessionID, RemovalGeneration: harness.directive.RemovalGeneration,
-			CleanupFence: harness.directive.CleanupFence, Phase: "prepared",
+			RemovalGeneration: harness.directive.RemovalGeneration,
+			CleanupFence:      harness.directive.CleanupFence, Phase: "prepared",
 			LastRefusalCode:   "unauthorized_attempt",
 			LastRefusalDetail: "attempt authority does not match a live attempt",
 			Attempts:          4, PreparedAt: prepared, LastAttemptedAt: prepared.Add(time.Minute),
@@ -345,5 +345,196 @@ func TestServiceRemovalStatusMigrationAdmitsTheStalledOutcome(t *testing.T) {
 	if _, err := store.db.Exec(`UPDATE service_removals SET status=? WHERE job_id=?`,
 		contract.JobStalledCleanupUnverified, harness.job.JobID); err != nil {
 		t.Fatalf("migrated schema still refuses the stalled outcome: %v", err)
+	}
+	// A rebuild that leaves enforcement off, or that orphaned a row, is not a
+	// successful migration.
+	var enforced int
+	if err := store.db.QueryRow(`PRAGMA foreign_keys`).Scan(&enforced); err != nil {
+		t.Fatal(err)
+	}
+	if enforced != 1 {
+		t.Fatal("the migration left foreign-key enforcement disabled")
+	}
+	violations, err := store.db.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer violations.Close()
+	if violations.Next() {
+		t.Fatal("the migration left a foreign-key violation")
+	}
+}
+
+// TestStalledRemovalKeepsItsBindingImagePinUntilCleanupCompletes is the other
+// half of "releases the Slot but claims nothing". The pin is what the standing
+// directive still needs; a reconciler that reads the binding proof must not be
+// told the binding is gone while cleanup is still owed.
+func TestStalledRemovalKeepsItsBindingImagePinUntilCleanupCompletes(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	proof := ServiceBindingProofRequest{NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID}
+	harness.advancePastStallBound(t)
+	if _, err := harness.declare(t, harness.declaration("image-pin")); err != nil {
+		t.Fatalf("declare stalled removal: %v", err)
+	}
+	bound, err := harness.h.store.ProveServiceBinding(context.Background(), "fabric-agent", harness.job.JobID, proof)
+	if err != nil || !bound {
+		t.Fatalf("stalled binding proof = %t, %v; the pin would be deleted", bound, err)
+	}
+	// Only positive cleanup ends the obligation.
+	completion := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "removal:pin-release",
+	}
+	if _, err := harness.declare(t, completion); err != nil {
+		t.Fatalf("late completion acknowledgement: %v", err)
+	}
+	bound, err = harness.h.store.ProveServiceBinding(context.Background(), "fabric-agent", harness.job.JobID, proof)
+	if err != nil || bound {
+		t.Fatalf("cleaned binding proof = %t, %v; the pin must be released", bound, err)
+	}
+}
+
+// TestForceForgetNeverRewritesAStalledRemoval covers both shapes: the live
+// stalled row, and the tombstone a late cleanup leaves behind.
+func TestForceForgetNeverRewritesAStalledRemoval(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	harness.advancePastStallBound(t)
+	if _, err := harness.declare(t, harness.declaration("force-forget")); err != nil {
+		t.Fatalf("declare stalled removal: %v", err)
+	}
+	waived, err := harness.h.store.ForceForgetService(context.Background(), harness.job.JobID)
+	if err != nil {
+		t.Fatalf("force-forget over a stalled removal: %v", err)
+	}
+	if waived.State != contract.JobStalledCleanupUnverified ||
+		waived.Removal.RemovalOutcome != ServiceRemovalOutcomeCleanupStalled {
+		t.Fatalf("force-forget rewrote the terminal agent outcome: %#v", waived)
+	}
+
+	completion := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "removal:forget-late",
+	}
+	if _, err := harness.declare(t, completion); err != nil {
+		t.Fatalf("late completion acknowledgement: %v", err)
+	}
+	if _, _, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID); err != nil {
+		t.Fatalf("finalize after a late cleanup: %v", err)
+	}
+	finalized, err := harness.h.store.ForceForgetService(context.Background(), harness.job.JobID)
+	if err != nil {
+		t.Fatalf("force-forget over a finalized stalled removal: %v", err)
+	}
+	if finalized.State != contract.JobStalledCleanupUnverified ||
+		finalized.Removal.RemovalOutcome != ServiceRemovalOutcomeCleanupStalled {
+		t.Fatalf("force-forget rewrote a finalized stalled removal: %#v", finalized)
+	}
+}
+
+// TestFinalizedStalledRemovalKeepsItsEvidenceAndReplayIdentity proves the
+// tombstone carries what the deleted row carried: a reader still sees why the
+// Slot was released, and a replay is still matched, not merely identified.
+func TestFinalizedStalledRemovalKeepsItsEvidenceAndReplayIdentity(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	harness.advancePastStallBound(t)
+	declaration := harness.declaration("tombstone")
+	if _, err := harness.declare(t, declaration); err != nil {
+		t.Fatalf("declare stalled removal: %v", err)
+	}
+	completion := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "removal:tombstone-late",
+	}
+	if _, err := harness.declare(t, completion); err != nil {
+		t.Fatalf("late completion acknowledgement: %v", err)
+	}
+	finalized, done, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID)
+	if err != nil || !done {
+		t.Fatalf("finalize = %#v, %t, %v", finalized, done, err)
+	}
+	if finalized.Removal == nil || finalized.Removal.Stall == nil ||
+		finalized.Removal.Stall.LastRefusalCode != "unauthorized_attempt" ||
+		finalized.Removal.Stall.Attempts != 4 || finalized.Removal.StalledAt == nil {
+		t.Fatalf("finalized stalled projection lost its evidence: %#v", finalized.Removal)
+	}
+	replayed, err := harness.declare(t, declaration)
+	if err != nil || replayed.State != contract.JobStalledCleanupUnverified {
+		t.Fatalf("finalized declaration replay = %#v, %v", replayed, err)
+	}
+	changed := harness.declaration("tombstone")
+	changed.CleanupStall.Attempts = 11
+	if _, err := harness.declare(t, changed); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("finalized replay with changed evidence = %v, want idempotency_conflict", err)
+	}
+}
+
+// TestCrashBetweenLateCleanupAndFinalizeStillReconcilesAStalledRemoval walks
+// the transaction boundary: once acknowledged the directive stops being
+// redispatched, so only recovery can finish the job.
+func TestCrashBetweenLateCleanupAndFinalizeStillReconcilesAStalledRemoval(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	harness.advancePastStallBound(t)
+	if _, err := harness.declare(t, harness.declaration("recovery")); err != nil {
+		t.Fatalf("declare stalled removal: %v", err)
+	}
+	completion := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "removal:recovery-late",
+	}
+	// The acknowledgement commits; finalization is the separate transaction a
+	// crash lands between, so it is simply never called here.
+	if _, err := harness.declare(t, completion); err != nil {
+		t.Fatalf("late completion acknowledgement: %v", err)
+	}
+	directives, err := harness.h.store.ListNodeRemovalDirectives(context.Background(), "fabric-agent",
+		harness.node.NodeID, harness.node.BootSessionID)
+	if err != nil || len(directives) != 0 {
+		t.Fatalf("acknowledged removal still redispatches: %#v, %v", directives, err)
+	}
+	result, err := harness.h.store.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if result.FinalizedRemovals != 1 {
+		t.Fatalf("recovery finalized %d removals, want 1", result.FinalizedRemovals)
+	}
+	var outcome string
+	if err := harness.h.store.db.QueryRow(`SELECT outcome FROM service_tombstones WHERE job_id=?`, harness.job.JobID).
+		Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != string(ServiceRemovalOutcomeCleanupStalled) {
+		t.Fatalf("recovered tombstone outcome = %q, want cleanup_stalled", outcome)
+	}
+}
+
+// TestStallDeclarationIsAcceptedFromALaterBoot is what makes a lost response
+// survivable: the agent replays the frozen bytes under the same key, and the
+// boot that finally lands is not the boot that first sent it.
+func TestStallDeclarationIsAcceptedFromALaterBoot(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	harness.advancePastStallBound(t)
+	declaration := harness.declaration("lost-response")
+	if _, err := harness.declare(t, declaration); err != nil {
+		t.Fatalf("declare stalled removal: %v", err)
+	}
+	replacement := harness.node.NodeRegistration
+	replacement.BootSessionID = "boot-after-restart"
+	status, _, body := harness.h.do(harness.h.client(harness.agent), http.MethodPost,
+		"/v1/agent/nodes/register", replacement)
+	if status != http.StatusOK {
+		t.Fatalf("replacement register status = %d body=%s", status, body)
+	}
+	// The frozen declaration is unchanged; only the enclosing request carries
+	// the new boot, exactly as the agent's replay does.
+	retried := declaration
+	retried.BootSessionID = replacement.BootSessionID
+	replayed, err := harness.declare(t, retried)
+	if err != nil || replayed.State != contract.JobStalledCleanupUnverified {
+		t.Fatalf("replay from a later boot = %#v, %v", replayed, err)
 	}
 }

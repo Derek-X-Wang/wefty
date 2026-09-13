@@ -126,8 +126,22 @@ type ServiceRemoval struct {
 	// Stall is the bound agent's typed account of a removal that could not
 	// complete. It is present exactly when the removal is terminally stalled,
 	// and it never asserts that any runtime resource was deleted.
-	Stall     *ServiceRemovalStallEvidence `json:"stall,omitempty"`
-	StalledAt *time.Time                   `json:"stalled_at,omitempty"`
+	Stall     *ServiceRemovalStall `json:"stall,omitempty"`
+	StalledAt *time.Time           `json:"stalled_at,omitempty"`
+}
+
+// ServiceRemovalStall is the operator projection of a stalled removal. Like
+// ServiceRemoval itself it deliberately omits cleanup authority: the fence and
+// the node identity that produced the declaration explain nothing about the
+// non-completion and grant write authority, so only the facts an operator acts
+// on survive the projection.
+type ServiceRemovalStall struct {
+	Phase             string    `json:"phase"`
+	LastRefusalCode   string    `json:"last_refusal_code"`
+	LastRefusalDetail string    `json:"last_refusal_detail,omitempty"`
+	Attempts          int       `json:"attempts"`
+	PreparedAt        time.Time `json:"prepared_at"`
+	LastAttemptedAt   time.Time `json:"last_attempted_at"`
 }
 
 type ServiceRemovalOutcome string
@@ -217,11 +231,14 @@ type RemovalAcknowledgementRequest struct {
 // standing removal never completed. Every field records non-completion: none
 // of them asserts that a runtime resource was deleted. L1 stores it verbatim
 // as the durable reason a service slot was released without proof.
+// It deliberately carries no boot session. The declaration is frozen durably
+// before it is sent and replayed byte for byte until L1 accepts it, so it must
+// stay valid across the agent restart that a lost response can straddle; the
+// enclosing request still carries and proves the current boot.
 type ServiceRemovalStallEvidence struct {
 	Kind              string    `json:"kind"`
 	JobID             string    `json:"job_id"`
 	NodeID            string    `json:"node_id"`
-	BootSessionID     string    `json:"boot_session_id"`
 	RemovalGeneration uint64    `json:"removal_generation"`
 	CleanupFence      string    `json:"cleanup_fence"`
 	Phase             string    `json:"phase"`
@@ -230,6 +247,15 @@ type ServiceRemovalStallEvidence struct {
 	Attempts          int       `json:"attempts"`
 	PreparedAt        time.Time `json:"prepared_at"`
 	LastAttemptedAt   time.Time `json:"last_attempted_at"`
+}
+
+// Stall renders the operator-safe half of a durable declaration.
+func (evidence ServiceRemovalStallEvidence) Stall() ServiceRemovalStall {
+	return ServiceRemovalStall{
+		Phase: evidence.Phase, LastRefusalCode: evidence.LastRefusalCode,
+		LastRefusalDetail: evidence.LastRefusalDetail, Attempts: evidence.Attempts,
+		PreparedAt: evidence.PreparedAt, LastAttemptedAt: evidence.LastAttemptedAt,
+	}
 }
 
 // ServiceRemovalStallEvidenceKind is the only accepted stall receipt kind.

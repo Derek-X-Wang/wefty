@@ -898,7 +898,11 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
   last_bound_node_id TEXT NOT NULL,
   removal_generation INTEGER NOT NULL CHECK(removal_generation > 0),
   root_instance_id TEXT NOT NULL,
-  cleanup_acknowledged_ns INTEGER
+  cleanup_acknowledged_ns INTEGER,
+  stall_evidence_json BLOB,
+  stall_acknowledgement_key TEXT,
+  stall_acknowledgement_hash TEXT,
+  stalled_ns INTEGER
 );
 INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
@@ -1029,6 +1033,14 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	}
 	if err := s.ensureColumn(ctx, "service_removals", "stalled_ns", "INTEGER"); err != nil {
 		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"stall_evidence_json", "BLOB"}, {"stall_acknowledgement_key", "TEXT"},
+		{"stall_acknowledgement_hash", "TEXT"}, {"stalled_ns", "INTEGER"},
+	} {
+		if err := s.ensureColumn(ctx, "service_tombstones", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
@@ -1239,7 +1251,12 @@ func (s *Store) migrateServiceRemovalStallConstraints(ctx context.Context) error
 	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return fmt.Errorf("l1: disable foreign keys for service removal stall migration: %w", err)
 	}
-	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	restored := false
+	defer func() {
+		if !restored {
+			connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+		}
+	}()
 	transaction, err := connection.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("l1: begin service removal stall schema migration: %w", err)
@@ -1285,6 +1302,24 @@ func (s *Store) migrateServiceRemovalStallConstraints(ctx context.Context) error
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("l1: commit service removal stall schema migration: %w", err)
+	}
+	// A rebuild that leaves this pooled connection with enforcement off, or
+	// that silently orphaned a row, is not a successful migration. Restore and
+	// prove it rather than trusting a deferred call whose error is discarded.
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		return fmt.Errorf("l1: restore foreign keys after service removal stall migration: %w", err)
+	}
+	restored = true
+	violations, err := connection.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("l1: verify foreign keys after service removal stall migration: %w", err)
+	}
+	defer violations.Close()
+	if violations.Next() {
+		return errors.New("l1: service removal stall migration left a foreign-key violation")
+	}
+	if err := violations.Err(); err != nil {
+		return fmt.Errorf("l1: iterate foreign-key check after service removal stall migration: %w", err)
 	}
 	return nil
 }

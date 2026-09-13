@@ -153,6 +153,9 @@ type RemovalRecord struct {
 	LastRefusalDetail string     `json:"last_refusal_detail,omitempty"`
 	LastAttemptedAt   *time.Time `json:"last_attempted_at,omitempty"`
 	StallDeclaredAt   *time.Time `json:"stall_declared_at,omitempty"`
+	// StallDeclarationFrozen reports that the agent wrote a declaration but
+	// L1 has not accepted it, which is the state a lost response leaves.
+	StallDeclarationFrozen bool `json:"stall_declaration_frozen,omitempty"`
 }
 
 type RemovalsResponse struct {

@@ -171,9 +171,14 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
+	// A waived or stalled removal that a returning node finally cleaned is
+	// acknowledged but not finalized, and its directive no longer redispatches
+	// to try again, so a crash between the two commits would strand it here
+	// forever unless recovery reconciles it too.
 	removalRows, err := tx.QueryContext(ctx, `SELECT job_id FROM service_removals
-		WHERE status=? OR (status=? AND agent_cleaned_ns IS NOT NULL)
-		ORDER BY requested_ns, job_id`, contract.JobAgentCleaned, contract.JobForgottenCleanupUnverified)
+		WHERE status=? OR (status IN (?, ?) AND cleanup_status=? AND agent_cleaned_ns IS NOT NULL)
+		ORDER BY requested_ns, job_id`, contract.JobAgentCleaned, contract.JobForgottenCleanupUnverified,
+		contract.JobStalledCleanupUnverified, ServiceRemovalCleanupAcknowledged)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "select acknowledged service removals")
 	}

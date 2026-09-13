@@ -914,9 +914,8 @@ func TestStalledComputerRemovalIsAnAnswerNotATimeout(t *testing.T) {
 				RemovalRequestedAt: stalledAt.Add(-12 * time.Minute), StalledAt: &stalledAt,
 				CleanupStatus:  l1.ServiceRemovalCleanupPending,
 				RemovalOutcome: l1.ServiceRemovalOutcomeCleanupStalled,
-				Stall: &l1.ServiceRemovalStallEvidence{
-					Kind: l1.ServiceRemovalStallEvidenceKind, JobID: "job", Phase: "prepared",
-					LastRefusalCode: "unauthorized_attempt", Attempts: 5,
+				Stall: &l1.ServiceRemovalStall{
+					Phase: "prepared", LastRefusalCode: "unauthorized_attempt", Attempts: 5,
 				}}}}
 	err := awaitedComputerRemovalOutcome(computer)
 	var responseErr *apiResponseError
@@ -950,7 +949,7 @@ func TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome(t *testing.T) {
 	removal := &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved,
 		RemovalGeneration: 1, RemovalRequestedAt: stalledAt.Add(-12 * time.Minute), StalledAt: &stalledAt,
 		CleanupStatus: l1.ServiceRemovalCleanupPending, RemovalOutcome: l1.ServiceRemovalOutcomeCleanupStalled,
-		Stall: &l1.ServiceRemovalStallEvidence{LastRefusalCode: "unauthorized_attempt", Attempts: 5}}
+		Stall: &l1.ServiceRemovalStall{LastRefusalCode: "unauthorized_attempt", Attempts: 5}}
 	rendered := computerRemovalColumn("removal_pending", removal)
 	for _, want := range []string{"removal_pending", "stalled", "unauthorized_attempt", "5", "12m0s"} {
 		if !strings.Contains(rendered, want) {
@@ -959,5 +958,34 @@ func TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome(t *testing.T) {
 	}
 	if got := computerRemovalColumn("removed_verified", nil); got != "removed_verified" {
 		t.Fatalf("ordinary removal column = %q, want the bare outcome", got)
+	}
+}
+
+// TestStalledServiceRemovalDoesNotExitSuccessfully is the plain-service twin
+// of the Computer path. Automation reads the exit code, and exit zero here
+// would claim the service's runtime state is gone when nothing proved that.
+func TestStalledServiceRemovalDoesNotExitSuccessfully(t *testing.T) {
+	job := l1.Job{JobID: "job", State: contract.JobStalledCleanupUnverified,
+		Removal: &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved,
+			RemovalGeneration: 1, CleanupStatus: l1.ServiceRemovalCleanupPending,
+			RemovalOutcome: l1.ServiceRemovalOutcomeCleanupStalled,
+			Stall: &l1.ServiceRemovalStall{Phase: "prepared",
+				LastRefusalCode: "unauthorized_attempt", Attempts: 4}}}
+	if !serviceRemovalComplete(job) {
+		t.Fatal("a stalled removal must stop the wait; it can never become verified")
+	}
+	err := awaitedServiceRemovalOutcome(job)
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorConflict ||
+		commandExitCode(err) != exitConflict {
+		t.Fatalf("stalled service removal = %T %v, want typed conflict", err, err)
+	}
+	if responseErr.APIError.Details["last_refusal_code"] != "unauthorized_attempt" ||
+		responseErr.APIError.Details["attempts"] != 4 {
+		t.Fatalf("stalled service removal details = %#v", responseErr.APIError.Details)
+	}
+	verified := l1.Job{JobID: "job", State: contract.JobRemovedVerified}
+	if err := awaitedServiceRemovalOutcome(verified); err != nil {
+		t.Fatalf("verified removal reported an outcome error: %v", err)
 	}
 }

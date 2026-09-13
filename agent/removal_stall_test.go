@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,7 +136,7 @@ func TestAgentDeclaresAStallOnlyAfterRepeatedRefusalsPastTheBound(t *testing.T) 
 				stallBound: l1.DefaultRemovalStallBound,
 				now:        func() time.Time { return testCase.now },
 			}
-			if got := controller.removalIsStalled(testCase.record); got != testCase.declare {
+			if got := controller.removalIsStalled(t.Context(), testCase.record); got != testCase.declare {
 				t.Fatalf("removalIsStalled = %t, want %t", got, testCase.declare)
 			}
 		})
@@ -143,22 +144,34 @@ func TestAgentDeclaresAStallOnlyAfterRepeatedRefusalsPastTheBound(t *testing.T) 
 }
 
 // TestAnUntypedRemovalFailureNeverBecomesAStall keeps a transport hiccup from
-// buying a permanent unverified outcome.
+// buying a permanent unverified outcome: it is never counted into the streak
+// and it never declares, however long the directive has stood.
 func TestAnUntypedRemovalFailureNeverBecomesAStall(t *testing.T) {
-	controller := &removalController{nodeID: "node"}
-	recorded := 0
+	controller := &removalController{nodeID: "node", stallBound: l1.DefaultRemovalStallBound}
+	controller.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+	counted := 0
+	reset := 0
 	controller.recordRemovalFailure = func(context.Context, localRemoval, string, string) error {
-		recorded++
+		counted++
+		return nil
+	}
+	controller.recordUntypedFailure = func(context.Context, localRemoval) error {
+		reset++
+		return nil
+	}
+	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
+		t.Fatal("an untyped failure declared a stall")
 		return nil
 	}
 	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
-		t.Fatal("an untyped failure must not even be weighed against the bound")
-		return runtimeRemovalRecord{}, false, nil
+		return runtimeRemovalRecord{failedAttempts: 99, lastRefusalCode: "unauthorized_attempt"}, true, nil
 	}
-	controller.noteRemovalFailure(t.Context(), l1.RemovalDirective{JobID: "job", BoundNodeID: "node"},
-		context.DeadlineExceeded)
-	if recorded != 0 {
-		t.Fatalf("untyped failures recorded = %d, want 0", recorded)
+	if declared := controller.noteRemovalFailure(t.Context(),
+		l1.RemovalDirective{JobID: "job", BoundNodeID: "node"}, context.DeadlineExceeded); declared {
+		t.Fatal("an untyped failure reported the removal as declared stalled")
+	}
+	if counted != 0 || reset != 1 {
+		t.Fatalf("untyped failure counted=%d reset=%d, want 0/1", counted, reset)
 	}
 }
 
@@ -195,5 +208,129 @@ func stallRecord(prepared time.Time, attempts int, refusal string) runtimeRemova
 	return runtimeRemovalRecord{
 		removal: testRuntimeRemoval("stall-job"), phase: runtimeRemovalPrepared, preparedAt: prepared,
 		failedAttempts: attempts, lastRefusalCode: refusal, lastAttemptedAt: &lastAttempted,
+	}
+}
+
+// TestAnUntypedFailureBreaksTheTypedRefusalStreak keeps the bound honest: the
+// rule is three consecutive attempts that produced the same typed refusal, so
+// an attempt that produced no typed refusal ends the streak instead of being
+// invisible to it.
+func TestAnUntypedFailureBreaksTheTypedRefusalStreak(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "bridge-node", 1024)
+	defer spool.Close()
+	removal := testRuntimeRemoval("bridge-job")
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	if err := spool.storeRuntimeResourceManifest(t.Context(), testRuntimeResourceManifest(removal.jobID, "attempt-a"), prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, prepared); err != nil {
+		t.Fatal(err)
+	}
+	now := prepared
+	controller := &removalController{nodeID: "bridge-node", stallBound: l1.DefaultRemovalStallBound}
+	controller.now = func() time.Time { return now }
+	controller.loadRuntimeRemoval = spool.runtimeRemoval
+	controller.removalStartedAt = spool.removalStartedAt
+	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+	}
+	controller.recordUntypedFailure = func(ctx context.Context, target localRemoval) error {
+		return spool.recordRuntimeRemovalUntypedFailure(ctx, target, now)
+	}
+	declarations := 0
+	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
+		declarations++
+		return nil
+	}
+	controller.recordStallDeclared = func(ctx context.Context, target localRemoval) error {
+		return spool.recordRuntimeRemovalStallDeclared(ctx, target, now)
+	}
+	directive := l1.RemovalDirective{
+		JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: contract.JobKindOCI,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
+		RootInstanceID: removal.rootInstanceID,
+	}
+	// Well past the bound throughout, so only the streak decides.
+	now = prepared.Add(l1.DefaultRemovalStallBound + time.Hour)
+	for index, cause := range []error{wedgeRefusal(), wedgeRefusal(), context.DeadlineExceeded} {
+		controller.noteRemovalFailure(t.Context(), directive, cause)
+		if declarations != 0 {
+			t.Fatalf("declared after %d failures ending in an untyped one", index+1)
+		}
+	}
+	record, _, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.failedAttempts != 0 || record.lastRefusalCode != "" {
+		t.Fatalf("streak after an untyped failure = %d/%q, want 0/empty", record.failedAttempts, record.lastRefusalCode)
+	}
+	for beat := 0; beat < l1.MinimumServiceRemovalStallAttempts; beat++ {
+		controller.noteRemovalFailure(t.Context(), directive, wedgeRefusal())
+	}
+	if declarations != 1 {
+		t.Fatalf("declarations after a rebuilt streak = %d, want 1", declarations)
+	}
+}
+
+// TestRepeatedRestartsCannotPostponeAStallDeclaration pins the bound to the
+// immutable moment the node accepted the directive. The frozen manifest's
+// prepared time is refreshed whenever a Storage-only inventory is
+// reconstructed, so measuring against that would reset the clock on every boot.
+func TestRepeatedRestartsCannotPostponeAStallDeclaration(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "restart-node", 1024)
+	defer spool.Close()
+	removal := testRuntimeRemoval("restart-job")
+	started := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	if err := spool.storeRuntimeResourceManifest(t.Context(), testRuntimeResourceManifest(removal.jobID, "attempt-a"), started); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, started); err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found {
+		t.Fatalf("record = %+v found=%t err=%v", record, found, err)
+	}
+	// A later boot reconstructed the inventory, so the record's own prepared
+	// time is now recent even though the directive is hours old.
+	record.preparedAt = started.Add(11 * time.Hour)
+	lastAttempted := record.preparedAt
+	record.lastAttemptedAt = &lastAttempted
+	record.failedAttempts = l1.MinimumServiceRemovalStallAttempts
+	record.lastRefusalCode = "unauthorized_attempt"
+
+	controller := &removalController{
+		stallBound: l1.DefaultRemovalStallBound, removalStartedAt: spool.removalStartedAt,
+		now: func() time.Time { return started.Add(11 * time.Hour) },
+	}
+	if !controller.removalIsStalled(t.Context(), record) {
+		t.Fatal("a refreshed prepared time postponed the declaration past the immutable removal start")
+	}
+	controller.now = func() time.Time { return started.Add(time.Minute) }
+	if controller.removalIsStalled(t.Context(), record) {
+		t.Fatal("a removal younger than the bound was declared stalled")
+	}
+}
+
+// TestStallAccountingRefusesARemovalWithNoRuntimeRecord states the scope out
+// loud. Stall accounting lives on the runtime removal record, which only a
+// runtime removal has; a process service must be refused visibly rather than
+// pass through an UPDATE that silently changes nothing.
+func TestStallAccountingRefusesARemovalWithNoRuntimeRecord(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "process-node", 1024)
+	defer spool.Close()
+	removal := localRemoval{jobID: "process-job", kind: contract.JobKindProcess,
+		generation: l1.InitialServiceRemovalGeneration, cleanupFence: "cleanup-fence", rootInstanceID: "root-instance"}
+	started := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	if err := spool.beginRemoval(t.Context(), removal, started); err != nil {
+		t.Fatal(err)
+	}
+	err := spool.recordRuntimeRemovalFailure(t.Context(), removal, "unauthorized_attempt", "detail", started)
+	if err == nil || !strings.Contains(err.Error(), "only a runtime removal keeps stall accounting") {
+		t.Fatalf("process-service stall accounting = %v, want a loud refusal", err)
+	}
+	if err := spool.recordRuntimeRemovalUntypedFailure(t.Context(), removal, started); err == nil {
+		t.Fatal("process-service streak reset silently succeeded")
 	}
 }

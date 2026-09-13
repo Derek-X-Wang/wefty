@@ -134,17 +134,31 @@ func (s *Store) ProveServiceBinding(ctx context.Context, identityNodeID, jobID s
 	}
 	var boundNodeID sql.NullString
 	var state contract.JobState
-	err = tx.QueryRowContext(ctx, `SELECT service_jobs.bound_node_id, jobs.state
-		FROM jobs JOIN service_jobs ON service_jobs.job_id=jobs.job_id WHERE jobs.job_id=?`, jobID).
-		Scan(&boundNodeID, &state)
+	var cleanupStatus sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT service_jobs.bound_node_id, jobs.state, service_removals.cleanup_status
+		FROM jobs JOIN service_jobs ON service_jobs.job_id=jobs.job_id
+		LEFT JOIN service_removals ON service_removals.job_id=jobs.job_id
+		WHERE jobs.job_id=?`, jobID).
+		Scan(&boundNodeID, &state, &cleanupStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, internalError(err, "read service binding proof")
 	}
+	// This proof answers "does this node still owe the binding an image pin",
+	// which is not the same question as "does this binding occupy a Slot". A
+	// stalled removal gave the Slot back precisely because cleanup could not
+	// be proven, so its pin must survive until cleanup actually completes --
+	// otherwise pin reconciliation deletes the image the standing directive
+	// still needs.
 	switch state {
 	case contract.JobQueued, contract.JobClaimed, contract.JobRunning, contract.JobStopping, contract.JobStopped, contract.JobFailed:
+		return boundNodeID.Valid && boundNodeID.String == request.NodeID, nil
+	case contract.JobStalledCleanupUnverified:
+		if ServiceRemovalCleanupStatus(cleanupStatus.String) == ServiceRemovalCleanupAcknowledged {
+			return false, nil
+		}
 		return boundNodeID.Valid && boundNodeID.String == request.NodeID, nil
 	default:
 		return false, nil

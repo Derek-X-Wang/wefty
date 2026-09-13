@@ -89,9 +89,19 @@ retried past that bound against at least three consecutive identical typed
 refusals. A quarantined cleanup, which deliberately keeps its slot and has its
 own resolution path, can never be declared stalled. `cleanup_status` stays
 `pending`, so the deletion directive keeps being dispatched to the bound node.
+The declaration is scoped to runtime removals -- `kind=oci` services and
+Computers -- because only a runtime cleanup can be refused with the typed code
+the evidence is built from; a process service has no such record and its
+removal can never be declared stalled.
+The bound agent freezes the exact declaration durably before it first sends it
+and replays those bytes until L1 accepts them, under an idempotency key that
+does not vary with the boot session, so a lost response cannot turn an accepted
+declaration into a permanent conflict.
 A later positive cleanup acknowledgement records the acknowledgement and, for
 a Computer, still earns the separate Storage-custody outcome, but it never
-upgrades the removal's own unverified terminal outcome. The node doctor's
+upgrades the removal's own unverified terminal outcome. A stalled removal also
+retains its node-local binding image pin, which the standing directive still
+needs, until that positive cleanup releases it. The node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is
 released.
 

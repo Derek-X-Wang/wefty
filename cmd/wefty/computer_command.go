@@ -503,7 +503,7 @@ func waitForComputerRemoval(ctx context.Context, clients *apiClients, computerID
 			return false, readErr
 		}
 		return computerRemovalTerminal(observed) || computerRemovalQuarantine(observed) != nil ||
-			computerRemovalStall(observed) != nil, nil
+			computerRemovalStalled(observed), nil
 	})
 	return observed, observation, err
 }
@@ -540,17 +540,24 @@ func computerRemovalQuarantine(computer l1.Computer) *l1.ComputerStorageCleanupQ
 	return nil
 }
 
-// computerRemovalStall reports the bound agent's declaration that this
-// removal cannot complete. Unlike a quarantine it is terminal and the Slot is
-// already free, so waiting longer changes nothing an operator can use.
-func computerRemovalStall(computer l1.Computer) *l1.ServiceRemovalStallEvidence {
+// computerRemovalStalled reports the terminal fact alone. Polling stops on
+// this and never on the evidence beside it: a declaration whose stored receipt
+// cannot be decoded projects nil evidence, and waiting for evidence that will
+// never arrive would turn a prompt typed answer into a timeout.
+func computerRemovalStalled(computer l1.Computer) bool {
 	removal := computer.CurrentJob.Removal
-	if removal == nil || computer.DesiredState != contract.ServiceDesiredRemoved ||
-		computer.CurrentJob.State != contract.JobStalledCleanupUnverified ||
-		removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupStalled {
+	return removal != nil && computer.DesiredState == contract.ServiceDesiredRemoved &&
+		computer.CurrentJob.State == contract.JobStalledCleanupUnverified &&
+		removal.RemovalOutcome == l1.ServiceRemovalOutcomeCleanupStalled
+}
+
+// computerRemovalStall is the evidence beside that fact, absent when the
+// stored receipt could not be decoded.
+func computerRemovalStall(computer l1.Computer) *l1.ServiceRemovalStall {
+	if !computerRemovalStalled(computer) {
 		return nil
 	}
-	return removal.Stall
+	return computer.CurrentJob.Removal.Stall
 }
 
 func awaitedComputerRemovalOutcome(computer l1.Computer) error {

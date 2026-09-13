@@ -261,6 +261,8 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	  last_refusal_code TEXT,
 	  last_refusal_detail TEXT,
 	  last_attempted_ns INTEGER,
+	  stall_declaration_json BLOB,
+	  stall_declaration_key TEXT,
 	  stall_declared_ns INTEGER
 	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
@@ -287,6 +289,8 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		{table: "runtime_removal_manifests", column: "last_refusal_code", definition: "TEXT"},
 		{table: "runtime_removal_manifests", column: "last_refusal_detail", definition: "TEXT"},
 		{table: "runtime_removal_manifests", column: "last_attempted_ns", definition: "INTEGER"},
+		{table: "runtime_removal_manifests", column: "stall_declaration_json", definition: "BLOB"},
+		{table: "runtime_removal_manifests", column: "stall_declaration_key", definition: "TEXT"},
 		{table: "runtime_removal_manifests", column: "stall_declared_ns", definition: "INTEGER"},
 	} {
 		if err := ensureLogSpoolColumn(ctx, spool.db, migration.table, migration.column, migration.definition); err != nil {

@@ -144,6 +144,19 @@ func (outbox *evidenceOutbox) recordRuntimeRemovalFailure(ctx context.Context, r
 	return outbox.spool.recordRuntimeRemovalFailure(ctx, removal, refusalCode, refusalDetail, outbox.clock.Now())
 }
 
+func (outbox *evidenceOutbox) recordRuntimeRemovalUntypedFailure(ctx context.Context, removal localRemoval) error {
+	return outbox.spool.recordRuntimeRemovalUntypedFailure(ctx, removal, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) freezeRuntimeRemovalStallDeclaration(ctx context.Context, removal localRemoval,
+	declaration []byte, key string) ([]byte, string, error) {
+	return outbox.spool.freezeRuntimeRemovalStallDeclaration(ctx, removal, declaration, key)
+}
+
+func (outbox *evidenceOutbox) removalStartedAt(ctx context.Context, jobID string) (time.Time, error) {
+	return outbox.spool.removalStartedAt(ctx, jobID)
+}
+
 func (outbox *evidenceOutbox) recordRuntimeRemovalStallDeclared(ctx context.Context, removal localRemoval) error {
 	return outbox.spool.recordRuntimeRemovalStallDeclared(ctx, removal, outbox.clock.Now())
 }

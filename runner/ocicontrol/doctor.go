@@ -441,6 +441,7 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 	// finding names. Reporting it as a failure forever would train an operator
 	// to ignore the one check that catches the wedge.
 	declared := make([]string, 0, len(removals))
+	ineligible := make([]string, 0, len(removals))
 	for _, removal := range removals {
 		if removal.InvalidReason != "" {
 			unreadable = append(unreadable, removal.JobID+":"+removal.InvalidReason)
@@ -450,34 +451,52 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 			continue
 		}
 		age := now.Sub(removal.PreparedAt).Round(time.Minute)
+		row := fmt.Sprintf("%s:%s:%s:%d:%s", removal.JobID, removal.Phase,
+			valueOrUnknownRefusal(removal.LastRefusalCode), removal.FailedAttempts, age)
 		if removal.StallDeclaredAt != nil {
-			declared = append(declared, fmt.Sprintf("%s:%s:%s:%s", removal.JobID, removal.Phase,
-				valueOrUnknownRefusal(removal.LastRefusalCode), age))
+			declared = append(declared, row)
 			continue
 		}
-		stalled = append(stalled, fmt.Sprintf("%s:%s:%s:%d:%s", removal.JobID, removal.Phase,
-			valueOrUnknownRefusal(removal.LastRefusalCode), removal.FailedAttempts, age))
+		// A record that has not accumulated the evidence the declaration
+		// requires is a different operational problem from one whose
+		// declaration is being refused, and telling an operator to go read a
+		// delivery failure that does not exist wastes the one check that
+		// catches this wedge.
+		if removal.StallDeclarationFrozen || removalStallEvidenceEligible(removal) {
+			stalled = append(stalled, row)
+			continue
+		}
+		ineligible = append(ineligible, row)
 	}
 	switch {
 	case len(unreadable) != 0:
 		detail := fmt.Sprintf("%d durable runtime removal record(s) cannot be validated and hold their node service slots: %s",
 			len(unreadable), strings.Join(unreadable, " "))
-		if len(stalled) != 0 {
+		if remaining := append(append([]string{}, stalled...), ineligible...); len(remaining) != 0 {
 			detail += fmt.Sprintf("; %d further record(s) have not finished within %s: %s",
-				len(stalled), removalStallBound, strings.Join(stalled, " "))
+				len(remaining), removalStallBound, strings.Join(remaining, " "))
 		}
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, code: "oci_removal_unreadable", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
 			detail: detail,
 		}))
-	case len(stalled) != 0:
+	case len(stalled) != 0 || len(ineligible) != 0:
+		detail := fmt.Sprintf("%d durable runtime removal record(s) have not finished within %s and still hold their node service slots. "+
+			"The bound agent frees such a Slot by declaring the removal stalled (L1 removal_outcome cleanup_stalled, "+
+			"Job state stalled_cleanup_unverified)", len(stalled)+len(ineligible), removalStallBound)
+		if len(stalled) != 0 {
+			detail += fmt.Sprintf("; %d record(s) have the evidence that declaration needs, so the declaration itself is failing -- "+
+				"read the agent log for the refusal it names (job:phase:refusal:attempts:age): %s",
+				len(stalled), strings.Join(stalled, " "))
+		}
+		if len(ineligible) != 0 {
+			detail += fmt.Sprintf("; %d record(s) cannot be declared yet because they carry no typed refusal or fewer than %d "+
+				"consecutive ones, so the cause is whatever is failing untyped (job:phase:refusal:attempts:age): %s",
+				len(ineligible), minimumStallAttempts, strings.Join(ineligible, " "))
+		}
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, code: "oci_removal_stalled", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
-			detail: fmt.Sprintf("%d durable runtime removal record(s) have not finished within %s and still hold their node service slots "+
-				"(job:phase:refusal:attempts:age): %s. The bound agent frees such a Slot by declaring the removal stalled "+
-				"(L1 removal_outcome cleanup_stalled, Job state stalled_cleanup_unverified); a record still listed here means that "+
-				"declaration is itself failing, so read the agent log for the refusal it names",
-				len(stalled), removalStallBound, strings.Join(stalled, " ")),
+			detail: detail,
 		}))
 	case len(declared) != 0:
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
@@ -492,6 +511,18 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 			detail: fmt.Sprintf("every durable runtime removal validated against its own frozen evidence and is within its completion bound (%d in flight)", len(removals)),
 		}))
 	}
+}
+
+// minimumStallAttempts mirrors l1.MinimumServiceRemovalStallAttempts. The
+// doctor is node-local diagnosis and does not import the control plane, so the
+// number is restated here and named in the finding rather than assumed.
+const minimumStallAttempts = 3
+
+// removalStallEvidenceEligible reports whether this record already carries
+// what a declaration requires. It is the doctor's own reading of the agent's
+// rule, used only to word the finding.
+func removalStallEvidenceEligible(removal RemovalRecord) bool {
+	return strings.TrimSpace(removal.LastRefusalCode) != "" && removal.FailedAttempts >= minimumStallAttempts
 }
 
 // valueOrUnknownRefusal keeps the job:phase:refusal shape stable for a record

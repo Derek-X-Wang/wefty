@@ -49,6 +49,10 @@ type serviceTombstoneRow struct {
 	removalGeneration     uint64
 	rootInstanceID        string
 	cleanupAcknowledgedAt *time.Time
+	stallEvidence         []byte
+	stallKey              sql.NullString
+	stallHash             sql.NullString
+	stalledAt             *time.Time
 }
 
 // RemoveService irreversibly revokes a service and scrubs its secret-bearing
@@ -178,7 +182,12 @@ func (s *Store) ForceForgetService(ctx context.Context, jobID string) (Job, erro
 	if err != nil {
 		return Job{}, err
 	}
-	if job.State == contract.JobRemovedVerified || job.State == contract.JobForgottenCleanupUnverified {
+	// A stalled removal is already terminal and already gave back its Slot.
+	// Waiving proof on it would rewrite whose decision ended the removal, and
+	// after a late cleanup has tombstoned an ordinary service there is no
+	// mutable row left to waive at all.
+	if job.State == contract.JobRemovedVerified || job.State == contract.JobForgottenCleanupUnverified ||
+		job.State == contract.JobStalledCleanupUnverified {
 		return job, nil
 	}
 
@@ -479,7 +488,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 			return Job{}, protocolError(contract.ErrorConflict,
 				"service removal state %q cannot accept stall evidence", removal.status)
 		}
-		job, err := s.recordServiceRemovalStall(ctx, tx, jobID, now, bodyHash, removal, request)
+		job, err := s.recordServiceRemovalStall(ctx, tx, jobID, now, removal, request)
 		if err != nil {
 			return Job{}, err
 		}
@@ -648,11 +657,20 @@ func recordComputerRemovalCleanupQuarantine(ctx context.Context, tx *sql.Tx, job
 // durably beside the release: the refusal the agent kept receiving, how many
 // times, and how long it had been trying.
 func (s *Store) recordServiceRemovalStall(ctx context.Context, tx *sql.Tx, jobID string, now time.Time,
-	bodyHash string, removal serviceRemovalRow, request RemovalAcknowledgementRequest) (Job, error) {
+	removal serviceRemovalRow, request RemovalAcknowledgementRequest) (Job, error) {
 	evidence := request.CleanupStall
 	if err := validateServiceRemovalStallEvidence(*evidence, jobID, removal, request); err != nil {
 		return Job{}, err
 	}
+	payload, err := json.Marshal(evidence)
+	if err != nil {
+		return Job{}, internalError(err, "encode service removal stall evidence")
+	}
+	// The replay identity is the frozen declaration, not the enclosing
+	// request. A lost response can be answered from a later boot, whose
+	// request necessarily carries a different boot session, and that retry is
+	// the same declaration rather than a new one.
+	bodyHash := hashServiceRemovalStall(payload)
 	// The agent owns the fact that cleanup kept failing; L1 owns the clock.
 	// Elapsed is measured against L1's own durable request time, so an agent
 	// can never shorten the bound by reporting a longer wait than it waited.
@@ -675,10 +693,6 @@ func (s *Store) recordServiceRemovalStall(ctx context.Context, tx *sql.Tx, jobID
 		}
 		applyServiceRemoval(&job, removal)
 		return job, nil
-	}
-	payload, err := json.Marshal(evidence)
-	if err != nil {
-		return Job{}, internalError(err, "encode service removal stall evidence")
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, stall_evidence_json=?,
 		stall_acknowledgement_key=?, stall_acknowledgement_hash=?, stalled_ns=?
@@ -731,9 +745,8 @@ func validateServiceRemovalStallEvidence(evidence ServiceRemovalStallEvidence, j
 		return protocolError(contract.ErrorInvalidRequest,
 			"service removal stall evidence requires an idempotency key in the %q namespace", ServiceRemovalStallKeyPrefix)
 	}
-	if evidence.JobID != jobID || evidence.NodeID != removal.boundNodeID || evidence.NodeID != request.NodeID ||
-		evidence.BootSessionID != request.BootSessionID {
-		return protocolError(contract.ErrorInvalidRequest, "service removal stall evidence names another service or boot")
+	if evidence.JobID != jobID || evidence.NodeID != removal.boundNodeID || evidence.NodeID != request.NodeID {
+		return protocolError(contract.ErrorInvalidRequest, "service removal stall evidence names another service or node")
 	}
 	if evidence.RemovalGeneration != removal.generation || evidence.CleanupFence != removal.cleanupFence {
 		return protocolError(contract.ErrorStaleFence, "service removal stall evidence does not match the standing directive")
@@ -870,7 +883,8 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 			createdAt: time.Unix(0, createdNS).UTC(), removalRequestedAt: removal.requestedAt,
 			removedAt: now, outcome: outcome, lastBoundNodeID: removal.boundNodeID,
 			removalGeneration: removal.generation, rootInstanceID: removal.rootInstanceID,
-			cleanupAcknowledgedAt: removal.acknowledgedAt,
+			cleanupAcknowledgedAt: removal.acknowledgedAt, stallEvidence: removal.stallEvidence,
+			stallKey: removal.stallKey, stallHash: removal.stallHash, stalledAt: removal.stalledAt,
 		}
 		insertTombstone = true
 	} else if tombstoneErr != nil {
@@ -1075,7 +1089,7 @@ func applyServiceRemoval(job *Job, removal serviceRemovalRow) {
 // failing the whole projection: the Job state already carries the fact that
 // the removal stalled, and an operator needs to see that more than they need
 // the receipt.
-func decodeServiceRemovalStall(payload []byte) *ServiceRemovalStallEvidence {
+func decodeServiceRemovalStall(payload []byte) *ServiceRemovalStall {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -1083,7 +1097,8 @@ func decodeServiceRemovalStall(payload []byte) *ServiceRemovalStallEvidence {
 	if err := json.Unmarshal(payload, &evidence); err != nil {
 		return nil
 	}
-	return &evidence
+	stall := evidence.Stall()
+	return &stall
 }
 
 func insertServiceTombstone(ctx context.Context, tx *sql.Tx, tombstone serviceTombstoneRow) error {
@@ -1091,13 +1106,23 @@ func insertServiceTombstone(ctx context.Context, tx *sql.Tx, tombstone serviceTo
 	if tombstone.cleanupAcknowledgedAt != nil {
 		acknowledged = tombstone.cleanupAcknowledgedAt.UnixNano()
 	}
+	var stalled any
+	if tombstone.stalledAt != nil {
+		stalled = tombstone.stalledAt.UnixNano()
+	}
+	// The evidence, its timestamp and its replay identity outlive the mutable
+	// row. Without them a finalized stalled service would lose the reason its
+	// Slot was released, and a replayed declaration would be accepted on
+	// identity alone.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO service_tombstones(
 		job_id, dispatch_key_hash, request_hash, created_ns, removal_requested_ns, removed_ns,
-		outcome, last_bound_node_id, removal_generation, root_instance_id, cleanup_acknowledged_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, tombstone.jobID, tombstone.dispatchKeyHash,
+		outcome, last_bound_node_id, removal_generation, root_instance_id, cleanup_acknowledged_ns,
+		stall_evidence_json, stall_acknowledgement_key, stall_acknowledgement_hash, stalled_ns
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, tombstone.jobID, tombstone.dispatchKeyHash,
 		tombstone.requestHash, tombstone.createdAt.UnixNano(), tombstone.removalRequestedAt.UnixNano(),
 		tombstone.removedAt.UnixNano(), tombstone.outcome, tombstone.lastBoundNodeID,
-		tombstone.removalGeneration, tombstone.rootInstanceID, acknowledged); err != nil {
+		tombstone.removalGeneration, tombstone.rootInstanceID, acknowledged,
+		tombstone.stallEvidence, tombstone.stallKey, tombstone.stallHash, stalled); err != nil {
 		return internalError(err, "insert service tombstone")
 	}
 	return nil
@@ -1114,14 +1139,20 @@ func readServiceTombstoneByDispatchHash(ctx context.Context, q queryer, dispatch
 func readServiceTombstone(ctx context.Context, q queryer, predicate string, value any) (serviceTombstoneRow, error) {
 	var row serviceTombstoneRow
 	var createdNS, requestedNS, removedNS int64
-	var acknowledgedNS sql.NullInt64
+	var acknowledgedNS, stalledNS sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT job_id, dispatch_key_hash, request_hash, created_ns,
 		removal_requested_ns, removed_ns, outcome, last_bound_node_id, removal_generation,
-		root_instance_id, cleanup_acknowledged_ns FROM service_tombstones WHERE `+predicate, value).
+		root_instance_id, cleanup_acknowledged_ns, stall_evidence_json, stall_acknowledgement_key,
+		stall_acknowledgement_hash, stalled_ns FROM service_tombstones WHERE `+predicate, value).
 		Scan(&row.jobID, &row.dispatchKeyHash, &row.requestHash, &createdNS, &requestedNS, &removedNS,
-			&row.outcome, &row.lastBoundNodeID, &row.removalGeneration, &row.rootInstanceID, &acknowledgedNS)
+			&row.outcome, &row.lastBoundNodeID, &row.removalGeneration, &row.rootInstanceID, &acknowledgedNS,
+			&row.stallEvidence, &row.stallKey, &row.stallHash, &stalledNS)
 	if err != nil {
 		return serviceTombstoneRow{}, err
+	}
+	if stalledNS.Valid {
+		value := time.Unix(0, stalledNS.Int64).UTC()
+		row.stalledAt = &value
 	}
 	row.createdAt = time.Unix(0, createdNS).UTC()
 	row.removalRequestedAt = time.Unix(0, requestedNS).UTC()
@@ -1154,7 +1185,8 @@ func (row serviceTombstoneRow) job() Job {
 			RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalBoundNodeID: row.lastBoundNodeID,
 			RemovalGeneration: row.removalGeneration, RemovalRequestedAt: row.removalRequestedAt,
 			CleanupStatus: cleanupStatus, RemovalOutcome: row.outcome, RemovedAt: &removedAt,
-			CleanupAcknowledgedAt: row.cleanupAcknowledgedAt,
+			CleanupAcknowledgedAt: row.cleanupAcknowledgedAt, StalledAt: row.stalledAt,
+			Stall: decodeServiceRemovalStall(row.stallEvidence),
 		},
 	}
 }
@@ -1196,7 +1228,26 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 	if request.RemovalGeneration != tombstone.removalGeneration || request.RootInstanceID != tombstone.rootInstanceID {
 		return protocolError(contract.ErrorStaleFence, "finalized removal acknowledgement does not match the tombstone")
 	}
+	if request.CleanupStall != nil {
+		payload, err := json.Marshal(request.CleanupStall)
+		if err != nil {
+			return internalError(err, "encode finalized service removal stall evidence")
+		}
+		if !tombstone.stallKey.Valid || tombstone.stallKey.String != request.IdempotencyKey ||
+			!tombstone.stallHash.Valid || tombstone.stallHash.String != hashServiceRemovalStall(payload) {
+			return protocolError(contract.ErrorIdempotencyConflict,
+				"finalized stalled removal replay does not match the accepted declaration")
+		}
+	}
 	return nil
+}
+
+// hashServiceRemovalStall hashes the frozen declaration alone. Using the
+// enclosing acknowledgement body instead would make an otherwise identical
+// replay from a later boot look like a different declaration.
+func hashServiceRemovalStall(payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
 }
 
 func hashDispatchKey(dispatchKey string) string {
