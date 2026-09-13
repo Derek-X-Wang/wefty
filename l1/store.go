@@ -899,6 +899,8 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
   removal_generation INTEGER NOT NULL CHECK(removal_generation > 0),
   root_instance_id TEXT NOT NULL,
   cleanup_acknowledged_ns INTEGER,
+  cleanup_acknowledgement_key TEXT,
+  cleanup_acknowledgement_hash TEXT,
   stall_evidence_json BLOB,
   stall_acknowledgement_key TEXT,
   stall_acknowledgement_hash TEXT,
@@ -1035,6 +1037,7 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
+		{"cleanup_acknowledgement_key", "TEXT"}, {"cleanup_acknowledgement_hash", "TEXT"},
 		{"stall_evidence_json", "BLOB"}, {"stall_acknowledgement_key", "TEXT"},
 		{"stall_acknowledgement_hash", "TEXT"}, {"stalled_ns", "INTEGER"},
 	} {

@@ -176,6 +176,21 @@ func (controller *removalController) reconcile(ctx context.Context, directive l1
 	return err
 }
 
+// declaredRefusalCode is the exact helper refusal an accepted declaration
+// stands for. Only that refusal is expected afterwards; anything else --
+// a replaced node session, a transport failure, a local persistence fault --
+// is new information the caller must still act on.
+func declaredRefusalCode(record runtimeRemovalRecord) string {
+	if record.stallDeclaredAt == nil || len(record.stallDeclaration) == 0 {
+		return ""
+	}
+	var declaration l1.ServiceRemovalStallEvidence
+	if err := json.Unmarshal(record.stallDeclaration, &declaration); err != nil {
+		return ""
+	}
+	return declaration.LastRefusalCode
+}
+
 func (controller *removalController) process(ctx context.Context, directive l1.RemovalDirective) error {
 	if directive.BoundNodeID != controller.nodeID {
 		return fmt.Errorf("removal directive belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
@@ -522,6 +537,16 @@ func (controller *removalController) resume(ctx context.Context) error {
 				// resume it without guessing from historical attempts.
 				continue
 			}
+			if record.stallDeclaredAt != nil {
+				// The declaration already told L1 this cleanup keeps being
+				// refused, and the standing directive is what keeps retrying
+				// it. Repeating the refusal here would fail the boot sweep on
+				// every restart, and the boot sweep is what restores the image
+				// pin this removal must keep (#450).
+				controller.log("agent: runtime removal %q is declared stalled; deferring to its standing directive",
+					record.removal.jobID)
+				continue
+			}
 			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, computerStorages); err != nil {
 				return err
 			}
@@ -739,7 +764,10 @@ func (controller *removalController) noteRemovalFailure(ctx context.Context, dir
 				controller.log("agent: reset removal refusal streak for service %q: %v", directive.JobID, err)
 			}
 		}
-		return controller.stallAlreadyDeclared(ctx, removal)
+		// An untyped failure is never the refusal a declaration stood for, so
+		// it stays the caller's problem however long ago the stall was
+		// declared.
+		return false
 	}
 	if err := controller.recordRemovalFailure(ctx, removal, refusalCode, refusalDetail); err != nil {
 		controller.log("agent: record removal failure for service %q: %v", directive.JobID, err)
@@ -750,7 +778,7 @@ func (controller *removalController) noteRemovalFailure(ctx context.Context, dir
 		return false
 	}
 	if record.stallDeclaredAt != nil {
-		return true
+		return refusalCode == declaredRefusalCode(record)
 	}
 	// A frozen declaration means a previous send may already have been
 	// committed by L1 and only its response was lost, so the retry replays it
@@ -773,14 +801,6 @@ func (controller *removalController) noteRemovalFailure(ctx context.Context, dir
 	controller.log("agent: service %q removal declared stalled after %d consecutive %q refusals; Slot released without cleanup proof",
 		directive.JobID, record.failedAttempts, record.lastRefusalCode)
 	return true
-}
-
-func (controller *removalController) stallAlreadyDeclared(ctx context.Context, removal localRemoval) bool {
-	if controller.loadRuntimeRemoval == nil {
-		return false
-	}
-	record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
-	return err == nil && found && record.stallDeclaredAt != nil
 }
 
 // removalIsStalled is the agent half of the two-sided bound. L1 can see how

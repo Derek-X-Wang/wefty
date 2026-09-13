@@ -314,7 +314,12 @@ func (session *agentSession) processRemovalDirectives(ctx context.Context, direc
 	}
 	var failures []error
 	for _, directive := range directives {
-		if err := session.removals.process(ctx, directive); err != nil {
+		// reconcile is the same narrowly scoped path the heartbeat uses: it
+		// counts the refusal, may declare the stall, and swallows only the
+		// exact refusal an accepted declaration already stands for. Without
+		// it a declared stall would fail registration on every restart and
+		// registration is what restores the retained image pin (#450).
+		if err := session.removals.reconcile(ctx, directive); err != nil {
 			failures = append(failures, fmt.Errorf("reconcile removed OCI binding %q: %w", directive.JobID, err))
 		}
 	}

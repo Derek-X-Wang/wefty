@@ -33,8 +33,11 @@ func newRemovalStallHarness(t *testing.T) removalStallHarness {
 	agent := fabric.Identity{NodeID: "fabric-agent", Tags: []string{DefaultAgentPrincipalTag}}
 	clientClient := h.client(client)
 	agentClient := h.client(agent)
-	node := h.register(agentClient, "node-1")
-	job := submitRemovalService(t, h, clientClient, removalServiceSpec("stalls-on-removal", []string{"service"}))
+	// Only a runtime removal can be declared stalled, so the fixture is an OCI
+	// service. A process service is the refusal case, covered separately.
+	node := h.registerWithCapabilities(agentClient, "node-1", map[string]bool{
+		"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true})
+	job := submitRemovalService(t, h, clientClient, stallOCIServiceSpec("stalls-on-removal"))
 	claimRestartService(t, h, agentClient, node)
 
 	status, _, body := h.do(clientClient, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
@@ -46,6 +49,19 @@ func newRemovalStallHarness(t *testing.T) removalStallHarness {
 		t.Fatalf("removal directives = %#v, %v", directives, err)
 	}
 	return removalStallHarness{h: h, client: client, agent: agent, node: node, job: job, directive: directives[0]}
+}
+
+// stallOCIServiceSpec is a digest-pinned OCI service: the only service shape a
+// helper can refuse with the typed code a declaration is built from.
+func stallOCIServiceSpec(dispatchKey string) contract.JobSpec {
+	digest := testTopDigest
+	return contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: contract.JobKindOCI,
+		Class: contract.JobClassService, Restart: contract.RestartAlways, RoutingTags: []string{"service"},
+		RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "ghcr.io/example/stall:latest", Digest: &digest}}},
+	}
 }
 
 // advancePastStallBound walks the clock to the bound while the node keeps
@@ -93,7 +109,7 @@ func (harness removalStallHarness) declare(t *testing.T, request RemovalAcknowle
 func TestStalledRemovalReleasesTheSlotSoAFreshServiceCanClaimIt(t *testing.T) {
 	harness := newRemovalStallHarness(t)
 	h, agentClient := harness.h, harness.h.client(harness.agent)
-	waiting := submitRemovalService(t, h, h.client(harness.client), removalServiceSpec("waits-for-stalled-slot", []string{"service"}))
+	waiting := submitRemovalService(t, h, h.client(harness.client), stallOCIServiceSpec("waits-for-stalled-slot"))
 
 	status, _, body := h.do(agentClient, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{
 		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID, Class: contract.JobClassService,
@@ -536,5 +552,195 @@ func TestStallDeclarationIsAcceptedFromALaterBoot(t *testing.T) {
 	replayed, err := harness.declare(t, retried)
 	if err != nil || replayed.State != contract.JobStalledCleanupUnverified {
 		t.Fatalf("replay from a later boot = %#v, %v", replayed, err)
+	}
+}
+
+// TestAProcessServiceRemovalCannotBeDeclaredStalled is the authoritative half
+// of the runtime-only scope. The agent refuses to account for one, but L1 is
+// the authority, and it reads the kind from the Job's own frozen spec rather
+// than trusting the directive the agent was handed.
+func TestAProcessServiceRemovalCannotBeDeclaredStalled(t *testing.T) {
+	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
+		"node-1": {Tags: []string{"service"}, MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: 1},
+	})
+	clientClient := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agentClient := h.client(fabric.Identity{NodeID: "fabric-agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agentClient, "node-1")
+	job := submitRemovalService(t, h, clientClient, removalServiceSpec("process-stall", []string{"service"}))
+	claimRestartService(t, h, agentClient, node)
+	status, _, body := h.do(clientClient, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("remove status = %d body=%s", status, body)
+	}
+	directives, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-agent", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("removal directives = %#v, %v", directives, err)
+	}
+	directive := directives[0]
+	h.clock.Advance(DefaultRemovalStallBound)
+	prepared := h.clock.Now().UTC()
+	request := RemovalAcknowledgementRequest{
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, IdempotencyKey: ServiceRemovalStallKeyPrefix + "process",
+		CleanupStall: &ServiceRemovalStallEvidence{
+			Kind: ServiceRemovalStallEvidenceKind, JobID: job.JobID, NodeID: node.NodeID,
+			RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+			Phase: "prepared", LastRefusalCode: "unauthorized_attempt", Attempts: 4,
+			PreparedAt: prepared, LastAttemptedAt: prepared.Add(time.Minute),
+		},
+	}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-agent", job.JobID, request); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("process-service stall declaration = %v, want conflict", err)
+	}
+	var state contract.JobState
+	if err := h.store.db.QueryRow(`SELECT state FROM jobs WHERE job_id=?`, job.JobID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != contract.JobRemovalPending {
+		t.Fatalf("process-service state after a refused declaration = %q, want removal_pending", state)
+	}
+}
+
+// TestAFinalizedStalledRemovalRefusesABareAcknowledgement closes the shape
+// bypass: dropping the declaration and sending a plain acknowledgement asserts
+// that cleanup completed, which the accepted declaration never said.
+func TestAFinalizedStalledRemovalRefusesABareAcknowledgement(t *testing.T) {
+	harness := newRemovalStallHarness(t)
+	harness.advancePastStallBound(t)
+	declaration := harness.declaration("shape")
+	if _, err := harness.declare(t, declaration); err != nil {
+		t.Fatalf("declare stalled removal: %v", err)
+	}
+	completion := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "removal:shape-late",
+	}
+	if _, err := harness.declare(t, completion); err != nil {
+		t.Fatalf("late completion acknowledgement: %v", err)
+	}
+	if _, _, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	// The accepted positive acknowledgement still replays.
+	if _, err := harness.declare(t, completion); err != nil {
+		t.Fatalf("finalized positive acknowledgement replay: %v", err)
+	}
+	forged := completion
+	forged.IdempotencyKey = "removal:forged"
+	forged.CleanupFence = "cleanup_forged"
+	if _, err := harness.declare(t, forged); errorCode(err) != contract.ErrorStaleFence &&
+		errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("forged finalized acknowledgement = %v, want a typed refusal", err)
+	}
+	sameFence := completion
+	sameFence.IdempotencyKey = "removal:another-key"
+	if _, err := harness.declare(t, sameFence); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("unmatched finalized acknowledgement = %v, want idempotency_conflict", err)
+	}
+}
+
+// TestRecoveryFinalizesAStalledComputerRemovalExactlyOnce keeps a retained
+// Computer row from being finalized again on every reconcile pass. A Computer
+// keeps its removal row instead of becoming a tombstone, so nothing else stops
+// recovery from reselecting it, rewriting removed_ns and rerunning custody
+// finalization forever.
+func TestRecoveryFinalizesAStalledComputerRemovalExactlyOnce(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {
+			Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1,
+		},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+		Name: "stalls", Spec: computerCapabilityJobSpec("computer:stall-once"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID,
+		node.BootSessionID, contract.JobClassService); err != nil || claim == nil {
+		t.Fatalf("claim = %#v err=%v", claim, err)
+	}
+	if computer, err = h.store.GetComputer(context.Background(), computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID, ComputerRemoveRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node",
+		node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("Computer removal directives = %#v, %v", directives, err)
+	}
+	directive := directives[0]
+	h.clock.Advance(DefaultRemovalStallBound)
+	prepared := h.clock.Now().UTC()
+	declaration := RemovalAcknowledgementRequest{
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, IdempotencyKey: ServiceRemovalStallKeyPrefix + "computer",
+		CleanupStall: &ServiceRemovalStallEvidence{
+			Kind: ServiceRemovalStallEvidenceKind, JobID: computer.CurrentJobID, NodeID: node.NodeID,
+			RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+			Phase: "prepared", LastRefusalCode: "unauthorized_attempt", Attempts: 4,
+			PreparedAt: prepared, LastAttemptedAt: prepared.Add(time.Minute),
+		},
+	}
+	stalled, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, declaration)
+	if err != nil || stalled.State != contract.JobStalledCleanupUnverified {
+		t.Fatalf("Computer stall declaration = %#v, %v", stalled, err)
+	}
+	completion := RemovalAcknowledgementRequest{
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, IdempotencyKey: "removal:computer-late",
+	}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, completion); err != nil {
+		t.Fatalf("late completion acknowledgement: %v", err)
+	}
+	first, err := h.store.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FinalizedRemovals != 1 {
+		t.Fatalf("first reconcile finalized %d removals, want 1", first.FinalizedRemovals)
+	}
+	var firstRemovedNS int64
+	if err := h.store.db.QueryRow(`SELECT removed_ns FROM service_removals WHERE job_id=?`,
+		computer.CurrentJobID).Scan(&firstRemovedNS); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(time.Minute)
+	second, err := h.store.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.FinalizedRemovals != 0 {
+		t.Fatalf("second reconcile finalized %d removals, want 0", second.FinalizedRemovals)
+	}
+	var secondRemovedNS int64
+	if err := h.store.db.QueryRow(`SELECT removed_ns FROM service_removals WHERE job_id=?`,
+		computer.CurrentJobID).Scan(&secondRemovedNS); err != nil {
+		t.Fatal(err)
+	}
+	if secondRemovedNS != firstRemovedNS {
+		t.Fatalf("removal time was rewritten by a later pass: %d then %d", firstRemovedNS, secondRemovedNS)
+	}
+	// The terminal label a declaration produced is never upgraded by the late
+	// cleanup that followed it.
+	var state contract.JobState
+	if err := h.store.db.QueryRow(`SELECT state FROM jobs WHERE job_id=?`, computer.CurrentJobID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != contract.JobStalledCleanupUnverified {
+		t.Fatalf("finalized Computer state = %q, want stalled_cleanup_unverified", state)
 	}
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -332,5 +333,55 @@ func TestStallAccountingRefusesARemovalWithNoRuntimeRecord(t *testing.T) {
 	}
 	if err := spool.recordRuntimeRemovalUntypedFailure(t.Context(), removal, started); err == nil {
 		t.Fatal("process-service streak reset silently succeeded")
+	}
+}
+
+// TestADeclaredStallSuppressesOnlyItsOwnRefusal keeps the boot-unblocking
+// exception narrow. The declaration says one thing -- that this helper refusal
+// keeps happening -- so only that refusal is expected afterwards. A replaced
+// node session, a different helper refusal, or an untyped local failure is new
+// information, and swallowing it would leave an obsolete session unfenced.
+func TestADeclaredStallSuppressesOnlyItsOwnRefusal(t *testing.T) {
+	declared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	declaration, err := json.Marshal(l1.ServiceRemovalStallEvidence{
+		Kind: l1.ServiceRemovalStallEvidenceKind, JobID: "declared-job",
+		LastRefusalCode: "unauthorized_attempt", Attempts: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, testCase := range map[string]struct {
+		cause    error
+		suppress bool
+	}{
+		"the refusal the declaration stands for": {cause: wedgeRefusal(), suppress: true},
+		"a different helper refusal": {cause: &ocihelper.RPCError{
+			Code: ocihelper.CodeSessionStale, Message: "session is stale"}},
+		"a replaced node session": {cause: &ProtocolError{APIError: contract.APIError{
+			Code: contract.ErrorNodeSessionReplaced, Message: "node boot session has been replaced"}}},
+		"an untyped local failure": {cause: context.DeadlineExceeded},
+	} {
+		t.Run(name, func(t *testing.T) {
+			controller := &removalController{nodeID: "node", stallBound: l1.DefaultRemovalStallBound}
+			controller.now = func() time.Time { return declared.Add(time.Hour) }
+			controller.recordRemovalFailure = func(context.Context, localRemoval, string, string) error { return nil }
+			controller.recordUntypedFailure = func(context.Context, localRemoval) error { return nil }
+			controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+				return runtimeRemovalRecord{
+					phase: runtimeRemovalPrepared, preparedAt: declared, failedAttempts: 9,
+					lastRefusalCode: "unauthorized_attempt", stallDeclaration: declaration,
+					stallDeclaredAt: &declared,
+				}, true, nil
+			}
+			controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
+				t.Fatal("an already-declared removal declared again")
+				return nil
+			}
+			got := controller.noteRemovalFailure(t.Context(),
+				l1.RemovalDirective{JobID: "declared-job", BoundNodeID: "node"}, testCase.cause)
+			if got != testCase.suppress {
+				t.Fatalf("suppressed = %t, want %t", got, testCase.suppress)
+			}
+		})
 	}
 }

@@ -240,15 +240,20 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 		t.Fatalf("already-removed replay = %d body=%s", status, body)
 	}
 
-	// After finalization there is no mutable state for an idempotency key to
-	// protect. The tombstone's retained authority fields make this a constant
-	// success without resurrecting or changing anything.
-	ack.IdempotencyKey = "different-after-finalization"
-	ack.CleanupFence = "not-retained-after-finalization"
+	// After finalization the only thing an acknowledgement can be is a replay
+	// of the one that was accepted, so it is matched rather than waved through:
+	// the identical body still succeeds without resurrecting or changing
+	// anything, while a different key or fence is a fresh claim against a
+	// finalized removal and conflicts.
 	status, _, body = h.do(agent, http.MethodPost, ackPath, ack)
 	if status != http.StatusOK {
 		t.Fatalf("post-finalization acknowledgement replay = %d body=%s", status, body)
 	}
+	changedAfterFinalization := ack
+	changedAfterFinalization.IdempotencyKey = "different-after-finalization"
+	changedAfterFinalization.CleanupFence = "not-retained-after-finalization"
+	status, _, body = h.do(agent, http.MethodPost, ackPath, changedAfterFinalization)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorIdempotencyConflict)
 
 	status, headers, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
 	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {

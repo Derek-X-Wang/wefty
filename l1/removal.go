@@ -49,6 +49,8 @@ type serviceTombstoneRow struct {
 	removalGeneration     uint64
 	rootInstanceID        string
 	cleanupAcknowledgedAt *time.Time
+	acknowledgementKey    sql.NullString
+	acknowledgementHash   sql.NullString
 	stallEvidence         []byte
 	stallKey              sql.NullString
 	stallHash             sql.NullString
@@ -488,6 +490,18 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 			return Job{}, protocolError(contract.ErrorConflict,
 				"service removal state %q cannot accept stall evidence", removal.status)
 		}
+		// The declaration is built from a typed helper refusal, and only a
+		// runtime removal has one. The immutable Job kind is the authority for
+		// that, and it is read inside this transaction rather than trusted
+		// from the directive the agent was handed.
+		kind, err := serviceWorkloadKind(ctx, tx, jobID)
+		if err != nil {
+			return Job{}, err
+		}
+		if kind != contract.JobKindOCI {
+			return Job{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{"job_id": jobID, "kind": kind},
+				"only a runtime removal can be declared stalled; service %q has workload kind %q", jobID, kind)
+		}
 		job, err := s.recordServiceRemovalStall(ctx, tx, jobID, now, removal, request)
 		if err != nil {
 			return Job{}, err
@@ -827,6 +841,22 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
 		return Job{}, false, mapErr
 	} else if mapped {
+		// A Computer keeps its removal row after finalization instead of
+		// becoming a tombstone, so removed_ns is the only thing separating
+		// "acknowledged, awaiting finalize" from "already finalized". Without
+		// this guard every later reconcile pass would rewrite the removal time
+		// and rerun custody finalization. An ordinary service cannot take this
+		// path twice because its rows are deleted, and force-forget sets
+		// removed_ns while still owing a tombstone, so the check belongs here
+		// rather than above.
+		if removal.removedAt != nil {
+			job, readErr := getJobByID(ctx, tx, jobID, now)
+			if readErr != nil {
+				return Job{}, false, internalError(readErr, "read finalized Computer removal")
+			}
+			applyServiceRemoval(&job, removal)
+			return job, false, nil
+		}
 		// A Computer keeps its immutable Job evidence and durable authority row.
 		// The ordinary removal directive still owns agent cleanup and Slot
 		// release; finalization records the terminal observation in place rather
@@ -883,7 +913,8 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 			createdAt: time.Unix(0, createdNS).UTC(), removalRequestedAt: removal.requestedAt,
 			removedAt: now, outcome: outcome, lastBoundNodeID: removal.boundNodeID,
 			removalGeneration: removal.generation, rootInstanceID: removal.rootInstanceID,
-			cleanupAcknowledgedAt: removal.acknowledgedAt, stallEvidence: removal.stallEvidence,
+			cleanupAcknowledgedAt: removal.acknowledgedAt, acknowledgementKey: removal.acknowledgementKey,
+			acknowledgementHash: removal.acknowledgementHash, stallEvidence: removal.stallEvidence,
 			stallKey: removal.stallKey, stallHash: removal.stallHash, stalledAt: removal.stalledAt,
 		}
 		insertTombstone = true
@@ -901,8 +932,9 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		if err := insertServiceTombstone(ctx, tx, tombstone); err != nil {
 			return Job{}, false, err
 		}
-	} else if _, err := tx.ExecContext(ctx, `UPDATE service_tombstones SET cleanup_acknowledged_ns=? WHERE job_id=?`,
-		removal.acknowledgedAt.UnixNano(), jobID); err != nil {
+	} else if _, err := tx.ExecContext(ctx, `UPDATE service_tombstones SET cleanup_acknowledged_ns=?,
+		cleanup_acknowledgement_key=?, cleanup_acknowledgement_hash=? WHERE job_id=?`,
+		removal.acknowledgedAt.UnixNano(), removal.acknowledgementKey, removal.acknowledgementHash, jobID); err != nil {
 		return Job{}, false, internalError(err, "record forgotten-service cleanup acknowledgement")
 	}
 	return tombstone.job(), true, nil
@@ -1117,11 +1149,13 @@ func insertServiceTombstone(ctx context.Context, tx *sql.Tx, tombstone serviceTo
 	if _, err := tx.ExecContext(ctx, `INSERT INTO service_tombstones(
 		job_id, dispatch_key_hash, request_hash, created_ns, removal_requested_ns, removed_ns,
 		outcome, last_bound_node_id, removal_generation, root_instance_id, cleanup_acknowledged_ns,
+		cleanup_acknowledgement_key, cleanup_acknowledgement_hash,
 		stall_evidence_json, stall_acknowledgement_key, stall_acknowledgement_hash, stalled_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, tombstone.jobID, tombstone.dispatchKeyHash,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, tombstone.jobID, tombstone.dispatchKeyHash,
 		tombstone.requestHash, tombstone.createdAt.UnixNano(), tombstone.removalRequestedAt.UnixNano(),
 		tombstone.removedAt.UnixNano(), tombstone.outcome, tombstone.lastBoundNodeID,
 		tombstone.removalGeneration, tombstone.rootInstanceID, acknowledged,
+		tombstone.acknowledgementKey, tombstone.acknowledgementHash,
 		tombstone.stallEvidence, tombstone.stallKey, tombstone.stallHash, stalled); err != nil {
 		return internalError(err, "insert service tombstone")
 	}
@@ -1142,10 +1176,12 @@ func readServiceTombstone(ctx context.Context, q queryer, predicate string, valu
 	var acknowledgedNS, stalledNS sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT job_id, dispatch_key_hash, request_hash, created_ns,
 		removal_requested_ns, removed_ns, outcome, last_bound_node_id, removal_generation,
-		root_instance_id, cleanup_acknowledged_ns, stall_evidence_json, stall_acknowledgement_key,
+		root_instance_id, cleanup_acknowledged_ns, cleanup_acknowledgement_key, cleanup_acknowledgement_hash,
+		stall_evidence_json, stall_acknowledgement_key,
 		stall_acknowledgement_hash, stalled_ns FROM service_tombstones WHERE `+predicate, value).
 		Scan(&row.jobID, &row.dispatchKeyHash, &row.requestHash, &createdNS, &requestedNS, &removedNS,
 			&row.outcome, &row.lastBoundNodeID, &row.removalGeneration, &row.rootInstanceID, &acknowledgedNS,
+			&row.acknowledgementKey, &row.acknowledgementHash,
 			&row.stallEvidence, &row.stallKey, &row.stallHash, &stalledNS)
 	if err != nil {
 		return serviceTombstoneRow{}, err
@@ -1228,6 +1264,13 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 	if request.RemovalGeneration != tombstone.removalGeneration || request.RootInstanceID != tombstone.rootInstanceID {
 		return protocolError(contract.ErrorStaleFence, "finalized removal acknowledgement does not match the tombstone")
 	}
+	// A finalized removal accepts replays, never new claims, so the replay is
+	// validated by the exact shape that was accepted. Dropping the declaration
+	// and sending a bare acknowledgement is a different assertion -- that
+	// cleanup completed -- and must not inherit the declaration's acceptance.
+	if request.CleanupQuarantine != nil {
+		return protocolError(contract.ErrorConflict, "a finalized service removal cannot accept cleanup quarantine evidence")
+	}
 	if request.CleanupStall != nil {
 		payload, err := json.Marshal(request.CleanupStall)
 		if err != nil {
@@ -1238,6 +1281,24 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 			return protocolError(contract.ErrorIdempotencyConflict,
 				"finalized stalled removal replay does not match the accepted declaration")
 		}
+		return nil
+	}
+	if !tombstone.acknowledgementKey.Valid {
+		// Nothing positive was ever accepted for this removal -- it was waived,
+		// or its only acceptance was a declaration -- so a bare acknowledgement
+		// is a fresh claim against a finalized row.
+		return protocolError(contract.ErrorIdempotencyConflict,
+			"finalized service removal accepted no cleanup acknowledgement to replay")
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return internalError(err, "encode finalized removal acknowledgement")
+	}
+	digest := sha256.Sum256(payload)
+	if tombstone.acknowledgementKey.String != request.IdempotencyKey || !tombstone.acknowledgementHash.Valid ||
+		tombstone.acknowledgementHash.String != hex.EncodeToString(digest[:]) {
+		return protocolError(contract.ErrorIdempotencyConflict,
+			"finalized removal acknowledgement replay does not match the accepted request")
 	}
 	return nil
 }
@@ -1245,6 +1306,20 @@ func validateFinalizedAcknowledgement(ctx context.Context, q queryer, identityNo
 // hashServiceRemovalStall hashes the frozen declaration alone. Using the
 // enclosing acknowledgement body instead would make an otherwise identical
 // replay from a later boot look like a different declaration.
+// serviceWorkloadKind reads the immutable workload kind from the Job's own
+// frozen specification.
+func serviceWorkloadKind(ctx context.Context, q queryer, jobID string) (string, error) {
+	var specJSON []byte
+	if err := q.QueryRowContext(ctx, `SELECT spec_json FROM jobs WHERE job_id=?`, jobID).Scan(&specJSON); err != nil {
+		return "", internalError(err, "read service workload kind")
+	}
+	var spec contract.JobSpec
+	if err := json.Unmarshal(specJSON, &spec); err != nil {
+		return "", internalError(err, "decode service workload kind")
+	}
+	return spec.Kind, nil
+}
+
 func hashServiceRemovalStall(payload []byte) string {
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:])
