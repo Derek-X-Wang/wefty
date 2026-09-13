@@ -288,34 +288,15 @@ func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBy
 	readFilesystemBytes func(context.Context, string) (int64, error),
 	allocate func(string, int64) error,
 ) error {
-	info, err := os.Lstat(imagePath)
-	if err != nil {
+	if allocate == nil {
+		// Preallocate the extended extent through create's full-allocation
+		// helper; growComputerDiskExtent then verifies the fully-allocated
+		// invariant that attempt admission enforces before any bytes are
+		// republished.
+		allocate = fullyAllocateComputerDisk
+	}
+	if err := growComputerDiskExtent(imagePath, oldBytes, newBytes, allocate); err != nil {
 		return err
-	}
-	if !info.Mode().IsRegular() || (info.Size() != oldBytes && info.Size() != newBytes) {
-		return errors.New("Computer disk image size conflicts with grow authority")
-	}
-	if info.Size() == oldBytes {
-		file, openErr := os.OpenFile(imagePath, os.O_RDWR, 0)
-		if openErr != nil {
-			return openErr
-		}
-		allocationErr := unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, oldBytes, newBytes-oldBytes)
-		if allocationErr == nil {
-			allocationErr = file.Truncate(newBytes)
-		}
-		if allocationErr == nil {
-			allocationErr = file.Sync()
-		}
-		allocationErr = errors.Join(allocationErr, file.Close())
-		if allocationErr != nil {
-			_ = os.Truncate(imagePath, oldBytes)
-			return allocationErr
-		}
-		if err := verifyComputerDiskAllocation(imagePath, newBytes); err != nil {
-			_ = os.Truncate(imagePath, oldBytes)
-			return err
-		}
 	}
 	resize2fs, err := findRootTool("resize2fs")
 	if err != nil {

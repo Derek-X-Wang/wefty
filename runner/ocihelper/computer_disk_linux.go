@@ -658,21 +658,6 @@ func syncDirectory(path string) error {
 	return directory.Sync()
 }
 
-func verifyComputerDiskAllocation(path string, bytes int64) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() || info.Size() != bytes {
-		return fmt.Errorf("Computer disk allocation does not match its %d-byte budget", bytes)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Blocks*512 < bytes {
-		return errors.New("Computer disk image is not fully allocated")
-	}
-	return nil
-}
-
 func migrateComputerDiskOwnership(root string, uid, gid uint32, lchown func(string, int, int) error) error {
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
