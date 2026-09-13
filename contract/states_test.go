@@ -8,10 +8,12 @@ func TestStateTransitionTablesCoverAllStates(t *testing.T) {
 	assertStates(t, JobTransitions, []JobState{
 		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobAwaitingInput, JobSucceeded, JobFailed,
 		JobRemovalPending, JobAgentCleaned, JobRemovedVerified, JobForgottenCleanupUnverified,
+		JobStalledCleanupUnverified,
 	})
 	assertStates(t, ServiceJobTransitions, []JobState{
 		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobFailed,
 		JobRemovalPending, JobAgentCleaned, JobRemovedVerified, JobForgottenCleanupUnverified,
+		JobStalledCleanupUnverified,
 	})
 	assertStates(t, AttemptTransitions, []AttemptState{
 		AttemptClaimed, AttemptRunning, AttemptAwaitingInput, AttemptSucceeded, AttemptFailed, AttemptLost,

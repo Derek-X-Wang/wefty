@@ -654,6 +654,11 @@ func run() error {
 					ResourceManifests: view.ResourceManifests,
 					Attestation:       view.Attestation,
 					InvalidReason:     view.InvalidReason,
+					FailedAttempts:    view.FailedAttempts,
+					LastRefusalCode:   view.LastRefusalCode,
+					LastRefusalDetail: view.LastRefusalDetail,
+					LastAttemptedAt:   view.LastAttemptedAt,
+					StallDeclaredAt:   view.StallDeclaredAt,
 				})
 			}
 			return records, nil

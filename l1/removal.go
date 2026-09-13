@@ -27,6 +27,10 @@ type serviceRemovalRow struct {
 	outcome             ServiceRemovalOutcome
 	acknowledgementKey  sql.NullString
 	acknowledgementHash sql.NullString
+	stallEvidence       []byte
+	stallKey            sql.NullString
+	stallHash           sql.NullString
+	stalledAt           *time.Time
 }
 
 // InitialServiceRemovalGeneration is the first and currently only removal
@@ -250,10 +254,10 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 		FROM service_removals JOIN jobs ON jobs.job_id=service_removals.job_id
 		LEFT JOIN computer_job_projections ON computer_job_projections.job_id=service_removals.job_id
 		LEFT JOIN computers ON computers.computer_id=computer_job_projections.computer_id
-		WHERE service_removals.bound_node_id=? AND service_removals.status IN (?, ?)
+		WHERE service_removals.bound_node_id=? AND service_removals.status IN (?, ?, ?)
 		AND service_removals.cleanup_status=?
 		ORDER BY service_removals.requested_ns, service_removals.job_id`, nodeID, contract.JobRemovalPending,
-		contract.JobForgottenCleanupUnverified, ServiceRemovalCleanupPending)
+		contract.JobForgottenCleanupUnverified, contract.JobStalledCleanupUnverified, ServiceRemovalCleanupPending)
 	if err != nil {
 		return nil, internalError(err, "list service removal directives")
 	}
@@ -459,6 +463,31 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if err := validateMutableAcknowledgement(ctx, tx, identityNodeID, request, removal); err != nil {
 		return Job{}, err
 	}
+	if request.CleanupStall != nil {
+		if request.CleanupQuarantine != nil {
+			return Job{}, protocolError(contract.ErrorInvalidRequest,
+				"a removal acknowledgement carries cleanup quarantine or stall evidence, never both")
+		}
+		// A quarantine deliberately keeps the slot and has its own resolution
+		// path. Letting a stall declaration release that slot would discard
+		// the quarantine's reason for existing.
+		if removal.cleanupStatus == ServiceRemovalCleanupQuarantined {
+			return Job{}, protocolError(contract.ErrorConflict,
+				"service removal cleanup is quarantined and retains its Slot; it cannot also be declared stalled")
+		}
+		if removal.status != contract.JobRemovalPending && removal.status != contract.JobStalledCleanupUnverified {
+			return Job{}, protocolError(contract.ErrorConflict,
+				"service removal state %q cannot accept stall evidence", removal.status)
+		}
+		job, err := s.recordServiceRemovalStall(ctx, tx, jobID, now, bodyHash, removal, request)
+		if err != nil {
+			return Job{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return Job{}, internalError(err, "commit stalled service removal")
+		}
+		return job, nil
+	}
 	if removal.cleanupStatus == ServiceRemovalCleanupQuarantined && request.CleanupQuarantine == nil {
 		return Job{}, protocolError(contract.ErrorConflict,
 			"Computer removal cleanup is quarantined; ordinary acknowledgement cannot resolve it")
@@ -529,8 +558,11 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	}
 
 	nextStatus := contract.JobAgentCleaned
-	if removal.status == contract.JobForgottenCleanupUnverified {
-		nextStatus = contract.JobForgottenCleanupUnverified
+	// A waived or stalled removal that a returning node finally cleans records
+	// the cleanup without taking back the terminal label it already carries.
+	if removal.status == contract.JobForgottenCleanupUnverified ||
+		removal.status == contract.JobStalledCleanupUnverified {
+		nextStatus = removal.status
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, cleanup_status=?, cleanup_acknowledgement_key=?,
 		cleanup_acknowledgement_hash=?, agent_cleaned_ns=? WHERE job_id=?`, nextStatus, ServiceRemovalCleanupAcknowledged,
@@ -610,6 +642,125 @@ func recordComputerRemovalCleanupQuarantine(ctx context.Context, tx *sql.Tx, job
 	return nil
 }
 
+// recordServiceRemovalStall commits the bound agent's declaration that this
+// removal cannot complete. It is the one place a service Slot is released
+// without any claim that runtime cleanup succeeded, so it writes the reason
+// durably beside the release: the refusal the agent kept receiving, how many
+// times, and how long it had been trying.
+func (s *Store) recordServiceRemovalStall(ctx context.Context, tx *sql.Tx, jobID string, now time.Time,
+	bodyHash string, removal serviceRemovalRow, request RemovalAcknowledgementRequest) (Job, error) {
+	evidence := request.CleanupStall
+	if err := validateServiceRemovalStallEvidence(*evidence, jobID, removal, request); err != nil {
+		return Job{}, err
+	}
+	// The agent owns the fact that cleanup kept failing; L1 owns the clock.
+	// Elapsed is measured against L1's own durable request time, so an agent
+	// can never shorten the bound by reporting a longer wait than it waited.
+	if elapsed := now.Sub(removal.requestedAt); elapsed < s.removalStallBound {
+		return Job{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
+			"job_id": jobID, "elapsed_seconds": int64(elapsed.Seconds()),
+			"bound_seconds": int64(s.removalStallBound.Seconds()),
+		}, "service removal %q has stood for %s, short of the %s stall bound", jobID,
+			elapsed.Round(time.Second), s.removalStallBound)
+	}
+	if removal.stallKey.Valid {
+		if removal.stallKey.String != request.IdempotencyKey || !removal.stallHash.Valid ||
+			removal.stallHash.String != bodyHash {
+			return Job{}, protocolError(contract.ErrorIdempotencyConflict,
+				"stalled service removal replay does not match the accepted declaration")
+		}
+		job, err := getJobByID(ctx, tx, jobID, now)
+		if err != nil {
+			return Job{}, internalError(err, "read replayed stalled service removal")
+		}
+		applyServiceRemoval(&job, removal)
+		return job, nil
+	}
+	payload, err := json.Marshal(evidence)
+	if err != nil {
+		return Job{}, internalError(err, "encode service removal stall evidence")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, stall_evidence_json=?,
+		stall_acknowledgement_key=?, stall_acknowledgement_hash=?, stalled_ns=?
+		WHERE job_id=? AND status=? AND stall_evidence_json IS NULL`, contract.JobStalledCleanupUnverified,
+		payload, request.IdempotencyKey, bodyHash, now.UnixNano(), jobID, contract.JobRemovalPending)
+	if err != nil {
+		return Job{}, internalError(err, "record stalled service removal")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Job{}, internalError(err, "inspect stalled service removal")
+	}
+	if affected != 1 {
+		return Job{}, protocolError(contract.ErrorConflict, "service removal %q is no longer declarable stalled", jobID)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
+		contract.JobStalledCleanupUnverified, now.UnixNano(), jobID); err != nil {
+		return Job{}, internalError(err, "project stalled service removal")
+	}
+	// Slot occupancy is keyed on the Job state alone, so the projection above
+	// is what releases it. These columns are the publication and restart
+	// bookkeeping that must not outlive the binding's last live attempt.
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET published_attempt_id=NULL, healthy_since_ns=NULL,
+		next_restart_at=NULL WHERE job_id=?`, jobID); err != nil {
+		return Job{}, internalError(err, "release stalled service removal Slot")
+	}
+	removal.status = contract.JobStalledCleanupUnverified
+	removal.stallEvidence = payload
+	removal.stallKey = sql.NullString{String: request.IdempotencyKey, Valid: true}
+	removal.stallHash = sql.NullString{String: bodyHash, Valid: true}
+	removal.stalledAt = &now
+	job, err := getJobByID(ctx, tx, jobID, now)
+	if err != nil {
+		return Job{}, internalError(err, "read stalled service removal")
+	}
+	applyServiceRemoval(&job, removal)
+	return job, nil
+}
+
+// validateServiceRemovalStallEvidence requires the declaration to name the
+// exact standing directive the authenticated boot holds. Nothing here is
+// taken on trust from the request body alone: every identity field must equal
+// the durable authority L1 already validated.
+func validateServiceRemovalStallEvidence(evidence ServiceRemovalStallEvidence, jobID string,
+	removal serviceRemovalRow, request RemovalAcknowledgementRequest) error {
+	if evidence.Kind != ServiceRemovalStallEvidenceKind {
+		return protocolError(contract.ErrorInvalidRequest, "service removal stall evidence has unknown kind %q", evidence.Kind)
+	}
+	if !strings.HasPrefix(request.IdempotencyKey, ServiceRemovalStallKeyPrefix) {
+		return protocolError(contract.ErrorInvalidRequest,
+			"service removal stall evidence requires an idempotency key in the %q namespace", ServiceRemovalStallKeyPrefix)
+	}
+	if evidence.JobID != jobID || evidence.NodeID != removal.boundNodeID || evidence.NodeID != request.NodeID ||
+		evidence.BootSessionID != request.BootSessionID {
+		return protocolError(contract.ErrorInvalidRequest, "service removal stall evidence names another service or boot")
+	}
+	if evidence.RemovalGeneration != removal.generation || evidence.CleanupFence != removal.cleanupFence {
+		return protocolError(contract.ErrorStaleFence, "service removal stall evidence does not match the standing directive")
+	}
+	if strings.TrimSpace(evidence.Phase) == "" || strings.TrimSpace(evidence.LastRefusalCode) == "" {
+		return protocolError(contract.ErrorInvalidRequest,
+			"service removal stall evidence requires the phase reached and the last refusal code")
+	}
+	if len(evidence.LastRefusalDetail) > MaximumServiceRemovalStallDetail {
+		return protocolError(contract.ErrorInvalidRequest, "service removal stall detail exceeds %d bytes",
+			MaximumServiceRemovalStallDetail)
+	}
+	// One failure is a bad try; a repeated identical refusal is the fact this
+	// outcome exists to record.
+	if evidence.Attempts < MinimumServiceRemovalStallAttempts {
+		return protocolError(contract.ErrorInvalidRequest,
+			"service removal stall evidence requires at least %d consecutive cleanup failures, not %d",
+			MinimumServiceRemovalStallAttempts, evidence.Attempts)
+	}
+	if evidence.PreparedAt.IsZero() || evidence.LastAttemptedAt.IsZero() ||
+		evidence.LastAttemptedAt.Before(evidence.PreparedAt) {
+		return protocolError(contract.ErrorInvalidRequest,
+			"service removal stall evidence requires a prepared time and a later last-attempt time")
+	}
+	return nil
+}
+
 // FinalizeServiceRemoval performs phase four in a transaction separate from
 // acknowledgement. Reconcile calls the same helper after a crash between the
 // two commits.
@@ -650,7 +801,8 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 	}
 	eligible := removal.cleanupStatus == ServiceRemovalCleanupAcknowledged &&
 		(removal.status == contract.JobAgentCleaned ||
-			(removal.status == contract.JobForgottenCleanupUnverified && removal.acknowledgedAt != nil))
+			(removal.status == contract.JobForgottenCleanupUnverified && removal.acknowledgedAt != nil) ||
+			(removal.status == contract.JobStalledCleanupUnverified && removal.acknowledgedAt != nil))
 	if !eligible {
 		job, readErr := getJobByID(ctx, tx, jobID, now)
 		if readErr != nil {
@@ -666,12 +818,21 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		// The ordinary removal directive still owns agent cleanup and Slot
 		// release; finalization records the terminal observation in place rather
 		// than deleting the Job into an ordinary-service tombstone.
+		//
+		// A removal already declared stalled keeps that terminal label. The
+		// Slot was released without proof, and a later cleanup cannot retell
+		// that story; the Computer's own custody outcome below is separate and
+		// may still be earned.
+		terminal := contract.JobRemovedVerified
+		if removal.status == contract.JobStalledCleanupUnverified {
+			terminal = contract.JobStalledCleanupUnverified
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, removed_ns=? WHERE job_id=?`,
-			contract.JobRemovedVerified, now.UnixNano(), jobID); err != nil {
+			terminal, now.UnixNano(), jobID); err != nil {
 			return Job{}, false, internalError(err, "finalize Computer removal directive")
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
-			contract.JobRemovedVerified, now.UnixNano(), jobID); err != nil {
+			terminal, now.UnixNano(), jobID); err != nil {
 			return Job{}, false, internalError(err, "project verified Computer removal")
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, published_attempt_id=NULL,
@@ -697,10 +858,17 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 	tombstone, tombstoneErr := readServiceTombstoneByID(ctx, tx, jobID)
 	insertTombstone := false
 	if errors.Is(tombstoneErr, sql.ErrNoRows) {
+		// A stalled removal has no tombstone yet because nothing was proven
+		// when its Slot was released. The late cleanup writes one, and it
+		// writes the outcome the removal actually ended with.
+		outcome := ServiceRemovalVerified
+		if removal.status == contract.JobStalledCleanupUnverified {
+			outcome = ServiceRemovalOutcomeCleanupStalled
+		}
 		tombstone = serviceTombstoneRow{
 			jobID: jobID, dispatchKeyHash: hashDispatchKey(dispatchKey), requestHash: requestHash,
 			createdAt: time.Unix(0, createdNS).UTC(), removalRequestedAt: removal.requestedAt,
-			removedAt: now, outcome: ServiceRemovalVerified, lastBoundNodeID: removal.boundNodeID,
+			removedAt: now, outcome: outcome, lastBoundNodeID: removal.boundNodeID,
 			removalGeneration: removal.generation, rootInstanceID: removal.rootInstanceID,
 			cleanupAcknowledgedAt: removal.acknowledgedAt,
 		}
@@ -840,22 +1008,29 @@ func (s *Store) checkpointSecretWAL(ctx context.Context) error {
 func readServiceRemoval(ctx context.Context, q queryer, jobID string) (serviceRemovalRow, error) {
 	var row serviceRemovalRow
 	var requestedNS int64
-	var acknowledgedNS, removedNS sql.NullInt64
+	var acknowledgedNS, removedNS, stalledNS sql.NullInt64
 	var outcome sql.NullString
 	err := q.QueryRowContext(ctx, `SELECT service_removals.bound_node_id, service_removals.removal_generation,
 		service_removals.cleanup_fence, service_removals.root_instance_id, service_removals.status, service_removals.cleanup_status,
 		service_removals.requested_ns, service_removals.cleanup_acknowledgement_key,
 		service_removals.cleanup_acknowledgement_hash, service_removals.agent_cleaned_ns,
-		service_removals.removed_ns, service_tombstones.outcome
+		service_removals.removed_ns, service_removals.stall_evidence_json,
+		service_removals.stall_acknowledgement_key, service_removals.stall_acknowledgement_hash,
+		service_removals.stalled_ns, service_tombstones.outcome
 		FROM service_removals
 		LEFT JOIN service_tombstones ON service_tombstones.job_id=service_removals.job_id
 		WHERE service_removals.job_id=?`, jobID).Scan(&row.boundNodeID, &row.generation,
 		&row.cleanupFence, &row.rootInstanceID, &row.status, &row.cleanupStatus, &requestedNS,
-		&row.acknowledgementKey, &row.acknowledgementHash, &acknowledgedNS, &removedNS, &outcome)
+		&row.acknowledgementKey, &row.acknowledgementHash, &acknowledgedNS, &removedNS,
+		&row.stallEvidence, &row.stallKey, &row.stallHash, &stalledNS, &outcome)
 	if err != nil {
 		return serviceRemovalRow{}, err
 	}
 	row.requestedAt = time.Unix(0, requestedNS).UTC()
+	if stalledNS.Valid {
+		value := time.Unix(0, stalledNS.Int64).UTC()
+		row.stalledAt = &value
+	}
 	if acknowledgedNS.Valid {
 		value := time.Unix(0, acknowledgedNS.Int64).UTC()
 		row.acknowledgedAt = &value
@@ -879,12 +1054,36 @@ func applyServiceRemoval(job *Job, removal serviceRemovalRow) {
 	if removal.cleanupStatus == ServiceRemovalCleanupQuarantined {
 		outcome = ServiceRemovalOutcomeCleanupQuarantined
 	}
+	// A stalled removal is terminal, so its own status is the outcome. It
+	// outranks the tombstone-derived outcome for the same reason force-forget
+	// does: the terminal label records how the slot was released, not what a
+	// later cleanup managed to prove.
+	if removal.status == contract.JobStalledCleanupUnverified {
+		outcome = ServiceRemovalOutcomeCleanupStalled
+	}
 	job.Removal = &ServiceRemoval{
 		RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalBoundNodeID: removal.boundNodeID,
 		RemovalGeneration: removal.generation, RemovalRequestedAt: removal.requestedAt,
 		CleanupStatus: removal.cleanupStatus, RemovalOutcome: outcome, RemovedAt: removal.removedAt,
-		CleanupAcknowledgedAt: removal.acknowledgedAt,
+		CleanupAcknowledgedAt: removal.acknowledgedAt, StalledAt: removal.stalledAt,
+		Stall: decodeServiceRemovalStall(removal.stallEvidence),
 	}
+}
+
+// decodeServiceRemovalStall renders durable stall evidence for an operator
+// read. A row that cannot be decoded is reported as absent rather than
+// failing the whole projection: the Job state already carries the fact that
+// the removal stalled, and an operator needs to see that more than they need
+// the receipt.
+func decodeServiceRemovalStall(payload []byte) *ServiceRemovalStallEvidence {
+	if len(payload) == 0 {
+		return nil
+	}
+	var evidence ServiceRemovalStallEvidence
+	if err := json.Unmarshal(payload, &evidence); err != nil {
+		return nil
+	}
+	return &evidence
 }
 
 func insertServiceTombstone(ctx context.Context, tx *sql.Tx, tombstone serviceTombstoneRow) error {
@@ -936,8 +1135,11 @@ func readServiceTombstone(ctx context.Context, q queryer, predicate string, valu
 
 func (row serviceTombstoneRow) job() Job {
 	state := contract.JobRemovedVerified
-	if row.outcome == ServiceRemovalForgotten {
+	switch row.outcome {
+	case ServiceRemovalForgotten:
 		state = contract.JobForgottenCleanupUnverified
+	case ServiceRemovalOutcomeCleanupStalled:
+		state = contract.JobStalledCleanupUnverified
 	}
 	removedAt := row.removedAt
 	cleanupStatus := ServiceRemovalCleanupPending
@@ -959,7 +1161,7 @@ func (row serviceTombstoneRow) job() Job {
 
 func validateMutableAcknowledgement(ctx context.Context, q queryer, identityNodeID string, request RemovalAcknowledgementRequest, removal serviceRemovalRow) error {
 	if removal.status != contract.JobRemovalPending && removal.status != contract.JobAgentCleaned &&
-		removal.status != contract.JobForgottenCleanupUnverified {
+		removal.status != contract.JobForgottenCleanupUnverified && removal.status != contract.JobStalledCleanupUnverified {
 		return protocolError(contract.ErrorConflict, "service removal state %q does not accept acknowledgement", removal.status)
 	}
 	var storedIdentity, currentBoot, currentRootInstance string

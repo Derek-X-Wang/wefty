@@ -8,22 +8,28 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag                      = "tag:wefty-client"
-	DefaultAgentPrincipalTag                       = "tag:wefty-agent"
-	DefaultLeaseDuration                           = 30 * time.Second
-	DefaultLateEvidenceWindow                      = 48 * time.Hour
-	DefaultNodeStaleAfter                          = 45 * time.Second
-	DefaultNodeDeadAfter                           = 2 * time.Minute
-	DefaultReconcileInterval                       = time.Second
-	DefaultServiceStabilityWindow                  = 2 * time.Minute
-	DefaultServiceLogRetentionAge                  = 7 * 24 * time.Hour
-	DefaultServiceLogRetentionBytes          int64 = 32 << 20
-	DefaultServiceAttemptSummaries                 = 32 // A detached Computer's replay-bound terminal attempt consumes one non-current slot.
-	DefaultMaxOneshotSlots                         = 4
-	DefaultMaxServiceSlots                         = 2
-	DefaultPrestartInfrastructureBudget            = 10 * time.Minute
-	DefaultAdminBootstrapTTL                       = 10 * time.Minute
-	DefaultComputerTakeoverAuditRetentionAge       = 90 * 24 * time.Hour
+	DefaultClientPrincipalTag                 = "tag:wefty-client"
+	DefaultAgentPrincipalTag                  = "tag:wefty-agent"
+	DefaultLeaseDuration                      = 30 * time.Second
+	DefaultLateEvidenceWindow                 = 48 * time.Hour
+	DefaultNodeStaleAfter                     = 45 * time.Second
+	DefaultNodeDeadAfter                      = 2 * time.Minute
+	DefaultReconcileInterval                  = time.Second
+	DefaultServiceStabilityWindow             = 2 * time.Minute
+	DefaultServiceLogRetentionAge             = 7 * 24 * time.Hour
+	DefaultServiceLogRetentionBytes     int64 = 32 << 20
+	DefaultServiceAttemptSummaries            = 32 // A detached Computer's replay-bound terminal attempt consumes one non-current slot.
+	DefaultMaxOneshotSlots                    = 4
+	DefaultMaxServiceSlots                    = 2
+	DefaultPrestartInfrastructureBudget       = 10 * time.Minute
+	// DefaultRemovalStallBound is how long a durable removal directive must
+	// have stood before L1 admits an agent's declaration that it cannot
+	// complete. It deliberately mirrors the prestart budget: the same wait a
+	// Job gets to acquire infrastructure is the wait a removal gets to give
+	// it back, and it is the bound the node doctor already reports against.
+	DefaultRemovalStallBound                 = 10 * time.Minute
+	DefaultAdminBootstrapTTL                 = 10 * time.Minute
+	DefaultComputerTakeoverAuditRetentionAge = 90 * 24 * time.Hour
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.
@@ -117,6 +123,11 @@ type ServiceRemoval struct {
 	RemovalOutcome        ServiceRemovalOutcome        `json:"removal_outcome,omitempty"`
 	RemovedAt             *time.Time                   `json:"removed_at,omitempty"`
 	CleanupAcknowledgedAt *time.Time                   `json:"cleanup_acknowledged_at,omitempty"`
+	// Stall is the bound agent's typed account of a removal that could not
+	// complete. It is present exactly when the removal is terminally stalled,
+	// and it never asserts that any runtime resource was deleted.
+	Stall     *ServiceRemovalStallEvidence `json:"stall,omitempty"`
+	StalledAt *time.Time                   `json:"stalled_at,omitempty"`
 }
 
 type ServiceRemovalOutcome string
@@ -125,6 +136,11 @@ const (
 	ServiceRemovalVerified                  ServiceRemovalOutcome = "verified_removed"
 	ServiceRemovalForgotten                 ServiceRemovalOutcome = "force_forgotten"
 	ServiceRemovalOutcomeCleanupQuarantined ServiceRemovalOutcome = "cleanup_quarantined"
+	// ServiceRemovalOutcomeCleanupStalled is agent-declared non-completion. It
+	// shares the cleanup_quarantined family -- neither claims cleanup
+	// succeeded -- but it is terminal and it releases the service slot, where
+	// a quarantine is recoverable and deliberately keeps the slot.
+	ServiceRemovalOutcomeCleanupStalled ServiceRemovalOutcome = "cleanup_stalled"
 )
 
 type ServiceRemovalCleanupStatus string
@@ -190,7 +206,50 @@ type RemovalAcknowledgementRequest struct {
 	RootInstanceID    string                            `json:"root_instance_id"`
 	IdempotencyKey    string                            `json:"idempotency_key"`
 	CleanupQuarantine *ComputerStorageCleanupQuarantine `json:"cleanup_quarantine,omitempty"`
+	// CleanupStall declares that this removal cannot complete. It is mutually
+	// exclusive with CleanupQuarantine and with an ordinary completion
+	// acknowledgement, and it carries its own idempotency key namespace so a
+	// later genuine completion from the same boot is still accepted.
+	CleanupStall *ServiceRemovalStallEvidence `json:"cleanup_stall,omitempty"`
 }
+
+// ServiceRemovalStallEvidence is the bound agent's typed account of why a
+// standing removal never completed. Every field records non-completion: none
+// of them asserts that a runtime resource was deleted. L1 stores it verbatim
+// as the durable reason a service slot was released without proof.
+type ServiceRemovalStallEvidence struct {
+	Kind              string    `json:"kind"`
+	JobID             string    `json:"job_id"`
+	NodeID            string    `json:"node_id"`
+	BootSessionID     string    `json:"boot_session_id"`
+	RemovalGeneration uint64    `json:"removal_generation"`
+	CleanupFence      string    `json:"cleanup_fence"`
+	Phase             string    `json:"phase"`
+	LastRefusalCode   string    `json:"last_refusal_code"`
+	LastRefusalDetail string    `json:"last_refusal_detail"`
+	Attempts          int       `json:"attempts"`
+	PreparedAt        time.Time `json:"prepared_at"`
+	LastAttemptedAt   time.Time `json:"last_attempted_at"`
+}
+
+// ServiceRemovalStallEvidenceKind is the only accepted stall receipt kind.
+const ServiceRemovalStallEvidenceKind = "service_removal_stalled"
+
+// ServiceRemovalStallKeyPrefix namespaces the stall declaration's idempotency
+// key. It is derived exactly like the completion acknowledgement key, but a
+// declaration and a later genuine completion from the same boot must be able
+// to coexist, so they can never be the same key.
+const ServiceRemovalStallKeyPrefix = "removal-stall:"
+
+// MaximumServiceRemovalStallDetail bounds the free-text refusal detail an
+// agent may attach. The typed code is the fact; the detail is context.
+const MaximumServiceRemovalStallDetail = 1024
+
+// MinimumServiceRemovalStallAttempts is how many consecutive cleanup failures
+// a removal must have accumulated before non-completion is a fact rather than
+// one bad try. It is enforced on the evidence L1 accepts as well as on the
+// agent that produces it.
+const MinimumServiceRemovalStallAttempts = 3
 
 type ComputerStorageCleanupQuarantine struct {
 	Kind              string                          `json:"kind"`

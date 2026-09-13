@@ -736,8 +736,12 @@ func serviceIsQuiescent(job l1.Job) bool {
 		(job.State == contract.JobFailed && job.DesiredState == contract.ServiceDesiredStopped && !job.SlotHeld)
 }
 
+// serviceRemovalComplete includes the stalled outcome: it is terminal and the
+// Slot is already released, so a caller that kept waiting would be waiting for
+// a state that can never arrive -- the wedge #450 named.
 func serviceRemovalComplete(job l1.Job) bool {
-	return job.State == contract.JobRemovedVerified || job.State == contract.JobForgottenCleanupUnverified
+	return job.State == contract.JobRemovedVerified || job.State == contract.JobForgottenCleanupUnverified ||
+		job.State == contract.JobStalledCleanupUnverified
 }
 
 func serviceDispatchKey(canonicalScriptPath string) string {

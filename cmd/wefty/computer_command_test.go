@@ -900,3 +900,64 @@ func createComputerCLIProjection(t *testing.T, ctx context.Context, clients *api
 	}
 	return projection
 }
+
+// TestStalledComputerRemovalIsAnAnswerNotATimeout proves the operator gets a
+// typed non-completion result with the refusal facts, and that the Slot is not
+// reported as held. The wait must return: on main it could only time out.
+func TestStalledComputerRemovalIsAnAnswerNotATimeout(t *testing.T) {
+	stalledAt := time.Now().UTC()
+	computer := l1.Computer{ComputerID: "computer", CurrentJobID: "job",
+		DesiredState: contract.ServiceDesiredRemoved, RemovalOutcome: "removal_pending",
+		CurrentJob: l1.Job{JobID: "job", State: contract.JobStalledCleanupUnverified,
+			Removal: &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved,
+				RemovalBoundNodeID: "node", RemovalGeneration: 1,
+				RemovalRequestedAt: stalledAt.Add(-12 * time.Minute), StalledAt: &stalledAt,
+				CleanupStatus:  l1.ServiceRemovalCleanupPending,
+				RemovalOutcome: l1.ServiceRemovalOutcomeCleanupStalled,
+				Stall: &l1.ServiceRemovalStallEvidence{
+					Kind: l1.ServiceRemovalStallEvidenceKind, JobID: "job", Phase: "prepared",
+					LastRefusalCode: "unauthorized_attempt", Attempts: 5,
+				}}}}
+	err := awaitedComputerRemovalOutcome(computer)
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorConflict {
+		t.Fatalf("stalled Computer removal = %T %v, want typed conflict", err, err)
+	}
+	details := responseErr.APIError.Details
+	if details["last_refusal_code"] != "unauthorized_attempt" || details["attempts"] != 5 ||
+		details["removal_outcome"] != string(l1.ServiceRemovalOutcomeCleanupStalled) || details["holds_slot"] != false {
+		t.Fatalf("stalled removal diagnostic details = %#v", details)
+	}
+	if computerRemovalTerminal(computer) {
+		t.Fatal("a stalled removal must never read as a proven removal")
+	}
+
+	// A stalled Job whose evidence is missing is a broken projection, not an
+	// outcome: it must not be reported as a conclusive non-completion.
+	bare := computer
+	bare.CurrentJob.Removal.Stall = nil
+	bareErr := awaitedComputerRemovalOutcome(bare)
+	if !errors.As(bareErr, &responseErr) ||
+		!strings.Contains(responseErr.APIError.Message, "typed non-completion evidence") {
+		t.Fatalf("stalled removal without evidence = %v", bareErr)
+	}
+}
+
+// TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome keeps a bare
+// `removal_pending` off the operator's screen for a Job that already ended.
+func TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome(t *testing.T) {
+	stalledAt := time.Now().UTC()
+	removal := &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved,
+		RemovalGeneration: 1, RemovalRequestedAt: stalledAt.Add(-12 * time.Minute), StalledAt: &stalledAt,
+		CleanupStatus: l1.ServiceRemovalCleanupPending, RemovalOutcome: l1.ServiceRemovalOutcomeCleanupStalled,
+		Stall: &l1.ServiceRemovalStallEvidence{LastRefusalCode: "unauthorized_attempt", Attempts: 5}}
+	rendered := computerRemovalColumn("removal_pending", removal)
+	for _, want := range []string{"removal_pending", "stalled", "unauthorized_attempt", "5", "12m0s"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered removal column %q does not name %q", rendered, want)
+		}
+	}
+	if got := computerRemovalColumn("removed_verified", nil); got != "removed_verified" {
+		t.Fatalf("ordinary removal column = %q, want the bare outcome", got)
+	}
+}

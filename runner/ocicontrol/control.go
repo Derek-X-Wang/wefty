@@ -144,6 +144,15 @@ type RemovalRecord struct {
 	// why the verb answers at all for a removal that is stuck: a row the agent
 	// refuses is exactly the row the operator came here to read.
 	InvalidReason string `json:"invalid_reason,omitempty"`
+	// FailedAttempts and LastRefusalCode explain a removal that is tried and
+	// refused on every heartbeat. StallDeclaredAt is set once L1 accepted that
+	// non-completion and released the service Slot, which is what separates a
+	// removal that still pins capacity from one that is merely outstanding.
+	FailedAttempts    int        `json:"failed_attempts,omitempty"`
+	LastRefusalCode   string     `json:"last_refusal_code,omitempty"`
+	LastRefusalDetail string     `json:"last_refusal_detail,omitempty"`
+	LastAttemptedAt   *time.Time `json:"last_attempted_at,omitempty"`
+	StallDeclaredAt   *time.Time `json:"stall_declared_at,omitempty"`
 }
 
 type RemovalsResponse struct {

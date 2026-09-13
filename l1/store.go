@@ -45,6 +45,7 @@ type StoreOptions struct {
 	ServiceLogRetentionBytes          int64
 	ServiceLogRetentionAge            time.Duration
 	PrestartInfrastructureBudget      time.Duration
+	RemovalStallBound                 time.Duration
 	AdminBootstrapTTL                 time.Duration
 	ComputerTakeoverAuditRetentionAge time.Duration
 	// ComputerBackupCap is the explicit cluster default materialized onto each
@@ -68,6 +69,7 @@ type Store struct {
 	serviceLogRetentionBytes          int64
 	serviceLogRetentionAge            time.Duration
 	prestartInfrastructureBudget      time.Duration
+	removalStallBound                 time.Duration
 	adminBootstrapTTL                 time.Duration
 	computerTakeoverAuditRetentionAge time.Duration
 	computerBackupCap                 int64
@@ -133,6 +135,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if prestartInfrastructureBudget <= 0 {
 		prestartInfrastructureBudget = DefaultPrestartInfrastructureBudget
 	}
+	removalStallBound := options.RemovalStallBound
+	if removalStallBound <= 0 {
+		removalStallBound = DefaultRemovalStallBound
+	}
 	adminBootstrapTTL := options.AdminBootstrapTTL
 	if adminBootstrapTTL < 0 {
 		return nil, fmt.Errorf("l1: admin bootstrap TTL must be non-negative")
@@ -171,6 +177,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		prestartInfrastructureBudget:      prestartInfrastructureBudget,
+		removalStallBound:                 removalStallBound,
 		adminBootstrapTTL:                 adminBootstrapTTL,
 		computerTakeoverAuditRetentionAge: computerTakeoverAuditRetentionAge,
 		computerBackupCap:                 options.ComputerBackupCap,
@@ -867,12 +874,16 @@ CREATE TABLE IF NOT EXISTS service_removals (
   removal_generation INTEGER NOT NULL CHECK(removal_generation > 0),
   cleanup_fence TEXT NOT NULL,
   root_instance_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('removal_pending', 'agent_cleaned', 'removed_verified', 'forgotten_cleanup_unverified')),
+  status TEXT NOT NULL CHECK(status IN ('removal_pending', 'agent_cleaned', 'removed_verified', 'forgotten_cleanup_unverified', 'stalled_cleanup_unverified')),
   cleanup_status TEXT NOT NULL DEFAULT 'pending' CHECK(cleanup_status IN ('pending', 'quarantined', 'acknowledged')),
   requested_ns INTEGER NOT NULL,
   cleanup_acknowledgement_key TEXT,
   cleanup_acknowledgement_hash TEXT,
   cleanup_quarantine_json BLOB,
+  stall_evidence_json BLOB,
+  stall_acknowledgement_key TEXT,
+  stall_acknowledgement_hash TEXT,
+  stalled_ns INTEGER,
   agent_cleaned_ns INTEGER,
   removed_ns INTEGER
 );
@@ -883,7 +894,7 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
   created_ns INTEGER NOT NULL,
   removal_requested_ns INTEGER NOT NULL,
   removed_ns INTEGER NOT NULL,
-  outcome TEXT NOT NULL CHECK(outcome IN ('verified_removed', 'force_forgotten')),
+  outcome TEXT NOT NULL CHECK(outcome IN ('verified_removed', 'force_forgotten', 'cleanup_stalled')),
   last_bound_node_id TEXT NOT NULL,
   removal_generation INTEGER NOT NULL CHECK(removal_generation > 0),
   root_instance_id TEXT NOT NULL,
@@ -1000,6 +1011,24 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if _, err := s.db.ExecContext(ctx, `UPDATE service_removals SET cleanup_status='quarantined'
 		WHERE cleanup_quarantine_json IS NOT NULL AND cleanup_acknowledgement_key IS NULL AND cleanup_status='pending'`); err != nil {
 		return fmt.Errorf("l1: backfill quarantined service removal cleanup status: %w", err)
+	}
+	// The stalled outcome widens two CHECK constraints, so the rebuild has to
+	// run before the columns that carry its evidence are added: it copies the
+	// durable table as sqlite_master still describes it.
+	if err := s.migrateServiceRemovalStallConstraints(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "stall_evidence_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "stall_acknowledgement_key", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "stall_acknowledgement_hash", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "stalled_ns", "INTEGER"); err != nil {
+		return err
 	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
@@ -1172,6 +1201,92 @@ func copySQLiteTableColumnsReplacingText(ctx context.Context, tx *sql.Tx, source
 	}
 	_, err = tx.ExecContext(ctx, "INSERT INTO "+quoteSQLiteIdentifier(targetTable)+" ("+strings.Join(quoted, ", ")+") SELECT "+strings.Join(selected, ", ")+" FROM "+quoteSQLiteIdentifier(sourceTable), oldValue, newValue)
 	return err
+}
+
+// migrateServiceRemovalStallConstraints widens the two removal CHECK
+// constraints written before a removal could end without proof. A durable
+// database created earlier admits only the three outcomes that claim
+// something, so a stalled declaration would be refused by the schema rather
+// than by the contract. CREATE TABLE IF NOT EXISTS cannot change a CHECK, so
+// both tables are rebuilt in one transaction; every existing row keeps its
+// value, and rows are copied before the stall evidence columns are added.
+func (s *Store) migrateServiceRemovalStallConstraints(ctx context.Context) error {
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("l1: acquire SQLite schema migration connection: %w", err)
+	}
+	defer connection.Close()
+	var removalsSQL, tombstonesSQL string
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='service_removals'`).
+		Scan(&removalsSQL); err != nil {
+		return fmt.Errorf("l1: inspect service removal schema: %w", err)
+	}
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='service_tombstones'`).
+		Scan(&tombstonesSQL); err != nil {
+		return fmt.Errorf("l1: inspect service tombstone schema: %w", err)
+	}
+	const (
+		oldRemovalStatuses  = "'removal_pending', 'agent_cleaned', 'removed_verified', 'forgotten_cleanup_unverified'"
+		newRemovalStatuses  = oldRemovalStatuses + ", 'stalled_cleanup_unverified'"
+		oldTombstoneOutcome = "'verified_removed', 'force_forgotten'"
+		newTombstoneOutcome = oldTombstoneOutcome + ", 'cleanup_stalled'"
+	)
+	migrateRemovals := !strings.Contains(removalsSQL, "'stalled_cleanup_unverified'")
+	migrateTombstones := !strings.Contains(tombstonesSQL, "'cleanup_stalled'")
+	if !migrateRemovals && !migrateTombstones {
+		return nil
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("l1: disable foreign keys for service removal stall migration: %w", err)
+	}
+	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	transaction, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin service removal stall schema migration: %w", err)
+	}
+	defer transaction.Rollback()
+	if migrateRemovals {
+		createSQL, rewriteErr := migratedSQLiteCreateTable(removalsSQL, "service_removals_stall_migration",
+			map[string]string{oldRemovalStatuses: newRemovalStatuses})
+		if rewriteErr != nil {
+			return fmt.Errorf("l1: rewrite widened service removal schema: %w", rewriteErr)
+		}
+		if _, err := transaction.ExecContext(ctx, createSQL); err != nil {
+			return fmt.Errorf("l1: create widened service removal schema: %w", err)
+		}
+		if err := copySQLiteTableColumns(ctx, transaction, "service_removals", "service_removals_stall_migration"); err != nil {
+			return fmt.Errorf("l1: copy service removals during migration: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `DROP TABLE service_removals`); err != nil {
+			return fmt.Errorf("l1: replace old service removal schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `ALTER TABLE service_removals_stall_migration RENAME TO service_removals`); err != nil {
+			return fmt.Errorf("l1: publish widened service removal schema: %w", err)
+		}
+	}
+	if migrateTombstones {
+		createSQL, rewriteErr := migratedSQLiteCreateTable(tombstonesSQL, "service_tombstones_stall_migration",
+			map[string]string{oldTombstoneOutcome: newTombstoneOutcome})
+		if rewriteErr != nil {
+			return fmt.Errorf("l1: rewrite widened service tombstone schema: %w", rewriteErr)
+		}
+		if _, err := transaction.ExecContext(ctx, createSQL); err != nil {
+			return fmt.Errorf("l1: create widened service tombstone schema: %w", err)
+		}
+		if err := copySQLiteTableColumns(ctx, transaction, "service_tombstones", "service_tombstones_stall_migration"); err != nil {
+			return fmt.Errorf("l1: copy service tombstones during migration: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `DROP TABLE service_tombstones`); err != nil {
+			return fmt.Errorf("l1: replace old service tombstone schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `ALTER TABLE service_tombstones_stall_migration RENAME TO service_tombstones`); err != nil {
+			return fmt.Errorf("l1: publish widened service tombstone schema: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("l1: commit service removal stall schema migration: %w", err)
+	}
+	return nil
 }
 
 // migrateComputerResetConstraints widens the two CHECK constraints introduced

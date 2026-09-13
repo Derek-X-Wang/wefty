@@ -93,7 +93,8 @@ func (columns serviceJobColumns) projection() *ServiceJob {
 // HoldsSlot reports whether this binding currently occupies service capacity.
 // Binding is the reservation: queued restart backoff, stopping, and an
 // attestation-pending removal all hold. Stopped, latched failed, verified
-// removal, and force-forget release without fabricating a slot identity.
+// removal, force-forget, and an agent-declared stalled cleanup release
+// without fabricating a slot identity.
 func (service ServiceJob) HoldsSlot(state contract.JobState) bool {
 	if service.BoundNodeID == "" {
 		return false
@@ -105,7 +106,7 @@ func (service ServiceJob) HoldsSlot(state contract.JobState) bool {
 		contract.JobRemovalPending, contract.JobAgentCleaned:
 		return true
 	case contract.JobStopped, contract.JobFailed, contract.JobRemovedVerified,
-		contract.JobForgottenCleanupUnverified:
+		contract.JobForgottenCleanupUnverified, contract.JobStalledCleanupUnverified:
 		return false
 	default:
 		return false

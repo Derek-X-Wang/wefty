@@ -436,6 +436,11 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 	// one in every other surface (#450). Age against the row's own prepared
 	// time is the one signal that separates them without guessing at a cause.
 	stalled := make([]string, 0, len(removals))
+	// A record whose stall L1 has already accepted is still outstanding work,
+	// but it no longer costs a Slot, and a Slot is the entire harm this
+	// finding names. Reporting it as a failure forever would train an operator
+	// to ignore the one check that catches the wedge.
+	declared := make([]string, 0, len(removals))
 	for _, removal := range removals {
 		if removal.InvalidReason != "" {
 			unreadable = append(unreadable, removal.JobID+":"+removal.InvalidReason)
@@ -444,8 +449,14 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 		if removal.CompletedAt != nil || removal.PreparedAt.IsZero() || now.Sub(removal.PreparedAt) < removalStallBound {
 			continue
 		}
-		stalled = append(stalled, fmt.Sprintf("%s:%s:%s", removal.JobID, removal.Phase,
-			now.Sub(removal.PreparedAt).Round(time.Minute)))
+		age := now.Sub(removal.PreparedAt).Round(time.Minute)
+		if removal.StallDeclaredAt != nil {
+			declared = append(declared, fmt.Sprintf("%s:%s:%s:%s", removal.JobID, removal.Phase,
+				valueOrUnknownRefusal(removal.LastRefusalCode), age))
+			continue
+		}
+		stalled = append(stalled, fmt.Sprintf("%s:%s:%s:%d:%s", removal.JobID, removal.Phase,
+			valueOrUnknownRefusal(removal.LastRefusalCode), removal.FailedAttempts, age))
 	}
 	switch {
 	case len(unreadable) != 0:
@@ -462,8 +473,18 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 	case len(stalled) != 0:
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
 			ran: true, code: "oci_removal_stalled", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
-			detail: fmt.Sprintf("%d durable runtime removal record(s) have not finished within %s and hold their node service slots (job:phase:age): %s",
+			detail: fmt.Sprintf("%d durable runtime removal record(s) have not finished within %s and still hold their node service slots "+
+				"(job:phase:refusal:attempts:age): %s. The bound agent frees such a Slot by declaring the removal stalled "+
+				"(L1 removal_outcome cleanup_stalled, Job state stalled_cleanup_unverified); a record still listed here means that "+
+				"declaration is itself failing, so read the agent log for the refusal it names",
 				len(stalled), removalStallBound, strings.Join(stalled, " ")),
+		}))
+	case len(declared) != 0:
+		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+			ran: true, passed: true, code: "oci_removal_stalled_declared",
+			detail: fmt.Sprintf("%d durable runtime removal record(s) are declared stalled and hold no node service slot "+
+				"(job:phase:refusal:age): %s. Cleanup is still outstanding and the deletion directive still stands; "+
+				"no Slot waits on it", len(declared), strings.Join(declared, " ")),
 		}))
 	default:
 		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
@@ -471,6 +492,15 @@ func buildRemovalRecords(ctx context.Context, config DoctorConfig, now time.Time
 			detail: fmt.Sprintf("every durable runtime removal validated against its own frozen evidence and is within its completion bound (%d in flight)", len(removals)),
 		}))
 	}
+}
+
+// valueOrUnknownRefusal keeps the job:phase:refusal shape stable for a record
+// that failed without a typed code, so the finding is still parseable.
+func valueOrUnknownRefusal(code string) string {
+	if strings.TrimSpace(code) == "" {
+		return "no_typed_refusal"
+	}
+	return code
 }
 
 // buildHelperStartupBound names a startup-failure bound that has already
@@ -1192,6 +1222,7 @@ func StableDoctorCodes() []string {
 		"oci_helper_restart_policy_not_read", "oci_helper_restart_policy_current", "oci_helper_restart_policy_drift",
 		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
 		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable", "oci_removal_stalled",
+		"oci_removal_stalled_declared",
 	}
 }
 

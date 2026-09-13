@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 var errServiceRemovalRequested = errors.New("service removal requested")
@@ -48,6 +51,11 @@ type removalController struct {
 	attestRuntimeRemoval  func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	ackRemoval            func(context.Context, localRemoval) error
 	ackRemovalQuarantine  func(context.Context, localRemoval, error) error
+	ackRemovalStall       func(context.Context, localRemoval, runtimeRemovalRecord) error
+	recordRemovalFailure  func(context.Context, localRemoval, string, string) error
+	recordStallDeclared   func(context.Context, localRemoval) error
+	stallBound            time.Duration
+	now                   func() time.Time
 	finishRemoval         func(context.Context, localRemoval) error
 	removeBackupCopies    func(context.Context, []l1.ComputerBackupPruneDirective) error
 
@@ -79,7 +87,14 @@ func newRemovalController(
 		controller.loadRemovalIntent = outbox.removalIntent
 		controller.purgeJob = outbox.purgeJob
 		controller.finishRemoval = outbox.completeRemoval
+		controller.recordRemovalFailure = outbox.recordRuntimeRemovalFailure
+		controller.recordStallDeclared = outbox.recordRuntimeRemovalStallDeclared
+		controller.now = outbox.clock.Now
 	}
+	if controller.now == nil {
+		controller.now = time.Now
+	}
+	controller.stallBound = l1.DefaultRemovalStallBound
 	if session != nil {
 		controller.reapService = session.reapServiceForRemoval
 		controller.clearReap = session.clearRuntimeReap
@@ -89,6 +104,7 @@ func newRemovalController(
 	}
 	controller.ackRemoval = controller.acknowledge
 	controller.ackRemovalQuarantine = controller.acknowledgeQuarantine
+	controller.ackRemovalStall = controller.acknowledgeStall
 	return controller
 }
 
@@ -118,6 +134,10 @@ func (controller *removalController) enqueue(
 			controller.mu.Unlock()
 		}()
 		if err := controller.process(ctx, directive); err != nil && ctx.Err() == nil {
+			// A refused removal used to end here, at a log line, and the next
+			// heartbeat started the identical attempt again (#450). Counting
+			// the refusal is what lets the same loop notice that it is a loop.
+			controller.noteRemovalFailure(ctx, directive, err)
 			classification := classifyAgentProtocolError(err)
 			if classification.destination == errorDestinationNodeSession {
 				select {
@@ -667,6 +687,117 @@ func (controller *removalController) acknowledge(ctx context.Context, removal lo
 	return nil
 }
 
+// noteRemovalFailure records one refused cleanup attempt and, once the record
+// shows a removal that has been retrying past the bound against the same
+// refusal, declares to L1 that it cannot complete. The directive is not
+// cancelled and the agent keeps trying; what the declaration buys is the
+// service slot, which otherwise stays pinned for as long as the refusal lasts.
+func (controller *removalController) noteRemovalFailure(ctx context.Context, directive l1.RemovalDirective, cause error) {
+	if controller.recordRemovalFailure == nil || controller.loadRuntimeRemoval == nil {
+		return
+	}
+	refusalCode, refusalDetail := removalRefusalCode(cause)
+	if refusalCode == "" {
+		// An untyped failure is not evidence that retrying cannot help, and a
+		// permanent unverified outcome is too expensive to spend on one.
+		return
+	}
+	removal := localRemoval{
+		jobID: directive.JobID, kind: directive.Kind, generation: directive.RemovalGeneration,
+		rootInstanceID: directive.RootInstanceID, cleanupFence: directive.CleanupFence,
+	}
+	if err := controller.recordRemovalFailure(ctx, removal, refusalCode, refusalDetail); err != nil {
+		controller.log("agent: record removal failure for service %q: %v", directive.JobID, err)
+		return
+	}
+	record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
+	if err != nil || !found || record.invalidReason != "" || record.stallDeclaredAt != nil {
+		return
+	}
+	if !controller.removalIsStalled(record) {
+		return
+	}
+	if controller.ackRemovalStall == nil {
+		return
+	}
+	if err := controller.ackRemovalStall(ctx, removal, record); err != nil {
+		controller.log("agent: declare stalled removal for service %q: %v", directive.JobID, err)
+		return
+	}
+	if controller.recordStallDeclared != nil {
+		if err := controller.recordStallDeclared(ctx, removal); err != nil {
+			controller.log("agent: record declared removal stall for service %q: %v", directive.JobID, err)
+		}
+	}
+	controller.log("agent: service %q removal declared stalled after %d consecutive %q refusals; Slot released without cleanup proof",
+		directive.JobID, record.failedAttempts, record.lastRefusalCode)
+}
+
+// removalIsStalled is the agent half of the ten-minute bound. L1 can see how
+// long the directive has stood, but only the node knows whether it was being
+// retried during that time: a node offline for the whole window has no right
+// to declare anything.
+func (controller *removalController) removalIsStalled(record runtimeRemovalRecord) bool {
+	if record.preparedAt.IsZero() || record.lastAttemptedAt == nil || record.completedAt != nil {
+		return false
+	}
+	if record.failedAttempts < l1.MinimumServiceRemovalStallAttempts || strings.TrimSpace(record.lastRefusalCode) == "" {
+		return false
+	}
+	now := controller.now
+	if now == nil {
+		now = time.Now
+	}
+	return now().UTC().Sub(record.preparedAt) >= controller.stallBound
+}
+
+// removalRefusalCode reduces a failed cleanup to the stable typed code the
+// streak is counted against. The raw message cannot be used: it carries job
+// and attempt identifiers, so every retry would look like a different refusal
+// and no streak would ever form.
+func removalRefusalCode(cause error) (string, string) {
+	var rpcErr *ocihelper.RPCError
+	if errors.As(cause, &rpcErr) && strings.TrimSpace(string(rpcErr.Code)) != "" {
+		return string(rpcErr.Code), rpcErr.Message
+	}
+	var reasoned interface{ ControlFailureReason() string }
+	if errors.As(cause, &reasoned) && strings.TrimSpace(reasoned.ControlFailureReason()) != "" {
+		return reasoned.ControlFailureReason(), ""
+	}
+	var protocolErr *ProtocolError
+	if errors.As(cause, &protocolErr) && strings.TrimSpace(string(protocolErr.APIError.Code)) != "" {
+		return "l1_" + string(protocolErr.APIError.Code), protocolErr.APIError.Message
+	}
+	return "", ""
+}
+
+func (controller *removalController) acknowledgeStall(ctx context.Context, removal localRemoval, record runtimeRemovalRecord) error {
+	if controller.client == nil {
+		return errors.New("declare a stalled removal requires an L1 client")
+	}
+	lastAttemptedAt := record.preparedAt
+	if record.lastAttemptedAt != nil {
+		lastAttemptedAt = *record.lastAttemptedAt
+	}
+	request := l1.RemovalAcknowledgementRequest{
+		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
+		RootInstanceID: removal.rootInstanceID,
+		IdempotencyKey: removalStallAcknowledgementKey(removal, controller.bootSessionID),
+		CleanupStall: &l1.ServiceRemovalStallEvidence{
+			Kind: l1.ServiceRemovalStallEvidenceKind, JobID: removal.jobID, NodeID: controller.nodeID,
+			BootSessionID: controller.bootSessionID, RemovalGeneration: removal.generation,
+			CleanupFence: removal.cleanupFence, Phase: string(record.phase),
+			LastRefusalCode: record.lastRefusalCode, LastRefusalDetail: record.lastRefusalDetail,
+			Attempts: record.failedAttempts, PreparedAt: record.preparedAt, LastAttemptedAt: lastAttemptedAt,
+		},
+	}
+	if _, err := controller.client.AcknowledgeRemoval(ctx, removal.jobID, request); err != nil {
+		return fmt.Errorf("declare stalled service removal: %w", err)
+	}
+	return nil
+}
+
 func (controller *removalController) acknowledgeQuarantine(ctx context.Context, removal localRemoval, cleanupErr error) error {
 	request, quarantined := storageCleanupQuarantineAcknowledgement(cleanupErr, removal.rootInstanceID, l1.ComputerStorageCleanupRemoval)
 	if !quarantined {
@@ -699,4 +830,16 @@ func removalAcknowledgementKey(removal localRemoval, bootSessionID string) strin
 		removal.jobID, removal.generation, removal.cleanupFence, removal.rootInstanceID, bootSessionID,
 	)))
 	return "removal:" + hex.EncodeToString(digest[:])
+}
+
+// removalStallAcknowledgementKey derives the declaration's key exactly like a
+// completion acknowledgement, under its own namespace. The two must differ:
+// declaring a stall never forecloses a later genuine completion from the same
+// boot, and reusing one key would make the second look like a replay.
+func removalStallAcknowledgementKey(removal localRemoval, bootSessionID string) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf(
+		"%s\x00%d\x00%s\x00%s\x00%s",
+		removal.jobID, removal.generation, removal.cleanupFence, removal.rootInstanceID, bootSessionID,
+	)))
+	return l1.ServiceRemovalStallKeyPrefix + hex.EncodeToString(digest[:])
 }

@@ -140,6 +140,14 @@ func (outbox *evidenceOutbox) recordRuntimeQuiesced(ctx context.Context, removal
 	return outbox.spool.recordRuntimeQuiesced(ctx, removal, receipt, outbox.clock.Now())
 }
 
+func (outbox *evidenceOutbox) recordRuntimeRemovalFailure(ctx context.Context, removal localRemoval, refusalCode, refusalDetail string) error {
+	return outbox.spool.recordRuntimeRemovalFailure(ctx, removal, refusalCode, refusalDetail, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) recordRuntimeRemovalStallDeclared(ctx context.Context, removal localRemoval) error {
+	return outbox.spool.recordRuntimeRemovalStallDeclared(ctx, removal, outbox.clock.Now())
+}
+
 func (outbox *evidenceOutbox) recordRuntimeAttested(ctx context.Context, removal localRemoval, attestation workloadrunner.RuntimeRemovalAttestation) error {
 	return outbox.spool.recordRuntimeAttested(ctx, removal, attestation, outbox.clock.Now())
 }
