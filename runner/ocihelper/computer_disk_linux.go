@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -269,11 +270,17 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if present {
 		allocationBytes = manifest.Storage.DiskBytes
 	}
-	if err = verifyComputerDiskAllocation(imagePath, allocationBytes); err != nil {
+	repairedBytes, allocationErr := ensureComputerDiskAllocation(imagePath, allocationBytes)
+	if allocationErr != nil {
+		err = allocationErr
 		if createdImage {
 			_ = os.Remove(imagePath)
 		}
 		return nil, err
+	}
+	if repairedBytes > 0 {
+		log.Printf("Computer disk allocation re-asserted computer=%s attempt=%s disk=%s short_bytes=%d budget_bytes=%d",
+			storage.ComputerID, authority.AttemptID, name, repairedBytes, allocationBytes)
 	}
 	if !createdImage && !present {
 		return nil, errors.New("Computer disk image exists without an authority manifest")
@@ -658,6 +665,8 @@ func syncDirectory(path string) error {
 	return directory.Sync()
 }
 
+var errComputerDiskNotFullyAllocated = errors.New("Computer disk image is not fully allocated")
+
 func verifyComputerDiskAllocation(path string, bytes int64) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -668,9 +677,40 @@ func verifyComputerDiskAllocation(path string, bytes int64) error {
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Blocks*512 < bytes {
-		return errors.New("Computer disk image is not fully allocated")
+		return errComputerDiskNotFullyAllocated
 	}
 	return nil
+}
+
+// ensureComputerDiskAllocation admits a budget that was already paid for and
+// reports how many bytes it had to re-assert. Blocks can leave a backing file
+// behind the helper's back — a loop device that honours discard turns the
+// guest filesystem's own trims and its deallocating write-zeroes into holes —
+// and a bare refusal then bricks a Computer that the node is still charged
+// for. Verify first; only a short allocation is repaired, by re-asserting the
+// same already-charged bytes. A host that genuinely cannot honour the budget
+// still refuses with the typed message, and that refusal is retryable instead
+// of permanent. A size or file kind conflict is authority, never allocation,
+// and is never repaired. Every repair is worth a record: an image that went
+// sparse under the helper is a fault somewhere else.
+func ensureComputerDiskAllocation(path string, bytes int64) (int64, error) {
+	err := verifyComputerDiskAllocation(path, bytes)
+	if !errors.Is(err, errComputerDiskNotFullyAllocated) {
+		return 0, err
+	}
+	short := bytes
+	if info, statErr := os.Lstat(path); statErr == nil {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			short = bytes - stat.Blocks*512
+		}
+	}
+	if allocationErr := fullyAllocateComputerDisk(path, bytes); allocationErr != nil {
+		return 0, errors.Join(err, allocationErr)
+	}
+	if err := verifyComputerDiskAllocation(path, bytes); err != nil {
+		return 0, err
+	}
+	return short, nil
 }
 
 func migrateComputerDiskOwnership(root string, uid, gid uint32, lchown func(string, int, int) error) error {
@@ -776,6 +816,58 @@ func rootOwnedPath(path string) bool {
 	}
 }
 
+const loopBlockRoot = "/sys/block"
+
+// computerDiskLoopDiscardError is the one closed-vocabulary refusal for a loop
+// device the helper cannot prove will refuse discard. It reaches the agent as
+// the sanitized engine-failure reason `loop_discard_not_disabled` rather than
+// a bare `operation_failed`, because the cure is a host fact, not a retry.
+type computerDiskLoopDiscardError struct {
+	Cause error
+}
+
+func (failure *computerDiskLoopDiscardError) Error() string {
+	return "Computer disk loop device discard could not be disabled: " + failure.Cause.Error()
+}
+
+func (failure *computerDiskLoopDiscardError) Unwrap() error { return failure.Cause }
+
+func (failure *computerDiskLoopDiscardError) LoopDiscardNotDisabled() bool { return true }
+
+// disableLoopDeviceDiscard makes the loop device refuse to retire backing
+// blocks. The image is fully allocated on purpose: its bytes are charged to
+// the node the moment the Computer is admitted. A file-backed loop device
+// advertises discard whenever the backing filesystem can punch holes, and
+// then serves REQ_OP_DISCARD (a guest trim) *and* a deallocating
+// REQ_OP_WRITE_ZEROES (ext4's own inode-table zeroing on an online resize)
+// with FALLOC_FL_PUNCH_HOLE against disk.ext4 — silently un-allocating bytes
+// the helper already promised. Both paths are gated on the queue's discard
+// limit, so zeroing it makes the loop driver answer EOPNOTSUPP and the block
+// layer write real zeroes instead. Cost: no thin provisioning behind a
+// Computer disk, which is exactly the invariant this runtime wants.
+// `discard_max_bytes` is a universal block-queue attribute, so its absence
+// says the helper cannot see this queue at all — not that the device refuses
+// discard. Fail closed on every outcome that does not end in a readback of 0.
+func disableLoopDeviceDiscard(blockRoot, loopPath string) error {
+	path := filepath.Join(blockRoot, filepath.Base(loopPath), "queue", "discard_max_bytes")
+	limit, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return &computerDiskLoopDiscardError{Cause: err}
+	}
+	_, writeErr := limit.WriteString("0\n")
+	if err := errors.Join(writeErr, limit.Close()); err != nil {
+		return &computerDiskLoopDiscardError{Cause: err}
+	}
+	observed, err := os.ReadFile(path)
+	if err != nil {
+		return &computerDiskLoopDiscardError{Cause: err}
+	}
+	if strings.TrimSpace(string(observed)) != "0" {
+		return &computerDiskLoopDiscardError{Cause: fmt.Errorf("queue still admits %s bytes of discard", strings.TrimSpace(string(observed)))}
+	}
+	return nil
+}
+
 func (linuxComputerDiskSystem) attachAndMount(_ context.Context, imagePath, mountPath string) (loopPath string, returnedErr error) {
 	control, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
 	if err != nil {
@@ -807,6 +899,9 @@ func (linuxComputerDiskSystem) attachAndMount(_ context.Context, imagePath, moun
 			_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, loop.Fd(), uintptr(unix.LOOP_CLR_FD), 0)
 		}
 	}()
+	if err := disableLoopDeviceDiscard(loopBlockRoot, loopPath); err != nil {
+		return "", err
+	}
 	if err := unix.Mount(loopPath, mountPath, "ext4", uintptr(unix.MS_NODEV|unix.MS_NOSUID), ""); err != nil {
 		return "", err
 	}
@@ -1548,7 +1643,21 @@ diskLoop:
 			}
 			continue
 		}
-		if err := verifyComputerDiskAllocation(filepath.Join(root, "disk.ext4"), manifest.Storage.DiskBytes); err != nil {
+		// A sparse image is repaired here for the same reason attach repairs
+		// it: the bytes are still charged to this node, so quarantining the
+		// disk would retire a Computer over blocks the helper can simply take
+		// back. Only a budget the host cannot honour, or a size conflict,
+		// survives as a failure.
+		reasserted, allocationErr := ensureComputerDiskAllocation(filepath.Join(root, "disk.ext4"), manifest.Storage.DiskBytes)
+		if reasserted > 0 {
+			log.Printf("Computer disk allocation re-asserted computer=%s disk=%s short_bytes=%d budget_bytes=%d origin=boot_sweep",
+				manifest.Storage.ComputerID, entry.Name(), reasserted, manifest.Storage.DiskBytes)
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerDiskAllocation, ID: entry.Name(), Action: SweepActionAllocationReasserted,
+				Method: "allocation_short",
+			})
+		}
+		if err := allocationErr; err != nil {
 			if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
 				engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence,
 					engine.resolveOperationalComputerRecoveryFailure(root, entry.Name(), "computer_disk_allocation", manifest.Storage, err, countRecoveryAttempt))

@@ -2754,3 +2754,177 @@ func TestComputerDiskRemovalBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 		})
 	}
 }
+
+// punchComputerDiskHole is what a loop device that honours discard does to a
+// fully allocated image on the helper's behalf: the guest filesystem's trims
+// and its deallocating write-zeroes both arrive as FALLOC_FL_PUNCH_HOLE.
+func punchComputerDiskHole(t *testing.T, path string, offset, length int64) {
+	t.Helper()
+	image, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	punchErr := unix.Fallocate(int(image.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, offset, length)
+	if err := errors.Join(punchErr, image.Close()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestComputerDiskAttachRepairsPunchedBackingAllocation(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, testComputerAuthority("attempt-a", "fence-a", "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A loop device that honours discard retires backing blocks behind the
+	// helper's back: the guest filesystem's trims and ext4's own deallocating
+	// write-zeroes both reach the backing file as FALLOC_FL_PUNCH_HOLE. The
+	// bytes stay charged to the node, so the budget must be re-asserted, not
+	// refused forever.
+	punchComputerDiskHole(t, attachment.imagePath, 4<<20, 8<<20)
+	if err := verifyComputerDiskAllocation(attachment.imagePath, storage.DiskBytes); err == nil ||
+		!strings.Contains(err.Error(), "not fully allocated") {
+		t.Fatalf("punched Computer disk image allocation = %v, want a sparse image", err)
+	}
+	successor, err := engine.attachComputerDisk(t.Context(), storage, testComputerAuthority("attempt-b", "fence-b", "boot-a"))
+	if err != nil {
+		t.Fatalf("attach refused an already-admitted budget instead of re-asserting it: %v", err)
+	}
+	if err := verifyComputerDiskAllocation(successor.imagePath, storage.DiskBytes); err != nil {
+		t.Fatalf("attach published a partially allocated Computer disk: %v", err)
+	}
+	if err := engine.detachComputerDisk(successor, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestComputerDiskAllocationRepairNeverCrossesBudgetAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disk.ext4")
+	if err := os.WriteFile(path, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if repaired, err := ensureComputerDiskAllocation(path, 4096); err != nil || repaired != 0 {
+		t.Fatalf("allocated image = repaired %d err %v, want admitted untouched", repaired, err)
+	}
+	// A short image is repaired; an image of the wrong size is a budget
+	// authority conflict and is never grown into agreement.
+	if _, err := ensureComputerDiskAllocation(path, 8192); err == nil ||
+		strings.Contains(err.Error(), "not fully allocated") {
+		t.Fatalf("budget conflict = %v, want an unrepaired authority conflict", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 4096 {
+		t.Fatalf("refused budget conflict mutated the image: size=%d", info.Size())
+	}
+}
+
+func TestComputerDiskLoopAttachmentRefusesDiscard(t *testing.T) {
+	blockRoot := t.TempDir()
+	queue := filepath.Join(blockRoot, "loop7", "queue")
+	if err := os.MkdirAll(queue, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	limit := filepath.Join(queue, "discard_max_bytes")
+	if err := os.WriteFile(limit, []byte("4294966784\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := disableLoopDeviceDiscard(blockRoot, "/dev/loop7"); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.ReadFile(limit)
+	if err != nil || strings.TrimSpace(string(observed)) != "0" {
+		t.Fatalf("loop discard limit = %q err=%v, want 0", strings.TrimSpace(string(observed)), err)
+	}
+	// discard_max_bytes is a universal block-queue attribute: an absent one
+	// means the helper cannot see the queue, not that discard is off. Both it
+	// and an unwritable limit are refused, and both carry the one closed
+	// reason the agent receives.
+	if err := os.MkdirAll(filepath.Join(blockRoot, "loop8", "queue", "discard_max_bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, device := range []string{"/dev/loop9", "/dev/loop8"} {
+		err := disableLoopDeviceDiscard(blockRoot, device)
+		if err == nil {
+			t.Fatalf("%s: a queue that cannot be proven discard-free was tolerated", device)
+		}
+		if reason := engineFailureReason(fmt.Errorf("attach Computer disk: %w", err)); reason != EngineFailureLoopDiscard {
+			t.Fatalf("%s: engine failure reason = %q, want %q", device, reason, EngineFailureLoopDiscard)
+		}
+	}
+}
+
+func TestComputerDiskSweepReassertsPunchedAllocationInsteadOfQuarantine(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	punchComputerDiskHole(t, imagePath, 2<<20, 4<<20)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	if err := engine.sweepComputerDisks(t.Context(), "sparse-image-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	name, _ := deterministicComputerDiskName(request.Storage)
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionAllocationReasserted && item.Method == "allocation_short"
+	}) {
+		t.Fatalf("sweep evidence = %+v, want a recorded re-assertion", engine.computerDiskSweepEvidence)
+	}
+	if slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionQuarantined
+	}) {
+		t.Fatalf("sweep retired a Computer over repairable blocks: %+v", engine.computerDiskSweepEvidence)
+	}
+	if entries, err := readDirectoryIfPresent(filepath.Join(root, "computer-disk-quarantine")); err != nil || len(entries) != 0 {
+		t.Fatalf("sparse image quarantine = %v err=%v", entries, err)
+	}
+	if err := verifyComputerDiskAllocation(imagePath, request.Storage.DiskBytes); err != nil {
+		t.Fatalf("sweep left the image sparse: %v", err)
+	}
+}
+
+func TestComputerStorageGrowResumeReassertsPunchedAllocation(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	diskRoot := filepath.Dir(imagePath)
+	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	name, err := deterministicComputerDiskName(request.Storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The grow already published its new budget: what is left to resume is the
+	// proof that the image carries it.
+	manifest := computerDiskManifest{Version: computerDiskManifestVersion, Storage: request.Storage,
+		DiskImage: "disk.ext4", MountDirectory: name, Prepared: true}
+	manifest.Storage.DiskBytes = request.NewDiskBytes
+	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	punchComputerDiskHole(t, imagePath, 8<<20, 4<<20)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	resumed, err := engine.resumeComputerStorageGrow(t.Context(), diskRoot, name, &manifest)
+	if err != nil || !resumed {
+		t.Fatalf("grow resume = %t err=%v, want a repaired allocation", resumed, err)
+	}
+	if err := verifyComputerDiskAllocation(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatalf("grow resume left the published budget sparse: %v", err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionAllocationReasserted
+	}) {
+		t.Fatalf("grow resume evidence = %+v, want a recorded re-assertion", engine.computerDiskSweepEvidence)
+	}
+}

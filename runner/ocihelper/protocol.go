@@ -147,12 +147,13 @@ const (
 	EngineFailureRetentionBound   EngineFailureReason = "retention_bound_exceeded"
 	EngineFailureEgressDNS        EngineFailureReason = "egress_dns_unavailable"
 	EngineFailureEgressBoundary   EngineFailureReason = "egress_boundary_unproven"
+	EngineFailureLoopDiscard      EngineFailureReason = "loop_discard_not_disabled"
 	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
 )
 
 func (reason EngineFailureReason) valid() bool {
 	switch reason {
-	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureEgressDNS, EngineFailureEgressBoundary, EngineFailureOperationFailed:
+	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureEgressDNS, EngineFailureEgressBoundary, EngineFailureLoopDiscard, EngineFailureOperationFailed:
 		return true
 	default:
 		return false
@@ -1460,6 +1461,7 @@ const (
 	SweepActionQuarantineGCFailed       SweepAction = "quarantine_gc_failed"
 	SweepActionQuarantineGCEscalated    SweepAction = "quarantine_gc_escalated"
 	SweepActionPreenCorrected           SweepAction = "preen_corrected"
+	SweepActionAllocationReasserted     SweepAction = "allocation_reasserted"
 )
 
 // SweepEvidence is assertion-derived mechanics evidence for a helper-owned

@@ -332,6 +332,12 @@ func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBy
 		if errno != 0 {
 			return errno
 		}
+		// A capacity change re-derives the queue limits on kernels before the
+		// user-set discard limit became sticky (6.9), so re-assert the refusal
+		// before resize2fs writes the new group's metadata through this loop.
+		if err := disableLoopDeviceDiscard(loopBlockRoot, loopDevice); err != nil {
+			return err
+		}
 		target = loopDevice
 	}
 	output, err := exec.CommandContext(ctx, resize2fs, target).CombinedOutput()
