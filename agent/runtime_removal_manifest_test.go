@@ -172,7 +172,7 @@ func TestDeclaredStorageOnlyRemovalRefreshesAtRetryDeadlineAndCompletes(t *testi
 	}
 	lastAttempt := startedAt.Add(l1.DefaultRemovalStallBound)
 	for range l1.MinimumServiceRemovalStallAttempts {
-		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", lastAttempt); err != nil {
+		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", "old-boot", lastAttempt); err != nil {
 			t.Fatal(err)
 		}
 	}

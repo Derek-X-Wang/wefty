@@ -140,12 +140,12 @@ func (outbox *evidenceOutbox) recordRuntimeQuiesced(ctx context.Context, removal
 	return outbox.spool.recordRuntimeQuiesced(ctx, removal, receipt, outbox.clock.Now())
 }
 
-func (outbox *evidenceOutbox) recordRuntimeRemovalFailure(ctx context.Context, removal localRemoval, refusalCode, refusalDetail string) error {
-	return outbox.spool.recordRuntimeRemovalFailure(ctx, removal, refusalCode, refusalDetail, outbox.clock.Now())
+func (outbox *evidenceOutbox) recordRuntimeRemovalFailure(ctx context.Context, removal localRemoval, refusalCode, refusalDetail, bootSessionID string) error {
+	return outbox.spool.recordRuntimeRemovalFailure(ctx, removal, refusalCode, refusalDetail, bootSessionID, outbox.clock.Now())
 }
 
-func (outbox *evidenceOutbox) recordRuntimeRemovalUntypedFailure(ctx context.Context, removal localRemoval) error {
-	return outbox.spool.recordRuntimeRemovalUntypedFailure(ctx, removal, outbox.clock.Now())
+func (outbox *evidenceOutbox) recordRuntimeRemovalUntypedFailure(ctx context.Context, removal localRemoval, bootSessionID string) error {
+	return outbox.spool.recordRuntimeRemovalUntypedFailure(ctx, removal, bootSessionID, outbox.clock.Now())
 }
 
 func (outbox *evidenceOutbox) freezeRuntimeRemovalStallDeclaration(ctx context.Context, removal localRemoval,

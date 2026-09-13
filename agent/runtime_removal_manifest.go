@@ -60,11 +60,12 @@ type runtimeRemovalRecord struct {
 	// is the independent monotonic cadence after declaration, so changing the
 	// refusal cannot collapse backoff while lastRefusalCode still records the
 	// observed state for transition-only logging.
-	failedAttempts     int
-	stallRetryAttempts int
-	lastRefusalCode    string
-	lastRefusalDetail  string
-	lastAttemptedAt    *time.Time
+	failedAttempts           int
+	stallRetryAttempts       int
+	lastRefusalCode          string
+	lastRefusalDetail        string
+	lastAttemptedAt          *time.Time
+	lastAttemptBootSessionID string
 	// stallDeclaration is the exact bytes of the declaration this agent sent
 	// or is about to send, frozen before the first send. A lost response is
 	// indistinguishable from a refusal, so the only safe retry is the same
@@ -352,7 +353,7 @@ func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
 func (spool *logSpool) runtimeRemoval(ctx context.Context, jobID string) (runtimeRemovalRecord, bool, error) {
 	row := spool.db.QueryRowContext(ctx, `SELECT job_id, removal_generation, cleanup_fence, root_instance_id,
 manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns,
-failed_attempts, stall_retry_attempts, last_refusal_code, last_refusal_detail, last_attempted_ns, stall_declaration_json,
+failed_attempts, stall_retry_attempts, last_refusal_code, last_refusal_detail, last_attempted_ns, last_attempt_boot_session_id, stall_declaration_json,
 stall_declaration_key, stall_declared_ns
 FROM runtime_removal_manifests WHERE job_id=?`, jobID)
 	record, err := scanRuntimeRemoval(row)
@@ -374,18 +375,19 @@ func scanRuntimeRemoval(row rowScanner) (runtimeRemovalRecord, error) {
 	var manifestJSON, receiptJSON, attestationJSON []byte
 	var preparedNS int64
 	var quiescedNS, attestedNS, completedNS, lastAttemptedNS, stallDeclaredNS sql.NullInt64
-	var lastRefusalCode, lastRefusalDetail, stallDeclarationKey sql.NullString
+	var lastRefusalCode, lastRefusalDetail, lastAttemptBootSessionID, stallDeclarationKey sql.NullString
 	// job_id is read from its own column rather than from the manifest it
 	// indexes, so a row whose stored JSON no longer parses still has the one
 	// identity an operator can act on.
 	if err := row.Scan(&record.removal.jobID, &record.removal.generation, &record.removal.cleanupFence, &record.removal.rootInstanceID,
 		&manifestJSON, &receiptJSON, &attestationJSON, &record.phase, &preparedNS, &quiescedNS, &attestedNS, &completedNS,
-		&record.failedAttempts, &record.stallRetryAttempts, &lastRefusalCode, &lastRefusalDetail, &lastAttemptedNS,
+		&record.failedAttempts, &record.stallRetryAttempts, &lastRefusalCode, &lastRefusalDetail, &lastAttemptedNS, &lastAttemptBootSessionID,
 		&record.stallDeclaration, &stallDeclarationKey, &stallDeclaredNS); err != nil {
 		return runtimeRemovalRecord{}, err
 	}
 	record.lastRefusalCode = lastRefusalCode.String
 	record.lastRefusalDetail = lastRefusalDetail.String
+	record.lastAttemptBootSessionID = lastAttemptBootSessionID.String
 	record.stallDeclarationKey = stallDeclarationKey.String
 	if lastAttemptedNS.Valid {
 		value := time.Unix(0, lastAttemptedNS.Int64).UTC()
@@ -538,7 +540,7 @@ func storageOnlyNoRuntimeReceipt(receipt workloadrunner.ReapReceipt, attempts []
 func (spool *logSpool) pendingRuntimeRemovals(ctx context.Context) ([]runtimeRemovalRecord, error) {
 	rows, err := spool.db.QueryContext(ctx, `SELECT job_id, removal_generation, cleanup_fence, root_instance_id,
 manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns,
-failed_attempts, stall_retry_attempts, last_refusal_code, last_refusal_detail, last_attempted_ns, stall_declaration_json,
+failed_attempts, stall_retry_attempts, last_refusal_code, last_refusal_detail, last_attempted_ns, last_attempt_boot_session_id, stall_declaration_json,
 stall_declaration_key, stall_declared_ns
 FROM runtime_removal_manifests WHERE phase IN (?, ?, ?) ORDER BY prepared_ns, job_id`,
 		runtimeRemovalPrepared, runtimeRemovalQuarantined, runtimeRemovalComplete)
@@ -571,7 +573,7 @@ FROM runtime_removal_manifests WHERE phase IN (?, ?, ?) ORDER BY prepared_ns, jo
 // refusals are evidence that retrying cannot help, while three different ones
 // are a removal still working through causes.
 func (spool *logSpool) recordRuntimeRemovalFailure(ctx context.Context, removal localRemoval,
-	refusalCode, refusalDetail string, observedAt time.Time) error {
+	refusalCode, refusalDetail, bootSessionID string, observedAt time.Time) error {
 	if strings.TrimSpace(refusalCode) == "" {
 		return errors.New("agent: runtime removal failure requires a refusal code")
 	}
@@ -581,9 +583,9 @@ func (spool *logSpool) recordRuntimeRemovalFailure(ctx context.Context, removal 
 	result, err := spool.db.ExecContext(ctx, `UPDATE runtime_removal_manifests
 SET failed_attempts=CASE WHEN last_refusal_code=? THEN failed_attempts+1 ELSE 1 END,
     stall_retry_attempts=stall_retry_attempts+CASE WHEN stall_declared_ns IS NULL THEN 0 ELSE 1 END,
-    last_refusal_code=?, last_refusal_detail=?, last_attempted_ns=?
+    last_refusal_code=?, last_refusal_detail=?, last_attempted_ns=?, last_attempt_boot_session_id=?
 WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`,
-		refusalCode, refusalCode, refusalDetail, observedAt.UTC().Round(0).UnixNano(), removal.jobID,
+		refusalCode, refusalCode, refusalDetail, observedAt.UTC().Round(0).UnixNano(), bootSessionID, removal.jobID,
 		removal.generation, removal.cleanupFence, removal.rootInstanceID)
 	if err != nil {
 		return fmt.Errorf("agent: persist runtime removal failure: %w", err)
@@ -599,13 +601,13 @@ WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id
 // The bound asks for three consecutive attempts that produced the same typed
 // refusal; an untyped failure observed nothing about the refusal, so it can
 // neither confirm the streak nor be counted into it.
-func (spool *logSpool) recordRuntimeRemovalUntypedFailure(ctx context.Context, removal localRemoval, observedAt time.Time) error {
+func (spool *logSpool) recordRuntimeRemovalUntypedFailure(ctx context.Context, removal localRemoval, bootSessionID string, observedAt time.Time) error {
 	result, err := spool.db.ExecContext(ctx, `UPDATE runtime_removal_manifests
 SET failed_attempts=0,
     stall_retry_attempts=stall_retry_attempts+CASE WHEN stall_declared_ns IS NULL THEN 0 ELSE 1 END,
-    last_refusal_code=NULL, last_refusal_detail=NULL, last_attempted_ns=?
+    last_refusal_code=NULL, last_refusal_detail=NULL, last_attempted_ns=?, last_attempt_boot_session_id=?
 WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`,
-		observedAt.UTC().Round(0).UnixNano(), removal.jobID, removal.generation, removal.cleanupFence,
+		observedAt.UTC().Round(0).UnixNano(), bootSessionID, removal.jobID, removal.generation, removal.cleanupFence,
 		removal.rootInstanceID)
 	if err != nil {
 		return fmt.Errorf("agent: reset runtime removal refusal streak: %w", err)

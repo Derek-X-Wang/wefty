@@ -107,8 +107,12 @@ func newRemovalController(
 		controller.loadRemovalIntent = outbox.removalIntent
 		controller.purgeJob = outbox.purgeJob
 		controller.finishRemoval = outbox.completeRemoval
-		controller.recordRemovalFailure = outbox.recordRuntimeRemovalFailure
-		controller.recordUntypedFailure = outbox.recordRuntimeRemovalUntypedFailure
+		controller.recordRemovalFailure = func(ctx context.Context, removal localRemoval, code, detail string) error {
+			return outbox.recordRuntimeRemovalFailure(ctx, removal, code, detail, bootSessionID)
+		}
+		controller.recordUntypedFailure = func(ctx context.Context, removal localRemoval) error {
+			return outbox.recordRuntimeRemovalUntypedFailure(ctx, removal, bootSessionID)
+		}
 		controller.freezeStall = outbox.freezeRuntimeRemovalStallDeclaration
 		controller.removalStartedAt = outbox.removalStartedAt
 		controller.recordStallDeclared = outbox.recordRuntimeRemovalStallDeclared
@@ -540,7 +544,7 @@ func (controller *removalController) declaredRemovalRetryDeferred(record runtime
 	if record.stallDeclaredAt == nil || record.lastAttemptedAt == nil {
 		return false
 	}
-	if record.phase == runtimeRemovalComplete && record.receipt.BootSessionID != controller.bootSessionID {
+	if record.phase == runtimeRemovalComplete && record.lastAttemptBootSessionID != controller.bootSessionID {
 		return false
 	}
 	delay := declaredRemovalRetryBase
@@ -859,7 +863,7 @@ func (controller *removalController) noteRemovalFailureDisposition(ctx context.C
 	}
 	if err := controller.recordRemovalFailure(ctx, removal, refusalCode, refusalDetail); err != nil {
 		controller.log("agent: record removal failure for service %q: %v", directive.JobID, err)
-		return false, removalFailureLogged, nil
+		return false, removalFailureUnlogged, nil
 	}
 	record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
 	if err != nil || !found || record.invalidReason != "" {
@@ -900,7 +904,11 @@ func (controller *removalController) noteRemovalFailureDisposition(ctx context.C
 	}
 	controller.log("agent: service %q removal declared stalled after %d consecutive %q refusals; Slot released without cleanup proof",
 		directive.JobID, declaration.Attempts, declaration.LastRefusalCode)
-	return refusalCode == declaration.LastRefusalCode, removalFailureLogged, nil
+	if refusalCode != declaration.LastRefusalCode {
+		controller.log("agent: service %q cleanup remains refused after its declared stall: %s", directive.JobID, refusalCode)
+		return false, removalFailureLogged, nil
+	}
+	return true, removalFailureLogged, nil
 }
 
 // removalIsStalled is the agent half of the two-sided bound. L1 can see how

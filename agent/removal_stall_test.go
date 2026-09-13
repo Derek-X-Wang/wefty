@@ -46,7 +46,7 @@ func TestWedgedRemovalDeclaresAStallInsteadOfRetryingForever(t *testing.T) {
 	controller.stallBound = l1.DefaultRemovalStallBound
 	controller.loadRuntimeRemoval = spool.runtimeRemoval
 	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
-		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, controller.bootSessionID, now)
 	}
 	controller.recordStallDeclared = func(ctx context.Context, target localRemoval) error {
 		return spool.recordRuntimeRemovalStallDeclared(ctx, target, now)
@@ -107,7 +107,7 @@ func TestDeclaredRemovalRetriesWithDurableBackoffAndLogsStateChanges(t *testing.
 	now := prepared.Add(l1.DefaultRemovalStallBound)
 	for attempt := 0; attempt < l1.MinimumServiceRemovalStallAttempts; attempt++ {
 		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt),
-			"attempt authority does not match a live attempt", now); err != nil {
+			"attempt authority does not match a live attempt", "boot", now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -135,7 +135,7 @@ func TestDeclaredRemovalRetriesWithDurableBackoffAndLogsStateChanges(t *testing.
 	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
 	controller.loadRuntimeRemoval = spool.runtimeRemoval
 	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
-		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, controller.bootSessionID, now)
 	}
 	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 		helperAttempts++
@@ -182,7 +182,7 @@ func TestCompleteDeclaredRemovalUsesBackoffForSameBootAcknowledgementConflicts(t
 	}
 	lastAttempt := prepared.Add(l1.DefaultRemovalStallBound)
 	for range l1.MinimumServiceRemovalStallAttempts {
-		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", lastAttempt); err != nil {
+		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", "same-boot", lastAttempt); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -211,7 +211,7 @@ func TestCompleteDeclaredRemovalUsesBackoffForSameBootAcknowledgementConflicts(t
 	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
 	controller.loadRuntimeRemoval = spool.runtimeRemoval
 	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
-		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, controller.bootSessionID, now)
 	}
 	controller.purgeJob = func(context.Context, string) error { return nil }
 	controller.removeResource = func(context.Context, localRemoval) error { return nil }
@@ -240,6 +240,109 @@ func TestCompleteDeclaredRemovalUsesBackoffForSameBootAcknowledgementConflicts(t
 	}
 }
 
+func TestCompleteDeclaredRemovalGetsOneImmediateAcknowledgementReplayPerBoot(t *testing.T) {
+	directory := t.TempDir()
+	spool := openTestLogSpool(t, directory, "complete-replay-node", 1024)
+	removal := testRuntimeRemoval("complete-replay-job")
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	manifest := testRuntimeResourceManifest(removal.jobID, "attempt")
+	if err := spool.storeRuntimeResourceManifest(t.Context(), manifest, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, prepared); err != nil {
+		t.Fatal(err)
+	}
+	lastAttempt := prepared.Add(l1.DefaultRemovalStallBound)
+	if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", "boot-a", lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+	declaration, _ := json.Marshal(l1.ServiceRemovalStallEvidence{Kind: l1.ServiceRemovalStallEvidenceKind,
+		JobID: removal.jobID, LastRefusalCode: string(ocihelper.CodeUnauthorizedAttempt)})
+	if _, _, err := spool.freezeRuntimeRemovalStallDeclaration(t.Context(), removal, declaration, "stall-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordRuntimeRemovalStallDeclared(t.Context(), removal, lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+	receipt := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: "boot-a"}
+	if err := spool.recordRuntimeQuiesced(t.Context(), removal, receipt, lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordRuntimeAttested(t.Context(), removal,
+		testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: removal.jobID,
+			RemovalGeneration: removal.generation, Attempts: []workloadrunner.RuntimeResourceManifest{manifest}}), lastAttempt); err != nil {
+		t.Fatal(err)
+	}
+
+	acknowledgements := 0
+	newController := func(bootSessionID string) *removalController {
+		controller := &removalController{nodeID: "complete-replay-node", bootSessionID: bootSessionID,
+			now: func() time.Time { return lastAttempt }}
+		controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+		controller.loadRuntimeRemoval = spool.runtimeRemoval
+		controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
+			return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, bootSessionID, lastAttempt)
+		}
+		controller.purgeJob = func(context.Context, string) error { return nil }
+		controller.removeResource = func(context.Context, localRemoval) error { return nil }
+		controller.ackRemoval = func(context.Context, localRemoval) error {
+			acknowledgements++
+			return &ProtocolError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "persistent conflict"}}
+		}
+		return controller
+	}
+	directive := l1.RemovalDirective{JobID: removal.jobID, BoundNodeID: "complete-replay-node", Kind: removal.kind,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID}
+	controller := newController("boot-b")
+	_ = controller.reconcile(t.Context(), directive)
+	_ = controller.reconcile(t.Context(), directive)
+	if acknowledgements != 1 {
+		t.Fatalf("boot B acknowledgement attempts = %d, want exactly one immediate replay", acknowledgements)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spool = openTestLogSpool(t, directory, "complete-replay-node", 1024)
+	defer spool.Close()
+	controller = newController("boot-b")
+	_ = controller.reconcile(t.Context(), directive)
+	if acknowledgements != 1 {
+		t.Fatalf("reopened boot B acknowledgement attempts = %d, want durable deferral", acknowledgements)
+	}
+	controller = newController("boot-c")
+	_ = controller.reconcile(t.Context(), directive)
+	_ = controller.reconcile(t.Context(), directive)
+	if acknowledgements != 2 {
+		t.Fatalf("boot C acknowledgement attempts = %d, want exactly one more immediate replay", acknowledgements)
+	}
+}
+
+func TestRemovalFailureSpoolErrorDoesNotSuppressCleanupCause(t *testing.T) {
+	removal := testRuntimeRemoval("spool-error-job")
+	var logs []string
+	controller := &removalController{nodeID: "node", bootSessionID: "boot",
+		managed: &recordingResumeResource{}, outbox: &evidenceOutbox{}, inflight: make(map[string]struct{}),
+		logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{removal: removal, phase: runtimeRemovalPrepared}, true, nil
+	}
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{}, wedgeRefusal()
+	}
+	controller.recordRemovalFailure = func(context.Context, localRemoval, string, string) error {
+		return errors.New("sqlite write failed")
+	}
+	controller.enqueue(t.Context(), l1.RemovalDirective{JobID: removal.jobID, BoundNodeID: controller.nodeID,
+		Kind: removal.kind, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
+		RootInstanceID: removal.rootInstanceID}, make(chan destinationError, 1))
+	controller.wait()
+	if len(logs) != 2 || !strings.Contains(logs[0], "sqlite write failed") ||
+		!strings.Contains(logs[1], string(ocihelper.CodeUnauthorizedAttempt)) {
+		t.Fatalf("spool and cleanup failure logs = %v, want both facts", logs)
+	}
+}
+
 func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "transition-node", 1024)
 	defer spool.Close()
@@ -253,7 +356,7 @@ func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.
 	}
 	now := prepared.Add(l1.DefaultRemovalStallBound)
 	for range l1.MinimumServiceRemovalStallAttempts {
-		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", now); err != nil {
+		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, string(ocihelper.CodeUnauthorizedAttempt), "A", "boot", now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -274,7 +377,7 @@ func TestDeclaredRemovalRetryCadenceAndLogsSurviveRefusalTransitions(t *testing.
 	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
 	controller.loadRuntimeRemoval = spool.runtimeRemoval
 	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
-		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, controller.bootSessionID, now)
 	}
 	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error { return nil }
 	controller.recordStallDeclared = func(ctx context.Context, target localRemoval) error {
@@ -453,7 +556,7 @@ func TestARemovalRefusalStreakResetsWhenTheRefusalChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	for index, code := range []string{"unauthorized_attempt", "unauthorized_attempt", "session_stale"} {
-		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, code, "detail",
+		if err := spool.recordRuntimeRemovalFailure(t.Context(), removal, code, "detail", "boot",
 			prepared.Add(time.Duration(index)*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
@@ -496,10 +599,10 @@ func TestAnUntypedFailureBreaksTheTypedRefusalStreak(t *testing.T) {
 	controller.loadRuntimeRemoval = spool.runtimeRemoval
 	controller.removalStartedAt = spool.removalStartedAt
 	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
-		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, now)
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, controller.bootSessionID, now)
 	}
 	controller.recordUntypedFailure = func(ctx context.Context, target localRemoval) error {
-		return spool.recordRuntimeRemovalUntypedFailure(ctx, target, now)
+		return spool.recordRuntimeRemovalUntypedFailure(ctx, target, controller.bootSessionID, now)
 	}
 	declarations := 0
 	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
@@ -590,11 +693,11 @@ func TestStallAccountingRefusesARemovalWithNoRuntimeRecord(t *testing.T) {
 	if err := spool.beginRemoval(t.Context(), removal, started); err != nil {
 		t.Fatal(err)
 	}
-	err := spool.recordRuntimeRemovalFailure(t.Context(), removal, "unauthorized_attempt", "detail", started)
+	err := spool.recordRuntimeRemovalFailure(t.Context(), removal, "unauthorized_attempt", "detail", "boot", started)
 	if err == nil || !strings.Contains(err.Error(), "only a runtime removal keeps stall accounting") {
 		t.Fatalf("process-service stall accounting = %v, want a loud refusal", err)
 	}
-	if err := spool.recordRuntimeRemovalUntypedFailure(t.Context(), removal, started); err == nil {
+	if err := spool.recordRuntimeRemovalUntypedFailure(t.Context(), removal, "boot", started); err == nil {
 		t.Fatal("process-service streak reset silently succeeded")
 	}
 }
@@ -665,14 +768,26 @@ func TestFrozenDeclarationAcceptanceStillPropagatesCurrentDifferentRefusal(t *te
 	record := runtimeRemovalRecord{removal: removal, phase: runtimeRemovalPrepared, preparedAt: prepared,
 		failedAttempts: l1.MinimumServiceRemovalStallAttempts, lastRefusalCode: string(ocihelper.CodeUnauthorizedAttempt),
 		stallDeclaration: declaration, stallDeclarationKey: "frozen-key"}
-	controller := &removalController{nodeID: "node", stallBound: l1.DefaultRemovalStallBound,
-		now: func() time.Time { return prepared.Add(l1.DefaultRemovalStallBound) }}
+	now := prepared.Add(l1.DefaultRemovalStallBound)
+	var logs []string
+	controller := &removalController{nodeID: "node", bootSessionID: "boot", stallBound: l1.DefaultRemovalStallBound,
+		managed: &recordingResumeResource{}, outbox: &evidenceOutbox{}, inflight: make(map[string]struct{}),
+		now: func() time.Time { return now }, logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
 	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) { return record, true, nil }
 	controller.recordRemovalFailure = func(_ context.Context, _ localRemoval, code, detail string) error {
+		if record.stallDeclaredAt != nil {
+			record.stallRetryAttempts++
+		}
 		record.failedAttempts = 1
 		record.lastRefusalCode = code
 		record.lastRefusalDetail = detail
+		attempted := now
+		record.lastAttemptedAt = &attempted
 		return nil
+	}
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{}, &ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"}
 	}
 	replayed := false
 	controller.ackRemovalStall = func(_ context.Context, _ localRemoval, got runtimeRemovalRecord) error {
@@ -684,13 +799,23 @@ func TestFrozenDeclarationAcceptanceStillPropagatesCurrentDifferentRefusal(t *te
 		record.stallDeclaredAt = &declared
 		return nil
 	}
-	suppressed, err := controller.noteRemovalFailure(t.Context(), l1.RemovalDirective{
+	directive := l1.RemovalDirective{
 		JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: contract.JobKindOCI,
 		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
-	}, &ocihelper.RPCError{Code: ocihelper.CodeSessionStale, Message: "B"})
-	if err != nil || suppressed || !replayed || record.stallDeclaredAt == nil {
-		t.Fatalf("frozen A acceptance under current B = suppressed:%t replayed:%t declared:%t err:%v",
-			suppressed, replayed, record.stallDeclaredAt != nil, err)
+	}
+	failures := make(chan destinationError, 1)
+	controller.enqueue(t.Context(), directive, failures)
+	controller.wait()
+	now = now.Add(declaredRemovalRetryBase)
+	controller.enqueue(t.Context(), directive, failures)
+	controller.wait()
+	if !replayed || record.stallDeclaredAt == nil || len(failures) != 0 {
+		t.Fatalf("frozen A acceptance under current B = replayed:%t declared:%t failures:%d",
+			replayed, record.stallDeclaredAt != nil, len(failures))
+	}
+	if len(logs) != 2 || !strings.Contains(logs[0], "removal declared stalled") ||
+		strings.Count(strings.Join(logs, "\n"), string(ocihelper.CodeSessionStale)) != 1 {
+		t.Fatalf("frozen A/current B logs = %v, want declaration A and exactly one B", logs)
 	}
 }
 

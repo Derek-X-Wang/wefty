@@ -416,18 +416,30 @@ func TestDeclaredStorageOnlyRefreshRefusalAtRetryDeadlineDoesNotPoisonRegistrati
 
 	pins := &stallPinRuntime{pinned: map[string]struct{}{fixture.jobID: {}}}
 	session := fixture.rebootSession(t, pins)
-	session.removals.now = func() time.Time { return record.lastAttemptedAt.Add(declaredRemovalRetryMax + time.Second) }
 	reconstructCalls := 0
 	session.removals.reconstructRuntime = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
 		reconstructCalls++
 		return nil, wedgeRefusal()
 	}
+	session.removals.now = func() time.Time { return record.lastAttemptedAt.Add(declaredRemovalRetryBase - time.Second) }
+	if err := session.removals.reconcile(fixture.ctx, fixture.directive); err != nil {
+		t.Fatal(err)
+	}
+	if reconstructCalls != 0 {
+		t.Fatalf("declared Storage-only removal reconstructed %d times before its retry deadline, want 0", reconstructCalls)
+	}
+	session.removals.now = func() time.Time { return record.lastAttemptedAt.Add(declaredRemovalRetryMax + time.Second) }
 	node, err := session.register(fixture.ctx)
 	if err != nil || !node.Capabilities["kind:oci"] || !session.capabilities.snapshot().Capabilities["kind:oci"] {
 		t.Fatalf("registration suppressed OCI around declared Storage-only refresh: node=%+v err=%v", node, err)
 	}
 	if reconstructCalls != 1 {
 		t.Fatalf("declared Storage-only removal reconstructed %d times at its retry deadline, want 1", reconstructCalls)
+	}
+	after, found, err := session.removals.loadRuntimeRemoval(fixture.ctx, fixture.jobID)
+	if err != nil || !found || after.stallRetryAttempts != record.stallRetryAttempts+1 {
+		t.Fatalf("suppressed refresh refusal retry count = %d, want %d (found=%t err=%v)",
+			after.stallRetryAttempts, record.stallRetryAttempts+1, found, err)
 	}
 	if pins.reconciles != 1 {
 		t.Fatalf("image-pin reconciliation ran %d times, want 1", pins.reconciles)
