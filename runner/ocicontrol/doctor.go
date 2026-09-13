@@ -289,6 +289,11 @@ type DoctorConfig struct {
 	ReadDesiredSetupState      func(string) (SetupState, error)
 	InstalledSystemdVersion    func(context.Context) (int, error)
 	InstalledHelperServiceUnit func(context.Context) (string, error)
+	// Removals reads the durable runtime removals the node-local agent is
+	// carrying. A removal the agent cannot validate holds its node service
+	// slot for as long as the row exists, and until this finding existed that
+	// fact reached an operator only if they thought to run the removals verb.
+	Removals func(context.Context) ([]RemovalRecord, error)
 }
 
 type diagnosticReceipt struct {
@@ -389,7 +394,49 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildHelperHandshakeStalls(config, &report)
 	buildHelperStartupBound(config, &report)
 	buildHelper(ctx, config, &report)
+	buildRemovalRecords(ctx, config, &report)
 	return report
+}
+
+// buildRemovalRecords surfaces durable removal rows the agent refuses to act
+// on. Such a row is not a helper fault and not a sweep fault: it is the
+// agent's own durable evidence disagreeing with itself, and its cost is a node
+// service slot that stays pinned until a human looks. Reading it starts,
+// retries and advances nothing.
+func buildRemovalRecords(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
+	if config.Removals == nil {
+		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+			code: "oci_removal_records_not_read", notRunCause: NotRunNotConfigured,
+			detail: "the node-local removal reader was not available to the doctor",
+		}))
+		return
+	}
+	removals, err := config.Removals(ctx)
+	if err != nil {
+		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+			code: "oci_removal_records_not_read", notRunCause: NotRunSourceUnavailable,
+			detail: "durable runtime removals could not be read",
+		}))
+		return
+	}
+	unreadable := make([]string, 0, len(removals))
+	for _, removal := range removals {
+		if removal.InvalidReason != "" {
+			unreadable = append(unreadable, removal.JobID+":"+removal.InvalidReason)
+		}
+	}
+	if len(unreadable) == 0 {
+		report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+			ran: true, passed: true, code: "oci_removal_records_readable",
+			detail: fmt.Sprintf("every durable runtime removal validated against its own frozen evidence (%d in flight)", len(removals)),
+		}))
+		return
+	}
+	report.Findings = append(report.Findings, finding("removal-records", diagnosticReceipt{
+		ran: true, code: "oci_removal_unreadable", reasonCode: contract.CapabilityReasonPrerequisiteMissing,
+		detail: fmt.Sprintf("%d durable runtime removal record(s) cannot be validated and hold their node service slots: %s",
+			len(unreadable), strings.Join(unreadable, " ")),
+	}))
 }
 
 // buildHelperStartupBound names a startup-failure bound that has already
@@ -1110,6 +1157,7 @@ func StableDoctorCodes() []string {
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
 		"oci_helper_restart_policy_not_read", "oci_helper_restart_policy_current", "oci_helper_restart_policy_drift",
 		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
+		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable",
 	}
 }
 
@@ -1152,7 +1200,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy", "removal-records"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}

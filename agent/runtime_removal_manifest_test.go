@@ -547,13 +547,21 @@ func TestRuntimeRemovalReadListsUnvalidatableRecordWithoutFailingTheVerb(t *test
 	defer outbox.Close()
 	nodeAgent := &Agent{outbox: outbox}
 	createdAt := time.Date(2026, 9, 13, 2, 0, 0, 0, time.UTC)
+	// Service-data manifests on purpose: a Computer inventory is skipped by
+	// resume for its own reason, which would hide whether the unvalidatable
+	// row was skipped because it is unvalidatable.
 	for index, jobID := range []string{"broken-job", "healthy-job"} {
-		if err := outbox.spool.storeRuntimeResourceManifest(t.Context(), testComputerAttemptManifest(jobID, "attempt-"+jobID), createdAt.Add(time.Duration(index)*time.Second)); err != nil {
+		if err := outbox.spool.storeRuntimeResourceManifest(t.Context(), testRuntimeResourceManifest(jobID, "attempt-"+jobID), createdAt.Add(time.Duration(index)*time.Second)); err != nil {
 			t.Fatal(err)
 		}
 		if err := outbox.spool.beginRemoval(t.Context(), testRuntimeRemoval(jobID), createdAt.Add(time.Minute+time.Duration(index)*time.Second)); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := outbox.spool.recordRuntimeQuiesced(t.Context(), testRuntimeRemoval("healthy-job"),
+		workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: "boot"},
+		createdAt.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
 	}
 	// Durable rows outlive the code that wrote them, so the read path has to
 	// survive a receipt this build would never persist.
@@ -576,7 +584,7 @@ SET runtime_quiescence_json=?, phase=?, quiesced_ns=? WHERE job_id=?`, foreign, 
 	for _, view := range views {
 		byJob[view.JobID] = view
 	}
-	if healthy := byJob["healthy-job"]; healthy.InvalidReason != "" || healthy.Phase != string(runtimeRemovalPrepared) {
+	if healthy := byJob["healthy-job"]; healthy.InvalidReason != "" || healthy.Phase != string(runtimeRemovalQuarantined) {
 		t.Fatalf("well-formed record was reported red: %+v", healthy)
 	}
 	broken := byJob["broken-job"]
@@ -587,17 +595,60 @@ SET runtime_quiescence_json=?, phase=?, quiesced_ns=? WHERE job_id=?`, foreign, 
 		t.Fatalf("unvalidatable record was not rendered as persisted: %+v", broken)
 	}
 
-	// Nothing resumes an unvalidatable row, so it can never pin a slot behind
-	// a retry loop; it stays visible until an operator acts on it.
-	controller := &removalController{listRuntimeRemovals: outbox.spool.pendingRuntimeRemovals}
-	resumed := make([]string, 0, 1)
+	// Resume walks the same listing, finishes the healthy removal, and acts on
+	// the unvalidatable one not at all: it can never be driven round a retry
+	// loop that pins the slot behind it.
+	resumed := make([]string, 0, 2)
+	controller := &removalController{nodeID: "removal-read-node", bootSessionID: "boot",
+		listRuntimeRemovals: outbox.spool.pendingRuntimeRemovals}
 	controller.purgeJob = func(_ context.Context, jobID string) error { resumed = append(resumed, jobID); return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, Attempts: request.Attempts}), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
 	if err := controller.resume(t.Context()); err != nil {
 		t.Fatalf("resume over an unvalidatable row = %v", err)
 	}
-	for _, jobID := range resumed {
-		if jobID == "broken-job" {
-			t.Fatal("resume acted on an unvalidatable removal record")
-		}
+	if len(resumed) != 1 || resumed[0] != "healthy-job" {
+		t.Fatalf("resume acted on %v, want the healthy removal alone", resumed)
+	}
+}
+
+// A durable row whose stored JSON no longer parses has no manifest to name
+// itself with, so job_id is read from its own column. Otherwise the one row an
+// operator has to act on is the one row the verb cannot show them (#443).
+func TestRuntimeRemovalReadNamesARowWhoseStoredJSONNoLongerParses(t *testing.T) {
+	outbox, err := newEvidenceOutbox(t.TempDir(), "removal-json-node", 1024, systemClock{}, 1, time.Second, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	nodeAgent := &Agent{outbox: outbox}
+	createdAt := time.Date(2026, 9, 13, 4, 0, 0, 0, time.UTC)
+	if err := outbox.spool.storeRuntimeResourceManifest(t.Context(), testComputerAttemptManifest("torn-job", "attempt-a"), createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.spool.beginRemoval(t.Context(), testRuntimeRemoval("torn-job"), createdAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbox.spool.db.ExecContext(t.Context(), `UPDATE runtime_removal_manifests
+SET manifest_json=? WHERE job_id=?`, []byte(`{"version":1,"attempts":[`), "torn-job"); err != nil {
+		t.Fatal(err)
+	}
+	views, err := nodeAgent.RuntimeRemovals(t.Context())
+	if err != nil || len(views) != 1 {
+		t.Fatalf("removal read over torn JSON = %+v err=%v", views, err)
+	}
+	if views[0].JobID != "torn-job" || !strings.Contains(views[0].InvalidReason, "unreadable_json") {
+		t.Fatalf("torn row did not name itself and its reason: %+v", views[0])
+	}
+	// The single-record read stays a refusal: nothing acts on this row.
+	if _, found, err := outbox.spool.runtimeRemoval(t.Context(), "torn-job"); err == nil || found {
+		t.Fatalf("torn row was returned as actionable: found=%t err=%v", found, err)
 	}
 }

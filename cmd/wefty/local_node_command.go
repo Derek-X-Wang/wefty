@@ -160,6 +160,13 @@ func executeLocalOCIRemovals(ctx context.Context, client *ocicontrol.Client, jso
 			removal.RuntimeQuiescence.RuntimeQuiesced, attested, len(removal.ResourceManifests)); err != nil {
 			return err
 		}
+		// A row the agent refuses reaches this listing looking like any other
+		// quarantined removal, and it is the one the operator is stuck on.
+		if removal.InvalidReason != "" {
+			if _, err := fmt.Fprintf(stdout, "\tINVALID\t%s\n", removal.InvalidReason); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

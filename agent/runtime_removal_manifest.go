@@ -317,7 +317,7 @@ func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
 }
 
 func (spool *logSpool) runtimeRemoval(ctx context.Context, jobID string) (runtimeRemovalRecord, bool, error) {
-	row := spool.db.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id,
+	row := spool.db.QueryRowContext(ctx, `SELECT job_id, removal_generation, cleanup_fence, root_instance_id,
 manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns
 FROM runtime_removal_manifests WHERE job_id=?`, jobID)
 	record, err := scanRuntimeRemoval(row)
@@ -339,24 +339,29 @@ func scanRuntimeRemoval(row rowScanner) (runtimeRemovalRecord, error) {
 	var manifestJSON, receiptJSON, attestationJSON []byte
 	var preparedNS int64
 	var quiescedNS, attestedNS, completedNS sql.NullInt64
-	if err := row.Scan(&record.removal.generation, &record.removal.cleanupFence, &record.removal.rootInstanceID,
+	// job_id is read from its own column rather than from the manifest it
+	// indexes, so a row whose stored JSON no longer parses still has the one
+	// identity an operator can act on.
+	if err := row.Scan(&record.removal.jobID, &record.removal.generation, &record.removal.cleanupFence, &record.removal.rootInstanceID,
 		&manifestJSON, &receiptJSON, &attestationJSON, &record.phase, &preparedNS, &quiescedNS, &attestedNS, &completedNS); err != nil {
 		return runtimeRemovalRecord{}, err
 	}
-	if err := json.Unmarshal(manifestJSON, &record.manifest); err != nil || !validRuntimeRemovalManifest(record.manifest) {
-		return runtimeRemovalRecord{}, errors.New("runtime removal manifest is corrupt")
-	}
-	record.removal.jobID = record.manifest.JobID
 	record.removal.kind = contract.JobKindOCI
 	record.preparedAt = time.Unix(0, preparedNS).UTC()
+	if err := json.Unmarshal(manifestJSON, &record.manifest); err != nil || !validRuntimeRemovalManifest(record.manifest) {
+		return record, errors.New("runtime removal manifest is unreadable_json")
+	}
+	if record.manifest.JobID != record.removal.jobID {
+		return record, fmt.Errorf("runtime removal manifest names job %q, not the row it is stored under", record.manifest.JobID)
+	}
 	if len(receiptJSON) != 0 {
 		if err := json.Unmarshal(receiptJSON, &record.receipt); err != nil {
-			return runtimeRemovalRecord{}, errors.New("runtime quiescence receipt is corrupt")
+			return record, errors.New("runtime quiescence receipt is unreadable_json")
 		}
 	}
 	if len(attestationJSON) != 0 {
 		if err := json.Unmarshal(attestationJSON, &record.attestation); err != nil {
-			return runtimeRemovalRecord{}, errors.New("runtime absence attestation is corrupt")
+			return record, errors.New("runtime absence attestation is unreadable_json")
 		}
 	}
 	if quiescedNS.Valid {
@@ -482,7 +487,7 @@ func storageOnlyNoRuntimeReceipt(receipt workloadrunner.ReapReceipt, attempts []
 }
 
 func (spool *logSpool) pendingRuntimeRemovals(ctx context.Context) ([]runtimeRemovalRecord, error) {
-	rows, err := spool.db.QueryContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id,
+	rows, err := spool.db.QueryContext(ctx, `SELECT job_id, removal_generation, cleanup_fence, root_instance_id,
 manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns
 FROM runtime_removal_manifests WHERE phase IN (?, ?, ?) ORDER BY prepared_ns, job_id`,
 		runtimeRemovalPrepared, runtimeRemovalQuarantined, runtimeRemovalComplete)
