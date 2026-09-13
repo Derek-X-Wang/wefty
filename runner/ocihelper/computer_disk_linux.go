@@ -269,7 +269,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if present {
 		allocationBytes = manifest.Storage.DiskBytes
 	}
-	if err = verifyComputerDiskAllocation(imagePath, allocationBytes); err != nil {
+	if err = ensureComputerDiskAllocation(imagePath, allocationBytes); err != nil {
 		if createdImage {
 			_ = os.Remove(imagePath)
 		}
@@ -658,6 +658,8 @@ func syncDirectory(path string) error {
 	return directory.Sync()
 }
 
+var errComputerDiskNotFullyAllocated = errors.New("Computer disk image is not fully allocated")
+
 func verifyComputerDiskAllocation(path string, bytes int64) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -668,9 +670,29 @@ func verifyComputerDiskAllocation(path string, bytes int64) error {
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Blocks*512 < bytes {
-		return errors.New("Computer disk image is not fully allocated")
+		return errComputerDiskNotFullyAllocated
 	}
 	return nil
+}
+
+// ensureComputerDiskAllocation admits a budget that was already paid for.
+// Blocks can leave a backing file behind the helper's back — a loop device
+// that honours discard turns the guest filesystem's own trims and its
+// deallocating write-zeroes into holes — and a bare refusal then bricks a
+// Computer that the node is still charged for. Verify first; only a short
+// allocation is repaired, by re-asserting the same already-charged bytes. A
+// host that genuinely cannot honour the budget still refuses with the typed
+// message, and that refusal is retryable instead of permanent. A size or file
+// kind conflict is authority, never allocation, and is never repaired.
+func ensureComputerDiskAllocation(path string, bytes int64) error {
+	err := verifyComputerDiskAllocation(path, bytes)
+	if !errors.Is(err, errComputerDiskNotFullyAllocated) {
+		return err
+	}
+	if allocationErr := fullyAllocateComputerDisk(path, bytes); allocationErr != nil {
+		return errors.Join(err, allocationErr)
+	}
+	return verifyComputerDiskAllocation(path, bytes)
 }
 
 func migrateComputerDiskOwnership(root string, uid, gid uint32, lchown func(string, int, int) error) error {
@@ -776,6 +798,44 @@ func rootOwnedPath(path string) bool {
 	}
 }
 
+const loopBlockRoot = "/sys/block"
+
+// disableLoopDeviceDiscard makes the loop device refuse to retire backing
+// blocks. The image is fully allocated on purpose: its bytes are charged to
+// the node the moment the Computer is admitted. A file-backed loop device
+// advertises discard whenever the backing filesystem can punch holes, and
+// then serves REQ_OP_DISCARD (a guest trim) *and* a deallocating
+// REQ_OP_WRITE_ZEROES (ext4's own inode-table zeroing on an online resize)
+// with FALLOC_FL_PUNCH_HOLE against disk.ext4 — silently un-allocating bytes
+// the helper already promised. Both paths are gated on the queue's discard
+// limit, so zeroing it makes the loop driver answer EOPNOTSUPP and the block
+// layer write real zeroes instead. Cost: no thin provisioning behind a
+// Computer disk, which is exactly the invariant this runtime wants.
+func disableLoopDeviceDiscard(blockRoot, loopPath string) error {
+	path := filepath.Join(blockRoot, filepath.Base(loopPath), "queue", "discard_max_bytes")
+	limit, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		// A kernel that exposes no discard limit for this queue can serve no
+		// discard through it either; there is nothing to disable.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("disable Computer disk loop discard: %w", err)
+	}
+	_, writeErr := limit.WriteString("0\n")
+	if err := errors.Join(writeErr, limit.Close()); err != nil {
+		return fmt.Errorf("disable Computer disk loop discard: %w", err)
+	}
+	observed, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read back Computer disk loop discard limit: %w", err)
+	}
+	if strings.TrimSpace(string(observed)) != "0" {
+		return fmt.Errorf("Computer disk loop device still admits %s bytes of discard", strings.TrimSpace(string(observed)))
+	}
+	return nil
+}
+
 func (linuxComputerDiskSystem) attachAndMount(_ context.Context, imagePath, mountPath string) (loopPath string, returnedErr error) {
 	control, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
 	if err != nil {
@@ -807,6 +867,9 @@ func (linuxComputerDiskSystem) attachAndMount(_ context.Context, imagePath, moun
 			_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, loop.Fd(), uintptr(unix.LOOP_CLR_FD), 0)
 		}
 	}()
+	if err := disableLoopDeviceDiscard(loopBlockRoot, loopPath); err != nil {
+		return "", err
+	}
 	if err := unix.Mount(loopPath, mountPath, "ext4", uintptr(unix.MS_NODEV|unix.MS_NOSUID), ""); err != nil {
 		return "", err
 	}

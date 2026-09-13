@@ -2754,3 +2754,97 @@ func TestComputerDiskRemovalBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 		})
 	}
 }
+
+func TestComputerDiskAttachRepairsPunchedBackingAllocation(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, testComputerAuthority("attempt-a", "fence-a", "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A loop device that honours discard retires backing blocks behind the
+	// helper's back: the guest filesystem's trims and ext4's own deallocating
+	// write-zeroes both reach the backing file as FALLOC_FL_PUNCH_HOLE. The
+	// bytes stay charged to the node, so the budget must be re-asserted, not
+	// refused forever.
+	image, err := os.OpenFile(attachment.imagePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	punchErr := unix.Fallocate(int(image.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, 4<<20, 8<<20)
+	if err := errors.Join(punchErr, image.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyComputerDiskAllocation(attachment.imagePath, storage.DiskBytes); err == nil ||
+		!strings.Contains(err.Error(), "not fully allocated") {
+		t.Fatalf("punched Computer disk image allocation = %v, want a sparse image", err)
+	}
+	successor, err := engine.attachComputerDisk(t.Context(), storage, testComputerAuthority("attempt-b", "fence-b", "boot-a"))
+	if err != nil {
+		t.Fatalf("attach refused an already-admitted budget instead of re-asserting it: %v", err)
+	}
+	if err := verifyComputerDiskAllocation(successor.imagePath, storage.DiskBytes); err != nil {
+		t.Fatalf("attach published a partially allocated Computer disk: %v", err)
+	}
+	if err := engine.detachComputerDisk(successor, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestComputerDiskAllocationRepairNeverCrossesBudgetAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disk.ext4")
+	if err := os.WriteFile(path, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureComputerDiskAllocation(path, 4096); err != nil {
+		t.Fatalf("allocated image = %v, want admitted", err)
+	}
+	// A short image is repaired; an image of the wrong size is a budget
+	// authority conflict and is never grown into agreement.
+	if err := ensureComputerDiskAllocation(path, 8192); err == nil ||
+		strings.Contains(err.Error(), "not fully allocated") {
+		t.Fatalf("budget conflict = %v, want an unrepaired authority conflict", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 4096 {
+		t.Fatalf("refused budget conflict mutated the image: size=%d", info.Size())
+	}
+}
+
+func TestComputerDiskLoopAttachmentRefusesDiscard(t *testing.T) {
+	blockRoot := t.TempDir()
+	queue := filepath.Join(blockRoot, "loop7", "queue")
+	if err := os.MkdirAll(queue, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	limit := filepath.Join(queue, "discard_max_bytes")
+	if err := os.WriteFile(limit, []byte("4294966784\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := disableLoopDeviceDiscard(blockRoot, "/dev/loop7"); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.ReadFile(limit)
+	if err != nil || strings.TrimSpace(string(observed)) != "0" {
+		t.Fatalf("loop discard limit = %q err=%v, want 0", strings.TrimSpace(string(observed)), err)
+	}
+	// A queue with no discard limit at all can serve no discard through it.
+	if err := disableLoopDeviceDiscard(blockRoot, "/dev/loop9"); err != nil {
+		t.Fatalf("absent discard limit = %v, want accepted", err)
+	}
+	// A limit that cannot be written is refused, never tolerated.
+	if err := os.MkdirAll(filepath.Join(blockRoot, "loop8", "queue", "discard_max_bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := disableLoopDeviceDiscard(blockRoot, "/dev/loop8"); err == nil {
+		t.Fatal("unwritable discard limit was tolerated")
+	}
+}
