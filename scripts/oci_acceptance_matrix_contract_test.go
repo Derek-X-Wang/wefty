@@ -46,7 +46,6 @@ const (
 // by #402, never a quiet PASS.
 var ociMatrixGapRows = []string{
 	"linux.oneshot.image_identity",
-	"linux.service.crash_recovery",
 	"linux.service.removal",
 	"linux.only.socket_activated_helper",
 	"linux.only.cgroup_v2_limits",
@@ -415,6 +414,11 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"service_bind_mount_content_verified=true")
 	write("helper-restart-timeline.txt", "socket_and_service_active_after_recovery=true")
 	write("oci-service-agent-sigkill-linux.txt", "service_oci_payload_sigkill_survived=true")
+	write("oci-service-heartbeat-blackhole-linux.txt",
+		"service_heartbeat_blackhole_live_reaped=true",
+		"service_heartbeat_blackhole_attempt_class=service",
+		"service_heartbeat_blackhole_helper_close_reason=session heartbeat deadline expired",
+		"service_heartbeat_blackhole_terminal_outcome=session_stale")
 	write("oci-service-removal-stopped-linux.txt", "service_removal_from_stopped_kind_oci=true")
 	write("oci-service-removal-offline-linux.txt", "service_removal_from_offline_kind_oci=true")
 	// The revision facts are receipt evidence, not matrix assertions: the live
