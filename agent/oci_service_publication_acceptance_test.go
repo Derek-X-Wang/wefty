@@ -783,27 +783,34 @@ func verifyNativeOCIOperatorBindMountUntouchedAfterRemoval(
 			Mounts: []contract.OCIMount{{
 				NodePath: bindSourceDirectory, ContainerPath: nativeOCIOperatorBindMountContainerPath, ReadOnly: true,
 			}},
+			// The read check reports the raw content (or cat's own stderr on
+			// failure) rather than a self-judged ok/mismatch boolean, and Go
+			// compares it: a shell-side comparison stayed opaque on failure.
+			// The create check uses touch, not the ":" special builtin --
+			// POSIX mandates that a redirection failure on a special builtin
+			// (":", unlike "printf" or "touch") terminates a non-interactive
+			// shell outright, even inside an "if" condition, so the read-only
+			// mount's EROFS previously killed the whole probe script before
+			// it could print bind-mount-create-rejected or
+			// bind-mount-probe-complete, and RestartAlways then crash-looped
+			// it forever on the same line.
 			Argv: []string{"/bin/sh", "-c", fmt.Sprintf(`
 trap 'exit 0' TERM
 mount_dir=%q
-if [ "$(cat "$mount_dir/readable.txt")" = %q ]; then
-	printf 'bind-mount-read-ok\n'
-else
-	printf 'bind-mount-read-mismatch\n'
-fi
+printf 'bind-mount-read:%%s\n' "$(cat "$mount_dir/readable.txt" 2>&1)"
 if printf 'container-write-attempt\n' >>"$mount_dir/protected.txt" 2>/dev/null; then
 	printf 'bind-mount-write-unexpectedly-succeeded\n'
 else
 	printf 'bind-mount-write-rejected\n'
 fi
-if : >"$mount_dir/created-by-container.txt" 2>/dev/null; then
+if touch "$mount_dir/created-by-container.txt" 2>/dev/null; then
 	printf 'bind-mount-create-unexpectedly-succeeded\n'
 else
 	printf 'bind-mount-create-rejected\n'
 fi
 printf 'bind-mount-probe-complete\n'
 while :; do sleep 1; done
-`, nativeOCIOperatorBindMountContainerPath, nativeOCIOperatorBindMountReadableContent)},
+`, nativeOCIOperatorBindMountContainerPath)},
 		}},
 	})
 	if err != nil {
@@ -830,21 +837,29 @@ while :; do sleep 1; done
 		t.Fatalf("operator bind-mount service did not reach running: %+v", bindMountRunning)
 	}
 	wantBindMountMarkers := map[string]bool{
-		"bind-mount-read-ok\n": false, "bind-mount-write-rejected\n": false,
-		"bind-mount-create-rejected\n": false, "bind-mount-probe-complete\n": false,
+		"bind-mount-write-rejected\n": false, "bind-mount-create-rejected\n": false, "bind-mount-probe-complete\n": false,
 	}
+	const bindMountReadPrefix = "bind-mount-read:"
+	var bindMountReadLine string
+	var bindMountReadObserved bool
+	var lastBindMountLogs l1.LogPage
 	bindMountDeadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(bindMountDeadline) {
 		logs, err := store.GetJobLogs(t.Context(), bindMountJob.JobID, "", l1.MaxLogPageLimit)
 		if err != nil {
 			t.Fatal(err)
 		}
+		lastBindMountLogs = logs
 		for _, event := range logs.Events {
-			if _, expected := wantBindMountMarkers[string(event.Bytes)]; expected {
-				wantBindMountMarkers[string(event.Bytes)] = true
+			line := string(event.Bytes)
+			if strings.HasPrefix(line, bindMountReadPrefix) {
+				bindMountReadLine, bindMountReadObserved = line, true
+			}
+			if _, expected := wantBindMountMarkers[line]; expected {
+				wantBindMountMarkers[line] = true
 			}
 		}
-		allObserved := true
+		allObserved := bindMountReadObserved
 		for _, found := range wantBindMountMarkers {
 			allObserved = allObserved && found
 		}
@@ -853,12 +868,21 @@ while :; do sleep 1; done
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	contentVerified := true
+	// The container reports what it actually read (or cat's own error text)
+	// rather than a self-judged boolean; Go owns the comparison so a mismatch
+	// is self-diagnosing in the failure message instead of an opaque false.
+	bindMountReadContent := strings.TrimSuffix(strings.TrimPrefix(bindMountReadLine, bindMountReadPrefix), "\n")
+	contentVerified := bindMountReadObserved && bindMountReadContent == nativeOCIOperatorBindMountReadableContent
 	for _, found := range wantBindMountMarkers {
 		contentVerified = contentVerified && found
 	}
 	if !contentVerified {
-		t.Fatalf("operator bind-mount probe markers = %+v", wantBindMountMarkers)
+		rawLines := make([]string, len(lastBindMountLogs.Events))
+		for i, event := range lastBindMountLogs.Events {
+			rawLines[i] = string(event.Bytes)
+		}
+		t.Fatalf("operator bind-mount probe: markers=%+v read_observed=%t read_content=%q want_read_content=%q raw_log=%q",
+			wantBindMountMarkers, bindMountReadObserved, bindMountReadContent, nativeOCIOperatorBindMountReadableContent, rawLines)
 	}
 
 	if _, err := store.RemoveService(t.Context(), bindMountJob.JobID); err != nil {
