@@ -2225,30 +2225,19 @@ func assertLiveProfileMarker(t *testing.T, computer l1.Computer, priorPath strin
 	}
 }
 
+// triggerLinuxComputerFault keeps the Computer lane's own test-scoped bound and
+// its own environment diagnostics; the FIFO protocol itself lives in
+// requestLinuxRootFault so a caller that must outlive its test context can pass
+// an independently bounded one.
 func triggerLinuxComputerFault(t *testing.T, harness *acceptanceHarness, action string) {
 	t.Helper()
 	fifo := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_FAULT_FIFO")
 	directory := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_FAULT_DIR")
-	done := filepath.Join(directory, action+".done")
-	failure := filepath.Join(directory, action+".failed")
-	_ = os.Remove(done)
-	_ = os.Remove(failure)
-	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), linuxRootFaultBound)
 	defer cancel()
-	command := exec.CommandContext(ctx, "sh", "-c", `printf '%s\n' "$1" > "$2"`, "wefty-fault", action, fifo)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("trigger fault %s: %v\n%s", action, err, output)
+	if err := requestLinuxRootFault(ctx, fifo, directory, action); err != nil {
+		t.Fatal(err)
 	}
-	for ctx.Err() == nil {
-		if _, err := os.Stat(done); err == nil {
-			return
-		}
-		if payload, err := os.ReadFile(failure); err == nil {
-			t.Fatalf("root assertion %s failed: %s", action, payload)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("fault %s did not complete", action)
 }
 
 type liveRFBSession struct {
