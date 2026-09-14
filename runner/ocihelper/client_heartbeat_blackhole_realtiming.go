@@ -11,7 +11,10 @@ package ocihelper
 // on its own heartbeat deadline rather than on a connection close (#456).
 //
 // This is not a setting. There is no way to turn it back off, it takes no
-// value, and it changes nothing until it is called.
-func (session *Session) SuppressHeartbeatsForAcceptanceBlackhole() {
-	session.suppressHeartbeats()
+// value, and it changes nothing until it is called. It returns only once the
+// pump has acknowledged the transition, so a caller that sees nil knows no
+// heartbeat is in flight and the blackhole window starts here; an error means
+// the session was already lost and the window never opened.
+func (session *Session) SuppressHeartbeatsForAcceptanceBlackhole() error {
+	return session.suppressHeartbeats()
 }

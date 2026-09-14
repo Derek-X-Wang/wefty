@@ -55,13 +55,13 @@ type Session struct {
 	controlWire *framedConn
 	response    AcquireSessionResponse
 
-	// heartbeatsSuppressed is the acceptance-lane heartbeat blackhole switch.
-	// It is never written on a production path: the only writer is
-	// suppressHeartbeats, whose single exported wrapper lives in a file built
-	// only under the service_acceptance_realtiming tag. Its zero value is the
-	// production behaviour, so an untouched session keeps exactly the heartbeat
-	// cadence it had before this field existed.
-	heartbeatsSuppressed atomic.Bool
+	// suppress carries the acceptance-lane heartbeat blackhole command to the
+	// pump and receives its acknowledgement. Nothing on a production path ever
+	// sends on it: the only sender is suppressHeartbeats, whose single exported
+	// wrapper lives in a file built only under the service_acceptance_realtiming
+	// tag. A session nobody ever blackholes keeps exactly the heartbeat cadence
+	// it had before this channel existed.
+	suppress chan chan error
 
 	controlMu   sync.Mutex
 	queueMu     sync.Mutex
@@ -189,6 +189,7 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 		client: client, capability: response.SessionCapability, control: connection, controlWire: wire, response: response,
 		pending: make(map[string]pendingRenewal), queued: make(chan struct{}, 1),
 		pumpCtx: pumpCtx, pumpCancel: pumpCancel, pumpDone: make(chan struct{}),
+		suppress: make(chan chan error),
 	}
 	if client.disableHeartbeatPump {
 		close(session.pumpDone)
@@ -317,18 +318,45 @@ func (session *Session) QueueAttemptRenewalUntil(authority AttemptAuthority, exp
 	return nil
 }
 
-// suppressHeartbeats makes this session stop SENDING heartbeat frames while
-// leaving the control connection open and the Session usable. It exists only so
-// acceptance tests can reproduce a real heartbeat blackhole -- the client goes
-// quiet, the helper's server-side heartbeat deadline expires, and the helper
-// reaps this session's attempts -- which is the one failure a closed connection
-// cannot stand in for. No production caller exists, no default changes, and the
-// only exported entry point is built under service_acceptance_realtiming.
-func (session *Session) suppressHeartbeats() {
-	if session == nil {
-		return
+// suppressHeartbeats blackholes this session's heartbeats: the pump keeps
+// running and the control connection stays open, undeadlined and unread, but no
+// further heartbeat is ever sent. It exists only so acceptance tests can
+// reproduce a real heartbeat blackhole -- the one failure a closed connection
+// cannot stand in for, because only the helper's own deadline can end a session
+// whose client is merely silent.
+//
+// It is a command to the pump rather than a flag, and it returns only once the
+// pump has acknowledged the transition from inside its own goroutine. So when
+// it returns nil, any flush that was in flight has finished, no heartbeat is in
+// flight, and none will start -- the client cannot afterwards be the cause of
+// anything the helper does. If the pump has already stopped, that is reported
+// rather than silently accepted: a client that lost its session proves nothing
+// about a heartbeat deadline. No production caller exists, no default changes,
+// and the only exported entry point is built under
+// service_acceptance_realtiming.
+func (session *Session) suppressHeartbeats() error {
+	if session == nil || session.suppress == nil {
+		return errors.New("OCI helper session is unavailable")
 	}
-	session.heartbeatsSuppressed.Store(true)
+	acknowledge := make(chan error, 1)
+	select {
+	case session.suppress <- acknowledge:
+	case <-session.pumpDone:
+		return session.heartbeatPumpStopped()
+	}
+	select {
+	case err := <-acknowledge:
+		return err
+	case <-session.pumpDone:
+		return session.heartbeatPumpStopped()
+	}
+}
+
+func (session *Session) heartbeatPumpStopped() error {
+	if err := session.HealthError(); err != nil {
+		return fmt.Errorf("suppress OCI helper heartbeats: %w", err)
+	}
+	return errors.New("the OCI helper heartbeat pump stopped before heartbeat suppression took effect")
 }
 
 func (session *Session) heartbeatPump() {
@@ -342,19 +370,30 @@ func (session *Session) heartbeatPump() {
 	}
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
+	suppressed := false
 	for {
+		// A waiting blackhole command is taken before anything else, so the
+		// transition never sits behind another flush. Both this and the arm
+		// below acknowledge from the pump's own goroutine and between flushes,
+		// which is what makes the acknowledgement a fence.
+		select {
+		case acknowledge := <-session.suppress:
+			suppressed = true
+			acknowledge <- nil
+		default:
+		}
 		select {
 		case <-session.pumpCtx.Done():
 			return
+		case acknowledge := <-session.suppress:
+			suppressed = true
+			acknowledge <- nil
+			timer.Reset(interval)
+			continue
 		case <-session.queued:
 		case <-timer.C:
 		}
-		if session.heartbeatsSuppressed.Load() {
-			// Heartbeat blackhole: stop SENDING while the control connection
-			// stays open, unread and undeadlined, so what ends this session is
-			// the helper's own server-side heartbeat deadline rather than an
-			// EOF the client caused. See suppressHeartbeats; nothing in
-			// production reaches this branch.
+		if suppressed {
 			timer.Reset(interval)
 			continue
 		}

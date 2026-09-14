@@ -2705,12 +2705,13 @@ func TestSuppressedHeartbeatsStopSendingWithoutClosingTheControlConnection(t *te
 		t.Fatal(err)
 	}
 	defer session.Close()
-	if session.heartbeatsSuppressed.Load() {
-		t.Fatal("a freshly opened session was born suppressed")
-	}
 	waitFor(t, 2*time.Second, func() bool { return control.writeCount() >= 3 }, "the production heartbeat cadence")
 
-	session.suppressHeartbeats()
+	// The acknowledgement is the fence: it comes from the pump's own goroutine
+	// between flushes, so the count read straight after it cannot still move.
+	if err := session.suppressHeartbeats(); err != nil {
+		t.Fatalf("suppress heartbeats: %v", err)
+	}
 	silenced := control.writeCount()
 	// Twenty-five intervals of real time. An unsuppressed pump writes a frame
 	// on every one of them, so a suppression that merely slowed the cadence
@@ -2745,6 +2746,14 @@ func TestSuppressedHeartbeatsStopSendingWithoutClosingTheControlConnection(t *te
 	var loss *RuntimeLossError
 	if !errors.As(err, &loss) {
 		t.Fatalf("blackholed session error = %v, want the typed runtime loss the attempt lands as runtime_failure", err)
+	}
+
+	// A pump that is already gone must say so rather than report a blackhole
+	// that never happened: a client which lost its session proves nothing about
+	// a heartbeat deadline.
+	_ = session.Close()
+	if err := session.suppressHeartbeats(); err == nil {
+		t.Fatal("suppression on a stopped heartbeat pump reported success")
 	}
 }
 

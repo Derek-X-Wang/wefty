@@ -102,6 +102,11 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The helper arms the deadman when it reserves the attempt, before Run
+	// returns, so the clock the deadman runs on starts here and not at the
+	// blackhole. Everything between here and the acknowledged suppression eats
+	// into it.
+	attemptStarted := time.Now()
 	if _, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: deadman,
 		Workload: ocihelper.WorkloadInput{
@@ -111,7 +116,11 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(nativeOCIContainerIDs(t, containerdAddress), identity.ContainerID) {
+	present, err := nativeOCIContainerIDs(ctx, containerdAddress)
+	if err != nil {
+		t.Fatalf("list live OCI containers: %v", err)
+	}
+	if !slices.Contains(present, identity.ContainerID) {
 		t.Fatalf("kind=oci attempt container %s never reached containerd", identity.ContainerID)
 	}
 	closesBefore := countHelperSessionCloses(t, helperStderrPath)
@@ -126,10 +135,21 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 		watchDone <- session.Watch(watchCtx, ocihelper.WatchRequest{Authority: authority}, nil)
 	}()
 
-	// Go quiet without hanging up. The control connection stays open and the
-	// client keeps believing in its session; only the helper can end it now.
+	// Go quiet without hanging up. Suppression returns only once the pump has
+	// acknowledged it from its own goroutine, so from this instant no heartbeat
+	// is in flight and none will start: the control connection stays open, the
+	// client keeps believing in its session, and only the helper can end it.
+	if err := session.SuppressHeartbeatsForAcceptanceBlackhole(); err != nil {
+		t.Fatalf("blackhole the live helper session: %v", err)
+	}
 	blackholeStarted := time.Now()
-	session.SuppressHeartbeatsForAcceptanceBlackhole()
+	// The attempt must still outlive the whole observation window, measured
+	// against the deadman the helper armed at reservation.
+	remainingDeadman := deadman - blackholeStarted.Sub(attemptStarted)
+	if remainingDeadman <= reapBound {
+		t.Fatalf("attempt deadman has %s left at the blackhole, which does not outlast the %s observation window; a deadman expiry would be indistinguishable from the session reap",
+			remainingDeadman, reapBound)
+	}
 	reapElapsed := waitForNativeOCIContainerAbsence(t, containerdAddress, identity.ContainerID, blackholeStarted, reapBound)
 	// The helper's deadline is measured from the last heartbeat it accepted,
 	// which may be up to one interval before the blackhole began. Anything
@@ -169,8 +189,13 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 		t.Fatalf("post-blackhole request on the dead session = %v, want %s", staleErr, ocihelper.CodeSessionStale)
 	}
 
-	// The helper must still be usable, and the takeover sweep must find nothing
-	// of this attempt left to remove -- the blackhole reap already did it.
+	// The helper must still be usable. The fresh session's sweep is where the
+	// expired session's reap reports itself: ReapSession returns the inventory
+	// it removed, the helper holds that in sessionReapSweep, and the next
+	// sweep merges it in. So the receipt naming this container is the helper's
+	// own account of having reaped it -- and because the container was already
+	// positively absent before this takeover began, that account cannot be the
+	// takeover's own work.
 	barrier.Invalidate()
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatalf("helper did not admit a fresh session after the blackhole reap: %v", err)
@@ -179,8 +204,15 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 	if !ok || !receipt.VerifiedAbsent {
 		t.Fatalf("post-blackhole takeover sweep receipt = %+v present=%t", receipt, ok)
 	}
-	if slices.Contains(receipt.SweptInventory.Containers, identity.ContainerID) {
-		t.Fatalf("takeover sweep, not the heartbeat-deadline reap, removed container %s", identity.ContainerID)
+	if !slices.Contains(receipt.SweptInventory.Containers, identity.ContainerID) {
+		t.Fatalf("fresh session's sweep does not carry container %s from the expired session's reap: %+v",
+			identity.ContainerID, receipt.SweptInventory.Containers)
+	}
+	if !slices.ContainsFunc(receipt.Attempts, func(swept ocihelper.SweptAttemptAuthority) bool {
+		return swept.AttemptID == authority.AttemptID && swept.JobID == authority.JobID &&
+			swept.FencingToken == authority.FencingToken && swept.Class == authority.Class
+	}) {
+		t.Fatalf("fresh session's sweep does not attribute the reap to attempt %s: %+v", authority.AttemptID, receipt.Attempts)
 	}
 
 	evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR")
@@ -193,6 +225,7 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_container=%s\n", identity.ContainerID)
 	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_helper_heartbeat_timeout_ns=%d\n", heartbeatTimeout.Nanoseconds())
 	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_attempt_deadman_ns=%d\n", deadman.Nanoseconds())
+	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_deadman_remaining_at_blackhole_ns=%d\n", remainingDeadman.Nanoseconds())
 	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_reap_elapsed_ns=%d\n", reapElapsed.Nanoseconds())
 	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_reap_bound_ns=%d\n", reapBound.Nanoseconds())
 	fmt.Fprintf(&evidence, "service_heartbeat_blackhole_helper_close_reason=%s\n", closeReason)
@@ -207,26 +240,41 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 // nativeOCIContainerIDs requires a successful containerd namespace list, so a
 // transport failure can never masquerade as absence. It is the same positive
 // check serviceacceptance uses for its own reap proofs; the test process is
-// unprivileged and deliberately cannot reach the socket itself.
-func nativeOCIContainerIDs(t *testing.T, containerdAddress string) []string {
-	t.Helper()
-	list, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress,
+// unprivileged and deliberately cannot reach the socket itself. The context
+// bounds the command, so a list that outlives the caller's window cannot come
+// back and be read as a timely observation.
+func nativeOCIContainerIDs(ctx context.Context, containerdAddress string) ([]string, error) {
+	list, err := exec.CommandContext(ctx, "sudo", "/usr/local/bin/ctr", "--address", containerdAddress,
 		"--namespace", ocihelper.ContainerdNamespace, "containers", "list", "--quiet").CombinedOutput()
 	if err != nil {
-		t.Fatalf("list live OCI containers: %v\n%s", err, list)
+		return nil, fmt.Errorf("%w\n%s", err, list)
 	}
-	return strings.Fields(string(list))
+	return strings.Fields(string(list)), nil
 }
 
+// waitForNativeOCIContainerAbsence returns how long the blackhole took to reap,
+// and only for an absence that was both observed and completed inside the
+// bound. A list that finishes late says nothing about a deadline that had
+// already passed.
 func waitForNativeOCIContainerAbsence(t *testing.T, containerdAddress, containerID string, started time.Time, bound time.Duration) time.Duration {
 	t.Helper()
 	deadline := started.Add(bound)
 	for {
-		if !slices.Contains(nativeOCIContainerIDs(t, containerdAddress), containerID) {
-			return time.Since(started)
+		listCtx, cancelList := context.WithDeadline(context.Background(), deadline)
+		ids, err := nativeOCIContainerIDs(listCtx, containerdAddress)
+		cancelList()
+		observedAt := time.Now()
+		if err != nil {
+			if observedAt.Before(deadline) {
+				t.Fatalf("list live OCI containers to prove the blackhole reap: %v", err)
+			}
+			t.Fatalf("container %s absence was not observed within %s of the heartbeat blackhole: %v", containerID, bound, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("container %s survived %s of heartbeat blackhole", containerID, bound)
+		if !observedAt.Before(deadline) {
+			t.Fatalf("container %s absence was not observed within %s of the heartbeat blackhole", containerID, bound)
+		}
+		if !slices.Contains(ids, containerID) {
+			return observedAt.Sub(started)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
