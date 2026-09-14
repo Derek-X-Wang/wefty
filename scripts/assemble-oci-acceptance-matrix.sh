@@ -46,8 +46,9 @@ rows="$work_directory/rows.json"
 : > "$facts"
 for receipt in native-linux-oci.txt oci-service-publication-linux.txt \
   oci-service-l1-agent-linux.txt helper-restart-timeline.txt lost-attempt-sweep.txt \
-  oci-service-agent-sigkill-linux.txt oci-service-removal-stopped-linux.txt \
-  oci-service-removal-offline-linux.txt oci-node-capability-claims-linux.txt; do
+  oci-service-agent-sigkill-linux.txt oci-service-heartbeat-blackhole-linux.txt \
+  oci-service-removal-stopped-linux.txt oci-service-removal-offline-linux.txt \
+  oci-node-capability-claims-linux.txt; do
   if [ -f "$linux_directory/$receipt" ]; then
     cat "$linux_directory/$receipt" >> "$facts"
   fi
@@ -89,7 +90,7 @@ linux.service.publication|Publish health and echo through Fabric on a helper-all
 linux.service.restart|Payload restart with cooperative TERM, KILL escalation, and paired log seals|table Linux/service|fresh_restart fresh_restart_authority term_cooperative_stop term_grace_stop term_kill_escalation term_kill_log_seal_pairing term_kill_stdout_log term_kill_stderr_log|
 linux.service.stop_start|Stop and start reacquires capacity, withdraws and republishes on the retained binding digest|table Linux/service|stop_start slot_saturation retained_binding_digest withdrawal republication|
 linux.service.data|Persistent service data across restart and stop/start, writable rootfs discarded on every restart|table Linux/service|service_data_root_user service_data_numeric_user service_data_named_user service_data_restart_persistent service_data_stop_start_persistent service_rootfs_discarded service_data_same_digest_replacement_fresh|
-linux.service.crash_recovery|Agent, helper and containerd crash, helper loss, stale residue sweep with a reused boot ID|table Linux/service + bullets 6,7,8|service_helper_loss_injected service_helper_loss_observed service_fresh_attempt_readmission service_barrier_prefaced_during_startup service_lost_log_typed !control_loss_reaped socket_and_service_active_after_recovery removal_prior_boot_oci_sweep service_oci_payload_sigkill_survived|heartbeat_blackhole_live:heartbeat blackhole is proven only against the fake engine harness
+linux.service.crash_recovery|Agent, helper and containerd crash, heartbeat blackhole, helper loss, stale residue sweep with a reused boot ID|table Linux/service + bullets 6,7,8|service_helper_loss_injected service_helper_loss_observed service_fresh_attempt_readmission service_barrier_prefaced_during_startup service_lost_log_typed !control_loss_reaped socket_and_service_active_after_recovery removal_prior_boot_oci_sweep service_oci_payload_sigkill_survived service_heartbeat_blackhole_live_reaped|
 linux.service.removal|Full removal and residue proof from every state, crash injection at every create and delete phase, bind sources untouched and image still cached|table Linux/service + bullets 9,10,11|removal_manifest_complete removal_pending removal_every_attempt removal_service_data_volume removal_service_data_owner_record removal_post_delete_attestation removal_delete_attest_crash_injected removal_completed service_residue_verified_absent service_retained_binding_verified !namespace_absent service_removal_from_stopped_kind_oci service_removal_from_offline_kind_oci|bind_sources_untouched_kind_oci:no live OCI test mounts an operator bind source, and operator_bind_source_untouched is Computer-only;crash_injection_create_phases:create-boundary crash injection exists only against the fake engine;crash_injection_after_quiescence:runtimeRemovalCheckpointAfterQuiescence is never injected in the live lane;delete_attest_restart:removal_delete_attest_restart is NOT-RUN_hosted_lane because a real agent process restart needs owner hardware
 linux.node.capability_claims|Capable and incapable claim pairs for every required capability|bullet 1|capability_claim_pair_oci_capable capability_claim_pair_oci_incapable capability_claim_pair_doctor_source=cli|
 linux.only.unprivileged_agent|The agent runs unprivileged|Linux-only list|agent_uid_nonzero|
