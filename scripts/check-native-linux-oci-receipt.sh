@@ -242,6 +242,8 @@ if [ "$lost_log_disposition_count" -ne 1 ]; then
   printf 'receipt must contain one typed lost-attempt log disposition\n' >&2
   exit 1
 fi
+require_unique_value "$l1_agent_receipt" service_operator_bind_source_untouched true
+require_unique_value "$l1_agent_receipt" service_bind_mount_content_verified true
 require_unique_value "$service_receipt" term_kill_escalation true
 require_unique_boolean "$service_receipt" term_kill_log_evidence_incomplete
 require_unique_value "$service_receipt" term_kill_log_seal_pairing true

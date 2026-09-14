@@ -5,11 +5,14 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -52,6 +55,11 @@ const (
 	// ticks before the production recovery window starts.
 	nativeOCIRepublicationDeadline = DefaultPublicationRecoveryWindow + nativeOCIPayloadListenerRestartGap +
 		nativeOCIReadinessConnectTimeout + 4*nativeOCIReadinessProbeInterval
+	// #457: the container path an ordinary OCI service mounts its operator
+	// bind-mount source at, and the content its probe script checks against
+	// the node-side readable.txt fixture.
+	nativeOCIOperatorBindMountContainerPath   = "/mnt/wefty-operator-bind"
+	nativeOCIOperatorBindMountReadableContent = "wefty-oci-bind-source-readable"
 )
 
 func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
@@ -194,7 +202,14 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
 	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
-	if helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" {
+	// #457: the helper only honors a contract.OCIMount source beneath its own
+	// --oci-allowed-mount-root allowlist (docs/contracts/oci-helper-protocol.md,
+	// "Run" and "Guest-side runtime-spec construction"), which is configured
+	// once at helper startup and cannot be widened by this test process. The
+	// realtiming provisioning must export a directory already covered by that
+	// allowlist here.
+	operatorMountRoot := os.Getenv("WEFTY_OCI_OPERATOR_MOUNT_ROOT")
+	if helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || operatorMountRoot == "" {
 		if runtime.GOOS == "darwin" {
 			t.Skip("NOT-RUN: attended Mac/Lima OCI L1/agent restart transitions require the owner-hardware helper and probe environment")
 		}
@@ -215,9 +230,10 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var removalManifestComplete, removalPending, removalEveryAttempt bool
 	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
+	var serviceOperatorBindSourceUntouched, serviceBindMountContentVerified bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_helper_loss_injected=%t\nservice_helper_loss_observed=%t\nservice_helper_loss_observed_at=%s\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_recovery_bound=%s\nservice_fresh_attempt_admission_elapsed=%s\nservice_kill_to_fresh_attempt_admission_elapsed=%s\nservice_fresh_attempt_admission_bound=%s\nservice_fresh_attempt_admission_margin=%s\nservice_fresh_attempt_admission_margin_basis=round4_cleanup_lt_600ms_ceil_1s_plus_preface_admission_ceil_1s\nservice_fresh_attempt_admitted_at=%s\nservice_barrier_advertised_reap_timeout=%s\nservice_barrier_takeover_bound=%s\nservice_barrier_verified_ready_bound=%s\nservice_barrier_started_at=%s\nservice_barrier_preface_completed_at=%s\nservice_barrier_session_admitted_at=%s\nservice_barrier_verified_ready_at=%s\nservice_barrier_prefaced_during_startup=%t\nservice_barrier_handshake_elapsed=%s\nservice_barrier_session_admission_elapsed=%s\nservice_barrier_sweep_elapsed=%s\nservice_barrier_verify_elapsed=%s\nservice_barrier_verified_ready_elapsed=%s\nservice_lost_log_typed=%t\nservice_lost_log_disposition=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceHelperLossInjected, !serviceBarrierTimeline.HelperLossObservedAt.IsZero(), serviceBarrierTimeline.HelperLossObservedAt.UTC().Format(time.RFC3339Nano), serviceFreshAttemptReadmission, serviceRecoveryElapsed, serviceRecoveryBound, serviceFreshAttemptAdmissionElapsed, serviceKillToFreshAttemptAdmissionElapsed, serviceFreshAttemptAdmissionBound, nativeOCIFreshAttemptLeaseMargin, serviceFreshAttemptAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.AdvertisedReapTimeout, serviceBarrierTimeline.TakeoverBound, serviceBarrierTimeline.VerifiedReadyBound, serviceBarrierTimeline.BarrierStartedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefaceCompletedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.SessionAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.VerifiedReadyAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefacedDuringStartup, serviceBarrierTimeline.HandshakeElapsed, serviceBarrierTimeline.SessionAdmissionElapsed, serviceBarrierTimeline.SweepElapsed, serviceBarrierTimeline.VerifyElapsed, serviceBarrierTimeline.VerifiedReadyElapsed, serviceLostLogTyped, serviceLostLogDisposition, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_helper_loss_injected=%t\nservice_helper_loss_observed=%t\nservice_helper_loss_observed_at=%s\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_recovery_bound=%s\nservice_fresh_attempt_admission_elapsed=%s\nservice_kill_to_fresh_attempt_admission_elapsed=%s\nservice_fresh_attempt_admission_bound=%s\nservice_fresh_attempt_admission_margin=%s\nservice_fresh_attempt_admission_margin_basis=round4_cleanup_lt_600ms_ceil_1s_plus_preface_admission_ceil_1s\nservice_fresh_attempt_admitted_at=%s\nservice_barrier_advertised_reap_timeout=%s\nservice_barrier_takeover_bound=%s\nservice_barrier_verified_ready_bound=%s\nservice_barrier_started_at=%s\nservice_barrier_preface_completed_at=%s\nservice_barrier_session_admitted_at=%s\nservice_barrier_verified_ready_at=%s\nservice_barrier_prefaced_during_startup=%t\nservice_barrier_handshake_elapsed=%s\nservice_barrier_session_admission_elapsed=%s\nservice_barrier_sweep_elapsed=%s\nservice_barrier_verify_elapsed=%s\nservice_barrier_verified_ready_elapsed=%s\nservice_lost_log_typed=%t\nservice_lost_log_disposition=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\nservice_operator_bind_source_untouched=%t\nservice_bind_mount_content_verified=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceHelperLossInjected, !serviceBarrierTimeline.HelperLossObservedAt.IsZero(), serviceBarrierTimeline.HelperLossObservedAt.UTC().Format(time.RFC3339Nano), serviceFreshAttemptReadmission, serviceRecoveryElapsed, serviceRecoveryBound, serviceFreshAttemptAdmissionElapsed, serviceKillToFreshAttemptAdmissionElapsed, serviceFreshAttemptAdmissionBound, nativeOCIFreshAttemptLeaseMargin, serviceFreshAttemptAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.AdvertisedReapTimeout, serviceBarrierTimeline.TakeoverBound, serviceBarrierTimeline.VerifiedReadyBound, serviceBarrierTimeline.BarrierStartedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefaceCompletedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.SessionAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.VerifiedReadyAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefacedDuringStartup, serviceBarrierTimeline.HandshakeElapsed, serviceBarrierTimeline.SessionAdmissionElapsed, serviceBarrierTimeline.SweepElapsed, serviceBarrierTimeline.VerifyElapsed, serviceBarrierTimeline.VerifiedReadyElapsed, serviceLostLogTyped, serviceLostLogDisposition, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep, serviceOperatorBindSourceUntouched, serviceBindMountContentVerified)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -225,8 +241,14 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	}()
 
 	network := plain.NewNetwork()
+	// #457's operator bind-mount arm requires RequiresPinnedPlacement's exactly
+	// one wefty:node:<stable-node-id> routing tag (contract/job_spec.go), so
+	// this node's policy must advertise that tag alongside its ordinary one.
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
-		"native-service-node": {Tags: []string{"native-service"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+		"native-service-node": {
+			Tags:            []string{"native-service", contract.StableNodeTagPrefix + "native-service-node"},
+			MaxOneshotSlots: 1, MaxServiceSlots: 1,
+		},
 	}, l1.DefaultLeaseDuration)
 	defer stopServer()
 	publishedPort := reserveNativePublishedPort(t)
@@ -698,10 +720,245 @@ while :; do sleep 1; done
 	case <-time.After(15 * time.Second):
 		t.Fatal("removal completion omitted captured prior-boot quiescence evidence")
 	}
+
+	// #457: detach the primary-removal injected hooks before proving an
+	// independent ordinary kind=oci service's operator bind-mount source
+	// survives its own full removal untouched. The freed sole service slot
+	// (primary is already removed_verified) admits this fresh job.
+	nodeAgent.session.removals.attestRuntimeRemoval = attestRuntimeRemoval
+	nodeAgent.session.removals.recordRuntimeQuiesced = recordQuiesced
+	nodeAgent.logSpool.runtimeRemovalCheckpoint = nil
+	serviceOperatorBindSourceUntouched, serviceBindMountContentVerified = verifyNativeOCIOperatorBindMountUntouchedAfterRemoval(
+		t, store, reference, digest, operatorMountRoot, managedRoot, spoolDirectory,
+	)
+
 	cancelRestart()
 	if err := <-restartDone; err != nil {
 		t.Fatalf("restarted L1/agent realtiming shutdown: %v", err)
 	}
+}
+
+// verifyNativeOCIOperatorBindMountUntouchedAfterRemoval submits an ordinary
+// (non-Computer) class=service, kind=oci job whose Execution.OCI.Mounts names
+// a node-local operator bind-mount source, has the container read from and
+// attempt to write into that source, removes the job through the full state
+// machine to removed_verified, and proves the node-side source is
+// byte-for-byte untouched: every file hashes identically before and after,
+// the directory itself still exists, and it is not inside any wefty-managed
+// root that removal deletes. It returns (source untouched, content probe
+// verified).
+func verifyNativeOCIOperatorBindMountUntouchedAfterRemoval(
+	t *testing.T, store *l1.Store, reference, digest, operatorMountRoot, managedRoot, spoolDirectory string,
+) (bool, bool) {
+	t.Helper()
+	bindSourceDirectory, err := os.MkdirTemp(operatorMountRoot, "wefty-oci-bind-source-457-*")
+	if err != nil {
+		t.Fatalf("create operator bind-mount source under allowed root %q: %v", operatorMountRoot, err)
+	}
+	if err := os.WriteFile(filepath.Join(bindSourceDirectory, "readable.txt"), []byte(nativeOCIOperatorBindMountReadableContent+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bindSourceDirectory, "protected.txt"), []byte("wefty-oci-bind-source-protected\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(bindSourceDirectory, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bindSourceDirectory, "nested", "deep.txt"), []byte("wefty-oci-bind-source-nested\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bindSourceContentsBefore := hashDirectoryContents(t, bindSourceDirectory)
+
+	bindMountJob, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "native-service-operator-bind-mount",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		// RequiresPinnedPlacement (contract/job_spec.go) requires exactly one
+		// wefty:node:<stable-node-id> tag on any OCI job with mounts, pinning
+		// it to the node that owns the bind source; "native-service-node" is
+		// this test's registered stable node id (see the NodePolicy above).
+		RoutingTags:    []string{"native-service", contract.StableNodeTagPrefix + "native-service-node"},
+		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: reference, Digest: &digest},
+			Mounts: []contract.OCIMount{{
+				NodePath: bindSourceDirectory, ContainerPath: nativeOCIOperatorBindMountContainerPath, ReadOnly: true,
+			}},
+			// The read check reports the raw content (or cat's own stderr on
+			// failure) rather than a self-judged ok/mismatch boolean, and Go
+			// compares it: a shell-side comparison stayed opaque on failure.
+			// The create check uses touch, not the ":" special builtin --
+			// POSIX mandates that a redirection failure on a special builtin
+			// (":", unlike "printf" or "touch") terminates a non-interactive
+			// shell outright, even inside an "if" condition, so the read-only
+			// mount's EROFS previously killed the whole probe script before
+			// it could print bind-mount-create-rejected or
+			// bind-mount-probe-complete, and RestartAlways then crash-looped
+			// it forever on the same line.
+			Argv: []string{"/bin/sh", "-c", fmt.Sprintf(`
+trap 'exit 0' TERM
+mount_dir=%q
+printf 'bind-mount-read:%%s\n' "$(cat "$mount_dir/readable.txt" 2>&1)"
+if printf 'container-write-attempt\n' >>"$mount_dir/protected.txt" 2>/dev/null; then
+	printf 'bind-mount-write-unexpectedly-succeeded\n'
+else
+	printf 'bind-mount-write-rejected\n'
+fi
+if touch "$mount_dir/created-by-container.txt" 2>/dev/null; then
+	printf 'bind-mount-create-unexpectedly-succeeded\n'
+else
+	printf 'bind-mount-create-rejected\n'
+fi
+printf 'bind-mount-probe-complete\n'
+while :; do sleep 1; done
+`, nativeOCIOperatorBindMountContainerPath)},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindMountRemoved := false
+	t.Cleanup(func() {
+		// Best-effort, same idiom as the OCI SIGKILL arm's cleanup
+		// (serviceacceptance/realtiming_test.go): a t.Fatal between job
+		// creation and the normal removal path below must not leave this
+		// test's container running past the test binary's own exit. The
+		// normal path disarms this by setting bindMountRemoved once it
+		// observes removed_verified; this only fires when that path was
+		// never reached.
+		if bindMountRemoved {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _ = store.RemoveService(ctx, bindMountJob.JobID)
+	})
+	bindMountRunning := waitNativeServiceState(t, store, bindMountJob.JobID, contract.JobRunning, 45*time.Second)
+	if bindMountRunning.CurrentAttemptID == "" {
+		t.Fatalf("operator bind-mount service did not reach running: %+v", bindMountRunning)
+	}
+	wantBindMountMarkers := map[string]bool{
+		"bind-mount-write-rejected": false, "bind-mount-create-rejected": false, "bind-mount-probe-complete": false,
+	}
+	const bindMountReadPrefix = "bind-mount-read:"
+	var bindMountReadLine string
+	var bindMountReadObserved bool
+	var lastBindMountLogs l1.LogPage
+	bindMountDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(bindMountDeadline) {
+		logs, err := store.GetJobLogs(t.Context(), bindMountJob.JobID, "", l1.MaxLogPageLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastBindMountLogs = logs
+		// A raw log entry is an arbitrary stdout write, not one marker per
+		// entry: the spool can coalesce several printf lines into one event
+		// or split one line across two, so every entry is split on "\n"
+		// before anything below ever compares a whole line.
+		for _, event := range logs.Events {
+			for _, line := range strings.Split(strings.TrimSuffix(string(event.Bytes), "\n"), "\n") {
+				if line == "" {
+					continue
+				}
+				if strings.HasPrefix(line, bindMountReadPrefix) {
+					bindMountReadLine, bindMountReadObserved = line, true
+				}
+				if _, expected := wantBindMountMarkers[line]; expected {
+					wantBindMountMarkers[line] = true
+				}
+			}
+		}
+		allObserved := bindMountReadObserved
+		for _, found := range wantBindMountMarkers {
+			allObserved = allObserved && found
+		}
+		if allObserved {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// The container reports what it actually read (or cat's own error text)
+	// rather than a self-judged boolean; Go owns the comparison so a mismatch
+	// is self-diagnosing in the failure message instead of an opaque false.
+	// bindMountReadLine is already one whole split line, with no trailing
+	// newline of its own to trim.
+	bindMountReadContent := strings.TrimPrefix(bindMountReadLine, bindMountReadPrefix)
+	contentVerified := bindMountReadObserved && bindMountReadContent == nativeOCIOperatorBindMountReadableContent
+	for _, found := range wantBindMountMarkers {
+		contentVerified = contentVerified && found
+	}
+	if !contentVerified {
+		rawLines := make([]string, len(lastBindMountLogs.Events))
+		for i, event := range lastBindMountLogs.Events {
+			rawLines[i] = string(event.Bytes)
+		}
+		t.Fatalf("operator bind-mount probe: markers=%+v read_observed=%t read_content=%q want_read_content=%q raw_log=%q",
+			wantBindMountMarkers, bindMountReadObserved, bindMountReadContent, nativeOCIOperatorBindMountReadableContent, rawLines)
+	}
+
+	if _, err := store.RemoveService(t.Context(), bindMountJob.JobID); err != nil {
+		t.Fatal(err)
+	}
+	bindMountRemovedJob := waitNativeServiceState(t, store, bindMountJob.JobID, contract.JobRemovedVerified, 45*time.Second)
+	if bindMountRemovedJob.State != contract.JobRemovedVerified {
+		t.Fatalf("operator bind-mount service removal did not complete: %+v", bindMountRemovedJob)
+	}
+	// The normal removal path completed: disarm the best-effort cleanup above.
+	bindMountRemoved = true
+
+	bindSourceInfo, bindSourceStatErr := os.Stat(bindSourceDirectory)
+	bindSourceContentsAfter := hashDirectoryContents(t, bindSourceDirectory)
+	sourceUntouched := bindSourceStatErr == nil && bindSourceInfo.IsDir() &&
+		maps.Equal(bindSourceContentsBefore, bindSourceContentsAfter) &&
+		!strings.HasPrefix(bindSourceDirectory, managedRoot+string(filepath.Separator)) &&
+		!strings.HasPrefix(bindSourceDirectory, spoolDirectory+string(filepath.Separator))
+	if !sourceUntouched {
+		t.Fatalf("operator bind-mount source altered after removal: before=%+v after=%+v stat_err=%v managed_root=%s spool_directory=%s source=%s",
+			bindSourceContentsBefore, bindSourceContentsAfter, bindSourceStatErr, managedRoot, spoolDirectory, bindSourceDirectory)
+	}
+	// The preservation assertion above passed: this test-owned fixture
+	// directory under the shared operator mount root is no longer needed.
+	if err := os.RemoveAll(bindSourceDirectory); err != nil {
+		t.Logf("cleanup operator bind-mount source %s: %v", bindSourceDirectory, err)
+	}
+	return sourceUntouched, contentVerified
+}
+
+// hashDirectoryContents returns a map from every regular file's path relative
+// to root to its sha256 hex digest, porting the sha256File before/after idiom
+// from serviceacceptance/computer_realtiming_test.go:800-859 to a whole
+// directory tree so an operator bind-mount source with nested files can be
+// proved byte-for-byte untouched in one comparison.
+func hashDirectoryContents(t *testing.T, root string) map[string]string {
+	t.Helper()
+	hashes := make(map[string]string)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		relative, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		hashes[relative] = sha256File(t, path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("hash operator bind-mount source %s: %v", root, err)
+	}
+	return hashes
+}
+
+func sha256File(t *testing.T, path string) string {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
 }
 
 func containsBindingPin(pins []workloadrunner.OCIImageBindingPin, jobID, digest string) bool {

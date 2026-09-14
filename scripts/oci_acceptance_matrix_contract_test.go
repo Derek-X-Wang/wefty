@@ -410,7 +410,8 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"removal_every_attempt=true", "removal_service_data_volume=true",
 		"removal_service_data_owner_record=true", "removal_post_delete_attestation=true",
 		"removal_delete_attest_crash_injected=true", "removal_completed=true",
-		"removal_prior_boot_oci_sweep=true")
+		"removal_prior_boot_oci_sweep=true", "service_operator_bind_source_untouched=true",
+		"service_bind_mount_content_verified=true")
 	write("helper-restart-timeline.txt", "socket_and_service_active_after_recovery=true")
 	write("oci-service-agent-sigkill-linux.txt", "service_oci_payload_sigkill_survived=true")
 	write("oci-service-heartbeat-blackhole-linux.txt",

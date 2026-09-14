@@ -137,6 +137,34 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			l1Receipt:      serviceReadmissionReceipt() + "service_lost_log_disposition=retained:log_spool_sealing\n",
 		},
 		{
+			name:           "operator bind-mount source untouched fact is gated",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_operator_bind_source_untouched=true", "service_operator_bind_source_untouched=false", 1),
+		},
+		{
+			name:           "bind-mount content verified fact is gated",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_bind_mount_content_verified=true", "service_bind_mount_content_verified=false", 1),
+		},
+		{
+			name:           "missing operator bind-mount source untouched fact fails closed",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_operator_bind_source_untouched=true\n", "", 1),
+		},
+		{
+			name:           "missing bind-mount content verified fact fails closed",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_bind_mount_content_verified=true\n", "", 1),
+		},
+		{
 			name:           "composite Go duration beyond bound fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
@@ -221,7 +249,8 @@ func serviceReadmissionReceipt() string {
 		"service_barrier_prefaced_during_startup=true\n" +
 		"service_barrier_handshake_elapsed=11ms\nservice_barrier_session_admission_elapsed=79ms\n" +
 		"service_barrier_sweep_elapsed=31ms\nservice_barrier_verify_elapsed=2ms\nservice_barrier_verified_ready_elapsed=112ms\n" +
-		"service_lost_log_typed=true\nservice_lost_log_disposition=swept:removed\n"
+		"service_lost_log_typed=true\nservice_lost_log_disposition=swept:removed\n" +
+		"service_operator_bind_source_untouched=true\nservice_bind_mount_content_verified=true\n"
 }
 
 func servicePublicationReceipt(logEvidenceIncomplete bool) string {
