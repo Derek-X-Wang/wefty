@@ -314,6 +314,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	// tar stream is the only possible source of the imported bytes.
 	requestRootFault(t, "reset-containerd")
 	var pulled ocihelper.EnsureImageResponse
+	var imagePullReference, imageImportReference string
 	bindingRepullReconciliation := false
 	if !prBuildRegistryNotRun {
 		err = session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
@@ -433,12 +434,28 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if importErr != nil || closeErr != nil {
 		t.Fatal(errors.Join(importErr, closeErr))
 	}
+	imageImportReference = imported.Evidence.SubmittedReference
 	if prBuildRegistryNotRun {
 		if imported.TopLevelDigest != digest || imported.PlatformDigest == "" {
 			t.Fatalf("PR archive import evidence = %+v, want immutable digest %s", imported, digest)
 		}
-	} else if !reflect.DeepEqual(pulled, imported) || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
-		t.Fatalf("pull/import evidence differs: pull=%+v import=%+v", pulled, imported)
+	} else {
+		// #426 keys offline import by the archive's own reference, so a
+		// published-artifact run legitimately pulls under ":latest" and
+		// imports the same bytes under a distinct candidate-SHA tag. The two
+		// SubmittedReference values are expected to differ; every other
+		// identity field (digests, media type, platform, runtime handler,
+		// snapshotter) must still agree exactly. Compare the structs with
+		// SubmittedReference cleared so the equality check does not weaken,
+		// and keep both submitted references as recorded evidence.
+		imagePullReference = pulled.Evidence.SubmittedReference
+		pulledIdentity, importedIdentity := pulled, imported
+		pulledIdentity.Evidence.SubmittedReference = ""
+		importedIdentity.Evidence.SubmittedReference = ""
+		if !reflect.DeepEqual(pulledIdentity, importedIdentity) || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
+			t.Fatalf("pull/import evidence differs beyond submitted reference: pull=%+v (submitted %q) import=%+v (submitted %q)",
+				pulled, pulled.Evidence.SubmittedReference, imported, imported.Evidence.SubmittedReference)
+		}
 	}
 	reconciled, err := session.ReconcileImagePins(ctx, reconcileRequest)
 	if err != nil || len(reconciled.MissingDigests) != 0 {
@@ -775,10 +792,10 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"
+		registryEvidence := fmt.Sprintf("pull_from_empty=true\npull_import_digest_equal=true\nimage_pull_reference=%s\nimage_import_reference=%s\n", imagePullReference, imageImportReference)
 		bindingRepullEvidence := fmt.Sprintf("binding_repull_reconciliation=%t\n", bindingRepullReconciliation)
 		if prBuildRegistryNotRun {
-			registryEvidence = "pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published\npull_import_digest_equal=NOT-RUN\npull_import_digest_equal_reason=pr-build: image not published\n"
+			registryEvidence = fmt.Sprintf("pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published\npull_import_digest_equal=NOT-RUN\npull_import_digest_equal_reason=pr-build: image not published\nimage_pull_reference=NOT-RUN\nimage_pull_reference_reason=pr-build: image not published\nimage_import_reference=%s\n", imageImportReference)
 			bindingRepullEvidence = "binding_repull_reconciliation=NOT-RUN\nbinding_repull_reconciliation_reason=pr-build: image not published\n"
 		}
 		residueEvidence := fmt.Sprintf("residue_verified_absent=%t\nretained_classes_exact=%t\nretained_classes=%s\nswept_runtime_classes_covered=%t\n",
