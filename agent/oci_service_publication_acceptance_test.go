@@ -837,7 +837,7 @@ while :; do sleep 1; done
 		t.Fatalf("operator bind-mount service did not reach running: %+v", bindMountRunning)
 	}
 	wantBindMountMarkers := map[string]bool{
-		"bind-mount-write-rejected\n": false, "bind-mount-create-rejected\n": false, "bind-mount-probe-complete\n": false,
+		"bind-mount-write-rejected": false, "bind-mount-create-rejected": false, "bind-mount-probe-complete": false,
 	}
 	const bindMountReadPrefix = "bind-mount-read:"
 	var bindMountReadLine string
@@ -850,13 +850,21 @@ while :; do sleep 1; done
 			t.Fatal(err)
 		}
 		lastBindMountLogs = logs
+		// A raw log entry is an arbitrary stdout write, not one marker per
+		// entry: the spool can coalesce several printf lines into one event
+		// or split one line across two, so every entry is split on "\n"
+		// before anything below ever compares a whole line.
 		for _, event := range logs.Events {
-			line := string(event.Bytes)
-			if strings.HasPrefix(line, bindMountReadPrefix) {
-				bindMountReadLine, bindMountReadObserved = line, true
-			}
-			if _, expected := wantBindMountMarkers[line]; expected {
-				wantBindMountMarkers[line] = true
+			for _, line := range strings.Split(strings.TrimSuffix(string(event.Bytes), "\n"), "\n") {
+				if line == "" {
+					continue
+				}
+				if strings.HasPrefix(line, bindMountReadPrefix) {
+					bindMountReadLine, bindMountReadObserved = line, true
+				}
+				if _, expected := wantBindMountMarkers[line]; expected {
+					wantBindMountMarkers[line] = true
+				}
 			}
 		}
 		allObserved := bindMountReadObserved
@@ -871,7 +879,9 @@ while :; do sleep 1; done
 	// The container reports what it actually read (or cat's own error text)
 	// rather than a self-judged boolean; Go owns the comparison so a mismatch
 	// is self-diagnosing in the failure message instead of an opaque false.
-	bindMountReadContent := strings.TrimSuffix(strings.TrimPrefix(bindMountReadLine, bindMountReadPrefix), "\n")
+	// bindMountReadLine is already one whole split line, with no trailing
+	// newline of its own to trim.
+	bindMountReadContent := strings.TrimPrefix(bindMountReadLine, bindMountReadPrefix)
 	contentVerified := bindMountReadObserved && bindMountReadContent == nativeOCIOperatorBindMountReadableContent
 	for _, found := range wantBindMountMarkers {
 		contentVerified = contentVerified && found
