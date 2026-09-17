@@ -246,20 +246,26 @@ re-mint returns the original Run while another Computer conflicts.
 ## Run mailbox
 
 A workflow reports through files, not HTTP. `WEFTY_RUN_DIR` is the run mailbox:
-`<handoff directory>/.wefty`, created by the node agent at mode `0700` before
-the workload starts. The agent publishes what the workload writes there to L3
-using the run token it holds, over its own authenticated Fabric connection. The
+`<handoff directory>/.wefty/<run id>`, created by the node agent before the
+workload starts. The agent publishes what the workload writes there to L3 using
+the run token it holds, over its own authenticated Fabric connection. The
 workload therefore needs no credential to report, and a mailbox write is a
-claim about the writer's own run and nothing else.
+claim about the writer's own run and nothing else. The directory is scoped by
+run ID because a cold rerun reuses the handoff directory: a rerun gets its own
+mailbox and can neither read nor republish the previous run's evidence.
 
 The layout is fixed:
 
 ```
-$WEFTY_RUN_DIR/params.json    the run's params, written by the agent at 0600
+$WEFTY_RUN_DIR/params.json    the run's params, written by the agent
 $WEFTY_RUN_DIR/tmp/           staging for write-then-rename
 $WEFTY_RUN_DIR/events/        complete events, published in lexical order
-$WEFTY_RUN_DIR/.published/    the agent's cursor; published events are moved here
+$WEFTY_RUN_DIR/.published/    the agent's cursor and bookkeeping
 ```
+
+`params.json` carries the parameters the run was submitted with. They travel
+from L3 on an agent-only dispatch label, never in the workload environment, and
+a document larger than 64 KiB is left in the ledger rather than delivered.
 
 An event becomes visible by being renamed into `events/` from `tmp/` on the
 same filesystem. The rename is the only "done writing" signal: there is no
@@ -271,46 +277,78 @@ payload that is never escaped by the producer:
 
 ```
 wefty-protocol: 1
-kind: gate            # envelope | phase | gate | result
+kind: gate
 name: vet
-outcome: fail         # gate only: pass | fail | error | skipped
-step: vet             # defaults to name
-status: succeeded     # envelope/result: succeeded | failed | partial
-                      # phase: started | ended (default started)
+outcome: fail
+step: vet
 summary: two tests failed
-key: vet              # idempotency identity; defaults to the file name
-payload: text         # text (default) or json
-created-at: 2026-09-17T09:31:04Z   # defaults to the file's modification time
+payload: text
+created-at: 2026-09-17T09:31:04Z
 --
 <raw payload bytes>
 ```
 
-The agent builds the protocol document. A text payload becomes a gate's
-evidence entry or an envelope extension under `dev.wefty.mailbox`; a `json`
-payload is nested under that same namespace, so a workload can never shape the
-envelope's own extension object. A phase becomes an envelope on step
-`phase:<name>`, `partial` while started and `succeeded` once ended; that
-mapping is internal and may change without changing this file protocol. Headers
-outside this set, a repeated header, a missing or misplaced `wefty-protocol`
-line, an unknown kind, status or outcome, and a missing separator are all
-refused; the first eight refusals of an attempt are reported as a `failed`
-envelope on step `mailbox`, and the file is retired unpublished.
+Comments are not part of the format; every line above is a header. The headers
+are:
+
+| Header | Meaning |
+| --- | --- |
+| `wefty-protocol` | Required, and required first. The only version is `1`. |
+| `kind` | `envelope`, `step`, `gate` or `result`. |
+| `name` | The gate's or step's name; defaults to `step`. |
+| `step` | The step the event belongs to; defaults to `name`. |
+| `status` | `succeeded`, `failed` or `partial` for `envelope` and `result` (default `succeeded`); `started` or `ended` for `step` (default `started`). |
+| `outcome` | `pass`, `fail`, `error` or `skipped`. Only a gate carries one. |
+| `summary` | Free text. Defaulted per kind when absent. |
+| `key` | The event's idempotency identity; defaults to the file name. |
+| `payload` | `text` (default) or `json`. |
+| `created-at` | RFC3339. Defaults to when the agent first observed the file. |
+
+The agent builds the protocol document and omits `attempt_id`: only L3 knows
+which attempt its run token is bound to, and it binds the field itself. A text
+payload becomes a gate's evidence entry or an envelope extension under
+`dev.wefty.mailbox`; a `json` payload is nested under that same namespace, so a
+workload can never shape the envelope's own extension object. A `step` becomes
+an envelope on its own step ID, `partial` while started and `succeeded` once
+ended; that mapping is internal and may change without changing this file
+protocol. Headers outside the set above, a repeated header, a missing or
+misplaced `wefty-protocol` line, an unknown kind, status or outcome, and a
+missing separator are all refused; the first eight refusals of an attempt are
+reported as a `failed` envelope on step `mailbox`, and the file is retired
+unpublished.
+
+A process workload runs under the agent's own OS identity, so the mailbox's
+permissions are not an isolation boundary. The agent instead performs every
+mailbox operation relative to an opened directory, on objects it has proven to
+be regular files, with bounded reads and non-blocking opens. A symlink, a FIFO
+or a directory planted in the mailbox is refused, and cannot redirect the agent
+outside the mailbox or hold finalization open.
 
 Every bound is enforced by the agent, never by the producer: at most 64 KiB per
-event file, 1024 events and 1 MiB of published documents per attempt, and 64
-KiB of params. An oversize event is truncated with an explicit marker rather
-than dropped, so a verdict is never lost to a large payload; events past the
-count or byte bound are discarded with one logged line.
+event file, 1024 events and 1 MiB of published documents per attempt, 64 KiB of
+params, and 256 directory entries per sweep. An oversize event is truncated
+with an explicit marker rather than dropped, so a verdict is never lost to a
+large payload; a truncated `json` payload is preserved as marked text. Events
+past the count or byte bound are discarded with one logged line.
 
 Publication is streamed, not deferred: a running attempt's mailbox is swept
-every 500 ms by default, so a phase is observable while the run is still
-executing. Phase timestamps are therefore accurate to that interval and not to
-the instant the workload wrote the file. A final sweep runs after the workload
-is quiesced and **before** the handoff lifecycle may remove the directory; a
-successful run publishes everything it wrote. Each event's document is derived
-deterministically from the file, and its idempotency key is stable across
-republication, so a sweep repeated after a lost rename or an agent restart is a
-replay in L3 rather than a second document.
+every 500 ms by default, so a step is observable while the run is still
+executing. Event timestamps are therefore accurate to that interval and not to
+the instant the workload wrote the file. A final sweep, with a bounded retry,
+runs after the workload is quiesced and before the handoff lifecycle may remove
+the directory. Publication is best effort: if evidence still has not reached
+the ledger when the final sweep ends, the agent logs that and the handoff
+directory is retained under the ordinary failure rules, so the files remain the
+run's only surviving copy rather than being deleted as a success. Losing the
+attempt's authority fences publication immediately and permanently; a fenced
+attempt publishes nothing further and retains its directory the same way.
+
+Each event's document is derived deterministically from its file — including
+its timestamp, which is pinned when the agent first observes the file — and its
+idempotency key is stable, so republishing after a lost cursor rename is a
+replay in L3 rather than a second document. That recovery reaches only the
+events of a retained directory: evidence removed with a successful run's
+handoff is gone.
 
 The mailbox is delivered to `kind=process` one-shots that L3 dispatched. An OCI
 handoff volume is helper-owned inside the node and the helper protocol exposes

@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -125,6 +126,10 @@ type attemptLogSinkFactory func(context.Context, l1.Claim) (attemptLogSink, erro
 // shared resource itself.
 type attemptLifecycle struct {
 	dependencies attemptLifecycleDependencies
+	// mailbox is this attempt's run mailbox, published by the workload path and
+	// read by the authority and completion paths. One lifecycle owns one
+	// attempt, so a single slot is the whole lifetime.
+	mailbox atomic.Pointer[runMailbox]
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -347,7 +352,17 @@ func (failure *completionDeliveryAbandoned) Unwrap() error { return failure.err 
 const ociRuntimeRecoveryTimeout = 10 * time.Second
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
-	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
+	attemptContext, cancelAttemptCause := context.WithCancelCause(ctx)
+	// Every authority-loss path cancels the attempt with a cause. Fencing the
+	// mailbox here, synchronously and before the cancellation itself, is what
+	// stops an attempt that has lost its lease from publishing anything
+	// further on the run's behalf.
+	cancelAttempt := func(cause error) {
+		if cause != nil {
+			lifecycle.mailbox.Load().fence(cause)
+		}
+		cancelAttemptCause(cause)
+	}
 	defer cancelAttempt(nil)
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
@@ -633,6 +648,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
 	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
+	if succeeded && lifecycle.mailbox.Load().publicationIncomplete() {
+		// Evidence the workload wrote never reached the ledger, so the files
+		// are the only remaining copy. Removing them here would destroy the
+		// result of a run that looks successful.
+		succeeded = false
+	}
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
@@ -1107,17 +1128,16 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	// authority is the agent's: the workload receives a directory, not a
 	// credential.
 	if lifecycle.dependencies.runLedger != nil && runMailboxAvailable(claim.Job.Spec) {
-		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID,
-			lifecycle.dependencies.runLedger, lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.logf)
+		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID, lifecycle.dependencies.runLedger,
+			lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 		mailbox = prepared
+		defer mailbox.close()
+		lifecycle.mailbox.Store(mailbox)
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
-		// Params reach the workload as a file, never as an environment value
-		// it could confuse with the reserved context.
-		delete(executionSpec.Env, contract.EnvRunParamsJSON)
 	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot &&
 		strings.TrimSpace(claim.Job.Spec.Execution.Env[contract.EnvL3Endpoint]) != "" {
 		// The OCI handoff volume is helper-owned inside the node, and the

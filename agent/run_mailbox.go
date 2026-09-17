@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -23,20 +24,29 @@ import (
 )
 
 // The run mailbox is the job-owned directory in which a workload writes its
-// envelopes, phases, gate results and result files, and from which this agent
+// envelopes, steps, gate results and result files, and from which this agent
 // publishes them to the ledger under authority the workload never holds. The
 // workload writes plain text; building protocol JSON that satisfies the v1
-// schemas is the agent's job, which is what lets a bash job report without
+// schemas is the agent's job, which is what lets a bash workflow report without
 // hand-rolling either HTTP or JSON escaping.
+//
+// A process workload runs under the agent's own OS identity, so directory
+// permissions are not a boundary here. Every mailbox operation is therefore
+// performed relative to an opened directory, on objects proven to be regular
+// files, with bounded reads and non-blocking opens: a workload can lie about
+// its own run, but it cannot redirect the agent outside the mailbox, hand it an
+// object that never returns, or reach another run's evidence.
 const (
 	runMailboxDirectoryName          = ".wefty"
 	runMailboxEventsDirectoryName    = "events"
 	runMailboxStagingDirectoryName   = "tmp"
 	runMailboxPublishedDirectoryName = ".published"
 	runMailboxParamsFileName         = "params.json"
+	runMailboxStateFileName          = "state.json"
 	runMailboxProtocolHeader         = "wefty-protocol"
 	runMailboxProtocolVersion        = "1"
 	runMailboxExtensionNamespace     = "dev.wefty.mailbox"
+	runMailboxParamsLabel            = "run_params_json"
 )
 
 // Bounds. A mailbox is a workload-writable directory, so every one of these is
@@ -50,15 +60,25 @@ const (
 	MaxRunMailboxEvents = 1024
 	// MaxRunMailboxTotalBytes bounds the published payload for one attempt.
 	MaxRunMailboxTotalBytes = 1 << 20
-	// MaxRunMailboxParamsBytes bounds the params document the agent writes.
+	// MaxRunMailboxParamsBytes bounds the params document the agent delivers.
 	MaxRunMailboxParamsBytes = 64 << 10
 	// MaxRunMailboxRejections bounds how many malformed events are reported
 	// into the ledger before the agent only logs them.
 	MaxRunMailboxRejections = 8
+	// MaxRunMailboxScanEntries bounds one sweep's directory enumeration, so a
+	// workload cannot hold the agent in a single scan indefinitely.
+	MaxRunMailboxScanEntries = 256
+	// MaxRunMailboxEventNameBytes bounds an event file name.
+	MaxRunMailboxEventNameBytes = 128
 	// DefaultRunMailboxPollInterval is how often a running attempt's mailbox
-	// is swept. Phase timestamps are therefore accurate to this interval, not
+	// is swept. Step timestamps are therefore accurate to this interval, not
 	// to the instant the workload wrote the file.
 	DefaultRunMailboxPollInterval = 500 * time.Millisecond
+	// runMailboxFinalPublishAttempts bounds the final sweep's retries. A
+	// transport failure that outlasts them retains the handoff instead of
+	// retrying forever inside finalization.
+	runMailboxFinalPublishAttempts = 3
+	runMailboxFinalPublishBackoff  = 100 * time.Millisecond
 
 	runMailboxTruncationNotice = "\n[truncated by the node agent: run mailbox event exceeded the size bound]"
 )
@@ -145,15 +165,15 @@ type runMailboxEvent struct {
 
 const (
 	runMailboxKindEnvelope = "envelope"
-	runMailboxKindPhase    = "phase"
+	runMailboxKindStep     = "step"
 	runMailboxKindGate     = "gate"
 	runMailboxKindResult   = "result"
 )
 
 var (
-	runMailboxKinds          = []string{runMailboxKindEnvelope, runMailboxKindPhase, runMailboxKindGate, runMailboxKindResult}
+	runMailboxKinds          = []string{runMailboxKindEnvelope, runMailboxKindStep, runMailboxKindGate, runMailboxKindResult}
 	runMailboxStatuses       = []string{string(contract.EnvelopeSucceeded), string(contract.EnvelopeFailed), string(contract.EnvelopePartial)}
-	runMailboxPhaseStatuses  = []string{"started", "ended"}
+	runMailboxStepStatuses   = []string{"started", "ended"}
 	runMailboxGateOutcomes   = []string{string(contract.GatePass), string(contract.GateFail), string(contract.GateError), string(contract.GateSkipped)}
 	runMailboxPayloadFormats = []string{"text", "json"}
 )
@@ -215,10 +235,10 @@ func parseRunMailboxEvent(raw []byte) (runMailboxEvent, error) {
 		case "key":
 			event.key = value
 		case "payload":
-			event.payloadJSON = value == "json"
 			if !slices.Contains(runMailboxPayloadFormats, value) {
 				return runMailboxEvent{}, fmt.Errorf("run mailbox payload format %q is unsupported", value)
 			}
+			event.payloadJSON = value == "json"
 		case "created-at":
 			parsed, err := time.Parse(time.RFC3339, value)
 			if err != nil {
@@ -246,15 +266,15 @@ func parseRunMailboxEvent(raw []byte) (runMailboxEvent, error) {
 		if !slices.Contains(runMailboxGateOutcomes, event.outcome) {
 			return runMailboxEvent{}, fmt.Errorf("run mailbox gate outcome %q is not one of %s", event.outcome, strings.Join(runMailboxGateOutcomes, ", "))
 		}
-	case runMailboxKindPhase:
+	case runMailboxKindStep:
 		if event.name == "" {
-			return runMailboxEvent{}, errors.New("run mailbox phase requires a name")
+			return runMailboxEvent{}, errors.New("run mailbox step requires a name")
 		}
 		if event.status == "" {
 			event.status = "started"
 		}
-		if !slices.Contains(runMailboxPhaseStatuses, event.status) {
-			return runMailboxEvent{}, fmt.Errorf("run mailbox phase status %q is not one of %s", event.status, strings.Join(runMailboxPhaseStatuses, ", "))
+		if !slices.Contains(runMailboxStepStatuses, event.status) {
+			return runMailboxEvent{}, fmt.Errorf("run mailbox step status %q is not one of %s", event.status, strings.Join(runMailboxStepStatuses, ", "))
 		}
 	default:
 		if event.step == "" {
@@ -273,12 +293,29 @@ func parseRunMailboxEvent(raw []byte) (runMailboxEvent, error) {
 	return event, nil
 }
 
+// runMailboxState is the agent's durable bookkeeping for one attempt. It makes
+// a republished document byte-identical to the first one — the timestamp is
+// pinned at first observation rather than read from the file at publish time —
+// and it keeps the size accounting honest across a reconstruction.
+type runMailboxState struct {
+	AttemptID string                          `json:"attempt_id"`
+	Count     int                             `json:"count"`
+	Bytes     int64                           `json:"bytes"`
+	Events    map[string]runMailboxEventState `json:"events"`
+}
+
+type runMailboxEventState struct {
+	ObservedAt time.Time `json:"observed_at"`
+	Published  bool      `json:"published"`
+}
+
 // runMailbox owns one attempt's mailbox directory and publishes from it.
 type runMailbox struct {
+	// directory is the absolute path handed to the workload. Every agent-side
+	// operation goes through root instead, which is an opened directory and
+	// cannot be redirected by anything the workload creates.
 	directory string
-	events    string
-	staging   string
-	published string
+	root      *os.Root
 
 	runID     string
 	attemptID string
@@ -286,13 +323,22 @@ type runMailbox struct {
 
 	appender runLedgerAppender
 	poll     time.Duration
+	clock    Clock
 	logf     func(string, ...any)
 
-	mu             sync.Mutex
-	publishedCount int
-	publishedBytes int64
-	rejections     int
-	boundReported  bool
+	// The bounds are fields rather than direct constant reads so a test can
+	// prove each one without writing a thousand files.
+	maxEvents int
+	maxBytes  int64
+	maxScan   int
+
+	mu         sync.Mutex
+	state      runMailboxState
+	rejections int
+	bounded    bool
+
+	fenced     atomic.Bool
+	incomplete atomic.Bool
 
 	stopOnce sync.Once
 	cancel   context.CancelFunc
@@ -311,42 +357,137 @@ type runMailbox struct {
 func runMailboxAvailable(spec contract.JobSpec) bool {
 	return usesAgentHandoffLifecycle(spec) &&
 		strings.TrimSpace(spec.Execution.Env[contract.EnvL3Endpoint]) != "" &&
-		strings.TrimSpace(spec.Execution.Env[contract.EnvRunID]) != "" &&
+		validRunMailboxSegment(strings.TrimSpace(spec.Execution.Env[contract.EnvRunID])) &&
 		strings.TrimSpace(spec.Execution.SensitiveEnv[contract.EnvRunToken]) != ""
 }
 
-// prepareRunMailbox creates the directory layout and materializes the params
-// file. It never fails an attempt for a params problem: a job that cannot read
-// its params fails on its own terms, with its own diagnostics.
-func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedgerAppender, poll time.Duration, logf func(string, ...any)) (*runMailbox, error) {
-	directory := filepath.Join(filepath.Clean(spec.Execution.HandoffDirectory), runMailboxDirectoryName)
+// prepareRunMailbox creates the run-scoped directory layout and materializes
+// the params file. Scoping by run ID is what keeps a cold rerun — which reuses
+// the same handoff directory — from inheriting and republishing the previous
+// run's events as its own.
+func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedgerAppender, poll time.Duration, clock Clock, logf func(string, ...any)) (*runMailbox, error) {
+	if clock == nil {
+		clock = systemClock{}
+	}
+	runID := strings.TrimSpace(spec.Execution.Env[contract.EnvRunID])
+	handoff := filepath.Clean(spec.Execution.HandoffDirectory)
+	handoffRoot, err := os.OpenRoot(handoff)
+	if err != nil {
+		return nil, fmt.Errorf("open handoff directory %q: %w", handoff, err)
+	}
+	defer handoffRoot.Close()
+	mailboxRoot, err := openRunMailboxDirectory(handoffRoot, runMailboxDirectoryName, runID)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range []string{runMailboxEventsDirectoryName, runMailboxStagingDirectoryName, runMailboxPublishedDirectoryName} {
+		if err := ensureMailboxSubdirectory(mailboxRoot, name); err != nil {
+			mailboxRoot.Close()
+			return nil, err
+		}
+	}
 	mailbox := &runMailbox{
-		directory: directory,
-		events:    filepath.Join(directory, runMailboxEventsDirectoryName),
-		staging:   filepath.Join(directory, runMailboxStagingDirectoryName),
-		published: filepath.Join(directory, runMailboxPublishedDirectoryName),
-		runID:     strings.TrimSpace(spec.Execution.Env[contract.EnvRunID]),
+		directory: filepath.Join(handoff, runMailboxDirectoryName, runID),
+		root:      mailboxRoot,
+		runID:     runID,
 		attemptID: attemptID,
 		runToken:  strings.TrimSpace(spec.Execution.SensitiveEnv[contract.EnvRunToken]),
 		appender:  appender,
 		poll:      durationOrDefault(poll, DefaultRunMailboxPollInterval),
+		clock:     clock,
 		logf:      logf,
+		maxEvents: MaxRunMailboxEvents,
+		maxBytes:  MaxRunMailboxTotalBytes,
+		maxScan:   MaxRunMailboxScanEntries,
 		finished:  make(chan struct{}),
 	}
-	for _, path := range []string{mailbox.directory, mailbox.events, mailbox.staging, mailbox.published} {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, fmt.Errorf("create run mailbox directory %q: %w", path, err)
-		}
-		if err := os.Chmod(path, 0o700); err != nil {
-			return nil, fmt.Errorf("set run mailbox directory permissions on %q: %w", path, err)
-		}
-	}
-	if err := mailbox.writeParams(spec.Execution.Env[contract.EnvRunParamsJSON]); err != nil {
+	mailbox.loadState()
+	if err := mailbox.writeParams(spec.Labels[runMailboxParamsLabel]); err != nil {
+		mailboxRoot.Close()
 		return nil, err
 	}
 	return mailbox, nil
 }
 
+// openRunMailboxDirectory walks into the mailbox one component at a time,
+// refusing anything that is not already a real directory. MkdirAll would
+// happily follow a symlink a previous attempt's workload left behind.
+func openRunMailboxDirectory(parent *os.Root, segments ...string) (*os.Root, error) {
+	current := parent
+	opened := false
+	for _, segment := range segments {
+		if err := ensureMailboxSubdirectory(current, segment); err != nil {
+			if opened {
+				current.Close()
+			}
+			return nil, err
+		}
+		next, err := current.OpenRoot(segment)
+		if opened {
+			current.Close()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("open run mailbox directory %q: %w", segment, err)
+		}
+		current, opened = next, true
+	}
+	return current, nil
+}
+
+func ensureMailboxSubdirectory(root *os.Root, name string) error {
+	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create run mailbox directory %q: %w", name, err)
+	}
+	info, err := root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("inspect run mailbox directory %q: %w", name, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("run mailbox path %q is not a directory", name)
+	}
+	return nil
+}
+
+func (m *runMailbox) statePath() string {
+	return runMailboxPublishedDirectoryName + "/" + runMailboxStateFileName
+}
+
+func (m *runMailbox) loadState() {
+	m.state = runMailboxState{AttemptID: m.attemptID, Events: map[string]runMailboxEventState{}}
+	payload, err := m.readRegularFile(m.statePath(), MaxRunMailboxEventBytes)
+	if err != nil {
+		return
+	}
+	var stored runMailboxState
+	if err := json.Unmarshal(payload, &stored); err != nil || stored.AttemptID != m.attemptID {
+		// A different attempt's accounting is not this attempt's to continue.
+		return
+	}
+	if stored.Events == nil {
+		stored.Events = map[string]runMailboxEventState{}
+	}
+	m.state = stored
+}
+
+func (m *runMailbox) persistState() {
+	payload, err := json.Marshal(m.state)
+	if err != nil {
+		return
+	}
+	staging := runMailboxPublishedDirectoryName + "/" + runMailboxStateFileName + ".tmp"
+	if err := m.writeRegularFile(staging, payload); err != nil {
+		m.log("agent: persist run %s mailbox state: %v", m.runID, err)
+		return
+	}
+	if err := m.root.Rename(staging, m.statePath()); err != nil {
+		m.log("agent: commit run %s mailbox state: %v", m.runID, err)
+	}
+}
+
+// writeParams delivers the submitted parameters as a file. They travel from L3
+// on an agent-only dispatch label, never in the workload environment, so the
+// job reads its own parameters without a credential and without a name it
+// could confuse with the reserved execution context.
 func (m *runMailbox) writeParams(raw string) error {
 	document := []byte("{}\n")
 	if trimmed := strings.TrimSpace(raw); trimmed != "" {
@@ -359,11 +500,16 @@ func (m *runMailbox) writeParams(raw string) error {
 			document = append([]byte(trimmed), '\n')
 		}
 	}
-	path := filepath.Join(m.directory, runMailboxParamsFileName)
-	if err := os.WriteFile(path, document, 0o600); err != nil {
+	staging := runMailboxStagingDirectoryName + "/" + runMailboxParamsFileName
+	if err := m.writeRegularFile(staging, document); err != nil {
 		return fmt.Errorf("write run mailbox params: %w", err)
 	}
-	return os.Chmod(path, 0o600)
+	// Rename replaces whatever occupies the name without following it, so a
+	// symlink planted there is destroyed rather than written through.
+	if err := m.root.Rename(staging, runMailboxParamsFileName); err != nil {
+		return fmt.Errorf("commit run mailbox params: %w", err)
+	}
+	return nil
 }
 
 // secrets are the values the agent holds on the run's behalf and must keep out
@@ -375,11 +521,20 @@ func (m *runMailbox) secrets() []string {
 	return []string{m.runToken}
 }
 
+func (m *runMailbox) close() {
+	if m == nil || m.root == nil {
+		return
+	}
+	m.root.Close()
+}
+
 // start begins streaming publication. Publishing only at attempt completion
-// would leave a running run with no observable phase at all, which is the
-// whole point of the live surface.
+// would leave a running run with no observable step at all, which is the whole
+// point of the live surface. The poll context is a child of the attempt's, so
+// losing the attempt cancels an in-flight publication rather than letting it
+// land after the lease is gone.
 func (m *runMailbox) start(ctx context.Context) {
-	pollContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	pollContext, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 	go func() {
 		defer close(m.finished)
@@ -387,8 +542,6 @@ func (m *runMailbox) start(ctx context.Context) {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
-				return
 			case <-pollContext.Done():
 				return
 			case <-ticker.C:
@@ -396,6 +549,19 @@ func (m *runMailbox) start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// fence stops publication immediately and permanently. Authority loss is not a
+// reason to finish reporting: an attempt that no longer holds its lease must
+// not write anything further on the run's behalf.
+func (m *runMailbox) fence(cause error) {
+	if m == nil || m.fenced.Swap(true) {
+		return
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+	m.log("agent: run %s mailbox publication fenced: %v", m.runID, cause)
 }
 
 // finalize stops the poller and performs the last sweep. It must complete
@@ -413,21 +579,84 @@ func (m *runMailbox) finalize(ctx context.Context) {
 			close(m.finished)
 		}
 	})
-	m.sweep(ctx)
+	if m.fenced.Load() {
+		if m.pending() {
+			m.incomplete.Store(true)
+		}
+		return
+	}
+	for attempt := range runMailboxFinalPublishAttempts {
+		if ctx.Err() != nil {
+			break
+		}
+		if attempt > 0 {
+			timer := time.NewTimer(runMailboxFinalPublishBackoff * time.Duration(1<<(attempt-1)))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+		}
+		if m.sweep(ctx) {
+			break
+		}
+	}
+	if m.pending() {
+		m.incomplete.Store(true)
+		m.log("agent: run %s mailbox has unpublished evidence; retaining the handoff directory", m.runID)
+	}
+}
+
+// publicationIncomplete reports that evidence written by this attempt did not
+// reach the ledger. A successful run must then keep its handoff directory: the
+// files are the only remaining copy.
+func (m *runMailbox) publicationIncomplete() bool {
+	return m != nil && m.incomplete.Load()
+}
+
+func (m *runMailbox) pending() bool {
+	names, err := m.scanEvents()
+	return err != nil || len(names) > 0
 }
 
 // sweep publishes every complete event file in lexical order and retires it by
 // renaming it under the published cursor. A rename that never happens costs a
 // republish, not a duplicate: the document is byte-identical, so L3 replays it.
-func (m *runMailbox) sweep(ctx context.Context) {
+// It reports whether the sweep finished without a transport failure.
+func (m *runMailbox) sweep(ctx context.Context) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entries, err := os.ReadDir(m.events)
+	if m.fenced.Load() {
+		return false
+	}
+	names, err := m.scanEvents()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			m.log("agent: read run mailbox events for run %s: %v", m.runID, err)
+		m.log("agent: read run %s mailbox events: %v", m.runID, err)
+		return false
+	}
+	for _, name := range names {
+		if ctx.Err() != nil || m.fenced.Load() {
+			return false
 		}
-		return
+		if err := m.publishEvent(ctx, name); err != nil {
+			// A transport failure keeps the event for the next sweep.
+			return false
+		}
+	}
+	return true
+}
+
+// scanEvents enumerates at most MaxRunMailboxScanEntries names per pass. The
+// bound is why a workload cannot hold the agent inside one directory read.
+func (m *runMailbox) scanEvents() ([]string, error) {
+	directory, err := m.root.Open(runMailboxEventsDirectoryName)
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(m.maxScan)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -437,15 +666,11 @@ func (m *runMailbox) sweep(ctx context.Context) {
 		names = append(names, entry.Name())
 	}
 	slices.Sort(names)
-	for _, name := range names {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := m.publishEvent(ctx, name); err != nil {
-			// A transport failure keeps the event for the next sweep.
-			return
-		}
-	}
+	return names, nil
+}
+
+func (m *runMailbox) eventPath(name string) string {
+	return runMailboxEventsDirectoryName + "/" + name
 }
 
 func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
@@ -454,27 +679,19 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 		m.retire(name)
 		return nil
 	}
-	if m.publishedCount >= MaxRunMailboxEvents || m.publishedBytes >= MaxRunMailboxTotalBytes {
-		if !m.boundReported {
-			m.boundReported = true
-			m.log("agent: run %s reached the run mailbox publication bound; later events are discarded", m.runID)
-		}
+	raw, truncated, err := m.readEvent(name)
+	if err != nil {
+		m.log("agent: read run %s mailbox event %q: %v", m.runID, name, err)
 		m.retire(name)
 		return nil
 	}
-	path := filepath.Join(m.events, name)
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		m.log("agent: stat run mailbox event %q: %v", name, err)
-		return nil
-	}
-	raw, truncated, err := readBoundedFile(path, MaxRunMailboxEventBytes)
-	if err != nil {
-		m.log("agent: read run mailbox event %q: %v", name, err)
-		return nil
+	// The observation timestamp is persisted before the document is built, so
+	// every later republication of this file produces the same bytes.
+	observation, known := m.state.Events[name]
+	if !known {
+		observation = runMailboxEventState{ObservedAt: m.clock.Now().UTC().Truncate(time.Second)}
+		m.state.Events[name] = observation
+		m.persistState()
 	}
 	event, err := parseRunMailboxEvent(raw)
 	if err != nil {
@@ -482,16 +699,28 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 		m.retire(name)
 		return nil
 	}
-	event.truncated = truncated
 	if truncated {
+		event.truncated = true
+		// A truncated payload is no longer the JSON it claimed to be; keeping
+		// it as marked text preserves the evidence instead of failing to
+		// decode it.
+		event.payloadJSON = false
 		event.body = append(event.body, runMailboxTruncationNotice...)
 	}
 	if event.createdAt.IsZero() {
-		event.createdAt = info.ModTime().UTC()
+		event.createdAt = observation.ObservedAt
 	}
 	collection, document, err := m.document(event, name)
 	if err != nil {
 		m.reject(ctx, name, err)
+		m.retire(name)
+		return nil
+	}
+	if m.state.Count >= m.maxEvents || m.state.Bytes+int64(len(document)) > m.maxBytes {
+		if !m.bounded {
+			m.bounded = true
+			m.log("agent: run %s reached the run mailbox publication bound; later events are discarded", m.runID)
+		}
 		m.retire(name)
 		return nil
 	}
@@ -505,8 +734,11 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 		m.log("agent: publish run %s mailbox event %q: %v", m.runID, name, err)
 		return err
 	}
-	m.publishedCount++
-	m.publishedBytes += int64(len(document))
+	m.state.Count++
+	m.state.Bytes += int64(len(document))
+	observation.Published = true
+	m.state.Events[name] = observation
+	m.persistState()
 	m.retire(name)
 	return nil
 }
@@ -525,10 +757,9 @@ func (m *runMailbox) reject(ctx context.Context, name string, cause error) {
 		IdempotencyKey: m.idempotencyKey("rejected." + name),
 		RunID:          m.runID,
 		StepID:         "mailbox",
-		AttemptID:      m.attemptID,
 		Status:         contract.EnvelopeFailed,
-		Summary:        fmt.Sprintf("run mailbox event %q was rejected: %v", name, cause),
-		CreatedAt:      time.Unix(0, 0).UTC(),
+		Summary:        boundedSummary(fmt.Sprintf("run mailbox event %q was rejected: %v", name, cause)),
+		CreatedAt:      m.state.Events[name].ObservedAt,
 	}
 	document, err := json.Marshal(envelope)
 	if err != nil {
@@ -543,14 +774,21 @@ func (m *runMailbox) retire(name string) {
 	if m.retireCheckpoint != nil && !m.retireCheckpoint() {
 		return
 	}
-	source := filepath.Join(m.events, name)
-	if err := os.Rename(source, filepath.Join(m.published, name)); err != nil && !os.IsNotExist(err) {
-		m.log("agent: retire run mailbox event %q: %v", name, err)
+	target := runMailboxPublishedDirectoryName + "/" + name
+	if err := m.root.Rename(m.eventPath(name), target); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.log("agent: retire run %s mailbox event %q: %v", m.runID, name, err)
+		// An event that cannot be retired would be republished forever.
+		// Removing it costs one event; leaving it costs the whole sweep.
+		if err := m.root.Remove(m.eventPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			m.log("agent: discard run %s mailbox event %q: %v", m.runID, name, err)
+		}
 	}
 }
 
 // document builds the protocol JSON. Every field an id constraint applies to is
-// derived here, never taken raw from the workload.
+// derived here, never taken raw from the workload. attempt_id is deliberately
+// absent: only L3 knows which attempt its run token is bound to, and it binds
+// the field itself from the authenticated scope.
 func (m *runMailbox) document(event runMailboxEvent, name string) (string, []byte, error) {
 	identity := event.key
 	if identity == "" {
@@ -564,7 +802,6 @@ func (m *runMailbox) document(event runMailboxEvent, name string) (string, []byt
 			IdempotencyKey: m.idempotencyKey("gate." + identity),
 			RunID:          m.runID,
 			StepID:         boundedIdentifier(event.step),
-			AttemptID:      m.attemptID,
 			Name:           boundedIdentifier(event.name),
 			Outcome:        contract.GateOutcome(event.outcome),
 			EvaluatedAt:    event.createdAt,
@@ -582,14 +819,13 @@ func (m *runMailbox) document(event runMailboxEvent, name string) (string, []byt
 		status := contract.EnvelopeStatus(event.status)
 		step := boundedIdentifier(event.step)
 		summary := event.summary
-		if event.kind == runMailboxKindPhase {
-			step = boundedIdentifier("phase:" + event.name)
+		if event.kind == runMailboxKindStep {
 			status = contract.EnvelopePartial
 			if event.status == "ended" {
 				status = contract.EnvelopeSucceeded
 			}
 			if summary == "" {
-				summary = "phase " + event.name + " " + event.status
+				summary = "step " + event.name + " " + event.status
 			}
 		}
 		if summary == "" {
@@ -605,7 +841,6 @@ func (m *runMailbox) document(event runMailboxEvent, name string) (string, []byt
 			IdempotencyKey: m.idempotencyKey(event.kind + "." + identity),
 			RunID:          m.runID,
 			StepID:         step,
-			AttemptID:      m.attemptID,
 			Status:         status,
 			Summary:        boundedSummary(summary),
 			Extensions:     extensions,
@@ -649,7 +884,8 @@ func (m *runMailbox) extensions(event runMailboxEvent) (json.RawMessage, error) 
 
 // idempotencyKey is stable for one file across every republish, which is what
 // makes a repeated sweep — or a sweep after an agent restart — a replay in L3
-// rather than a second document.
+// rather than a second document. It is scoped to the attempt so a retried
+// attempt's evidence is additive rather than conflicting.
 func (m *runMailbox) idempotencyKey(suffix string) string {
 	return boundedIdentifier("mailbox." + m.attemptID + "." + suffix)
 }
@@ -662,6 +898,64 @@ func (m *runMailbox) log(format string, args ...any) {
 	if m != nil && m.logf != nil {
 		m.logf(format, args...)
 	}
+}
+
+// readEvent opens the event without following a link, proves the object it
+// actually opened is a regular file, and reads it under the size bound. The
+// non-blocking open is what keeps a FIFO planted in the events directory from
+// holding finalization open forever.
+func (m *runMailbox) readEvent(name string) ([]byte, bool, error) {
+	return m.readBounded(m.eventPath(name), MaxRunMailboxEventBytes)
+}
+
+func (m *runMailbox) readRegularFile(name string, limit int) ([]byte, error) {
+	payload, _, err := m.readBounded(name, limit)
+	return payload, err
+}
+
+func (m *runMailbox) readBounded(name string, limit int) ([]byte, bool, error) {
+	info, err := m.root.Lstat(name)
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("run mailbox path %q is not a regular file", name)
+	}
+	file, err := m.root.OpenFile(name, os.O_RDONLY|runMailboxNonBlockingOpen, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, false, fmt.Errorf("run mailbox path %q changed identity while opening", name)
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(payload) > limit {
+		return payload[:limit], true, nil
+	}
+	return payload, false, nil
+}
+
+func (m *runMailbox) writeRegularFile(name string, payload []byte) error {
+	if err := m.root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	file, err := m.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(payload); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // boundedIdentifier keeps every derived id inside the v1 schema's 255-byte
@@ -690,7 +984,16 @@ func boundedSummary(value string) string {
 }
 
 func validRunMailboxEventName(name string) bool {
-	if name == "" || len(name) > 128 || strings.HasPrefix(name, ".") {
+	return validRunMailboxName(name, MaxRunMailboxEventNameBytes)
+}
+
+// validRunMailboxSegment bounds the run ID before it becomes a path component.
+func validRunMailboxSegment(value string) bool {
+	return validRunMailboxName(value, MaxRunMailboxEventNameBytes)
+}
+
+func validRunMailboxName(name string, limit int) bool {
+	if name == "" || len(name) > limit || strings.HasPrefix(name, ".") {
 		return false
 	}
 	for _, r := range name {
@@ -702,22 +1005,4 @@ func validRunMailboxEventName(name string) bool {
 		}
 	}
 	return true
-}
-
-// readBoundedFile reads at most limit bytes and reports whether the file had
-// more. The tail is dropped, never the event.
-func readBoundedFile(path string, limit int) ([]byte, bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, false, err
-	}
-	defer file.Close()
-	payload, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
-	if err != nil {
-		return nil, false, err
-	}
-	if len(payload) > limit {
-		return payload[:limit], true, nil
-	}
-	return payload, false, nil
 }

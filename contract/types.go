@@ -26,17 +26,13 @@ type ComputerTokenRevocationReceipt struct {
 // Run execution environment names are shared wire-contract vocabulary. Keep
 // credentials in SensitiveEnv so public job projections can redact them.
 const (
-	EnvRunID        = "WEFTY_RUN_ID"
-	EnvL1Endpoint   = "WEFTY_L1_ENDPOINT"
-	EnvL3Endpoint   = "WEFTY_L3_ENDPOINT"
-	EnvAttemptToken = "WEFTY_ATTEMPT_TOKEN"
-	EnvRunToken     = "WEFTY_RUN_TOKEN"
-	EnvHandoffDir   = "WEFTY_HANDOFF_DIR"
-	EnvRunDir       = "WEFTY_RUN_DIR"
-	// EnvRunParamsJSON is agent-consumed, never workload-visible: the node
-	// agent materializes its contents as the run mailbox params file and
-	// removes the name from the workload environment.
-	EnvRunParamsJSON             = "WEFTY_RUN_PARAMS_JSON"
+	EnvRunID                     = "WEFTY_RUN_ID"
+	EnvL1Endpoint                = "WEFTY_L1_ENDPOINT"
+	EnvL3Endpoint                = "WEFTY_L3_ENDPOINT"
+	EnvAttemptToken              = "WEFTY_ATTEMPT_TOKEN"
+	EnvRunToken                  = "WEFTY_RUN_TOKEN"
+	EnvHandoffDir                = "WEFTY_HANDOFF_DIR"
+	EnvRunDir                    = "WEFTY_RUN_DIR"
 	EnvServiceDir                = "WEFTY_SERVICE_DIR"
 	EnvServicePort               = "WEFTY_SERVICE_PORT"
 	EnvComputerToken             = "WEFTY_COMPUTER_TOKEN"
@@ -471,12 +467,14 @@ type JobLimits struct {
 }
 
 type Envelope struct {
-	SchemaVersion     int             `json:"schema_version"`
-	EnvelopeID        string          `json:"envelope_id"`
-	IdempotencyKey    string          `json:"idempotency_key"`
-	RunID             string          `json:"run_id"`
-	StepID            string          `json:"step_id"`
-	AttemptID         string          `json:"attempt_id"`
+	SchemaVersion  int    `json:"schema_version"`
+	EnvelopeID     string `json:"envelope_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	RunID          string `json:"run_id"`
+	StepID         string `json:"step_id"`
+	// AttemptID is omitted when a client leaves the binding to L3, which is
+	// the only party that knows which attempt a run token belongs to.
+	AttemptID         string          `json:"attempt_id,omitempty"`
 	Status            EnvelopeStatus  `json:"status"`
 	Summary           string          `json:"summary"`
 	Artifacts         []Artifact      `json:"artifacts,omitempty"`
@@ -501,16 +499,17 @@ type Artifact struct {
 }
 
 type GateResult struct {
-	SchemaVersion  int         `json:"schema_version"`
-	GateID         string      `json:"gate_id"`
-	IdempotencyKey string      `json:"idempotency_key"`
-	RunID          string      `json:"run_id"`
-	StepID         string      `json:"step_id"`
-	AttemptID      string      `json:"attempt_id"`
-	Name           string      `json:"name"`
-	Outcome        GateOutcome `json:"outcome"`
-	Evidence       []Evidence  `json:"evidence,omitempty"`
-	EvaluatedAt    time.Time   `json:"evaluated_at"`
+	SchemaVersion  int    `json:"schema_version"`
+	GateID         string `json:"gate_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	RunID          string `json:"run_id"`
+	StepID         string `json:"step_id"`
+	// AttemptID is omitted when a client leaves the binding to L3.
+	AttemptID   string      `json:"attempt_id,omitempty"`
+	Name        string      `json:"name"`
+	Outcome     GateOutcome `json:"outcome"`
+	Evidence    []Evidence  `json:"evidence,omitempty"`
+	EvaluatedAt time.Time   `json:"evaluated_at"`
 }
 
 type GateOutcome string
