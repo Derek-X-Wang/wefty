@@ -159,6 +159,13 @@ type ComputerControlReceipt struct {
 
 var ociReservedEnvironmentNames = [...]string{
 	EnvHandoffDir,
+	// EnvRunDir is minted by the helper from the run-mailbox seed, inside the
+	// privileged boundary, exactly like the handoff directory beside it. It has
+	// to be reserved for two reasons: the helper's own validation refuses to
+	// mint a name this list does not carry, and a submitter or image that could
+	// set it would be choosing which directory the workload's reporting writer
+	// writes into.
+	EnvRunDir,
 	EnvServiceDir,
 	EnvServicePort,
 	EnvL1Endpoint,

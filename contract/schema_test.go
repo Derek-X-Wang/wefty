@@ -394,6 +394,7 @@ func TestOCIReservedEnvironmentNamesAreExact(t *testing.T) {
 
 	want := []string{
 		EnvHandoffDir,
+		EnvRunDir,
 		EnvServiceDir,
 		EnvServicePort,
 		EnvL1Endpoint,
@@ -413,7 +414,7 @@ func TestOCIReservedEnvironmentNamesAreExact(t *testing.T) {
 		}
 	}
 	if IsOCIReservedEnvironmentName(EnvRunID) || IsOCIReservedEnvironmentName("WEFTY_CUSTOM") {
-		t.Fatal("OCI reserved-name set differs from the ten ratified names")
+		t.Fatal("OCI reserved-name set differs from the eleven ratified names")
 	}
 	if !IsOCISensitiveReservedEnvironmentName(EnvRunToken) || !IsOCISensitiveReservedEnvironmentName(EnvComputerToken) ||
 		!IsOCISensitiveReservedEnvironmentName(EnvAttemptToken) ||

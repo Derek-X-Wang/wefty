@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,12 +33,23 @@ import (
 func ociRunMailboxWorkflow() string {
 	return workflowhelper.InlineBashWriter() + `
 set -eu
-[ -n "${WEFTY_RUN_DIR:-}" ] || { echo "no WEFTY_RUN_DIR" >&2; exit 64; }
+# Every assertion says which one it is, on stderr, before exiting. A failing
+# attempt's only voice is its captured output, and "exit 64" in a lane log is
+# not a diagnosis.
+wefty_refuse() {
+	printf 'wefty-mailbox-acceptance: FAILED %s\n' "$1" >&2
+	printf 'wefty-mailbox-acceptance: WEFTY_RUN_DIR=%s handoff=%s run_id=%s\n' \
+		"${WEFTY_RUN_DIR:-<unset>}" "${WEFTY_HANDOFF_DIR:-<unset>}" "${WEFTY_RUN_ID:-<unset>}" >&2
+	exit "$2"
+}
+[ -n "${WEFTY_RUN_DIR:-}" ] || wefty_refuse "the attempt received no WEFTY_RUN_DIR, so it has no mailbox" 64
+[ -d "$WEFTY_RUN_DIR/events" ] || wefty_refuse "WEFTY_RUN_DIR has no events directory: $(ls -la "$WEFTY_RUN_DIR" 2>&1)" 68
+[ -f "$WEFTY_RUN_DIR/params.json" ] || wefty_refuse "the helper seeded no params.json" 69
 branch=$(wefty_param branch)
-[ "$branch" = "acceptance-branch" ] || { echo "params.json did not carry the branch: '$branch'" >&2; exit 65; }
+[ "$branch" = "acceptance-branch" ] || wefty_refuse "params.json did not carry the branch, read '$branch'" 65
 # A credential must never reach a job that only reports.
-[ -z "${WEFTY_RUN_TOKEN:-}" ] || { echo "a reporting job was handed a run token" >&2; exit 66; }
-[ -z "${WEFTY_ATTEMPT_TOKEN:-}" ] || { echo "a reporting job was handed an attempt token" >&2; exit 67; }
+[ -z "${WEFTY_RUN_TOKEN:-}" ] || wefty_refuse "a reporting job was handed a run token" 66
+[ -z "${WEFTY_ATTEMPT_TOKEN:-}" ] || wefty_refuse "a reporting job was handed an attempt token" 67
 printf 'no findings\n' > /tmp/vet-evidence
 printf 'all gates passed\n' > /tmp/result-evidence
 wefty_event step gates gates started '' 'running the gates'
@@ -151,6 +163,7 @@ func describeOCIMailboxRun(t *testing.T, harness *acceptanceHarness, runID, stat
 	fmt.Fprintf(&detail, "\n  last observed: run=%s status=%q l1_job=%q", runID, status, jobID)
 	if jobID != "" {
 		detail.WriteString(describeAcceptanceL1Job(t, harness, jobID))
+		detail.WriteString(lastAttemptOutput(t, harness, jobID))
 	}
 	envelopes, gates := readRunLedgerEvidence(t, harness, runID)
 	fmt.Fprintf(&detail, "\n  published: %d envelopes, %d gates", len(envelopes), len(gates))
@@ -168,15 +181,87 @@ func describeAcceptanceL1Job(t *testing.T, harness *acceptanceHarness, jobID str
 		return fmt.Sprintf("\n  l1 job: unreadable: %v", err)
 	}
 	defer database.Close()
-	var state, currentAttempt, failureReason string
-	var attempts int
-	row := database.QueryRow(`SELECT state, COALESCE(current_attempt_id, ''), COALESCE(failure_reason, ''),
-		(SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.job_id) FROM jobs WHERE job_id=?`, jobID)
-	if err := row.Scan(&state, &currentAttempt, &failureReason, &attempts); err != nil {
+	var state, currentAttempt, terminalReason string
+	var retries int
+	row := database.QueryRow(`SELECT state, COALESCE(current_attempt_id, ''),
+		COALESCE(prestart_terminal_reason, ''), prestart_retry_count FROM jobs WHERE job_id=?`, jobID)
+	if err := row.Scan(&state, &currentAttempt, &terminalReason, &retries); err != nil {
 		return fmt.Sprintf("\n  l1 job %s: unreadable: %v", jobID, err)
 	}
-	return fmt.Sprintf("\n  l1 job %s: state=%q attempts=%d current_attempt=%q failure=%q",
-		jobID, state, attempts, currentAttempt, failureReason)
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "\n  l1 job %s: state=%q current_attempt=%q prestart_retries=%d prestart_terminal=%q",
+		jobID, state, currentAttempt, retries, terminalReason)
+	// Each attempt's result carries why it ended: an exit code, or the typed
+	// spawn failure that never let it start. Five failed attempts with the same
+	// reason is the whole diagnosis.
+	rows, err := database.Query(`SELECT attempt_id, state, COALESCE(result_json, '')
+		FROM attempts WHERE job_id=? ORDER BY created_ns`, jobID)
+	if err != nil {
+		fmt.Fprintf(&detail, "\n    attempts unreadable: %v", err)
+		return detail.String()
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var attemptID, attemptState, result string
+		if err := rows.Scan(&attemptID, &attemptState, &result); err != nil {
+			fmt.Fprintf(&detail, "\n    attempt row unreadable: %v", err)
+			break
+		}
+		count++
+		fmt.Fprintf(&detail, "\n    attempt %d: id=%q state=%q result=%s",
+			count, attemptID, attemptState, boundedResult(result))
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(&detail, "\n    attempts iteration failed: %v", err)
+	}
+	fmt.Fprintf(&detail, "\n  attempts: %d", count)
+	return detail.String()
+}
+
+// boundedResult keeps one attempt's stored result readable in a test log. The
+// spawn failure or exit code is at the front of it, which is the part that
+// matters.
+func boundedResult(result string) string {
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "(none)"
+	}
+	if len(result) > 512 {
+		return result[:512] + "…"
+	}
+	return result
+}
+
+// lastAttemptOutput returns whatever the workload itself wrote, which is the
+// only place a failing script can say which of its own assertions failed.
+func lastAttemptOutput(t *testing.T, harness *acceptanceHarness, jobID string) string {
+	t.Helper()
+	database, err := sql.Open("sqlite", harness.l1Database+"?mode=ro")
+	if err != nil {
+		return fmt.Sprintf("\n  workload output: unreadable: %v", err)
+	}
+	defer database.Close()
+	rows, err := database.Query(`SELECT stream, bytes FROM log_events WHERE job_id=?
+		ORDER BY ordinal DESC LIMIT 40`, jobID)
+	if err != nil {
+		return fmt.Sprintf("\n  workload output: unreadable: %v", err)
+	}
+	defer rows.Close()
+	var lines []string
+	for rows.Next() {
+		var stream string
+		var payload []byte
+		if err := rows.Scan(&stream, &payload); err != nil {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("    %s: %s", stream, strings.TrimRight(string(payload), "\n")))
+	}
+	if len(lines) == 0 {
+		return "\n  workload output: none (the payload produced no log events)"
+	}
+	slices.Reverse(lines)
+	return "\n  workload output (most recent " + fmt.Sprint(len(lines)) + "):\n" + strings.Join(lines, "\n")
 }
 
 // filteredAgentOutput returns the agent lines that bear on this failure. The
@@ -188,7 +273,7 @@ func filteredAgentOutput(harness *acceptanceHarness) string {
 		return "\n  agent output: unavailable"
 	}
 	const maxLines = 200
-	interesting := regexp.MustCompile(`mailbox|spawn|finaliz|helper|attempt`)
+	interesting := regexp.MustCompile(`mailbox|spawn|finaliz|helper|attempt|error|fail|refus|reject`)
 	var matched []string
 	for _, line := range strings.Split(harness.agent.output.String(), "\n") {
 		if interesting.MatchString(strings.ToLower(line)) {
@@ -196,7 +281,7 @@ func filteredAgentOutput(harness *acceptanceHarness) string {
 		}
 	}
 	if len(matched) == 0 {
-		return "\n  agent output: no line matched mailbox|spawn|finaliz|helper|attempt"
+		return "\n  agent output: no line matched mailbox|spawn|finaliz|helper|attempt|error|fail|refus|reject"
 	}
 	elided := 0
 	if len(matched) > maxLines {

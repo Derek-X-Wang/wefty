@@ -131,10 +131,14 @@ loopback and wildcard guest listeners rather than creating an ambient host
 door. No form exposes the bridge on a host wildcard or embeds a fixed gateway.
 
 For `kind=oci`, the exact reserved-name set is `WEFTY_HANDOFF_DIR`,
-`WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L1_ENDPOINT`,
+`WEFTY_RUN_DIR`, `WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L1_ENDPOINT`,
 `WEFTY_L3_ENDPOINT`, `WEFTY_ATTEMPT_TOKEN`, `WEFTY_RUN_TOKEN`,
 `WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and
-`WEFTY_COMPUTER_CONTROL_PORT`. `WEFTY_ATTEMPT_TOKEN` is sensitive alongside
+`WEFTY_COMPUTER_CONTROL_PORT`. `WEFTY_RUN_DIR` joined the set with the OCI run
+mailbox: the helper mints it from the mailbox seed inside the privileged
+boundary exactly as it mints `WEFTY_HANDOFF_DIR`, and a submitter or image able
+to set it would be choosing the directory the workload's reporting writer writes
+into. `WEFTY_ATTEMPT_TOKEN` is sensitive alongside
 `WEFTY_RUN_TOKEN` and `WEFTY_COMPUTER_TOKEN`. The unprivileged adapter removes those names
 from generic operator layers, and the privileged helper independently rejects
 any reserved name that crosses in a generic or caller-supplied reserved layer.

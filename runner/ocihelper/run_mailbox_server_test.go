@@ -3,10 +3,13 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // runMailboxEngine is a fakeEngine that also serves the mailbox, so the server
@@ -297,5 +300,68 @@ func requireRunMailboxCode(t *testing.T, err error, want ErrorCode) {
 	}
 	if rpcErr.Code != want {
 		t.Fatalf("error code = %s (%s), want %s", rpcErr.Code, rpcErr.Message, want)
+	}
+}
+
+// TestRunMailboxMintedEnvironmentSurvivesHelperValidation is the test whose
+// absence cost a lane cycle. Every earlier mailbox test drove a fake engine,
+// which never mints reserved environment and never builds a runtime spec, so
+// nothing exercised the one step that actually runs on a real node: the helper
+// validating the environment it minted for itself.
+//
+// WEFTY_RUN_DIR was not a reserved name, so the helper minted a value its own
+// two validation sites then refused -- validateEnvironmentLayer's reserved
+// layer and the runtime spec's environment merge -- and every OCI run with a
+// mailbox failed inside Run before its container started.
+func TestRunMailboxMintedEnvironmentSurvivesHelperValidation(t *testing.T) {
+	seed := RunMailboxSeed{RunID: mailboxTestRunID}
+	minted := []EnvironmentVariable{
+		{Name: contract.EnvHandoffDir, Value: contract.OCIContainerHandoffDirectory},
+		{Name: contract.EnvRunDir, Value: seed.ContainerDirectory()},
+		{Name: contract.EnvL3Endpoint, Value: "http://127.0.0.1:9/"},
+	}
+	for _, variable := range minted {
+		if !contract.IsOCIReservedEnvironmentName(variable.Name) {
+			t.Fatalf("the helper mints %q but it is not a reserved name, so the helper refuses its own value",
+				variable.Name)
+		}
+	}
+
+	input := testRunMailboxRunRequest(testAuthority()).Workload
+	input.ReservedEnvironment = minted
+	input.helperMintedReserved = true
+	if err := validateWorkloadWire(input); err != nil {
+		t.Fatalf("the helper refused the environment it minted: %v", err)
+	}
+
+	// The runtime spec's own merge is the second gate, and it refuses on the
+	// same rule. Both must accept what Run produces.
+	merged, err := mergeRuntimeEnvironment(nil, nil, nil, minted)
+	if err != nil {
+		t.Fatalf("runtime spec refused the minted environment: %v", err)
+	}
+	if !slices.Contains(merged, contract.EnvRunDir+"="+seed.ContainerDirectory()) {
+		t.Fatalf("merged environment lost the mailbox directory: %v", merged)
+	}
+}
+
+// TestRunMailboxDirectoryIsNotSubmitterSupplied proves the reserved status does
+// the other half of its job: a submitter or image that names WEFTY_RUN_DIR is
+// stripped, never able to redirect the workload's reporting writer.
+func TestRunMailboxDirectoryIsNotSubmitterSupplied(t *testing.T) {
+	forged := "/tmp/attacker-chosen"
+	merged, err := mergeRuntimeEnvironment(
+		[]string{contract.EnvRunDir + "=" + forged},
+		[]EnvironmentVariable{{Name: contract.EnvRunDir, Value: forged}},
+		[]EnvironmentVariable{{Name: contract.EnvRunDir, Value: forged}},
+		[]EnvironmentVariable{{Name: contract.EnvRunDir, Value: "/wefty/handoff/.wefty/" + mailboxTestRunID}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range merged {
+		if strings.Contains(entry, forged) {
+			t.Fatalf("a submitter-supplied run directory survived: %q", entry)
+		}
 	}
 }
