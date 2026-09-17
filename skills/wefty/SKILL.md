@@ -103,10 +103,13 @@ clear message when `WEFTY_RUN_DIR` is absent — an OCI job does not receive one
 yet. Submit with `--required-envelope` so a job that exits 0 having reported
 nothing cannot pass for a success.
 
-Start a new workflow with `wefty workflow init NAME [--lang bash|ts]`: it
-writes a runnable starter using those subcommands (with an inline POSIX writer
-for an image that does not ship the binary), a README with the submit/follow/
-inspect commands, and a test that exercises the starter without a cluster.
+Start a new workflow with `wefty workflow init NAME`: it writes a runnable bash
+starter using those subcommands (with an inline POSIX writer for an image that
+does not ship the binary), a README with the submit/follow/inspect commands,
+and a test that exercises the starter without a cluster. bash is the only
+language the scaffold writes; a TypeScript workflow needs a bundle step,
+because a submission carries one inline script that the node materializes
+without a file extension.
 
 Scope check before writing one: a mailbox write is a claim about the writing
 run and nothing else. Reporting through it confers no authority, so design the

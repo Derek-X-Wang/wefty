@@ -18,9 +18,6 @@ var inlineWriter string
 //go:embed templates/starter.sh.tmpl
 var bashStarterTemplate string
 
-//go:embed templates/starter.ts.tmpl
-var typeScriptStarterTemplate string
-
 //go:embed templates/README.md.tmpl
 var readmeTemplate string
 
@@ -28,13 +25,13 @@ var readmeTemplate string
 var integrationTestTemplate string
 
 // WorkflowUsage is the scaffold's whole surface.
-const WorkflowUsage = `Usage: wefty workflow init NAME [--lang bash|ts] [--dir DIR]
+const WorkflowUsage = `Usage: wefty workflow init NAME [--lang bash] [--dir DIR]
 
 Write a runnable workflow starter that reports through the run mailbox: one
 step, one envelope, one gate and one result, plus a README and a test that
 exercises it without a cluster.
 
-  --lang bash|ts   the starter's language (default: bash)
+  --lang bash      the starter's language; bash is the only one for now
   --dir DIR        the parent directory (default: workflows)
   --json           print the written paths as JSON
 `
@@ -48,7 +45,6 @@ func InlineBashWriter() string { return inlineWriter }
 // scaffold is what every template is rendered against.
 type scaffold struct {
 	Name       string
-	Lang       string
 	ScriptName string
 	TestFile   string
 	// GoPackage and TestPrefix are the sanitized forms of Name: a workflow may
@@ -86,18 +82,29 @@ func ExecuteWorkflow(args []string, jsonOutput bool, stdout io.Writer) error {
 
 func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 	flags := newFlagSet("init")
-	lang := flags.String("lang", "bash", "bash or ts")
+	lang := flags.String("lang", "bash", "the starter's language; bash is the only one for now")
 	directory := flags.String("dir", "workflows", "the parent directory to write the workflow into")
 	flags.BoolVar(&jsonOutput, "json", jsonOutput, "print the written paths as JSON")
 	name, err := parseWithPositional(flags, args, false)
 	if err != nil {
-		return UsageError("usage: wefty workflow init NAME [--lang bash|ts] [--dir DIR]")
+		return UsageError("usage: wefty workflow init NAME [--lang bash] [--dir DIR]")
 	}
 	if err := validWorkflowName(name); err != nil {
 		return err
 	}
-	if *lang != "bash" && *lang != "ts" {
-		return UsageError(fmt.Sprintf("--lang %q is not bash or ts", *lang))
+	if *lang != "bash" {
+		// A TypeScript starter needs a bundle step, and this scaffold has no
+		// place to put one. A submission carries one inline script, which the
+		// node materializes as a file with no extension, and every TypeScript
+		// runtime decides whether to strip types from that extension. The lane
+		// that works is the dogfood shape -- src/NAME.ts plus a package.json,
+		// bundled to a single dist/NAME.mjs and submitted -- and that is a
+		// follow-up to #476, not something to fake here.
+		if *lang == "ts" || *lang == "typescript" {
+			return UsageError(
+				"--lang ts is not available: a TypeScript workflow needs a bundle step -- src/NAME.ts and a package.json bundled to one dist/NAME.mjs, which is what gets submitted -- and that lane is a follow-up to #476. The scaffold writes bash")
+		}
+		return UsageError(fmt.Sprintf("--lang %q is not bash; bash is the only language the scaffold writes", *lang))
 	}
 	target := filepath.Join(*directory, name)
 	if _, err := os.Stat(target); err == nil {
@@ -106,28 +113,17 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 
 	data := scaffold{
 		Name:         name,
-		Lang:         *lang,
 		GoPackage:    goIdentifier(name) + "_test",
 		TestPrefix:   exportedIdentifier(name),
 		InlineWriter: inlineWriter,
 	}
 	data.TestFile = goIdentifier(name) + "_integration_test.go"
-	if *lang == "bash" {
-		data.ScriptName = name + ".sh"
-	} else {
-		data.ScriptName = name + ".ts"
-	}
+	data.ScriptName = name + ".sh"
 
 	files := []scaffoldFile{
 		{data.ScriptName, bashStarterTemplate, 0o755},
 		{"README.md", readmeTemplate, 0o644},
 		{data.TestFile, integrationTestTemplate, 0o644},
-	}
-	if *lang == "ts" {
-		// One file, deliberately: a submission carries one inline script, and
-		// the node materializes exactly that. A starter that imported a
-		// sibling would scaffold something that cannot be submitted.
-		files[0] = scaffoldFile{data.ScriptName, typeScriptStarterTemplate, 0o644}
 	}
 
 	if err := os.MkdirAll(target, 0o755); err != nil {
@@ -163,16 +159,10 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(stdout, "\nNext: read %s, then submit with\n  wefty --json submit --script=%s --interpreter=%s --tag=<routing-tag>\n",
-		filepath.Join(target, "README.md"), filepath.Join(target, data.ScriptName), interpreterFor(*lang))
+	_, err = fmt.Fprintf(stdout,
+		"\nNext: read %s, then submit with\n  wefty --json submit --script=%s --interpreter=bash --required-envelope --tag=<routing-tag>\n",
+		filepath.Join(target, "README.md"), filepath.Join(target, data.ScriptName))
 	return err
-}
-
-func interpreterFor(lang string) string {
-	if lang == "ts" {
-		return "node"
-	}
-	return "bash"
 }
 
 func render(name, body string, data scaffold) ([]byte, error) {

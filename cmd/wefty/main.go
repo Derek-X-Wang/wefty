@@ -419,8 +419,8 @@ Commands:
     gate --name NAME --outcome pass|fail|error|skipped [--evidence-file FILE --summary TEXT]
     result --file PATH [--status succeeded|failed|partial --summary TEXT]
     params [--json] [NAME]
-  workflow init NAME         Scaffold a runnable workflow starter
-    [--lang bash|ts] [--dir DIR]
+  workflow init NAME         Scaffold a runnable bash workflow starter
+    [--lang bash] [--dir DIR]
 
 Global flags:
   --fabric plain|tsnet

@@ -19,7 +19,6 @@ import (
 	"strings"
 	"testing"
 )
-{{if eq .Lang "bash"}}
 // Test{{.TestPrefix}}StarterIsValidShell keeps a syntax error in shipped source
 // out of the default suite's blind spot.
 func Test{{.TestPrefix}}StarterIsValidShell(t *testing.T) {
@@ -43,7 +42,7 @@ func Test{{.TestPrefix}}StarterIsValidShell(t *testing.T) {
 		t.Fatalf("shellcheck {{.ScriptName}}: %v\n%s\n%s", err, output, version)
 	}
 }
-{{end}}
+
 // Test{{.TestPrefix}}ReportsThroughTheRunMailbox runs the workflow against a
 // mailbox directory and asserts it reported a step, an envelope, a gate and a
 // result — the four events an operator reads back with `wefty inspect`.
@@ -59,13 +58,11 @@ func Test{{.TestPrefix}}ReportsThroughTheRunMailbox(t *testing.T) {
 	command.Env = append(os.Environ(),
 		"WEFTY_RUN_DIR="+runDir,
 		"WEFTY_HANDOFF_DIR="+handoffDir,
-{{- if eq .Lang "bash"}}
 		// A system PATH keeps a developer's own wefty out of the run, so this
 		// always exercises the inline writer: the path an image without the
 		// binary takes. The `wefty run` path is exercised by wefty's own
 		// conformance test.
 		"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
-{{- end}}
 	)
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -118,7 +115,6 @@ func eventKinds(t *testing.T, events string) []string {
 	sort.Strings(kinds)
 	return kinds
 }
-{{if eq .Lang "bash"}}
 func workflowInterpreter(t *testing.T) []string {
 	t.Helper()
 	bashPath, err := exec.LookPath("bash")
@@ -133,31 +129,3 @@ func workflowFile(t *testing.T) string {
 	t.Helper()
 	return "{{.ScriptName}}"
 }
-{{else}}
-func workflowInterpreter(t *testing.T) []string {
-	t.Helper()
-	nodePath, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is required to run the workflow; NOT-RUN")
-	}
-	return []string{nodePath}
-}
-
-// workflowFile copies the workflow to a name with no extension, because that
-// is exactly what a wefty node does with an inline script: it materializes one
-// file called "workflow". Running the .ts name here would exercise a path the
-// cluster never takes, and would hide the day someone adds an `import` or a
-// type annotation that only a .ts-aware runtime can load.
-func workflowFile(t *testing.T) string {
-	t.Helper()
-	source, err := os.ReadFile("{{.ScriptName}}")
-	if err != nil {
-		t.Fatalf("read {{.ScriptName}}: %v", err)
-	}
-	materialized := filepath.Join(t.TempDir(), "workflow")
-	if err := os.WriteFile(materialized, source, 0o700); err != nil {
-		t.Fatalf("materialize the workflow: %v", err)
-	}
-	return materialized
-}
-{{end}}

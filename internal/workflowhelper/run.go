@@ -303,8 +303,8 @@ func runParams(directory string, args []string, jsonOutput bool, stdout io.Write
 
 // parseWithPositional accepts flags on either side of the one positional
 // argument these commands take. Go's flag package stops at the first
-// non-flag word, so `wefty workflow init demo --lang ts` -- the form anyone
-// actually types -- needs the tail parsed as flags too.
+// non-flag word, so `wefty workflow init demo --dir elsewhere` -- the form
+// anyone actually types -- needs the tail parsed as flags too.
 func parseWithPositional(flags *flag.FlagSet, args []string, optional bool) (string, error) {
 	if err := flags.Parse(args); err != nil {
 		return "", UsageError(fmt.Sprintf("wefty %s: %v", flags.Name(), err))

@@ -66,7 +66,8 @@ func TestAuthoringCommandsReportUsageMistakes(t *testing.T) {
 		{[]string{"run", "envelope"}, "requires --step"},
 		{[]string{"run", "nonsense"}, "unknown wefty run subcommand"},
 		{[]string{"workflow", "init"}, "usage: wefty workflow init"},
-		{[]string{"workflow", "init", "demo", "--lang", "perl"}, "is not bash or ts"},
+		{[]string{"workflow", "init", "demo", "--lang", "ts"}, "needs a bundle step"},
+		{[]string{"workflow", "init", "demo", "--lang", "perl"}, "is not bash"},
 		{[]string{"workflow", "init", "9lives"}, "must start with a letter"},
 	}
 	for _, test := range cases {

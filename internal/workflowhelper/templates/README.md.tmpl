@@ -1,8 +1,8 @@
 # {{.Name}}
 
-A wefty workflow scaffolded by `wefty workflow init {{.Name}} --lang {{.Lang}}`.
-It greets a subject, reports one step, one envelope and one gate, and hands
-back a result document. Replace the work; keep the reporting shape.
+A wefty workflow scaffolded by `wefty workflow init {{.Name}}`. It greets a
+subject, reports one step, one envelope and one gate, and hands back a result
+document. Replace the work; keep the reporting shape.
 
 ## What this workflow may do
 
@@ -21,15 +21,9 @@ does not receive one yet.
 
 | File | What it is |
 |---|---|
-{{if eq .Lang "bash" -}}
 | `{{.Name}}.sh` | the workflow |
 | `{{.TestFile}}` | `bash -n`, shellcheck, and a local run that asserts the four events |
-{{- else -}}
-| `{{.Name}}.ts` | the workflow, self-contained |
-| `{{.TestFile}}` | a local run that asserts the four events |
-{{- end}}
 
-{{if eq .Lang "bash" -}}
 `{{.Name}}.sh` calls `wefty run ...` when the `wefty` binary is on PATH and
 falls back to an inline POSIX writer otherwise. The two produce byte-identical
 event files, which is what will let an image that does not ship the binary
@@ -38,21 +32,6 @@ report the same way once OCI attempts receive a mailbox.
 The fallback's parameter reader is deliberately limited — top-level string
 params, no JSON escapes — so prefer `wefty run params NAME` when the binary is
 there. The exact limits are documented above `wefty_param` in the script.
-{{- else -}}
-`{{.Name}}.ts` is one self-contained file, and it has to stay that way: a wefty
-submission carries **one** inline script, and the node materializes it as a
-file with no extension and no `package.json` beside it. Every TypeScript
-runtime decides whether to strip types from the extension — both
-`node --experimental-strip-types` and `tsx` refuse an extensionless file — so
-the runtime syntax is CommonJS JavaScript (`require`, no annotations) and the
-types live in JSDoc comments. A sibling `import` or a `const x: string` makes
-the file unsubmittable. If you want real TypeScript, build it elsewhere into
-one CommonJS file and submit that.
-
-Any supported Node (18+) runs it. Node 22.6 and later also run `{{.Name}}.ts`
-directly by its name; on an older Node, run the file under a name with no
-extension, which is what the node itself does.
-{{- end}}
 
 ## Run it
 
@@ -61,11 +40,7 @@ Submit it to the cluster, follow it, then read what it reported:
 ```sh
 wefty --json submit \
   --script={{.ScriptName}} \
-{{- if eq .Lang "bash" }}
   --interpreter=bash \
-{{- else }}
-  --interpreter=node \
-{{- end }}
   --params-file=params.json \
   --tag=<routing-tag> \
   --required-envelope \
@@ -86,7 +61,7 @@ this whole reporting shape exists to prevent.
 ```
 
 A job never receives its own params in the environment. The agent delivers them
-to `$WEFTY_RUN_DIR/params.json`, which is what `{{if eq .Lang "bash"}}wefty run params subject{{else}}param("subject"){{end}}` reads.
+to `$WEFTY_RUN_DIR/params.json`, which is what `wefty run params subject` reads.
 
 ## Local exercise
 
@@ -96,11 +71,10 @@ an empty directory and run it, then read `events/`.
 ```sh
 export WEFTY_RUN_DIR=$(mktemp -d)
 export WEFTY_HANDOFF_DIR=$(mktemp -d)
-{{if eq .Lang "bash"}}bash {{.Name}}.sh{{else}}node {{.Name}}.ts{{end}}
+bash {{.Name}}.sh
 ls "$WEFTY_RUN_DIR/events"
 ```
 
-`{{.TestFile}}` does exactly that{{if ne .Lang "bash"}}, running the file
-without an extension so the exercise matches how the node runs it{{end}}. The
-full single-machine stack exercise — submit, dispatch, publish, inspect — is
-modelled in `workflows/branch-gates/branchgates_integration_test.go`.
+`{{.TestFile}}` does exactly that. The full single-machine stack exercise —
+submit, dispatch, publish, inspect — is modelled in
+`workflows/branch-gates/branchgates_integration_test.go`.
