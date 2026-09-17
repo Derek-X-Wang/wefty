@@ -13,6 +13,7 @@ depend on additional variables.
 | `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
+| `WEFTY_RUN_DIR` | public | The run mailbox: the job-owned directory the workload writes protocol events into and the node agent publishes from. |
 
 The first four L3 variables are delivered only when L3 dispatched the job.
 `WEFTY_L1_ENDPOINT` and `WEFTY_ATTEMPT_TOKEN` are delivered by the node agent
@@ -241,6 +242,85 @@ Computer submission idempotency binds the stable principal (`ComputerID`) and
 normalized request only. Attempt, grant, Storage, intent, and L3 authority
 generations remain commit-time fences, not request identity, so replay after a
 re-mint returns the original Run while another Computer conflicts.
+
+## Run mailbox
+
+A workflow reports through files, not HTTP. `WEFTY_RUN_DIR` is the run mailbox:
+`<handoff directory>/.wefty`, created by the node agent at mode `0700` before
+the workload starts. The agent publishes what the workload writes there to L3
+using the run token it holds, over its own authenticated Fabric connection. The
+workload therefore needs no credential to report, and a mailbox write is a
+claim about the writer's own run and nothing else.
+
+The layout is fixed:
+
+```
+$WEFTY_RUN_DIR/params.json    the run's params, written by the agent at 0600
+$WEFTY_RUN_DIR/tmp/           staging for write-then-rename
+$WEFTY_RUN_DIR/events/        complete events, published in lexical order
+$WEFTY_RUN_DIR/.published/    the agent's cursor; published events are moved here
+```
+
+An event becomes visible by being renamed into `events/` from `tmp/` on the
+same filesystem. The rename is the only "done writing" signal: there is no
+separate marker and no partial-file parsing. An event file name is at most 128
+characters of `[A-Za-z0-9._-]` and may not begin with a dot.
+
+An event file is a line-oriented header block, a `--` separator line, and a raw
+payload that is never escaped by the producer:
+
+```
+wefty-protocol: 1
+kind: gate            # envelope | phase | gate | result
+name: vet
+outcome: fail         # gate only: pass | fail | error | skipped
+step: vet             # defaults to name
+status: succeeded     # envelope/result: succeeded | failed | partial
+                      # phase: started | ended (default started)
+summary: two tests failed
+key: vet              # idempotency identity; defaults to the file name
+payload: text         # text (default) or json
+created-at: 2026-09-17T09:31:04Z   # defaults to the file's modification time
+--
+<raw payload bytes>
+```
+
+The agent builds the protocol document. A text payload becomes a gate's
+evidence entry or an envelope extension under `dev.wefty.mailbox`; a `json`
+payload is nested under that same namespace, so a workload can never shape the
+envelope's own extension object. A phase becomes an envelope on step
+`phase:<name>`, `partial` while started and `succeeded` once ended; that
+mapping is internal and may change without changing this file protocol. Headers
+outside this set, a repeated header, a missing or misplaced `wefty-protocol`
+line, an unknown kind, status or outcome, and a missing separator are all
+refused; the first eight refusals of an attempt are reported as a `failed`
+envelope on step `mailbox`, and the file is retired unpublished.
+
+Every bound is enforced by the agent, never by the producer: at most 64 KiB per
+event file, 1024 events and 1 MiB of published documents per attempt, and 64
+KiB of params. An oversize event is truncated with an explicit marker rather
+than dropped, so a verdict is never lost to a large payload; events past the
+count or byte bound are discarded with one logged line.
+
+Publication is streamed, not deferred: a running attempt's mailbox is swept
+every 500 ms by default, so a phase is observable while the run is still
+executing. Phase timestamps are therefore accurate to that interval and not to
+the instant the workload wrote the file. A final sweep runs after the workload
+is quiesced and **before** the handoff lifecycle may remove the directory; a
+successful run publishes everything it wrote. Each event's document is derived
+deterministically from the file, and its idempotency key is stable across
+republication, so a sweep repeated after a lost rename or an agent restart is a
+replay in L3 rather than a second document.
+
+The mailbox is delivered to `kind=process` one-shots that L3 dispatched. An OCI
+handoff volume is helper-owned inside the node and the helper protocol exposes
+no read path, so an OCI attempt receives no `WEFTY_RUN_DIR` and the agent logs
+that publication is unavailable rather than delivering a directory nothing
+would ever read.
+
+`WEFTY_RUN_TOKEN` delivery is unchanged by the mailbox: a workflow that
+dispatches child runs still needs it. Withholding it from jobs that only report
+is a separate, opt-in change.
 
 ## Node-local handoff lifecycle
 

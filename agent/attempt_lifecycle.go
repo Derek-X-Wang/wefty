@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +87,8 @@ type attemptLifecycleDependencies struct {
 	outputSinkFactory      OutputSinkFactory
 	managedResource        managedResourceManager
 	handoffs               *handoffManager
+	runLedger              runLedgerAppender
+	mailboxPoll            time.Duration
 	nodeID                 string
 	bootSessionID          string
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
@@ -904,6 +907,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var uploader attemptLogSink
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
+	var mailbox *runMailbox
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
 		// No renewal may cross the terminal/reap boundary. Closing before
 		// ReapAndVerify also discards a pre-admission renewal when Started
@@ -958,6 +962,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if lifecycle.dependencies.runtimeReaped != nil {
 			lifecycle.dependencies.runtimeReaped(claim.Job.JobID, reapReceipt, reapErr)
 		}
+		// The workload is quiesced here and the handoff directory still
+		// exists: this is the only point at which every event it wrote can be
+		// published. finishCompletedAttempt may remove the directory once this
+		// returns, so the final sweep is not optional and not asynchronous.
+		mailbox.finalize(finalizationContext)
 		if reapErr != nil {
 			reapErr = fmt.Errorf("reap and verify workload runtime: %w", reapErr)
 		}
@@ -1093,6 +1102,30 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 	}
+	// The run mailbox is prepared before the workload starts, so a job that
+	// writes its first event immediately has somewhere to write it. Publication
+	// authority is the agent's: the workload receives a directory, not a
+	// credential.
+	if lifecycle.dependencies.runLedger != nil && runMailboxAvailable(claim.Job.Spec) {
+		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID,
+			lifecycle.dependencies.runLedger, lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.logf)
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+		mailbox = prepared
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
+		// Params reach the workload as a file, never as an environment value
+		// it could confuse with the reserved context.
+		delete(executionSpec.Env, contract.EnvRunParamsJSON)
+	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot &&
+		strings.TrimSpace(claim.Job.Spec.Execution.Env[contract.EnvL3Endpoint]) != "" {
+		// The OCI handoff volume is helper-owned inside the node, and the
+		// helper protocol has no read method yet, so there is nothing the
+		// agent could publish from. Say so rather than deliver a directory
+		// whose contents would silently never reach the ledger.
+		lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; the handoff volume is helper-owned and exposes no read path", claim.Lease.AttemptID)
+	}
 	var err error
 	var computerBridge *computerAttemptBridgeController
 	if computerService {
@@ -1184,9 +1217,15 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	} else if len(sinks) > 1 {
 		sink = sinks
 	}
-	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv)
+	// The mailbox holds the run token on the run's behalf. Naming it here keeps
+	// redaction correct once that credential stops travelling in the job
+	// environment, instead of letting the guarantee lapse silently.
+	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv, mailbox.secrets()...)
 	if redactingSink != nil {
 		sink = redactingSink
+	}
+	if mailbox != nil {
+		mailbox.start(ctx)
 	}
 	request.Execution = executionSpec
 	var result contract.ProcessResult

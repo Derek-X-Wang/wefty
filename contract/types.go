@@ -26,12 +26,17 @@ type ComputerTokenRevocationReceipt struct {
 // Run execution environment names are shared wire-contract vocabulary. Keep
 // credentials in SensitiveEnv so public job projections can redact them.
 const (
-	EnvRunID                     = "WEFTY_RUN_ID"
-	EnvL1Endpoint                = "WEFTY_L1_ENDPOINT"
-	EnvL3Endpoint                = "WEFTY_L3_ENDPOINT"
-	EnvAttemptToken              = "WEFTY_ATTEMPT_TOKEN"
-	EnvRunToken                  = "WEFTY_RUN_TOKEN"
-	EnvHandoffDir                = "WEFTY_HANDOFF_DIR"
+	EnvRunID        = "WEFTY_RUN_ID"
+	EnvL1Endpoint   = "WEFTY_L1_ENDPOINT"
+	EnvL3Endpoint   = "WEFTY_L3_ENDPOINT"
+	EnvAttemptToken = "WEFTY_ATTEMPT_TOKEN"
+	EnvRunToken     = "WEFTY_RUN_TOKEN"
+	EnvHandoffDir   = "WEFTY_HANDOFF_DIR"
+	EnvRunDir       = "WEFTY_RUN_DIR"
+	// EnvRunParamsJSON is agent-consumed, never workload-visible: the node
+	// agent materializes its contents as the run mailbox params file and
+	// removes the name from the workload environment.
+	EnvRunParamsJSON             = "WEFTY_RUN_PARAMS_JSON"
 	EnvServiceDir                = "WEFTY_SERVICE_DIR"
 	EnvServicePort               = "WEFTY_SERVICE_PORT"
 	EnvComputerToken             = "WEFTY_COMPUTER_TOKEN"
