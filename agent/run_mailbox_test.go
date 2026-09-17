@@ -1401,6 +1401,17 @@ func waitMailboxSignal(t *testing.T, signal <-chan struct{}) {
 	}
 }
 
+// mailboxEventsRoot reaches the events directory a process mailbox is prepared
+// over. Only ownership tests need it; the publisher itself sees mailboxFS.
+func mailboxEventsRoot(t *testing.T, mailbox *runMailbox) *os.Root {
+	t.Helper()
+	backing, ok := mailbox.fs.(*osRootMailboxFS)
+	if !ok {
+		t.Fatalf("mailbox is not backed by an os.Root: %T", mailbox.fs)
+	}
+	return backing.events
+}
+
 func waitMailboxRootsClosed(t *testing.T, mailbox *runMailbox) {
 	t.Helper()
 	timer := time.NewTimer(5 * time.Second)
@@ -1788,7 +1799,7 @@ func TestMailboxFinalizationExpiryTransfersRootsUntilWorkerUnwinds(t *testing.T)
 			teardown := make(chan struct{})
 			go func() { mailbox.fence(nil); mailbox.close(); close(teardown) }()
 			waitMailboxSignal(t, teardown)
-			for _, root := range []*os.Root{mailbox.root, mailbox.events, mailbox.published} {
+			for _, root := range []*os.Root{mailbox.root, mailboxEventsRoot(t, mailbox), mailbox.published} {
 				if _, err := root.Stat("."); err != nil {
 					t.Fatalf("teardown closed roots under an admitted worker: %v", err)
 				}
