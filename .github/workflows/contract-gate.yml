@@ -148,20 +148,28 @@ jobs:
   branch-gates-workflow:
     name: branch-gates-workflow
     runs-on: ubuntu-latest
+    # Margin over the test binary's own 10-minute default timeout, which is
+    # itself the outer bound on the 5-minute per-run budget.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
       # Stands up L1, L3, an agent and the process runner, then submits
       # workflows/branch-gates/branch-gates.sh against a purpose-built subject
       # repository with a clean branch and a deliberately broken one. The
       # kind=oci path is proven on the Lima node, not here; running wefty's own
       # go test ./... inside a container is a node-lane cost.
+      # WEFTY_REQUIRE_SHELLCHECK turns the script lint from a skip into a
+      # failure, so this lane cannot go green without actually linting.
       - name: Exercise the branch-gates workflow against a real stack
         env:
           WEFTY_BRANCH_GATES_EXERCISE: "1"
+          WEFTY_REQUIRE_SHELLCHECK: "1"
         run: go test ./workflows/branch-gates/ -count=1
 
   # The credentialed tsnet lane lives in tsnet-smoke.yml (push to main +

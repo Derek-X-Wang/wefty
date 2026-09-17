@@ -23,7 +23,21 @@ scaffold, no `runs list`, no `wait`. Every awkward step is a requirement for
 | `test` | `go test ./...` | the expensive one |
 
 The default gate set is all four, in that order. `params.gates` selects a
-subset, e.g. `"gates":"gofmt,vet"` for a quick syntax pass.
+subset, e.g. `"gates":"gofmt,vet"` for a quick syntax pass. The list is
+validated before anything is cloned: an empty element (`","`), whitespace, an
+unknown name or a repeat is a workflow error, never a silently reduced run.
+
+## Trust boundary
+
+The repository under test is untrusted code. The clone, the checkout and every
+gate run under `env -i` with a small allowlist (`PATH`, `HOME`, `LANG`,
+`LC_ALL`, `TMPDIR`, `GIT_TERMINAL_PROMPT`, `GOFLAGS`, `GOTOOLCHAIN`, `GOCACHE`,
+`GOMODCACHE`, `GOPATH`), so no `WEFTY_*` value — run token, attempt credential
+or anything the contract adds later — is visible to them. That matters twice:
+a gate's raw output is copied verbatim into `failures.txt` before the agent's
+log redaction ever sees it, and a credential reaching the subject would let it
+write its own run or submit L1 children. All L3 reporting happens in the
+workflow shell, outside every gate process.
 
 ## Inputs (run params)
 
@@ -57,6 +71,14 @@ A failing gate result fails the run in L3, so `.run.status` is `failed` whenever
 the branch is bad. A `branch-gates` gate with outcome `error` means the workflow
 itself could not do its job (bad input, clone failure), not that the branch is
 bad.
+
+Every exit after the execution context is known writes the same two files. A
+workflow error writes a `result.json` with `"passed":false`, `"gates":[]` and a
+`workflow_error` object naming the step (`environment`, `input`, `checkout`,
+`publish`, `results`) and the message, plus a `failures.txt` whose first line is
+`===== workflow-error: <step> =====`. Both are echoed into the run log and
+copied through `copy_to` exactly like a verdict, and the non-zero exit retains
+them on the node.
 
 ## Running it
 
@@ -151,7 +173,10 @@ fastest way to gate a branch that has not been pushed.
 process runner, builds a small subject repository with a clean `main` branch
 and a `broken` branch (unformatted file plus a deliberately failing test), and
 submits this exact script twice. It asserts the result files, the handoff
-lifecycle, the per-gate envelopes and the final gate. It is opt-in:
+lifecycle, the per-gate envelopes and the final gate. The broken branch's test
+prints every `WEFTY_*` variable it can see, and the assertion is that the list
+is empty — that is the standing regression test for the trust boundary above.
+A second table covers rejected input and checkout failure. It is opt-in:
 
 ```sh
 WEFTY_BRANCH_GATES_EXERCISE=1 go test ./workflows/branch-gates/ -count=1
