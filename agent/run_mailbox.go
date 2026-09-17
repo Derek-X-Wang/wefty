@@ -341,8 +341,10 @@ type runMailbox struct {
 	// nothing the agent looks at.
 	directory string
 	root      *os.Root
-	events    *os.Root
 	published *os.Root
+	// fs is the publisher's only view of the events directory, so the rules
+	// above this field hold whatever backs it.
+	fs mailboxFS
 
 	runID     string
 	attemptID string
@@ -444,8 +446,8 @@ func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedg
 	mailbox := &runMailbox{
 		directory: filepath.Join(handoff, runMailboxDirectoryName, runID),
 		root:      mailboxRoot,
-		events:    eventsRoot,
 		published: publishedRoot,
+		fs:        newOSRootMailboxFS(eventsRoot),
 		runID:     runID,
 		attemptID: attemptID,
 		runToken:  strings.TrimSpace(spec.Execution.SensitiveEnv[contract.EnvRunToken]),
@@ -673,7 +675,10 @@ func (m *runMailbox) close() {
 func (m *runMailbox) closeRoots() {
 	m.closeOnce.Do(func() {
 		m.cancelPublication()
-		for _, root := range []*os.Root{m.events, m.published, m.root} {
+		if m.fs != nil {
+			_ = m.fs.close()
+		}
+		for _, root := range []*os.Root{m.published, m.root} {
 			if root != nil {
 				root.Close()
 			}
@@ -936,22 +941,15 @@ func (m *runMailbox) sweep(ctx context.Context) bool {
 // scanEvents reads the whole listing up to a hard cap, then sorts it globally.
 // Hitting the cap is incomplete even if exactly that many entries exist; no
 // partial listing is published and no page cursor depends on directory order.
+// Sorting is the publisher's, not the implementation's: lexical publication
+// order must hold whichever mailboxFS enumerated the names.
 func (m *runMailbox) scanEvents() ([]string, bool, error) {
-	directory, err := m.events.Open(".")
+	names, exhausted, err := m.fs.list(m.maxScan)
 	if err != nil {
 		return nil, false, err
 	}
-	defer directory.Close()
-	entries, err := directory.ReadDir(m.maxScan)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, false, err
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		names = append(names, entry.Name())
-	}
 	slices.Sort(names)
-	return names, len(names) >= m.maxScan, nil
+	return names, exhausted, nil
 }
 
 func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
@@ -1105,7 +1103,7 @@ func (m *runMailbox) retire(name string) error {
 	if m.retireCheckpoint != nil && !m.retireCheckpoint() {
 		return nil
 	}
-	if err := m.removeEntry(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := m.fs.remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		m.log("agent: retire run %s mailbox event %q: %v", m.runID, name, err)
 		return err
 	}
@@ -1116,24 +1114,11 @@ func (m *runMailbox) retire(name string) error {
 	return nil
 }
 
-// removeEntry never recursively walks workload data. Unknown objects and
-// nonempty directories remain pending and force handoff retention.
-func (m *runMailbox) removeEntry(name string) error {
-	info, err := m.events.Lstat(name)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && !info.IsDir() {
-		return fmt.Errorf("run mailbox entry %q has unsupported type %s", name, info.Mode())
-	}
-	return m.events.Remove(name)
-}
-
 var errRunMailboxEntryNotDrained = errors.New("run mailbox entry not drained")
 
 // discard removes only files, symlinks and empty directories.
 func (m *runMailbox) discard(name string) error {
-	if err := m.removeEntry(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := m.fs.remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		m.log("agent: discard run %s mailbox entry %q: %v", m.runID, name, err)
 		return fmt.Errorf("%w: %v", errRunMailboxEntryNotDrained, err)
 	}
@@ -1255,12 +1240,11 @@ func (m *runMailbox) log(format string, args ...any) {
 	}
 }
 
-// readEvent opens the event through the events directory opened at
-// preparation, proves the object it actually opened is a regular file, and
-// reads it under the size bound. The non-blocking open is what keeps a FIFO
-// planted in the events directory from holding finalization open forever.
+// readEvent reads one event under the size bound. Whether the entry is a
+// readable regular file is the implementation's to prove, and an entry that is
+// not one is an error here rather than bytes.
 func (m *runMailbox) readEvent(name string) ([]byte, bool, error) {
-	return readBoundedRegularFile(m.events, name, MaxRunMailboxEventBytes)
+	return m.fs.read(name, MaxRunMailboxEventBytes)
 }
 
 func readBoundedRegularFile(root *os.Root, name string, limit int) ([]byte, bool, error) {
