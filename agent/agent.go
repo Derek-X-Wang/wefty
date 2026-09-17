@@ -106,6 +106,9 @@ type Config struct {
 	OutputSinkFactory   OutputSinkFactory
 	HandoffRoot         string
 	HandoffRetention    time.Duration
+	// RunMailboxPollInterval sets how often a running attempt's run mailbox is
+	// swept for events to publish. Zero uses DefaultRunMailboxPollInterval.
+	RunMailboxPollInterval time.Duration
 	// Logf need not be goroutine-safe. Agent serializes calls made through it.
 	Logf  func(string, ...any)
 	Clock Clock
@@ -132,6 +135,8 @@ type Agent struct {
 	managedResource       managedResourceManager
 	outputSinkFactory     OutputSinkFactory
 	handoffs              *handoffManager
+	runLedger             runLedgerAppender
+	mailboxPoll           time.Duration
 	logf                  func(string, ...any)
 	clock                 Clock
 	observer              *lifecycleObserver
@@ -424,8 +429,10 @@ func New(config Config) (*Agent, error) {
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
-		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
-		logf:     logf, clock: clock, observer: observer, capabilities: capabilities,
+		handoffs:    newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
+		runLedger:   newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
+		mailboxPoll: durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
+		logf:        logf, clock: clock, observer: observer, capabilities: capabilities,
 		attemptDeadman:  config.AttemptDeadman,
 		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
 		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
@@ -549,6 +556,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
 		finalizationTimeout: a.finalizationTimeout,
 		outputSinkFactory:   a.outputSinkFactory, handoffs: a.handoffs,
+		runLedger: a.runLedger, mailboxPoll: a.mailboxPoll,
 		managedResource: a.managedResource,
 		nodeID:          a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,

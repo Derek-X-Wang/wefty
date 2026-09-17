@@ -38,6 +38,13 @@ A recorded verification verdict, evaluated by the workflow's own code and
 stored by the ledger.
 _Avoid_: check, test result
 
+**Run mailbox**:
+The job-owned directory in which a workload writes its envelopes, step
+markers, gate results and result files, and from which the node agent
+publishes them to the ledger without requiring the workload to hold or use a credential (the agent publishes with the run token it holds).
+_Avoid_: outbox (the agent's own durable evidence outbox), handoff directory
+(a different lifecycle), spool, queue, drop box
+
 **Pattern** _(reserved — does not exist yet)_:
 A future declarative plan, expressed as data, that the ledger itself would
 interpret into runs. Named for what a loom follows. Reserved so it can never

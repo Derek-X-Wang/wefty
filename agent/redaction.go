@@ -24,15 +24,35 @@ type redactionStream struct {
 	template contract.LogEvent
 }
 
-func newRedactingOutputSink(sink processrunner.OutputSink, sensitive map[string]string) *redactingOutputSink {
-	if sink == nil || len(sensitive) == 0 {
+// newRedactingOutputSink redacts every sensitive environment value, plus any
+// credential the agent holds on the attempt's behalf rather than delivering it
+// — a value absent from the job environment is still a value that must never
+// reach a log sink.
+func newRedactingOutputSink(sink processrunner.OutputSink, sensitive map[string]string, alsoRedact ...string) *redactingOutputSink {
+	if sink == nil || (len(sensitive) == 0 && len(alsoRedact) == 0) {
 		return nil
 	}
-	secrets := make([][]byte, 0, len(sensitive))
+	secrets := make([][]byte, 0, len(sensitive)+len(alsoRedact))
+	seen := make(map[string]struct{}, len(sensitive)+len(alsoRedact))
 	for _, value := range sensitive {
-		if value != "" {
-			secrets = append(secrets, []byte(value))
+		if value == "" {
+			continue
 		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		secrets = append(secrets, []byte(value))
+	}
+	for _, value := range alsoRedact {
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		secrets = append(secrets, []byte(value))
 	}
 	if len(secrets) == 0 {
 		return nil

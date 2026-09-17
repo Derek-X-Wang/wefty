@@ -19,6 +19,15 @@ const (
 	DefaultComputerSubmitMaxInflight = 20
 	DefaultComputerRunPageLimit      = 100
 	MaxComputerRunPageLimit          = 1000
+	// RunParamsLabel carries a dispatched run's canonical parameter document
+	// to the node agent, which writes it into the run mailbox. It is a job
+	// label rather than an environment value precisely so the workload reads
+	// its parameters from a file and never from a name it could confuse with
+	// the reserved execution context.
+	RunParamsLabel = contract.LabelRunParams
+	// MaxDispatchedRunParamsBytes bounds what travels on that label. A larger
+	// document stays in the ledger, where the submitter can still read it.
+	MaxDispatchedRunParamsBytes = 64 << 10
 )
 
 // Clock supplies ledger timestamps so state projection can be tested without

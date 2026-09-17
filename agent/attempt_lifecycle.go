@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -86,6 +88,8 @@ type attemptLifecycleDependencies struct {
 	outputSinkFactory      OutputSinkFactory
 	managedResource        managedResourceManager
 	handoffs               *handoffManager
+	runLedger              runLedgerAppender
+	mailboxPoll            time.Duration
 	nodeID                 string
 	bootSessionID          string
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
@@ -122,6 +126,11 @@ type attemptLogSinkFactory func(context.Context, l1.Claim) (attemptLogSink, erro
 // shared resource itself.
 type attemptLifecycle struct {
 	dependencies attemptLifecycleDependencies
+	// mailbox is this attempt's run mailbox, published by the workload path and
+	// read by the authority and completion paths. One lifecycle owns one
+	// attempt, so a single slot is the whole lifetime.
+	mailbox    atomic.Pointer[runMailbox]
+	fenceCause atomic.Pointer[error]
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -343,8 +352,63 @@ func (failure *completionDeliveryAbandoned) Unwrap() error { return failure.err 
 
 const ociRuntimeRecoveryTimeout = 10 * time.Second
 
+// attemptDeadlineContext preserves the caller's deadline metadata without a
+// second timer that could cancel the attempt before the parent fence completes.
+// The parent's own timer still drives cancellation through fencedAttemptContext.
+type attemptDeadlineContext struct {
+	context.Context
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (ctx attemptDeadlineContext) Deadline() (time.Time, bool) {
+	return ctx.deadline, ctx.hasDeadline
+}
+
+// fencedAttemptContext derives an attempt context whose every cancellation —
+// this lifecycle's own and the parent's alike — runs fence first. The fence
+// joins admitted appends unless finalization already transferred a timed-out
+// join to cleanup; cancellation must not race new publication admission.
+func fencedAttemptContext(parent context.Context, fence func(error)) (context.Context, context.CancelCauseFunc, func()) {
+	gate, cancelGate := context.WithCancelCause(context.WithoutCancel(parent))
+	attempt, cancelAttempt := context.WithCancelCause(gate)
+	released := make(chan struct{})
+	go func() {
+		select {
+		case <-parent.Done():
+			cause := context.Cause(parent)
+			fence(cause)
+			cancelGate(cause)
+		case <-released:
+		}
+	}()
+	deadline, hasDeadline := parent.Deadline()
+	return attemptDeadlineContext{Context: attempt, deadline: deadline, hasDeadline: hasDeadline}, func(cause error) {
+			fence(cause)
+			cancelAttempt(cause)
+		}, func() {
+			close(released)
+		}
+}
+
+// Latch before loading the mailbox: preparation can finish after cancellation.
+func (lifecycle *attemptLifecycle) fenceMailbox(cause error) {
+	lifecycle.fenceCause.CompareAndSwap(nil, &cause)
+	lifecycle.mailbox.Load().fence(cause)
+}
+
+func (lifecycle *attemptLifecycle) storeMailbox(mailbox *runMailbox) {
+	lifecycle.mailbox.Store(mailbox)
+	if cause := lifecycle.fenceCause.Load(); cause != nil {
+		mailbox.fence(*cause)
+	}
+}
+
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
-	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
+	// The attempt context is deliberately not a direct child of ctx: every
+	// route to its cancellation passes through the mailbox fence first.
+	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, lifecycle.fenceMailbox)
+	defer releaseFenceGate()
 	defer cancelAttempt(nil)
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
@@ -630,6 +694,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
 	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
+	if succeeded && lifecycle.mailbox.Load().publicationIncomplete() {
+		// Evidence the workload wrote never reached the ledger, so the files
+		// are the only remaining copy. Removing them here would destroy the
+		// result of a run that looks successful.
+		succeeded = false
+	}
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
@@ -904,6 +974,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var uploader attemptLogSink
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
+	var mailbox *runMailbox
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
 		// No renewal may cross the terminal/reap boundary. Closing before
 		// ReapAndVerify also discards a pre-admission renewal when Started
@@ -958,6 +1029,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if lifecycle.dependencies.runtimeReaped != nil {
 			lifecycle.dependencies.runtimeReaped(claim.Job.JobID, reapReceipt, reapErr)
 		}
+		// The workload is quiesced here and the handoff directory still
+		// exists: this is the only point at which every event it wrote can be
+		// published. finishCompletedAttempt may remove the directory once this
+		// returns, so the final sweep is not optional and not asynchronous.
+		mailbox.finalize(finalizationContext)
 		if reapErr != nil {
 			reapErr = fmt.Errorf("reap and verify workload runtime: %w", reapErr)
 		}
@@ -1093,6 +1169,29 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 	}
+	// The run mailbox is prepared before the workload starts, so a job that
+	// writes its first event immediately has somewhere to write it. Mailbox
+	// reporting does not require or use the workload's credential; run-token
+	// delivery remains unchanged.
+	if lifecycle.dependencies.runLedger != nil && runMailboxAvailable(claim.Job.Spec) {
+		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID, lifecycle.dependencies.runLedger,
+			lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+		mailbox = prepared
+		defer mailbox.close()
+		lifecycle.storeMailbox(mailbox)
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
+	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot &&
+		strings.TrimSpace(claim.Job.Spec.Execution.Env[contract.EnvL3Endpoint]) != "" {
+		// The OCI handoff volume is helper-owned inside the node, and the
+		// helper protocol has no read method yet, so there is nothing the
+		// agent could publish from. Say so rather than deliver a directory
+		// whose contents would silently never reach the ledger.
+		lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; the handoff volume is helper-owned and exposes no read path", claim.Lease.AttemptID)
+	}
 	var err error
 	var computerBridge *computerAttemptBridgeController
 	if computerService {
@@ -1184,9 +1283,15 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	} else if len(sinks) > 1 {
 		sink = sinks
 	}
-	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv)
+	// The mailbox holds the run token on the run's behalf. Naming it here keeps
+	// redaction correct once that credential stops travelling in the job
+	// environment, instead of letting the guarantee lapse silently.
+	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv, mailbox.secrets()...)
 	if redactingSink != nil {
 		sink = redactingSink
+	}
+	if mailbox != nil {
+		mailbox.start(ctx)
 	}
 	request.Execution = executionSpec
 	var result contract.ProcessResult

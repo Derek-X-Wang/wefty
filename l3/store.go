@@ -1706,20 +1706,25 @@ type dispatchIntent struct {
 	DispatchKey    string
 	ParentRunID    string
 	HandoffOwnerID string
-	Content        []byte
-	SHA256         string
-	Interpreter    []string
-	Mode           uint32
-	Image          *contract.ImageProgram
-	Tags           []string
-	Limits         *contract.RunLimits
+	// Params is the run's canonical parameter document. It reaches the job as
+	// a file in the run mailbox, written by the node agent, so a workload can
+	// read what it was submitted with while holding no credential.
+	Params      []byte
+	Content     []byte
+	SHA256      string
+	Interpreter []string
+	Mode        uint32
+	Image       *contract.ImageProgram
+	Tags        []string
+	Limits      *contract.RunLimits
 }
 
 func (s *Store) pendingDispatches(ctx context.Context) ([]dispatchIntent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
        CASE WHEN t.source='rerun' THEN t.source_run_id ELSE r.run_id END,
-       s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, r.tags_json, r.limits_json
+       s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, r.tags_json, r.limits_json,
+       r.params_json
 FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
@@ -1731,10 +1736,10 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 	var intents []dispatchIntent
 	for rows.Next() {
 		var intent dispatchIntent
-		var content, interpreterJSON, imageJSON, tagsJSON, limitsJSON []byte
+		var content, interpreterJSON, imageJSON, tagsJSON, limitsJSON, paramsJSON []byte
 		var sha sql.NullString
 		var mode sql.NullInt64
-		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &content, &sha, &interpreterJSON, &mode, &imageJSON, &tagsJSON, &limitsJSON); err != nil {
+		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &content, &sha, &interpreterJSON, &mode, &imageJSON, &tagsJSON, &limitsJSON, &paramsJSON); err != nil {
 			return nil, internalError(err, "scan pending dispatch")
 		}
 		if len(imageJSON) > 0 {
@@ -1753,6 +1758,7 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 		if err := json.Unmarshal(tagsJSON, &intent.Tags); err != nil {
 			return nil, internalError(err, "decode dispatch tags")
 		}
+		intent.Params = paramsJSON
 		if len(limitsJSON) > 0 {
 			intent.Limits = &contract.RunLimits{}
 			if err := json.Unmarshal(limitsJSON, intent.Limits); err != nil {
@@ -2054,6 +2060,12 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 	}
 	handoff := filepath.Join(DefaultHandoffRoot, handoffOwnerID)
 	labels := map[string]string{"run_id": intent.RunID}
+	// The parameter document travels as an agent-only dispatch label, never as
+	// an environment value: the node agent turns it into the run mailbox's
+	// params file, and the workload never sees the transport.
+	if params := strings.TrimSpace(string(intent.Params)); params != "" && params != "{}" && len(params) <= MaxDispatchedRunParamsBytes {
+		labels[RunParamsLabel] = params
+	}
 	if handoffOwnerID != intent.RunID {
 		labels["handoff_owner_run_id"] = handoffOwnerID
 	}

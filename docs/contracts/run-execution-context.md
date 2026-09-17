@@ -13,6 +13,7 @@ depend on additional variables.
 | `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
+| `WEFTY_RUN_DIR` | public | The run mailbox: the job-owned directory the workload writes protocol events into and the node agent publishes from. |
 
 The first four L3 variables are delivered only when L3 dispatched the job.
 `WEFTY_L1_ENDPOINT` and `WEFTY_ATTEMPT_TOKEN` are delivered by the node agent
@@ -241,6 +242,168 @@ Computer submission idempotency binds the stable principal (`ComputerID`) and
 normalized request only. Attempt, grant, Storage, intent, and L3 authority
 generations remain commit-time fences, not request identity, so replay after a
 re-mint returns the original Run while another Computer conflicts.
+
+## Run mailbox
+
+A workflow reports through files, not HTTP. `WEFTY_RUN_DIR` is the run mailbox:
+`<handoff directory>/.wefty/<run id>`, created by the node agent before the
+workload starts. The agent publishes what the workload writes there to L3 using
+the run token it holds, over its own authenticated Fabric connection. The
+workload therefore needs no credential to report, and a mailbox write is a
+claim about the writer's own run and nothing else. The directory is scoped by
+run ID because a cold rerun reuses the handoff directory: a rerun gets its own
+mailbox; the agent does not import the previous run's evidence into it.
+
+The layout is fixed:
+
+```
+$WEFTY_RUN_DIR/params.json    the run's params, written by the agent
+$WEFTY_RUN_DIR/tmp/           staging for write-then-rename
+$WEFTY_RUN_DIR/events/        complete events, published in lexical order per sweep
+$WEFTY_RUN_DIR/.published/    durable, advisory bookkeeping
+```
+
+`params.json` carries the parameters the run was submitted with. They travel
+from L3 on an agent-only dispatch label, never in the workload environment, and
+a document larger than 64 KiB is left in the ledger rather than delivered.
+The agent opens `tmp/` only during preparation to place `params.json`; it does
+not read staged events there.
+
+An event becomes visible by being renamed into `events/` from `tmp/` on the
+same filesystem. The rename is the only "done writing" signal: there is no
+separate marker and no partial-file parsing. An event file name is at most 128
+characters of `[A-Za-z0-9._-]` and may not begin with a dot.
+
+An event file is a line-oriented header block, a `--` separator line, and a raw
+payload that is never escaped by the producer:
+
+```
+wefty-protocol: 1
+kind: gate
+name: vet
+outcome: fail
+step: vet
+summary: two tests failed
+payload: text
+created-at: 2026-09-17T09:31:04Z
+--
+<raw payload bytes>
+```
+
+Comments are not part of the format; every line above is a header. The headers
+are:
+
+| Header | Meaning |
+| --- | --- |
+| `wefty-protocol` | Required, and required first. The only version is `1`. |
+| `kind` | `envelope`, `step`, `gate` or `result`. |
+| `name` | The gate's or step's name; defaults to `step`. |
+| `step` | The step the event belongs to; defaults to `name`. |
+| `status` | `succeeded`, `failed` or `partial` for `envelope` and `result` (default `succeeded`); `started` or `ended` for `step` (default `started`). |
+| `outcome` | `pass`, `fail`, `error` or `skipped`. Only a gate carries one. |
+| `summary` | Free text. Defaulted per kind when absent. |
+| `key` | The event's idempotency identity; defaults to the file name. |
+| `payload` | `text` (default) or `json`. |
+| `created-at` | RFC3339. Defaults to when the agent first observed the file. |
+
+The agent builds the protocol document and omits `attempt_id`: only L3 knows
+which attempt its run token is bound to, and it binds the field itself. A text
+payload becomes a gate's evidence entry or an envelope extension under
+`dev.wefty.mailbox`; a `json` payload is nested under that same namespace, so a
+workload can never shape the envelope's own extension object. A `step` becomes
+an envelope on its own step ID, `partial` while started and `succeeded` once
+ended; that mapping is internal and may change without changing this file
+protocol. Headers outside the set above, a repeated header, a missing or
+misplaced `wefty-protocol` line, an unknown kind, status or outcome, and a
+missing separator are all refused; the first eight refusals of an attempt are
+reported as a `failed` envelope on step `mailbox`, and those files are removed
+only once their reports are accepted. A refused rejection report (including
+HTTP 4xx) keeps its source pending and latches `publicationIncomplete`, retaining
+the handoff. The ninth and later malformed files, once the rejection-report
+budget is exhausted, are retired with a logged line. An HTTP 4xx refusal of the
+event itself permanently retires that document, logs the refusal reason, and
+latches `publicationIncomplete` so the run retains its handoff. An entry in
+`events/` that is not a readable regular file is refused. Cleanup removes only
+regular files, symlinks and empty directories, never recursively walking
+workload directories. Nonempty
+directories, unsupported objects and entries that cannot be classified or
+removed make the sweep not drained and retain the handoff; they do not hide
+later valid events in a complete listing.
+
+A process workload runs under the agent's own OS identity, so the mailbox's
+permissions are not an isolation boundary. Publication is bounded and
+best-effort under a shared identity, not tamper-proof against the workload.
+The mailbox publisher holds the append credential; reporting through files
+requires none. Directory-relative operations, regular-file checks, bounded
+reads and non-blocking opens limit redirection and stalls.
+
+Every bound is enforced by the agent, never by the producer: at most 64 KiB per
+event file, 1024 events and 1 MiB of published documents per attempt, 64 KiB of
+params, and a hard listing cap of 4096 entries (`MaxRunMailboxScanEntries`).
+Each sweep reads the whole listing under that cap and sorts it lexically. A
+listing that reaches the cap publishes nothing and retains the handoff, since
+a partial listing cannot establish lexical order. An oversize event is truncated
+with an explicit marker rather than dropped, so a verdict is never lost to a
+large payload; a truncated `json` payload is preserved as marked text. Events
+past the count or byte bound are discarded with one logged line.
+
+Publication is streamed, not deferred: a running attempt's mailbox is swept
+every 500 ms by default, so a step is observable while the run is still
+executing. Event timestamps are therefore accurate to that interval and not to
+the instant the workload wrote the file. Finalization, including the poller
+join and final sweep retries, uses the earlier of the caller's deadline and
+`DefaultFinalizationTimeout` (30 seconds). It runs after the workload is
+quiesced and before the handoff lifecycle may remove the directory. Expiry
+cancels publication and allows a second join bound of
+`runMailboxFenceJoinTimeout` (the 500 ms default poll interval). Pending or
+in-flight work marks `publicationIncomplete` and retains the handoff; an empty,
+idle mailbox does not become incomplete solely because the deadline expired.
+If the second bound expires, finalization marks incomplete, retains the handoff,
+and logs `mailbox_finalization_join_timeout`; the detached cleanup worker owns
+the open roots and closes them only after the poller and final sweep unwind.
+Publication is best effort: if evidence still has not reached
+the ledger when the final sweep ends, the agent logs that and the handoff
+directory is retained under the ordinary failure rules, so the files remain the
+run's only surviving copy rather than being deleted as a success. Losing the
+attempt's authority permanently fences publication: the fence cancels the
+mailbox-owned append context and normally waits for all admitted appends to
+finish. On finalization expiry, that join has the separate short bound above:
+no new append is admitted, but an uncooperative admitted operation may remain
+in flight with cleanup owning its roots. Subsequent teardown does not rejoin
+a detached worker. A fenced attempt retains pending evidence the same way.
+
+Each event's document is derived deterministically from its file — including
+its timestamp, which is pinned when the agent first observes the file — and its
+idempotency key is stable, so republishing after an interrupted retirement is a
+replay in L3 rather than a second document, and an already-accepted event is
+never charged against the bounds twice. Event count and byte budgets, and the
+eight-rejection budget, are reserved durably before appending; a pending retry
+reuses its reservation after restart, including when the append response was
+lost. That recovery reaches only the events of a retained directory: evidence
+removed with a successful run's handoff is gone.
+
+The bookkeeping under `.published/` is advisory and workload-writable. Loaded
+counters and reservations are validated and clamped to their bounds, timestamps
+must be whole seconds between the Unix epoch and the current agent time plus
+`runMailboxObservationClockTolerance` (5 seconds, allowing a small backwards
+clock correction across restart), and names must be valid event names.
+Inconsistent reservations, out-of-range values, or bookkeeping that cannot be
+read, parsed or persisted latch `corrupt`: publication stops,
+`publicationIncomplete` is set, and the handoff is retained. This is validation,
+not authentication. Forged bookkeeping can only suppress or truncate the
+workload's own run's evidence; it grants no append credential or authority over
+another run.
+
+The mailbox is delivered to `kind=process` one-shots that L3 dispatched and
+extends to OCI once the helper exposes a read path. An OCI handoff volume is
+helper-owned inside the node and the helper protocol exposes
+no read path, so an OCI attempt receives no `WEFTY_RUN_DIR` and the agent logs
+that publication is unavailable rather than delivering a directory nothing
+would ever read.
+
+`WEFTY_RUN_TOKEN` delivery is unchanged by the mailbox: a workflow that
+dispatches child runs still needs it. Withholding it from jobs that only report
+is a separate, opt-in change.
 
 ## Node-local handoff lifecycle
 

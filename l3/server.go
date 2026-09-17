@@ -174,6 +174,7 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			job.Spec.Execution.SensitiveEnv = nil
+			job.Spec.Labels = contract.RedactJobLabels(job.Spec.Labels)
 			projection.Job = &job
 		}
 	}

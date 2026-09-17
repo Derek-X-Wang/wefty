@@ -2157,6 +2157,7 @@ func (s *Server) acknowledgeServiceRemoval(w http.ResponseWriter, r *http.Reques
 
 func redactJob(job Job) Job {
 	job.Spec.Execution.SensitiveEnv = nil
+	job.Spec.Labels = contract.RedactJobLabels(job.Spec.Labels)
 	return job
 }
 
