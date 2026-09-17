@@ -506,7 +506,7 @@ func TestMailboxEventsArePublishedWhileTheAttemptRuns(t *testing.T) {
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
 		runtimes:     testRuntimeSet(runner),
-		handoffs:     newHandoffManager(root, time.Hour),
+		handoffs:     newHandoffManager(root, time.Hour, nil),
 		runLedger:    appender,
 		mailboxPoll:  5 * time.Millisecond,
 	}
@@ -539,7 +539,7 @@ func TestMailboxEventsArePublishedWhileTheAttemptRuns(t *testing.T) {
 	}
 }
 
-func TestMailboxFinalSweepCompletesBeforeHandoffRemoval(t *testing.T) {
+func TestMailboxFinalSweepCompletesBeforeHandoffFinalization(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "handoffs")
 	runID := "run_mailbox"
 	handoff := filepath.Join(root, runID)
@@ -554,7 +554,7 @@ func TestMailboxFinalSweepCompletesBeforeHandoffRemoval(t *testing.T) {
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
 		runtimes:     testRuntimeSet(runner),
-		handoffs:     newHandoffManager(root, time.Hour),
+		handoffs:     newHandoffManager(root, time.Hour, nil),
 		runLedger:    appender,
 		// Long enough that no poll can fire: only the final sweep can publish.
 		mailboxPoll: time.Hour,
@@ -575,8 +575,10 @@ func TestMailboxFinalSweepCompletesBeforeHandoffRemoval(t *testing.T) {
 	if _, err := lifecycle.finishCompletedAttempt(context.Background(), claim, result, runErr); err != nil {
 		t.Fatalf("finishCompletedAttempt: %v", err)
 	}
-	if _, err := os.Stat(handoff); !os.IsNotExist(err) {
-		t.Fatalf("successful handoff directory still exists: %v", err)
+	// The sweep still has to finish before finalization, which is what this
+	// test is about; the directory it swept is now retained rather than removed.
+	if _, err := os.Stat(handoff); err != nil {
+		t.Fatalf("a successful run's results were not retained: %v", err)
 	}
 }
 
@@ -596,7 +598,7 @@ func TestUnpublishedMailboxEvidenceRetainsTheHandoffOnSuccess(t *testing.T) {
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
 		runtimes:     testRuntimeSet(runner),
-		handoffs:     newHandoffManager(root, time.Hour),
+		handoffs:     newHandoffManager(root, time.Hour, nil),
 		runLedger:    appender,
 		mailboxPoll:  time.Hour,
 	}

@@ -302,6 +302,19 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
+	if results := inspection.Results; results != nil {
+		state := "retained until " + results.RetainedUntil.Format(time.RFC3339)
+		if results.Expired {
+			state = "expired " + results.RetainedUntil.Format(time.RFC3339)
+		}
+		where := results.Location
+		if results.NodeID != "" {
+			where = "node " + results.NodeID + ", " + where
+		}
+		if _, err := fmt.Fprintf(writer, "\nresults: %s (%s; %s)\n", state, where, results.Note); err != nil {
+			return err
+		}
+	}
 	detail := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	if _, err := fmt.Fprintln(detail, "KIND\tRUN\tSTEP\tSTATUS/OUTCOME\tSUMMARY/NAME"); err != nil {
 		return err

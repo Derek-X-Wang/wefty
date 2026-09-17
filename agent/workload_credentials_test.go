@@ -389,7 +389,7 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 			node := &Agent{
 				registration:     contract.NodeRegistration{NodeID: "node-1"},
 				runtimes:         testRuntimeSet(processrunner.New(processrunner.Config{})),
-				handoffs:         newHandoffManager(root, time.Hour),
+				handoffs:         newHandoffManager(root, time.Hour, nil),
 				fabric:           plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node-1"}),
 				controlPlaneAddr: "wefty://control-plane",
 				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {

@@ -1246,8 +1246,10 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 		t.Fatalf("intent-stop one-shot agent exited before L1 completion: %v", runErr)
 	default:
 	}
+	// finalized stays 0: a successful one-shot keeps its handoff volume now,
+	// because that is where its results are.
 	completed, err := waitForFailureJobState(store, job.JobID, contract.JobSucceeded, 5*time.Second)
-	if err != nil || completed.State != contract.JobSucceeded || runtime.finalized.Load() != 1 {
+	if err != nil || completed.State != contract.JobSucceeded || runtime.finalized.Load() != 0 {
 		cancelRun()
 		attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
 		t.Fatalf("intent-stop one-shot completion=%+v attempts=%+v attempts_err=%v finalized=%d err=%v", completed, attempts, attemptsErr, runtime.finalized.Load(), err)

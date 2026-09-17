@@ -27,7 +27,7 @@ const (
 	DefaultCapabilityProbeTimeout  = 10 * time.Second
 	DefaultClaimInterval           = time.Second
 	DefaultRenewalInterval         = 10 * time.Second
-	DefaultHandoffRetention        = 24 * time.Hour
+	DefaultHandoffRetention        = contract.DefaultResultRetention
 	DefaultLogBatchSize            = 32
 	DefaultLogFlushInterval        = 100 * time.Millisecond
 	DefaultLogRetryInterval        = 100 * time.Millisecond
@@ -432,7 +432,7 @@ func New(config Config) (*Agent, error) {
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
-		handoffs:         newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
+		handoffs:         newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
 		runLedger:        newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
 		mailboxPoll:      durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
 		mailboxStateRoot: logSpoolDirectory,

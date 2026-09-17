@@ -569,14 +569,13 @@ workload has returned and the attempt is still live, the only window in which
 every event is both complete and still reachable — and after it for a process
 attempt, whose quiescence that reap is what proves.
 
-The handoff volume is removed immediately, by the agent's managed-volume
-finalizer through the helper, only when the attempt both executed successfully —
-no execution error and exit code zero — and published all of its evidence.
-Everything else retains it: a workload that failed keeps its volume even if
-every event it wrote reached the ledger, and a successful workload keeps it if
-the drain could not finish, because the helper stopped answering, a deadman
-guardian reaped the attempt first, or an entry could not be read. A retained
-volume is expired by the helper's boot sweep after its retention window. A read that
+The handoff volume is retained on every outcome and expired by the helper's
+boot sweep after the retention window, exactly as a process run's handoff
+directory is. Nothing is removed at completion any more: a run's results are
+what the directory holds, and the outcome an operator most wants to read is a
+run that worked. Publication completeness no longer decides whether the files
+survive; it decides only what a node gives up first when it runs out of room
+(see "Results and their retention"). A read that
 fails for any reason other than the helper positively classifying the entry as
 unpublishable leaves that entry in place: an unreachable entry is never mistaken
 for junk, because deleting a run's only copy of its evidence on the strength of
@@ -599,13 +598,49 @@ managed volume keyed by the job's stable run ID or `handoff_owner_run_id`; the
 helper hashes that opaque key and mounts the resulting source at
 `/wefty/handoff`. Attempt IDs never enter the OCI handoff identity.
 
-Both forms are removed only after a successful result has also been accepted
-by L1. Failed or interrupted executions retain them for the default 24-hour
-retry window. Agent startup removes expired marked process directories; the
-helper boot sweep removes expired deterministic OCI handoff children while
-preserving unexpired handoff data outside the swept attempt namespace. A retry
-or rerun reuses the same owner identity, and helper attempt `Delete` never
-removes the retained handoff volume.
+Neither form is removed at completion. Both are retained on every outcome and
+expire on the retention window below. Agent startup removes expired marked
+process directories; the helper boot sweep removes expired deterministic OCI
+handoff children while preserving unexpired handoff data outside the swept
+attempt namespace. A retry or rerun reuses the same owner identity, and helper
+attempt `Delete` never removes the retained handoff volume.
+
+### Results and their retention
+
+A finished run's handoff directory is its results, and it survives the run. That
+is the whole rule, and it replaces the previous one under which a successful
+attempt deleted its own directory — which meant the outcome an operator most
+wants to read was the only one that left nothing behind.
+
+Three bounds apply, and all three are contract values rather than node
+configuration, because a person reading `wefty inspect` has to know when their
+results stop existing:
+
+| Bound | Value | What happens past it |
+| --- | --- | --- |
+| Retention window | 7 days from the run finishing | The whole directory is swept, process and OCI alike. |
+| Per run | 64 MiB | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. |
+| Per node | 1 GiB across every retained run | Whole runs are evicted until the node fits. |
+
+Eviction order is the one place this design chooses what to lose. A run whose
+evidence reached the ledger goes before a run whose evidence did not, because
+the ledger still holds the first run's story and nothing holds the second's;
+within each group the oldest goes first. The run currently executing is never
+swept. Directories under the handoff root that carry no agent ownership marker
+are never touched at all, however full the node is.
+
+This bound is the agent's own. Cache-pressure rules elsewhere — the OCI image
+cache, a node running out of disk — govern their own resources and neither
+defers to nor overrides it; where both apply to one node, each enforces its own
+budget.
+
+**How results are read.** Today: on the node, under the handoff directory, by
+someone with access to that node. `wefty inspect` reports where a finished run's
+results are and when they are scheduled to expire, computed from the run's
+finish time and the retention window above rather than observed on the node —
+so a node configured with a different window, or one that evicted the run early
+for room, will differ, and the report says so. Reading a result file remotely,
+for `kind=process` and `kind=oci` alike, is #483 D2 and is not implemented.
 
 Handoff files are node-local. If a cold rerun finds files in an existing
 managed directory, its job must include the reserved routing tag

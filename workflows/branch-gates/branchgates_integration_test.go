@@ -219,22 +219,18 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 				}
 			}
 
-			// Handoff lifecycle: the node agent removes the directory as soon
-			// as its attempt succeeds, so the files survive exactly on the
-			// path an operator cares about — a failing verdict.
+			// Handoff lifecycle: results are retained on every outcome now, so
+			// the passing run -- the one an operator most wants to read and the
+			// only one that used to leave nothing behind -- keeps its files too.
 			handoff := filepath.Join(l3.DefaultHandoffRoot, accepted.RunID)
-			if testCase.wantPassed {
-				if _, err := os.Stat(handoff); !os.IsNotExist(err) {
-					t.Fatalf("handoff %s survived a succeeding attempt: %v", handoff, err)
-				}
-			} else {
-				retained, err := os.ReadFile(filepath.Join(handoff, "result.json"))
-				if err != nil {
-					t.Fatalf("read retained result.json: %v; logs:\n%s", err, logs)
-				}
-				if !bytes.Equal(bytes.TrimSpace(retained), bytes.TrimSpace(raw)) {
-					t.Fatalf("retained result.json differs from the logged one:\n%s\n%s", retained, raw)
-				}
+			retained, err := os.ReadFile(filepath.Join(handoff, "result.json"))
+			if err != nil {
+				t.Fatalf("read retained result.json: %v; logs:\n%s", err, logs)
+			}
+			if !bytes.Equal(bytes.TrimSpace(retained), bytes.TrimSpace(raw)) {
+				t.Fatalf("retained result.json differs from the logged one:\n%s\n%s", retained, raw)
+			}
+			if !testCase.wantPassed {
 				failures, err := os.ReadFile(filepath.Join(handoff, "failures.txt"))
 				if err != nil {
 					t.Fatalf("read retained failures.txt: %v", err)

@@ -698,14 +698,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
 	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
-	if succeeded && lifecycle.mailbox.Load().publicationIncomplete() {
-		// Evidence the workload wrote never reached the ledger, so the files
-		// are the only remaining copy. Removing them here would destroy the
-		// result of a run that looks successful.
-		succeeded = false
-	}
+	// Publication completeness no longer decides whether the files survive --
+	// both outcomes are retained -- but it still decides what the node gives up
+	// first when it runs out of room, so it is recorded rather than folded into
+	// the verdict.
+	published := !lifecycle.mailbox.Load().publicationIncomplete()
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
+		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
 		}
 	}
@@ -1508,11 +1507,17 @@ func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
 	return nil
 }
 
+// runtimeManagedVolumesForSuccessfulCompletion names the runtime-managed
+// volumes a successful one-shot gives up immediately.
+//
+// It is now empty, and the seam is kept rather than deleted because the answer
+// is a policy that could change per volume kind, not an absence. A one-shot
+// OCI job's only managed volume is its handoff volume, and that is precisely
+// what this milestone stopped throwing away on success: the results live there,
+// and the helper's own boot sweep expires them on the same retention window the
+// agent applies to a process run's directory.
 func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
-	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot {
-		return nil
-	}
-	return runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: spec}})
+	return nil
 }
 
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch, deadmanAdmission *attemptDeadmanAdmission) {
