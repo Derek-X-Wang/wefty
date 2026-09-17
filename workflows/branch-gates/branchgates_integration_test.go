@@ -104,8 +104,13 @@ func TestBranchGatesScriptIsValidShell(t *testing.T) {
 		t.Log("shellcheck is not installed; NOT-RUN")
 		return
 	}
+	// Default severity on purpose: findings are silenced with a scoped
+	// directive and a reason, never by raising the threshold. The version is
+	// reported because CI's shellcheck is older than a developer's and can
+	// report the same thing under a different code.
 	if output, err := exec.Command(shellcheckPath, "branch-gates.sh").CombinedOutput(); err != nil {
-		t.Fatalf("shellcheck branch-gates.sh: %v\n%s", err, output)
+		version, _ := exec.Command(shellcheckPath, "--version").Output()
+		t.Fatalf("shellcheck branch-gates.sh: %v\n%s\n%s", err, output, version)
 	}
 }
 

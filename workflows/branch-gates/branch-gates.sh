@@ -110,7 +110,7 @@ WORK_DIR=$WORK_ROOT/wefty-bg-$(printf '%.12s' "${RUN_ID##*_}")
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" || abort "cannot create $WORK_DIR"
 chmod 0700 "$WORK_DIR" 2>/dev/null || true
-# shellcheck disable=SC2329 # invoked by the EXIT trap below.
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via the EXIT trap below.
 cleanup() {
 	status=$?
 	# The curl config carries the run token: remove it first and unconditionally.
