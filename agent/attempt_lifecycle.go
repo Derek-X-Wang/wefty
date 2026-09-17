@@ -351,18 +351,42 @@ func (failure *completionDeliveryAbandoned) Unwrap() error { return failure.err 
 
 const ociRuntimeRecoveryTimeout = 10 * time.Second
 
-func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
-	attemptContext, cancelAttemptCause := context.WithCancelCause(ctx)
-	// Every authority-loss path cancels the attempt with a cause. Fencing the
-	// mailbox here, synchronously and before the cancellation itself, is what
-	// stops an attempt that has lost its lease from publishing anything
-	// further on the run's behalf.
-	cancelAttempt := func(cause error) {
-		if cause != nil {
-			lifecycle.mailbox.Load().fence(cause)
+// fencedAttemptContext derives an attempt context whose every cancellation —
+// this lifecycle's own and the parent's alike — runs fence first and to
+// completion. An attempt that has lost its authority must not be able to win a
+// race against its own final publication and write to the run's ledger after
+// the fact, so the fence cannot be something the cancellation merely races.
+func fencedAttemptContext(parent context.Context, fence func(error)) (context.Context, context.CancelCauseFunc, func()) {
+	gate, cancelGate := context.WithCancelCause(context.WithoutCancel(parent))
+	attempt, cancelAttempt := context.WithCancelCause(gate)
+	released := make(chan struct{})
+	go func() {
+		select {
+		case <-parent.Done():
+			cause := context.Cause(parent)
+			fence(cause)
+			cancelGate(cause)
+		case <-released:
 		}
-		cancelAttemptCause(cause)
-	}
+	}()
+	return attempt, func(cause error) {
+			if cause != nil {
+				fence(cause)
+			}
+			cancelAttempt(cause)
+		}, func() {
+			close(released)
+			cancelGate(context.Canceled)
+		}
+}
+
+func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
+	// The attempt context is deliberately not a direct child of ctx: every
+	// route to its cancellation passes through the mailbox fence first.
+	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, func(cause error) {
+		lifecycle.mailbox.Load().fence(cause)
+	})
+	defer releaseFenceGate()
 	defer cancelAttempt(nil)
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()

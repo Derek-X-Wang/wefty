@@ -24,7 +24,7 @@ const (
 	// label rather than an environment value precisely so the workload reads
 	// its parameters from a file and never from a name it could confuse with
 	// the reserved execution context.
-	RunParamsLabel = "run_params_json"
+	RunParamsLabel = contract.LabelRunParams
 	// MaxDispatchedRunParamsBytes bounds what travels on that label. A larger
 	// document stays in the ledger, where the submitter can still read it.
 	MaxDispatchedRunParamsBytes = 64 << 10

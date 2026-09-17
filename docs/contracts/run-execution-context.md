@@ -260,7 +260,7 @@ The layout is fixed:
 $WEFTY_RUN_DIR/params.json    the run's params, written by the agent
 $WEFTY_RUN_DIR/tmp/           staging for write-then-rename
 $WEFTY_RUN_DIR/events/        complete events, published in lexical order
-$WEFTY_RUN_DIR/.published/    the agent's cursor and bookkeeping
+$WEFTY_RUN_DIR/.published/    the agent's durable bookkeeping
 ```
 
 `params.json` carries the parameters the run was submitted with. They travel
@@ -314,8 +314,11 @@ ended; that mapping is internal and may change without changing this file
 protocol. Headers outside the set above, a repeated header, a missing or
 misplaced `wefty-protocol` line, an unknown kind, status or outcome, and a
 missing separator are all refused; the first eight refusals of an attempt are
-reported as a `failed` envelope on step `mailbox`, and the file is retired
-unpublished.
+reported as a `failed` envelope on step `mailbox`, and the file is then removed
+unpublished — but only once that report has been accepted, so an unreachable
+ledger never costs the evidence. An entry in `events/` that is not a readable
+regular file at all is removed on sight, because an entry the sweep merely
+skipped would hide every later event behind it.
 
 A process workload runs under the agent's own OS identity, so the mailbox's
 permissions are not an isolation boundary. The agent instead performs every
@@ -345,10 +348,16 @@ attempt publishes nothing further and retains its directory the same way.
 
 Each event's document is derived deterministically from its file — including
 its timestamp, which is pinned when the agent first observes the file — and its
-idempotency key is stable, so republishing after a lost cursor rename is a
-replay in L3 rather than a second document. That recovery reaches only the
-events of a retained directory: evidence removed with a successful run's
-handoff is gone.
+idempotency key is stable, so republishing after an interrupted retirement is a
+replay in L3 rather than a second document, and an already-accepted event is
+never charged against the bounds twice. That recovery reaches only the events of
+a retained directory: evidence removed with a successful run's handoff is gone.
+
+The bookkeeping under `.published/` is the agent's, but the mailbox is the
+workload's own directory and the two share an OS identity, so it cannot be made
+unreachable. The agent therefore refuses to trust what it did not write:
+bookkeeping it cannot read, parse, or persist stops publication for the attempt
+and retains the directory, rather than silently starting its accounting over.
 
 The mailbox is delivered to `kind=process` one-shots that L3 dispatched. An OCI
 handoff volume is helper-owned inside the node and the helper protocol exposes

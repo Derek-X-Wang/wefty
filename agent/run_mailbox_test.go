@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -295,6 +297,30 @@ func (l *realLedger) appender() runLedgerAppender {
 	return newFabricRunLedgerAppender(l.agentFabric, l.address)
 }
 
+// observingAppender wraps the real HTTP appender so a test can see exactly
+// what was sent and how the ledger answered.
+type observingAppender struct {
+	inner runLedgerAppender
+	mu    sync.Mutex
+	sent  [][]byte
+	errs  []error
+}
+
+func (a *observingAppender) appendRunDocument(ctx context.Context, runToken, runID, collection string, body []byte) error {
+	err := a.inner.appendRunDocument(ctx, runToken, runID, collection, body)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sent = append(a.sent, append([]byte(nil), body...))
+	a.errs = append(a.errs, err)
+	return err
+}
+
+func (a *observingAppender) observed() ([][]byte, []error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([][]byte(nil), a.sent...), append([]error(nil), a.errs...)
+}
+
 func (l *realLedger) mailbox(t *testing.T, attemptID string, clock Clock) *runMailbox {
 	t.Helper()
 	mailbox, err := prepareRunMailbox(l.spec, attemptID, l.appender(), time.Hour, clock, t.Logf)
@@ -376,11 +402,16 @@ func TestMailboxReplayAfterAgentRestartDoesNotDuplicateEnvelopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledger := startRealLedger(t, handoff, `{}`)
+	observer := &observingAppender{inner: ledger.appender()}
 	clock := newManualClock(mailboxTestClockOrigin)
-	first := ledger.mailbox(t, mailboxTestAttempt, clock)
+	first, err := prepareRunMailbox(ledger.spec, mailboxTestAttempt, observer, time.Hour, clock, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.close()
 	writeMailboxEvent(t, first.directory, "0007-envelope-implement",
 		"wefty-protocol: 1\nkind: envelope\nname: implement\nsummary: done\n--\n")
-	// The agent is lost between the accepted publication and the cursor rename.
+	// The agent is lost between the accepted publication and its retirement.
 	first.retireCheckpoint = func() bool { return false }
 	if !first.sweep(context.Background()) {
 		t.Fatal("first sweep failed against real L3")
@@ -389,11 +420,28 @@ func TestMailboxReplayAfterAgentRestartDoesNotDuplicateEnvelopes(t *testing.T) {
 	// A restarted agent re-reads the same file. Its document must be
 	// byte-identical — including the timestamp, which is pinned at first
 	// observation rather than read from the file now — so L3 replays the
-	// original instead of accepting a second envelope.
+	// original instead of accepting a second envelope or refusing a conflict.
 	clock.Advance(90 * time.Second)
-	second := ledger.mailbox(t, mailboxTestAttempt, clock)
+	second, err := prepareRunMailbox(ledger.spec, mailboxTestAttempt, observer, time.Hour, clock, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.close()
 	if !second.sweep(context.Background()) {
 		t.Fatal("republication failed against real L3")
+	}
+
+	sent, errs := observer.observed()
+	if len(sent) != 2 {
+		t.Fatalf("sent %d documents, want the same event twice", len(sent))
+	}
+	if !bytes.Equal(sent[0], sent[1]) {
+		t.Fatalf("republished document differs:\n%s\n%s", sent[0], sent[1])
+	}
+	// A conflict would come back as a rejection, which the mailbox retires
+	// silently; only a genuine replay returns no error at all.
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatalf("real L3 answers = (%v, %v), want the republication accepted as a replay", errs[0], errs[1])
 	}
 	envelopes, err := ledger.store.ListEnvelopes(context.Background(), ledger.runID)
 	if err != nil {
@@ -405,6 +453,25 @@ func TestMailboxReplayAfterAgentRestartDoesNotDuplicateEnvelopes(t *testing.T) {
 	if !envelopes[0].CreatedAt.Equal(mailboxTestClockOrigin) {
 		t.Fatalf("envelope created_at = %s, want the first observation", envelopes[0].CreatedAt)
 	}
+	// The stored document is the one that was sent, with only the attempt
+	// identity L3 bound itself added.
+	var stored, resent map[string]any
+	storedBody, err := json.Marshal(envelopes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(storedBody, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(sent[1], &resent); err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range resent {
+		if fmt.Sprint(stored[field]) != fmt.Sprint(value) {
+			t.Fatalf("stored %s = %v, resent %v", field, stored[field], value)
+		}
+	}
+
 	// The retired event is gone, so a third sweep is a no-op.
 	if !second.sweep(context.Background()) {
 		t.Fatal("third sweep failed")
@@ -745,7 +812,7 @@ func TestRunMailboxEnforcesItsPublicationBounds(t *testing.T) {
 			t.Fatalf("published %d documents, want the count bound to hold at 2", len(documents))
 		}
 		// Bounded events are retired, so they cannot be retried forever.
-		if names, err := mailbox.scanEvents(); err != nil || len(names) != 0 {
+		if names, _, err := mailbox.scanEvents(); err != nil || len(names) != 0 {
 			t.Fatalf("events remaining after the bound: %v, %v", names, err)
 		}
 	})
@@ -818,7 +885,7 @@ func TestMalformedMailboxEventIsReportedAndRetired(t *testing.T) {
 	if envelope.Status != contract.EnvelopeFailed || envelope.StepID != "mailbox" {
 		t.Fatalf("rejection envelope = %+v", envelope)
 	}
-	if names, err := mailbox.scanEvents(); err != nil || len(names) != 0 {
+	if names, _, err := mailbox.scanEvents(); err != nil || len(names) != 0 {
 		t.Fatalf("malformed event was not retired: %v, %v", names, err)
 	}
 }
@@ -961,5 +1028,186 @@ func TestRunMailboxEventParsing(t *testing.T) {
 			}
 			testCase.assert(t, event)
 		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// Post-preparation directory replacement, fencing, and durable bookkeeping
+// --------------------------------------------------------------------------
+
+func TestRunMailboxIgnoresAPostPreparationEventsDirectoryReplacement(t *testing.T) {
+	t.Run("replaced by a FIFO", func(t *testing.T) {
+		appender := newRecordingAppender("")
+		mailbox, _, _ := newTestMailbox(t, appender, "")
+		writeMailboxEvent(t, mailbox.directory, "0001-gate-test",
+			"wefty-protocol: 1\nkind: gate\nname: test\noutcome: pass\n--\n")
+		events := filepath.Join(mailbox.directory, runMailboxEventsDirectoryName)
+		replaced := filepath.Join(mailbox.directory, "events.moved")
+		if err := os.Rename(events, replaced); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(events, 0o600); err != nil {
+			t.Skipf("this filesystem cannot create a FIFO: %v", err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			mailbox.finalize(context.Background())
+		}()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+			t.Fatal("a FIFO in place of the events directory blocked finalization")
+		}
+		// The directory opened at preparation is the one the agent reads, so
+		// the event it already held is published and the FIFO is irrelevant.
+		if documents := appender.snapshot(); len(documents) != 1 {
+			t.Fatalf("published %d documents through the retained directory", len(documents))
+		}
+	})
+
+	t.Run("replaced by a symlink to the staging directory", func(t *testing.T) {
+		appender := newRecordingAppender("")
+		mailbox, _, _ := newTestMailbox(t, appender, "")
+		staging := filepath.Join(mailbox.directory, runMailboxStagingDirectoryName)
+		// A half-written event, which must never be published.
+		if err := os.WriteFile(filepath.Join(staging, "0001-partial"),
+			[]byte("wefty-protocol: 1\nkind: gate\nname: partial\noutcome: pass\n--\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		events := filepath.Join(mailbox.directory, runMailboxEventsDirectoryName)
+		if err := os.Rename(events, filepath.Join(mailbox.directory, "events.moved")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(staging, events); err != nil {
+			t.Fatal(err)
+		}
+		mailbox.sweep(context.Background())
+		if documents := appender.snapshot(); len(documents) != 0 {
+			t.Fatalf("a redirected events directory published %d staged documents", len(documents))
+		}
+	})
+}
+
+func TestParentCancellationFencesBeforeTheAttemptContextEnds(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	var fencedFirst atomic.Bool
+	var fencedCount atomic.Int32
+	attempt, cancelAttempt, release := fencedAttemptContext(parent, func(error) {
+		fencedCount.Add(1)
+		fencedFirst.Store(true)
+	})
+	defer release()
+	defer cancelAttempt(nil)
+
+	if attempt.Err() != nil {
+		t.Fatal("the attempt context started cancelled")
+	}
+	cancelParent()
+	<-attempt.Done()
+	// Reaching Done is only possible after the fence ran to completion: the
+	// gate between the parent and the attempt is cancelled by the same
+	// goroutine, after fence returns.
+	if !fencedFirst.Load() {
+		t.Fatal("the attempt context was cancelled without fencing publication")
+	}
+	if !errors.Is(context.Cause(attempt), context.Canceled) {
+		t.Fatalf("attempt cause = %v", context.Cause(attempt))
+	}
+	if fencedCount.Load() != 1 {
+		t.Fatalf("fenced %d times, want once", fencedCount.Load())
+	}
+}
+
+func TestAFailedRejectionReportLeavesTheEventPending(t *testing.T) {
+	appender := newRecordingAppender("")
+	appender.failWith(errors.New("run ledger is unreachable"))
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	writeMailboxEvent(t, mailbox.directory, "0001-broken", "not a protocol file\n")
+	mailbox.finalize(context.Background())
+	if !mailbox.publicationIncomplete() {
+		t.Fatal("an undeliverable rejection report did not mark publication incomplete")
+	}
+	names, _, err := mailbox.scanEvents()
+	if err != nil || len(names) != 1 {
+		t.Fatalf("events remaining = %v (%v), want the event kept for retry", names, err)
+	}
+}
+
+func TestCorruptMailboxBookkeepingFailsClosed(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, handoff, _ := newTestMailbox(t, appender, "")
+	writeMailboxEvent(t, mailbox.directory, "0001-gate-test",
+		"wefty-protocol: 1\nkind: gate\nname: test\noutcome: pass\n--\n")
+	state := filepath.Join(mailbox.directory, runMailboxPublishedDirectoryName, runMailboxStateFileName)
+	if err := os.WriteFile(state, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := prepareRunMailbox(mailboxSpec("run_mailbox", handoff, ""), mailboxTestAttempt, appender, time.Hour, nil, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.close()
+	restarted.finalize(context.Background())
+	if documents := appender.snapshot(); len(documents) != 0 {
+		t.Fatalf("a mailbox with untrustworthy bookkeeping published %d documents", len(documents))
+	}
+	if !restarted.publicationIncomplete() {
+		t.Fatal("corrupt bookkeeping did not mark publication incomplete")
+	}
+	names, _, err := restarted.scanEvents()
+	if err != nil || len(names) != 1 {
+		t.Fatalf("events remaining = %v (%v), want the evidence retained", names, err)
+	}
+}
+
+func TestJunkEntriesCannotHideLaterMailboxEvents(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	mailbox.maxScan = 2
+	events := filepath.Join(mailbox.directory, runMailboxEventsDirectoryName)
+	// Two entries that are not events sort ahead of the real one and would,
+	// if merely skipped, fill every page forever.
+	if err := os.Mkdir(filepath.Join(events, "0001-directory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(events, "0002-symlink")); err != nil {
+		t.Fatal(err)
+	}
+	writeMailboxEvent(t, mailbox.directory, "0003-gate-test",
+		"wefty-protocol: 1\nkind: gate\nname: test\noutcome: pass\n--\n")
+
+	mailbox.finalize(context.Background())
+	documents := appender.snapshot()
+	if len(documents) != 1 {
+		t.Fatalf("published %d documents, want the hidden event to be reached", len(documents))
+	}
+	var gate contract.GateResult
+	if err := json.Unmarshal(documents[0].body, &gate); err != nil {
+		t.Fatal(err)
+	}
+	if gate.Name != "test" {
+		t.Fatalf("published gate = %+v", gate)
+	}
+	if mailbox.publicationIncomplete() {
+		t.Fatal("a drained mailbox reported incomplete publication")
+	}
+}
+
+func TestAnExhaustedScanPageCountsAsPending(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	mailbox.maxScan = 1
+	for index := range 2 {
+		writeMailboxEvent(t, mailbox.directory, fmt.Sprintf("%04d-gate", index),
+			fmt.Sprintf("wefty-protocol: 1\nkind: gate\nname: g%d\noutcome: pass\n--\n", index))
+	}
+	// One sweep can only see one entry, so it must not claim to be finished.
+	if mailbox.sweep(context.Background()) {
+		t.Fatal("a full scan page reported a drained mailbox")
+	}
+	if !mailbox.pending() {
+		t.Fatal("a mailbox with unseen entries reported nothing pending")
 	}
 }

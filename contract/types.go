@@ -61,7 +61,30 @@ const (
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
 	// consumes node-local handoff files from an earlier execution.
 	StableNodeTagPrefix = "wefty:node:"
+
+	// LabelRunParams carries a dispatched run's parameter document to the node
+	// agent, which writes it into the run mailbox. It travels on the claim path
+	// only: RedactJobLabels removes it from every public job projection, the
+	// way SensitiveEnv is removed.
+	LabelRunParams = "run_params_json"
 )
+
+// RedactJobLabels returns labels without any reserved agent-only value. It
+// copies rather than mutates, because the caller's map is shared with the
+// stored job.
+func RedactJobLabels(labels map[string]string) map[string]string {
+	if _, present := labels[LabelRunParams]; !present {
+		return labels
+	}
+	redacted := make(map[string]string, len(labels))
+	for name, value := range labels {
+		if name == LabelRunParams {
+			continue
+		}
+		redacted[name] = value
+	}
+	return redacted
+}
 
 type ComputerControlTenureState string
 
