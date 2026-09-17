@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/workflowhelper"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -126,10 +128,6 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := exec.LookPath("curl"); err != nil {
-		t.Fatal(err)
-	}
-
 	subject := initializeSubjectRepository(t)
 	caller, store := startStack(t)
 
@@ -174,14 +172,15 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 					Content: string(script), SHA256: hex.EncodeToString(digest[:]),
 					Interpreter: []string{bashPath}, Mode: &mode,
 				},
-				Params:           params,
-				Tags:             []string{contract.StableNodeTagPrefix + nodeID},
-				Limits:           &contract.RunLimits{MaxRuntimeSeconds: int(runBudget.Seconds())},
+				Params: params,
+				Tags:   []string{contract.StableNodeTagPrefix + nodeID},
+				Limits: &contract.RunLimits{MaxRuntimeSeconds: int(runBudget.Seconds())},
+				// The envelope the previous HTTP path guaranteed is still
+				// guaranteed, now by the ledger refusing a run that produced
+				// none. DispatchAuthority is deliberately absent: branch-gates
+				// reports and dispatches nothing, so it runs with no credential
+				// at all.
 				RequiredEnvelope: true,
-				// branch-gates still reports to L3 over HTTP with the run
-				// token, so it must be submitted as a run that holds one until
-				// it is converted to the run mailbox.
-				DispatchAuthority: true,
 			}, "branch-gates-exercise-"+testCase.ref)
 
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
@@ -255,10 +254,12 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 				assertCredentialProbe(t, "failures.txt", string(failures), 2)
 			}
 			assertCredentialProbe(t, "run log", logs, testCase.wantProbes)
+			assertNoCredentialInTheWorkflowShell(t, logs)
 			assertScratchRemoved(t, accepted.RunID)
 
-			// The ledger carries one envelope per gate plus the single final
-			// gate result appended by hand through the L3 API.
+			// The ledger carries one envelope per gate, the run's result event,
+			// and the single final gate result -- all of them published by the
+			// node agent from the mailbox, none of them by this job.
 			gotSteps := make([]string, 0, len(record.Envelopes))
 			for _, envelope := range record.Envelopes {
 				gotSteps = append(gotSteps, envelope.StepID)
@@ -269,11 +270,14 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 				if testCase.wantOutcomes[envelope.StepID] == "fail" {
 					wantStatus = contract.EnvelopeFailed
 				}
+				if envelope.StepID == "result" && !testCase.wantPassed {
+					wantStatus = contract.EnvelopeFailed
+				}
 				if envelope.Status != wantStatus {
 					t.Fatalf("envelope %s status = %q, want %q", envelope.StepID, envelope.Status, wantStatus)
 				}
 			}
-			if want := strings.Split(allGates, ","); !equalStrings(gotSteps, want) {
+			if want := append(strings.Split(allGates, ","), "result"); !equalStrings(gotSteps, want) {
 				t.Fatalf("envelope steps = %v, want %v", gotSteps, want)
 			}
 			if len(record.Gates) != 1 {
@@ -287,8 +291,17 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			if finalGate.Name != "branch-gates" || finalGate.Outcome != wantOutcome || finalGate.AttemptID == "" {
 				t.Fatalf("final gate = %#v, want name branch-gates outcome %q with a bound attempt", finalGate, wantOutcome)
 			}
-			if !gateEvidenceContains(finalGate, "commit", result.Commit) {
-				t.Fatalf("final gate evidence = %#v, want the resolved commit", finalGate.Evidence)
+			// The mailbox defaults a gate's step to its name, so the step
+			// identity the HTTP path set explicitly is preserved rather than
+			// lost. Pinned because it is not obvious from either side alone.
+			if finalGate.StepID != "branch-gates" {
+				t.Fatalf("final gate step = %q, want branch-gates", finalGate.StepID)
+			}
+			// A mailbox gate carries exactly one evidence value, so the
+			// structure the HTTP path spread across entries now lives inside
+			// that single document.
+			if len(finalGate.Evidence) != 1 || !strings.Contains(finalGate.Evidence[0].Value, result.Commit) {
+				t.Fatalf("final gate evidence = %#v, want one document naming the resolved commit", finalGate.Evidence)
 			}
 
 		})
@@ -366,10 +379,6 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 				Tags:             []string{contract.StableNodeTagPrefix + nodeID},
 				Limits:           &contract.RunLimits{MaxRuntimeSeconds: int(runBudget.Seconds())},
 				RequiredEnvelope: true,
-				// branch-gates still reports to L3 over HTTP with the run
-				// token, so it must be submitted as a run that holds one until
-				// it is converted to the run mailbox.
-				DispatchAuthority: true,
 			}, "branch-gates-negative-"+testCase.name)
 
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
@@ -415,23 +424,27 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 				t.Fatalf("failures.txt is not the standard diagnostic:\n%s", diagnostic)
 			}
 
-			if len(record.Envelopes) != 1 || record.Envelopes[0].StepID != testCase.wantStep ||
-				record.Envelopes[0].Status != contract.EnvelopeFailed {
-				t.Fatalf("envelopes = %#v, want one failed %q envelope", record.Envelopes, testCase.wantStep)
+			// The failed step envelope, then the workflow-error result
+			// document, both failed and both published from the mailbox.
+			if len(record.Envelopes) != 2 ||
+				record.Envelopes[0].StepID != testCase.wantStep || record.Envelopes[0].Status != contract.EnvelopeFailed ||
+				record.Envelopes[1].StepID != "result" || record.Envelopes[1].Status != contract.EnvelopeFailed {
+				t.Fatalf("envelopes = %#v, want a failed %q envelope then a failed result", record.Envelopes, testCase.wantStep)
 			}
 			if len(record.Gates) != 1 || record.Gates[0].Name != "branch-gates" ||
 				record.Gates[0].Outcome != contract.GateError {
 				t.Fatalf("gates = %#v, want one branch-gates gate with outcome error", record.Gates)
 			}
 			assertCredentialProbe(t, "run log", logs, 0)
+			assertNoCredentialInTheWorkflowShell(t, logs)
 			assertScratchRemoved(t, accepted.RunID)
 		})
 	}
 }
 
 // assertScratchRemoved pins the workflow's own cleanup: the scratch directory
-// holds the clone, the Go caches and the 0600 curl config carrying the run
-// token, so it must not outlive the run on either path.
+// holds the clone, the Go caches and every document this workflow assembles,
+// so it must not outlive the run on either path.
 //
 // It polls, because a `fail` or `error` gate makes the run terminal in L3 while
 // the workload is still exiting: the run reads as failed before the shell has
@@ -474,6 +487,27 @@ func assertCredentialProbe(t *testing.T, surface, content string, wantProbes int
 		if strings.Contains(content, needle) {
 			t.Fatalf("%s leaks %q:\n%s", surface, needle, content)
 		}
+	}
+}
+
+// assertNoCredentialInTheWorkflowShell reads the workflow's own report of what
+// it can see. The subject probe covers the code under test; this covers the
+// shell running it, which is the half that used to hold the run token and is
+// the whole point of reporting through the mailbox.
+func assertNoCredentialInTheWorkflowShell(t *testing.T, logs string) {
+	t.Helper()
+	const marker = "branch-gates: credentials in the workflow environment: ["
+	index := strings.Index(logs, marker)
+	if index < 0 {
+		t.Fatalf("the run log carries no credential report; the workflow may not have started:\n%s", logs)
+	}
+	rest := logs[index+len(marker):]
+	end := strings.Index(rest, "]")
+	if end < 0 {
+		t.Fatalf("the credential report is truncated:\n%s", logs)
+	}
+	if visible := rest[:end]; visible != "" {
+		t.Fatalf("the workflow shell was handed credentials it does not need: [%s]", visible)
 	}
 }
 
@@ -593,7 +627,7 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 		LogSpoolDirectory: t.TempDir(),
 		WorkloadRuntimes: map[string]agent.WorkloadRuntime{
 			contract.JobKindProcess: processrunner.NewAdapter(processrunner.New(processrunner.Config{
-				BaseEnvironment: os.Environ(),
+				BaseEnvironment: environmentWithWefty(t),
 			})),
 		},
 	})
@@ -615,6 +649,31 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 	caller := fabricHTTPClient(callerFabric, l3.DefaultL3Address)
 	t.Cleanup(caller.CloseIdleConnections)
 	return caller, l3Store
+}
+
+// environmentWithWefty puts a freshly built `wefty` on the job's PATH. The
+// workflow reports through `wefty run`, so the binary is now as much a
+// prerequisite of the job rootfs as git and go are -- and building it here is
+// what lets the CI job stay exactly as it is.
+func environmentWithWefty(t *testing.T) []string {
+	t.Helper()
+	directory := t.TempDir()
+	binary := filepath.Join(directory, "wefty")
+	build := exec.Command("go", "build", "-o", binary, "github.com/Derek-X-Wang/wefty/cmd/wefty")
+	build.Dir = ".."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build wefty for the workflow rootfs: %v\n%s", err, output)
+	}
+	environment := make([]string, 0, len(os.Environ())+1)
+	path := directory
+	for _, entry := range os.Environ() {
+		if value, ok := strings.CutPrefix(entry, "PATH="); ok {
+			path = directory + string(os.PathListSeparator) + value
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment, "PATH="+path)
 }
 
 func submitRun(t *testing.T, client *http.Client, input l3.CreateRunRequest, idempotencyKey string) l3.RunAccepted {
@@ -794,4 +853,102 @@ func runGit(t *testing.T, directory string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 	return string(output)
+}
+
+// TestEmbeddedInlineWriterMatchesTheShippedTemplate pins the copy. The workflow
+// embeds the inline mailbox writer so an image without the wefty binary -- the
+// upstream golang image the OCI examples use -- can still report, and a copy
+// that drifts from the shipped template is a second, subtly different protocol
+// producer. Byte-identical or nothing.
+func TestEmbeddedInlineWriterMatchesTheShippedTemplate(t *testing.T) {
+	script, err := os.ReadFile("branch-gates.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const begin = "# >>> BEGIN embedded inline run-mailbox writer >>>\n"
+	const end = "# <<< END embedded inline run-mailbox writer <<<\n"
+	start := strings.Index(string(script), begin)
+	if start < 0 {
+		t.Fatal("branch-gates.sh carries no embedded inline writer block")
+	}
+	rest := string(script)[start+len(begin):]
+	stop := strings.Index(rest, end)
+	if stop < 0 {
+		t.Fatal("the embedded inline writer block is not terminated")
+	}
+	if embedded, want := rest[:stop], workflowhelper.InlineBashWriter(); embedded != want {
+		t.Fatalf("the embedded inline writer has drifted from the shipped template; "+
+			"copy internal/workflowhelper/templates/inline-writer.sh back between the markers "+
+			"(embedded %d bytes, template %d bytes)", len(embedded), len(want))
+	}
+}
+
+// TestBranchGatesReportsWithoutTheWeftyBinary is the fallback under the
+// condition that matters: the helper absent and the workflow failing. The
+// verdict document must still reach the handoff directory, because that is what
+// an operator reads off the node, and it must not depend on a reporter that is
+// not there.
+func TestBranchGatesReportsWithoutTheWeftyBinary(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is required to run the workflow script")
+	}
+	handoff := t.TempDir()
+	mailbox := filepath.Join(handoff, ".wefty", "run_without_wefty")
+	for _, directory := range []string{filepath.Join(mailbox, "tmp"), filepath.Join(mailbox, "events")} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No ref: the input failure path, which is the one that reports last and
+	// would lose its result document to an absent helper.
+	if err := os.WriteFile(filepath.Join(mailbox, "params.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(bashPath, "branch-gates.sh")
+	// A PATH with no wefty on it, and deliberately nothing else from this
+	// process: the point is a rootfs that never had the binary.
+	command.Env = []string{
+		"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+		"WEFTY_RUN_ID=run_without_wefty",
+		"WEFTY_RUN_DIR=" + mailbox,
+		"WEFTY_HANDOFF_DIR=" + handoff,
+		"BRANCH_GATES_WORK_ROOT=" + t.TempDir(),
+	}
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("exit = %v, want 1 on the failure path:\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "reporting with the inline mailbox writer") {
+		t.Fatalf("the workflow did not fall back to the inline writer:\n%s", output)
+	}
+
+	retained, err := os.ReadFile(filepath.Join(handoff, "result.json"))
+	if err != nil {
+		t.Fatalf("no result.json survived an absent helper: %v\n%s", err, output)
+	}
+	var result struct {
+		Workflow      string `json:"workflow"`
+		Passed        bool   `json:"passed"`
+		WorkflowError struct {
+			Step    string `json:"step"`
+			Message string `json:"message"`
+		} `json:"workflow_error"`
+	}
+	if err := json.Unmarshal(retained, &result); err != nil {
+		t.Fatalf("decode retained result.json %q: %v", retained, err)
+	}
+	if result.Workflow != "branch-gates" || result.Passed || result.WorkflowError.Step == "" {
+		t.Fatalf("retained result.json is not a workflow error: %s", retained)
+	}
+	if _, err := os.Stat(filepath.Join(handoff, "failures.txt")); err != nil {
+		t.Fatalf("no failures.txt survived an absent helper: %v", err)
+	}
+	// The events are written too, so a node agent would publish them.
+	events, err := os.ReadDir(filepath.Join(mailbox, "events"))
+	if err != nil || len(events) == 0 {
+		t.Fatalf("the inline writer wrote no mailbox events: %v", err)
+	}
 }

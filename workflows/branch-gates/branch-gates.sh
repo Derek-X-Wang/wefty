@@ -3,13 +3,19 @@
 # branch-gates: run the wefty gates against one ref and hand the verdict back.
 #
 # Contract: docs/contracts/run-execution-context.md. The workflow reads
-# WEFTY_RUN_ID, WEFTY_L3_ENDPOINT, WEFTY_RUN_TOKEN and WEFTY_HANDOFF_DIR, clones
-# the repository at the requested ref into a scratch directory, runs the gates,
-# writes result.json and failures.txt into the handoff directory, appends one
-# envelope per gate and appends one final gate result.
+# WEFTY_RUN_ID, WEFTY_RUN_DIR and WEFTY_HANDOFF_DIR, clones the repository at
+# the requested ref into a scratch directory, runs the gates, writes
+# result.json and failures.txt into the handoff directory, reports one envelope
+# per gate, and reports one final gate result.
 #
-# Input arrives as run params (read back from GET /v1/runs/{run_id} with the run
-# token, because a job never receives its own params):
+# It reports through the run mailbox, not over HTTP. `wefty run envelope|gate|
+# result` writes event files into WEFTY_RUN_DIR and the node agent publishes
+# them to the run ledger with the credential it already holds, so this job holds
+# none of its own. Where `wefty` is not on PATH -- a stock upstream image, for
+# one -- the embedded inline writer below produces the same events.
+#
+# Input arrives as run params, read from the mailbox with `wefty run params`
+# (the agent writes them there; a job never receives them in its environment):
 #
 #   ref        required   branch, tag or commit to test
 #   repo_url   optional   clone source (default: the public wefty repository)
@@ -23,14 +29,16 @@
 # BRANCH_GATES_COPY_TO override the params for a local dry run.
 #
 # Trust boundary: the gates run as the run's own OS user, as descendants of
-# this shell, which holds the run token for the whole run. `env -i` with a small
-# allowlist, fresh per-run HOME/XDG/Go caches and disabled global Git
-# configuration keep credentials and operator state out of the ordinary path --
-# it stops a failing test from printing the token into failures.txt, which is
-# copied verbatim before any log redaction -- but it is hygiene, not an OS
-# boundary: a deliberately hostile branch running under the same UID can still
-# reach this shell's environment. Only test branches you trust. Removing the
-# token from the job entirely is a #476 design item.
+# this shell. Reporting goes through the mailbox, so this shell holds neither
+# the run token nor the attempt credential, and a hostile branch therefore gains
+# no authority over the cluster from this run -- it cannot write another run or
+# submit a child job. It can still forge this run's own evidence by writing into
+# the mailbox. Everything else is unchanged: `env -i` with a small allowlist,
+# fresh per-run HOME/XDG/Go caches and disabled global Git configuration are
+# hygiene, not an OS boundary, the subject inherits this node's module and TLS
+# configuration (a proxy URL can carry credentials of its own), and a branch
+# running under the same UID still shares this user's access to the machine.
+# Only test branches you trust.
 #
 # Exit codes carry the verdict, deliberately. The node agent removes a handoff
 # directory as soon as its attempt succeeds (docs/contracts/run-execution-context.md,
@@ -47,6 +55,12 @@
 # Both paths also echo result.json into the run log, which is the only result
 # surface reachable from the host for an OCI run.
 
+# The embedded inline writer below is a verbatim copy, so its functions cannot
+# carry their own directives, and this workflow reaches them indirectly --
+# through `report`, which takes the producer as arguments. SC2329 (and SC2317,
+# which shellcheck 0.9.0 in CI raises for the same reason) is therefore
+# silenced for the file rather than for a block a copy is not allowed to have.
+# shellcheck disable=SC2317,SC2329
 set -u
 
 WORKFLOW=branch-gates
@@ -56,6 +70,7 @@ KNOWN_GATES="gofmt fabric-boundary vet test"
 FAILURE_BYTE_LIMIT=524288
 
 # Fields the failure path needs before they are known.
+RESULT_FILE=
 REF=
 REPO_URL=
 GATES=
@@ -83,11 +98,22 @@ require_context() {
 }
 
 RUN_ID=$(require_context WEFTY_RUN_ID) || exit 1
-L3_ENDPOINT=$(require_context WEFTY_L3_ENDPOINT) || exit 1
-RUN_TOKEN=$(require_context WEFTY_RUN_TOKEN) || exit 1
+# The value is not kept: every `wefty run` subcommand reads WEFTY_RUN_DIR from
+# the environment itself. What matters here is failing early, with the contract
+# named, when this job was dispatched without a mailbox to report through.
+require_context WEFTY_RUN_DIR >/dev/null || exit 1
 HANDOFF_DIR=$(require_context WEFTY_HANDOFF_DIR) || exit 1
-L3_ENDPOINT=${L3_ENDPOINT%/}
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# The boundary this workflow claims, stated in its own log on every run. A
+# reporting run holds no credential, so this list is empty; if it ever is not,
+# the run was submitted with dispatch authority it does not need.
+visible_credentials=
+for name in WEFTY_RUN_TOKEN WEFTY_ATTEMPT_TOKEN WEFTY_COMPUTER_TOKEN; do
+	eval "value=\${$name:-}"
+	[ -z "$value" ] || visible_credentials="$visible_credentials $name"
+done
+log "credentials in the workflow environment: [${visible_credentials# }]"
 
 mkdir -p "$HANDOFF_DIR" || abort "cannot create handoff directory $HANDOFF_DIR"
 
@@ -110,11 +136,13 @@ WORK_DIR=$WORK_ROOT/wefty-bg-$(printf '%.12s' "${RUN_ID##*_}")
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" || abort "cannot create $WORK_DIR"
 chmod 0700 "$WORK_DIR" 2>/dev/null || true
+# The result document is assembled here and published from here: `wefty run
+# result` is what places the handoff copy, so writing that copy by hand as well
+# would mean the helper reading the file it is writing.
+RESULT_FILE=$WORK_DIR/result.json
 # shellcheck disable=SC2317,SC2329 # invoked indirectly via the EXIT trap below.
 cleanup() {
 	status=$?
-	# The curl config carries the run token: remove it first and unconditionally.
-	rm -f "${CURL_CONFIG:-}" 2>/dev/null || true
 	if [ -d "$WORK_DIR" ]; then
 		# The Go module cache -- and a downloaded toolchain in particular --
 		# leaves read-only directories that u+w alone cannot make traversable.
@@ -128,22 +156,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The run token stays out of every argument vector: curl reads the
-# Authorization header from a 0600 config file instead of --header. This is
-# hygiene, not a boundary -- see "Trust boundary" in the README.
-CURL_CONFIG=$WORK_DIR/curl.conf
-(
-	umask 077
-	printf 'header = "Authorization: Bearer %s"\n' \
-		"$(printf '%s' "$RUN_TOKEN" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')" >"$CURL_CONFIG"
-) || abort "cannot write the curl authorization config"
-
 # --------------------------------------------------------------------------
-# JSON without a helper
+# JSON by hand, for the documents this workflow owns
 #
-# There is no envelope/gate helper yet, so every protocol body below is
-# assembled by hand. json_escape drops control characters that JSON cannot
-# carry raw, escapes the two structural characters, and folds newlines.
+# The protocol bodies are the helper's job now. What is still assembled here is
+# result.json, which is this workflow's own schema rather than the contract's.
+# json_escape drops control characters that JSON cannot carry raw, escapes the
+# two structural characters, and folds newlines.
 # --------------------------------------------------------------------------
 
 json_escape() {
@@ -157,105 +176,206 @@ json_escape() {
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # --------------------------------------------------------------------------
-# L3 calls
+# Reporting
+#
+# Every protocol document is written into the run mailbox for the node agent to
+# publish. Two producers write the same file protocol: `wefty run`, which is
+# preferred wherever the binary exists, and the inline writer below for an image
+# that does not ship it -- the upstream `golang` image the OCI examples use, for
+# one. The inline writer is a verbatim copy of the one `wefty workflow init`
+# scaffolds; a test asserts the two stay byte-identical.
 #
 # These return non-zero instead of exiting, so the caller decides whether a
-# failed protocol write is fatal (normal path) or best effort (failure path).
-# There is no bounded retry here; adding one is part of #476.
+# failed write is fatal (normal path) or best effort (failure path).
 # --------------------------------------------------------------------------
 
-# l3_call sets L3_STATUS and leaves the response body in L3_RESPONSE_FILE. It
-# must not be called inside a command substitution: the status has to land in
-# this shell, not in a subshell.
-L3_STATUS=0
-L3_RESPONSE_FILE=
-L3_ERROR=
+# >>> BEGIN embedded inline run-mailbox writer >>>
+# --------------------------------------------------------------------------
+# Inline run-mailbox writer (fallback)
+#
+# A parser-compatible convenience for an image that does not ship the wefty
+# binary. It is NOT hardened and NOT durable: it writes through pathnames, so
+# a hostile co-tenant that can plant a symlink in this directory can redirect
+# it, it inherits the ambient umask, and it does not flush, so a crash can lose
+# an event whose name already exists. `wefty run ...` does all three properly.
+# Use it wherever the binary exists; this is the fallback for where it does not.
+#
+# The OCI case is exactly where it earns its keep: an OCI attempt's mailbox lives
+# in its helper-owned handoff volume, and the image that runs there is usually
+# not one that ships the wefty binary. The caveats above still apply, and they
+# apply more there, because that directory is inside a container.
+#
+# Protocol: docs/contracts/run-execution-context.md, "Run mailbox".
+# --------------------------------------------------------------------------
 
-l3_call() {
-	method=$1
-	path=$2
-	body_file=${3:-}
-	# Never let a previous request's status decide this one.
-	L3_STATUS=000
-	[ -z "$L3_RESPONSE_FILE" ] || rm -f "$L3_RESPONSE_FILE"
-	L3_RESPONSE_FILE=$(mktemp) || {
-		L3_ERROR="cannot create a response file for $method $path"
+# Nanoseconds since the epoch, as a 19-digit number. A sweep publishes in
+# lexical order, so the file name is the only ordering signal a producer has;
+# without a sub-second stamp, two events written back to back would be
+# published in alphabetical order of their kind. The width must match what
+# `wefty run` writes, or a workflow that uses both would sort every fallback
+# event ahead of every helper event.
+#
+# bash 5 carries microseconds in EPOCHREALTIME, so the last three digits are
+# always zero; a shell without it (bash 4, dash) degrades to seconds and relies
+# on the per-process sequence below for ordering.
+wefty_nanos() {
+	if [ -n "${EPOCHREALTIME:-}" ]; then
+		printf '%019d' "$(printf '%s%.6s000' "${EPOCHREALTIME%%[.,]*}" "${EPOCHREALTIME#*[.,]}000000")"
+	else
+		printf '%019d' "$(date -u +%s)000000000"
+	fi
+}
+
+# wefty_header_value VALUE LIMIT -- one header line's worth of VALUE: fold what
+# a header cannot carry, drop the rest, and truncate to LIMIT bytes.
+#
+# Truncating rather than refusing is the fallback's choice, and it is the safe
+# direction: an over-long summary that pushed the "--" separator past the 64 KiB
+# event bound would be truncated by the agent mid-header and then refused
+# outright, costing the whole event. `wefty run` refuses instead, because it can
+# tell the author which flag was too long.
+wefty_header_value() {
+	printf '%s' "${1:-}" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177' |
+		LC_ALL=C cut -b "1-${2:-255}" |
+		sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# wefty_event KIND NAME STEP STATUS OUTCOME SUMMARY PAYLOAD_FILE KEY
+# Every argument after KIND may be empty. The rename into events/ is the only
+# "done writing" signal the protocol has, so nothing partial is ever visible.
+#
+# The payload is always declared `text`. This shell has no JSON parser, and the
+# agent refuses an event whose payload claims `json` and then fails to decode
+# -- so a structural guess here would trade a readable text payload for a lost
+# event. `wefty run` declares `json` because it can actually validate one.
+wefty_event() {
+	[ -n "${WEFTY_RUN_DIR:-}" ] || {
+		printf 'no WEFTY_RUN_DIR: this job has no run mailbox to report through\n' >&2
 		return 1
 	}
-	if [ -n "$body_file" ]; then
-		L3_STATUS=$(curl --silent --show-error --max-time 60 \
-			--output "$L3_RESPONSE_FILE" --write-out '%{http_code}' \
-			--request "$method" \
-			--config "$CURL_CONFIG" \
-			--header 'Content-Type: application/json' \
-			--data-binary "@$body_file" \
-			"$L3_ENDPOINT$path") || L3_STATUS=000
-	else
-		L3_STATUS=$(curl --silent --show-error --max-time 60 \
-			--output "$L3_RESPONSE_FILE" --write-out '%{http_code}' \
-			--request "$method" \
-			--config "$CURL_CONFIG" \
-			"$L3_ENDPOINT$path") || L3_STATUS=000
+	mkdir -p "$WEFTY_RUN_DIR/tmp" "$WEFTY_RUN_DIR/events" || return 1
+	WEFTY_EVENT_SEQ=$(((${WEFTY_EVENT_SEQ:-0} + 1) % 10000))
+	wefty_slug=$(printf '%s' "${2:-${3:-$1}}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
+	wefty_file=$(printf '%s-%04d-%s-%.32s-%08x' \
+		"$(wefty_nanos)" "$WEFTY_EVENT_SEQ" "$1" "${wefty_slug:-event}" "$$")
+	{
+		printf 'wefty-protocol: 1\nkind: %s\n' "$1"
+		for wefty_header in name step status outcome summary key; do
+			case $wefty_header in
+			# 255 is the v1 schema's identifier bound and 2048 the agent's
+			# summary bound; past either the agent rewrites the value, and a
+			# rewritten key is a different idempotency identity.
+			name) wefty_raw=${2:-} wefty_limit=255 ;;
+			step) wefty_raw=${3:-} wefty_limit=255 ;;
+			status) wefty_raw=${4:-} wefty_limit=32 ;;
+			outcome) wefty_raw=${5:-} wefty_limit=32 ;;
+			summary) wefty_raw=${6:-} wefty_limit=2048 ;;
+			key) wefty_raw=${8:-} wefty_limit=255 ;;
+			esac
+			wefty_value=$(wefty_header_value "$wefty_raw" "$wefty_limit")
+			[ -z "$wefty_value" ] || printf '%s: %s\n' "$wefty_header" "$wefty_value"
+		done
+		printf 'payload: text\ncreated-at: %s\n--\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		[ -z "${7:-}" ] || cat "$7"
+	} >"$WEFTY_RUN_DIR/tmp/$wefty_file" || return 1
+	mv "$WEFTY_RUN_DIR/tmp/$wefty_file" "$WEFTY_RUN_DIR/events/$wefty_file"
+}
+
+# Read one run parameter without jq. Deliberately limited, and the limits are
+# the reason to prefer `wefty run params NAME` whenever the binary is present:
+# this reads TOP-LEVEL STRING params only, it does not decode JSON escapes (a
+# value containing \" or \\ reads as empty rather than as a truncated value,
+# so a workflow can detect it), and a key that also appears in a nested object
+# is not disambiguated. Anything richer needs the helper or jq.
+wefty_param() {
+	[ -f "${WEFTY_RUN_DIR:-}/params.json" ] || return 0
+	tr -d '\n' <"$WEFTY_RUN_DIR/params.json" |
+		sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p'
+}
+
+# JSON-escape one string value for a document this script assembles by hand.
+# It escapes the two characters that can break out of a JSON string and drops
+# the control bytes JSON cannot carry raw.
+wefty_json_escape() {
+	printf '%s' "${1:-}" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C tr '\011\012' '  ' |
+		sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+# <<< END embedded inline run-mailbox writer <<<
+
+if command -v wefty >/dev/null 2>&1; then
+	REPORTER=wefty
+else
+	REPORTER=inline
+	log "wefty is not on PATH; reporting with the inline mailbox writer"
+fi
+
+REPORT_ERROR=
+
+# report runs one reporting action and captures its diagnosis. The producer's
+# own stderr is what explains a refusal, so it is kept rather than discarded.
+report() {
+	report_log=$WORK_DIR/report.log
+	if "$@" >"$report_log" 2>&1; then
+		return 0
 	fi
+	REPORT_ERROR="reporting $2 failed: $(tr '\n' ' ' <"$report_log")"
+	return 1
 }
 
 append_envelope() {
 	step=$1
 	status=$2
 	summary=$3
-	extensions=$4
-	body=$(mktemp) || {
-		L3_ERROR="mktemp failed while building the $step envelope"
-		return 1
-	}
-	printf '{"schema_version":1,"envelope_id":"%s","idempotency_key":"%s","run_id":"%s","step_id":"%s","status":"%s","summary":"%s","extensions":{"dev.wefty.branch-gates":%s},"created_at":"%s"}\n' \
-		"$(json_escape "$RUN_ID-envelope-$step")" \
-		"$(json_escape "$RUN_ID-envelope-$step")" \
-		"$(json_escape "$RUN_ID")" \
-		"$(json_escape "$step")" \
-		"$status" \
-		"$(json_escape "$summary")" \
-		"$extensions" \
-		"$(timestamp)" >"$body"
-	l3_call POST "/v1/runs/$RUN_ID/envelopes" "$body" || {
-		rm -f "$body"
-		return 1
-	}
-	rm -f "$body"
-	case "$L3_STATUS" in
-	200 | 201) return 0 ;;
-	esac
-	L3_ERROR="append $step envelope returned HTTP $L3_STATUS: $(cat "$L3_RESPONSE_FILE")"
-	return 1
+	payload_file=$4
+	if [ "$REPORTER" = wefty ]; then
+		if [ -n "$payload_file" ]; then
+			report wefty run envelope --step "$step" --status "$status" \
+				--summary "$summary" --payload-json-file "$payload_file"
+			return
+		fi
+		report wefty run envelope --step "$step" --status "$status" --summary "$summary"
+		return
+	fi
+	# The inline writer declares every payload `text`: it has no JSON parser, and
+	# an event whose payload claims `json` and fails to decode is refused
+	# outright. The document is the same, carried as the envelope's detail.
+	report wefty_event envelope "" "$step" "$status" "" "$summary" "$payload_file"
 }
 
 append_gate() {
 	name=$1
 	outcome=$2
-	evidence=$3
-	body=$(mktemp) || {
-		L3_ERROR="mktemp failed while building the $name gate"
-		return 1
-	}
-	printf '{"schema_version":1,"gate_id":"%s","idempotency_key":"%s","run_id":"%s","step_id":"%s","name":"%s","outcome":"%s","evidence":%s,"evaluated_at":"%s"}\n' \
-		"$(json_escape "$RUN_ID-gate-$name")" \
-		"$(json_escape "$RUN_ID-gate-$name")" \
-		"$(json_escape "$RUN_ID")" \
-		"$(json_escape "$name")" \
-		"$(json_escape "$name")" \
-		"$outcome" \
-		"$evidence" \
-		"$(timestamp)" >"$body"
-	l3_call POST "/v1/runs/$RUN_ID/gates" "$body" || {
-		rm -f "$body"
-		return 1
-	}
-	rm -f "$body"
-	case "$L3_STATUS" in
-	200 | 201) return 0 ;;
-	esac
-	L3_ERROR="append $name gate returned HTTP $L3_STATUS: $(cat "$L3_RESPONSE_FILE")"
-	return 1
+	evidence_file=$3
+	if [ "$REPORTER" = wefty ]; then
+		if [ -n "$evidence_file" ]; then
+			report wefty run gate --name "$name" --outcome "$outcome" --evidence-file "$evidence_file"
+			return
+		fi
+		report wefty run gate --name "$name" --outcome "$outcome"
+		return
+	fi
+	report wefty_event gate "$name" "" "" "$outcome" "" "$evidence_file"
+}
+
+# publish_result records the run's final document two ways: into the ledger as
+# the run's result event, and into the handoff directory as result.json.
+#
+# The handoff copy is written here rather than left to `wefty run result`,
+# which also writes it. An operator reads the verdict off the node, and that
+# must not depend on reporting having succeeded -- the failure path in
+# particular reports last and may not report at all.
+publish_result() {
+	status=$1
+	summary=$2
+	if ! cp "$RESULT_FILE" "$HANDOFF_DIR/result.json" 2>/dev/null; then
+		log "WARNING: could not write $HANDOFF_DIR/result.json"
+	fi
+	chmod 0600 "$HANDOFF_DIR/result.json" 2>/dev/null || true
+	if [ "$REPORTER" = wefty ]; then
+		report wefty run result --file "$RESULT_FILE" --status "$status" --summary "$summary"
+		return
+	fi
+	report wefty_event result result result "$status" "" "$summary" "$RESULT_FILE"
 }
 
 # --------------------------------------------------------------------------
@@ -284,24 +404,25 @@ fail_workflow() {
 		"$(json_escape "$step")" \
 		"$(json_escape "$message")" \
 		"$STARTED_AT" \
-		"$(timestamp)" >"$HANDOFF_DIR/result.json" 2>/dev/null ||
-		log "WARNING: could not write $HANDOFF_DIR/result.json"
+		"$(timestamp)" >"$RESULT_FILE" 2>/dev/null ||
+		log "WARNING: could not write $RESULT_FILE"
 	{
 		printf '===== workflow-error: %s =====\n' "$step"
 		printf '%s\n' "$message"
 		[ -z "$detail" ] || printf '%s\n' "$detail"
 	} >"$HANDOFF_DIR/failures.txt" 2>/dev/null ||
 		log "WARNING: could not write $HANDOFF_DIR/failures.txt"
-	chmod 0600 "$HANDOFF_DIR/result.json" "$HANDOFF_DIR/failures.txt" 2>/dev/null || true
+	chmod 0600 "$HANDOFF_DIR/failures.txt" 2>/dev/null || true
 
 	log "result.json:"
-	cat "$HANDOFF_DIR/result.json" 2>/dev/null || true
-	copy_results_out
+	cat "$RESULT_FILE" 2>/dev/null || true
 
-	append_envelope "$step" failed "$message" '{}' || log "WARNING: $L3_ERROR"
-	append_gate "$WORKFLOW" error \
-		"[{\"kind\":\"step\",\"value\":\"$(json_escape "$step")\"},{\"kind\":\"error\",\"value\":\"$(json_escape "$message")\"}]" ||
-		log "WARNING: $L3_ERROR"
+	append_envelope "$step" failed "$message" "" || log "WARNING: $REPORT_ERROR"
+	publish_result failed "$message" || log "WARNING: $REPORT_ERROR"
+	evidence_file=$WORK_DIR/error-evidence.txt
+	printf 'step: %s\nerror: %s\n' "$step" "$message" >"$evidence_file" 2>/dev/null || evidence_file=
+	append_gate "$WORKFLOW" error "$evidence_file" || log "WARNING: $REPORT_ERROR"
+	copy_results_out
 	# Last line on this path. An operator (and the CI exercise) can wait for
 	# "done:" instead of guessing whether the log has settled.
 	log "done: workflow-error at $step"
@@ -320,7 +441,7 @@ copy_results_out() {
 	fi
 }
 
-for tool in curl git go; do
+for tool in git go; do
 	command -v "$tool" >/dev/null 2>&1 ||
 		fail_workflow environment "$tool is required in the job rootfs"
 done
@@ -329,24 +450,15 @@ done
 # Input
 # --------------------------------------------------------------------------
 
-l3_call GET "/v1/runs/$RUN_ID" || fail_workflow input "$L3_ERROR"
-case "$L3_STATUS" in
-200) ;;
-*) fail_workflow input "read run params returned HTTP $L3_STATUS" "$(cat "$L3_RESPONSE_FILE")" ;;
-esac
-RUN_RECORD=$(cat "$L3_RESPONSE_FILE")
-
-# There is no helper for reading params either. jq is not in the reference
-# rootfs, so a flat string field is extracted textually; every branch-gates
-# param is deliberately a flat string for exactly this reason.
+# The agent writes the submitted params into the mailbox, and the helper reads
+# one named value out of them. No cluster call, no credential, and no
+# hand-rolled JSON extraction.
 param() {
-	if command -v jq >/dev/null 2>&1; then
-		printf '%s' "$RUN_RECORD" | jq -r --arg name "$1" '.params[$name] // empty'
+	if [ "$REPORTER" = wefty ]; then
+		wefty run params "$1" 2>/dev/null || true
 		return
 	fi
-	printf '%s' "$RUN_RECORD" |
-		tr -d '\n' |
-		sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+	wefty_param "$1" 2>/dev/null || true
 }
 
 REF=${BRANCH_GATES_REF:-$(param ref)}
@@ -522,11 +634,15 @@ for gate in "${SELECTED_GATES[@]}"; do
 	[ -z "$GATES_JSON" ] || GATES_JSON="$GATES_JSON,"
 	GATES_JSON="$GATES_JSON{\"name\":\"$(json_escape "$gate")\",\"outcome\":\"$outcome\",\"exit_code\":$exit_code,\"duration_seconds\":$duration,\"command\":\"$(json_escape "$command_line")\"}"
 	[ -z "$GATE_EVIDENCE" ] || GATE_EVIDENCE="$GATE_EVIDENCE,"
-	GATE_EVIDENCE="$GATE_EVIDENCE{\"kind\":\"gate:$(json_escape "$gate")\",\"value\":\"$outcome\"}"
+	GATE_EVIDENCE="$GATE_EVIDENCE\"$(json_escape "$gate")\":\"$outcome\""
 
-	append_envelope "$gate" "$status" "$summary" \
-		"{\"ref\":\"$(json_escape "$REF")\",\"commit\":\"$(json_escape "$COMMIT")\",\"gate\":\"$(json_escape "$gate")\",\"outcome\":\"$outcome\",\"exit_code\":$exit_code,\"duration_seconds\":$duration}" ||
-		fail_workflow publish "$L3_ERROR"
+	envelope_payload=$WORK_DIR/envelope-$gate.json
+	printf '{"ref":"%s","commit":"%s","gate":"%s","outcome":"%s","exit_code":%s,"duration_seconds":%s}\n' \
+		"$(json_escape "$REF")" "$(json_escape "$COMMIT")" "$(json_escape "$gate")" \
+		"$outcome" "$exit_code" "$duration" >"$envelope_payload" ||
+		fail_workflow publish "cannot write the $gate envelope payload"
+	append_envelope "$gate" "$status" "$summary" "$envelope_payload" ||
+		fail_workflow publish "$REPORT_ERROR"
 done
 
 if [ "$RAN_GATES" -eq 0 ]; then
@@ -546,7 +662,6 @@ fi
 # Results
 # --------------------------------------------------------------------------
 
-RESULT_FILE=$HANDOFF_DIR/result.json
 printf '{"schema_version":1,"workflow":"%s","run_id":"%s","repo_url":"%s","ref":"%s","commit":"%s","passed":%s,"failed_gates":%s,"started_at":"%s","finished_at":"%s","gates":[%s]}\n' \
 	"$WORKFLOW" \
 	"$(json_escape "$RUN_ID")" \
@@ -561,7 +676,17 @@ printf '{"schema_version":1,"workflow":"%s","run_id":"%s","repo_url":"%s","ref":
 	fail_workflow results "cannot write $RESULT_FILE"
 cp "$FAILURES_FILE" "$HANDOFF_DIR/failures.txt" ||
 	fail_workflow results "cannot write $HANDOFF_DIR/failures.txt"
-chmod 0600 "$RESULT_FILE" "$HANDOFF_DIR/failures.txt" 2>/dev/null || true
+chmod 0600 "$HANDOFF_DIR/failures.txt" 2>/dev/null || true
+
+# One call records the verdict document both ways: into the ledger as the run's
+# result event, and into the handoff directory as result.json.
+if [ "$FAILED_GATES" -eq 0 ]; then
+	RESULT_STATUS=succeeded
+else
+	RESULT_STATUS=failed
+fi
+publish_result "$RESULT_STATUS" "verdict $VERDICT for $REF ($COMMIT): $FAILED_GATES of $RAN_GATES gates failed" ||
+	fail_workflow publish "$REPORT_ERROR"
 copy_results_out
 
 log "result.json:"
@@ -572,9 +697,16 @@ if [ "$FAILED_GATES" -gt 0 ]; then
 	printf '\n'
 fi
 
-append_gate "$WORKFLOW" "$VERDICT" \
-	"[{\"kind\":\"ref\",\"value\":\"$(json_escape "$REF")\"},{\"kind\":\"commit\",\"value\":\"$(json_escape "$COMMIT")\"},{\"kind\":\"gates-run\",\"value\":\"$RAN_GATES\"},{\"kind\":\"gates-failed\",\"value\":\"$FAILED_GATES\"},$GATE_EVIDENCE]" ||
-	fail_workflow publish "$L3_ERROR"
+# The final gate carries one evidence document rather than the protocol's
+# per-entry array: the mailbox gives a gate exactly one evidence value, so the
+# structure moves inside it.
+VERDICT_EVIDENCE=$WORK_DIR/verdict-evidence.json
+printf '{"ref":"%s","commit":"%s","gates_run":%s,"gates_failed":%s,"gates":{%s}}\n' \
+	"$(json_escape "$REF")" "$(json_escape "$COMMIT")" \
+	"$RAN_GATES" "$FAILED_GATES" "$GATE_EVIDENCE" >"$VERDICT_EVIDENCE" ||
+	fail_workflow publish "cannot write the verdict evidence"
+append_gate "$WORKFLOW" "$VERDICT" "$VERDICT_EVIDENCE" ||
+	fail_workflow publish "$REPORT_ERROR"
 
 log "verdict $VERDICT for $REF ($COMMIT): $FAILED_GATES of $RAN_GATES gates failed"
 if [ "$FAILED_GATES" -gt 0 ]; then
