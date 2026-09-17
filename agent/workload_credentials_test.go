@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -101,8 +103,10 @@ func dispatchRunDeclaring(t *testing.T, dispatchAuthority bool) *dispatchedRun {
 	if spec.Execution.SensitiveEnv[contract.EnvRunToken] == "" {
 		t.Fatal("dispatch delivered no run token to the node agent")
 	}
-	if got := contract.DeclaresDispatchAuthority(spec.Labels); got != dispatchAuthority {
-		t.Fatalf("dispatched job declares dispatch authority = %t, want %t", got, dispatchAuthority)
+	// L3 marks the withholding, not the declaration, so the agent never has to
+	// infer provenance from anything a submitter could have written.
+	if got := contract.WithholdsWorkloadCredentials(spec.Labels); got != !dispatchAuthority {
+		t.Fatalf("dispatched job withholds credentials = %t, want %t", got, !dispatchAuthority)
 	}
 	handoff := filepath.Join(t.TempDir(), "handoff")
 	if err := os.MkdirAll(handoff, 0o700); err != nil {
@@ -317,6 +321,125 @@ func TestTheRedactorStillMasksUndeliveredTokens(t *testing.T) {
 			}
 			if got := output.String(); got != "run=[REDACTED] attempt=[REDACTED]\n" {
 				t.Fatalf("workload output = %q, want both undelivered credentials masked", got)
+			}
+		})
+	}
+}
+
+// TestAmbientAgentCredentialsNeverReachAWorkload runs a real child process
+// through the production process runner, which seeds its base environment from
+// os.Environ(). An operator who exported a credential into the agent must not
+// thereby hand one to a job the control plane gave none, and the value must
+// still be masked if it reaches output by any route.
+//
+// The workload prints each credential's length as well as its value, because
+// a delivered credential and an ambient one both redact to the same text: the
+// length is what says which one arrived.
+func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
+	const (
+		ambientRunToken     = "wrun_ambient_operator_canary_value"
+		ambientAttemptToken = "wattempt_ambient_operator_canary"
+		deliveredRunToken   = "wrun_delivered"
+		deliveredAttempt    = "wattempt_delivered_bearer_for_this_attempt"
+	)
+	for _, testCase := range []struct {
+		name string
+		// withhold is L3's label. ledgerDispatched distinguishes a run from a
+		// job submitted straight to L1, which has no run at all.
+		withhold         bool
+		ledgerDispatched bool
+		wantRunLength    int
+		wantAttemptLen   int
+	}{
+		{name: "reporting run holds neither", withhold: true, ledgerDispatched: true},
+		{
+			name: "declaring run holds both", withhold: false, ledgerDispatched: true,
+			wantRunLength: len(deliveredRunToken), wantAttemptLen: len(deliveredAttempt),
+		},
+		{
+			// The direct-L1 guarantee: no run, no label, and the attempt
+			// credential arrives even though the submitter named an L3
+			// endpoint in its own JobSpec.
+			name: "direct L1 job keeps its attempt credential", withhold: false, ledgerDispatched: false,
+			wantAttemptLen: len(deliveredAttempt),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Exported before the runner is constructed, because that is when
+			// the production runner captures os.Environ().
+			t.Setenv(contract.EnvRunToken, ambientRunToken)
+			t.Setenv(contract.EnvAttemptToken, ambientAttemptToken)
+
+			root := filepath.Join(t.TempDir(), "handoffs")
+			runID := "run_ambient"
+			handoff := filepath.Join(root, runID)
+			script := []byte("#!/bin/sh\nprintf '%s %s %s %s\\n' " +
+				"\"${#WEFTY_RUN_TOKEN}\" \"$WEFTY_RUN_TOKEN\" \"${#WEFTY_ATTEMPT_TOKEN}\" \"$WEFTY_ATTEMPT_TOKEN\"\n")
+			digest := sha256.Sum256(script)
+			var output bytes.Buffer
+			node := &Agent{
+				registration:     contract.NodeRegistration{NodeID: "node-1"},
+				runtimes:         testRuntimeSet(processrunner.New(processrunner.Config{})),
+				handoffs:         newHandoffManager(root, time.Hour),
+				fabric:           plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node-1"}),
+				controlPlaneAddr: "wefty://control-plane",
+				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
+					return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+						if event.Stream == contract.LogStdout {
+							_, _ = output.Write(event.Bytes)
+						}
+						return nil
+					})
+				},
+			}
+			claim := handoffClaim(runID, handoff, nil)
+			claim.AttemptToken = deliveredAttempt
+			if testCase.withhold {
+				claim.Job.Spec.Labels[contract.LabelWithholdCredentials] = contract.LabelTrue
+			}
+			environment := map[string]string{contract.EnvRunID: runID, contract.EnvHandoffDir: handoff}
+			sensitive := map[string]string{}
+			if testCase.ledgerDispatched {
+				environment[contract.EnvL3Endpoint] = "wefty://l3"
+				sensitive[contract.EnvRunToken] = deliveredRunToken
+			} else {
+				// A direct-L1 submitter may legally name this; it must not be
+				// read as proof that L3 dispatched the job.
+				environment[contract.EnvL3Endpoint] = "http://submitter.invalid/l3"
+			}
+			claim.Job.Spec.Execution = contract.ExecutionSpec{
+				Executable: contract.ExecutableSpec{
+					InlineBase64: base64.StdEncoding.EncodeToString(script),
+					SHA256:       hex.EncodeToString(digest[:]),
+					Interpreter:  []string{"/bin/sh"},
+					Mode:         0o700,
+				},
+				Argv:             []string{"wefty-inline-" + runID},
+				Env:              environment,
+				SensitiveEnv:     sensitive,
+				WorkingDirectory: t.TempDir(),
+				HandoffDirectory: handoff,
+			}
+			result, err := node.runWorkload(context.Background(), claim)
+			if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+				t.Fatalf("runWorkload() = (%#v, %v)", result, err)
+			}
+			logged := output.String()
+			for _, canary := range []string{ambientRunToken, ambientAttemptToken} {
+				if strings.Contains(logged, canary) {
+					t.Fatalf("an ambient agent credential reached the log: %q", logged)
+				}
+			}
+			runValue, attemptValue := "", ""
+			if testCase.wantRunLength > 0 {
+				runValue = "[REDACTED]"
+			}
+			if testCase.wantAttemptLen > 0 {
+				attemptValue = "[REDACTED]"
+			}
+			want := fmt.Sprintf("%d %s %d %s\n", testCase.wantRunLength, runValue, testCase.wantAttemptLen, attemptValue)
+			if logged != want {
+				t.Fatalf("workload credential environment = %q, want %q", logged, want)
 			}
 		})
 	}

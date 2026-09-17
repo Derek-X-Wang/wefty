@@ -112,7 +112,9 @@ type CreateRunRequest struct {
 	// DispatchAuthority declares that this run's workload dispatches child
 	// work. Declaring it delivers the in-job credentials to the workload;
 	// leaving it false — the default — means the job reports through its run
-	// mailbox and holds no credential at all.
+	// mailbox and holds no credential at all. kind=oci has no mailbox yet, so
+	// an OCI run that reports anything must declare it. A rerun inherits the
+	// declaration from its source run.
 	DispatchAuthority bool   `json:"dispatch_authority,omitempty"`
 	ParentRunID       string `json:"parent_run_id,omitempty"`
 }

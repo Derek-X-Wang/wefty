@@ -286,7 +286,7 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	// Dispatch authority is shown because it is the one column that says
 	// whether the workload held a credential, and "-" keeps the ordinary run
-	// quiet while the privileged one stands out.
+	// quiet while the declaring run stands out.
 	if _, err := fmt.Fprintln(table, "RUN ID\tPARENT\tSTATUS\tDISPATCH AUTHORITY\tENVELOPES\tGATES"); err != nil {
 		return err
 	}

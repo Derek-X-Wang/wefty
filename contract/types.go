@@ -68,25 +68,40 @@ const (
 	// way SensitiveEnv is removed.
 	LabelRunParams = "run_params_json"
 
-	// LabelDispatchAuthority carries the submitter's declaration that this run
-	// dispatches child work, and is therefore the switch that puts the in-job
-	// credentials into the workload's environment. Without it a dispatched job
-	// reports through the run mailbox and holds nothing. The run token still
-	// reaches the node agent on every dispatch — the agent publishes the
-	// mailbox with it — so this label governs delivery to the workload, not
-	// delivery to the node. It states a fact about the run rather than a
-	// secret, so unlike LabelRunParams it stays in public job projections.
-	LabelDispatchAuthority = "dispatch_authority"
+	// LabelWithholdCredentials is L3's instruction to the node agent: do not
+	// place the in-job credentials in this job's workload environment. L3 sets
+	// it on every run it dispatches that did not declare dispatch authority.
+	// The run token still reaches the agent in SensitiveEnv, because the
+	// mailbox publisher holds it on the run's behalf; this label governs
+	// delivery to the workload, not delivery to the node.
+	//
+	// It deliberately marks the withholding rather than the declaration. The
+	// agent must never infer whether L3 dispatched a job from anything a
+	// submitter can write — a process JobSpec may legally carry any
+	// environment name, WEFTY_L3_ENDPOINT included — so a job submitted
+	// straight to L1 carries no label and keeps its attempt credential by
+	// construction. In this direction the only thing forging the label can
+	// achieve is withholding the forger's own job's credential; no forgery can
+	// obtain a credential the job would not otherwise have had.
+	LabelWithholdCredentials = "withhold_workload_credentials"
 
-	// LabelTrue is the only value either boolean label is written with, so a
+	// LabelTrue is the only value a boolean label is written with, so a
 	// producer and a reader cannot drift over "1" versus "true".
 	LabelTrue = "true"
 )
 
-// DeclaresDispatchAuthority reports whether a job carries its submitter's
-// declaration that the workload dispatches child work.
-func DeclaresDispatchAuthority(labels map[string]string) bool {
-	return labels[LabelDispatchAuthority] == LabelTrue
+// WithholdsWorkloadCredentials reports whether L3 marked this job as one whose
+// workload must not receive the in-job credentials.
+func WithholdsWorkloadCredentials(labels map[string]string) bool {
+	return labels[LabelWithholdCredentials] == LabelTrue
+}
+
+// IsReservedCredentialEnvironmentName reports the reserved names whose values
+// are credentials rather than facts. A runtime must never let one of these
+// reach a workload from its own ambient environment: only an authoritative,
+// attempt-local value may be delivered, and only deliberately.
+func IsReservedCredentialEnvironmentName(name string) bool {
+	return name == EnvRunToken || name == EnvComputerToken || name == EnvAttemptToken
 }
 
 // RedactJobLabels returns labels without any reserved agent-only value. It
@@ -161,7 +176,7 @@ func IsOCIReservedEnvironmentName(name string) bool {
 // authoritative contents must travel only through the sensitive environment
 // layer. Operator and image values are stripped for every reserved name.
 func IsOCISensitiveReservedEnvironmentName(name string) bool {
-	return name == EnvRunToken || name == EnvComputerToken || name == EnvAttemptToken
+	return IsReservedCredentialEnvironmentName(name)
 }
 
 // IsComputerExecution is the single cross-layer discriminator for Computer

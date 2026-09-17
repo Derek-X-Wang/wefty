@@ -49,6 +49,8 @@ _Avoid_: outbox (the agent's own durable evidence outbox), handoff directory
 The submitter's declaration, made when a run is created, that this run's
 workload dispatches child work. It is what delivers the in-job credentials to
 the workload; a run without it reports through its run mailbox and holds none.
+Until the mailbox reaches kind=oci, an OCI run that reports anything must
+declare it.
 _Avoid_: token flag, credential flag, privileged run
 
 **Pattern** _(reserved — does not exist yet)_:

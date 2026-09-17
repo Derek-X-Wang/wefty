@@ -373,9 +373,18 @@ func buildEnvironment(base []string, public, sensitive map[string]string) []stri
 	environment := make(map[string]string, len(base)+len(public)+len(sensitive))
 	for _, entry := range base {
 		key, value, found := strings.Cut(entry, "=")
-		if found {
-			environment[key] = value
+		if !found {
+			continue
 		}
+		// The base environment is the agent's own, usually os.Environ(). A
+		// reserved credential there belongs to whoever started the agent, never
+		// to this workload: letting it through would hand a bearer to a job the
+		// control plane deliberately gave none, and no one would be redacting
+		// it. Only the explicit job maps below may supply these names.
+		if contract.IsReservedCredentialEnvironmentName(key) {
+			continue
+		}
+		environment[key] = value
 	}
 	for key, value := range public {
 		environment[key] = value

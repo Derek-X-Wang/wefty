@@ -136,8 +136,8 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 				},
 			}
 			claim := handoffClaim(runID, handoff, nil)
-			if testCase.declares {
-				claim.Job.Spec.Labels[contract.LabelDispatchAuthority] = contract.LabelTrue
+			if !testCase.declares {
+				claim.Job.Spec.Labels[contract.LabelWithholdCredentials] = contract.LabelTrue
 			}
 			claim.Job.Spec.Execution = contract.ExecutionSpec{
 				Executable: contract.ExecutableSpec{

@@ -1194,7 +1194,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// dispatches child work, because that is the only way it holds a
 		// credential to report with.
 		lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; the handoff volume is helper-owned and exposes no read path", claim.Lease.AttemptID)
-		if !contract.DeclaresDispatchAuthority(claim.Job.Spec.Labels) {
+		if contract.WithholdsWorkloadCredentials(claim.Job.Spec.Labels) {
 			lifecycle.log("agent: kind=oci attempt %s was dispatched without dispatch authority and has no mailbox, so it can report nothing to the run ledger", claim.Lease.AttemptID)
 		}
 	}

@@ -25,10 +25,17 @@ dispatches child work declares that at submit — `dispatch_authority` on the ru
 request, `wefty submit --dispatch-authority` on the command line — and that
 declaration delivers both credentials exactly as before. The declaration is
 recorded on the run record, so `wefty --json inspect` shows which runs hold
-credentials. It reaches the node agent as the public job label
-`dispatch_authority`. The run token still travels to the agent on every
+credentials. On the wire it reaches the node agent inverted, as the public job
+label `withhold_workload_credentials`, which L3 sets on every run it dispatches
+that did not declare dispatch authority. Marking the withholding rather than
+the declaration is deliberate: the agent must never infer L3 provenance from
+anything a submitter can write, and a process `JobSpec` may legally carry any
+environment name, `WEFTY_L3_ENDPOINT` included. A job submitted straight to L1
+therefore carries no label and keeps its attempt credential by construction,
+and the only thing forging the label can achieve is withholding the forger's
+own job's credential. The run token still travels to the agent on every
 dispatch, in `SensitiveEnv` as always, because the mailbox publisher needs it;
-the declaration governs whether the agent then places it in the workload's own
+the label governs whether the agent then places it in the workload's own
 environment. Declaring dispatch authority is not an escalation: a run can only
 declare it at submit, and a credential-free job cannot submit anything.
 
@@ -46,6 +53,14 @@ anything about and always receives its attempt credential. In v1 neither is
 delivered to `class=service` attempts or to Computer attempts; L1 still mints
 the attempt credential at every claim, so service and Computer delivery is a
 follow-up that changes no authority rule.
+
+A reserved credential name is never inherited from the node agent's own
+environment. A runtime strips `WEFTY_RUN_TOKEN`, `WEFTY_ATTEMPT_TOKEN` and
+`WEFTY_COMPUTER_TOKEN` from the base environment it seeds a workload from
+before applying any job value, so an operator who exported one into the agent
+cannot hand it to a job the control plane deliberately gave none. The agent
+also names whatever it finds under those names in its own environment to the
+log redactor on every attempt, so such a value cannot reach a log sink either.
 
 L3 places `WEFTY_RUN_TOKEN` only in `ExecutionSpec.SensitiveEnv`, and the agent
 places `WEFTY_ATTEMPT_TOKEN` only there; the other variables are in

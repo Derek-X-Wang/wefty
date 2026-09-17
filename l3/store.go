@@ -2072,11 +2072,13 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 	handoff := filepath.Join(DefaultHandoffRoot, handoffOwnerID)
 	labels := map[string]string{"run_id": intent.RunID}
 	// The run token reaches the node agent on every dispatch, because the agent
-	// publishes the run mailbox with it. This label is what decides whether the
-	// agent then puts it — and the attempt credential — into the workload's own
-	// environment.
-	if intent.DispatchAuthority {
-		labels[contract.LabelDispatchAuthority] = contract.LabelTrue
+	// publishes the run mailbox with it. This label is what tells the agent not
+	// to put it — or the attempt credential — into the workload's own
+	// environment. Marking the withholding rather than the declaration is what
+	// keeps the agent from having to infer L3 provenance from a submitter's
+	// own environment values.
+	if !intent.DispatchAuthority {
+		labels[contract.LabelWithholdCredentials] = contract.LabelTrue
 	}
 	// The parameter document travels as an agent-only dispatch label, never as
 	// an environment value: the node agent turns it into the run mailbox's
