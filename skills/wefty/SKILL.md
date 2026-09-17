@@ -64,14 +64,21 @@ wefty rerun <run_id>              # NEW run from the stored immutable snapshot
 
 A workflow's job process receives the run execution context as env vars
 (documented in `docs/contracts/run-execution-context.md`): `WEFTY_RUN_ID`,
-`WEFTY_L3_ENDPOINT` (a dialable HTTP URL), `WEFTY_RUN_TOKEN` (scoped to this
-run — dispatch children, write own envelopes/gates; never sibling access),
-`WEFTY_HANDOFF_DIR` (node-local). Dispatch child steps through the same public
-`POST /v1/runs` with `parent_run_id`; hand off across nodes via envelopes,
-never local files.
+`WEFTY_L3_ENDPOINT` (a dialable HTTP URL), `WEFTY_HANDOFF_DIR` (node-local) and
+`WEFTY_RUN_DIR`, the run mailbox. Report by writing event files into the
+mailbox: the node agent publishes them to the ledger, so the job needs no
+credential at all. `kind=oci` has no mailbox yet, so an OCI run still reports
+over HTTP and must be submitted with `--dispatch-authority`.
 
-Every one-shot attempt — with or without L3 — also receives `WEFTY_L1_ENDPOINT`
-(a dialable HTTP URL) and `WEFTY_ATTEMPT_TOKEN`, the attempt credential. Send
+`WEFTY_RUN_TOKEN` (scoped to this run — dispatch children, write own
+envelopes/gates; never sibling access) is **not** delivered by default. Submit
+with `--dispatch-authority` when the workflow dispatches child steps through
+`POST /v1/runs` with `parent_run_id`; that also delivers the attempt
+credential. Hand off across nodes via envelopes, never local files.
+
+Every one-shot attempt L1 ran without L3 also receives `WEFTY_L1_ENDPOINT`
+(a dialable HTTP URL) and `WEFTY_ATTEMPT_TOKEN`, the attempt credential; for an
+L3-dispatched job the same `--dispatch-authority` declaration governs it. Send
 it as `Authorization: Bearer` to submit a child job (`POST /v1/jobs`), read
 your own job or one of its children (`GET /v1/jobs/{job_id}`, adding
 `?class=service` only when that job is a service), or list your children

@@ -103,7 +103,7 @@ func run() error {
 		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
 		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
 		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address")
-		runLedgerNodeID          = flag.String("run-ledger-node-id", "run-ledger", "authenticated Fabric Node ID allowed to request Computer scope proofs")
+		runLedgerNodeID          = flag.String("run-ledger-node-id", "run-ledger", "authenticated Fabric identity allowed to request Computer scope proofs and classified as run-ledger job provenance; on tsnet this is the run ledger's Tailscale StableID, not a friendly name")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")

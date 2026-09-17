@@ -226,6 +226,11 @@
                       "minLength": 1,
                       "description": "Opaque attempt credential for this attempt, minted inside the claim transaction and returned exactly once. L1 persists only its SHA-256 digest. The agent delivers it to a one-shot workload as WEFTY_ATTEMPT_TOKEN through SensitiveEnv, keeps it only in memory, and never writes it to logs, evidence, or the dispatch outbox."
                     },
+                    "submitted_by_run_ledger": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "L1's own classification of the authenticated submitter against its configured trusted run-ledger identity, decided when the job was created and stored with it. The agent uses it for credential delivery, run-ledger reachability and run-mailbox eligibility, so it is server-owned: the submitter identity's form is fabric-specific and a JobSpec is submitter-writable. False for a job spawned through an attempt credential, which has no Run of its own."
+                    },
                     "prestart_deadline": {
                       "type": "string",
                       "format": "date-time",

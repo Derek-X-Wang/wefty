@@ -249,6 +249,9 @@ async function dispatchChild(
     tags: record.tags ?? [],
     limits: { max_runtime_seconds: params.child_max_runtime_seconds ?? 3600 },
     required_envelope: true,
+    // Every dogfood step reports over HTTP and the first two dispatch the next
+    // one, so each child is submitted as a run that holds the credentials.
+    dispatch_authority: true,
     parent_run_id: context.runId,
   };
   const accepted = await l3Request<RunAccepted>(

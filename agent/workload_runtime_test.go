@@ -459,7 +459,7 @@ func TestProcessPreflightRejectsBeforeAgentResourceAcquisition(t *testing.T) {
 					portReservations++
 					return nil, nil
 				},
-				workflowBridge: func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error) {
+				workflowBridge: func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error) {
 					bridges++
 					return nil, errors.New("must not create workflow bridge")
 				},

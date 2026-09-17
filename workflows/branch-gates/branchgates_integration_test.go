@@ -178,6 +178,10 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 				Tags:             []string{contract.StableNodeTagPrefix + nodeID},
 				Limits:           &contract.RunLimits{MaxRuntimeSeconds: int(runBudget.Seconds())},
 				RequiredEnvelope: true,
+				// branch-gates still reports to L3 over HTTP with the run
+				// token, so it must be submitted as a run that holds one until
+				// it is converted to the run mailbox.
+				DispatchAuthority: true,
 			}, "branch-gates-exercise-"+testCase.ref)
 
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
@@ -362,6 +366,10 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 				Tags:             []string{contract.StableNodeTagPrefix + nodeID},
 				Limits:           &contract.RunLimits{MaxRuntimeSeconds: int(runBudget.Seconds())},
 				RequiredEnvelope: true,
+				// branch-gates still reports to L3 over HTTP with the run
+				// token, so it must be submitted as a run that holds one until
+				// it is converted to the run mailbox.
+				DispatchAuthority: true,
 			}, "branch-gates-negative-"+testCase.name)
 
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)

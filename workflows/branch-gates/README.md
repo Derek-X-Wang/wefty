@@ -34,10 +34,18 @@ silently reduce the set is rejected before anything is cloned — an empty eleme
 shell, and that shell holds the run token for the whole run. A deliberately
 hostile branch can therefore recover the run token — from an ancestor's
 environment, for example — and use it to write its own run or submit child
-jobs. Only run branch-gates on branches you trust. Removing the token from the
-job entirely, so the agent publishes envelopes from a file protocol and the
-workload never holds a credential, is a #476 design item; until then this is a
-convenience boundary, not a security one.**
+jobs. Only run branch-gates on branches you trust. This is a convenience
+boundary, not a security one.**
+
+**Why it still holds a token.** Credential delivery is now opt-in: a dispatched
+run reports through its run mailbox and holds nothing unless it declares
+`--dispatch-authority` at submit. branch-gates still posts its envelopes and
+gates to L3 over HTTP, so every submit command below passes that flag and every
+submission in `branchgates_integration_test.go` sets `DispatchAuthority`.
+It over-grants deliberately and temporarily: branch-gates dispatches no child
+work and asks for the flag only for the reporting half. Converting it to the
+mailbox — after which the flag comes off and this whole section goes away — is
+the remaining #476 slice.
 
 What the workflow does do, because it is cheap and it closes the ordinary
 accidents:
@@ -151,6 +159,7 @@ RUN_ID=$(w --json submit \
   --params-file /tmp/branch-gates-params.json \
   --tag "wefty:node:$NODE_ID" \
   --required-envelope \
+  --dispatch-authority \
   --max-runtime 3600 \
   --idempotency-key "branch-gates-my-branch-$(date -u +%Y%m%dT%H%M%SZ)" \
   | jq -er '.run_id')
@@ -174,7 +183,7 @@ w --json submit --image "$GOLANG_IMAGE@$GOLANG_DIGEST" \
   --argv bash --argv -c --argv "$(cat workflows/branch-gates/branch-gates.sh)" --argv branch-gates \
   --params-file /tmp/branch-gates-params.json \
   --mount "$WEFTY_MOUNT_ROOT/branch-gates:/out" --node "$NODE_ID" \
-  --required-envelope --max-runtime 3600 --idempotency-key "branch-gates-$(date -u +%s)"
+  --required-envelope --dispatch-authority --max-runtime 3600 --idempotency-key "branch-gates-$(date -u +%s)"
 ```
 
 `$WEFTY_MOUNT_ROOT` must be a strict descendant of the node's configured
@@ -195,6 +204,7 @@ RUN_ID=$(w --json submit \
   --params-file /tmp/branch-gates-params.json \
   --tag wefty:node:dogfood-local \
   --required-envelope \
+  --dispatch-authority \
   --max-runtime 3600 \
   --idempotency-key "branch-gates-local-$(date -u +%s)" \
   | jq -er '.run_id')
@@ -252,5 +262,6 @@ Kept here because #476 and #477 are supposed to remove it:
   can truncate that teardown.
 - The job holds the reporting credential for its whole life, so isolating
   untrusted work from it needs an OS boundary the workflow cannot build for
-  itself. A protocol where the agent publishes envelopes from a file the
-  workload writes would remove the token from the job entirely.
+  itself. The run mailbox now removes the token from a dispatched job by
+  default; branch-gates still opts back in with `--dispatch-authority` because
+  it reports over HTTP, and converting it to the mailbox is what retires that.

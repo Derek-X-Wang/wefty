@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,7 +91,7 @@ type attemptLifecycleDependencies struct {
 	mailboxPoll            time.Duration
 	nodeID                 string
 	bootSessionID          string
-	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
+	workflowBridge         func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
 	fabric                 fabric.Fabric
@@ -1171,9 +1170,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	// The run mailbox is prepared before the workload starts, so a job that
 	// writes its first event immediately has somewhere to write it. Mailbox
-	// reporting does not require or use the workload's credential; run-token
-	// delivery remains unchanged.
-	if lifecycle.dependencies.runLedger != nil && runMailboxAvailable(claim.Job.Spec) {
+	// reporting does not require or use the workload's credential, which is
+	// why a run that only reports is dispatched without one at all.
+	// L1 derived this from the authenticated identity that submitted the job,
+	// so it is the one L3-provenance answer nothing in the JobSpec can forge.
+	ledgerDispatched := submittedByRunLedger(claim)
+	if lifecycle.dependencies.runLedger != nil && ledgerDispatched && runMailboxAvailable(claim.Job.Spec) {
 		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID, lifecycle.dependencies.runLedger,
 			lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
 		if err != nil {
@@ -1184,13 +1186,18 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		lifecycle.storeMailbox(mailbox)
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
-	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot &&
-		strings.TrimSpace(claim.Job.Spec.Execution.Env[contract.EnvL3Endpoint]) != "" {
+	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot && ledgerDispatched {
 		// The OCI handoff volume is helper-owned inside the node, and the
 		// helper protocol has no read method yet, so there is nothing the
 		// agent could publish from. Say so rather than deliver a directory
-		// whose contents would silently never reach the ledger.
+		// whose contents would silently never reach the ledger. Until that
+		// seam exists an OCI run that reports must be submitted as one that
+		// dispatches child work, because that is the only way it holds a
+		// credential to report with.
 		lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; the handoff volume is helper-owned and exposes no read path", claim.Lease.AttemptID)
+		if withholdsWorkloadCredentials(claim) {
+			lifecycle.log("agent: kind=oci attempt %s was dispatched without dispatch authority and has no mailbox, so it can report nothing to the run ledger", claim.Lease.AttemptID)
+		}
 	}
 	var err error
 	var computerBridge *computerAttemptBridgeController
@@ -1212,7 +1219,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		request.HostBridgeEndpointReady = computerBridge.setGuestEndpoint
 		request.HostBridgeFallbackActive = true
 	} else if claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.workflowBridge != nil {
-		bridge, bridgeErr := lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec)
+		bridge, bridgeErr := lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec, ledgerDispatched)
 		if bridgeErr != nil {
 			return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, bridgeErr), bridgeErr)
 		}
@@ -1220,7 +1227,6 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			defer bridge.close()
 			// A bridge now exists for every one-shot attempt, so the L3 endpoint
 			// must be published only when L3 actually dispatched this job.
-			ledgerDispatched := executionSpec.Env[contract.EnvL3Endpoint] != ""
 			executionSpec.Env = cloneEnvironment(executionSpec.Env)
 			executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
 			// Reserved names carry attempt-local truth, never submitter input.
@@ -1242,6 +1248,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			}
 		}
 	}
+	// Credential delivery is opt-in from here on. The run token and the attempt
+	// credential have both reached this point — the mailbox publisher needs the
+	// first and L1 minted the second at claim — and this is the last moment
+	// before either could enter the workload's environment.
+	withheldCredentials := withholdWorkloadCredentials(&executionSpec, claim)
 	var sinks multiOutputSink
 	if lifecycle.dependencies.logSinkFactory != nil {
 		var candidate attemptLogSink
@@ -1283,10 +1294,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	} else if len(sinks) > 1 {
 		sink = sinks
 	}
-	// The mailbox holds the run token on the run's behalf. Naming it here keeps
-	// redaction correct once that credential stops travelling in the job
-	// environment, instead of letting the guarantee lapse silently.
-	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv, mailbox.secrets()...)
+	// The mailbox holds the run token on the run's behalf, and a withheld
+	// credential is no longer in SensitiveEnv for the redactor to find. Naming
+	// both here is what keeps the redaction guarantee from lapsing silently the
+	// moment a credential stops travelling in the job environment.
+	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv,
+		append(mailbox.secrets(), withheldCredentials...)...)
 	if redactingSink != nil {
 		sink = redactingSink
 	}

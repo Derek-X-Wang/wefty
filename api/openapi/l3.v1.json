@@ -244,6 +244,11 @@
                     "description": "Restricted JSON Schema 2020-12 dialect. Local fragment references are allowed; remote references, dynamic references, vocabularies, and content decoders are forbidden."
                   },
                   "required_envelope": { "type": "boolean", "default": false },
+                  "dispatch_authority": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Declares that this run's workload dispatches child work, which delivers WEFTY_RUN_TOKEN and WEFTY_ATTEMPT_TOKEN to the job. By default a dispatched job holds neither credential and reports through its run mailbox; kind=oci has no run mailbox yet, so an OCI run that reports anything must declare this."
+                  },
                   "parent_run_id": { "type": "string" }
                 },
                 "oneOf": [
@@ -390,7 +395,7 @@
       "post": {
         "operationId": "rerunRun",
         "summary": "Create a new run from a stored run snapshot",
-        "description": "Copies the source run's immutable program fields, params, tags, limits, and envelope requirements. A tag-only image source gains only the write-once top-level digest previously ingested from accepted L1 attempt evidence; unresolved sources fail with no_resolved_image_snapshot and no tag is resolved again. Saved Workflow refs are never re-resolved. Trigger provenance records rerun and the source run ID. The source must carry exactly one reserved wefty:node:<stable-node-id> tag; the rerun reuses its node-local handoff directory and otherwise fails explicitly.",
+        "description": "Copies the source run's immutable program fields, params, tags, limits, envelope requirements, and dispatch_authority declaration. A tag-only image source gains only the write-once top-level digest previously ingested from accepted L1 attempt evidence; unresolved sources fail with no_resolved_image_snapshot and no tag is resolved again. Saved Workflow refs are never re-resolved. Trigger provenance records rerun and the source run ID. The source must carry exactly one reserved wefty:node:<stable-node-id> tag; the rerun reuses its node-local handoff directory and otherwise fails explicitly.",
         "security": [{ "fabricIdentity": [] }],
         "responses": {
           "200": {

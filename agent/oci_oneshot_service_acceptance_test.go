@@ -124,6 +124,9 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 		},
 		Params: json.RawMessage(`{"ticket":146}`),
 		Tags:   []string{"linux"},
+		// kind=oci has no run mailbox yet, so an OCI run that reports to the
+		// ledger over the bridge is one that declares dispatch authority.
+		DispatchAuthority: true,
 	}
 	var accepted l3.RunAccepted
 	doOCIOneshotJSON(t, caller, http.MethodPost, "/v1/runs", request, http.Header{"Idempotency-Key": []string{"oci-oneshot-acceptance"}}, http.StatusCreated, &accepted)

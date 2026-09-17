@@ -115,7 +115,7 @@ func withControlPlaneSurface(participant fabric.Fabric, address string) workflow
 	}
 }
 
-func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec) (*workflowBridge, error) {
+func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec, ledgerDispatched bool) (*workflowBridge, error) {
 	computer := contract.IsComputerExecution(execution)
 	computerEnabled := computer && execution.SensitiveEnv[contract.EnvComputerToken] != ""
 	if a.fabric == nil || (computer && !computerEnabled) {
@@ -130,7 +130,10 @@ func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution 
 		// or not L3 dispatched it. That is the whole point: an L1-only user
 		// must be able to spawn work from inside work.
 		options = append(options, withControlPlaneSurface(a.fabric, a.controlPlaneAddr))
-		if execution.Env[contract.EnvL3Endpoint] == "" {
+		// Reachability follows L1's record of who submitted the job, never the
+		// job's own environment: a direct-L1 submitter may name
+		// WEFTY_L3_ENDPOINT and must still get no route to the run ledger.
+		if !ledgerDispatched {
 			options = append(options, withoutRunLedgerSurface())
 		}
 	}

@@ -143,6 +143,7 @@ jq -n \
   --params-file=/tmp/wefty-quickstart-params.json \
   --tag=wefty:node:dogfood-local \
   --required-envelope \
+  --dispatch-authority \
   --max-runtime=7200
 ```
 
