@@ -252,20 +252,22 @@ the run token it holds, over its own authenticated Fabric connection. The
 workload therefore needs no credential to report, and a mailbox write is a
 claim about the writer's own run and nothing else. The directory is scoped by
 run ID because a cold rerun reuses the handoff directory: a rerun gets its own
-mailbox and can neither read nor republish the previous run's evidence.
+mailbox; the agent does not import the previous run's evidence into it.
 
 The layout is fixed:
 
 ```
 $WEFTY_RUN_DIR/params.json    the run's params, written by the agent
 $WEFTY_RUN_DIR/tmp/           staging for write-then-rename
-$WEFTY_RUN_DIR/events/        complete events, published in lexical order
-$WEFTY_RUN_DIR/.published/    the agent's durable bookkeeping
+$WEFTY_RUN_DIR/events/        complete events, published in lexical order per sweep
+$WEFTY_RUN_DIR/.published/    durable, advisory bookkeeping
 ```
 
 `params.json` carries the parameters the run was submitted with. They travel
 from L3 on an agent-only dispatch label, never in the workload environment, and
 a document larger than 64 KiB is left in the ledger rather than delivered.
+The agent opens `tmp/` only during preparation to place `params.json`; it does
+not read staged events there.
 
 An event becomes visible by being renamed into `events/` from `tmp/` on the
 same filesystem. The rename is the only "done writing" signal: there is no
@@ -317,19 +319,25 @@ missing separator are all refused; the first eight refusals of an attempt are
 reported as a `failed` envelope on step `mailbox`, and the file is then removed
 unpublished — but only once that report has been accepted, so an unreachable
 ledger never costs the evidence. An entry in `events/` that is not a readable
-regular file at all is removed on sight, because an entry the sweep merely
-skipped would hide every later event behind it.
+regular file is refused. Cleanup removes only regular files, symlinks and empty
+directories, never recursively walking workload directories. Nonempty
+directories, unsupported objects and entries that cannot be classified or
+removed make the sweep not drained and retain the handoff; they do not hide
+later valid events in a complete listing.
 
 A process workload runs under the agent's own OS identity, so the mailbox's
-permissions are not an isolation boundary. The agent instead performs every
-mailbox operation relative to an opened directory, on objects it has proven to
-be regular files, with bounded reads and non-blocking opens. A symlink, a FIFO
-or a directory planted in the mailbox is refused, and cannot redirect the agent
-outside the mailbox or hold finalization open.
+permissions are not an isolation boundary. Publication is bounded and
+best-effort under a shared identity, not tamper-proof against the workload.
+The mailbox publisher holds the append credential; reporting through files
+requires none. Directory-relative operations, regular-file checks, bounded
+reads and non-blocking opens limit redirection and stalls.
 
 Every bound is enforced by the agent, never by the producer: at most 64 KiB per
 event file, 1024 events and 1 MiB of published documents per attempt, 64 KiB of
-params, and 256 directory entries per sweep. An oversize event is truncated
+params, and a hard listing cap of 4096 entries (`MaxRunMailboxScanEntries`).
+Each sweep reads the whole listing under that cap and sorts it lexically. A
+listing that reaches the cap publishes nothing and retains the handoff, since
+a partial listing cannot establish lexical order. An oversize event is truncated
 with an explicit marker rather than dropped, so a verdict is never lost to a
 large payload; a truncated `json` payload is preserved as marked text. Events
 past the count or byte bound are discarded with one logged line.
@@ -337,27 +345,40 @@ past the count or byte bound are discarded with one logged line.
 Publication is streamed, not deferred: a running attempt's mailbox is swept
 every 500 ms by default, so a step is observable while the run is still
 executing. Event timestamps are therefore accurate to that interval and not to
-the instant the workload wrote the file. A final sweep, with a bounded retry,
-runs after the workload is quiesced and before the handoff lifecycle may remove
-the directory. Publication is best effort: if evidence still has not reached
+the instant the workload wrote the file. Finalization, including the poller
+join and final sweep retries, uses the earlier of the caller's deadline and
+`DefaultFinalizationTimeout` (30 seconds). It runs after the workload is
+quiesced and before the handoff lifecycle may remove the directory. Expiry
+stops publication, marks `publicationIncomplete`, and retains the handoff.
+Publication is best effort: if evidence still has not reached
 the ledger when the final sweep ends, the agent logs that and the handoff
 directory is retained under the ordinary failure rules, so the files remain the
 run's only surviving copy rather than being deleted as a success. Losing the
-attempt's authority fences publication immediately and permanently; a fenced
-attempt publishes nothing further and retains its directory the same way.
+attempt's authority permanently fences publication: the fence cancels the
+mailbox-owned append context and waits for all admitted appends to finish.
+No append can start or remain in flight after the fence returns. A fenced
+attempt retains pending evidence the same way.
 
 Each event's document is derived deterministically from its file — including
 its timestamp, which is pinned when the agent first observes the file — and its
 idempotency key is stable, so republishing after an interrupted retirement is a
 replay in L3 rather than a second document, and an already-accepted event is
-never charged against the bounds twice. That recovery reaches only the events of
-a retained directory: evidence removed with a successful run's handoff is gone.
+never charged against the bounds twice. Event count and byte budgets, and the
+eight-rejection budget, are reserved durably before appending; a pending retry
+reuses its reservation after restart, including when the append response was
+lost. That recovery reaches only the events of a retained directory: evidence
+removed with a successful run's handoff is gone.
 
-The bookkeeping under `.published/` is the agent's, but the mailbox is the
-workload's own directory and the two share an OS identity, so it cannot be made
-unreachable. The agent therefore refuses to trust what it did not write:
-bookkeeping it cannot read, parse, or persist stops publication for the attempt
-and retains the directory, rather than silently starting its accounting over.
+The bookkeeping under `.published/` is advisory and workload-writable. Loaded
+counters and reservations are validated and clamped to their bounds, timestamps
+must be whole seconds between the Unix epoch and the current agent time, names
+must be valid event names, and `Published` is allowed only for events absent
+from `events/`. Inconsistent reservations, out-of-range values, or bookkeeping
+that cannot be read, parsed or persisted latch `corrupt`: publication stops,
+`publicationIncomplete` is set, and the handoff is retained. This is validation,
+not authentication. Forged bookkeeping can only suppress or truncate the
+workload's own run's evidence; it grants no append credential or authority over
+another run.
 
 The mailbox is delivered to `kind=process` one-shots that L3 dispatched. An OCI
 handoff volume is helper-owned inside the node and the helper protocol exposes

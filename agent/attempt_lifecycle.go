@@ -351,6 +351,19 @@ func (failure *completionDeliveryAbandoned) Unwrap() error { return failure.err 
 
 const ociRuntimeRecoveryTimeout = 10 * time.Second
 
+// attemptDeadlineContext preserves the caller's deadline metadata without a
+// second timer that could cancel the attempt before the parent fence completes.
+// The parent's own timer still drives cancellation through fencedAttemptContext.
+type attemptDeadlineContext struct {
+	context.Context
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (ctx attemptDeadlineContext) Deadline() (time.Time, bool) {
+	return ctx.deadline, ctx.hasDeadline
+}
+
 // fencedAttemptContext derives an attempt context whose every cancellation —
 // this lifecycle's own and the parent's alike — runs fence first and to
 // completion. An attempt that has lost its authority must not be able to win a
@@ -369,7 +382,8 @@ func fencedAttemptContext(parent context.Context, fence func(error)) (context.Co
 		case <-released:
 		}
 	}()
-	return attempt, func(cause error) {
+	deadline, hasDeadline := parent.Deadline()
+	return attemptDeadlineContext{Context: attempt, deadline: deadline, hasDeadline: hasDeadline}, func(cause error) {
 			if cause != nil {
 				fence(cause)
 			}

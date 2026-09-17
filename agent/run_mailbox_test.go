@@ -862,12 +862,12 @@ func TestRunMailboxEnforcesItsPublicationBounds(t *testing.T) {
 			writeMailboxEvent(t, mailbox.directory, fmt.Sprintf("%04d-gate", index), gate(fmt.Sprintf("g%d", index)))
 		}
 		mailbox.sweep(context.Background())
-		if documents := appender.snapshot(); len(documents) != 1 {
-			t.Fatalf("one sweep published %d documents, want the scan bound to hold at 1", len(documents))
+		if documents := appender.snapshot(); len(documents) != 0 {
+			t.Fatalf("a capped listing published %d documents without knowing lexical order", len(documents))
 		}
-		mailbox.sweep(context.Background())
-		if documents := appender.snapshot(); len(documents) != 2 {
-			t.Fatalf("two sweeps published %d documents", len(documents))
+		mailbox.finalize(context.Background())
+		if !mailbox.publicationIncomplete() || !mailbox.pending() {
+			t.Fatal("a capped listing must retain its evidence")
 		}
 	})
 }
@@ -1165,10 +1165,9 @@ func TestCorruptMailboxBookkeepingFailsClosed(t *testing.T) {
 func TestJunkEntriesCannotHideLaterMailboxEvents(t *testing.T) {
 	appender := newRecordingAppender("")
 	mailbox, _, _ := newTestMailbox(t, appender, "")
-	mailbox.maxScan = 2
 	events := filepath.Join(mailbox.directory, runMailboxEventsDirectoryName)
-	// Two entries that are not events sort ahead of the real one and would,
-	// if merely skipped, fill every page forever.
+	// Enumerate the whole listing regardless of filesystem creation order.
+	// The removable junk sorts ahead of the valid event.
 	if err := os.Mkdir(filepath.Join(events, "0001-directory"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1195,7 +1194,7 @@ func TestJunkEntriesCannotHideLaterMailboxEvents(t *testing.T) {
 	}
 }
 
-func TestAnExhaustedScanPageCountsAsPending(t *testing.T) {
+func TestAnExhaustedScanListingCountsAsPending(t *testing.T) {
 	appender := newRecordingAppender("")
 	mailbox, _, _ := newTestMailbox(t, appender, "")
 	mailbox.maxScan = 1
@@ -1203,11 +1202,337 @@ func TestAnExhaustedScanPageCountsAsPending(t *testing.T) {
 		writeMailboxEvent(t, mailbox.directory, fmt.Sprintf("%04d-gate", index),
 			fmt.Sprintf("wefty-protocol: 1\nkind: gate\nname: g%d\noutcome: pass\n--\n", index))
 	}
-	// One sweep can only see one entry, so it must not claim to be finished.
+	// The capped listing is incomplete, so it must not claim to be drained.
 	if mailbox.sweep(context.Background()) {
-		t.Fatal("a full scan page reported a drained mailbox")
+		t.Fatal("a capped listing reported a drained mailbox")
 	}
 	if !mailbox.pending() {
 		t.Fatal("a mailbox with unseen entries reported nothing pending")
+	}
+}
+
+// mailboxAppenderFunc lets concurrency tests observe the actual appender entry.
+type mailboxAppenderFunc func(context.Context, string, string, string, []byte) error
+
+func (f mailboxAppenderFunc) appendRunDocument(ctx context.Context, token, run, collection string, body []byte) error {
+	return f(ctx, token, run, collection, body)
+}
+
+func TestMailboxFenceJoinsAppendAdmissionAndInflightCalls(t *testing.T) {
+	for _, raw := range []string{
+		"wefty-protocol: 1\nkind: gate\nname: test\noutcome: pass\n--\n",
+		"malformed event\n",
+	} {
+		for _, beforeEntry := range []bool{true, false} {
+			t.Run(fmt.Sprintf("rejection=%t/before-entry=%t", strings.HasPrefix(raw, "malformed"), beforeEntry), func(t *testing.T) {
+				entered := make(chan struct{})
+				cancelled := make(chan struct{})
+				release := make(chan struct{})
+				var releaseOnce sync.Once
+				unblock := func() { releaseOnce.Do(func() { close(release) }) }
+				defer unblock()
+				pause := func(ctx context.Context) {
+					close(entered)
+					<-ctx.Done()
+					close(cancelled)
+					<-release
+				}
+				var calls atomic.Int32
+				appender := mailboxAppenderFunc(func(ctx context.Context, _, _, _ string, _ []byte) error {
+					calls.Add(1)
+					if !beforeEntry {
+						pause(ctx)
+					}
+					return ctx.Err()
+				})
+				mailbox, _, _ := newTestMailbox(t, appender, "")
+				if beforeEntry {
+					mailbox.appendCheckpoint = pause
+				}
+				writeMailboxEvent(t, mailbox.directory, "0001-event", raw)
+				swept := make(chan struct{})
+				go func() { defer close(swept); mailbox.finalize(context.Background()) }()
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("append did not reach the controlled pause")
+				}
+				fenced := make(chan struct{}, 2)
+				// Every fence caller must join, including a concurrent second one.
+				for range 2 {
+					go func() { mailbox.fence(context.Canceled); fenced <- struct{}{} }()
+				}
+				select {
+				case <-cancelled:
+				case <-time.After(5 * time.Second):
+					t.Fatal("fence did not cancel the admitted append")
+				}
+				select {
+				case <-fenced:
+					t.Fatal("fence returned with an append still admitted/in flight")
+				default:
+				}
+				unblock()
+				for range 2 {
+					select {
+					case <-fenced:
+					case <-time.After(5 * time.Second):
+						t.Fatal("fence did not join the cancelled append")
+					}
+				}
+				<-swept
+				wantCalls := int32(1)
+				if beforeEntry {
+					wantCalls = 0
+				}
+				if calls.Load() != wantCalls {
+					t.Fatalf("appender calls = %d, want %d", calls.Load(), wantCalls)
+				}
+				mailbox.finalize(context.Background())
+				mailbox.sweep(context.Background())
+				if calls.Load() != wantCalls || !mailbox.publicationIncomplete() {
+					t.Fatal("publication crossed the returned fence or lost retained evidence")
+				}
+			})
+		}
+	}
+}
+
+func TestFencedAttemptPreservesComputerShutdownDeadline(t *testing.T) {
+	deadline := time.Now().Add(time.Minute)
+	parent, cancelParent := context.WithDeadline(context.Background(), deadline)
+	defer cancelParent()
+	entered, releaseFence := make(chan struct{}), make(chan struct{})
+	attempt, cancelAttempt, release := fencedAttemptContext(parent, func(error) {
+		close(entered)
+		<-releaseFence
+	})
+	defer release()
+	defer cancelAttempt(nil)
+	if got, ok := attempt.Deadline(); !ok || !got.Equal(deadline) {
+		t.Fatalf("attempt deadline = %v, %t; want %v", got, ok, deadline)
+	}
+	cancelParent()
+	<-entered
+	if attempt.Err() != nil {
+		t.Fatal("attempt cancelled before the fence completed")
+	}
+	operation, cancelOperation := newComputerPublicationOperation(attempt, func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return context.WithTimeout(ctx, time.Hour)
+	})
+	defer cancelOperation()
+	if got, ok := operation.Deadline(); !ok || !got.Equal(deadline) {
+		t.Fatalf("Computer shutdown deadline = %v, %t; want %v", got, ok, deadline)
+	}
+	close(releaseFence)
+	<-attempt.Done()
+}
+
+func TestMailboxFinalizationDeadlineBoundsPollerJoinAndFinalSweep(t *testing.T) {
+	for _, polling := range []bool{false, true} {
+		t.Run(fmt.Sprintf("polling=%t", polling), func(t *testing.T) {
+			entered, exited := make(chan struct{}), make(chan struct{})
+			var calls atomic.Int32
+			appender := mailboxAppenderFunc(func(ctx context.Context, _, _, _ string, _ []byte) error {
+				calls.Add(1)
+				close(entered)
+				defer close(exited)
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			mailbox, _, _ := newTestMailbox(t, appender, "")
+			writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
+			if polling {
+				// A deliberately wedged poller join exercises the deadline path
+				// independently of an appender honoring cancellation.
+				mailbox.cancel = func() {}
+				defer close(mailbox.finished)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			done := make(chan struct{})
+			go func() { defer close(done); mailbox.finalize(ctx) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("finalization exceeded its caller's deadline")
+			}
+			if !mailbox.publicationIncomplete() || !mailbox.fenced.Load() || mailbox.publicationContext.Err() == nil {
+				t.Fatal("expired finalization did not stop publication and retain evidence")
+			}
+			mailbox.fence(context.DeadlineExceeded)
+			if !polling {
+				for _, signal := range []chan struct{}{entered, exited} {
+					select {
+					case <-signal:
+					case <-time.After(5 * time.Second):
+						t.Fatal("deadline test did not observe appender entry and cancellation")
+					}
+				}
+			}
+			before := calls.Load()
+			mailbox.sweep(context.Background())
+			if calls.Load() != before || !mailbox.pending() {
+				t.Fatal("deadline allowed a later append or discarded the event")
+			}
+		})
+	}
+}
+
+func TestMailboxFinalizationLeavesTreesAndFIFOsAndPublishesLaterEvents(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	tree := filepath.Join(mailbox.directory, runMailboxEventsDirectoryName, "0001-tree")
+	for i := range 64 {
+		child := filepath.Join(tree, fmt.Sprintf("branch-%03d", i), "nested")
+		if err := os.MkdirAll(child, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(child, "evidence"), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo := filepath.Join(mailbox.directory, runMailboxEventsDirectoryName, "0002-fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeMailboxEvent(t, mailbox.directory, "0003-valid", "wefty-protocol: 1\nkind: envelope\n--\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	mailbox.finalize(ctx)
+	if !mailbox.publicationIncomplete() || len(appender.snapshot()) != 1 {
+		t.Fatal("unremovable junk either hid the valid event or lost handoff retention")
+	}
+	for i := range 64 {
+		payload, err := os.ReadFile(filepath.Join(tree, fmt.Sprintf("branch-%03d", i), "nested", "evidence"))
+		if err != nil || string(payload) != "keep" {
+			t.Fatalf("completion traversed or removed the workload tree: %q, %v", payload, err)
+		}
+	}
+	if info, err := os.Lstat(fifo); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("FIFO was removed: %v, %v", info, err)
+	}
+}
+
+func TestMailboxLexicalOrderAcrossFormerPageBoundary(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	// Reverse creation order crosses the old 256-entry page boundary.
+	for i := 299; i >= 0; i-- {
+		name := fmt.Sprintf("gate-%04d", i)
+		writeMailboxEvent(t, mailbox.directory, name, "wefty-protocol: 1\nkind: gate\nname: "+name+"\noutcome: pass\n--\n")
+	}
+	if !mailbox.sweep(context.Background()) {
+		t.Fatal("complete listing was not drained")
+	}
+	documents := appender.snapshot()
+	if len(documents) != 300 {
+		t.Fatalf("published %d events, want 300", len(documents))
+	}
+	for i, document := range documents {
+		var gate contract.GateResult
+		if err := json.Unmarshal(document.body, &gate); err != nil {
+			t.Fatal(err)
+		}
+		if gate.Name != fmt.Sprintf("gate-%04d", i) {
+			t.Fatalf("publication %d = %s, not lexical order", i, gate.Name)
+		}
+	}
+}
+
+func TestMailboxValidJSONStateIsClampedAndFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		forge func(*runMailboxState)
+	}{
+		{"negative count", func(s *runMailboxState) { s.Count = -1 }},
+		{"excess count", func(s *runMailboxState) { s.Count = MaxRunMailboxEvents + 1 }},
+		{"negative bytes", func(s *runMailboxState) { s.Bytes = -1 }},
+		{"excess bytes", func(s *runMailboxState) { s.Bytes = MaxRunMailboxTotalBytes + 1 }},
+		{"negative rejections", func(s *runMailboxState) { s.Rejections = -1 }},
+		{"excess rejections", func(s *runMailboxState) { s.Rejections = MaxRunMailboxRejections + 1 }},
+		{"zero timestamp", func(s *runMailboxState) { s.Events["0001-event"] = runMailboxEventState{} }},
+		{"future timestamp", func(s *runMailboxState) {
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin.Add(time.Second)}
+		}},
+		{"invalid name", func(s *runMailboxState) {
+			s.Events["../outside"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin}
+		}},
+		{"published live event", func(s *runMailboxState) {
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, Published: true}
+		}},
+		{"unaccounted reservation", func(s *runMailboxState) {
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, ChargedBytes: 1}
+		}},
+		{"negative reservation", func(s *runMailboxState) {
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, ChargedBytes: -1}
+		}},
+		{"unaccounted rejection", func(s *runMailboxState) {
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, RejectionReserved: true}
+		}},
+		{"excess entries", func(s *runMailboxState) {
+			for i := range MaxRunMailboxScanEntries + 1 {
+				s.Events[fmt.Sprintf("event-%04d", i)] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin}
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			appender := newRecordingAppender("")
+			mailbox, handoff, clock := newTestMailbox(t, appender, "")
+			writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
+			state := runMailboxState{AttemptID: mailboxTestAttempt, Events: map[string]runMailboxEventState{}}
+			test.forge(&state)
+			payload, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(mailbox.directory, runMailboxPublishedDirectoryName, runMailboxStateFileName), payload, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := prepareRunMailbox(mailboxSpec("run_mailbox", handoff, ""), mailboxTestAttempt, appender, time.Hour, clock, t.Logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.close()
+			restarted.finalize(context.Background())
+			if !restarted.corrupt || !restarted.publicationIncomplete() || !restarted.pending() || len(appender.snapshot()) != 0 {
+				t.Fatal("forged state did not stop publication and retain the evidence")
+			}
+			got := restarted.state
+			if got.Count < 0 || got.Count > MaxRunMailboxEvents || got.Bytes < 0 || got.Bytes > MaxRunMailboxTotalBytes || got.Rejections < 0 || got.Rejections > MaxRunMailboxRejections || len(got.Events) > MaxRunMailboxScanEntries {
+				t.Fatal("loaded counters or map were not clamped")
+			}
+			for name, event := range got.Events {
+				if !validRunMailboxEventName(name) || event.ObservedAt.Before(time.Unix(0, 0)) || event.ObservedAt.After(clock.Now()) || event.ChargedBytes < 0 || event.ChargedBytes > MaxRunMailboxTotalBytes || event.Published {
+					t.Fatalf("loaded event was not clamped: %s %+v", name, event)
+				}
+			}
+		})
+	}
+}
+
+func TestMailboxRejectionBudgetAndPendingReservationSurviveRestart(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, handoff, clock := newTestMailbox(t, appender, "")
+	for i := range MaxRunMailboxRejections - 1 {
+		writeMailboxEvent(t, mailbox.directory, fmt.Sprintf("%04d-bad", i), "not protocol\n")
+	}
+	mailbox.sweep(context.Background())
+	appender.failWith(errors.New("response lost"))
+	writeMailboxEvent(t, mailbox.directory, "0007-bad", "not protocol\n")
+	mailbox.sweep(context.Background())
+	if mailbox.state.Rejections != MaxRunMailboxRejections {
+		t.Fatal("last rejection was not reserved before publication")
+	}
+	restarted, err := prepareRunMailbox(mailboxSpec("run_mailbox", handoff, ""), mailboxTestAttempt, appender, time.Hour, clock, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.close()
+	appender.failWith(nil)
+	writeMailboxEvent(t, mailbox.directory, "0008-bad", "not protocol\n")
+	restarted.finalize(context.Background())
+	if restarted.publicationIncomplete() || len(appender.snapshot()) != MaxRunMailboxRejections || restarted.state.Rejections != MaxRunMailboxRejections {
+		t.Fatalf("restart rejection budget = %d, published %d, incomplete=%t", restarted.state.Rejections, len(appender.snapshot()), restarted.publicationIncomplete())
 	}
 }
