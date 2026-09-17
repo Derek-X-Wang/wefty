@@ -1050,6 +1050,12 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		switch volume.Kind {
 		case ManagedVolumeHandoff:
 			request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvHandoffDir, contract.OCIContainerHandoffDirectory)
+			if request.Workload.RunMailbox != nil {
+				// WEFTY_RUN_DIR is minted here from the seed's run ID, never
+				// supplied by a caller, so no guest path crosses the protocol.
+				request.Workload.ReservedEnvironment = setReservedEnvironment(
+					request.Workload.ReservedEnvironment, contract.EnvRunDir, request.Workload.RunMailbox.ContainerDirectory())
+			}
 		case ManagedVolumeServiceData, ManagedVolumeComputerDisk:
 			request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvServiceDir, contract.OCIContainerServiceDirectory)
 		}
@@ -1168,6 +1174,17 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			}
 			if servicePath, ok := managedSources[ManagedVolumeServiceData]; ok {
 				if ownerErr = engine.initializeServiceVolume(servicePath, request.Resources.ServiceVolumeOwnerRecord, freshServiceVolume, uid, gid); ownerErr != nil {
+					closeErr := document.Close()
+					document = nil
+					return errors.Join(ownerErr, closeErr)
+				}
+			}
+			// The run mailbox is seeded here because this is the only point at
+			// which the process owner the workload will run as is known, and it
+			// must exist before the task starts: a job that writes its first
+			// event immediately needs somewhere to write it.
+			if handoffPath, ok := managedSources[ManagedVolumeHandoff]; ok && request.Workload.RunMailbox != nil {
+				if ownerErr = seedRunMailbox(handoffPath, *request.Workload.RunMailbox, uid, gid); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)

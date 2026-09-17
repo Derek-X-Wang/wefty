@@ -108,7 +108,10 @@ func (fs *memoryMailboxFS) read(name string, limit int) ([]byte, bool, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if fs.unreadable[name] {
-		return nil, false, fmt.Errorf("run mailbox path %q is not a regular file", name)
+		// Positively classified, so the publisher may remove it. An
+		// implementation that reported this as a bare error would have the
+		// entry preserved instead, which is the safe direction.
+		return nil, false, fmt.Errorf("%w: %q is not a regular file", errRunMailboxEntryUnusable, name)
 	}
 	payload, ok := fs.entries[name]
 	if !ok {

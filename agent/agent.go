@@ -130,13 +130,16 @@ type Agent struct {
 	outbox              *evidenceOutbox
 	// logSpool is a compatibility view used by existing package tests. The
 	// process-lifetime evidenceOutbox is its sole owner.
-	logSpool              *logSpool
-	runtimes              workloadRuntimeSet
-	managedResource       managedResourceManager
-	outputSinkFactory     OutputSinkFactory
-	handoffs              *handoffManager
-	runLedger             runLedgerAppender
-	mailboxPoll           time.Duration
+	logSpool          *logSpool
+	runtimes          workloadRuntimeSet
+	managedResource   managedResourceManager
+	outputSinkFactory OutputSinkFactory
+	handoffs          *handoffManager
+	runLedger         runLedgerAppender
+	mailboxPoll       time.Duration
+	// mailboxStateRoot is the agent-owned durable directory under which a
+	// mailbox the agent cannot open keeps its bookkeeping.
+	mailboxStateRoot      string
 	logf                  func(string, ...any)
 	clock                 Clock
 	observer              *lifecycleObserver
@@ -429,10 +432,11 @@ func New(config Config) (*Agent, error) {
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
-		handoffs:    newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
-		runLedger:   newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
-		mailboxPoll: durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
-		logf:        logf, clock: clock, observer: observer, capabilities: capabilities,
+		handoffs:         newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
+		runLedger:        newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
+		mailboxPoll:      durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
+		mailboxStateRoot: logSpoolDirectory,
+		logf:             logf, clock: clock, observer: observer, capabilities: capabilities,
 		attemptDeadman:  config.AttemptDeadman,
 		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
 		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
@@ -557,8 +561,9 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		finalizationTimeout: a.finalizationTimeout,
 		outputSinkFactory:   a.outputSinkFactory, handoffs: a.handoffs,
 		runLedger: a.runLedger, mailboxPoll: a.mailboxPoll,
-		managedResource: a.managedResource,
-		nodeID:          a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
+		mailboxStateRoot: a.mailboxStateRoot,
+		managedResource:  a.managedResource,
+		nodeID:           a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
 		fabric: a.fabric, computerPolicy: computerPolicy,

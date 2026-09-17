@@ -117,6 +117,17 @@ type ComputerCustodyExportEngine interface {
 	ExportComputerCustody(context.Context, ExportComputerCustodyRequest) (ExportComputerCustodyResponse, error)
 }
 
+// RunMailboxEngine serves the bounded read of one attempt's run mailbox. The
+// server has already proved the attempt is live and owns the named volume;
+// this engine owes confinement — it must reach the events directory only by
+// descriptor-relative descent from the managed root, follow no symlink at any
+// component, and return bytes only from a regular file it proved it opened.
+type RunMailboxEngine interface {
+	ListRunMailbox(context.Context, ListRunMailboxRequest) (ListRunMailboxResponse, error)
+	ReadRunMailbox(context.Context, ReadRunMailboxRequest) (ReadRunMailboxResponse, error)
+	RemoveRunMailboxEntry(context.Context, RemoveRunMailboxEntryRequest) (RemoveRunMailboxEntryResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

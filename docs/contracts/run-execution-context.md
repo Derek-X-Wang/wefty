@@ -77,11 +77,19 @@ decision governs reachability: an attempt without run-ledger provenance gets no
 run mailbox. Declaring dispatch authority is not an escalation: a run can only
 declare it at submit, and a credential-free job cannot submit anything.
 
-The two endpoints are unaffected. `WEFTY_L3_ENDPOINT` and `WEFTY_L1_ENDPOINT`
-remain present on a default job: they are transport, not authority. A call from
-a credential-free job is refused the same way any unauthenticated call is —
-`forbidden`, because no Fabric privilege is projected into the workload, and
-`unauthorized` if it presents a bearer that is not a valid credential.
+`WEFTY_L3_ENDPOINT` is unaffected: it remains present on a default job because
+it is transport, not authority. A call from a credential-free job is refused the
+same way any unauthenticated call is — `forbidden`, because no Fabric privilege
+is projected into the workload, and `unauthorized` if it presents a bearer that
+is not a valid credential.
+
+`WEFTY_L1_ENDPOINT` is different, and only for `kind=oci`. It and the attempt
+credential are one surface, and the OCI helper refuses a request that carries
+only half of the pair — an endpoint with no credential is a route to nothing,
+and a credential with no endpoint is unusable. A `kind=oci` job whose attempt
+credential is withheld therefore receives no `WEFTY_L1_ENDPOINT` either. A
+`kind=process` job keeps the endpoint, because nothing there enforces the pair
+and seeing the refusal is more useful than hiding the route.
 
 `WEFTY_L1_ENDPOINT` and `WEFTY_ATTEMPT_TOKEN` are delivered by the node agent
 to every `class=one-shot` attempt it launches, for both `kind=process` and
@@ -131,10 +139,14 @@ loopback and wildcard guest listeners rather than creating an ambient host
 door. No form exposes the bridge on a host wildcard or embeds a fixed gateway.
 
 For `kind=oci`, the exact reserved-name set is `WEFTY_HANDOFF_DIR`,
-`WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L1_ENDPOINT`,
+`WEFTY_RUN_DIR`, `WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L1_ENDPOINT`,
 `WEFTY_L3_ENDPOINT`, `WEFTY_ATTEMPT_TOKEN`, `WEFTY_RUN_TOKEN`,
 `WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and
-`WEFTY_COMPUTER_CONTROL_PORT`. `WEFTY_ATTEMPT_TOKEN` is sensitive alongside
+`WEFTY_COMPUTER_CONTROL_PORT`. `WEFTY_RUN_DIR` joined the set with the OCI run
+mailbox: the helper mints it from the mailbox seed inside the privileged
+boundary exactly as it mints `WEFTY_HANDOFF_DIR`, and a submitter or image able
+to set it would be choosing the directory the workload's reporting writer writes
+into. `WEFTY_ATTEMPT_TOKEN` is sensitive alongside
 `WEFTY_RUN_TOKEN` and `WEFTY_COMPUTER_TOKEN`. The unprivileged adapter removes those names
 from generic operator layers, and the privileged helper independently rejects
 any reserved name that crosses in a generic or caller-supplied reserved layer.
@@ -499,20 +511,83 @@ not authentication. Forged bookkeeping can only suppress or truncate the
 workload's own run's evidence; it grants no append credential or authority over
 another run.
 
-The mailbox is delivered to `kind=process` one-shots that L3 dispatched and
-extends to OCI once the helper exposes a read path. An OCI handoff volume is
-helper-owned inside the node and the helper protocol exposes
-no read path, so an OCI attempt receives no `WEFTY_RUN_DIR` and the agent logs
-that publication is unavailable rather than delivering a directory nothing
-would ever read.
+The mailbox is delivered to every one-shot L3 dispatched, `kind=process` and
+`kind=oci` alike. The file protocol above is identical for both; what differs is
+who owns the directory, and the differences make the OCI mailbox stricter rather
+than looser.
+
+An OCI handoff volume is helper-owned inside the node, so the agent cannot open
+it. The helper creates the mailbox inside the volume before the workload starts,
+mints `WEFTY_RUN_DIR` as `/wefty/handoff/.wefty/<run id>` inside its own trust
+boundary — no guest path crosses the protocol — and then serves a bounded,
+attempt-scoped read of `events/` to the agent through
+`ListRunMailbox`, `ReadRunMailbox` and `RemoveRunMailboxEntry`
+(`docs/contracts/oci-helper-protocol.md`). The agent's publisher is unchanged:
+it sees a listing, a bounded read and a removal, and every rule in this section
+— lexical order, the bounds, the rejection budget, the idempotency identity —
+is enforced exactly where it was.
+
+The boundary that matters is the helper's descent, not the volume's permissions.
+The agent never opens the volume; it asks the helper, which reaches the mailbox
+only by opening each component relative to the one above it and refusing any
+symlink or non-directory (`docs/contracts/oci-helper-protocol.md`, "Run mailbox
+confinement"). An image that declares no `USER` runs as uid 0 with no user
+namespace, so root inside the container is root on this bind mount and can
+rewrite anything in it. That is contained rather than prevented, and the
+containment is the volume: a workload reaches its handoff owner's volume and
+nothing outside it. That volume is not always one run's. A cold rerun keeps its
+source run as handoff owner, so a source run and its reruns on the same node
+share one volume, each with its own `.wefty/<run id>` inside it, and a uid-0
+workload can alter the retained evidence of its own lineage as well as its own.
+It cannot reach any other run, the agent's bookkeeping — `.published/` is not in
+the volume at all, and for an OCI attempt it is agent-local and per attempt — or
+anything else on the node; and a workload that replaces `events/` with a symlink
+only makes its own mailbox unreadable, because the descent refuses it.
+
+The permissions are defense in depth for the ordinary case, a non-root image.
+The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable
+but not writable (0711); `tmp/` and `events/` are owned by the uid the image
+declares (0700); `params.json` is root-owned and world-readable (0644). A
+non-root workload therefore writes and renames its own events, reads its own
+parameters, and can neither rewrite the parameters nor replace `events/`. Each
+is applied through the descriptor the helper just opened, never by name, and
+always explicitly, so a directory left by an earlier attempt is restored rather
+than trusted.
+
+Publication is authorized against the live attempt that declared the mailbox:
+once that attempt leaves the live state no new mailbox operation is admitted.
+An operation admitted before the reap may finish, and an event read while the
+attempt was live may reach the ledger after it — that is deliberate, because the
+event was written by a live workload and the agent publishes it with its own
+token. Each helper call honours the operation's context and carries a short
+deadline inside the finalization budget, so a closing session cannot keep an
+in-flight read alive behind it. What the reap ends is the ability to read
+anything further.
+
+The final drain therefore runs *before* `ReapAndVerify` for an OCI attempt — the
+workload has returned and the attempt is still live, the only window in which
+every event is both complete and still reachable — and after it for a process
+attempt, whose quiescence that reap is what proves.
+
+The handoff volume is removed immediately, by the agent's managed-volume
+finalizer through the helper, only when the attempt both executed successfully —
+no execution error and exit code zero — and published all of its evidence.
+Everything else retains it: a workload that failed keeps its volume even if
+every event it wrote reached the ledger, and a successful workload keeps it if
+the drain could not finish, because the helper stopped answering, a deadman
+guardian reaped the attempt first, or an entry could not be read. A retained
+volume is expired by the helper's boot sweep after its retention window. A read that
+fails for any reason other than the helper positively classifying the entry as
+unpublishable leaves that entry in place: an unreachable entry is never mistaken
+for junk, because deleting a run's only copy of its evidence on the strength of
+a timeout is the one failure this publisher must not have.
 
 Because the mailbox needs no credential, it is what a dispatched job reports
 through by default: `WEFTY_RUN_TOKEN` and `WEFTY_ATTEMPT_TOKEN` are withheld
 unless the run declared `dispatch_authority` at submit. A workflow that
-dispatches child runs still needs the run token and still declares it. The
-mailbox does not yet reach `kind=oci`, so until it does an OCI run that reports
-anything must declare dispatch authority; the agent logs that it can report
-nothing when a dispatched OCI attempt has neither.
+dispatches child runs still needs the run token and still declares it. That is
+now the only reason to declare it: an OCI run that merely reports holds no
+credential either, exactly like a process one.
 
 ## Node-local handoff lifecycle
 

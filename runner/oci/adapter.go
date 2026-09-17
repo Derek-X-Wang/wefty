@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"slices"
@@ -2386,6 +2387,76 @@ func (adapter *Adapter) ExportComputerCustody(ctx context.Context, request workl
 	return response.Receipt, nil
 }
 
+// ListRunMailbox, ReadRunMailbox and RemoveRunMailboxEntry are the agent's only
+// view of an OCI attempt's run mailbox. The handoff volume is helper-owned
+// inside the node, so these three calls are the whole seam: the helper proves
+// confinement and the attempt's ownership of the named mailbox, and returns
+// bounded bytes. Nothing here interprets an event.
+func (adapter *Adapter) ListRunMailbox(ctx context.Context, reference workloadrunner.RunMailboxReference, limit int) ([]string, bool, error) {
+	session, request, err := adapter.runMailboxRequest(reference)
+	if err != nil {
+		return nil, false, err
+	}
+	response, err := session.ListRunMailbox(ctx, ocihelper.ListRunMailboxRequest{RunMailboxReference: request, Limit: limit})
+	if err != nil {
+		return nil, false, err
+	}
+	return response.Names, response.Exhausted, nil
+}
+
+func (adapter *Adapter) ReadRunMailbox(ctx context.Context, reference workloadrunner.RunMailboxReference, name string, limit int) ([]byte, bool, error) {
+	session, request, err := adapter.runMailboxRequest(reference)
+	if err != nil {
+		return nil, false, err
+	}
+	response, err := session.ReadRunMailbox(ctx, ocihelper.ReadRunMailboxRequest{RunMailboxReference: request, Name: name, Limit: limit})
+	if err != nil {
+		return nil, false, err
+	}
+	if response.Unusable {
+		// The helper looked at the entry and says it can never be an event.
+		// That is the only answer on which the caller may delete it; a
+		// transport or authority failure arrives above as an ordinary error.
+		return nil, false, fmt.Errorf("%w: %s", workloadrunner.ErrRunMailboxEntryUnusable, response.Reason)
+	}
+	return response.Payload, response.Truncated, nil
+}
+
+func (adapter *Adapter) RemoveRunMailboxEntry(ctx context.Context, reference workloadrunner.RunMailboxReference, name string) error {
+	session, request, err := adapter.runMailboxRequest(reference)
+	if err != nil {
+		return err
+	}
+	response, err := session.RemoveRunMailboxEntry(ctx, ocihelper.RemoveRunMailboxEntryRequest{RunMailboxReference: request, Name: name})
+	if err != nil {
+		return err
+	}
+	if response.Absent {
+		// An entry that is already gone reads as retired, which is what a
+		// replayed retirement after a lost response must look like.
+		return fs.ErrNotExist
+	}
+	if !response.Removed {
+		return errors.New("OCI helper did not positively remove the run mailbox entry")
+	}
+	return nil
+}
+
+func (adapter *Adapter) runMailboxRequest(reference workloadrunner.RunMailboxReference) (*ocihelper.Session, ocihelper.RunMailboxReference, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return nil, ocihelper.RunMailboxReference{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return nil, ocihelper.RunMailboxReference{}, err
+	}
+	return session, ocihelper.RunMailboxReference{
+		Authority: HelperAuthority(reference.Authority),
+		OwnerKey:  reference.OwnerKey,
+		RunID:     reference.RunID,
+	}, nil
+}
+
 func adapterAuthorityKey(authority workloadrunner.AttemptAuthority) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", authority.NodeID, authority.BootSessionID, authority.JobID, authority.AttemptID, authority.FencingToken, authority.WorkloadClass, authority.RemovalGeneration)
 }
@@ -2443,6 +2514,14 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 		Environment: public, SensitiveEnvironment: sensitive,
 		ManagedVolumes: managedVolumes,
 	}
+	if request.RunMailbox != nil {
+		// WEFTY_RUN_DIR is not carried here: the helper mints it from this seed
+		// inside its trust boundary, exactly as it mints every other reserved
+		// execution-context value.
+		input.RunMailbox = &ocihelper.RunMailboxSeed{
+			RunID: request.RunMailbox.RunID, Params: request.RunMailbox.Params,
+		}
+	}
 	// Reserved names never cross the helper boundary through generic layers.
 	// The only currently minted execution-context values have closed fields,
 	// and their source layer is part of the protocol contract.
@@ -2451,6 +2530,16 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	}
 	if value, ok := request.Execution.SensitiveEnv[contract.EnvAttemptToken]; ok && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvAttemptToken) {
 		input.AttemptToken = value
+	}
+	// The attempt credential and the endpoint it authenticates to are one
+	// surface, and the helper refuses a request carrying only half of it. That
+	// refusal is right and stays: an endpoint without a credential is a route
+	// to nothing, and a credential without its endpoint is unusable. Credential
+	// delivery is opt-in, so an ordinary reporting run arrives here with the
+	// credential already withheld and the endpoint still set; dropping the
+	// endpoint with it is what keeps that run startable.
+	if input.AttemptToken == "" || input.L1Endpoint == "" {
+		input.AttemptToken, input.L1Endpoint = "", ""
 	}
 	if value, ok := request.Execution.Env[contract.EnvL3Endpoint]; ok && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL3Endpoint) {
 		input.L3Endpoint = value

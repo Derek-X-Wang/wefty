@@ -36,6 +36,13 @@ import (
 // under a shared identity, not tamper-proof. Directory-relative operations,
 // bounded reads and non-blocking opens limit accidental redirection and stalls;
 // the credential used to append is held by the agent.
+//
+// An OCI workload's mailbox is not this process's to open: it lives in a
+// helper-owned handoff volume and is read through the helper. Everything in
+// this file is the same for both, because the publisher sees only a mailboxFS.
+// What differs is in run_mailbox_remote.go, and each difference is a
+// tightening: the bookkeeping moves out of the workload's reach entirely, and
+// every read is authorized against the live attempt.
 const (
 	runMailboxDirectoryName          = ".wefty"
 	runMailboxEventsDirectoryName    = "events"
@@ -345,6 +352,11 @@ type runMailbox struct {
 	// fs is the publisher's only view of the events directory, so the rules
 	// above this field hold whatever backs it.
 	fs mailboxFS
+	// remote reports that the mailbox is read through a runtime rather than
+	// opened by this process. Its only consequence above this file is when the
+	// final drain runs: a remote read is authorized against the live attempt,
+	// so it must happen before the runtime is reaped, not after.
+	remote bool
 
 	runID     string
 	attemptID string
@@ -386,9 +398,10 @@ type runMailbox struct {
 	detachedDone chan struct{}
 	closeOnce    sync.Once
 
-	stopOnce sync.Once
-	cancel   context.CancelFunc
-	finished chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+	cancel    context.CancelFunc
+	finished  chan struct{}
 
 	// retireCheckpoint is a test-only seam that withholds retirement, so
 	// an agent lost between a successful publication and its bookkeeping can be
@@ -396,10 +409,10 @@ type runMailbox struct {
 	retireCheckpoint func() bool
 }
 
-// runMailboxAvailable reports whether this attempt can have a mailbox the
-// agent is able to read. An OCI handoff volume is helper-owned and guest-side,
-// and the helper protocol exposes no read method, so OCI publication waits for
-// that seam rather than pretending to work.
+// runMailboxAvailable reports whether this attempt can have a mailbox the agent
+// is able to open itself. An OCI handoff volume is helper-owned and guest-side,
+// so it has its own eligibility rule and its own read path;
+// see remoteRunMailboxAvailable.
 func runMailboxAvailable(spec contract.JobSpec) bool {
 	return usesAgentHandoffLifecycle(spec) &&
 		strings.TrimSpace(spec.Execution.Env[contract.EnvL3Endpoint]) != "" &&
@@ -443,18 +456,63 @@ func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedg
 		mailboxRoot.Close()
 		return nil, fmt.Errorf("open run mailbox cursor directory: %w", err)
 	}
-	mailbox := &runMailbox{
+	mailbox := newRunMailbox(runMailboxSettings{
 		directory: filepath.Join(handoff, runMailboxDirectoryName, runID),
-		root:      mailboxRoot,
-		published: publishedRoot,
-		fs:        newOSRootMailboxFS(eventsRoot),
 		runID:     runID,
 		attemptID: attemptID,
 		runToken:  strings.TrimSpace(spec.Execution.SensitiveEnv[contract.EnvRunToken]),
+		root:      mailboxRoot,
+		published: publishedRoot,
+		fs:        newOSRootMailboxFS(eventsRoot),
 		appender:  appender,
-		poll:      durationOrDefault(poll, DefaultRunMailboxPollInterval),
+		poll:      poll,
 		clock:     clock,
 		logf:      logf,
+	})
+	mailbox.loadState()
+	if err := mailbox.writeParams(spec.Labels[contract.LabelRunParams]); err != nil {
+		mailbox.close()
+		return nil, err
+	}
+	return mailbox, nil
+}
+
+// runMailboxSettings is what a prepared mailbox needs whatever backs it. The
+// bounds and the publication context are the same for every kind: only the
+// storage the publisher reads, and where its bookkeeping lives, differ.
+type runMailboxSettings struct {
+	directory string
+	runID     string
+	attemptID string
+	runToken  string
+	root      *os.Root
+	published *os.Root
+	fs        mailboxFS
+	appender  runLedgerAppender
+	poll      time.Duration
+	clock     Clock
+	logf      func(string, ...any)
+	remote    bool
+}
+
+func newRunMailbox(settings runMailboxSettings) *runMailbox {
+	clock := settings.clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	mailbox := &runMailbox{
+		directory: settings.directory,
+		root:      settings.root,
+		published: settings.published,
+		fs:        settings.fs,
+		runID:     settings.runID,
+		attemptID: settings.attemptID,
+		runToken:  settings.runToken,
+		appender:  settings.appender,
+		poll:      durationOrDefault(settings.poll, DefaultRunMailboxPollInterval),
+		clock:     clock,
+		logf:      settings.logf,
+		remote:    settings.remote,
 		maxEvents: MaxRunMailboxEvents,
 		maxBytes:  MaxRunMailboxTotalBytes,
 		maxScan:   MaxRunMailboxScanEntries,
@@ -464,12 +522,7 @@ func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedg
 		detachedDone:  make(chan struct{}),
 	}
 	mailbox.publicationContext, mailbox.cancelPublication = context.WithCancel(context.Background())
-	mailbox.loadState()
-	if err := mailbox.writeParams(spec.Labels[contract.LabelRunParams]); err != nil {
-		mailbox.close()
-		return nil, err
-	}
-	return mailbox, nil
+	return mailbox
 }
 
 // openRunMailboxDirectory walks into the mailbox one component at a time,
@@ -709,6 +762,16 @@ func (m *runMailbox) start(ctx context.Context) {
 	}()
 }
 
+// startIfRemote begins streaming publication for a mailbox served by the
+// runtime, once its attempt is admitted and a read can actually be authorized.
+// It is safe to call when there is no mailbox, and safe to call twice.
+func (m *runMailbox) startIfRemote(ctx context.Context) {
+	if !m.readsThroughRuntime() {
+		return
+	}
+	m.startOnce.Do(func() { m.start(ctx) })
+}
+
 // fence stops publication immediately and permanently. Authority loss is not a
 // reason to finish reporting: an attempt that no longer holds its lease must
 // not write anything further on the run's behalf.
@@ -742,7 +805,13 @@ func (m *runMailbox) stopPublication(cause error) {
 	first := !m.fenced.Swap(true)
 	m.cancelPublication()
 	if first {
-		m.log("agent: run %s mailbox publication fenced: %v", m.runID, cause)
+		// An ordinary teardown fences with no cause at all. Saying "<nil>"
+		// reads as a lost error; saying so plainly reads as what it is.
+		reason := "attempt teardown"
+		if cause != nil {
+			reason = cause.Error()
+		}
+		m.log("agent: run %s mailbox publication fenced: %s", m.runID, reason)
 	}
 }
 
@@ -880,6 +949,12 @@ func (m *runMailbox) finishExpired(cause error, done <-chan struct{}) {
 	}
 }
 
+// readsThroughRuntime reports a mailbox whose evidence is only reachable while
+// its attempt is still live at the runtime.
+func (m *runMailbox) readsThroughRuntime() bool {
+	return m != nil && m.remote
+}
+
 // publicationIncomplete reports that evidence written by this attempt did not
 // reach the ledger. A successful run must then keep its handoff directory: the
 // files are the only remaining copy.
@@ -962,10 +1037,26 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 	}
 	raw, truncated, err := m.readEvent(name)
 	if err != nil {
-		// Not a regular file, or not readable: it is junk in the events
-		// directory. Remove only safely classifiable entries; keep the rest.
+		if errors.Is(err, errRunMailboxEntryUnusable) {
+			// The implementation looked at the entry and says it can never
+			// become an event, so removing it loses nothing. This sentinel is
+			// the only thing that reaches discard. In particular a bare
+			// os.ErrNotExist is NOT enough: a missing helper socket is an
+			// ENOENT about the transport, not about the entry, and acting on
+			// it would delete a run's only copy of its evidence. An
+			// implementation that can genuinely tell an entry vanished says so
+			// with this sentinel itself.
+			m.log("agent: run %s mailbox entry %q is not a publishable event: %v", m.runID, name, err)
+			return m.discard(name)
+		}
+		// Anything else -- a transport failure, an expired deadline, lost
+		// authority, an unclassifiable I/O error -- says nothing about the
+		// entry. Keep it, stop this sweep so lexical order is preserved, and
+		// let the next one retry; if the failure outlasts finalization the
+		// entry is still pending, which latches publicationIncomplete and
+		// retains the handoff.
 		m.log("agent: read run %s mailbox event %q: %v", m.runID, name, err)
-		return m.discard(name)
+		return err
 	}
 	// The observation timestamp is persisted before the document is built, so
 	// every later republication of this file produces the same bytes.
@@ -1253,7 +1344,7 @@ func readBoundedRegularFile(root *os.Root, name string, limit int) ([]byte, bool
 		return nil, false, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("run mailbox path %q is not a regular file", name)
+		return nil, false, fmt.Errorf("%w: %q is not a regular file", errRunMailboxEntryUnusable, name)
 	}
 	file, err := root.OpenFile(name, os.O_RDONLY|runMailboxNonBlockingOpen, 0)
 	if err != nil {
@@ -1265,7 +1356,7 @@ func readBoundedRegularFile(root *os.Root, name string, limit int) ([]byte, bool
 		return nil, false, err
 	}
 	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, false, fmt.Errorf("run mailbox path %q changed identity while opening", name)
+		return nil, false, fmt.Errorf("%w: %q changed identity while opening", errRunMailboxEntryUnusable, name)
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
 	if err != nil {

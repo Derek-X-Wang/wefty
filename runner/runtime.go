@@ -110,6 +110,49 @@ type OCIImagePinRuntime interface {
 	ReleaseOCIImageBindingPin(context.Context, string) error
 }
 
+// RunMailboxSeed asks a runtime to create one run-scoped mailbox inside this
+// attempt's handoff volume and deliver the run's parameters into it. Only
+// runtimes whose handoff storage the agent cannot reach need it; a process
+// attempt's agent creates its own.
+type RunMailboxSeed struct {
+	RunID  string
+	Params []byte
+}
+
+// RunMailboxReference names one attempt's mailbox for a bounded read. OwnerKey
+// is the same stable handoff owner key the attempt's managed volume carries.
+type RunMailboxReference struct {
+	Authority AttemptAuthority
+	OwnerKey  string
+	RunID     string
+}
+
+// ErrRunMailboxEntryUnusable is a runtime's positive classification of one
+// mailbox entry that can never become an event: it is not a readable regular
+// file, or it changed identity while being opened. A caller may delete such an
+// entry. It must never be conflated with a transport, deadline or authority
+// failure, which say nothing about the entry and on which deleting it would
+// destroy a workload's only copy of its evidence.
+var ErrRunMailboxEntryUnusable = errors.New("run mailbox entry is not a publishable event")
+
+// RunMailboxRuntime is the bounded read of a mailbox the agent cannot open
+// itself. It is implemented by the OCI adapter without exposing helper types at
+// this seam, and deliberately offers nothing but the three operations the run
+// mailbox publisher needs: a bounded listing, a bounded read of one entry, and
+// the removal of an entry the ledger already holds.
+//
+// Every call is authorized against the live attempt that declared the mailbox,
+// so it stops working the moment that attempt is reaped. A publisher that
+// cannot finish before then retains its evidence rather than losing it.
+type RunMailboxRuntime interface {
+	ListRunMailbox(ctx context.Context, reference RunMailboxReference, limit int) (names []string, exhausted bool, err error)
+	// ReadRunMailbox returns ErrRunMailboxEntryUnusable for an entry the
+	// runtime positively classified as unpublishable, and the underlying
+	// failure for anything else.
+	ReadRunMailbox(ctx context.Context, reference RunMailboxReference, name string, limit int) (payload []byte, truncated bool, err error)
+	RemoveRunMailboxEntry(ctx context.Context, reference RunMailboxReference, name string) error
+}
+
 // RuntimeGeneration identifies the adapter generation that observed a runtime
 // loss without exposing kind-specific session types at the agent seam.
 type RuntimeGeneration struct {
@@ -382,6 +425,9 @@ type Request struct {
 	Limits           *contract.JobLimits
 	ManagedResources ManagedResources
 	ManagedVolumes   []ManagedVolume
+	// RunMailbox asks the runtime to seed this attempt's mailbox. It is set
+	// only for a runtime whose handoff storage the agent cannot reach.
+	RunMailbox       *RunMailboxSeed
 	LifetimeBoundary LifetimeBoundary
 	// TerminationGrace is the agent-compiled interval between TERM and KILL
 	// for runtimes whose lifetime is bound to the agent boot. It is ignored

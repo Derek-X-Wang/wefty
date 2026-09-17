@@ -25,13 +25,24 @@ type mailboxFS interface {
 	// implementation happens to enumerate.
 	list(limit int) (names []string, exhausted bool, err error)
 	// read returns at most limit bytes of one entry and reports truncation.
-	// An entry that is not a readable regular file is an error, never bytes.
+	// An entry the implementation positively classifies as unpublishable is
+	// reported as errRunMailboxEntryUnusable; every other failure -- a
+	// transport, deadline, authority or I/O error -- is reported as itself.
+	// The caller deletes the first and preserves the second, so the two must
+	// never be conflated by an implementation.
 	read(name string, limit int) (payload []byte, truncated bool, err error)
 	// remove deletes one entry. A missing entry reports os.ErrNotExist so the
 	// caller can treat an already-retired event as retired.
 	remove(name string) error
 	close() error
 }
+
+// errRunMailboxEntryUnusable marks an entry that can never become an event:
+// not a readable regular file, or one that changed identity while being opened.
+// It is the only read failure that permits removal. Anything else leaves the
+// entry where it is, because deleting a workload's only copy of its evidence on
+// the strength of a timeout is the one mistake this publisher must never make.
+var errRunMailboxEntryUnusable = errors.New("run mailbox entry is not a publishable event")
 
 // osRootMailboxFS reaches the events directory only through the root opened at
 // preparation. The root is never re-resolved by name, so a workload that
@@ -70,7 +81,18 @@ func (fs *osRootMailboxFS) list(limit int) ([]string, bool, error) {
 // the size bound. The non-blocking open is what keeps a FIFO planted in the
 // events directory from holding finalization open forever.
 func (fs *osRootMailboxFS) read(name string, limit int) ([]byte, bool, error) {
-	return readBoundedRegularFile(fs.events, name, limit)
+	payload, truncated, err := readBoundedRegularFile(fs.events, name, limit)
+	if errors.Is(err, os.ErrNotExist) {
+		// An entry that was listed and is gone by the time it is read was
+		// retired by something else, or never survived its own rename. This
+		// implementation opened the directory itself, so the absence is a fact
+		// about the entry and is classified here rather than left as a generic
+		// error the publisher would have to interpret -- which is exactly what
+		// it must not do, because an ENOENT from a transport means something
+		// entirely different.
+		return nil, false, fmt.Errorf("%w: %q is absent", errRunMailboxEntryUnusable, name)
+	}
+	return payload, truncated, err
 }
 
 // remove never recursively walks workload data. Unknown objects and nonempty

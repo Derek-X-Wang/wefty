@@ -84,6 +84,7 @@ type acceptanceHarness struct {
 	spoolDirectory      string
 	controlPlaneAddress string
 	runLedgerAddress    string
+	runLedgerDatabase   string
 	adminBootstrapNonce string
 	agentArguments      []string
 	productionTimings   bool
@@ -107,6 +108,10 @@ type acceptanceHarnessOptions struct {
 	productionTimings bool
 	agentArguments    []string
 	computerLane      bool
+	// runLedgerLane brings up L3 and configures L1's trusted run-ledger
+	// identity without the Computer plumbing, so a lane can submit a run the
+	// way a person does and have L1 classify the submitter.
+	runLedgerLane bool
 	// maxServiceSlots overrides the node's service-class slot pool (default 2,
 	// the count TestClassPoolsRunAtCapacityAndIsolateSiblings relies on) for a
 	// harness that must run more than two service-class jobs at once.
@@ -142,14 +147,18 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 		"--node-max-service-slots=acceptance-node=" + strconv.Itoa(serviceSlots),
 		"--ready-file=" + readyFile,
 	}
+	ledgerLane := options.computerLane || options.runLedgerLane
+	runLedgerDatabase := filepath.Join(directory, "l3.sqlite")
 	var runLedgerAddress string
-	if options.computerLane {
+	if ledgerLane {
 		runLedgerAddress = net.JoinHostPort("127.0.0.1", strconv.Itoa(reservePort(t)))
 		controlPlaneArguments = append(controlPlaneArguments,
 			"--allow-plain-person-identities",
-			"--computer-backup-cap=4",
 			"--run-ledger="+runLedgerAddress,
 		)
+	}
+	if options.computerLane {
+		controlPlaneArguments = append(controlPlaneArguments, "--computer-backup-cap=4")
 	}
 	var adminBootstrapNonce string
 	if options.computerLane {
@@ -172,13 +181,13 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 	controlPlane.start(t)
 	address := waitForReadyAddress(t, readyFile, controlPlane, 10*time.Second)
 	var runLedger *managedProcess
-	if options.computerLane {
+	if ledgerLane {
 		runLedgerReadyFile := filepath.Join(directory, "l3-ready.json")
 		runLedgerArguments := []string{
 			"--fabric=plain",
 			"--listen=" + runLedgerAddress,
 			"--control-plane=" + address,
-			"--db=" + filepath.Join(directory, "l3.sqlite"),
+			"--db=" + runLedgerDatabase,
 			"--ready-file=" + runLedgerReadyFile,
 		}
 		if !options.productionTimings {
@@ -211,6 +220,7 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
 		l1Database: l1Database, spoolDirectory: spoolDirectory, controlPlaneAddress: address,
 		runLedgerAddress:    runLedgerAddress,
+		runLedgerDatabase:   runLedgerDatabase,
 		adminBootstrapNonce: adminBootstrapNonce,
 		agentArguments:      append([]string(nil), options.agentArguments...),
 		productionTimings:   options.productionTimings,
