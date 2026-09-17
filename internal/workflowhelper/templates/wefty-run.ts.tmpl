@@ -1,0 +1,193 @@
+// wefty-run.ts: the run-mailbox writer for a TypeScript workflow.
+//
+// A thin wrapper, deliberately: no package, no dependency, no build step. It
+// writes the same event files `wefty run ...` writes (the protocol is
+// docs/contracts/run-execution-context.md, "Run mailbox"), so a job reports
+// without holding any credential and without speaking HTTP.
+//
+// Run it with a TypeScript-capable Node (`node --experimental-strip-types`,
+// Node 23+, or `tsx`). Only type annotations are used, so stripping is enough.
+
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+export type Status = "succeeded" | "failed" | "partial";
+export type Outcome = "pass" | "fail" | "error" | "skipped";
+export type PayloadFormat = "text" | "json";
+
+export interface EventOptions {
+  name?: string;
+  step?: string;
+  status?: string;
+  outcome?: string;
+  summary?: string;
+  key?: string;
+  format?: PayloadFormat;
+  payload?: string;
+}
+
+let sequence = 0;
+
+function runDirectory(): string {
+  const directory = (process.env.WEFTY_RUN_DIR ?? "").trim();
+  if (directory === "") {
+    throw new Error(
+      "WEFTY_RUN_DIR is not set: this job has no run mailbox to report through. " +
+        'See docs/contracts/run-execution-context.md, "Run mailbox".',
+    );
+  }
+  return directory;
+}
+
+// A header value is one line: fold what a header cannot carry, drop the rest.
+function headerValue(value: string): string {
+  let folded = "";
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (character === "\n" || character === "\r" || character === "\t") {
+      folded += " ";
+    } else if (code < 0x20 || code === 0x7f) {
+      continue;
+    } else {
+      folded += character;
+    }
+  }
+  return folded.replace(/^ +/, "").replace(/ +$/, "");
+}
+
+function slug(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 32);
+  return cleaned === "" ? "event" : cleaned;
+}
+
+/** Write one event. Returns the published path. */
+export function event(kind: string, options: EventOptions = {}): string {
+  const directory = runDirectory();
+  const staging = join(directory, "tmp");
+  const events = join(directory, "events");
+  mkdirSync(staging, { recursive: true });
+  mkdirSync(events, { recursive: true });
+
+  // Milliseconds, not seconds: a sweep publishes in lexical order, so the file
+  // name is what keeps two events written back to back in the order the
+  // workflow reported them.
+  sequence = (sequence + 1) % 10000;
+  const label = options.name ?? options.step ?? kind;
+  const file =
+    `${String(Date.now()).padStart(13, "0")}-${String(sequence).padStart(4, "0")}` +
+    `-${kind}-${slug(label)}-${process.pid.toString(16).padStart(8, "0")}`;
+
+  const headers: Array<[string, string | undefined]> = [
+    ["name", options.name],
+    ["step", options.step],
+    ["status", options.status],
+    ["outcome", options.outcome],
+    ["summary", options.summary],
+    ["key", options.key],
+  ];
+  let document = `wefty-protocol: 1\nkind: ${kind}\n`;
+  for (const [header, raw] of headers) {
+    const value = headerValue(raw ?? "");
+    if (value !== "") {
+      document += `${header}: ${value}\n`;
+    }
+  }
+  const createdAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  document += `payload: ${options.format ?? "text"}\ncreated-at: ${createdAt}\n--\n`;
+  document += options.payload ?? "";
+
+  const staged = join(staging, file);
+  writeFileSync(staged, document, { mode: 0o600 });
+  const published = join(events, file);
+  renameSync(staged, published);
+  return published;
+}
+
+/** Bracket a step: start it, then end it. */
+export function step(name: string, options: { end?: boolean; summary?: string } = {}): string {
+  return event("step", {
+    name,
+    status: options.end === true ? "ended" : "started",
+    summary: options.summary,
+  });
+}
+
+/** Report one step's outcome. */
+export function envelope(
+  stepId: string,
+  options: { status?: Status; summary?: string; payload?: string; format?: PayloadFormat } = {},
+): string {
+  return event("envelope", {
+    step: stepId,
+    status: options.status ?? "succeeded",
+    summary: options.summary,
+    payload: options.payload,
+    format: options.format,
+  });
+}
+
+/** Record one verdict. Its evidence is the payload. */
+export function gate(
+  name: string,
+  outcome: Outcome,
+  options: { summary?: string; evidence?: string } = {},
+): string {
+  return event("gate", {
+    name,
+    outcome,
+    summary: options.summary,
+    payload: options.evidence,
+  });
+}
+
+/**
+ * Record the run's result document. It also lands in the handoff directory as
+ * result.json, which is what an operator reads off the node when a failing
+ * attempt retains its handoff.
+ */
+export function result(
+  document: string,
+  options: { status?: Status; summary?: string } = {},
+): string {
+  const handoff = (process.env.WEFTY_HANDOFF_DIR ?? "").trim();
+  if (handoff !== "") {
+    mkdirSync(handoff, { recursive: true });
+    writeFileSync(join(handoff, "result.json"), document, { mode: 0o600 });
+  }
+  let format: PayloadFormat = "text";
+  try {
+    JSON.parse(document);
+    format = "json";
+  } catch {
+    format = "text";
+  }
+  return event("result", {
+    status: options.status ?? "succeeded",
+    summary: options.summary,
+    payload: document,
+    format,
+  });
+}
+
+/** The parameters this run was submitted with, delivered by the node agent. */
+export function params(): Record<string, unknown> {
+  try {
+    return JSON.parse(readFileSync(join(runDirectory(), "params.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    // A run submitted without params, and one whose params were too large to
+    // deliver, both leave the file absent. Neither is a workflow error.
+    return {};
+  }
+}
+
+/** One parameter as text, empty when it was not submitted. */
+export function param(name: string): string {
+  const value = params()[name];
+  if (value === undefined || value === null) {
+    return "";
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}

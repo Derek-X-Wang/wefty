@@ -1,0 +1,84 @@
+# {{.Name}}
+
+A wefty workflow scaffolded by `wefty workflow init {{.Name}} --lang {{.Lang}}`.
+It greets a subject, reports one step, one envelope and one gate, and hands
+back a result document. Replace the work; keep the reporting shape.
+
+## What this workflow may do
+
+It reports, and it uses no credential to do it. Reporting goes through the
+**run mailbox** — files written into `$WEFTY_RUN_DIR`, which the node agent
+publishes to the run ledger with the credential it already holds. A mailbox
+write is a claim about this run and nothing else: it confers no authority over
+the cluster, so do not build on this workflow being able to dispatch a child
+run, read another run, or act on any other job.
+
+The protocol is `docs/contracts/run-execution-context.md`, "Run mailbox".
+
+## Files
+
+| File | What it is |
+|---|---|
+{{if eq .Lang "bash" -}}
+| `{{.Name}}.sh` | the workflow |
+| `{{.TestFile}}` | `bash -n`, shellcheck, and a local run that asserts the four events |
+{{- else -}}
+| `{{.Name}}.ts` | the workflow |
+| `wefty-run.ts` | the run-mailbox writer: no package, no dependency, no build step |
+| `{{.TestFile}}` | a local run that asserts the four events |
+{{- end}}
+
+{{if eq .Lang "bash" -}}
+`{{.Name}}.sh` calls `wefty run ...` when the `wefty` binary is on PATH and
+falls back to an inline POSIX writer otherwise. The two produce byte-identical
+event files, which is how an OCI image that does not ship the binary reports
+the same way.
+{{- else -}}
+`wefty-run.ts` writes the event files directly. It needs a TypeScript-capable
+Node: `node --experimental-strip-types {{.Name}}.ts`, Node 23+, or `tsx`.
+{{- end}}
+
+## Run it
+
+Submit it to the cluster, follow it, then read what it reported:
+
+```sh
+wefty --json submit \
+  --script={{.ScriptName}} \
+{{- if eq .Lang "bash" }}
+  --interpreter=bash \
+{{- else }}
+  --interpreter=node \
+{{- end }}
+  --params-file=params.json \
+  --tag=<routing-tag> \
+  --idempotency-key=<stable-unique-key>
+
+wefty logs <run_id> --follow      # wait for it, live
+wefty --json inspect <run_id>     # the envelopes, gates and lineage it produced
+```
+
+`params.json` is an ordinary JSON object; this starter reads `subject`:
+
+```json
+{"subject": "wefty"}
+```
+
+A job never receives its own params in the environment. The agent delivers them
+to `$WEFTY_RUN_DIR/params.json`, which is what `{{if eq .Lang "bash"}}wefty run params subject{{else}}param("subject"){{end}}` reads.
+
+## Local exercise
+
+The workflow does not need a cluster to be exercised: point `WEFTY_RUN_DIR` at
+an empty directory and run it, then read `events/`.
+
+```sh
+export WEFTY_RUN_DIR=$(mktemp -d)
+export WEFTY_HANDOFF_DIR=$(mktemp -d)
+{{if eq .Lang "bash"}}bash {{.Name}}.sh{{else}}node --experimental-strip-types {{.Name}}.ts{{end}}
+ls "$WEFTY_RUN_DIR/events"
+```
+
+`{{.TestFile}}` does exactly that. The full single-machine stack exercise —
+submit, dispatch, publish, inspect — is modelled in
+`workflows/branch-gates/branchgates_integration_test.go`.

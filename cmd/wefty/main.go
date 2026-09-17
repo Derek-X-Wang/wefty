@@ -233,6 +233,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if commandArgs[0] == "node" {
 		return executeLocalNode(ctx, options, commandArgs[1:], stdout, stderr)
 	}
+	// The authoring surface runs before the fabric is opened, like `wefty
+	// node`. It writes files and never speaks to the cluster: a job reporting
+	// through its run mailbox holds no credential and has no identity to dial
+	// with, so requiring one here would defeat the mailbox entirely.
+	if handled, err := executeAuthoringCommand(options, commandArgs, stdout, stderr); handled {
+		return err
+	}
 	plainIdentity := fabric.Identity{
 		NodeID: options.plainIdentity, UserID: options.plainUserID, DeviceID: options.plainDeviceID,
 		Tags: []string{l3.DefaultCallerPrincipalTag},
@@ -385,6 +392,17 @@ Commands:
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
   drain NODE_ID              Disable new claims using the current intent revision
+  run <envelope|step|gate|result|params>
+                             Report from inside a running job by writing run
+                             mailbox events; needs no credential and no cluster
+    envelope --step STEP [--status succeeded|failed|partial --summary TEXT
+             --payload-file FILE | --payload-json-file FILE --key KEY]
+    step --name NAME [--end --summary TEXT]
+    gate --name NAME --outcome pass|fail|error|skipped [--evidence-file FILE --summary TEXT]
+    result --file PATH [--status succeeded|failed|partial --summary TEXT]
+    params [--json] [NAME]
+  workflow init NAME         Scaffold a runnable workflow starter
+    [--lang bash|ts] [--dir DIR]
 
 Global flags:
   --fabric plain|tsnet

@@ -1,0 +1,49 @@
+// {{.Name}}: a wefty workflow, scaffolded by `wefty workflow init`.
+//
+// What this workflow may do
+// -------------------------
+// It reports, and it uses no credential to do it. Everything below writes files
+// into $WEFTY_RUN_DIR, the run mailbox; the node agent, which already holds
+// authority, publishes them to the run ledger. A mailbox write is a claim about
+// this run and nothing else -- it confers no authority over the cluster, so do
+// not build on this workflow being able to dispatch a child run, read another
+// run, or act on any other job.
+//
+// Contract: docs/contracts/run-execution-context.md, "Run mailbox".
+//
+// Replace the "do the work" section. Keep the reporting shape: one step
+// bracketing the work, one envelope per unit of work, one gate carrying the
+// verdict, one result document.
+
+import { envelope, gate, param, result, step } from "./wefty-run.ts";
+
+const WORKFLOW = "{{.Name}}";
+
+function log(message: string): void {
+  process.stdout.write(`${WORKFLOW}: ${message}\n`);
+}
+
+// --------------------------------------------------------------------------
+// Do the work
+// --------------------------------------------------------------------------
+
+const subject = param("subject") || "world";
+
+step("work", { summary: `greeting ${subject}` });
+
+const detail = `hello, ${subject}\n`;
+const passed = detail.length > 0;
+const status = passed ? "succeeded" : "failed";
+const outcome = passed ? "pass" : "fail";
+
+envelope("work", { status, summary: `greeted ${subject}`, payload: detail });
+step("work", { end: true, summary: `greeting ${subject}` });
+gate(WORKFLOW, outcome, { summary: `the greeting is ${outcome}` });
+
+result(JSON.stringify({ schema_version: 1, workflow: WORKFLOW, subject, passed }) + "\n", {
+  status,
+  summary: `${WORKFLOW} finished: ${outcome}`,
+});
+
+log(`done: ${outcome}`);
+process.exit(passed ? 0 : 1);

@@ -78,6 +78,36 @@ every other job route answers `principal_forbidden`. The child's
 only while your attempt holds the lease. Service and Computer attempts do not
 receive these two variables yet.
 
+## Reporting from a workflow
+
+Do not hand-roll HTTP or JSON to report. A job that L3 dispatched receives
+`WEFTY_RUN_DIR`, its **run mailbox**: it writes event files there and the node
+agent publishes them to the ledger with the credential it already holds, so the
+workload needs none. Use the CLI, which writes those files and speaks to
+nothing:
+
+```sh
+wefty run params ref                                   # a submitted param
+wefty run step --name build --summary "compiling"      # ... work ... then --end
+wefty run envelope --step build --status succeeded --summary "built" \
+  --payload-file detail.txt                            # or --payload-json-file
+wefty run gate --name vet --outcome fail --evidence-file failures.txt
+wefty run result --file result.json --status failed    # also lands in the handoff dir
+```
+
+Add `--json` to print the written event's path. Every subcommand fails with a
+clear message when `WEFTY_RUN_DIR` is absent — an OCI job does not receive one
+yet.
+
+Start a new workflow with `wefty workflow init NAME [--lang bash|ts]`: it
+writes a runnable starter using those subcommands (with an inline POSIX writer
+for an image that does not ship the binary), a README with the submit/follow/
+inspect commands, and a test that exercises the starter without a cluster.
+
+Scope check before writing one: a mailbox write is a claim about the writing
+run and nothing else. Reporting through it confers no authority, so design the
+workflow as if reporting is all it can do.
+
 ## Judging results
 
 A run is only good when `inspect` shows: status `succeeded`, expected
