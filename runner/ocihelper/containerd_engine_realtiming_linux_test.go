@@ -2364,9 +2364,17 @@ func exerciseOrdinaryL3OCIOneshot(
 		t.Fatal(err)
 	}
 	defer l1Store.Close()
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
-		"native-node": l1.DefaultNodePolicy("linux"),
-	}})
+	// L1 must be told which identity the run ledger actually uses here, or it
+	// classifies this test's L3 as an ordinary direct-L1 submitter: the default
+	// is "run-ledger" and this fixture's ledger is "native-ledger". That
+	// classification became load-bearing in #485 -- it decides whether the
+	// workload is reachable to L3 at all -- so without this the test silently
+	// stops exercising the L3-dispatched path it exists to cover.
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
+		RunLedgerNodeID: "native-ledger",
+		NodePolicies: map[string]l1.NodePolicy{
+			"native-node": l1.DefaultNodePolicy("linux"),
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2440,6 +2448,12 @@ func exerciseOrdinaryL3OCIOneshot(
 	create := l3.CreateRunRequest{
 		Image:  &contract.ImageProgram{Reference: echoReference, Digest: &digest, Argv: []string{"/usr/local/bin/wefty-echo-service", "--once"}},
 		Params: json.RawMessage(`{"lane":"native-linux"}`), Tags: []string{"linux"},
+		// The payload reports to L3 over HTTP with the run token, so under the
+		// opt-in delivery #485 introduced it must declare that it does. Without
+		// the declaration the agent withholds the run token and publishes no L3
+		// endpoint, and `wefty-echo-service --once` refuses to start. The rerun
+		// below inherits the declaration from this run.
+		DispatchAuthority: true,
 	}
 	var accepted l3.RunAccepted
 	doNativeJSON(t, caller, http.MethodPost, "/v1/runs", create, http.Header{"Idempotency-Key": []string{"native-ordinary-oci"}}, http.StatusCreated, &accepted)
@@ -2545,19 +2559,84 @@ func doNativeJSON(t *testing.T, client *http.Client, method, path string, input 
 func waitNativeRun(t *testing.T, client *http.Client, runID string, want contract.RunState) contract.RunRecord {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
+	var last contract.RunRecord
 	for time.Now().Before(deadline) {
 		var record contract.RunRecord
 		doNativeJSON(t, client, http.MethodGet, "/v1/runs/"+runID, nil, nil, http.StatusOK, &record)
+		last = record
 		if record.Status == want {
 			return record
 		}
 		if record.Status == contract.RunFailed {
-			t.Fatalf("run %s failed while waiting for %s", runID, want)
+			t.Fatalf("run %s failed while waiting for %s%s", runID, want, describeNativeRun(t, client, runID, record))
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for run %s state %s", runID, want)
+	t.Fatalf("timed out waiting for run %s state %s%s", runID, want, describeNativeRun(t, client, runID, last))
 	return contract.RunRecord{}
+}
+
+// describeNativeRun is diagnosis only, and it exists because this failure
+// already cost a lane cycle to attribute. A run that never terminalizes is the
+// same message whether the attempt keeps requeueing or the agent is wedged
+// inside one; the L1 job state and its attempt count are what separate them,
+// and whether any log event reached the ledger says whether the payload ran at
+// all.
+func describeNativeRun(t *testing.T, client *http.Client, runID string, last contract.RunRecord) string {
+	t.Helper()
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "\n  last observed: status=%q l1_job=%q node=%q started=%v finished=%v",
+		last.Status, last.L1JobID, last.NodeID, last.StartedAt != nil, last.FinishedAt != nil)
+	if status, body := tryNativeJSON(t, client, http.MethodGet, "/v1/runs/"+runID+"/execution"); status == http.StatusOK {
+		var execution l3.RunExecution
+		if err := json.Unmarshal(body, &execution); err == nil {
+			if execution.Job != nil {
+				fmt.Fprintf(&detail, "\n  l1 job: state=%q status=%q attempts=%d current_attempt=%q unschedulable=%q failure=%q",
+					execution.Job.State, execution.Job.Status, len(execution.Job.Attempts),
+					execution.Job.CurrentAttemptID, execution.Job.UnschedulableReason, execution.Job.FailureReason)
+				for index, attempt := range execution.Job.Attempts {
+					fmt.Fprintf(&detail, "\n    attempt %d: id=%q state=%q", index, attempt.AttemptID, attempt.State)
+				}
+			}
+			if execution.DispatchError != nil {
+				fmt.Fprintf(&detail, "\n  dispatch error: %v", execution.DispatchError)
+			}
+		}
+	}
+	if status, body := tryNativeJSON(t, client, http.MethodGet, "/v1/runs/"+runID+"/logs"); status == http.StatusOK {
+		var logs l1.LogPage
+		if err := json.Unmarshal(body, &logs); err == nil {
+			fmt.Fprintf(&detail, "\n  log events: %d", len(logs.Events))
+			for index, event := range logs.Events {
+				if index >= 10 {
+					fmt.Fprintf(&detail, "\n    ... %d more", len(logs.Events)-index)
+					break
+				}
+				fmt.Fprintf(&detail, "\n    %s: %q", event.Stream, strings.TrimRight(string(event.Bytes), "\n"))
+			}
+		}
+	}
+	return detail.String()
+}
+
+// tryNativeJSON is doNativeJSON without the status assertion, so a diagnostic
+// can report what it found instead of failing inside a failure.
+func tryNativeJSON(t *testing.T, client *http.Client, method, path string) (int, []byte) {
+	t.Helper()
+	request, err := http.NewRequest(method, "http://wefty.invalid"+path, nil)
+	if err != nil {
+		return 0, nil
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return response.StatusCode, nil
+	}
+	return response.StatusCode, body
 }
 
 func assertNativeRunLogs(t *testing.T, client *http.Client, runID string) {
