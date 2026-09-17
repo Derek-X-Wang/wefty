@@ -145,6 +145,33 @@ jobs:
         working-directory: workflows/dogfood
         run: npm test
 
+  branch-gates-workflow:
+    name: branch-gates-workflow
+    runs-on: ubuntu-latest
+    # Margin over the test binary's own 10-minute default timeout, which is
+    # itself the outer bound on the 5-minute per-run budget.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      # Stands up L1, L3, an agent and the process runner, then submits
+      # workflows/branch-gates/branch-gates.sh against a purpose-built subject
+      # repository with a clean branch and a deliberately broken one. The
+      # kind=oci path is proven on the Lima node, not here; running wefty's own
+      # go test ./... inside a container is a node-lane cost.
+      # WEFTY_REQUIRE_SHELLCHECK turns the script lint from a skip into a
+      # failure, so this lane cannot go green without actually linting.
+      - name: Exercise the branch-gates workflow against a real stack
+        env:
+          WEFTY_BRANCH_GATES_EXERCISE: "1"
+          WEFTY_REQUIRE_SHELLCHECK: "1"
+        run: go test ./workflows/branch-gates/ -count=1
+
   # The credentialed tsnet lane lives in tsnet-smoke.yml (push to main +
   # weekly schedule, never pull_request) so every job in this PR-facing
   # workflow is secretless by construction.
@@ -158,6 +185,7 @@ jobs:
       - mac-linux-runner
       - service-acceptance
       - dogfood-workflow
+      - branch-gates-workflow
     # always() so a failed dependency cannot skip this job — a skipped
     # required check does not block merging. The step then fails closed
     # unless every lane result is exactly "success".
@@ -173,6 +201,7 @@ jobs:
           MAC_LINUX_RESULT: ${{ needs['mac-linux-runner'].result }}
           SERVICE_ACCEPTANCE_RESULT: ${{ needs['service-acceptance'].result }}
           DOGFOOD_RESULT: ${{ needs['dogfood-workflow'].result }}
+          BRANCH_GATES_RESULT: ${{ needs['branch-gates-workflow'].result }}
         run: |
           set -eu
           printf '%s\n' \
@@ -182,7 +211,8 @@ jobs:
             "sqlite-integration=$SQLITE_RESULT" \
             "mac-linux-runner=$MAC_LINUX_RESULT" \
             "service-acceptance=$SERVICE_ACCEPTANCE_RESULT" \
-            "dogfood-workflow=$DOGFOOD_RESULT"
+            "dogfood-workflow=$DOGFOOD_RESULT" \
+            "branch-gates-workflow=$BRANCH_GATES_RESULT"
           test "$ACCEPTANCE_IMAGE_RESULT" = success
           test "$UNIT_RESULT" = success
           test "$DEBIAN_SYSTEMD_252_RESULT" = success
@@ -190,3 +220,4 @@ jobs:
           test "$MAC_LINUX_RESULT" = success
           test "$SERVICE_ACCEPTANCE_RESULT" = success
           test "$DOGFOOD_RESULT" = success
+          test "$BRANCH_GATES_RESULT" = success
