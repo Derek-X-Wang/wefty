@@ -68,12 +68,6 @@ const (
 	// way SensitiveEnv is removed.
 	LabelRunParams = "run_params_json"
 
-	// DefaultRunLedgerNodeID is the Fabric Node ID L1 trusts as the run ledger
-	// and the agent recognizes as L3 provenance. It lives here so the two
-	// sides cannot drift apart on their defaults; an operator who overrides it
-	// must override it on both.
-	DefaultRunLedgerNodeID = "run-ledger"
-
 	// LabelDispatchAuthority is L3's positive marker: this run declared at
 	// submit that its workload dispatches child work, so the workload receives
 	// the in-job credentials. L3 sets it only for declaring runs.
@@ -86,12 +80,14 @@ const (
 	// mailbox publisher holds it on the run's behalf; this label governs
 	// delivery to the workload, not delivery to the node.
 	//
-	// Both markers are sent, and the agent also consults L1's own record of
-	// who submitted the job, because neither label alone is safe: a label that
-	// must be present to withhold fails open when an older L3 omits it, and a
-	// label that must be present to deliver fails closed when an older agent
-	// has never heard of it. Forging this one can only withhold the forger's
-	// own job's credential.
+	// Both marker directions are supported and exactly one is sent per
+	// dispatch, because neither alone is safe: a label that must be present to
+	// withhold fails open when an older L3 omits it, and a label that must be
+	// present to deliver fails closed when an older agent has never heard of
+	// it. The agent reads whichever arrives alongside L1's own
+	// Claim.SubmittedByRunLedger classification, which is what closes the
+	// first gap. Forging this label can only withhold the forger's own job's
+	// credential.
 	LabelWithholdCredentials = "withhold_workload_credentials"
 
 	// LabelTrue is the only value a boolean label is written with, so a

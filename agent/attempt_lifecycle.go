@@ -88,7 +88,6 @@ type attemptLifecycleDependencies struct {
 	managedResource        managedResourceManager
 	handoffs               *handoffManager
 	runLedger              runLedgerAppender
-	runLedgerNodeID        string
 	mailboxPoll            time.Duration
 	nodeID                 string
 	bootSessionID          string
