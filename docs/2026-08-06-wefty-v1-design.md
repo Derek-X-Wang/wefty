@@ -157,7 +157,9 @@ Post-v1: E2B (no Go path), Modal (gRPC-only, Go SDK beta — no REST exists at a
 
 A workflow definition is an **executable program**, stored and versioned in L3, executed as an ordinary L1 job. The script drives control flow in deterministic code and calls L1/L3 APIs to spawn sub-jobs (dispatch is callable from inside a running job, with parent run-id propagation). **No DSL, no graph engine in v1** — SSSF's "agent proposes, code disposes," matching the 2026 practitioner consensus that workflows beat free-form agents. A declarative layer can grow later on top of the same contracts.
 
-The script contract is **language-agnostic**: any executable, run as `kind=process` or `oci`. Contract = environment (run id, API endpoints, handoff dir) + envelope/gate JSON files. **No blessed-language SDK in v1** — client libs are later sugar, never the contract. The dogfood script can be TS/Python/bash driving `claude`/`codex` CLIs.
+The script contract is **language-agnostic**: any executable, run as `kind=process` or `oci`. Contract = environment (run id, handoff dir, run mailbox) + envelope/gate files the node agent publishes to the ledger on the run's behalf, so a job that only reports needs no API endpoint and no credential; API endpoints remain in the contract for a workflow that dispatches child runs. **No blessed-language SDK in v1** — client libs are later sugar, never the contract. The dogfood script can be TS/Python/bash driving `claude`/`codex` CLIs.
+
+> **Amended (2026-09-17):** reporting moved to the run mailbox ([#476](https://github.com/Derek-X-Wang/wefty/issues/476)); envelopes, steps, gates and results are files a job writes into a job-owned directory, and the agent publishes them under authority the job never holds.
 
 #### L3-owned contracts
 
