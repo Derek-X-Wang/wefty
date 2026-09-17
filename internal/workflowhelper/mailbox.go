@@ -66,10 +66,21 @@ const (
 	maxEventNameBytes = 128
 	// maxSlugBytes bounds the readable part of a generated event file name.
 	maxSlugBytes = 32
-	// maxPayloadBytes keeps a helper-written event inside the agent's 64 KiB
-	// event bound with room for the header block, so the agent never has to
+	// MaxEventBytes is the contract's bound on one event file. The agent
+	// truncates a larger file, and a file truncated before its "--" separator
+	// is one the parser must refuse — so this helper refuses to write it in
+	// the first place, where the author can still read why.
+	MaxEventBytes = 64 << 10
+	// maxPayloadBytes keeps a helper-written event inside MaxEventBytes with
+	// room for the whole bounded header block, so the agent never has to
 	// truncate what this helper wrote.
 	maxPayloadBytes = 56 << 10
+	// maxIdentifierBytes is the v1 schema's bound on a step, name or key; the
+	// agent truncates past it, and a silently truncated idempotency key is a
+	// different document.
+	maxIdentifierBytes = 255
+	// maxSummaryBytes is what the agent's own summary bound allows.
+	maxSummaryBytes = 2048
 	// maxParamsBytes matches the agent's params bound.
 	maxParamsBytes = 64 << 10
 
@@ -85,7 +96,9 @@ var (
 )
 
 // UsageError is a caller mistake rather than a failure of the run. The CLI
-// turns it into the same exit-2 usage error every other wefty command uses.
+// turns it into its ordinary usage error, which exits 1: typed exit codes are
+// a contract only on the Computer, access and Storage surfaces, and this
+// surface does not claim one.
 type UsageError string
 
 func (e UsageError) Error() string { return string(e) }
@@ -112,11 +125,16 @@ type Event struct {
 	CreatedAt     time.Time
 }
 
-// sequence orders events written by one process inside the same millisecond.
-// The agent publishes a sweep in lexical order, so the file name is the only
-// ordering signal a producer controls — and without a sub-second timestamp two
-// events written back to back would be published in alphabetical order of
-// their kind rather than in the order the workflow reported them.
+// sequence separates two events written by one process at the same clock
+// reading. Ordering is carried by the file name because the agent publishes a
+// sweep in lexical order, and each `wefty run` is its own process: a coarse
+// timestamp would leave two events written back to back sorted alphabetically
+// by kind rather than in the order the workflow reported them. The name
+// therefore leads with a nanosecond stamp. Two processes that read the same
+// nanosecond still fall back to the rest of the name, so ordering across
+// processes is guaranteed only when their writes are distinguishable at
+// nanosecond resolution; there is no cross-process allocator, because that
+// would mean shared writable state in a directory the workload owns.
 var sequence atomic.Uint32
 
 // Validate rejects what the agent's parser would refuse, at the point where the
@@ -164,6 +182,26 @@ func (e *Event) Validate() error {
 	}
 	if e.Outcome != "" && e.Kind != KindGate {
 		return UsageError(fmt.Sprintf("kind %q does not carry an outcome", e.Kind))
+	}
+	// A header value is refused rather than trimmed. A truncated payload still
+	// carries the verdict, which is why the payload path truncates instead;
+	// a truncated key is a different idempotency identity and a truncated step
+	// is a different step, so quietly shortening either would change what the
+	// ledger records.
+	for _, bound := range []struct {
+		flag  string
+		value string
+		limit int
+	}{
+		{"--step", e.Step, maxIdentifierBytes},
+		{"--name", e.Name, maxIdentifierBytes},
+		{"--key", e.Key, maxIdentifierBytes},
+		{"--summary", e.Summary, maxSummaryBytes},
+	} {
+		if len(bound.value) > bound.limit {
+			return UsageError(fmt.Sprintf("%s is %d bytes; the run mailbox bounds it at %d",
+				bound.flag, len(bound.value), bound.limit))
+		}
 	}
 	if len(e.Payload) > maxPayloadBytes {
 		// Truncate here rather than let the agent do it, so the marker names
@@ -231,10 +269,16 @@ func Write(runDir string, event Event) (string, error) {
 			return "", fmt.Errorf("create %s: %w", directory, err)
 		}
 	}
+	document := event.Encode()
+	if len(document) > MaxEventBytes {
+		return "", UsageError(fmt.Sprintf(
+			"this event encodes to %d bytes; the run mailbox bounds one event at %d, and the agent would refuse a truncated file",
+			len(document), MaxEventBytes))
+	}
 	name := eventFileName(event)
 	staged := filepath.Join(staging, name)
-	if err := os.WriteFile(staged, event.Encode(), 0o600); err != nil {
-		return "", fmt.Errorf("stage %s: %w", staged, err)
+	if err := writeExclusive(staged, document); err != nil {
+		return "", err
 	}
 	published := filepath.Join(events, name)
 	if err := os.Rename(staged, published); err != nil {
@@ -242,6 +286,32 @@ func Write(runDir string, event Event) (string, error) {
 		return "", fmt.Errorf("publish %s: %w", published, err)
 	}
 	return published, nil
+}
+
+// writeExclusive creates a new regular file and refuses an existing one,
+// including a symlink planted where the file was going to be: O_EXCL never
+// follows. The content is flushed before the caller renames it into place, so
+// a reader of the renamed name never sees a short file.
+func writeExclusive(path string, document []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("stage %s: %w", path, err)
+	}
+	if _, err := file.Write(document); err != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("stage %s: %w", path, err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("stage %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("stage %s: %w", path, err)
+	}
+	return nil
 }
 
 // eventFileName sorts chronologically in the agent's lexical sweep, stays
@@ -255,8 +325,8 @@ func eventFileName(event Event) string {
 	if slug == "" {
 		slug = event.Kind
 	}
-	name := fmt.Sprintf("%013d-%04d-%s-%s-%08x",
-		time.Now().UTC().UnixMilli(), sequence.Add(1)%10000, event.Kind, nameSlug(slug), os.Getpid())
+	name := fmt.Sprintf("%019d-%04d-%s-%s-%08x",
+		time.Now().UTC().UnixNano(), sequence.Add(1)%10000, event.Kind, nameSlug(slug), os.Getpid())
 	if len(name) > maxEventNameBytes {
 		name = name[:maxEventNameBytes]
 	}

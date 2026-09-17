@@ -250,6 +250,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return usageError("plain person commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
 		}
 	}
+	resolveFabricEnvironment(&options)
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
 		Identity:       plainIdentity,
@@ -270,6 +271,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	defer clients.close()
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
+}
+
+// resolveFabricEnvironment fills the credential defaults immediately before
+// the fabric is opened. Reading them earlier would mean `wefty run` touched a
+// coordination credential on a path that exists precisely because the caller
+// has none.
+func resolveFabricEnvironment(options *globalOptions) {
+	if options.authKey == "" {
+		options.authKey = os.Getenv("TS_AUTHKEY")
+	}
+	if options.controlURL == "" {
+		options.controlURL = os.Getenv("TS_CONTROL_URL")
+	}
 }
 
 func usesPersonProtocol(args []string) bool {
@@ -302,8 +316,12 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.plainFabricID, "plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain- prefixed Fabric authority")
 	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "tsnet logical node name")
 	flags.StringVar(&options.stateDirectory, "state-dir", "", "tsnet state directory")
-	flags.StringVar(&options.authKey, "auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
-	flags.StringVar(&options.controlURL, "control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
+	// These two default from the environment, but the read happens at
+	// resolveFabricEnvironment, after the authoring commands have been
+	// dispatched. `wefty run` reports from inside a job that holds no
+	// credential; it must not so much as look at one on the way.
+	flags.StringVar(&options.authKey, "auth-key", "", "tsnet auth key (default $TS_AUTHKEY)")
+	flags.StringVar(&options.controlURL, "control-url", "", "optional tsnet coordination URL (default $TS_CONTROL_URL)")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by singular node commands")
 	flags.Usage = func() { fmt.Fprint(stderr, rootUsage) }

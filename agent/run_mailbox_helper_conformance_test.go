@@ -3,12 +3,14 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -29,6 +31,54 @@ import (
 // stamp the second they ran in, and two processes need not share one.
 var createdAtLine = regexp.MustCompile(`(?m)^created-at: .*$`)
 
+var (
+	weftyBinaryOnce sync.Once
+	weftyBinaryPath string
+	weftyBinaryErr  error
+)
+
+// weftyBinary builds the CLI once per test binary. These tests drive the real
+// executable rather than calling the package in process, because the thing
+// being proved is what a workflow's `wefty run` invocations leave on disk —
+// and every one of those is a separate process with its own in-memory state.
+// Calling the package five times in one process would share a sequence counter
+// no real workflow has.
+func weftyBinary(t *testing.T) string {
+	t.Helper()
+	weftyBinaryOnce.Do(func() {
+		directory, err := os.MkdirTemp("", "wefty-conformance-")
+		if err != nil {
+			weftyBinaryErr = err
+			return
+		}
+		weftyBinaryPath = filepath.Join(directory, "wefty")
+		build := exec.Command("go", "build", "-o", weftyBinaryPath, "../cmd/wefty")
+		if output, err := build.CombinedOutput(); err != nil {
+			weftyBinaryErr = fmt.Errorf("go build ./cmd/wefty: %w\n%s", err, output)
+		}
+	})
+	if weftyBinaryErr != nil {
+		t.Fatalf("build the wefty CLI: %v", weftyBinaryErr)
+	}
+	return weftyBinaryPath
+}
+
+// runWefty invokes one `wefty run` subcommand as its own process, the way a
+// workflow does.
+func runWefty(t *testing.T, directory string, arguments ...string) string {
+	t.Helper()
+	command := exec.Command(weftyBinary(t), append([]string{"run"}, arguments...)...)
+	command.Env = append(os.Environ(),
+		workflowhelper.RunDirEnv+"="+directory,
+		workflowhelper.HandoffDirEnv+"="+t.TempDir(),
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wefty run %s: %v\n%s", strings.Join(arguments, " "), err, output)
+	}
+	return string(output)
+}
+
 // TestRunSubcommandsProduceEventsTheAgentMailboxAccepts drives each `wefty
 // run` subcommand and feeds what it wrote to the agent's own parser, then
 // builds the ledger document from the parsed event and validates it against
@@ -36,8 +86,6 @@ var createdAtLine = regexp.MustCompile(`(?m)^created-at: .*$`)
 // silently cost a run its evidence.
 func TestRunSubcommandsProduceEventsTheAgentMailboxAccepts(t *testing.T) {
 	directory := t.TempDir()
-	t.Setenv(workflowhelper.RunDirEnv, directory)
-	t.Setenv(workflowhelper.HandoffDirEnv, t.TempDir())
 
 	evidence := filepath.Join(t.TempDir(), "evidence.txt")
 	if err := os.WriteFile(evidence, []byte("two tests failed\n"), 0o600); err != nil {
@@ -59,11 +107,11 @@ func TestRunSubcommandsProduceEventsTheAgentMailboxAccepts(t *testing.T) {
 		{"gate", "--name", "vet", "--outcome", "fail", "--summary", "vet failed", "--evidence-file", evidence},
 		{"result", "--file", result, "--status", "failed", "--summary", "one gate failed"},
 	}
+	// Each of these is a separate process, so the published order below is the
+	// order the file names produce and not an artifact of one process's
+	// counter.
 	for _, command := range commands {
-		var stdout, stderr bytes.Buffer
-		if err := workflowhelper.ExecuteRun(command, false, &stdout, &stderr); err != nil {
-			t.Fatalf("wefty run %s: %v\n%s", strings.Join(command, " "), err, stderr.String())
-		}
+		runWefty(t, directory, command...)
 	}
 
 	mailbox := &runMailbox{runID: "run_conformance", attemptID: "attempt_conformance"}
@@ -364,11 +412,7 @@ func readMailboxEvents(t *testing.T, directory string) []mailboxEntry {
 func writeThroughSubcommand(t *testing.T, command []string) []byte {
 	t.Helper()
 	directory := t.TempDir()
-	t.Setenv(workflowhelper.RunDirEnv, directory)
-	var stdout, stderr bytes.Buffer
-	if err := workflowhelper.ExecuteRun(command, false, &stdout, &stderr); err != nil {
-		t.Fatalf("wefty run %s: %v\n%s", strings.Join(command, " "), err, stderr.String())
-	}
+	runWefty(t, directory, command...)
 	events := readMailboxEvents(t, directory)
 	if len(events) != 1 {
 		t.Fatalf("wefty run %s wrote %d events, want 1", strings.Join(command, " "), len(events))

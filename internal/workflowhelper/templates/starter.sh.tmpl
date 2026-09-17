@@ -16,8 +16,12 @@
 # Replace the "do the work" section. Keep the reporting shape: one step
 # bracketing the work, one envelope per unit of work, one gate carrying the
 # verdict, one result document.
+#
+# `set -e` is load-bearing: a workflow that could not report must not exit 0,
+# because an exit code alone is not evidence. The one step below that is
+# deliberately allowed to fail is marked where it happens.
 
-set -u
+set -euo pipefail
 
 WORKFLOW={{.Name}}
 
@@ -39,7 +43,9 @@ else
 	log "wefty is not on PATH: using the inline run-mailbox writer"
 fi
 
-# param NAME -- one run parameter, empty when it was not submitted.
+# param NAME -- one run parameter, empty when it was not submitted. The helper
+# reads params.json properly; the fallback reads top-level string params only
+# (see wefty_param above for the exact limits).
 param() {
 	if [ -n "$WEFTY_HELPER" ]; then
 		wefty run params "$1"
@@ -91,12 +97,33 @@ emit_gate() {
 emit_result() {
 	if [ -n "$WEFTY_HELPER" ]; then
 		wefty run result --file "$1" --status "$2" --summary "$3"
-	else
-		if [ -n "${WEFTY_HANDOFF_DIR:-}" ]; then
-			mkdir -p "$WEFTY_HANDOFF_DIR" && cp "$1" "$WEFTY_HANDOFF_DIR/result.json"
-		fi
-		wefty_event result "" "" "$2" "" "$3" json "$1" ""
+		return 0
 	fi
+	# The handoff directory is writable by this job and anything it started,
+	# so `result.json` may already exist -- as a symlink, even. mktemp creates
+	# a fresh private regular file and never follows one, and the rename means
+	# a reader sees the whole document or the previous one. This is also the
+	# one step deliberately allowed to fail: the mailbox event below is the
+	# copy that survives the handoff directory being removed.
+	if [ -n "${WEFTY_HANDOFF_DIR:-}" ]; then
+		if ! {
+			mkdir -p "$WEFTY_HANDOFF_DIR" &&
+				staged=$(umask 077 && mktemp "$WEFTY_HANDOFF_DIR/.result.json.XXXXXX") &&
+				cat "$1" >"$staged" &&
+				mv "$staged" "$WEFTY_HANDOFF_DIR/result.json"
+		}; then
+			log "WARNING: could not publish result.json into $WEFTY_HANDOFF_DIR"
+			[ -z "${staged:-}" ] || rm -f "$staged"
+		fi
+	fi
+	# `payload: json` has to be true or the agent refuses the event, and this
+	# fallback cannot validate JSON. The structural check is what keeps an
+	# edited starter from losing its result to a malformed document.
+	format=text
+	case "$(tr -d ' \t\n' <"$1")" in
+	"{"*"}" | "["*"]") format=json ;;
+	esac
+	wefty_event result "" "" "$2" "" "$3" "$format" "$1" ""
 }
 
 # --------------------------------------------------------------------------
@@ -130,9 +157,11 @@ emit_envelope work "$STATUS" "greeted $SUBJECT" "$DETAIL_FILE"
 emit_step work ended "greeting $SUBJECT"
 emit_gate "$WORKFLOW" "$OUTCOME" "the greeting is $OUTCOME"
 
+# Every string that reaches the document is JSON-escaped: a subject carrying a
+# quote or a backslash would otherwise produce a document the agent refuses.
 RESULT_FILE=$WORK_DIR/result.json
 printf '{"schema_version":1,"workflow":"%s","subject":"%s","passed":%s}\n' \
-	"$WORKFLOW" "$SUBJECT" "$PASSED" >"$RESULT_FILE"
+	"$(wefty_json_escape "$WORKFLOW")" "$(wefty_json_escape "$SUBJECT")" "$PASSED" >"$RESULT_FILE"
 emit_result "$RESULT_FILE" "$STATUS" "$WORKFLOW finished: $OUTCOME"
 
 log "done: $OUTCOME"

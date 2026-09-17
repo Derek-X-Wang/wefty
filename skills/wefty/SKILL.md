@@ -19,8 +19,11 @@ least one `wefty-agent`, and the `wefty` CLI. Single-machine setup and the
 full flag reference live in `docs/acceptance/v0.1-dogfood.md` (v0.1 section);
 build all four binaries with `go build -o .bin/<name> ./cmd/<name>`.
 
-Every CLI call needs the endpoints: `--l1=<host:port> --l3=<host:port>`
-(plain fabric) — or the tsnet flags on a fleet. Set them once per shell.
+Every CLI call that reaches the cluster needs the endpoints:
+`--l1=<host:port> --l3=<host:port>` (plain fabric) — or the tsnet flags on a
+fleet. Set them once per shell. `wefty run ...` and `wefty workflow init` are
+the exceptions: they only write files, so they need no endpoint, no identity
+and no credential — see "Reporting from a workflow".
 
 ## Core operations
 
@@ -97,7 +100,8 @@ wefty run result --file result.json --status failed    # also lands in the hando
 
 Add `--json` to print the written event's path. Every subcommand fails with a
 clear message when `WEFTY_RUN_DIR` is absent — an OCI job does not receive one
-yet.
+yet. Submit with `--required-envelope` so a job that exits 0 having reported
+nothing cannot pass for a success.
 
 Start a new workflow with `wefty workflow init NAME [--lang bash|ts]`: it
 writes a runnable starter using those subcommands (with an inline POSIX writer

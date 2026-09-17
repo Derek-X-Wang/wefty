@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // RunUsage is the whole `wefty run` surface. It is short on purpose: a
@@ -44,7 +45,10 @@ func ExecuteRun(args []string, jsonOutput bool, stdout, stderr io.Writer) error 
 	if len(args) == 0 {
 		return UsageError("a wefty run subcommand is required: envelope, step, gate, result or params")
 	}
-	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+	// Help is answered before anything is read from the environment: a person
+	// reaching for `wefty run gate --help` at a desk has no mailbox, and
+	// answering "this job has no run mailbox" to a request for help is useless.
+	if wantsHelp(args) {
 		_, err := io.WriteString(stdout, RunUsage)
 		return err
 	}
@@ -68,6 +72,17 @@ func ExecuteRun(args []string, jsonOutput bool, stdout, stderr io.Writer) error 
 	default:
 		return UsageError(fmt.Sprintf("unknown wefty run subcommand %q", args[0]))
 	}
+}
+
+// wantsHelp reports whether the caller asked for usage rather than for work.
+func wantsHelp(args []string) bool {
+	for _, argument := range args {
+		switch argument {
+		case "help", "-h", "--help", "-help":
+			return true
+		}
+	}
+	return false
 }
 
 // runDirectory is the single place the absent-mailbox message comes from, so
@@ -182,7 +197,7 @@ func runResult(directory string, args []string, jsonOutput bool, stdout, stderr 
 	if strings.TrimSpace(*file) == "" {
 		return UsageError("wefty run result requires --file")
 	}
-	raw, err := readBoundedFile(*file)
+	raw, _, err := readBoundedFile(*file, maxPayloadBytes)
 	if err != nil {
 		return err
 	}
@@ -203,15 +218,51 @@ func runResult(directory string, args []string, jsonOutput bool, stdout, stderr 
 	}, jsonOutput, stdout)
 }
 
+// copyResult publishes the result document into the handoff directory the way
+// the mailbox publishes an event: a fresh 0600 regular file, then a rename.
+//
+// Neither half is ceremony. The handoff directory is writable by the workload
+// and by anything it started, so a plain write follows whatever `result.json`
+// happens to be — including a symlink planted at some path the workload could
+// not otherwise touch — and leaves the previous file's mode on an existing
+// one. O_EXCL through an opened root never follows a link and never reuses an
+// existing file, and the rename means a reader sees the whole document or the
+// previous one, never a half-written verdict.
 func copyResult(raw []byte, handoff string) error {
 	if err := os.MkdirAll(handoff, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", handoff, err)
 	}
-	target := filepath.Join(handoff, ResultFileName)
-	if err := os.WriteFile(target, raw, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", target, err)
+	root, err := os.OpenRoot(handoff)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", handoff, err)
+	}
+	defer root.Close()
+	staged := fmt.Sprintf(".%s.%d.%d", ResultFileName, os.Getpid(), time.Now().UnixNano())
+	file, err := root.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("stage %s in %s: %w", ResultFileName, handoff, err)
+	}
+	if err := writeAndSync(file, raw); err != nil {
+		_ = root.Remove(staged)
+		return fmt.Errorf("stage %s in %s: %w", ResultFileName, handoff, err)
+	}
+	if err := root.Rename(staged, ResultFileName); err != nil {
+		_ = root.Remove(staged)
+		return fmt.Errorf("publish %s in %s: %w", ResultFileName, handoff, err)
 	}
 	return nil
+}
+
+func writeAndSync(file *os.File, raw []byte) error {
+	if _, err := file.Write(raw); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // runParams reads the params the agent delivered. A job never receives its own
@@ -301,14 +352,14 @@ func writeAllParams(stdout io.Writer, params map[string]json.RawMessage, jsonOut
 // without params, and one whose params were too large to deliver, both leave
 // the file absent; neither is a workflow error.
 func readParams(directory string) (map[string]json.RawMessage, error) {
-	raw, err := os.ReadFile(filepath.Join(directory, paramsFileName))
+	raw, oversize, err := readBoundedFile(filepath.Join(directory, paramsFileName), maxParamsBytes)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return map[string]json.RawMessage{}, nil
 	case err != nil:
 		return nil, err
 	}
-	if len(raw) > maxParamsBytes {
+	if oversize {
 		return nil, fmt.Errorf("%s is larger than the %d byte params bound", paramsFileName, maxParamsBytes)
 	}
 	params := map[string]json.RawMessage{}
@@ -331,16 +382,24 @@ func scalar(value json.RawMessage) string {
 func readPayload(textFile, jsonFile string) ([]byte, string, error) {
 	switch {
 	case jsonFile != "":
-		raw, err := readBoundedFile(jsonFile)
+		raw, truncated, err := readBoundedFile(jsonFile, maxPayloadBytes)
 		if err != nil {
 			return nil, "", err
+		}
+		if truncated {
+			// A truncated JSON document is not a JSON document, and silently
+			// downgrading it to text would hide that the author's payload did
+			// not fit.
+			return nil, "", UsageError(fmt.Sprintf(
+				"%s is larger than %d bytes; a JSON payload must fit in one run mailbox event",
+				jsonFile, maxPayloadBytes))
 		}
 		if !json.Valid(raw) {
 			return nil, "", UsageError(fmt.Sprintf("%s is not a JSON document", jsonFile))
 		}
 		return raw, PayloadJSON, nil
 	case textFile != "":
-		raw, err := readBoundedFile(textFile)
+		raw, _, err := readBoundedFile(textFile, maxPayloadBytes)
 		if err != nil {
 			return nil, "", err
 		}
@@ -350,12 +409,20 @@ func readPayload(textFile, jsonFile string) ([]byte, string, error) {
 	}
 }
 
-func readBoundedFile(path string) ([]byte, error) {
-	raw, err := os.ReadFile(path)
+// readBoundedFile reads at most limit+1 bytes, so a workflow that points at a
+// multi-gigabyte log gets a truncated event rather than an out-of-memory
+// helper. The extra byte is what makes the overflow observable.
+func readBoundedFile(path string, limit int) ([]byte, bool, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, false, fmt.Errorf("read %s: %w", path, err)
 	}
-	return raw, nil
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return raw, len(raw) > limit, nil
 }
 
 func emit(directory string, event Event, jsonOutput bool, stdout io.Writer) error {

@@ -21,9 +21,6 @@ var bashStarterTemplate string
 //go:embed templates/starter.ts.tmpl
 var typeScriptStarterTemplate string
 
-//go:embed templates/wefty-run.ts.tmpl
-var typeScriptWrapperTemplate string
-
 //go:embed templates/README.md.tmpl
 var readmeTemplate string
 
@@ -75,10 +72,11 @@ func ExecuteWorkflow(args []string, jsonOutput bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return UsageError("a wefty workflow subcommand is required: init")
 	}
-	switch args[0] {
-	case "help", "-h", "--help":
+	if wantsHelp(args) {
 		_, err := io.WriteString(stdout, WorkflowUsage)
 		return err
+	}
+	switch args[0] {
 	case "init":
 		return workflowInit(args[1:], jsonOutput, stdout)
 	default:
@@ -126,8 +124,10 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 		{data.TestFile, integrationTestTemplate, 0o644},
 	}
 	if *lang == "ts" {
+		// One file, deliberately: a submission carries one inline script, and
+		// the node materializes exactly that. A starter that imported a
+		// sibling would scaffold something that cannot be submitted.
 		files[0] = scaffoldFile{data.ScriptName, typeScriptStarterTemplate, 0o644}
-		files = append(files, scaffoldFile{"wefty-run.ts", typeScriptWrapperTemplate, 0o644})
 	}
 
 	if err := os.MkdirAll(target, 0o755); err != nil {

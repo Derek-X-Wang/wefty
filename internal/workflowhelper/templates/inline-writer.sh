@@ -1,23 +1,34 @@
 # --------------------------------------------------------------------------
 # Inline run-mailbox writer (fallback)
 #
-# Used only when the `wefty` binary is not on PATH -- an OCI image that does
-# not ship it, for example. It writes byte-identical event files to the ones
-# `wefty run ...` writes; wefty's own
+# Used only when the `wefty` binary is not on PATH. It writes byte-identical
+# event files to the ones `wefty run ...` writes; wefty's own
 # TestInlineBashWriterProducesByteIdenticalEvents holds that.
+#
+# It exists for an image that does not ship the wefty binary. Today that case
+# is not reachable: an OCI attempt receives no WEFTY_RUN_DIR at all, because
+# the handoff volume is helper-owned and the helper protocol exposes no read
+# path (#476 slice C). Until then this is the process one-shot's fallback and
+# the proof that the protocol, not the binary, is the contract.
 #
 # Protocol: docs/contracts/run-execution-context.md, "Run mailbox".
 # --------------------------------------------------------------------------
 
-# Milliseconds since the epoch. A sweep publishes in lexical order, so the file
-# name is the only ordering signal a producer has; without a sub-second stamp,
-# two events written back to back would be published in alphabetical order of
-# their kind. A shell without EPOCHREALTIME degrades to second resolution.
-wefty_millis() {
+# Nanoseconds since the epoch, as a 19-digit number. A sweep publishes in
+# lexical order, so the file name is the only ordering signal a producer has;
+# without a sub-second stamp, two events written back to back would be
+# published in alphabetical order of their kind. The width must match what
+# `wefty run` writes, or a workflow that uses both would sort every fallback
+# event ahead of every helper event.
+#
+# bash 5 carries microseconds in EPOCHREALTIME, so the last three digits are
+# always zero; a shell without it (bash 4, dash) degrades to seconds and relies
+# on the per-process sequence below for ordering.
+wefty_nanos() {
 	if [ -n "${EPOCHREALTIME:-}" ]; then
-		printf '%s%.3s' "${EPOCHREALTIME%%[.,]*}" "${EPOCHREALTIME#*[.,]}000"
+		printf '%019d' "$(printf '%s%.6s000' "${EPOCHREALTIME%%[.,]*}" "${EPOCHREALTIME#*[.,]}000000")"
 	else
-		printf '%s000' "$(date -u +%s)"
+		printf '%019d' "$(date -u +%s)000000000"
 	fi
 }
 
@@ -38,8 +49,8 @@ wefty_event() {
 	mkdir -p "$WEFTY_RUN_DIR/tmp" "$WEFTY_RUN_DIR/events" || return 1
 	WEFTY_EVENT_SEQ=$(((${WEFTY_EVENT_SEQ:-0} + 1) % 10000))
 	wefty_slug=$(printf '%s' "${2:-${3:-$1}}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
-	wefty_file=$(printf '%013d-%04d-%s-%.32s-%08x' \
-		"$(wefty_millis)" "$WEFTY_EVENT_SEQ" "$1" "${wefty_slug:-event}" "$$")
+	wefty_file=$(printf '%s-%04d-%s-%.32s-%08x' \
+		"$(wefty_nanos)" "$WEFTY_EVENT_SEQ" "$1" "${wefty_slug:-event}" "$$")
 	{
 		printf 'wefty-protocol: 1\nkind: %s\n' "$1"
 		for wefty_pair in "name:${2:-}" "step:${3:-}" "status:${4:-}" \
@@ -53,10 +64,22 @@ wefty_event() {
 	mv "$WEFTY_RUN_DIR/tmp/$wefty_file" "$WEFTY_RUN_DIR/events/$wefty_file"
 }
 
-# Read one run parameter without jq: params.json is delivered by the agent, and
-# a flat string field is what a shell workflow should ask for.
+# Read one run parameter without jq. Deliberately limited, and the limits are
+# the reason to prefer `wefty run params NAME` whenever the binary is present:
+# this reads TOP-LEVEL STRING params only, it does not decode JSON escapes (a
+# value containing \" or \\ reads as empty rather than as a truncated value,
+# so a workflow can detect it), and a key that also appears in a nested object
+# is not disambiguated. Anything richer needs the helper or jq.
 wefty_param() {
 	[ -f "${WEFTY_RUN_DIR:-}/params.json" ] || return 0
 	tr -d '\n' <"$WEFTY_RUN_DIR/params.json" |
-		sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+		sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p'
+}
+
+# JSON-escape one string value for a document this script assembles by hand.
+# It escapes the two characters that can break out of a JSON string and drops
+# the control bytes JSON cannot carry raw.
+wefty_json_escape() {
+	printf '%s' "${1:-}" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C tr '\011\012' '  ' |
+		sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }

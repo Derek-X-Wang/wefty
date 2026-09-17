@@ -55,7 +55,7 @@ func Test{{.TestPrefix}}ReportsThroughTheRunMailbox(t *testing.T) {
 		t.Fatalf("write params.json: %v", err)
 	}
 
-	command := exec.Command(interpreter[0], append(interpreter[1:], "{{.ScriptName}}")...)
+	command := exec.Command(interpreter[0], append(interpreter[1:], workflowFile(t))...)
 	command.Env = append(os.Environ(),
 		"WEFTY_RUN_DIR="+runDir,
 		"WEFTY_HANDOFF_DIR="+handoffDir,
@@ -127,23 +127,37 @@ func workflowInterpreter(t *testing.T) []string {
 	}
 	return []string{bashPath}
 }
+
+// workflowFile is the script as submitted.
+func workflowFile(t *testing.T) string {
+	t.Helper()
+	return "{{.ScriptName}}"
+}
 {{else}}
-// workflowInterpreter finds a TypeScript-capable Node. wefty-run.ts uses type
-// annotations only, so stripping is enough; there is no build step and no
-// package to install.
 func workflowInterpreter(t *testing.T) []string {
 	t.Helper()
-	if path, err := exec.LookPath("tsx"); err == nil {
-		return []string{path}
-	}
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
-		t.Skip("node or tsx is required to run the workflow; NOT-RUN")
+		t.Skip("node is required to run the workflow; NOT-RUN")
 	}
-	probe := exec.Command(nodePath, "--experimental-strip-types", "-e", "const x: number = 1; void x;")
-	if output, err := probe.CombinedOutput(); err != nil {
-		t.Skipf("this node cannot strip TypeScript types; NOT-RUN: %v\n%s", err, output)
+	return []string{nodePath}
+}
+
+// workflowFile copies the workflow to a name with no extension, because that
+// is exactly what a wefty node does with an inline script: it materializes one
+// file called "workflow". Running the .ts name here would exercise a path the
+// cluster never takes, and would hide the day someone adds an `import` or a
+// type annotation that only a .ts-aware runtime can load.
+func workflowFile(t *testing.T) string {
+	t.Helper()
+	source, err := os.ReadFile("{{.ScriptName}}")
+	if err != nil {
+		t.Fatalf("read {{.ScriptName}}: %v", err)
 	}
-	return []string{nodePath, "--experimental-strip-types", "--disable-warning=ExperimentalWarning"}
+	materialized := filepath.Join(t.TempDir(), "workflow")
+	if err := os.WriteFile(materialized, source, 0o700); err != nil {
+		t.Fatalf("materialize the workflow: %v", err)
+	}
+	return materialized
 }
 {{end}}

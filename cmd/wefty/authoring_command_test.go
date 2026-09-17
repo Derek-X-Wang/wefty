@@ -85,6 +85,53 @@ func TestAuthoringCommandsReportUsageMistakes(t *testing.T) {
 	}
 }
 
+// TestAuthoringHelpAnswersWithoutAMailbox covers the case a person actually
+// hits: reading the flags at a desk, where there is no run to report against.
+// Answering "this job has no run mailbox" to a request for help is useless.
+func TestAuthoringHelpAnswersWithoutAMailbox(t *testing.T) {
+	t.Setenv(workflowhelper.RunDirEnv, "")
+	t.Setenv("WEFTY_NODE_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
+	for _, args := range [][]string{
+		{"run", "--help"},
+		{"run", "gate", "--help"},
+		{"run", "params", "-h"},
+		{"workflow", "--help"},
+		{"workflow", "init", "--help"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+			t.Fatalf("wefty %s: %v", strings.Join(args, " "), err)
+		}
+		if !strings.Contains(stdout.String(), "Usage: wefty ") {
+			t.Fatalf("wefty %s printed %q, want usage", strings.Join(args, " "), stdout.String())
+		}
+	}
+}
+
+// TestRunSubcommandsRefuseAnEventTheAgentWouldHaveToTruncate keeps a bound the
+// author can act on. An oversize header pushes the file past the contract's
+// 64 KiB event bound, the agent truncates it before the "--" separator, and the
+// parser then refuses the whole event — so the evidence is lost after the CLI
+// has already reported success.
+func TestRunSubcommandsRefuseAnEventTheAgentWouldHaveToTruncate(t *testing.T) {
+	directory := t.TempDir()
+	t.Setenv(workflowhelper.RunDirEnv, directory)
+	t.Setenv("WEFTY_NODE_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"run", "envelope", "--step", "build",
+		"--summary", strings.Repeat("x", 4096)}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("an oversize summary was accepted")
+	}
+	if !strings.Contains(err.Error(), "--summary") || !strings.Contains(err.Error(), "bounds it at") {
+		t.Fatalf("refused with %q, want the flag and its bound", err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(directory, "events"))
+	if len(entries) != 0 {
+		t.Fatalf("a refused event still published %d files", len(entries))
+	}
+}
+
 // TestRootUsageNamesTheAuthoringCommands keeps the surface discoverable: a
 // workflow author who never reads the contract should find `wefty run` by
 // typing `wefty help`.
