@@ -37,7 +37,7 @@ func TestComputerSubmissionPolicyChangeRotatesAttemptTokenFile(t *testing.T) {
 	done := make(chan error, 1)
 	disabled := ComputerSubmissionAuthority{ComputerID: "computer-1", SubmitIntentRevision: 1, SubmitMaxInflight: 7}
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
-	controller := newComputerAttemptBridgeController(ctx, func(ctx context.Context, _ string, _ contract.ExecutionSpec) (*workflowBridge, error) {
+	controller := newComputerAttemptBridgeController(ctx, func(ctx context.Context, _ string, _ contract.ExecutionSpec, _ bool) (*workflowBridge, error) {
 		return newComputerAttemptBridge(ctx, participant, "wefty://run-ledger", true)
 	}, contract.JobKindOCI, contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}})
 	go func() {

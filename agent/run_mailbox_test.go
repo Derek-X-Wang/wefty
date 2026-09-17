@@ -120,7 +120,9 @@ func mailboxSpec(runID, handoff, params string) contract.JobSpec {
 
 func mailboxClaim(runID, handoff, params string) l1.Claim {
 	return l1.Claim{
-		Job:   l1.Job{Spec: mailboxSpec(runID, handoff, params)},
+		// Mailbox eligibility follows L1's record of who submitted the job, so
+		// the fixture carries the submitter a real L3 dispatch always has.
+		Job:   l1.Job{Spec: mailboxSpec(runID, handoff, params), OriginatingSubmitter: contract.DefaultRunLedgerNodeID},
 		Lease: l1.AttemptLease{AttemptID: mailboxTestAttempt},
 	}
 }

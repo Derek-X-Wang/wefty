@@ -103,10 +103,14 @@ func dispatchRunDeclaring(t *testing.T, dispatchAuthority bool) *dispatchedRun {
 	if spec.Execution.SensitiveEnv[contract.EnvRunToken] == "" {
 		t.Fatal("dispatch delivered no run token to the node agent")
 	}
-	// L3 marks the withholding, not the declaration, so the agent never has to
-	// infer provenance from anything a submitter could have written.
+	// L3 marks both directions, so neither an older agent that only knows the
+	// positive marker nor a newer one that only knows the negative instruction
+	// misreads a rolling upgrade.
 	if got := contract.WithholdsWorkloadCredentials(spec.Labels); got != !dispatchAuthority {
 		t.Fatalf("dispatched job withholds credentials = %t, want %t", got, !dispatchAuthority)
+	}
+	if got := contract.DeclaresDispatchAuthority(spec.Labels); got != dispatchAuthority {
+		t.Fatalf("dispatched job declares dispatch authority = %t, want %t", got, dispatchAuthority)
 	}
 	handoff := filepath.Join(t.TempDir(), "handoff")
 	if err := os.MkdirAll(handoff, 0o700); err != nil {
@@ -119,7 +123,12 @@ func dispatchRunDeclaring(t *testing.T, dispatchAuthority bool) *dispatchedRun {
 
 func (d *dispatchedRun) claim() l1.Claim {
 	return l1.Claim{
-		Job:          l1.Job{JobID: "job-" + d.runID, Spec: d.spec, State: contract.JobClaimed},
+		Job: l1.Job{
+			JobID: "job-" + d.runID, Spec: d.spec, State: contract.JobClaimed,
+			// L1 derived this from the authenticated identity that submitted
+			// the job. It is the provenance the agent trusts.
+			OriginatingSubmitter: contract.DefaultRunLedgerNodeID,
+		},
 		Lease:        l1.AttemptLease{AttemptID: "attempt-" + d.runID},
 		AttemptToken: undeliveredAttemptBearer,
 	}
@@ -134,6 +143,7 @@ func (d *dispatchedRun) node(runner processrunner.Executor) *Agent {
 		fabric:           d.fabric,
 		controlPlaneAddr: "wefty://control-plane",
 		runLedgerAddr:    l3.DefaultL3Address,
+		runLedgerNodeID:  contract.DefaultRunLedgerNodeID,
 		runLedger:        newFabricRunLedgerAppender(d.fabric, l3.DefaultL3Address),
 		mailboxPoll:      time.Hour,
 	}
@@ -344,23 +354,24 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 	)
 	for _, testCase := range []struct {
 		name string
-		// withhold is L3's label. ledgerDispatched distinguishes a run from a
-		// job submitted straight to L1, which has no run at all.
+		// withhold and declare are L3's two wire labels; ledgerDispatched is
+		// L1's own record of who submitted the job.
 		withhold         bool
+		declare          bool
 		ledgerDispatched bool
 		wantRunLength    int
 		wantAttemptLen   int
 	}{
 		{name: "reporting run holds neither", withhold: true, ledgerDispatched: true},
 		{
-			name: "declaring run holds both", withhold: false, ledgerDispatched: true,
+			name: "declaring run holds both", declare: true, ledgerDispatched: true,
 			wantRunLength: len(deliveredRunToken), wantAttemptLen: len(deliveredAttempt),
 		},
 		{
-			// The direct-L1 guarantee: no run, no label, and the attempt
+			// The direct-L1 guarantee: no run, no labels, and the attempt
 			// credential arrives even though the submitter named an L3
 			// endpoint in its own JobSpec.
-			name: "direct L1 job keeps its attempt credential", withhold: false, ledgerDispatched: false,
+			name: "direct L1 job keeps its attempt credential", ledgerDispatched: false,
 			wantAttemptLen: len(deliveredAttempt),
 		},
 	} {
@@ -383,6 +394,7 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 				handoffs:         newHandoffManager(root, time.Hour),
 				fabric:           plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node-1"}),
 				controlPlaneAddr: "wefty://control-plane",
+				runLedgerNodeID:  contract.DefaultRunLedgerNodeID,
 				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 					return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
 						if event.Stream == contract.LogStdout {
@@ -397,9 +409,13 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 			if testCase.withhold {
 				claim.Job.Spec.Labels[contract.LabelWithholdCredentials] = contract.LabelTrue
 			}
+			if testCase.declare {
+				claim.Job.Spec.Labels[contract.LabelDispatchAuthority] = contract.LabelTrue
+			}
 			environment := map[string]string{contract.EnvRunID: runID, contract.EnvHandoffDir: handoff}
 			sensitive := map[string]string{}
 			if testCase.ledgerDispatched {
+				claim.Job.OriginatingSubmitter = contract.DefaultRunLedgerNodeID
 				environment[contract.EnvL3Endpoint] = "wefty://l3"
 				sensitive[contract.EnvRunToken] = deliveredRunToken
 			} else {
@@ -442,5 +458,130 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 				t.Fatalf("workload credential environment = %q, want %q", logged, want)
 			}
 		})
+	}
+}
+
+// TestCredentialDeliveryMatrixAcrossLabelsAndProvenance pins the whole rule:
+// withhold when the negative label is present, or when L1 says the run ledger
+// submitted the job and the positive marker is absent. Every combination is
+// enumerated for both kinds, because no single signal survives a rolling
+// upgrade and the interesting cases are precisely the inconsistent ones.
+func TestCredentialDeliveryMatrixAcrossLabelsAndProvenance(t *testing.T) {
+	const (
+		matrixRunToken     = "wrun_matrix_secret"
+		matrixAttemptToken = "wattempt_matrix_secret"
+	)
+	for _, kind := range []string{contract.JobKindProcess, contract.JobKindOCI} {
+		for _, labels := range []struct {
+			name              string
+			withhold, declare bool
+		}{
+			{name: "both labels", withhold: true, declare: true},
+			{name: "negative label only", withhold: true},
+			{name: "positive label only", declare: true},
+			{name: "no labels", withhold: false, declare: false},
+		} {
+			for _, provenance := range []struct {
+				name   string
+				ledger bool
+			}{
+				{name: "run-ledger provenance", ledger: true},
+				{name: "direct L1 provenance", ledger: false},
+			} {
+				// The rule, stated once, independently of the implementation.
+				want := labels.withhold || (provenance.ledger && !labels.declare)
+				t.Run(kind+"/"+labels.name+"/"+provenance.name, func(t *testing.T) {
+					claim := matrixClaim(kind, labels.withhold, labels.declare, provenance.ledger, "")
+					execution := claim.Job.Spec.Execution
+					execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+					withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+					assertCredentialDelivery(t, execution, !want, matrixRunToken, matrixAttemptToken)
+				})
+			}
+		}
+	}
+
+	// The two rolling-upgrade skews, named so a regression says which one broke.
+	t.Run("skew/older L3 omits both labels", func(t *testing.T) {
+		claim := matrixClaim(contract.JobKindProcess, false, false, true, "")
+		execution := claim.Job.Spec.Execution
+		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+		withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+		// Provenance alone must close it: an unlabelled ledger job is a
+		// reporting run until it says otherwise.
+		assertCredentialDelivery(t, execution, false, matrixRunToken, matrixAttemptToken)
+	})
+	t.Run("skew/newer L3 marks a declaring run both ways", func(t *testing.T) {
+		// An agent that only knows the positive marker reads it; one that only
+		// knows the negative instruction finds none. Both deliver.
+		claim := matrixClaim(contract.JobKindProcess, false, true, true, "")
+		if !contract.DeclaresDispatchAuthority(claim.Job.Spec.Labels) {
+			t.Fatal("a declaring run carries no positive marker for an older agent")
+		}
+		execution := claim.Job.Spec.Execution
+		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+		withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+		assertCredentialDelivery(t, execution, true, matrixRunToken, matrixAttemptToken)
+	})
+
+	// A job spawned through an attempt credential inherits its root's
+	// originating submitter. It is a direct-L1 job with no run of its own, and
+	// withholding its credential would break the spawn chain ADR-0006 exists
+	// for.
+	t.Run("descendant of a ledger run keeps its credential", func(t *testing.T) {
+		claim := matrixClaim(contract.JobKindProcess, false, false, true, "job-parent")
+		execution := claim.Job.Spec.Execution
+		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+		withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+		assertCredentialDelivery(t, execution, true, matrixRunToken, matrixAttemptToken)
+	})
+}
+
+func matrixClaim(kind string, withhold, declare, ledgerProvenance bool, parentJobID string) l1.Claim {
+	labels := map[string]string{}
+	if withhold {
+		labels[contract.LabelWithholdCredentials] = contract.LabelTrue
+	}
+	if declare {
+		labels[contract.LabelDispatchAuthority] = contract.LabelTrue
+	}
+	submitter := "some-operator-workstation"
+	if ledgerProvenance {
+		submitter = contract.DefaultRunLedgerNodeID
+	}
+	return l1.Claim{
+		Job: l1.Job{
+			JobID: "job-matrix", ParentJobID: parentJobID, OriginatingSubmitter: submitter,
+			Spec: contract.JobSpec{
+				Kind: kind, Class: contract.JobClassOneShot, Labels: labels,
+				Execution: contract.ExecutionSpec{
+					// A submitter may legally name this; it must never be read
+					// as provenance.
+					Env: map[string]string{contract.EnvL3Endpoint: "http://submitter.invalid/l3"},
+					SensitiveEnv: map[string]string{
+						contract.EnvRunToken:     "wrun_matrix_secret",
+						contract.EnvAttemptToken: "wattempt_matrix_secret",
+					},
+				},
+			},
+		},
+		Lease:        l1.AttemptLease{AttemptID: "attempt-matrix"},
+		AttemptToken: "wattempt_matrix_secret",
+	}
+}
+
+func assertCredentialDelivery(t *testing.T, execution contract.ExecutionSpec, wantDelivered bool, runToken, attemptToken string) {
+	t.Helper()
+	for name, want := range map[string]string{
+		contract.EnvRunToken:     runToken,
+		contract.EnvAttemptToken: attemptToken,
+	} {
+		got := execution.SensitiveEnv[name]
+		if wantDelivered && got != want {
+			t.Fatalf("%s = %q, want it delivered", name, got)
+		}
+		if !wantDelivered && got != "" {
+			t.Fatalf("%s = %q, want it withheld", name, got)
+		}
 	}
 }

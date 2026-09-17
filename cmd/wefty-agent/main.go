@@ -432,6 +432,7 @@ func run() error {
 		plainFabricID         = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
 		controlPlane          = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
 		runLedger             = flag.String("run-ledger", "wefty://run-ledger", "run-ledger Fabric address used by workflow jobs")
+		runLedgerNodeID       = flag.String("run-ledger-node-id", contract.DefaultRunLedgerNodeID, "authenticated Fabric Node ID recognized as run-ledger job provenance; must match the L1 setting of the same name")
 		nodeID                = flag.String("node-id", "", "stable operator-facing node ID")
 		fabricIdentityID      = flag.String("plain-identity", "", "plain Fabric identity node ID (defaults to node-id)")
 		fabricName            = flag.String("fabric-name", "", "tsnet logical node name")
@@ -595,6 +596,7 @@ func run() error {
 		Fabric:                  participant,
 		ControlPlaneAddress:     *controlPlane,
 		RunLedgerAddress:        *runLedger,
+		RunLedgerNodeID:         *runLedgerNodeID,
 		NodeID:                  *nodeID,
 		BootSessionID:           bootSessionID,
 		Version:                 version,

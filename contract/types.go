@@ -68,6 +68,17 @@ const (
 	// way SensitiveEnv is removed.
 	LabelRunParams = "run_params_json"
 
+	// DefaultRunLedgerNodeID is the Fabric Node ID L1 trusts as the run ledger
+	// and the agent recognizes as L3 provenance. It lives here so the two
+	// sides cannot drift apart on their defaults; an operator who overrides it
+	// must override it on both.
+	DefaultRunLedgerNodeID = "run-ledger"
+
+	// LabelDispatchAuthority is L3's positive marker: this run declared at
+	// submit that its workload dispatches child work, so the workload receives
+	// the in-job credentials. L3 sets it only for declaring runs.
+	LabelDispatchAuthority = "dispatch_authority"
+
 	// LabelWithholdCredentials is L3's instruction to the node agent: do not
 	// place the in-job credentials in this job's workload environment. L3 sets
 	// it on every run it dispatches that did not declare dispatch authority.
@@ -75,20 +86,24 @@ const (
 	// mailbox publisher holds it on the run's behalf; this label governs
 	// delivery to the workload, not delivery to the node.
 	//
-	// It deliberately marks the withholding rather than the declaration. The
-	// agent must never infer whether L3 dispatched a job from anything a
-	// submitter can write — a process JobSpec may legally carry any
-	// environment name, WEFTY_L3_ENDPOINT included — so a job submitted
-	// straight to L1 carries no label and keeps its attempt credential by
-	// construction. In this direction the only thing forging the label can
-	// achieve is withholding the forger's own job's credential; no forgery can
-	// obtain a credential the job would not otherwise have had.
+	// Both markers are sent, and the agent also consults L1's own record of
+	// who submitted the job, because neither label alone is safe: a label that
+	// must be present to withhold fails open when an older L3 omits it, and a
+	// label that must be present to deliver fails closed when an older agent
+	// has never heard of it. Forging this one can only withhold the forger's
+	// own job's credential.
 	LabelWithholdCredentials = "withhold_workload_credentials"
 
 	// LabelTrue is the only value a boolean label is written with, so a
 	// producer and a reader cannot drift over "1" versus "true".
 	LabelTrue = "true"
 )
+
+// DeclaresDispatchAuthority reports whether a job carries L3's positive marker
+// that this run declared dispatch authority at submit.
+func DeclaresDispatchAuthority(labels map[string]string) bool {
+	return labels[LabelDispatchAuthority] == LabelTrue
+}
 
 // WithholdsWorkloadCredentials reports whether L3 marked this job as one whose
 // workload must not receive the in-job credentials.

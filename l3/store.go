@@ -1717,9 +1717,11 @@ type dispatchIntent struct {
 	// a file in the run mailbox, written by the node agent, so a workload can
 	// read what it was submitted with while holding no credential.
 	Params []byte
-	// DispatchAuthority is the submitter's declaration that this run dispatches
-	// child work. It reaches the node agent as a job label, which is what makes
-	// the agent deliver the in-job credentials to the workload.
+	// DispatchAuthority is the run's stored public declaration that its
+	// workload dispatches child work. Dispatch converts it into both wire
+	// labels — the positive dispatch_authority marker when it is true, the
+	// withhold_workload_credentials instruction when it is false — which the
+	// node agent reads alongside L1's own record of who submitted the job.
 	DispatchAuthority bool
 	Content           []byte
 	SHA256            string
@@ -2072,12 +2074,14 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 	handoff := filepath.Join(DefaultHandoffRoot, handoffOwnerID)
 	labels := map[string]string{"run_id": intent.RunID}
 	// The run token reaches the node agent on every dispatch, because the agent
-	// publishes the run mailbox with it. This label is what tells the agent not
-	// to put it — or the attempt credential — into the workload's own
-	// environment. Marking the withholding rather than the declaration is what
-	// keeps the agent from having to infer L3 provenance from a submitter's
-	// own environment values.
-	if !intent.DispatchAuthority {
+	// publishes the run mailbox with it. These labels tell the agent whether to
+	// put it — and the attempt credential — into the workload's own
+	// environment. Both directions are marked so that neither an older L3 that
+	// omits the instruction nor an older agent that ignores it can turn a
+	// rolling upgrade into a credential handed to a reporting run.
+	if intent.DispatchAuthority {
+		labels[contract.LabelDispatchAuthority] = contract.LabelTrue
+	} else {
 		labels[contract.LabelWithholdCredentials] = contract.LabelTrue
 	}
 	// The parameter document travels as an agent-only dispatch label, never as

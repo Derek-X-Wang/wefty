@@ -25,18 +25,41 @@ dispatches child work declares that at submit — `dispatch_authority` on the ru
 request, `wefty submit --dispatch-authority` on the command line — and that
 declaration delivers both credentials exactly as before. The declaration is
 recorded on the run record, so `wefty --json inspect` shows which runs hold
-credentials. On the wire it reaches the node agent inverted, as the public job
-label `withhold_workload_credentials`, which L3 sets on every run it dispatches
-that did not declare dispatch authority. Marking the withholding rather than
-the declaration is deliberate: the agent must never infer L3 provenance from
-anything a submitter can write, and a process `JobSpec` may legally carry any
-environment name, `WEFTY_L3_ENDPOINT` included. A job submitted straight to L1
-therefore carries no label and keeps its attempt credential by construction,
-and the only thing forging the label can achieve is withholding the forger's
-own job's credential. The run token still travels to the agent on every
-dispatch, in `SensitiveEnv` as always, because the mailbox publisher needs it;
-the label governs whether the agent then places it in the workload's own
-environment. Declaring dispatch authority is not an escalation: a run can only
+credentials.
+
+On the wire the agent decides from three inputs, and withholds when **either**
+the public job label `withhold_workload_credentials` is present, **or** L1's
+own record says the run ledger submitted the job and the public job label
+`dispatch_authority` is absent. L3 sets exactly one of the two labels on every
+run it dispatches. The provenance is `originating_submitter`, which L1 derives
+from the authenticated Fabric identity of whoever created the job and returns
+on the claim; it matches the Node ID configured as the run ledger on both L1
+(`--run-ledger-node-id`) and the agent (the flag of the same name), which
+default to the same value and must be overridden together.
+
+Three properties follow, and each one is why a single signal was not enough.
+The agent never infers L3 provenance from anything a submitter can write — a
+process `JobSpec` may legally carry any environment name, `WEFTY_L3_ENDPOINT`
+included. Neither direction fails open across a rolling upgrade: an older L3
+that sets no label still meets the provenance test, so its reporting runs are
+withheld from, and a newer L3 still sets the positive marker an older agent
+looks for, so a declaring run's child dispatch keeps working. And no forgery is
+a way in: a submitter cannot set the provenance at all, a job submitted
+straight to L1 carries neither label and keeps its credentials by construction,
+and the most a forged `withhold_workload_credentials` achieves is deleting the
+forger's own job's credentials.
+
+A job spawned through an attempt credential inherits its root's originating
+submitter, so a descendant of an L3 run would otherwise read as an L3 dispatch.
+L3 submits only root jobs, so a job with a parent never counts as run-ledger
+provenance and keeps the credential its spawn chain depends on.
+
+The run token still travels to the agent on every dispatch, in `SensitiveEnv`
+as always, because the mailbox publisher needs it; the decision above governs
+whether the agent then places it in the workload's own environment. The same
+decision governs reachability: an attempt without run-ledger provenance gets no
+`/l3` route on its attempt-local bridge, whatever its environment says, and no
+run mailbox. Declaring dispatch authority is not an escalation: a run can only
 declare it at submit, and a credential-free job cannot submit anything.
 
 The two endpoints are unaffected. `WEFTY_L3_ENDPOINT` and `WEFTY_L1_ENDPOINT`

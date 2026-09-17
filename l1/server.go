@@ -115,7 +115,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	}
 	runLedgerNodeID := strings.TrimSpace(config.RunLedgerNodeID)
 	if runLedgerNodeID == "" {
-		runLedgerNodeID = "run-ledger"
+		runLedgerNodeID = contract.DefaultRunLedgerNodeID
 	}
 	if policyFreshness <= policyWatchWait {
 		return nil, fmt.Errorf("l1: Computer policy freshness must exceed watch wait")
