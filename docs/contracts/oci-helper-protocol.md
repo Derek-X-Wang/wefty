@@ -459,6 +459,36 @@ heartbeats.
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the bridge and the helper issued that attempt's separate capability. It is mandatory for Computers because their private network namespace cannot address the agent's Node-loopback listener directly; ordinary OCI uses it only for the Mac bind-failure fallback. It never accepts an arbitrary host address or port. |
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
+| `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from that mailbox's `events/` directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
+| `ReadRunMailbox` | Same authority, plus one bounded entry name. Returns at most 64 KiB of one regular file, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file is a refusal, never bytes. |
+| `RemoveRunMailboxEntry` | Same authority and name. Removes one regular file, symlink or empty directory and reports whether it removed one or found it already absent, so a replayed retirement is not a failure. It never recurses: a nonempty directory or an unclassifiable object stays where it is. |
+| `Run` (run mailbox seed) | A `Run` may carry one run-mailbox seed: a bounded run ID and an optional JSON params document, valid only alongside a handoff managed volume and never for a Computer. The helper creates `.wefty/<run id>/{tmp,events}` inside that volume, writes `params.json` by write-then-rename, and mints `WEFTY_RUN_DIR` from the seed as reserved environment. `.wefty/` and `.wefty/<run id>/` stay root-owned and traversable (0711), `tmp/` and `events/` are chowned to the image's process owner (0700), and `params.json` is root-owned and world-readable (0644). No guest path is ever supplied by a caller. |
+
+## Run mailbox confinement
+
+The three run-mailbox methods are the only route by which bytes a workload wrote
+leave the managed root, and the helper runs as root over a directory that
+workload can write. The confinement is descriptor-based descent and nothing
+else.
+
+No path from the wire ever becomes a filesystem path. The wire carries an owner
+key, which is hashed into the deterministic handoff volume directory name; a run
+ID; and an entry name. The run ID and the entry name must each be one bounded
+component of `[A-Za-z0-9._-]` that does not begin with a dot, so neither can name
+`.`, `..`, a nested path, or the agent's own bookkeeping. Only the managed root
+is opened by absolute path, and it is refused if any of its own components is a
+symlink. Every component below it — `handoffs`, the volume, `.wefty`, the run ID,
+`events` — is opened relative to the descriptor above it, refused if it is a
+symlink or not a directory, and proved with `SameFile` both before and after the
+open, so a component swapped mid-descent fails closed instead of being followed.
+
+A read proves the entry is a regular file before and after opening it, opens
+non-blocking so a FIFO planted in the directory cannot block the helper, and
+stops at the byte cap. A removal classifies the entry first and never recurses,
+so workload data is never walked. Nothing here creates a missing directory: an
+absent mailbox is a refusal, not an empty one. The helper never parses an event;
+the file protocol, the publication bounds and the ordering are all the agent's
+(`docs/contracts/run-execution-context.md`).
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
 The helper emits an internal backend-ready marker only after that connection is

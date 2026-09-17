@@ -63,6 +63,9 @@ const (
 	MethodDialHostBridge     Method = "DialHostBridge"
 	MethodSetComputerControl Method = "SetComputerControlState"
 	MethodSetComputerToken   Method = "SetComputerToken"
+	MethodListRunMailbox     Method = "ListRunMailbox"
+	MethodReadRunMailbox     Method = "ReadRunMailbox"
+	MethodRemoveRunMailbox   Method = "RemoveRunMailboxEntry"
 )
 
 // attemptPortBackendReady is emitted only after the helper has connected the
@@ -666,6 +669,156 @@ type ManagedVolumeDescriptor struct {
 	ReadOnly        bool                      `json:"read_only,omitempty"`
 }
 
+// Run mailbox. The helper seeds one run-scoped directory inside the handoff
+// volume before the workload starts and then serves a bounded, attempt-scoped
+// read of it, so an unprivileged agent can publish what the workload reported
+// without the workload ever holding a credential. The layout and the file
+// protocol are `docs/contracts/run-execution-context.md`; the helper enforces
+// only confinement and these bounds and never parses an event.
+const (
+	// RunMailboxDirectoryName and the run-scoped child below it mirror the
+	// agent's own layout so one contract describes both kinds.
+	RunMailboxDirectoryName        = ".wefty"
+	RunMailboxEventsDirectoryName  = "events"
+	RunMailboxStagingDirectoryName = "tmp"
+	RunMailboxParamsFileName       = "params.json"
+	// MaxRunMailboxReadBytes bounds one served event. It matches the agent's
+	// own per-event bound; a larger file is truncated, never refused, because
+	// losing a verdict to a large payload is the worse failure.
+	MaxRunMailboxReadBytes = 64 << 10
+	// MaxRunMailboxListNames bounds one listing. The publisher needs a
+	// complete listing to establish lexical order, so this is a single cap and
+	// not a page size: at the name bound the whole response stays inside
+	// MaxFrameBytes.
+	MaxRunMailboxListNames = 4096
+	// MaxRunMailboxNameBytes bounds one entry name, matching the agent's rule.
+	MaxRunMailboxNameBytes = 128
+	// MaxRunMailboxParamsBytes bounds the params document the helper seeds.
+	MaxRunMailboxParamsBytes = 64 << 10
+)
+
+// RunMailboxSeed asks the helper to create one run-scoped mailbox inside this
+// attempt's handoff volume and deliver its parameters. Params is the exact
+// document written to params.json; the helper validates its size and that it
+// is a JSON object, and never interprets it further.
+type RunMailboxSeed struct {
+	RunID  string `json:"run_id"`
+	Params []byte `json:"params,omitempty"`
+}
+
+// ContainerDirectory is the mailbox path as the workload sees it. The helper
+// mints WEFTY_RUN_DIR from this, so no guest path is ever supplied by a caller.
+func (seed RunMailboxSeed) ContainerDirectory() string {
+	return contract.OCIContainerHandoffDirectory + "/" + RunMailboxDirectoryName + "/" + seed.RunID
+}
+
+// RunMailboxReference names exactly one attempt's mailbox. Every field is
+// checked: the authority must match a live attempt of this session, and the
+// owner key must be the one that attempt's Run declared, so a live attempt
+// cannot read a different run's handoff volume.
+type RunMailboxReference struct {
+	Authority AttemptAuthority `json:"authority"`
+	OwnerKey  string           `json:"owner_key"`
+	RunID     string           `json:"run_id"`
+}
+
+type ListRunMailboxRequest struct {
+	RunMailboxReference
+	Limit int `json:"limit,omitempty"`
+}
+
+type ListRunMailboxResponse struct {
+	Names []string `json:"names,omitempty"`
+	// Exhausted reports that the listing reached its cap, so the caller must
+	// treat it as incomplete rather than as the whole directory.
+	Exhausted bool `json:"exhausted,omitempty"`
+}
+
+type ReadRunMailboxRequest struct {
+	RunMailboxReference
+	Name  string `json:"name"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+type ReadRunMailboxResponse struct {
+	Payload   []byte `json:"payload,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
+type RemoveRunMailboxEntryRequest struct {
+	RunMailboxReference
+	Name string `json:"name"`
+}
+
+type RemoveRunMailboxEntryResponse struct {
+	Removed bool `json:"removed,omitempty"`
+	// Absent distinguishes an entry that was already gone from one this call
+	// deleted, so a replayed retirement is not mistaken for a failure.
+	Absent bool `json:"absent,omitempty"`
+}
+
+// ValidRunMailboxName is the single name rule for the mailbox, applied by the
+// agent before it asks and by the helper before it opens anything. A name is
+// one path component of bounded, unambiguous characters that cannot begin with
+// a dot, so it can never name `.`, `..`, or the agent-only bookkeeping.
+func ValidRunMailboxName(name string) bool {
+	if name == "" || len(name) > MaxRunMailboxNameBytes || strings.HasPrefix(name, ".") {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (seed RunMailboxSeed) validate() error {
+	if !ValidRunMailboxName(seed.RunID) {
+		return errors.New("run mailbox run ID is not a bounded mailbox name")
+	}
+	if len(seed.Params) > MaxRunMailboxParamsBytes {
+		return fmt.Errorf("run mailbox params exceed %d bytes", MaxRunMailboxParamsBytes)
+	}
+	if len(seed.Params) > 0 && !json.Valid(seed.Params) {
+		return errors.New("run mailbox params are not valid JSON")
+	}
+	return nil
+}
+
+// validate checks everything about the reference that does not require session
+// state. Attempt liveness and the owner-key match are the server's, because
+// only the session knows what this attempt's Run actually declared.
+func (reference RunMailboxReference) validate() error {
+	if err := reference.Authority.validate(); err != nil {
+		return err
+	}
+	if !ValidRunMailboxName(reference.RunID) {
+		return errors.New("run mailbox run ID is not a bounded mailbox name")
+	}
+	if _, err := DeterministicHandoffVolumeDirectory(reference.OwnerKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (request ListRunMailboxRequest) boundedLimit() int {
+	if request.Limit <= 0 || request.Limit > MaxRunMailboxListNames {
+		return MaxRunMailboxListNames
+	}
+	return request.Limit
+}
+
+func (request ReadRunMailboxRequest) boundedLimit() int {
+	if request.Limit <= 0 || request.Limit > MaxRunMailboxReadBytes {
+		return MaxRunMailboxReadBytes
+	}
+	return request.Limit
+}
+
 type OperatorMount struct {
 	NodePath      string `json:"node_path"`
 	ContainerPath string `json:"container_path"`
@@ -687,12 +840,16 @@ type WorkloadInput struct {
 	// closed helper-minting inputs. Their values become reserved environment
 	// only inside the privileged trust boundary; the two credentials are
 	// deliberately separate fields so sensitive-only routing is explicit.
-	L1Endpoint           string                    `json:"l1_endpoint,omitempty"`
-	L3Endpoint           string                    `json:"l3_endpoint,omitempty"`
-	AttemptToken         string                    `json:"attempt_token,omitempty"`
-	RunToken             string                    `json:"run_token,omitempty"`
-	ComputerToken        string                    `json:"computer_token,omitempty"`
-	ReservedEnvironment  []EnvironmentVariable     `json:"reserved_environment,omitempty"`
+	L1Endpoint          string                `json:"l1_endpoint,omitempty"`
+	L3Endpoint          string                `json:"l3_endpoint,omitempty"`
+	AttemptToken        string                `json:"attempt_token,omitempty"`
+	RunToken            string                `json:"run_token,omitempty"`
+	ComputerToken       string                `json:"computer_token,omitempty"`
+	ReservedEnvironment []EnvironmentVariable `json:"reserved_environment,omitempty"`
+	// RunMailbox seeds this attempt's mailbox inside its handoff volume. It
+	// requires a handoff managed volume, and WEFTY_RUN_DIR is minted from it
+	// inside the trust boundary like every other reserved value.
+	RunMailbox           *RunMailboxSeed           `json:"run_mailbox,omitempty"`
 	ManagedVolumes       []ManagedVolumeDescriptor `json:"managed_volumes,omitempty"`
 	OperatorMounts       []OperatorMount           `json:"operator_mounts,omitempty"`
 	Limits               WorkloadLimits            `json:"limits,omitempty"`

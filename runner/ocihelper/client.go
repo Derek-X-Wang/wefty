@@ -705,6 +705,24 @@ func (session *Session) ExportComputerCustody(ctx context.Context, request Expor
 	return response, err
 }
 
+func (session *Session) ListRunMailbox(ctx context.Context, request ListRunMailboxRequest) (ListRunMailboxResponse, error) {
+	var response ListRunMailboxResponse
+	err := session.call(ctx, MethodListRunMailbox, request, &response)
+	return response, err
+}
+
+func (session *Session) ReadRunMailbox(ctx context.Context, request ReadRunMailboxRequest) (ReadRunMailboxResponse, error) {
+	var response ReadRunMailboxResponse
+	err := session.call(ctx, MethodReadRunMailbox, request, &response)
+	return response, err
+}
+
+func (session *Session) RemoveRunMailboxEntry(ctx context.Context, request RemoveRunMailboxEntryRequest) (RemoveRunMailboxEntryResponse, error) {
+	var response RemoveRunMailboxEntryResponse
+	err := session.call(ctx, MethodRemoveRunMailbox, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

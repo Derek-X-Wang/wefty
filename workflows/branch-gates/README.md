@@ -43,9 +43,10 @@ run reports through its run mailbox and holds nothing unless it declares
 gates to L3 over HTTP, so every submit command below passes that flag and every
 submission in `branchgates_integration_test.go` sets `DispatchAuthority`.
 It over-grants deliberately and temporarily: branch-gates dispatches no child
-work and asks for the flag only for the reporting half. Converting it to the
-mailbox — after which the flag comes off and this whole section goes away — is
-the remaining #476 slice.
+work and asks for the flag only for the reporting half. The mailbox now reaches
+`kind=oci` too, so nothing is missing any more — converting this workflow to it,
+after which the flag comes off and this whole section goes away, is the only
+thing left.
 
 What the workflow does do, because it is cheap and it closes the ordinary
 accidents:
@@ -264,4 +265,5 @@ Kept here because #476 and #477 are supposed to remove it:
   untrusted work from it needs an OS boundary the workflow cannot build for
   itself. The run mailbox now removes the token from a dispatched job by
   default; branch-gates still opts back in with `--dispatch-authority` because
-  it reports over HTTP, and converting it to the mailbox is what retires that.
+  it reports over HTTP, and converting it to the mailbox — now available for
+  `kind=oci` as well — is what retires that.

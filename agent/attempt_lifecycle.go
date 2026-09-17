@@ -75,20 +75,25 @@ func (disabledAttemptWatch) Check() error           { return nil }
 func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
-	client                 *Client
-	runtimes               workloadRuntimeSet
-	outbox                 *evidenceOutbox
-	logSinkFactory         attemptLogSinkFactory
-	watchdog               attemptWatchdog
-	clock                  Clock
-	renewalInterval        time.Duration
-	completionRetry        time.Duration
-	finalizationTimeout    time.Duration
-	outputSinkFactory      OutputSinkFactory
-	managedResource        managedResourceManager
-	handoffs               *handoffManager
-	runLedger              runLedgerAppender
-	mailboxPoll            time.Duration
+	client              *Client
+	runtimes            workloadRuntimeSet
+	outbox              *evidenceOutbox
+	logSinkFactory      attemptLogSinkFactory
+	watchdog            attemptWatchdog
+	clock               Clock
+	renewalInterval     time.Duration
+	completionRetry     time.Duration
+	finalizationTimeout time.Duration
+	outputSinkFactory   OutputSinkFactory
+	managedResource     managedResourceManager
+	handoffs            *handoffManager
+	runLedger           runLedgerAppender
+	mailboxPoll         time.Duration
+	// mailboxStateRoot is the agent-owned directory under which a remote
+	// mailbox keeps its bookkeeping. A remote mailbox's directory is
+	// workload-writable and on the far side of a trust boundary, so its
+	// accounting is deliberately not kept there.
+	mailboxStateRoot       string
 	nodeID                 string
 	bootSessionID          string
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error)
@@ -997,6 +1002,17 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			recoverRuntime(generation)
 		}
 		finalizationContext, cancelFinalization := finalization.begin()
+		// A mailbox the agent reads through the runtime is authorized against
+		// the live attempt, and ReapAndVerify is what ends that attempt. The
+		// drain therefore happens here, with the workload already returned and
+		// the runtime not yet reaped -- the only window in which every event
+		// the workload wrote is both complete and still reachable. If the
+		// attempt was already reaped (a deadman guardian that won the race),
+		// the drain fails, publication is marked incomplete, and the handoff
+		// volume is retained rather than expiring as a clean success.
+		if mailbox.readsThroughRuntime() {
+			mailbox.finalize(finalizationContext)
+		}
 		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
 			Authority: authority, ManagedResources: managedResources,
 		})
@@ -1031,8 +1047,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// The workload is quiesced here and the handoff directory still
 		// exists: this is the only point at which every event it wrote can be
 		// published. finishCompletedAttempt may remove the directory once this
-		// returns, so the final sweep is not optional and not asynchronous.
-		mailbox.finalize(finalizationContext)
+		// returns, so the final sweep is not optional and not asynchronous. A
+		// mailbox read through the runtime has already drained above, while its
+		// attempt was still live.
+		if !mailbox.readsThroughRuntime() {
+			mailbox.finalize(finalizationContext)
+		}
 		if reapErr != nil {
 			reapErr = fmt.Errorf("reap and verify workload runtime: %w", reapErr)
 		}
@@ -1186,17 +1206,39 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		lifecycle.storeMailbox(mailbox)
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
-	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot && ledgerDispatched {
-		// The OCI handoff volume is helper-owned inside the node, and the
-		// helper protocol has no read method yet, so there is nothing the
-		// agent could publish from. Say so rather than deliver a directory
-		// whose contents would silently never reach the ledger. Until that
-		// seam exists an OCI run that reports must be submitted as one that
-		// dispatches child work, because that is the only way it holds a
-		// credential to report with.
-		lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; the handoff volume is helper-owned and exposes no read path", claim.Lease.AttemptID)
-		if withholdsWorkloadCredentials(claim) {
-			lifecycle.log("agent: kind=oci attempt %s was dispatched without dispatch authority and has no mailbox, so it can report nothing to the run ledger", claim.Lease.AttemptID)
+	} else if lifecycle.dependencies.runLedger != nil && ledgerDispatched && remoteRunMailboxAvailable(claim.Job.Spec) {
+		// The OCI handoff volume is helper-owned inside the node, so the agent
+		// cannot open it. The runtime serves a bounded, attempt-scoped read of
+		// it instead, and the runtime seeds the directory itself because only
+		// it knows which uid the container will run as. WEFTY_RUN_DIR is minted
+		// inside that trust boundary, which is why nothing is set here.
+		runtime, served := runtimeAdapter.(workloadrunner.RunMailboxRuntime)
+		switch {
+		case !served:
+			lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; this runtime exposes no read path", claim.Lease.AttemptID)
+		default:
+			prepared, err := prepareRemoteRunMailbox(claim, lifecycle.dependencies.mailboxStateRoot, runtime, authority,
+				lifecycle.dependencies.runLedger, lifecycle.dependencies.mailboxPoll,
+				lifecycle.dependencies.clock, lifecycle.dependencies.logf)
+			if err != nil {
+				return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+			}
+			mailbox = prepared
+			defer mailbox.close()
+			// Bookkeeping for a drained attempt has nothing left to protect.
+			// One that ended incomplete keeps its reservations, so a later
+			// republication replays rather than charging the same document a
+			// second time.
+			defer func() {
+				if mailbox.publicationIncomplete() {
+					return
+				}
+				if err := discardRemoteRunMailboxState(lifecycle.dependencies.mailboxStateRoot, claim.Lease.AttemptID); err != nil {
+					lifecycle.log("agent: discard run mailbox bookkeeping for attempt %s: %v", claim.Lease.AttemptID, err)
+				}
+			}()
+			lifecycle.storeMailbox(mailbox)
+			request.RunMailbox = runMailboxSeed(claim.Job.Spec)
 		}
 	}
 	var err error

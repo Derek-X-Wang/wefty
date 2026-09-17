@@ -499,20 +499,49 @@ not authentication. Forged bookkeeping can only suppress or truncate the
 workload's own run's evidence; it grants no append credential or authority over
 another run.
 
-The mailbox is delivered to `kind=process` one-shots that L3 dispatched and
-extends to OCI once the helper exposes a read path. An OCI handoff volume is
-helper-owned inside the node and the helper protocol exposes
-no read path, so an OCI attempt receives no `WEFTY_RUN_DIR` and the agent logs
-that publication is unavailable rather than delivering a directory nothing
-would ever read.
+The mailbox is delivered to every one-shot L3 dispatched, `kind=process` and
+`kind=oci` alike. The file protocol above is identical for both; what differs is
+who owns the directory, and the differences make the OCI mailbox stricter rather
+than looser.
+
+An OCI handoff volume is helper-owned inside the node, so the agent cannot open
+it. The helper creates the mailbox inside the volume before the workload starts,
+mints `WEFTY_RUN_DIR` as `/wefty/handoff/.wefty/<run id>` inside its own trust
+boundary — no guest path crosses the protocol — and then serves a bounded,
+attempt-scoped read of `events/` to the agent through
+`ListRunMailbox`, `ReadRunMailbox` and `RemoveRunMailboxEntry`
+(`docs/contracts/oci-helper-protocol.md`). The agent's publisher is unchanged:
+it sees a listing, a bounded read and a removal, and every rule in this section
+— lexical order, the bounds, the rejection budget, the idempotency identity —
+is enforced exactly where it was.
+
+Ownership inside the volume is the smallest arrangement that works. `.wefty/`
+and `.wefty/<run id>/` stay root-owned and traversable (0711); `tmp/` and
+`events/` are owned by the uid the container's image declares (0700); and
+`params.json` is root-owned and world-readable. A workload therefore writes and
+renames its own events, reads its own parameters, and can neither rewrite the
+parameters nor replace `events/` with a symlink. `.published/` is not in the
+volume at all: for an OCI attempt the bookkeeping is agent-local, per attempt,
+so it is unreachable by the workload rather than merely validated.
+
+Publication is authorized against the live attempt that declared the mailbox, so
+it stops when the runtime is reaped. The final drain therefore runs *before*
+`ReapAndVerify` for an OCI attempt — the workload has returned and the attempt
+is still live, the only window in which every event is both complete and still
+reachable — and after it for a process attempt, whose quiescence that reap is
+what proves. Each helper call carries a short deadline inside the finalization
+budget. If the drain cannot finish (the helper stopped answering, or a deadman
+guardian reaped the attempt first), publication is marked incomplete and the
+handoff volume is retained under the ordinary rules rather than expiring as a
+clean success; the volume already survives a successful run and is expired by
+the helper's boot sweep after its retention window.
 
 Because the mailbox needs no credential, it is what a dispatched job reports
 through by default: `WEFTY_RUN_TOKEN` and `WEFTY_ATTEMPT_TOKEN` are withheld
 unless the run declared `dispatch_authority` at submit. A workflow that
-dispatches child runs still needs the run token and still declares it. The
-mailbox does not yet reach `kind=oci`, so until it does an OCI run that reports
-anything must declare dispatch authority; the agent logs that it can report
-nothing when a dispatched OCI attempt has neither.
+dispatches child runs still needs the run token and still declares it. That is
+now the only reason to declare it: an OCI run that merely reports holds no
+credential either, exactly like a process one.
 
 ## Node-local handoff lifecycle
 

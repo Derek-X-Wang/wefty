@@ -8,11 +8,10 @@
 # an event whose name already exists. `wefty run ...` does all three properly.
 # Use it wherever the binary exists; this is the fallback for where it does not.
 #
-# Today that case is not reachable in production: an OCI attempt receives no
-# WEFTY_RUN_DIR at all, because the handoff volume is helper-owned and the
-# helper protocol exposes no read path. Until that lands, this is the process
-# one-shot's fallback and the proof that the protocol, not the binary, is the
-# contract.
+# The OCI case is exactly where it earns its keep: an OCI attempt's mailbox lives
+# in its helper-owned handoff volume, and the image that runs there is usually
+# not one that ships the wefty binary. The caveats above still apply, and they
+# apply more there, because that directory is inside a container.
 #
 # Protocol: docs/contracts/run-execution-context.md, "Run mailbox".
 # --------------------------------------------------------------------------

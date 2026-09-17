@@ -100,6 +100,21 @@ func validateWorkloadWire(input WorkloadInput) error {
 	if input.Computer && input.Limits.MemoryBytes <= 0 {
 		return errors.New("Computer workload requires a positive memory cap")
 	}
+	if input.RunMailbox != nil {
+		if err := input.RunMailbox.validate(); err != nil {
+			return err
+		}
+		if input.Computer {
+			return errors.New("a Computer workload receives no run mailbox")
+		}
+		handoff := false
+		for _, volume := range input.ManagedVolumes {
+			handoff = handoff || volume.Kind == ManagedVolumeHandoff
+		}
+		if !handoff {
+			return errors.New("a run mailbox requires a handoff managed volume")
+		}
+	}
 	seenManagedKinds := make(map[ManagedVolumeKind]struct{}, len(input.ManagedVolumes))
 	seenVolumes := make(map[string]struct{}, len(input.OperatorMounts))
 	for _, volume := range input.ManagedVolumes {

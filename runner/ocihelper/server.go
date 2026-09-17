@@ -99,7 +99,13 @@ const (
 )
 
 type serverAttempt struct {
-	authority        AttemptAuthority
+	authority AttemptAuthority
+	// handoffOwnerKey and runMailboxRunID are exactly what this attempt's Run
+	// declared. A mailbox request must name both, so a live attempt can only
+	// ever read the one mailbox it was started with -- never another run's
+	// handoff volume, and never a second run inside its own.
+	handoffOwnerKey  string
+	runMailboxRunID  string
 	computerStorage  *ComputerStorageReference
 	state            attemptState
 	endpoints        map[string]uint16
@@ -838,8 +844,13 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 		if volume.Kind == ManagedVolumeComputerDisk && volume.ComputerStorage != nil {
 			storage := *volume.ComputerStorage
 			attempt.computerStorage = &storage
-			break
 		}
+		if volume.Kind == ManagedVolumeHandoff {
+			attempt.handoffOwnerKey = volume.OwnerKey
+		}
+	}
+	if request.Workload.RunMailbox != nil {
+		attempt.runMailboxRunID = request.Workload.RunMailbox.RunID
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -1101,6 +1112,45 @@ func (session *serverSession) authorizeAttempt(authority AttemptAuthority) (*ser
 	return attempt, nil
 }
 
+// authorizeRunMailbox is attempt authorization plus the exact mailbox this
+// attempt declared at Run. Attempt liveness alone would let any live attempt
+// name any handoff volume on the node, because the volume is keyed by run and
+// not by attempt; binding the owner key and run ID to what Run recorded closes
+// that without widening anything else.
+func (session *serverSession) authorizeRunMailbox(reference RunMailboxReference) *RPCError {
+	if err := reference.validate(); err != nil {
+		return &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+	}
+	attempt, rpcErr := session.authorizeAttempt(reference.Authority)
+	if rpcErr != nil {
+		return rpcErr
+	}
+	session.mu.Lock()
+	ownerKey, runID := attempt.handoffOwnerKey, attempt.runMailboxRunID
+	session.mu.Unlock()
+	if ownerKey == "" || runID == "" {
+		return &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt was not started with a run mailbox"}
+	}
+	if reference.OwnerKey != ownerKey || reference.RunID != runID {
+		return &RPCError{Code: CodeUnauthorizedAttempt, Message: "run mailbox is not the one this attempt was started with"}
+	}
+	return nil
+}
+
+// runMailboxEngine authorizes the request and then resolves the engine that can
+// serve it. Authorization always runs first, so an engine that cannot serve a
+// mailbox never becomes a way to learn whether an attempt exists.
+func (session *serverSession) runMailboxEngine(server *Server, reference RunMailboxReference) (RunMailboxEngine, *RPCError) {
+	if rpcErr := session.authorizeRunMailbox(reference); rpcErr != nil {
+		return nil, rpcErr
+	}
+	engine, ok := server.engine.(RunMailboxEngine)
+	if !ok {
+		return nil, &RPCError{Code: CodeUnsupportedOperation, Message: "run mailbox reads are unavailable"}
+	}
+	return engine, nil
+}
+
 // authorizeDelete accepts a completed guardian reap as exact positive absence
 // evidence. Ordinary repeated Delete remains a non-live authority refusal: the
 // exception exists only for the race where the helper's own deadman completed
@@ -1160,7 +1210,8 @@ func (session *serverSession) sweepRequired(method Method) bool {
 		return false
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
-		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken:
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken,
+		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -1793,6 +1844,53 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.ExportComputerCustody(operation.ctx, body)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+	case MethodListRunMailbox:
+		var body ListRunMailboxRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.ListRunMailbox(operation.ctx, body)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+	case MethodReadRunMailbox:
+		var body ReadRunMailboxRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if !ValidRunMailboxName(body.Name) {
+			_ = writeFailure(wire, CodeInvalidRequest, "run mailbox entry name is not a bounded mailbox name")
+			return
+		}
+		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.ReadRunMailbox(operation.ctx, body)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+	case MethodRemoveRunMailbox:
+		var body RemoveRunMailboxEntryRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if !ValidRunMailboxName(body.Name) {
+			_ = writeFailure(wire, CodeInvalidRequest, "run mailbox entry name is not a bounded mailbox name")
+			return
+		}
+		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.RemoveRunMailboxEntry(operation.ctx, body)
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodVerify:
 		var body VerifyRequest
