@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -22,6 +23,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/workflowhelper"
 	"github.com/Derek-X-Wang/wefty/l3"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 // ociRunMailboxWorkflow is the workload under test. It is the SHIPPED inline
@@ -72,6 +75,11 @@ func TestOCIRunMailboxEventsReachTheRunLedgerThroughTheHelper(t *testing.T) {
 	}
 	harness := newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{
 		leaseDuration: 10 * time.Second, runLedgerLane: true,
+		// Without these the agent advertises kind:process only, L1's claim
+		// query never matches an OCI job's required capability, and the run
+		// sits queued with zero attempts -- which is exactly how this test
+		// failed before they were here.
+		agentArguments: ociAgentArguments(t),
 	})
 
 	runID := submitOCIMailboxRun(t, harness, reference, digest)
@@ -108,13 +116,49 @@ func TestOCIRunMailboxEventsReachTheRunLedgerThroughTheHelper(t *testing.T) {
 	}
 }
 
+// ociAgentArguments enables kind=oci on the acceptance agent and makes the
+// probe image locally resolvable, mirroring what every other OCI test in this
+// lane does. The agent advertises kind:oci only when its OCI flags are present:
+// L1's claim query requires every declared capability to be advertised by the
+// node (l1/store.go:2494-2501), so an OCI job submitted to a process-only agent
+// is never claimed at all and reports nothing, because nothing ran.
+func ociAgentArguments(t *testing.T) []string {
+	t.Helper()
+	var arguments []string
+	for _, value := range []struct{ name, flag string }{
+		{"WEFTY_OCI_HELPER_SOCKET", "--oci-helper-socket="},
+		{"WEFTY_OCI_HELPER_CHECKSUM", "--oci-helper-checksum="},
+		{"WEFTY_OCI_PROBE_REFERENCE", "--oci-probe-image="},
+		{"WEFTY_OCI_PROBE_DIGEST", "--oci-probe-digest="},
+	} {
+		setting := os.Getenv(value.name)
+		if setting == "" {
+			t.Fatalf("the OCI run-mailbox lane requires %s", value.name)
+		}
+		arguments = append(arguments, value.flag+setting)
+	}
+	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
+	if archivePath == "" {
+		t.Fatal("the OCI run-mailbox lane requires WEFTY_OCI_PROBE_ARCHIVE")
+	}
+	// The image must already exist locally; this lane does not pull.
+	importRealtimeProbeImage(t, archivePath,
+		os.Getenv("WEFTY_OCI_HELPER_SOCKET"), os.Getenv("WEFTY_OCI_HELPER_CHECKSUM"),
+		os.Getenv("WEFTY_OCI_PROBE_REFERENCE"), os.Getenv("WEFTY_OCI_PROBE_DIGEST"), nil)
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return append(arguments, "--oci-intent-file="+intentPath)
+}
+
 func submitOCIMailboxRun(t *testing.T, harness *acceptanceHarness, reference, digest string) string {
 	t.Helper()
 	request := l3.CreateRunRequest{
 		Image: &contract.ImageProgram{
 			Reference: reference, Digest: &digest,
 			Argv:           []string{"/bin/sh", "-c", ociRunMailboxWorkflow()},
-			RuntimeHandler: "io.containerd.runc.v2",
+			RuntimeHandler: ocihelper.DefaultRuntimeHandler,
 		},
 		Params: json.RawMessage(`{"branch":"acceptance-branch"}`),
 		// Deliberately absent: DispatchAuthority. This run reports and
@@ -281,7 +325,18 @@ func filteredAgentOutput(harness *acceptanceHarness) string {
 		}
 	}
 	if len(matched) == 0 {
-		return "\n  agent output: no line matched mailbox|spawn|finaliz|helper|attempt|error|fail|refus|reject"
+		// "no line matched" twice over is more likely an empty capture than a
+		// quiet agent, and those need opposite next steps.
+		whole := harness.agent.output.String()
+		lines := strings.Split(strings.TrimRight(whole, "\n"), "\n")
+		if len(whole) == 0 {
+			return "\n  agent output: the harness captured 0 bytes from the agent"
+		}
+		if len(lines) > 30 {
+			lines = lines[len(lines)-30:]
+		}
+		return fmt.Sprintf("\n  agent output: %d bytes captured, no line matched; last %d lines unfiltered:\n    %s",
+			len(whole), len(lines), strings.Join(lines, "\n    "))
 	}
 	elided := 0
 	if len(matched) > maxLines {
