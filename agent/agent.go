@@ -143,6 +143,8 @@ type Agent struct {
 	// mailboxStateRoot is the agent-owned durable directory under which a
 	// mailbox the agent cannot open keeps its bookkeeping.
 	mailboxStateRoot      string
+	collectorCancel       context.CancelFunc
+	collectorDone         chan struct{}
 	logf                  func(string, ...any)
 	clock                 Clock
 	observer              *lifecycleObserver
@@ -435,7 +437,7 @@ func New(config Config) (*Agent, error) {
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
-		handoffs:         newHandoffManager(config.HandoffRoot, logSpoolDirectory, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
+		handoffs:         newHandoffManager(config.HandoffRoot, logSpoolDirectory, config.NodeID, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
 		runLedger:        newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
 		mailboxPoll:      durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
 		mailboxStateRoot: logSpoolDirectory,
@@ -482,6 +484,7 @@ func (a *Agent) Close() {
 			a.log("close durable log spool: %v", err)
 		}
 	}
+	a.stopResultCollector()
 	if a.nodeLock != nil {
 		if err := a.nodeLock.Close(); err != nil {
 			a.log("release stable-node lock: %v", err)
@@ -526,12 +529,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 	if a.handoffs != nil {
+		// One clock: the ticker above and the retention timestamps below have
+		// to move together, or a test can only ever exercise one of them.
+		a.handoffs.now = func() time.Time { return a.clock.Now() }
 		if err := a.handoffs.collect(); err != nil {
 			return fmt.Errorf("agent: collect retained results: %w", err)
 		}
 		// Startup is not enough on its own: an agent that runs for weeks would
-		// otherwise never expire or evict anything it retained while up.
-		go a.collectResultsPeriodically(ctx)
+		// otherwise never expire anything it retained while up. The collector
+		// is the agent's, not this call's: Close cancels and joins it before
+		// the node lock is released, so nothing is sweeping a node another
+		// agent may already have taken.
+		a.startResultCollector()
 	}
 	if a.outbox != nil && a.session != nil {
 		a.outbox.startRecovery(ctx, a.session.client, func(err error) {
@@ -587,23 +596,40 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 	})
 }
 
-// collectResultsPeriodically expires and evicts on a timer, so retention holds
-// on a node that is never restarted. Attempt completion collects too; this is
-// what covers a node that finishes nothing for a long time and one whose runs
-// all finished while it was over budget with work in flight.
-func (a *Agent) collectResultsPeriodically(ctx context.Context) {
-	for {
-		timer := a.clock.NewTimer(resultCollectionInterval)
-		select {
-		case <-ctx.Done():
-			stopTimer(timer)
-			return
-		case <-timer.C():
+// startResultCollector expires retained results on a timer, so retention holds
+// on a node that is never restarted. Attempt completion collects too; this
+// covers a node that finishes nothing for a long time.
+func (a *Agent) startResultCollector() {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.collectorCancel = cancel
+	a.collectorDone = make(chan struct{})
+	go func() {
+		defer close(a.collectorDone)
+		for {
+			timer := a.clock.NewTimer(resultCollectionInterval)
+			select {
+			case <-ctx.Done():
+				stopTimer(timer)
+				return
+			case <-timer.C():
+			}
+			if err := a.handoffs.collect(); err != nil {
+				a.log("collect retained results: %v", err)
+			}
 		}
-		if err := a.handoffs.collect(); err != nil {
-			a.log("collect retained results: %v", err)
-		}
+	}()
+}
+
+// stopResultCollector cancels the collector and waits for it. It runs before
+// the node lock is released: a sweep that outlived its agent would be deleting
+// under a node another agent has already claimed.
+func (a *Agent) stopResultCollector() {
+	if a.collectorCancel == nil {
+		return
 	}
+	a.collectorCancel()
+	<-a.collectorDone
+	a.collectorCancel = nil
 }
 
 func (a *Agent) currentOCIRuntimeGeneration() (workloadrunner.RuntimeGeneration, bool) {

@@ -455,7 +455,7 @@ func TestLogFinalizationDeadlineStillFinishesProcessHandoff(t *testing.T) {
 			preparedAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 			finishedAt := preparedAt.Add(time.Minute)
 			nowCalls := 0
-			handoffs := newHandoffManager(root, t.TempDir(), time.Hour, nil)
+			handoffs := newHandoffManager(root, t.TempDir(), "handoff-deadline-node", time.Hour, nil)
 			handoffs.now = func() time.Time {
 				nowCalls++
 				if nowCalls == 1 {
@@ -3229,7 +3229,7 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 				if test.successfulHandoff {
 					root := filepath.Join(t.TempDir(), "handoffs")
 					handoffPath = filepath.Join(root, "directive-run")
-					handoffs = newHandoffManager(root, t.TempDir(), time.Hour, nil)
+					handoffs = newHandoffManager(root, t.TempDir(), "stable-node", time.Hour, nil)
 					claim.Job.Spec.Class = contract.JobClassOneShot
 					claim.Job.Spec.Labels = map[string]string{"run_id": "directive-run"}
 					claim.Job.Spec.Execution.WorkingDirectory = t.TempDir()
@@ -3286,11 +3286,19 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					return
 				}
 				if test.loseOwnership {
-					if destination != errorDestinationUnclassified || executeErr == nil || !strings.Contains(executeErr.Error(), "finish handoff lifecycle") || !strings.Contains(executeErr.Error(), "lost its ownership marker") {
-						t.Fatalf("handoff failure absorbed: destination=%d err=%v", destination, executeErr)
+					// The workload rewrote the ownership marker to name another
+					// node. That used to change the agent's behaviour, which is
+					// precisely why retention no longer reads it: ownership is
+					// agent-held, so a forged marker changes nothing at all.
+					if destination != errorDestinationUnclassified || executeErr != nil {
+						t.Fatalf("a forged ownership marker changed the attempt: destination=%d err=%v", destination, executeErr)
 					}
 					if _, err := os.Stat(filepath.Join(handoffPath, "result")); err != nil {
-						t.Fatalf("unowned handoff mutated: %v", err)
+						t.Fatalf("handoff mutated: %v", err)
+					}
+					record := requireRetentionRecord(t, handoffs, "directive-run")
+					if !record.Succeeded || record.NodeID != "stable-node" {
+						t.Fatalf("a forged marker reached the retention record: %#v", record)
 					}
 				} else {
 					if destination != errorDestinationUnclassified || executeErr != nil {

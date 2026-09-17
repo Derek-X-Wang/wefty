@@ -612,56 +612,70 @@ is the whole rule, and it replaces the previous one under which a successful
 attempt deleted its own directory — which meant the outcome an operator most
 wants to read was the only one that left nothing behind.
 
-Three bounds apply, and all three are contract values rather than node
-configuration, because a person reading `wefty inspect` has to know when their
-results stop existing:
+Two bounds apply, and both are contract values rather than node configuration,
+because a person reading `wefty inspect` has to know when their results stop
+existing:
 
 | Bound | Value | Applies to | What happens past it |
 | --- | --- | --- | --- |
 | Retention window | 7 days | both kinds | The whole directory or volume is swept. |
-| Per run | 64 MiB | the process handoff root | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. A `result.json` that is not a regular file is not a result at all and is removed, because the alternative is a dangling link named like a verdict. |
-| Per node | 1 GiB | the process handoff root | Whole runs are evicted until the node fits. |
+| Per run | 64 MiB | the process handoff directory | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. A `result.json` that is not a regular file is not a result at all and is removed, because the alternative is a dangling link named like a verdict. |
 
-**Part 1 bounds the process handoff root only.** An OCI run's results live in a
-helper-owned volume the agent cannot measure, so in part 1 those volumes are
-bounded by the window alone: neither byte budget covers them, and the node's
-1 GiB is not a combined process-plus-OCI figure. Per-volume byte accounting and
-publication-aware eviction inside the helper are #494.
+**There is no node-wide budget in part 1.** A budget across every retained run
+needs accounting and an eviction order, and both need to be right: measuring a
+tree a workload is still writing, deciding which run to lose, and doing it
+without racing the attempt that owns the directory. Part 1 keeps the two rules
+it can enforce correctly and leaves the node budget to #494. A node's retained
+results are therefore bounded by how many runs it executes within the window and
+by 64 MiB each, not by a single figure.
 
-**The OCI window runs from the volume's last preparation, not from the run
-finishing.** The helper stamps the volume's mtime when it prepares or reuses it
-and expires it on that stamp, so a job that creates its files early and then
-runs for a long time can see its results expire sooner than seven days after it
-finished. A uid-0 workload can also move that timestamp, by the same ownership
-limit the mailbox records (`oci-helper-protocol.md`, "Run mailbox
-confinement"): the volume is a bind mount it can write. A helper-owned terminal
-timestamp, recorded after quiescence and validated, is #494.
+**Part 1's per-run bound covers the process handoff directory only.** An OCI
+run's results live in a helper-owned volume the agent cannot measure, so those
+are bounded by the window alone. Per-volume byte accounting inside the helper is
+#494.
 
-Eviction order is the one place this design chooses what to lose. A run whose
-evidence reached the ledger goes before a run whose evidence did not, because
-the ledger still holds the first run's story and nothing holds the second's;
-within each group the oldest goes first. A run an attempt currently holds is
-never swept and never evicted, and its bytes still count against the node: if
-work in flight alone exceeds the budget, the node logs the overrun once and
-collects again when those runs finish rather than deleting a directory a
-workload is writing into.
+**The OCI window runs from the volume's current directory mtime**, which
+preparation stamps and which ordinary entry creation inside the directory also
+changes — not from the run finishing. A job that creates its files early and
+then runs for a long time can therefore see its results expire sooner than seven
+days after it finished, and a uid-0 workload can move the timestamp directly, by
+the same ownership limit the mailbox records (`oci-helper-protocol.md`, "Run
+mailbox confinement"). A helper-owned terminal timestamp, recorded after
+quiescence and validated, is #494.
 
-Collection runs at agent startup, after every attempt finishes — including the
-attempts that never completed cleanly — and hourly. The authority it acts on is
-a record the agent keeps under its own state directory, never a file inside the
-handoff directory: a process workload shares the agent's OS identity, so
-anything in there is a file it can rewrite to make another run expire, to prefer
-its own results, or to escape accounting. A directory with no agent record is
-not the agent's and is never measured, evicted or removed, however full the node
-is. A record that cannot be read or does not match where it is filed is skipped
-with a logged reason and never stops the sweep.
+Collection expires and nothing else. It runs at agent startup, after every
+attempt finishes — including attempts that never completed cleanly — and hourly;
+the collector is the agent's own and is cancelled and joined before the node
+lock is released. A run an attempt is holding is never swept: the sweep takes
+the same path lock an attempt does, and re-checks ownership under that lock
+immediately before deleting.
+
+The authority it acts on is a record the agent keeps under its own state
+directory, never a file inside the handoff directory: a process workload shares
+the agent's OS identity, so anything in there is a file it can rewrite. A
+directory with no agent record is not the agent's and is never measured or
+removed, however full the node is. A record is validated against the file it was
+found in, the root, this node's identity and the retention window, and one that
+fails any of those — including one from an older agent missing fields — is
+skipped with a logged reason and never stops the sweep. The marker inside the
+handoff directory keeps only its cold-rerun ownership job and is read once, at
+preparation.
+
+Terminal recording and trimming happen while the attempt still owns the path,
+only for a directory that attempt prepared, and reach it through an opened
+directory handle rather than by rebuilding pathnames. A handoff path that is a
+symlink is skipped and logged, never followed.
 
 **The budgets are logical bytes**, summed over regular files: the length a file
-reports, not the blocks it occupies. A hard-linked file is charged once, a
-symlink is never followed and contributes nothing, and sparse files are charged
-their logical length. There is no inode or entry-count bound in part 1, so many
-tiny files can consume node resources while barely moving these budgets;
-whether to add one is part of #494.
+reports, not the blocks it occupies. A symlink is never followed and contributes
+nothing; a hard-linked file is charged once per link, because part 1 tracks no
+inode identity. Sparse files are charged their logical length. There is no inode
+or entry-count bound, so many tiny files can consume node resources while barely
+moving the per-run budget; whether to add one is part of #494.
+
+The record also carries whether the run's evidence reached the ledger. Nothing
+in part 1 reads it — there is no eviction order for it to inform — and it is
+kept because part 2 reports it and #494's eviction order needs it.
 
 These are the agent's own bounds. Cache-pressure rules elsewhere — the OCI image
 cache, a node running out of disk — govern their own resources and neither

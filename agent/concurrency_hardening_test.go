@@ -25,7 +25,7 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "handoffs")
 	runID := "run-shared-path"
 	path := filepath.Join(root, runID)
-	manager := newHandoffManager(root, t.TempDir(), time.Hour, nil)
+	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
 	spec := handoffClaim(runID, path, nil).Job.Spec
 
 	unlockFirst, err := manager.lock(context.Background(), spec)

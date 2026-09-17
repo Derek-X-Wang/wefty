@@ -420,18 +420,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, lifecycle.fenceMailbox)
 	defer releaseFenceGate()
 	defer cancelAttempt(nil)
-	// Every exit from an attempt retains and accounts for its results, not only
-	// the one that completes cleanly. A completion that never landed, an
-	// authority loss or a cancelled context used to leave the run's directory
-	// unbounded and invisible to the node's budget. The latch means this fires
-	// only when the completion path did not already record the real verdict,
-	// and the conservative values it records -- not succeeded, not published --
-	// are the ones that keep a run's files longest.
-	defer func() {
-		if err := lifecycle.retainResults(claim, false, false); err != nil {
-			lifecycle.log("agent: retain results for attempt %s: %v", claim.Lease.AttemptID, err)
-		}
-	}()
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
@@ -492,6 +480,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			handoffUnlock()
 		}
 	}()
+	// The last resort, and deliberately the last defer registered before the
+	// attempt runs: it fires after the completion path has had its chance to
+	// record the real verdict, and before the path lock is released. Terminal
+	// recording and trimming touch the run's directory, so doing either after
+	// the unlock would let this attempt trim a successor's live directory.
+	defer lifecycle.retainResultsFallback(claim)
 	completed := make(chan runOutcome, 1)
 	go func() {
 		if claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
@@ -1148,7 +1142,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if retainHandoffLock != nil {
 			retainHandoffLock(unlock)
 		} else {
+			// This path owns the lock for its own duration and never reaches a
+			// completion verdict, so the fallback belongs here, registered
+			// after the unlock so it runs before it and while the path is
+			// still owned.
 			defer unlock()
+			defer lifecycle.retainResultsFallback(claim)
 		}
 	}
 	executionSpec := request.Execution
@@ -1540,6 +1539,16 @@ func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
 // a node's retained bytes actually change, and because the per-run bound has to
 // apply to a run that ended without a clean completion just as much as to one
 // that ended with one.
+// retainResultsFallback records the conservative outcome for an attempt that
+// never reached a verdict -- a completion that never landed, an authority loss,
+// a cancelled context. It is latched behind the completion path, so it does
+// nothing at all when a real verdict was already recorded.
+func (lifecycle *attemptLifecycle) retainResultsFallback(claim l1.Claim) {
+	if err := lifecycle.retainResults(claim, false, false); err != nil {
+		lifecycle.log("agent: retain results for attempt %s: %v", claim.Lease.AttemptID, err)
+	}
+}
+
 func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
 	if lifecycle.dependencies.handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return nil

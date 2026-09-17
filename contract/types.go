@@ -77,13 +77,6 @@ const (
 	// for -- and loses the rest with a logged reason.
 	MaxRetainedResultBytes int64 = 64 << 20
 
-	// MaxRetainedResultRootBytes bounds every retained run on one node
-	// together. Past it the oldest already-published runs are evicted first,
-	// because their evidence is in the ledger and the files are a convenience;
-	// a run whose evidence never published is the last thing to go, because for
-	// it the files are the only copy.
-	MaxRetainedResultRootBytes int64 = 1 << 30
-
 	// LabelRunParams carries a dispatched run's parameter document to the node
 	// agent, which writes it into the run mailbox. It travels on the claim path
 	// only: RedactJobLabels removes it from every public job projection, the

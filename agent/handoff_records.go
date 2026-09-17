@@ -142,7 +142,7 @@ func (m *handoffManager) loadRecords() []retentionRecord {
 			m.log("agent: skip unusable retention record %q: %v", name, err)
 			continue
 		}
-		if err := validRetentionRecord(record, name, m.root, now); err != nil {
+		if err := validRetentionRecord(record, name, m.root, m.nodeID, m.retention, now); err != nil {
 			m.log("agent: skip untrustworthy retention record %q: %v", name, err)
 			continue
 		}
@@ -161,7 +161,7 @@ func (m *handoffManager) readRecord(path string) (retentionRecord, error) {
 	if !info.Mode().IsRegular() {
 		return retentionRecord{}, fmt.Errorf("retention record is not a regular file")
 	}
-	file, err := os.OpenFile(path, os.O_RDONLY|runMailboxNonBlockingOpen, 0)
+	file, err := os.OpenFile(path, os.O_RDONLY|noFollowOpenFlag|runMailboxNonBlockingOpen, 0)
 	if err != nil {
 		return retentionRecord{}, err
 	}
@@ -188,18 +188,27 @@ func (m *handoffManager) readRecord(path string) (retentionRecord, error) {
 }
 
 // validRetentionRecord refuses a record whose identity does not match its own
-// file name and directory, or whose timestamps do not make sense. The record is
-// the agent's own, so this is validation against corruption and against a
-// record left by a different configuration -- not authentication.
-func validRetentionRecord(record retentionRecord, fileName, root string, now time.Time) error {
+// file name, its directory, or this node, and one whose timestamps do not make
+// sense. A record is the authority for deleting a directory, so every field it
+// carries is checked and a record missing any of them fails closed: an older
+// agent's partial record is skipped, never guessed at.
+func validRetentionRecord(record retentionRecord, fileName, root, nodeID string, retention time.Duration, now time.Time) error {
 	if record.RunID == "" || record.NodeID == "" || record.Directory == "" {
 		return errors.New("record is missing its identity")
+	}
+	// The run ID becomes a path component, so it must be exactly one -- the
+	// same rule the run mailbox applies to every name it opens.
+	if !validRunMailboxSegment(record.RunID) {
+		return fmt.Errorf("record run %q is not one safe path component", record.RunID)
 	}
 	if recordComponent(record.RunID) != fileName {
 		return fmt.Errorf("record names run %q but is filed as %q", record.RunID, fileName)
 	}
 	if record.Directory != filepath.Join(root, record.RunID) {
 		return fmt.Errorf("record directory %q is not this root's run %q", record.Directory, record.RunID)
+	}
+	if nodeID != "" && record.NodeID != nodeID {
+		return fmt.Errorf("record belongs to node %q, not %q", record.NodeID, nodeID)
 	}
 	if record.RetainedAt.IsZero() || record.RetainUntil.IsZero() {
 		return errors.New("record carries no retention window")
@@ -209,6 +218,9 @@ func validRetentionRecord(record retentionRecord, fileName, root string, now tim
 	}
 	if record.RetainedAt.After(now.Add(retentionClockSkew)) {
 		return errors.New("record was retained in the future")
+	}
+	if retention > 0 && record.RetainUntil.After(record.RetainedAt.Add(retention)) {
+		return fmt.Errorf("record keeps run %q past the retention window", record.RunID)
 	}
 	return nil
 }
