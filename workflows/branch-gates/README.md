@@ -39,12 +39,22 @@ shell. A deliberately hostile branch running under the same UID can reach
 anything that identity can reach on the machine. Only run branch-gates on
 branches you trust. This is a convenience boundary, not a security one.**
 
-**It holds no credential.** Credential delivery is opt-in, and branch-gates
-reports through its run mailbox and dispatches nothing, so it is submitted
-without `--dispatch-authority` and receives neither the run token nor the
-attempt credential. The worst a hostile branch can reach through this process is
-the run's own mailbox, where it could forge its own run's evidence and nothing
-else — it cannot write another run, submit a child job, or act on the cluster.
+**What changed: it holds no wefty credential.** Credential delivery is opt-in,
+and branch-gates reports through its run mailbox and dispatches nothing, so it
+is submitted without `--dispatch-authority` and receives neither the run token
+nor the attempt credential. That is the exact and only guarantee: a hostile
+branch gains **no authority over the cluster from this run** — it cannot write
+another run or submit a child job. It can still forge this run's own evidence,
+by writing into the mailbox the workflow reports through.
+
+Everything else the warning above says still holds. Same-UID filesystem and
+process access is unchanged. The subject also inherits this node's module and
+TLS configuration — `GOPROXY`, `GOPRIVATE`, `SSL_CERT_FILE` and the proxy
+variables — which are passed through because a private or offline node cannot
+resolve modules without them, and a proxy URL can itself carry credentials.
+Removing the run token narrowed one surface; it did not make the job's
+environment secret-free.
+
 The workflow prints the reserved credential names visible to its own shell on
 every run; that line is expected to be empty, and the integration test asserts
 it is.
@@ -87,8 +97,11 @@ variables in both cases (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`).
 
 ## Inputs (run params)
 
-A job never receives its own params, so the script reads them back from
-`GET /v1/runs/{run_id}` with its run token. Every param is a flat string.
+A job never receives its own params in its environment; the node agent writes
+them into the run mailbox instead, and the script reads one named value with
+`wefty run params NAME` (or the inline writer's `wefty_param`). No cluster call
+and no credential. Every param is a flat string, because the inline reader
+handles top-level strings only.
 
 | Param | Required | Meaning |
 |---|---|---|
@@ -110,8 +123,12 @@ A job never receives its own params, so the script reads them back from
    `/tmp/wefty/handoffs/<run_id>/`; for `kind=oci` it is a helper-managed
    volume inside the node, reachable only through `copy_to` plus a mount.
 3. **The ledger** — `wefty --json inspect <run_id>` shows one envelope per gate
-   (`status` `succeeded`/`failed`, extensions carrying ref, commit, exit code
-   and duration) and one `branch-gates` gate whose outcome is the verdict.
+   (`status` `succeeded`/`failed`), then one `result` envelope carrying the
+   verdict document, then one `branch-gates` gate whose outcome is the verdict.
+   Envelope data is nested under the mailbox's own extension namespace,
+   `dev.wefty.mailbox`: `payload` when it was published by `wefty run`, `detail`
+   when the inline writer published it as text. The gate carries its evidence as
+   a single JSON document rather than one entry per fact.
 
 A failing gate result fails the run in L3, so `.run.status` is `failed` whenever
 the branch is bad. A `branch-gates` gate with outcome `error` means the workflow
@@ -139,9 +156,18 @@ alias w='"$WEFTY_ROOT"/.bin/wefty --l1="$WEFTY_L1_ADDR" --l3="$WEFTY_L3_ADDR"'
 
 ### On a Linux OCI node (the intended path)
 
-The rootfs needs Go, git, bash and the `wefty` binary. The acceptance echo image is BusyBox
-and cannot run any of the gates, so this uses the upstream `golang` image;
-resolve its digest once and submit the pinned reference.
+The rootfs needs Go, git and bash. It does **not** need the `wefty` binary: the
+script carries the same inline mailbox writer `wefty workflow init` scaffolds
+and uses it whenever `wefty` is not on `PATH`, which is exactly the case for a
+stock upstream image. The acceptance echo image is BusyBox and cannot run any of
+the gates, so this uses the upstream `golang` image; resolve its digest once and
+submit the pinned reference.
+
+The only difference the fallback makes is the envelope payload: the inline
+writer has no JSON parser, so it declares every payload `text` and the document
+arrives as `dev.wefty.mailbox.detail` rather than a nested
+`dev.wefty.mailbox.payload` object. The events, the gate, the result and both
+handoff files are the same.
 
 ```sh
 cd "$WEFTY_ROOT"
@@ -189,8 +215,9 @@ allowed mount root (`docs/runbooks/oci-node.md`).
 
 ### As a process job (local check, no container)
 
-Any node with Go, git, bash and `wefty` on `PATH` can run the same script with
-the inline-script arm:
+Any node with Go, git and bash on `PATH` can run the same script with the
+inline-script arm. `wefty` on the **agent's** `PATH` is preferred — it is the
+better producer — but the inline writer covers a node without it:
 
 ```sh
 cd "$WEFTY_ROOT"

@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/workflowhelper"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -288,6 +290,12 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			}
 			if finalGate.Name != "branch-gates" || finalGate.Outcome != wantOutcome || finalGate.AttemptID == "" {
 				t.Fatalf("final gate = %#v, want name branch-gates outcome %q with a bound attempt", finalGate, wantOutcome)
+			}
+			// The mailbox defaults a gate's step to its name, so the step
+			// identity the HTTP path set explicitly is preserved rather than
+			// lost. Pinned because it is not obvious from either side alone.
+			if finalGate.StepID != "branch-gates" {
+				t.Fatalf("final gate step = %q, want branch-gates", finalGate.StepID)
 			}
 			// A mailbox gate carries exactly one evidence value, so the
 			// structure the HTTP path spread across entries now lives inside
@@ -845,4 +853,102 @@ func runGit(t *testing.T, directory string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 	return string(output)
+}
+
+// TestEmbeddedInlineWriterMatchesTheShippedTemplate pins the copy. The workflow
+// embeds the inline mailbox writer so an image without the wefty binary -- the
+// upstream golang image the OCI examples use -- can still report, and a copy
+// that drifts from the shipped template is a second, subtly different protocol
+// producer. Byte-identical or nothing.
+func TestEmbeddedInlineWriterMatchesTheShippedTemplate(t *testing.T) {
+	script, err := os.ReadFile("branch-gates.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const begin = "# >>> BEGIN embedded inline run-mailbox writer >>>\n"
+	const end = "# <<< END embedded inline run-mailbox writer <<<\n"
+	start := strings.Index(string(script), begin)
+	if start < 0 {
+		t.Fatal("branch-gates.sh carries no embedded inline writer block")
+	}
+	rest := string(script)[start+len(begin):]
+	stop := strings.Index(rest, end)
+	if stop < 0 {
+		t.Fatal("the embedded inline writer block is not terminated")
+	}
+	if embedded, want := rest[:stop], workflowhelper.InlineBashWriter(); embedded != want {
+		t.Fatalf("the embedded inline writer has drifted from the shipped template; "+
+			"copy internal/workflowhelper/templates/inline-writer.sh back between the markers "+
+			"(embedded %d bytes, template %d bytes)", len(embedded), len(want))
+	}
+}
+
+// TestBranchGatesReportsWithoutTheWeftyBinary is the fallback under the
+// condition that matters: the helper absent and the workflow failing. The
+// verdict document must still reach the handoff directory, because that is what
+// an operator reads off the node, and it must not depend on a reporter that is
+// not there.
+func TestBranchGatesReportsWithoutTheWeftyBinary(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is required to run the workflow script")
+	}
+	handoff := t.TempDir()
+	mailbox := filepath.Join(handoff, ".wefty", "run_without_wefty")
+	for _, directory := range []string{filepath.Join(mailbox, "tmp"), filepath.Join(mailbox, "events")} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No ref: the input failure path, which is the one that reports last and
+	// would lose its result document to an absent helper.
+	if err := os.WriteFile(filepath.Join(mailbox, "params.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(bashPath, "branch-gates.sh")
+	// A PATH with no wefty on it, and deliberately nothing else from this
+	// process: the point is a rootfs that never had the binary.
+	command.Env = []string{
+		"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+		"WEFTY_RUN_ID=run_without_wefty",
+		"WEFTY_RUN_DIR=" + mailbox,
+		"WEFTY_HANDOFF_DIR=" + handoff,
+		"BRANCH_GATES_WORK_ROOT=" + t.TempDir(),
+	}
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("exit = %v, want 1 on the failure path:\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "reporting with the inline mailbox writer") {
+		t.Fatalf("the workflow did not fall back to the inline writer:\n%s", output)
+	}
+
+	retained, err := os.ReadFile(filepath.Join(handoff, "result.json"))
+	if err != nil {
+		t.Fatalf("no result.json survived an absent helper: %v\n%s", err, output)
+	}
+	var result struct {
+		Workflow      string `json:"workflow"`
+		Passed        bool   `json:"passed"`
+		WorkflowError struct {
+			Step    string `json:"step"`
+			Message string `json:"message"`
+		} `json:"workflow_error"`
+	}
+	if err := json.Unmarshal(retained, &result); err != nil {
+		t.Fatalf("decode retained result.json %q: %v", retained, err)
+	}
+	if result.Workflow != "branch-gates" || result.Passed || result.WorkflowError.Step == "" {
+		t.Fatalf("retained result.json is not a workflow error: %s", retained)
+	}
+	if _, err := os.Stat(filepath.Join(handoff, "failures.txt")); err != nil {
+		t.Fatalf("no failures.txt survived an absent helper: %v", err)
+	}
+	// The events are written too, so a node agent would publish them.
+	events, err := os.ReadDir(filepath.Join(mailbox, "events"))
+	if err != nil || len(events) == 0 {
+		t.Fatalf("the inline writer wrote no mailbox events: %v", err)
+	}
 }
