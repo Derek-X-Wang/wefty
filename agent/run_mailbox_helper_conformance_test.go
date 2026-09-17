@@ -183,10 +183,17 @@ func TestRunSubcommandsProduceEventsTheAgentMailboxAccepts(t *testing.T) {
 	}
 }
 
-// TestInlineBashWriterProducesByteIdenticalEvents holds the claim the scaffold
-// makes to every OCI author: the ~25 lines of shell it emits for an image
-// without the wefty binary are not a second, subtly different protocol.
-func TestInlineBashWriterProducesByteIdenticalEvents(t *testing.T) {
+// TestInlineBashWriterMatchesRunOnTextEventsAndTheAgentAcceptsBoth holds the
+// claim the scaffold makes to an author whose image has no wefty binary: the
+// shell it emits is not a second, subtly different protocol.
+//
+// The claim is deliberately narrower than "byte-identical", because the two
+// producers are allowed to differ where only one of them can do the job. The
+// shell has no JSON parser, so it always declares a text payload; it truncates
+// an over-long header where `wefty run` refuses and names the flag. What must
+// hold is that for the text events both support, the bytes are the same — and
+// that whatever the shell writes, the agent accepts.
+func TestInlineBashWriterMatchesRunOnTextEventsAndTheAgentAcceptsBoth(t *testing.T) {
 	bashPath, err := exec.LookPath("bash")
 	if err != nil {
 		if os.Getenv("GITHUB_ACTIONS") == "true" {
@@ -209,17 +216,17 @@ func TestInlineBashWriterProducesByteIdenticalEvents(t *testing.T) {
 		{
 			name:    "step",
 			command: []string{"step", "--name", "build", "--summary", "compiling"},
-			inline:  []string{"step", "build", "", "started", "", "compiling", "text", "", ""},
+			inline:  []string{"step", "build", "", "started", "", "compiling", "", ""},
 		},
 		{
 			name:    "envelope",
 			command: []string{"envelope", "--step", "build", "--status", "partial", "--summary", "half done", "--payload-file", payload},
-			inline:  []string{"envelope", "", "build", "partial", "", "half done", "text", payload, ""},
+			inline:  []string{"envelope", "", "build", "partial", "", "half done", payload, ""},
 		},
 		{
 			name:    "gate",
 			command: []string{"gate", "--name", "vet", "--outcome", "error", "--summary", "vet could not run", "--evidence-file", payload},
-			inline:  []string{"gate", "vet", "", "", "error", "vet could not run", "text", payload, ""},
+			inline:  []string{"gate", "vet", "", "", "error", "vet could not run", payload, ""},
 		},
 		{
 			// A summary carrying a newline and a tab is the case a hand-rolled
@@ -227,7 +234,7 @@ func TestInlineBashWriterProducesByteIdenticalEvents(t *testing.T) {
 			// and the agent refuses the whole event.
 			name:    "folded summary and explicit key",
 			command: []string{"envelope", "--step", "test", "--summary", "  two\tfailures\nsee the log  ", "--key", "test.1"},
-			inline:  []string{"envelope", "", "test", "succeeded", "", "  two\tfailures\nsee the log  ", "text", "", "test.1"},
+			inline:  []string{"envelope", "", "test", "succeeded", "", "  two\tfailures\nsee the log  ", "", "test.1"},
 		},
 	}
 
@@ -239,9 +246,25 @@ func TestInlineBashWriterProducesByteIdenticalEvents(t *testing.T) {
 				t.Fatalf("the two producers disagree.\nwefty run:\n%s\ninline writer:\n%s", fromCommand, fromInline)
 			}
 			// Both must still be events the agent accepts, not two copies of
-			// the same mistake.
-			if _, err := parseRunMailboxEvent(fromInline); err != nil {
+			// the same mistake — and the document the agent builds from the
+			// shell's event has to satisfy the v1 schema.
+			parsed, err := parseRunMailboxEvent(fromInline)
+			if err != nil {
 				t.Fatalf("the agent refused the inline writer's event: %v\n%s", err, fromInline)
+			}
+			mailbox := &runMailbox{runID: "run_inline", attemptID: "attempt_inline"}
+			collection, document, err := mailbox.document(parsed, "inline-event")
+			if err != nil {
+				t.Fatalf("the agent could not build a document from the inline writer's event: %v", err)
+			}
+			bound := bindAttemptID(t, document, mailbox.attemptID)
+			if collection == runLedgerGateCollection {
+				err = contract.ValidateGateResultJSON(bound)
+			} else {
+				err = contract.ValidateEnvelopeJSON(bound)
+			}
+			if err != nil {
+				t.Fatalf("the inline writer produced an invalid document: %v\n%s", err, bound)
 			}
 			if !createdAtLine.Match(fromInline) {
 				t.Fatalf("the inline writer stamped no created-at:\n%s", fromInline)
@@ -327,6 +350,37 @@ func TestWorkflowInitProducesARunnableStarter(t *testing.T) {
 	// The starter read its params rather than guessing.
 	if !bytes.Contains(output, []byte("wefty")) {
 		t.Fatalf("the starter did not use the submitted subject:\n%s", output)
+	}
+}
+
+// TestInlineBashWriterTruncatesRatherThanLosingAnEvent covers the one place
+// the two producers deliberately part company. A summary past the agent's
+// bound would push the "--" separator beyond the 64 KiB event bound, and an
+// event truncated before its separator is refused outright. `wefty run`
+// refuses and names the flag; the shell, which has nobody to tell, truncates
+// so the verdict still lands.
+func TestInlineBashWriterTruncatesRatherThanLosingAnEvent(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			t.Fatalf("bash is required in CI: %v", err)
+		}
+		t.Skip("bash is required to exercise the inline writer")
+	}
+	raw := writeThroughInlineWriter(t, bashPath, []string{
+		"gate", "vet", "", "", "fail", strings.Repeat("x", 9000), "", ""})
+	if len(raw) > 64<<10 {
+		t.Fatalf("the inline writer produced a %d byte event", len(raw))
+	}
+	event, err := parseRunMailboxEvent(raw)
+	if err != nil {
+		t.Fatalf("the agent refused the truncated event: %v", err)
+	}
+	if len(event.summary) != 2048 {
+		t.Fatalf("summary is %d bytes, want it truncated to 2048", len(event.summary))
+	}
+	if event.outcome != "fail" {
+		t.Fatalf("the verdict did not survive truncation: %+v", event)
 	}
 }
 

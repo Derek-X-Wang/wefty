@@ -18,8 +18,10 @@ package workflowhelper
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -81,6 +83,11 @@ const (
 	maxIdentifierBytes = 255
 	// maxSummaryBytes is what the agent's own summary bound allows.
 	maxSummaryBytes = 2048
+	// maxResultBytes bounds the result document copied into the handoff
+	// directory. It is a refusal threshold rather than an expectation: the
+	// handoff copy is written whole, because a truncated result.json is an
+	// invalid document that still looks like one.
+	maxResultBytes = 64 << 20
 	// maxParamsBytes matches the agent's params bound.
 	maxParamsBytes = 64 << 10
 
@@ -134,7 +141,10 @@ type Event struct {
 // nanosecond still fall back to the rest of the name, so ordering across
 // processes is guaranteed only when their writes are distinguishable at
 // nanosecond resolution; there is no cross-process allocator, because that
-// would mean shared writable state in a directory the workload owns.
+// would mean shared writable state in a directory the workload owns. Two
+// processes that read the very same nanosecond fall back to kind, name and
+// PID, which is arbitrary — a published best-effort limit, stated in the
+// contract and in every scaffolded README, not an implementation detail.
 var sequence atomic.Uint32
 
 // Validate rejects what the agent's parser would refuse, at the point where the
@@ -214,6 +224,11 @@ func (e *Event) Validate() error {
 			e.PayloadFormat = PayloadText
 		}
 	}
+	if e.PayloadFormat == PayloadJSON && !json.Valid(e.Payload) {
+		// The agent decodes a json payload before nesting it, and a refusal
+		// there costs the whole event. Caught here, it costs a message.
+		return UsageError("the payload is marked json but is not a JSON document")
+	}
 	return nil
 }
 
@@ -252,6 +267,13 @@ func (e Event) Encode() []byte {
 // Write stages the event under tmp/ and renames it into events/. The rename is
 // the only "done writing" signal the protocol has, so nothing incomplete is
 // ever visible to the agent.
+//
+// Everything below the mailbox happens through one opened root. The mailbox is
+// a directory the workload owns, so `tmp` or `events` can be a symlink by the
+// time this runs; O_EXCL on the leaf would not notice, because it is the
+// ancestor that was replaced. The root confines every lookup, and the explicit
+// Lstat refuses a symlinked directory outright rather than following one that
+// merely happens to stay inside.
 func Write(runDir string, event Event) (string, error) {
 	if strings.TrimSpace(runDir) == "" {
 		return "", ErrNoRunDir
@@ -259,59 +281,97 @@ func Write(runDir string, event Event) (string, error) {
 	if err := event.Validate(); err != nil {
 		return "", err
 	}
-	staging := filepath.Join(runDir, stagingDirectory)
-	events := filepath.Join(runDir, eventsDirectory)
-	// The agent creates these during preparation. Creating them anyway is what
-	// lets a starter be exercised against a directory that is only a mailbox
-	// by convention, which is how the scaffold's own test runs.
-	for _, directory := range []string{staging, events} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			return "", fmt.Errorf("create %s: %w", directory, err)
-		}
-	}
 	document := event.Encode()
 	if len(document) > MaxEventBytes {
 		return "", UsageError(fmt.Sprintf(
 			"this event encodes to %d bytes; the run mailbox bounds one event at %d, and the agent would refuse a truncated file",
 			len(document), MaxEventBytes))
 	}
+	// The agent creates the mailbox during preparation. Creating it anyway is
+	// what lets a starter be exercised against a directory that is only a
+	// mailbox by convention, which is how the scaffold's own test runs. Only
+	// this one call is unrooted: it is the path the caller named.
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return "", fmt.Errorf("create %s: %w", runDir, err)
+	}
+	root, err := os.OpenRoot(runDir)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", runDir, err)
+	}
+	defer root.Close()
+	for _, directory := range []string{stagingDirectory, eventsDirectory} {
+		if err := ensureDirectory(root, directory); err != nil {
+			return "", err
+		}
+	}
 	name := eventFileName(event)
-	staged := filepath.Join(staging, name)
-	if err := writeExclusive(staged, document); err != nil {
+	staged := stagingDirectory + "/" + name
+	published := eventsDirectory + "/" + name
+	if err := writeExclusive(root, staged, document); err != nil {
 		return "", err
 	}
-	published := filepath.Join(events, name)
-	if err := os.Rename(staged, published); err != nil {
-		_ = os.Remove(staged)
-		return "", fmt.Errorf("publish %s: %w", published, err)
+	if err := root.Rename(staged, published); err != nil {
+		_ = root.Remove(staged)
+		return "", fmt.Errorf("publish %s in %s: %w", published, runDir, err)
 	}
-	return published, nil
+	syncDirectory(root, eventsDirectory)
+	return filepath.Join(runDir, eventsDirectory, name), nil
 }
 
-// writeExclusive creates a new regular file and refuses an existing one,
-// including a symlink planted where the file was going to be: O_EXCL never
-// follows. The content is flushed before the caller renames it into place, so
-// a reader of the renamed name never sees a short file.
-func writeExclusive(path string, document []byte) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+// ensureDirectory creates one mailbox subdirectory through the root and proves
+// what it created, or found, is a directory and not a link to one.
+func ensureDirectory(root *os.Root, name string) error {
+	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("create %s in %s: %w", name, root.Name(), err)
+	}
+	info, err := root.Lstat(name)
 	if err != nil {
-		return fmt.Errorf("stage %s: %w", path, err)
+		return fmt.Errorf("inspect %s in %s: %w", name, root.Name(), err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s in %s is not a directory (mode %s); the run mailbox layout is fixed",
+			name, root.Name(), info.Mode())
+	}
+	return nil
+}
+
+// writeExclusive creates a new 0600 regular file through the root and refuses
+// an existing one, including a symlink planted where the file was going to be:
+// O_EXCL never follows. The content is flushed before the caller renames it
+// into place, so a reader of the renamed name never sees a short file.
+func writeExclusive(root *os.Root, name string, document []byte) error {
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("stage %s in %s: %w", name, root.Name(), err)
 	}
 	if _, err := file.Write(document); err != nil {
 		file.Close()
-		_ = os.Remove(path)
-		return fmt.Errorf("stage %s: %w", path, err)
+		_ = root.Remove(name)
+		return fmt.Errorf("stage %s in %s: %w", name, root.Name(), err)
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
-		_ = os.Remove(path)
-		return fmt.Errorf("stage %s: %w", path, err)
+		_ = root.Remove(name)
+		return fmt.Errorf("stage %s in %s: %w", name, root.Name(), err)
 	}
 	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return fmt.Errorf("stage %s: %w", path, err)
+		_ = root.Remove(name)
+		return fmt.Errorf("stage %s in %s: %w", name, root.Name(), err)
 	}
 	return nil
+}
+
+// syncDirectory flushes the rename itself, so a crash cannot leave an event
+// whose contents reached the disk but whose name did not. It is best effort:
+// not every platform lets a directory be opened for sync, and a mailbox that
+// is published but unsynced is still better than no event at all.
+func syncDirectory(root *os.Root, name string) {
+	directory, err := root.Open(name)
+	if err != nil {
+		return
+	}
+	_ = directory.Sync()
+	_ = directory.Close()
 }
 
 // eventFileName sorts chronologically in the agent's lexical sweep, stays

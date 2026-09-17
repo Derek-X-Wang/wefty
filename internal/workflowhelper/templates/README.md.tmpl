@@ -25,13 +25,20 @@ does not receive one yet.
 | `{{.TestFile}}` | `bash -n`, shellcheck, and a local run that asserts the four events |
 
 `{{.Name}}.sh` calls `wefty run ...` when the `wefty` binary is on PATH and
-falls back to an inline POSIX writer otherwise. The two produce byte-identical
-event files, which is what will let an image that does not ship the binary
-report the same way once OCI attempts receive a mailbox.
+falls back to an inline POSIX writer otherwise. Prefer the binary. The fallback
+is a parser-compatible convenience for an image that does not ship it: it is
+not hardened against a hostile co-tenant (it writes through pathnames and
+inherits the ambient umask), it is not durable across a crash (it does not
+flush), it always declares a text payload because it has no JSON parser, and it
+truncates an over-long header where `wefty run` refuses and names the flag. Its
+parameter reader is limited too — top-level string params, no JSON escapes. The
+exact limits are documented above each function in the script.
 
-The fallback's parameter reader is deliberately limited — top-level string
-params, no JSON escapes — so prefer `wefty run params NAME` when the binary is
-there. The exact limits are documented above `wefty_param` in the script.
+One ordering limit applies to both: the agent publishes a sweep in the lexical
+order of the event file names, and a name carries a nanosecond stamp plus a
+per-process sequence. Two separate processes that write at the same nanosecond
+are ordered arbitrarily. Sequential reporting, which is what this starter does,
+is ordered; two concurrent writers are not.
 
 ## Run it
 

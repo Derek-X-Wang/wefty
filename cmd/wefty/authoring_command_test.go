@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,6 +131,96 @@ func TestRunSubcommandsRefuseAnEventTheAgentWouldHaveToTruncate(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(directory, "events"))
 	if len(entries) != 0 {
 		t.Fatalf("a refused event still published %d files", len(entries))
+	}
+}
+
+// TestRunResultKeepsTheWholeDocumentInTheHandoffDirectory separates the two
+// bounds that apply to a result. The handoff copy is what an operator reads
+// off the node, so it is written whole; bounding it at the event size turned
+// an ordinary large result into a truncated file that still looked valid. The
+// event's payload is bounded, because one event has to fit the protocol.
+func TestRunResultKeepsTheWholeDocumentInTheHandoffDirectory(t *testing.T) {
+	directory := t.TempDir()
+	handoff := t.TempDir()
+	t.Setenv(workflowhelper.RunDirEnv, directory)
+	t.Setenv(workflowhelper.HandoffDirEnv, handoff)
+	t.Setenv("WEFTY_NODE_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
+
+	// 200 KiB of perfectly valid JSON: far past one event, nowhere near a
+	// reason to refuse a result document.
+	document, err := json.Marshal(map[string]string{"schema_version": "1", "detail": strings.Repeat("d", 200<<10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "result.json")
+	if err := os.WriteFile(source, document, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"run", "result", "--file", source, "--status", "succeeded"}, &stdout, &stderr); err != nil {
+		t.Fatalf("wefty run result: %v\n%s", err, stderr.String())
+	}
+
+	copied, err := os.ReadFile(filepath.Join(handoff, workflowhelper.ResultFileName))
+	if err != nil {
+		t.Fatalf("read the handoff result: %v", err)
+	}
+	if !bytes.Equal(copied, document) {
+		t.Fatalf("the handoff copy is %d bytes, want the whole %d byte document", len(copied), len(document))
+	}
+	if !json.Valid(copied) {
+		t.Fatal("the handoff copy is not a JSON document")
+	}
+
+	events, err := os.ReadDir(filepath.Join(directory, "events"))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("read the mailbox: %d entries, %v", len(events), err)
+	}
+	raw, err := os.ReadFile(filepath.Join(directory, "events", events[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > 64<<10 {
+		t.Fatalf("the event is %d bytes; one event must fit the protocol bound", len(raw))
+	}
+	// The event says text, not json: a truncated JSON document is not one, and
+	// an event that claims json and fails to decode is refused outright.
+	if !strings.Contains(string(raw), "\npayload: text\n") {
+		t.Fatalf("the truncated event does not declare a text payload:\n%s", raw[:512])
+	}
+	if !strings.Contains(string(raw), "truncated by wefty run") {
+		t.Fatal("the truncated event carries no truncation marker")
+	}
+}
+
+// TestRunSubcommandsRefuseASubstitutedMailboxDirectory covers the mailbox
+// being a directory the workload owns: `events` can be a symlink by the time
+// the helper runs, and O_EXCL on the leaf would not notice, because it is the
+// ancestor that was replaced.
+func TestRunSubcommandsRefuseASubstitutedMailboxDirectory(t *testing.T) {
+	directory := t.TempDir()
+	elsewhere := filepath.Join(directory, "elsewhere")
+	if err := os.Mkdir(elsewhere, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(directory, "events")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(workflowhelper.RunDirEnv, directory)
+	t.Setenv("WEFTY_NODE_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
+
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"run", "gate", "--name", "vet", "--outcome", "pass"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("a symlinked events directory was accepted")
+	}
+	if !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("refused with %q, want it to name the substituted directory", err)
+	}
+	entries, _ := os.ReadDir(elsewhere)
+	if len(entries) != 0 {
+		t.Fatalf("the redirected directory received %d files", len(entries))
 	}
 }
 

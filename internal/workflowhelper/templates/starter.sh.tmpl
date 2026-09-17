@@ -57,7 +57,7 @@ param() {
 # emit_step NAME started|ended SUMMARY
 emit_step() {
 	if [ -z "$WEFTY_HELPER" ]; then
-		wefty_event step "$1" "" "$2" "" "$3" text "" ""
+		wefty_event step "$1" "" "$2" "" "$3" "" ""
 	elif [ "$2" = ended ]; then
 		wefty run step --name "$1" --end --summary "$3"
 	else
@@ -74,7 +74,7 @@ emit_envelope() {
 			wefty run envelope --step "$1" --status "$2" --summary "$3"
 		fi
 	else
-		wefty_event envelope "" "$1" "$2" "" "$3" text "${4:-}" ""
+		wefty_event envelope "" "$1" "$2" "" "$3" "${4:-}" ""
 	fi
 }
 
@@ -87,7 +87,7 @@ emit_gate() {
 			wefty run gate --name "$1" --outcome "$2" --summary "$3"
 		fi
 	else
-		wefty_event gate "$1" "" "" "$2" "$3" text "${4:-}" ""
+		wefty_event gate "$1" "" "" "$2" "$3" "${4:-}" ""
 	fi
 }
 
@@ -116,14 +116,11 @@ emit_result() {
 			[ -z "${staged:-}" ] || rm -f "$staged"
 		fi
 	fi
-	# `payload: json` has to be true or the agent refuses the event, and this
-	# fallback cannot validate JSON. The structural check is what keeps an
-	# edited starter from losing its result to a malformed document.
-	format=text
-	case "$(tr -d ' \t\n' <"$1")" in
-	"{"*"}" | "["*"]") format=json ;;
-	esac
-	wefty_event result "" "" "$2" "" "$3" "$format" "$1" ""
+	# The fallback always declares a text payload: this shell has no JSON
+	# parser, and an event that claims `json` and then fails to decode is
+	# refused outright. The document still reaches the ledger verbatim, and
+	# result.json above is the copy an operator reads.
+	wefty_event result "" "" "$2" "" "$3" "$1" ""
 }
 
 # --------------------------------------------------------------------------

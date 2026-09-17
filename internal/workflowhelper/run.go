@@ -197,26 +197,97 @@ func runResult(directory string, args []string, jsonOutput bool, stdout, stderr 
 	if strings.TrimSpace(*file) == "" {
 		return UsageError("wefty run result requires --file")
 	}
-	raw, _, err := readBoundedFile(*file, maxPayloadBytes)
+	// The two copies are bounded differently on purpose. The handoff copy is
+	// the result document an operator reads off the node, so it is written
+	// whole; bounding it at the event size would turn a perfectly ordinary
+	// 200 KiB result into a truncated, invalid file that still looked like
+	// one. The event's payload is bounded, because one event has to fit the
+	// protocol, and a truncated payload still carries the verdict.
+	payload, truncated, err := publishResult(*file, strings.TrimSpace(os.Getenv(HandoffDirEnv)), stderr)
 	if err != nil {
 		return err
 	}
 	format := PayloadText
-	if json.Valid(raw) {
+	if !truncated && json.Valid(payload) {
 		format = PayloadJSON
-	}
-	if handoff := strings.TrimSpace(os.Getenv(HandoffDirEnv)); handoff != "" {
-		if err := copyResult(raw, handoff); err != nil {
-			// A handoff copy that fails must not lose the event: the ledger
-			// entry is the copy that survives a removed handoff directory.
-			fmt.Fprintf(stderr, "wefty run result: %v\n", err)
-		}
 	}
 	return emit(directory, Event{
 		Kind: KindResult, Status: *status, Summary: *summary, Key: *key,
-		Payload: raw, PayloadFormat: format,
+		Payload: payload, PayloadFormat: format,
 	}, jsonOutput, stdout)
 }
+
+// publishResult reads the result document once: it streams the whole thing
+// into the handoff directory while keeping only the head the event can carry.
+// It returns that head and whether the document was longer than it.
+func publishResult(path, handoff string, stderr io.Writer) ([]byte, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s: %w", path, err)
+	}
+	defer file.Close()
+
+	head := &headCapture{limit: maxPayloadBytes + 1}
+	// The outer bound is a refusal threshold, not an expectation: a result
+	// document this large is a mistake, and copying it into a node-local
+	// directory unbounded is how a workflow fills a disk.
+	source := io.TeeReader(io.LimitReader(file, maxResultBytes+1), head)
+
+	if handoff == "" {
+		copied, err := io.Copy(io.Discard, source)
+		if err != nil {
+			return nil, false, fmt.Errorf("read %s: %w", path, err)
+		}
+		if copied > maxResultBytes {
+			return nil, false, oversizeResult(path)
+		}
+		return head.captured(), head.overflowed(), nil
+	}
+
+	copied, err := copyResult(source, handoff)
+	switch {
+	case err != nil:
+		// A handoff copy that fails must not lose the event: the ledger entry
+		// is the copy that survives a removed handoff directory.
+		fmt.Fprintf(stderr, "wefty run result: %v\n", err)
+		// The stream is spent either way; fall through with whatever head the
+		// tee captured before the failure.
+	case copied > maxResultBytes:
+		return nil, false, oversizeResult(path)
+	}
+	return head.captured(), head.overflowed(), nil
+}
+
+func oversizeResult(path string) error {
+	return UsageError(fmt.Sprintf("%s is larger than %d bytes; a result document that size belongs in an artifact, not in the handoff directory",
+		path, maxResultBytes))
+}
+
+// headCapture keeps the first limit bytes of a stream and forgets the rest, so
+// the event's payload can be taken from the same read that writes the whole
+// document into the handoff directory.
+type headCapture struct {
+	limit int
+	head  []byte
+}
+
+func (c *headCapture) Write(raw []byte) (int, error) {
+	if remaining := c.limit - len(c.head); remaining > 0 {
+		if remaining > len(raw) {
+			remaining = len(raw)
+		}
+		c.head = append(c.head, raw[:remaining]...)
+	}
+	return len(raw), nil
+}
+
+// captured returns what it kept, overflow byte included. Event.Validate owns
+// the truncation and its marker, so handing it an over-long payload is what
+// makes the marker appear; trimming here would hide the overflow from the one
+// place that records it.
+func (c *headCapture) captured() []byte { return c.head }
+
+func (c *headCapture) overflowed() bool { return len(c.head) > maxPayloadBytes }
 
 // copyResult publishes the result document into the handoff directory the way
 // the mailbox publishes an event: a fresh 0600 regular file, then a rename.
@@ -228,41 +299,43 @@ func runResult(directory string, args []string, jsonOutput bool, stdout, stderr 
 // one. O_EXCL through an opened root never follows a link and never reuses an
 // existing file, and the rename means a reader sees the whole document or the
 // previous one, never a half-written verdict.
-func copyResult(raw []byte, handoff string) error {
+func copyResult(source io.Reader, handoff string) (int64, error) {
 	if err := os.MkdirAll(handoff, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", handoff, err)
+		return 0, fmt.Errorf("create %s: %w", handoff, err)
 	}
 	root, err := os.OpenRoot(handoff)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", handoff, err)
+		return 0, fmt.Errorf("open %s: %w", handoff, err)
 	}
 	defer root.Close()
 	staged := fmt.Sprintf(".%s.%d.%d", ResultFileName, os.Getpid(), time.Now().UnixNano())
 	file, err := root.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("stage %s in %s: %w", ResultFileName, handoff, err)
+		return 0, fmt.Errorf("stage %s in %s: %w", ResultFileName, handoff, err)
 	}
-	if err := writeAndSync(file, raw); err != nil {
+	copied, err := io.Copy(file, source)
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		_ = root.Remove(staged)
-		return fmt.Errorf("stage %s in %s: %w", ResultFileName, handoff, err)
+		return copied, fmt.Errorf("stage %s in %s: %w", ResultFileName, handoff, err)
+	}
+	if copied > maxResultBytes {
+		// Refused rather than published: a partial document that still looks
+		// like a result is worse than none.
+		_ = root.Remove(staged)
+		return copied, nil
 	}
 	if err := root.Rename(staged, ResultFileName); err != nil {
 		_ = root.Remove(staged)
-		return fmt.Errorf("publish %s in %s: %w", ResultFileName, handoff, err)
+		return copied, fmt.Errorf("publish %s in %s: %w", ResultFileName, handoff, err)
 	}
-	return nil
-}
-
-func writeAndSync(file *os.File, raw []byte) error {
-	if _, err := file.Write(raw); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
-	}
-	return file.Close()
+	syncDirectory(root, ".")
+	return copied, nil
 }
 
 // runParams reads the params the agent delivered. A job never receives its own

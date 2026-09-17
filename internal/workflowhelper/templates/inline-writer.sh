@@ -1,15 +1,18 @@
 # --------------------------------------------------------------------------
 # Inline run-mailbox writer (fallback)
 #
-# Used only when the `wefty` binary is not on PATH. It writes byte-identical
-# event files to the ones `wefty run ...` writes; wefty's own
-# TestInlineBashWriterProducesByteIdenticalEvents holds that.
+# A parser-compatible convenience for an image that does not ship the wefty
+# binary. It is NOT hardened and NOT durable: it writes through pathnames, so
+# a hostile co-tenant that can plant a symlink in this directory can redirect
+# it, it inherits the ambient umask, and it does not flush, so a crash can lose
+# an event whose name already exists. `wefty run ...` does all three properly.
+# Use it wherever the binary exists; this is the fallback for where it does not.
 #
-# It exists for an image that does not ship the wefty binary. Today that case
-# is not reachable: an OCI attempt receives no WEFTY_RUN_DIR at all, because
-# the handoff volume is helper-owned and the helper protocol exposes no read
-# path (#476 slice C). Until then this is the process one-shot's fallback and
-# the proof that the protocol, not the binary, is the contract.
+# Today that case is not reachable in production: an OCI attempt receives no
+# WEFTY_RUN_DIR at all, because the handoff volume is helper-owned and the
+# helper protocol exposes no read path. Until that lands, this is the process
+# one-shot's fallback and the proof that the protocol, not the binary, is the
+# contract.
 #
 # Protocol: docs/contracts/run-execution-context.md, "Run mailbox".
 # --------------------------------------------------------------------------
@@ -32,15 +35,28 @@ wefty_nanos() {
 	fi
 }
 
-# A header value is one line: fold what a header cannot carry, drop the rest.
+# wefty_header_value VALUE LIMIT -- one header line's worth of VALUE: fold what
+# a header cannot carry, drop the rest, and truncate to LIMIT bytes.
+#
+# Truncating rather than refusing is the fallback's choice, and it is the safe
+# direction: an over-long summary that pushed the "--" separator past the 64 KiB
+# event bound would be truncated by the agent mid-header and then refused
+# outright, costing the whole event. `wefty run` refuses instead, because it can
+# tell the author which flag was too long.
 wefty_header_value() {
 	printf '%s' "${1:-}" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177' |
+		LC_ALL=C cut -b "1-${2:-255}" |
 		sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
-# wefty_event KIND NAME STEP STATUS OUTCOME SUMMARY FORMAT PAYLOAD_FILE KEY
+# wefty_event KIND NAME STEP STATUS OUTCOME SUMMARY PAYLOAD_FILE KEY
 # Every argument after KIND may be empty. The rename into events/ is the only
 # "done writing" signal the protocol has, so nothing partial is ever visible.
+#
+# The payload is always declared `text`. This shell has no JSON parser, and the
+# agent refuses an event whose payload claims `json` and then fails to decode
+# -- so a structural guess here would trade a readable text payload for a lost
+# event. `wefty run` declares `json` because it can actually validate one.
 wefty_event() {
 	[ -n "${WEFTY_RUN_DIR:-}" ] || {
 		printf 'no WEFTY_RUN_DIR: this job has no run mailbox to report through\n' >&2
@@ -53,13 +69,23 @@ wefty_event() {
 		"$(wefty_nanos)" "$WEFTY_EVENT_SEQ" "$1" "${wefty_slug:-event}" "$$")
 	{
 		printf 'wefty-protocol: 1\nkind: %s\n' "$1"
-		for wefty_pair in "name:${2:-}" "step:${3:-}" "status:${4:-}" \
-			"outcome:${5:-}" "summary:${6:-}" "key:${9:-}"; do
-			wefty_value=$(wefty_header_value "${wefty_pair#*:}")
-			[ -z "$wefty_value" ] || printf '%s: %s\n' "${wefty_pair%%:*}" "$wefty_value"
+		for wefty_header in name step status outcome summary key; do
+			case $wefty_header in
+			# 255 is the v1 schema's identifier bound and 2048 the agent's
+			# summary bound; past either the agent rewrites the value, and a
+			# rewritten key is a different idempotency identity.
+			name) wefty_raw=${2:-} wefty_limit=255 ;;
+			step) wefty_raw=${3:-} wefty_limit=255 ;;
+			status) wefty_raw=${4:-} wefty_limit=32 ;;
+			outcome) wefty_raw=${5:-} wefty_limit=32 ;;
+			summary) wefty_raw=${6:-} wefty_limit=2048 ;;
+			key) wefty_raw=${8:-} wefty_limit=255 ;;
+			esac
+			wefty_value=$(wefty_header_value "$wefty_raw" "$wefty_limit")
+			[ -z "$wefty_value" ] || printf '%s: %s\n' "$wefty_header" "$wefty_value"
 		done
-		printf 'payload: %s\ncreated-at: %s\n--\n' "${7:-text}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-		[ -z "${8:-}" ] || cat "$8"
+		printf 'payload: text\ncreated-at: %s\n--\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		[ -z "${7:-}" ] || cat "$7"
 	} >"$WEFTY_RUN_DIR/tmp/$wefty_file" || return 1
 	mv "$WEFTY_RUN_DIR/tmp/$wefty_file" "$WEFTY_RUN_DIR/events/$wefty_file"
 }

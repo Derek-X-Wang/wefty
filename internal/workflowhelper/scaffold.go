@@ -98,11 +98,11 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 		// node materializes as a file with no extension, and every TypeScript
 		// runtime decides whether to strip types from that extension. The lane
 		// that works is the dogfood shape -- src/NAME.ts plus a package.json,
-		// bundled to a single dist/NAME.mjs and submitted -- and that is a
-		// follow-up to #476, not something to fake here.
+		// bundled to a single dist/NAME.mjs and submitted -- and that is
+		// #487, not something to fake here.
 		if *lang == "ts" || *lang == "typescript" {
 			return UsageError(
-				"--lang ts is not available: a TypeScript workflow needs a bundle step -- src/NAME.ts and a package.json bundled to one dist/NAME.mjs, which is what gets submitted -- and that lane is a follow-up to #476. The scaffold writes bash")
+				"--lang ts is not available: a TypeScript workflow needs a bundle step -- src/NAME.ts and a package.json bundled to one dist/NAME.mjs, which is what gets submitted -- and that lane is #487. The scaffold writes bash")
 		}
 		return UsageError(fmt.Sprintf("--lang %q is not bash; bash is the only language the scaffold writes", *lang))
 	}
