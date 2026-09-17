@@ -460,9 +460,9 @@ heartbeats.
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
 | `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from that mailbox's `events/` directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
-| `ReadRunMailbox` | Same authority, plus one bounded entry name. Returns at most 64 KiB of one regular file, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file is a refusal, never bytes. |
+| `ReadRunMailbox` | Same authority, plus one bounded entry name. Returns at most 64 KiB of one regular file, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. |
 | `RemoveRunMailboxEntry` | Same authority and name. Removes one regular file, symlink or empty directory and reports whether it removed one or found it already absent, so a replayed retirement is not a failure. It never recurses: a nonempty directory or an unclassifiable object stays where it is. |
-| `Run` (run mailbox seed) | A `Run` may carry one run-mailbox seed: a bounded run ID and an optional JSON params document, valid only alongside a handoff managed volume and never for a Computer. The helper creates `.wefty/<run id>/{tmp,events}` inside that volume, writes `params.json` by write-then-rename, and mints `WEFTY_RUN_DIR` from the seed as reserved environment. `.wefty/` and `.wefty/<run id>/` stay root-owned and traversable (0711), `tmp/` and `events/` are chowned to the image's process owner (0700), and `params.json` is root-owned and world-readable (0644). No guest path is ever supplied by a caller. |
+| `Run` (run mailbox seed) | A `Run` may carry one run-mailbox seed: a bounded run ID and an optional JSON params document of at most 64 KiB, valid only alongside a handoff managed volume and never for a Computer. The helper creates `.wefty/<run id>/{tmp,events}` inside that volume, writes `params.json` by write-then-rename, and mints `WEFTY_RUN_DIR` from the seed as reserved environment. The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable but not writable (0711) — the volume root included, because containerd creates it 0700 and mounts it at `/wefty/handoff`, so without this a non-root image could not reach its mailbox at all; `tmp/` and `events/` are chowned to the image's process owner (0700); `params.json` is root-owned and world-readable (0644). Every mode and owner is applied through the descriptor just opened, never by name, and always explicitly, so a directory left by an earlier attempt is restored rather than trusted. No guest path is ever supplied by a caller. |
 
 ## Run mailbox confinement
 
@@ -486,9 +486,21 @@ A read proves the entry is a regular file before and after opening it, opens
 non-blocking so a FIFO planted in the directory cannot block the helper, and
 stops at the byte cap. A removal classifies the entry first and never recurses,
 so workload data is never walked. Nothing here creates a missing directory: an
-absent mailbox is a refusal, not an empty one. The helper never parses an event;
-the file protocol, the publication bounds and the ordering are all the agent's
-(`docs/contracts/run-execution-context.md`).
+absent mailbox is a refusal, not an empty one. Every operation honours the
+operation context, so a closing session or an attempt whose reap has begun
+cannot leave an in-flight descent or read running behind it. The helper never
+parses an event; the file protocol, the publication bounds and the ordering are
+all the agent's (`docs/contracts/run-execution-context.md`).
+
+This descent is the boundary, and the volume's permissions are not. An image
+that declares no `USER` runs as uid 0 with no user namespace, so root inside the
+container is root on the bind mount and can rewrite anything in the volume. The
+permissions above are defense in depth for the ordinary non-root image; what
+holds at every uid is that the agent never opens the volume, the descent refuses
+whatever a workload plants, the volume is scoped to a single run so there is no
+sibling run inside it to reach, and the agent's own bookkeeping is not in the
+volume at all. A uid-0 workload can therefore corrupt its own run's evidence,
+which it could equally do by reporting nothing, and nothing further.
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
 The helper emits an internal backend-ready marker only after that connection is

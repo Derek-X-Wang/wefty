@@ -5,10 +5,12 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 // fakeRunMailboxRuntime stands in for the OCI adapter. It records the reference
@@ -30,6 +33,10 @@ type fakeRunMailboxRuntime struct {
 	block      chan struct{}
 	entered    chan struct{}
 	failWith   error
+	// readErr fails only the read, so a test can prove a transient read
+	// failure never becomes a removal.
+	readErr error
+	removed []string
 }
 
 func newFakeRunMailboxRuntime() *fakeRunMailboxRuntime {
@@ -95,6 +102,9 @@ func (runtime *fakeRunMailboxRuntime) ReadRunMailbox(ctx context.Context, refere
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	if runtime.readErr != nil {
+		return nil, false, runtime.readErr
+	}
 	payload, ok := runtime.entries[name]
 	if !ok {
 		return nil, false, fs.ErrNotExist
@@ -111,11 +121,18 @@ func (runtime *fakeRunMailboxRuntime) RemoveRunMailboxEntry(ctx context.Context,
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	runtime.removed = append(runtime.removed, name)
 	if _, ok := runtime.entries[name]; !ok {
 		return fs.ErrNotExist
 	}
 	delete(runtime.entries, name)
 	return nil
+}
+
+func (runtime *fakeRunMailboxRuntime) removals() []string {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return slices.Clone(runtime.removed)
 }
 
 const (
@@ -241,7 +258,7 @@ func TestRemoteRunMailboxSeedCarriesOnlyDeliverableParams(t *testing.T) {
 		params string
 		want   string
 	}{
-		{name: "an object is delivered", params: `{"branch":"main"}`, want: "{\"branch\":\"main\"}\n"},
+		{name: "an object is delivered", params: `{"branch":"main"}`, want: `{"branch":"main"}`},
 		{name: "no params deliver nothing", params: "", want: ""},
 		{name: "an array is not delivered", params: `["not","an","object"]`, want: ""},
 		{name: "an oversize document is not delivered", params: "{" + string(make([]byte, MaxRunMailboxParamsBytes)) + "}", want: ""},
@@ -290,6 +307,122 @@ func TestRemoteRunMailboxAvailabilityMatchesWhatCanBePublished(t *testing.T) {
 			testCase.mutate(&spec)
 			if remoteRunMailboxAvailable(spec) {
 				t.Fatal("this claim must not receive a mailbox nothing would publish from")
+			}
+		})
+	}
+}
+
+// TestRemoteRunMailboxKeepsAnEntryItCouldNotRead is the rule a transient helper
+// failure must not break: a read that fails for any reason other than the
+// helper positively classifying the entry says nothing about the entry, so the
+// entry stays, nothing is removed, and the evidence survives to be retried.
+// Deleting a run's only copy on the strength of a timeout is the one failure
+// this publisher must not have.
+func TestRemoteRunMailboxKeepsAnEntryItCouldNotRead(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{name: "an expired deadline", err: context.DeadlineExceeded},
+		{name: "a transport failure", err: errors.New("helper session is not configured")},
+		{name: "a refused authority", err: errors.New("attempt authority does not match a live attempt")},
+		{name: "an unclassifiable I/O error", err: errors.New("input/output error")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			appender := newRecordingAppender("")
+			runtime := newFakeRunMailboxRuntime()
+			runtime.put("0001-alpha", mailboxAgnosticFirstEvent)
+			runtime.readErr = testCase.err
+			mailbox, _ := newRemoteTestMailbox(t, appender, runtime, "")
+
+			if drained := mailbox.sweep(context.Background()); drained {
+				t.Fatal("a sweep whose read failed reported the mailbox drained")
+			}
+			if removals := runtime.removals(); len(removals) != 0 {
+				t.Fatalf("an unread entry was removed: %v", removals)
+			}
+			if remaining := runtime.remaining(); len(remaining) != 1 || remaining[0] != "0001-alpha" {
+				t.Fatalf("the unread entry did not survive: %v", remaining)
+			}
+			if documents := appender.snapshot(); len(documents) != 0 {
+				t.Fatalf("published %d documents from a failed read", len(documents))
+			}
+			if !mailbox.pending() {
+				t.Fatal("an entry that could not be read must stay pending")
+			}
+
+			// Finalization retries and then reports incompleteness, which is
+			// what retains the handoff volume instead of expiring it as a
+			// clean success.
+			mailbox.finalize(context.Background())
+			if !mailbox.publicationIncomplete() {
+				t.Fatal("a persistent read failure did not latch publicationIncomplete")
+			}
+			if removals := runtime.removals(); len(removals) != 0 {
+				t.Fatalf("finalization removed an unread entry: %v", removals)
+			}
+		})
+	}
+}
+
+// TestRemoteRunMailboxDiscardsOnlyPositivelyClassifiedJunk is the other half of
+// the same rule: when the runtime does say the entry can never be an event, it
+// is removed, because keeping it would hold the sweep undrained forever.
+func TestRemoteRunMailboxDiscardsOnlyPositivelyClassifiedJunk(t *testing.T) {
+	appender := newRecordingAppender("")
+	runtime := newFakeRunMailboxRuntime()
+	runtime.put("0001-junk", "")
+	runtime.readErr = fmt.Errorf("%w: is not a regular file", workloadrunner.ErrRunMailboxEntryUnusable)
+	mailbox, _ := newRemoteTestMailbox(t, appender, runtime, "")
+
+	if drained := mailbox.sweep(context.Background()); !drained {
+		t.Fatal("a mailbox holding only junk did not drain")
+	}
+	if removals := runtime.removals(); len(removals) != 1 || removals[0] != "0001-junk" {
+		t.Fatalf("junk removals = %v, want exactly the junk entry", removals)
+	}
+	if documents := appender.snapshot(); len(documents) != 0 {
+		t.Fatalf("junk published %d documents", len(documents))
+	}
+}
+
+// TestRemoteRunMailboxSeedAcceptsParamsAtTheLedgersOwnBound keeps the agent
+// from refusing, one byte at a time, a document L3 is willing to dispatch.
+func TestRemoteRunMailboxSeedAcceptsParamsAtTheLedgersOwnBound(t *testing.T) {
+	document := func(size int) string {
+		// {"p":"<filler>"} padded to exactly size bytes.
+		const prefix, suffix = `{"p":"`, `"}`
+		filler := size - len(prefix) - len(suffix)
+		if filler < 0 {
+			t.Fatalf("cannot build a %d byte object", size)
+		}
+		return prefix + strings.Repeat("x", filler) + suffix
+	}
+	for _, testCase := range []struct {
+		size      int
+		delivered bool
+	}{
+		{size: MaxRunMailboxParamsBytes - 1, delivered: true},
+		{size: MaxRunMailboxParamsBytes, delivered: true},
+		{size: MaxRunMailboxParamsBytes + 1, delivered: false},
+	} {
+		t.Run(fmt.Sprintf("%d bytes", testCase.size), func(t *testing.T) {
+			params := document(testCase.size)
+			seed := runMailboxSeed(remoteMailboxClaim(params).Job.Spec)
+			if !testCase.delivered {
+				if len(seed.Params) != 0 {
+					t.Fatalf("an oversize document was delivered as %d bytes", len(seed.Params))
+				}
+				return
+			}
+			if len(seed.Params) != testCase.size {
+				t.Fatalf("delivered %d bytes, want the canonical document's %d", len(seed.Params), testCase.size)
+			}
+			// The helper applies the same bound to the wire, so a document the
+			// agent delivers must be one the helper accepts.
+			if len(seed.Params) > ocihelper.MaxRunMailboxParamsBytes {
+				t.Fatalf("delivered %d bytes, past the helper's %d byte wire bound",
+					len(seed.Params), ocihelper.MaxRunMailboxParamsBytes)
 			}
 		})
 	}

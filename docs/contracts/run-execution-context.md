@@ -515,26 +515,56 @@ it sees a listing, a bounded read and a removal, and every rule in this section
 — lexical order, the bounds, the rejection budget, the idempotency identity —
 is enforced exactly where it was.
 
-Ownership inside the volume is the smallest arrangement that works. `.wefty/`
-and `.wefty/<run id>/` stay root-owned and traversable (0711); `tmp/` and
-`events/` are owned by the uid the container's image declares (0700); and
-`params.json` is root-owned and world-readable. A workload therefore writes and
-renames its own events, reads its own parameters, and can neither rewrite the
-parameters nor replace `events/` with a symlink. `.published/` is not in the
-volume at all: for an OCI attempt the bookkeeping is agent-local, per attempt,
-so it is unreachable by the workload rather than merely validated.
+The boundary that matters is the helper's descent, not the volume's permissions.
+The agent never opens the volume; it asks the helper, which reaches the mailbox
+only by opening each component relative to the one above it and refusing any
+symlink or non-directory (`docs/contracts/oci-helper-protocol.md`, "Run mailbox
+confinement"). An image that declares no `USER` runs as uid 0 with no user
+namespace, so root inside the container is root on this bind mount and can
+rewrite anything in it. That is contained rather than prevented: the volume is
+scoped to one run, so there is no sibling run inside it to reach; a workload
+that replaces `events/` with a symlink only makes its own mailbox unreadable,
+because the descent refuses it; and `.published/` is not in the volume at all —
+for an OCI attempt the bookkeeping is agent-local, per attempt, so no uid inside
+the container can forge it. The worst a uid-0 workload achieves is corrupting
+its own run's evidence, which it could equally do by writing nothing.
 
-Publication is authorized against the live attempt that declared the mailbox, so
-it stops when the runtime is reaped. The final drain therefore runs *before*
-`ReapAndVerify` for an OCI attempt — the workload has returned and the attempt
-is still live, the only window in which every event is both complete and still
-reachable — and after it for a process attempt, whose quiescence that reap is
-what proves. Each helper call carries a short deadline inside the finalization
-budget. If the drain cannot finish (the helper stopped answering, or a deadman
-guardian reaped the attempt first), publication is marked incomplete and the
-handoff volume is retained under the ordinary rules rather than expiring as a
-clean success; the volume already survives a successful run and is expired by
-the helper's boot sweep after its retention window.
+The permissions are defense in depth for the ordinary case, a non-root image.
+The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable
+but not writable (0711); `tmp/` and `events/` are owned by the uid the image
+declares (0700); `params.json` is root-owned and world-readable (0644). A
+non-root workload therefore writes and renames its own events, reads its own
+parameters, and can neither rewrite the parameters nor replace `events/`. Each
+is applied through the descriptor the helper just opened, never by name, and
+always explicitly, so a directory left by an earlier attempt is restored rather
+than trusted.
+
+Publication is authorized against the live attempt that declared the mailbox:
+once that attempt leaves the live state no new mailbox operation is admitted.
+An operation admitted before the reap may finish, and an event read while the
+attempt was live may reach the ledger after it — that is deliberate, because the
+event was written by a live workload and the agent publishes it with its own
+token. Each helper call honours the operation's context and carries a short
+deadline inside the finalization budget, so a closing session cannot keep an
+in-flight read alive behind it. What the reap ends is the ability to read
+anything further.
+
+The final drain therefore runs *before* `ReapAndVerify` for an OCI attempt — the
+workload has returned and the attempt is still live, the only window in which
+every event is both complete and still reachable — and after it for a process
+attempt, whose quiescence that reap is what proves.
+
+A run whose evidence all reached the ledger is complete, and its handoff volume
+is removed immediately when the attempt finishes, by the agent's managed-volume
+finalizer through the helper. Retention is the failure path: if the drain cannot
+finish — the helper stopped answering, a deadman guardian reaped the attempt
+first, or an entry could not be read — publication is marked incomplete, the
+volume is retained under the ordinary failure rules instead of being removed,
+and the helper's boot sweep expires it after its retention window. A read that
+fails for any reason other than the helper positively classifying the entry as
+unpublishable leaves that entry in place: an unreachable entry is never mistaken
+for junk, because deleting a run's only copy of its evidence on the strength of
+a timeout is the one failure this publisher must not have.
 
 Because the mailbox needs no credential, it is what a dispatched job reports
 through by default: `WEFTY_RUN_TOKEN` and `WEFTY_ATTEMPT_TOKEN` are withheld

@@ -1,6 +1,7 @@
 package ocihelper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -83,6 +84,23 @@ func openConfinedDirectory(root string, segments ...string) (_ *os.Root, resultE
 	return current, nil
 }
 
+// runMailboxUnusableEntryError is the helper's positive classification of an
+// entry that can never become an event. It is separated from every other
+// failure because the two must not be confused at the far end: junk is safe to
+// delete, and an unreachable entry never is.
+type runMailboxUnusableEntryError struct {
+	name   string
+	reason string
+}
+
+func (err *runMailboxUnusableEntryError) Error() string {
+	return fmt.Sprintf("run mailbox entry %q %s", err.name, err.reason)
+}
+
+func unusableRunMailboxEntry(name, reason string) error {
+	return &runMailboxUnusableEntryError{name: name, reason: reason}
+}
+
 // readConfinedRegularFile proves the entry is a regular file before and after
 // opening it, opens non-blocking so a FIFO planted in the directory cannot
 // block the helper, and reads no more than limit bytes.
@@ -92,7 +110,7 @@ func readConfinedRegularFile(root *os.Root, name string, limit int) ([]byte, boo
 		return nil, false, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("run mailbox entry %q is not a regular file", name)
+		return nil, false, unusableRunMailboxEntry(name, "is not a regular file")
 	}
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -104,7 +122,7 @@ func readConfinedRegularFile(root *os.Root, name string, limit int) ([]byte, boo
 		return nil, false, err
 	}
 	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, false, fmt.Errorf("run mailbox entry %q changed identity while opening", name)
+		return nil, false, unusableRunMailboxEntry(name, "changed identity while opening")
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
 	if err != nil {
@@ -119,18 +137,31 @@ func readConfinedRegularFile(root *os.Root, name string, limit int) ([]byte, boo
 // seedRunMailbox creates the run-scoped mailbox inside an already-created
 // handoff volume and delivers the run's parameters.
 //
-// Ownership is the honest part of this design, and it is deliberately the
-// smallest arrangement that works. The handoff volume is created root-owned and
-// the container process may be any uid the image declares, so exactly the two
-// directories the workload must write — tmp/ and events/ — are chowned to that
-// process owner, the same way the service-data volume and the Computer control
-// files already are. Everything above them stays root-owned and merely
-// traversable (0711): the workload can reach its own mailbox but cannot replace
-// events/ with a symlink, cannot rewrite params.json, and cannot enumerate the
-// directory it was handed. The agent's own bookkeeping is not in the volume at
-// all — for an OCI attempt it lives on the agent side of the boundary, so a
-// workload cannot reach or forge it, which is strictly stronger than the
-// advisory, workload-writable bookkeeping a process attempt has.
+// Be precise about what the permissions here are and are not.
+//
+// They are NOT the security boundary. An image that declares no USER runs as
+// 0:0, wefty gives it no user namespace, and root inside the container is root
+// on this bind mount: such a workload can rewrite params.json and replace the
+// directories below regardless of what is set here. The security boundary is
+// the helper's descriptor descent in this file — the agent never opens this
+// volume, and a workload that replaces events/ with a symlink only makes its
+// own mailbox unreadable, because the descent refuses it. The volume is scoped
+// to one Run, so there is no sibling run inside it to reach, and the agent's
+// bookkeeping is not in the volume at all: for an OCI attempt it lives on the
+// agent side of the boundary, so it cannot be forged from in here at any uid.
+//
+// What they ARE is defense in depth for the ordinary case, a non-root image.
+// Exactly the two directories such a workload must write — tmp/ and events/ —
+// are chowned to its process owner, the same way the service-data volume and
+// the Computer control files already are. Everything above them stays
+// root-owned and traversable but not writable (0711), so a non-root workload
+// reaches its own mailbox, reads its parameters, and can neither rewrite them
+// nor enumerate the directory it was handed.
+//
+// The volume root itself is part of that chain: containerd creates the handoff
+// directory 0700 root-owned and mounts it at /wefty/handoff, so without the
+// 0711 applied here a non-root image could not traverse into its mailbox at
+// all, whatever the modes below.
 func seedRunMailbox(volumePath string, seed RunMailboxSeed, uid, gid uint32) error {
 	if err := seed.validate(); err != nil {
 		return err
@@ -140,12 +171,20 @@ func seedRunMailbox(volumePath string, seed RunMailboxSeed, uid, gid uint32) err
 		return fmt.Errorf("open handoff volume for the run mailbox: %w", err)
 	}
 	defer root.Close()
-	mailbox, err := makeRunMailboxDirectory(root, RunMailboxDirectoryName, 0o711, 0, 0)
+	// The directories above the workload's two belong to the helper. That is
+	// the invariant, and it is stated as the helper's own identity rather than
+	// as a literal 0 so it stays true of whatever the helper runs as -- root in
+	// production, and whoever runs the tests elsewhere.
+	helperUID, helperGID := uint32(os.Geteuid()), uint32(os.Getegid())
+	if err := applyRunMailboxOwnership(root, "handoff volume root", 0o711, helperUID, helperGID); err != nil {
+		return err
+	}
+	mailbox, err := makeRunMailboxDirectory(root, RunMailboxDirectoryName, 0o711, helperUID, helperGID)
 	if err != nil {
 		return err
 	}
 	defer mailbox.Close()
-	scoped, err := makeRunMailboxDirectory(mailbox, seed.RunID, 0o711, 0, 0)
+	scoped, err := makeRunMailboxDirectory(mailbox, seed.RunID, 0o711, helperUID, helperGID)
 	if err != nil {
 		return err
 	}
@@ -191,29 +230,46 @@ func makeRunMailboxDirectory(parent *os.Root, name string, mode os.FileMode, uid
 	if err != nil || !os.SameFile(before, current) {
 		return nil, fmt.Errorf("run mailbox directory %q changed while opening", name)
 	}
-	// Mode and ownership are applied through the descriptor just opened, never
-	// by name, and always explicitly: the helper's umask must not decide
-	// whether the workload can reach its own mailbox, and a directory that
-	// already existed from an earlier attempt must be corrected rather than
-	// trusted.
-	handle, err := opened.Open(".")
-	if err != nil {
+	if err := applyRunMailboxOwnership(opened, name, mode, uid, gid); err != nil {
 		return nil, err
 	}
+	return opened, nil
+}
+
+// applyRunMailboxOwnership sets mode and ownership through an already-opened
+// descriptor, never by name. The helper's umask must not decide whether the
+// workload can reach its own mailbox, and a directory left behind by an earlier
+// attempt must be restored to what this attempt requires rather than trusted as
+// it stands -- including back to root ownership, which is why there is no
+// special case for a requested owner of 0:0.
+//
+// The chown is issued only when the observed owner differs from the requested
+// one. That is not an optimization: chowning to an owner an unprivileged
+// process does not hold is refused even when it is already correct, so a
+// conditional chown is what keeps this function honest about the one thing it
+// must do -- change ownership that drifted -- without failing on the far more
+// common case where nothing has.
+func applyRunMailboxOwnership(root *os.Root, name string, mode os.FileMode, uid, gid uint32) error {
+	handle, err := root.Open(".")
+	if err != nil {
+		return err
+	}
 	applyErr := handle.Chmod(mode)
-	if applyErr == nil && (uid != 0 || gid != 0) {
-		if err := unix.Fchown(int(handle.Fd()), int(uid), int(gid)); err != nil {
-			applyErr = fmt.Errorf("own run mailbox directory %q as %d:%d: %w", name, uid, gid, err)
+	if applyErr == nil {
+		var observed unix.Stat_t
+		if err := unix.Fstat(int(handle.Fd()), &observed); err != nil {
+			applyErr = fmt.Errorf("inspect run mailbox directory %q owner: %w", name, err)
+		} else if observed.Uid != uid || observed.Gid != gid {
+			if err := unix.Fchown(int(handle.Fd()), int(uid), int(gid)); err != nil {
+				applyErr = fmt.Errorf("own run mailbox directory %q as %d:%d: %w", name, uid, gid, err)
+			}
 		}
 	}
 	closeErr := handle.Close()
 	if applyErr != nil {
-		return nil, applyErr
+		return applyErr
 	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-	return opened, nil
+	return closeErr
 }
 
 // writeRunMailboxParams writes then renames inside the mailbox, so the
@@ -255,7 +311,10 @@ func writeRunMailboxParams(mailbox *os.Root, document []byte) (resultErr error) 
 	return mailbox.Rename(staging, RunMailboxParamsFileName)
 }
 
-func listRunMailbox(runtimeRoot string, request ListRunMailboxRequest) (ListRunMailboxResponse, error) {
+func listRunMailbox(ctx context.Context, runtimeRoot string, request ListRunMailboxRequest) (ListRunMailboxResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return ListRunMailboxResponse{}, err
+	}
 	events, err := openRunMailboxEvents(runtimeRoot, request.RunMailboxReference)
 	if err != nil {
 		return ListRunMailboxResponse{}, err
@@ -266,6 +325,9 @@ func listRunMailbox(runtimeRoot string, request ListRunMailboxRequest) (ListRunM
 		return ListRunMailboxResponse{}, err
 	}
 	defer directory.Close()
+	if err := ctx.Err(); err != nil {
+		return ListRunMailboxResponse{}, err
+	}
 	limit := request.boundedLimit()
 	entries, err := directory.ReadDir(limit)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -281,7 +343,10 @@ func listRunMailbox(runtimeRoot string, request ListRunMailboxRequest) (ListRunM
 	return ListRunMailboxResponse{Names: names, Exhausted: len(names) >= limit}, nil
 }
 
-func readRunMailbox(runtimeRoot string, request ReadRunMailboxRequest) (ReadRunMailboxResponse, error) {
+func readRunMailbox(ctx context.Context, runtimeRoot string, request ReadRunMailboxRequest) (ReadRunMailboxResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return ReadRunMailboxResponse{}, err
+	}
 	if !ValidRunMailboxName(request.Name) {
 		return ReadRunMailboxResponse{}, errors.New("run mailbox entry name is not a bounded mailbox name")
 	}
@@ -290,15 +355,30 @@ func readRunMailbox(runtimeRoot string, request ReadRunMailboxRequest) (ReadRunM
 		return ReadRunMailboxResponse{}, err
 	}
 	defer events.Close()
+	if err := ctx.Err(); err != nil {
+		return ReadRunMailboxResponse{}, err
+	}
 	limit := request.boundedLimit()
 	payload, truncated, err := readConfinedRegularFile(events, request.Name, limit)
 	if err != nil {
+		// An entry the helper positively classified as unpublishable is a
+		// fact about the entry, reported in the response. Everything else --
+		// an I/O failure, a cancelled context -- stays an error, because the
+		// caller must not mistake "I could not read this" for "this is junk"
+		// and delete a workload's only copy of its evidence.
+		var unusable *runMailboxUnusableEntryError
+		if errors.As(err, &unusable) {
+			return ReadRunMailboxResponse{Unusable: true, Reason: unusable.reason}, nil
+		}
 		return ReadRunMailboxResponse{}, err
 	}
 	return ReadRunMailboxResponse{Payload: payload, Truncated: truncated}, nil
 }
 
-func removeRunMailboxEntry(runtimeRoot string, request RemoveRunMailboxEntryRequest) (RemoveRunMailboxEntryResponse, error) {
+func removeRunMailboxEntry(ctx context.Context, runtimeRoot string, request RemoveRunMailboxEntryRequest) (RemoveRunMailboxEntryResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return RemoveRunMailboxEntryResponse{}, err
+	}
 	if !ValidRunMailboxName(request.Name) {
 		return RemoveRunMailboxEntryResponse{}, errors.New("run mailbox entry name is not a bounded mailbox name")
 	}
@@ -307,6 +387,9 @@ func removeRunMailboxEntry(runtimeRoot string, request RemoveRunMailboxEntryRequ
 		return RemoveRunMailboxEntryResponse{}, err
 	}
 	defer events.Close()
+	if err := ctx.Err(); err != nil {
+		return RemoveRunMailboxEntryResponse{}, err
+	}
 	info, err := events.Lstat(request.Name)
 	if errors.Is(err, os.ErrNotExist) {
 		return RemoveRunMailboxEntryResponse{Absent: true}, nil

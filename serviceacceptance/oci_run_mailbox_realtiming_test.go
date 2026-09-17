@@ -18,52 +18,34 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/workflowhelper"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
-// ociRunMailboxWorkflow is the workload under test: a POSIX shell script that
-// writes run-mailbox events with the inline writer the scaffold ships, because
-// the acceptance image is BusyBox and does not carry the wefty binary. It
-// deliberately uses nothing beyond BusyBox ash builtins and applets.
-//
-// It reads its own parameters out of params.json, which the helper seeded, and
-// reports a step, a gate and a result -- exactly what a real workflow does.
-const ociRunMailboxWorkflow = `set -eu
-wefty_nanos() {
-	printf '%019d' "$(date -u +%s)000000000"
-}
-wefty_event() {
-	mkdir -p "$WEFTY_RUN_DIR/tmp" "$WEFTY_RUN_DIR/events"
-	WEFTY_EVENT_SEQ=$(((${WEFTY_EVENT_SEQ:-0} + 1) % 10000))
-	wefty_file=$(printf '%s-%04d-%s-%.32s-%08x' "$(wefty_nanos)" "$WEFTY_EVENT_SEQ" "$1" "${2:-event}" "$$")
-	{
-		printf 'wefty-protocol: 1\nkind: %s\n' "$1"
-		[ -z "${2:-}" ] || printf 'name: %s\n' "$2"
-		[ -z "${3:-}" ] || printf 'step: %s\n' "$3"
-		[ -z "${4:-}" ] || printf 'status: %s\n' "$4"
-		[ -z "${5:-}" ] || printf 'outcome: %s\n' "$5"
-		[ -z "${6:-}" ] || printf 'summary: %s\n' "$6"
-		printf 'payload: text\n--\n'
-		[ -z "${7:-}" ] || printf '%s\n' "$7"
-	} >"$WEFTY_RUN_DIR/tmp/$wefty_file"
-	mv "$WEFTY_RUN_DIR/tmp/$wefty_file" "$WEFTY_RUN_DIR/events/$wefty_file"
-}
-wefty_param() {
-	[ -f "$WEFTY_RUN_DIR/params.json" ] || return 0
-	tr -d '\n' <"$WEFTY_RUN_DIR/params.json" |
-		sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p'
-}
+// ociRunMailboxWorkflow is the workload under test. It is the SHIPPED inline
+// writer -- the exact bytes `wefty workflow init` embeds for an image that does
+// not carry the wefty binary -- followed by the reporting a real workflow does.
+// Embedding the template itself rather than a simplified copy is the point: the
+// acceptance image is BusyBox, and this lane is the only place that proves the
+// writer we actually ship runs under ash.
+func ociRunMailboxWorkflow() string {
+	return workflowhelper.InlineBashWriter() + `
+set -eu
 [ -n "${WEFTY_RUN_DIR:-}" ] || { echo "no WEFTY_RUN_DIR" >&2; exit 64; }
 branch=$(wefty_param branch)
 [ "$branch" = "acceptance-branch" ] || { echo "params.json did not carry the branch: '$branch'" >&2; exit 65; }
 # A credential must never reach a job that only reports.
 [ -z "${WEFTY_RUN_TOKEN:-}" ] || { echo "a reporting job was handed a run token" >&2; exit 66; }
+[ -z "${WEFTY_ATTEMPT_TOKEN:-}" ] || { echo "a reporting job was handed an attempt token" >&2; exit 67; }
+printf 'no findings\n' > /tmp/vet-evidence
+printf 'all gates passed\n' > /tmp/result-evidence
 wefty_event step gates gates started '' 'running the gates'
-wefty_event gate vet gates '' pass 'vet is clean' 'no findings'
+wefty_event gate vet gates '' pass 'vet is clean' /tmp/vet-evidence
 wefty_event step gates gates ended '' 'gates finished'
-wefty_event result result result succeeded '' "branch $branch is green" 'all gates passed'
+wefty_event result result result succeeded '' "branch $branch is green" /tmp/result-evidence
 exit 0
 `
+}
 
 // TestOCIRunMailboxEventsReachTheRunLedgerThroughTheHelper is the live proof of
 // #476 slice C: an OCI one-shot dispatched by L3, holding no credential at all,
@@ -88,6 +70,17 @@ func TestOCIRunMailboxEventsReachTheRunLedgerThroughTheHelper(t *testing.T) {
 	assertMailboxEnvelope(t, envelopes, "result", contract.EnvelopeSucceeded, "branch acceptance-branch is green")
 	assertMailboxGate(t, gates, "vet", contract.GatePass, "no findings")
 
+	// Exactly one row per event. Republication after an interrupted retirement
+	// is meant to be a replay in L3, not a second document, so a duplicate here
+	// would mean the idempotency identity is not stable across a sweep.
+	if len(envelopes) != 3 {
+		t.Fatalf("published %d envelopes, want exactly the three the workload wrote:\n%s",
+			len(envelopes), joinBodies(envelopes))
+	}
+	if len(gates) != 1 {
+		t.Fatalf("published %d gates, want exactly one:\n%s", len(gates), joinBodies(gates))
+	}
+
 	// Every document the agent built for this run is the agent's, not the
 	// workload's: L3 binds the attempt from the authenticated run token, and
 	// the workload never held one.
@@ -107,7 +100,7 @@ func submitOCIMailboxRun(t *testing.T, harness *acceptanceHarness, reference, di
 	request := l3.CreateRunRequest{
 		Image: &contract.ImageProgram{
 			Reference: reference, Digest: &digest,
-			Argv:           []string{"/bin/sh", "-c", ociRunMailboxWorkflow},
+			Argv:           []string{"/bin/sh", "-c", ociRunMailboxWorkflow()},
 			RuntimeHandler: "io.containerd.runc.v2",
 		},
 		Params: json.RawMessage(`{"branch":"acceptance-branch"}`),

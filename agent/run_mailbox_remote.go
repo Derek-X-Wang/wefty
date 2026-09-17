@@ -68,7 +68,18 @@ func (fs *helperMailboxFS) list(limit int) ([]string, bool, error) {
 func (fs *helperMailboxFS) read(name string, limit int) ([]byte, bool, error) {
 	ctx, cancel := fs.call()
 	defer cancel()
-	return fs.runtime.ReadRunMailbox(ctx, fs.reference, name, limit)
+	payload, truncated, err := fs.runtime.ReadRunMailbox(ctx, fs.reference, name, limit)
+	if err != nil {
+		// Only the runtime's own positive classification of the entry becomes
+		// a removable-junk verdict here. A timeout, a lost session or a
+		// refused authority is a fact about the transport, not about the
+		// entry, and the publisher must keep the entry on that evidence.
+		if errors.Is(err, workloadrunner.ErrRunMailboxEntryUnusable) {
+			return nil, false, fmt.Errorf("%w: %v", errRunMailboxEntryUnusable, err)
+		}
+		return nil, false, err
+	}
+	return payload, truncated, nil
 }
 
 func (fs *helperMailboxFS) remove(name string) error {
@@ -103,7 +114,10 @@ func runMailboxSeed(spec contract.JobSpec) *workloadrunner.RunMailboxSeed {
 	if trimmed == "" || len(trimmed) > MaxRunMailboxParamsBytes || !strings.HasPrefix(trimmed, "{") {
 		return seed
 	}
-	seed.Params = append([]byte(trimmed), '\n')
+	// The document is delivered exactly as the ledger canonicalized it. A
+	// trailing newline added here would push a document at L3's own 64 KiB
+	// bound one byte past the helper's, refusing a run the ledger accepted.
+	seed.Params = []byte(trimmed)
 	return seed
 }
 

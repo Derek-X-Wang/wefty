@@ -2413,6 +2413,12 @@ func (adapter *Adapter) ReadRunMailbox(ctx context.Context, reference workloadru
 	if err != nil {
 		return nil, false, err
 	}
+	if response.Unusable {
+		// The helper looked at the entry and says it can never be an event.
+		// That is the only answer on which the caller may delete it; a
+		// transport or authority failure arrives above as an ordinary error.
+		return nil, false, fmt.Errorf("%w: %s", workloadrunner.ErrRunMailboxEntryUnusable, response.Reason)
+	}
 	return response.Payload, response.Truncated, nil
 }
 

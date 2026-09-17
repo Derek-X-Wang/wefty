@@ -127,6 +127,14 @@ type RunMailboxReference struct {
 	RunID     string
 }
 
+// ErrRunMailboxEntryUnusable is a runtime's positive classification of one
+// mailbox entry that can never become an event: it is not a readable regular
+// file, or it changed identity while being opened. A caller may delete such an
+// entry. It must never be conflated with a transport, deadline or authority
+// failure, which say nothing about the entry and on which deleting it would
+// destroy a workload's only copy of its evidence.
+var ErrRunMailboxEntryUnusable = errors.New("run mailbox entry is not a publishable event")
+
 // RunMailboxRuntime is the bounded read of a mailbox the agent cannot open
 // itself. It is implemented by the OCI adapter without exposing helper types at
 // this seam, and deliberately offers nothing but the three operations the run
@@ -138,6 +146,9 @@ type RunMailboxReference struct {
 // cannot finish before then retains its evidence rather than losing it.
 type RunMailboxRuntime interface {
 	ListRunMailbox(ctx context.Context, reference RunMailboxReference, limit int) (names []string, exhausted bool, err error)
+	// ReadRunMailbox returns ErrRunMailboxEntryUnusable for an entry the
+	// runtime positively classified as unpublishable, and the underlying
+	// failure for anything else.
 	ReadRunMailbox(ctx context.Context, reference RunMailboxReference, name string, limit int) (payload []byte, truncated bool, err error)
 	RemoveRunMailboxEntry(ctx context.Context, reference RunMailboxReference, name string) error
 }

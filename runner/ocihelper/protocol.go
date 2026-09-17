@@ -743,6 +743,14 @@ type ReadRunMailboxRequest struct {
 type ReadRunMailboxResponse struct {
 	Payload   []byte `json:"payload,omitempty"`
 	Truncated bool   `json:"truncated,omitempty"`
+	// Unusable is the helper's positive classification of an entry that can
+	// never become an event: it is not a readable regular file, or it changed
+	// identity while being opened. It is deliberately a field and not an
+	// error, because the caller must be able to tell "this entry is junk, drop
+	// it" apart from "I could not reach the helper", and a transport failure
+	// that read as junk would delete a workload's only copy of its evidence.
+	Unusable bool   `json:"unusable,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 type RemoveRunMailboxEntryRequest struct {

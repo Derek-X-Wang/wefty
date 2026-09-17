@@ -1020,10 +1020,20 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 	}
 	raw, truncated, err := m.readEvent(name)
 	if err != nil {
-		// Not a regular file, or not readable: it is junk in the events
-		// directory. Remove only safely classifiable entries; keep the rest.
+		if errors.Is(err, errRunMailboxEntryUnusable) || errors.Is(err, os.ErrNotExist) {
+			// Positively classified: this entry can never become an event, so
+			// removing it loses nothing.
+			m.log("agent: run %s mailbox entry %q is not a publishable event: %v", m.runID, name, err)
+			return m.discard(name)
+		}
+		// Anything else -- a transport failure, an expired deadline, lost
+		// authority, an unclassifiable I/O error -- says nothing about the
+		// entry. Keep it, stop this sweep so lexical order is preserved, and
+		// let the next one retry; if the failure outlasts finalization the
+		// entry is still pending, which latches publicationIncomplete and
+		// retains the handoff.
 		m.log("agent: read run %s mailbox event %q: %v", m.runID, name, err)
-		return m.discard(name)
+		return err
 	}
 	// The observation timestamp is persisted before the document is built, so
 	// every later republication of this file produces the same bytes.
@@ -1311,7 +1321,7 @@ func readBoundedRegularFile(root *os.Root, name string, limit int) ([]byte, bool
 		return nil, false, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("run mailbox path %q is not a regular file", name)
+		return nil, false, fmt.Errorf("%w: %q is not a regular file", errRunMailboxEntryUnusable, name)
 	}
 	file, err := root.OpenFile(name, os.O_RDONLY|runMailboxNonBlockingOpen, 0)
 	if err != nil {
@@ -1323,7 +1333,7 @@ func readBoundedRegularFile(root *os.Root, name string, limit int) ([]byte, bool
 		return nil, false, err
 	}
 	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, false, fmt.Errorf("run mailbox path %q changed identity while opening", name)
+		return nil, false, fmt.Errorf("%w: %q changed identity while opening", errRunMailboxEntryUnusable, name)
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
 	if err != nil {
