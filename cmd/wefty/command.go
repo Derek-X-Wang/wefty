@@ -204,7 +204,7 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	var workflowRef, scriptPath, params, paramsFile, envelopeSchema, envelopeSchemaFile, idempotencyKey string
 	var maxRuntime int
 	var maxCost float64
-	var requiredEnvelope bool
+	var requiredEnvelope, dispatchAuthority bool
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var imageFlags imageFlagSet
@@ -221,6 +221,8 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	flags.StringVar(&envelopeSchema, "envelope-schema", "", "envelope JSON schema")
 	flags.StringVar(&envelopeSchemaFile, "envelope-schema-file", "", "file containing envelope JSON schema")
 	flags.BoolVar(&requiredEnvelope, "required-envelope", false, "require a valid envelope")
+	flags.BoolVar(&dispatchAuthority, "dispatch-authority", false,
+		"this run dispatches child work, so deliver the in-job credentials (default: report through the run mailbox and hold none)")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "request idempotency key")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -261,6 +263,7 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	request := l3.CreateRunRequest{
 		WorkflowRef: workflowRef, Image: image, Params: paramsJSON, Tags: resolvedTags,
 		EnvelopeSchema: envelopeJSON, RequiredEnvelope: requiredEnvelope,
+		DispatchAuthority: dispatchAuthority,
 	}
 	if maxRuntime < 0 || maxCost < 0 {
 		return usageError("run limits cannot be negative")

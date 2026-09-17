@@ -284,11 +284,18 @@ func pointerOrNA(value *string, suffix string) string {
 
 func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "RUN ID\tPARENT\tSTATUS\tENVELOPES\tGATES"); err != nil {
+	// Dispatch authority is shown because it is the one column that says
+	// whether the workload held a credential, and "-" keeps the ordinary run
+	// quiet while the declaring run stands out.
+	if _, err := fmt.Fprintln(table, "RUN ID\tPARENT\tSTATUS\tDISPATCH AUTHORITY\tENVELOPES\tGATES"); err != nil {
 		return err
 	}
 	for _, run := range inspection.Runs {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%d\t%d\n", run.RunID, run.ParentRunID, run.Status, len(run.Envelopes), len(run.Gates)); err != nil {
+		authority := "-"
+		if run.DispatchAuthority {
+			authority = "yes"
+		}
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\t%d\n", run.RunID, run.ParentRunID, run.Status, authority, len(run.Envelopes), len(run.Gates)); err != nil {
 			return err
 		}
 	}

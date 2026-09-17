@@ -67,7 +67,53 @@ const (
 	// only: RedactJobLabels removes it from every public job projection, the
 	// way SensitiveEnv is removed.
 	LabelRunParams = "run_params_json"
+
+	// LabelDispatchAuthority is L3's positive marker: this run declared at
+	// submit that its workload dispatches child work, so the workload receives
+	// the in-job credentials. L3 sets it only for declaring runs.
+	LabelDispatchAuthority = "dispatch_authority"
+
+	// LabelWithholdCredentials is L3's instruction to the node agent: do not
+	// place the in-job credentials in this job's workload environment. L3 sets
+	// it on every run it dispatches that did not declare dispatch authority.
+	// The run token still reaches the agent in SensitiveEnv, because the
+	// mailbox publisher holds it on the run's behalf; this label governs
+	// delivery to the workload, not delivery to the node.
+	//
+	// Both marker directions are supported and exactly one is sent per
+	// dispatch, because neither alone is safe: a label that must be present to
+	// withhold fails open when an older L3 omits it, and a label that must be
+	// present to deliver fails closed when an older agent has never heard of
+	// it. The agent reads whichever arrives alongside L1's own
+	// Claim.SubmittedByRunLedger classification, which is what closes the
+	// first gap. Forging this label can only withhold the forger's own job's
+	// credential.
+	LabelWithholdCredentials = "withhold_workload_credentials"
+
+	// LabelTrue is the only value a boolean label is written with, so a
+	// producer and a reader cannot drift over "1" versus "true".
+	LabelTrue = "true"
 )
+
+// DeclaresDispatchAuthority reports whether a job carries L3's positive marker
+// that this run declared dispatch authority at submit.
+func DeclaresDispatchAuthority(labels map[string]string) bool {
+	return labels[LabelDispatchAuthority] == LabelTrue
+}
+
+// WithholdsWorkloadCredentials reports whether L3 marked this job as one whose
+// workload must not receive the in-job credentials.
+func WithholdsWorkloadCredentials(labels map[string]string) bool {
+	return labels[LabelWithholdCredentials] == LabelTrue
+}
+
+// IsReservedCredentialEnvironmentName reports the reserved names whose values
+// are credentials rather than facts. A runtime must never let one of these
+// reach a workload from its own ambient environment: only an authoritative,
+// attempt-local value may be delivered, and only deliberately.
+func IsReservedCredentialEnvironmentName(name string) bool {
+	return name == EnvRunToken || name == EnvComputerToken || name == EnvAttemptToken
+}
 
 // RedactJobLabels returns labels without any reserved agent-only value. It
 // copies rather than mutates, because the caller's map is shared with the
@@ -141,7 +187,7 @@ func IsOCIReservedEnvironmentName(name string) bool {
 // authoritative contents must travel only through the sensitive environment
 // layer. Operator and image values are stripped for every reserved name.
 func IsOCISensitiveReservedEnvironmentName(name string) bool {
-	return name == EnvRunToken || name == EnvComputerToken || name == EnvAttemptToken
+	return IsReservedCredentialEnvironmentName(name)
 }
 
 // IsComputerExecution is the single cross-layer discriminator for Computer
@@ -560,14 +606,18 @@ type RunRecord struct {
 	Trigger       Trigger         `json:"trigger"`
 	Workflow      WorkflowSource  `json:"workflow"`
 	Params        json.RawMessage `json:"params"`
-	Tags          []string        `json:"tags,omitempty"`
-	Limits        *RunLimits      `json:"limits,omitempty"`
-	Envelopes     []Envelope      `json:"envelopes,omitempty"`
-	Gates         []GateResult    `json:"gates,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	StartedAt     *time.Time      `json:"started_at,omitempty"`
-	FinishedAt    *time.Time      `json:"finished_at,omitempty"`
+	// DispatchAuthority records that this run was submitted as one that
+	// dispatches child work, so its workload receives the in-job credentials
+	// instead of reporting through the run mailbox alone.
+	DispatchAuthority bool         `json:"dispatch_authority,omitempty"`
+	Tags              []string     `json:"tags,omitempty"`
+	Limits            *RunLimits   `json:"limits,omitempty"`
+	Envelopes         []Envelope   `json:"envelopes,omitempty"`
+	Gates             []GateResult `json:"gates,omitempty"`
+	CreatedAt         time.Time    `json:"created_at"`
+	UpdatedAt         time.Time    `json:"updated_at"`
+	StartedAt         *time.Time   `json:"started_at,omitempty"`
+	FinishedAt        *time.Time   `json:"finished_at,omitempty"`
 }
 
 type Trigger struct {

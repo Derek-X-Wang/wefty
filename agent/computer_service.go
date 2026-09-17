@@ -43,7 +43,7 @@ type computerServiceConfig struct {
 // only token authority and the helper publishes the paired token/endpoint.
 type computerAttemptBridgeController struct {
 	ctx       context.Context
-	start     func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
+	start     func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error)
 	kind      string
 	execution contract.ExecutionSpec
 
@@ -55,7 +55,7 @@ type computerAttemptBridgeController struct {
 
 func newComputerAttemptBridgeController(
 	ctx context.Context,
-	start func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error),
+	start func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error),
 	kind string,
 	execution contract.ExecutionSpec,
 ) *computerAttemptBridgeController {
@@ -79,7 +79,9 @@ func (controller *computerAttemptBridgeController) enable(token string) (string,
 	execution := controller.execution
 	execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
 	execution.SensitiveEnv[contract.EnvComputerToken] = token
-	bridge, err := controller.start(controller.ctx, controller.kind, execution)
+	// A Computer is never a Run: it has its own pass and its own door, so it
+	// never carries run-ledger job provenance.
+	bridge, err := controller.start(controller.ctx, controller.kind, execution, false)
 	if err != nil {
 		return "", err
 	}

@@ -159,7 +159,7 @@ A workflow definition is an **executable program**, stored and versioned in L3, 
 
 The script contract is **language-agnostic**: any executable, run as `kind=process` or `oci`. Contract = environment (run id, handoff dir) plus, for process one-shots, a run mailbox of envelope/gate files the node agent publishes without requiring the workload to hold or use a credential (the agent publishes with the run token it holds); the mailbox extends to OCI once the helper exposes a read path, and API endpoints remain in the contract for a workflow that dispatches child runs. **No blessed-language SDK in v1** — client libs are later sugar, never the contract. The dogfood script can be TS/Python/bash driving `claude`/`codex` CLIs.
 
-> **Amended (2026-09-17):** reporting moved to the run mailbox ([#476](https://github.com/Derek-X-Wang/wefty/issues/476)); envelopes, steps, gates and results are files a job writes into a job-owned directory, and the agent publishes them without requiring the workload to hold or use a credential (the agent publishes with the run token it holds); the run token is still delivered today, and withholding it is a separate opt-in change.
+> **Amended (2026-09-17):** reporting moved to the run mailbox ([#476](https://github.com/Derek-X-Wang/wefty/issues/476)); envelopes, steps, gates and results are files a job writes into a job-owned directory, and the agent publishes them without requiring the workload to hold or use a credential (the agent publishes with the run token it holds); the run token and the attempt credential are therefore withheld from a dispatched job by default, and are delivered only when the run declares dispatch authority at submit.
 
 #### L3-owned contracts
 

@@ -22,6 +22,7 @@
     "node_id": { "$ref": "#/$defs/id" },
     "parent_run_id": { "$ref": "#/$defs/id" },
     "dispatch_key": { "$ref": "#/$defs/id" },
+    "dispatch_authority": { "type": "boolean" },
     "status": {
       "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"]
     },

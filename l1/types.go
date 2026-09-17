@@ -348,9 +348,19 @@ type Claim struct {
 	Lease AttemptLease `json:"lease"`
 	// AttemptToken is the attempt credential's opaque bearer, returned exactly
 	// once to the claiming agent. L1 retains only its SHA-256 digest.
-	AttemptToken     string                `json:"attempt_token"`
-	PrestartDeadline *time.Time            `json:"prestart_deadline,omitempty"`
-	ComputerStorage  *ComputerStorageClaim `json:"computer_storage,omitempty"`
+	AttemptToken string `json:"attempt_token"`
+	// SubmittedByRunLedger is L1's own answer to "did the run ledger submit
+	// this job?", classified against L1's configured trusted run-ledger
+	// identity when the job was created and stored with it. The node agent
+	// uses it to decide credential delivery, run-ledger reachability and
+	// mailbox eligibility, so it must be a server-owned fact: a JobSpec is
+	// submitter-writable and the submitter identity itself takes a different
+	// form on each fabric (a Node ID on plain, a Tailscale StableID on tsnet),
+	// which is exactly why the agent cannot reconstruct this itself. A job
+	// spawned through an attempt credential is false: it has no Run.
+	SubmittedByRunLedger bool                  `json:"submitted_by_run_ledger,omitempty"`
+	PrestartDeadline     *time.Time            `json:"prestart_deadline,omitempty"`
+	ComputerStorage      *ComputerStorageClaim `json:"computer_storage,omitempty"`
 }
 
 // ComputerStorageClaim is the exact durable Storage identity a claimed

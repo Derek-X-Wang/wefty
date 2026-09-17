@@ -195,11 +195,11 @@ func TestStartWorkflowBridgeSelectsComputerSurfaceOnForcedMacFallback(t *testing
 		return workloadrunner.WorkflowBridgeBinding{Listener: listener, AdvertiseHost: "127.0.0.1", HostBridgeFallback: true}, err
 	})}
 	disabledExecution := contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}}
-	if disabledBridge, err := agent.startWorkflowBridge(t.Context(), contract.JobKindOCI, disabledExecution); err != nil || disabledBridge != nil {
+	if disabledBridge, err := agent.startWorkflowBridge(t.Context(), contract.JobKindOCI, disabledExecution, false); err != nil || disabledBridge != nil {
 		t.Fatalf("default-off production bridge = %v, err=%v; want no endpoint", disabledBridge, err)
 	}
 	execution := contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}, SensitiveEnv: map[string]string{contract.EnvComputerToken: "real-computer-pass"}}
-	bridge, err := agent.startWorkflowBridge(t.Context(), contract.JobKindOCI, execution)
+	bridge, err := agent.startWorkflowBridge(t.Context(), contract.JobKindOCI, execution, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +435,7 @@ func TestComputerAttemptBridgeProjectsOnlyTheL3OwnedSurface(t *testing.T) {
 
 func TestComputerAttemptBridgePublishesPrivateNamespaceEndpoint(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
-	controller := newComputerAttemptBridgeController(t.Context(), func(ctx context.Context, _ string, _ contract.ExecutionSpec) (*workflowBridge, error) {
+	controller := newComputerAttemptBridgeController(t.Context(), func(ctx context.Context, _ string, _ contract.ExecutionSpec, _ bool) (*workflowBridge, error) {
 		return newComputerAttemptBridge(ctx, participant, "wefty://run-ledger", true)
 	}, contract.JobKindOCI, contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}})
 	const guestEndpoint = "http://127.0.0.1:42424/l3"
@@ -596,7 +596,7 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	computerExecution := contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}}
-	controller := newComputerAttemptBridgeController(ctx, func(ctx context.Context, _ string, _ contract.ExecutionSpec) (*workflowBridge, error) {
+	controller := newComputerAttemptBridgeController(ctx, func(ctx context.Context, _ string, _ contract.ExecutionSpec, _ bool) (*workflowBridge, error) {
 		return newComputerAttemptBridge(ctx, agentFabric, "wefty://run-ledger", true)
 	}, contract.JobKindOCI, computerExecution)
 	endpoint, err := controller.enable("initial-pass")

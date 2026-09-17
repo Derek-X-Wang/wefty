@@ -161,7 +161,12 @@ func TestBridgeOmitsTheRunLedgerSurfaceForAnL1OnlyAttempt(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "suppress-node"})
 	agent := &Agent{fabric: participant, controlPlaneAddr: "wefty://control-plane", runLedgerAddr: "wefty://run-ledger"}
 
-	l1Only, err := agent.startWorkflowBridge(t.Context(), contract.JobKindProcess, contract.ExecutionSpec{})
+	// The submitter names an L3 endpoint in its own JobSpec. Reachability
+	// follows L1's record of who submitted the job, so this must change
+	// nothing: a direct-L1 attempt gets no route to the run ledger.
+	l1Only, err := agent.startWorkflowBridge(t.Context(), contract.JobKindProcess, contract.ExecutionSpec{
+		Env: map[string]string{contract.EnvL3Endpoint: "http://submitter.invalid/l3"},
+	}, false)
 	if err != nil || l1Only == nil {
 		t.Fatalf("L1-only bridge = (%v, %v), want a bridge", l1Only, err)
 	}
@@ -177,9 +182,7 @@ func TestBridgeOmitsTheRunLedgerSurfaceForAnL1OnlyAttempt(t *testing.T) {
 	}
 
 	// An L3-dispatched attempt keeps both surfaces.
-	dispatched, err := agent.startWorkflowBridge(t.Context(), contract.JobKindProcess, contract.ExecutionSpec{
-		Env: map[string]string{contract.EnvL3Endpoint: "http://placeholder.invalid/l3"},
-	})
+	dispatched, err := agent.startWorkflowBridge(t.Context(), contract.JobKindProcess, contract.ExecutionSpec{}, true)
 	if err != nil || dispatched == nil {
 		t.Fatalf("L3-dispatched bridge = (%v, %v), want a bridge", dispatched, err)
 	}
