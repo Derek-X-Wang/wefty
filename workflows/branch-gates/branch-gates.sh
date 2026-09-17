@@ -57,9 +57,10 @@
 
 # The embedded inline writer below is a verbatim copy, so its functions cannot
 # carry their own directives, and this workflow reaches them indirectly --
-# through `report`, which takes the producer as arguments. SC2329 is therefore
+# through `report`, which takes the producer as arguments. SC2329 (and SC2317,
+# which shellcheck 0.9.0 in CI raises for the same reason) is therefore
 # silenced for the file rather than for a block a copy is not allowed to have.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 set -u
 
 WORKFLOW=branch-gates
