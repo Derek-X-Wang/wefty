@@ -1,0 +1,131 @@
+//go:build darwin || linux
+
+// Package {{.GoPackage}} exercises {{.ScriptName}} the way the node agent sees
+// it: the workflow runs against a run-mailbox directory and the test reads the
+// event files it wrote.
+//
+// No cluster is involved. That is deliberate — a workflow's reporting is a
+// file protocol (docs/contracts/run-execution-context.md, "Run mailbox"), so
+// the part a workflow author gets wrong is testable without L1, L3 or an
+// agent. The full single-machine exercise — submit, dispatch, publish,
+// inspect — is modelled in workflows/branch-gates/branchgates_integration_test.go.
+package {{.GoPackage}}
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+// Test{{.TestPrefix}}StarterIsValidShell keeps a syntax error in shipped source
+// out of the default suite's blind spot.
+func Test{{.TestPrefix}}StarterIsValidShell(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			t.Fatalf("bash is required in CI: %v", err)
+		}
+		t.Skip("bash is required to check the workflow script")
+	}
+	if output, err := exec.Command(bashPath, "-n", "{{.ScriptName}}").CombinedOutput(); err != nil {
+		t.Fatalf("bash -n {{.ScriptName}}: %v\n%s", err, output)
+	}
+	shellcheckPath, err := exec.LookPath("shellcheck")
+	if err != nil {
+		t.Log("shellcheck is not installed; NOT-RUN")
+		return
+	}
+	if output, err := exec.Command(shellcheckPath, "{{.ScriptName}}").CombinedOutput(); err != nil {
+		version, _ := exec.Command(shellcheckPath, "--version").Output()
+		t.Fatalf("shellcheck {{.ScriptName}}: %v\n%s\n%s", err, output, version)
+	}
+}
+
+// Test{{.TestPrefix}}ReportsThroughTheRunMailbox runs the workflow against a
+// mailbox directory and asserts it reported a step, an envelope, a gate and a
+// result — the four events an operator reads back with `wefty inspect`.
+func Test{{.TestPrefix}}ReportsThroughTheRunMailbox(t *testing.T) {
+	interpreter := workflowInterpreter(t)
+	runDir := t.TempDir()
+	handoffDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runDir, "params.json"), []byte(`{"subject":"wefty"}`), 0o600); err != nil {
+		t.Fatalf("write params.json: %v", err)
+	}
+
+	command := exec.Command(interpreter[0], append(interpreter[1:], workflowFile(t))...)
+	command.Env = append(os.Environ(),
+		"WEFTY_RUN_DIR="+runDir,
+		"WEFTY_HANDOFF_DIR="+handoffDir,
+		// A system PATH keeps a developer's own wefty out of the run, so this
+		// always exercises the inline writer: the path an image without the
+		// binary takes. The `wefty run` path is exercised by wefty's own
+		// conformance test.
+		"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run {{.ScriptName}}: %v\n%s", err, output)
+	}
+
+	kinds := eventKinds(t, filepath.Join(runDir, "events"))
+	want := []string{"envelope", "gate", "result", "step", "step"}
+	if strings.Join(kinds, ",") != strings.Join(want, ",") {
+		t.Fatalf("events %v, want %v\n%s", kinds, want, output)
+	}
+	if _, err := os.Stat(filepath.Join(handoffDir, "result.json")); err != nil {
+		t.Fatalf("the workflow left no result.json in the handoff directory: %v", err)
+	}
+}
+
+// eventKinds reads every published event, checks it is a well-formed protocol
+// document, and returns the kinds in sorted order.
+func eventKinds(t *testing.T, events string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(events)
+	if err != nil {
+		t.Fatalf("read %s: %v", events, err)
+	}
+	kinds := []string{}
+	for _, entry := range entries {
+		raw, err := os.ReadFile(filepath.Join(events, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		document := string(raw)
+		if !strings.HasPrefix(document, "wefty-protocol: 1\n") {
+			t.Fatalf("%s does not start with the protocol header:\n%s", entry.Name(), document)
+		}
+		headers, _, separated := strings.Cut(document, "\n--\n")
+		if !separated {
+			t.Fatalf("%s has no payload separator:\n%s", entry.Name(), document)
+		}
+		kind := ""
+		for _, line := range strings.Split(headers, "\n") {
+			if value, found := strings.CutPrefix(line, "kind: "); found {
+				kind = value
+			}
+		}
+		if kind == "" {
+			t.Fatalf("%s carries no kind:\n%s", entry.Name(), document)
+		}
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+func workflowInterpreter(t *testing.T) []string {
+	t.Helper()
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is required to run the workflow")
+	}
+	return []string{bashPath}
+}
+
+// workflowFile is the script as submitted.
+func workflowFile(t *testing.T) string {
+	t.Helper()
+	return "{{.ScriptName}}"
+}

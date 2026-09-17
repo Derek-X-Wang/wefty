@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# {{.Name}}: a wefty workflow, scaffolded by `wefty workflow init`.
+#
+# What this workflow may do
+# -------------------------
+# It reports, and it uses no credential to do it. Everything below writes files
+# into $WEFTY_RUN_DIR, the run mailbox; the node agent, which already holds
+# authority, publishes them to the run ledger. A mailbox write is a claim about
+# this run and nothing else -- it confers no authority over the cluster, so do
+# not build on this workflow being able to dispatch a child run, read another
+# run, or act on any other job.
+#
+# Contract: docs/contracts/run-execution-context.md, "Run mailbox".
+#
+# Replace the "do the work" section. Keep the reporting shape: one step
+# bracketing the work, one envelope per unit of work, one gate carrying the
+# verdict, one result document.
+#
+# `set -e` is load-bearing: a workflow that could not report must not exit 0,
+# because an exit code alone is not evidence. The one step below that is
+# deliberately allowed to fail is marked where it happens.
+
+set -euo pipefail
+
+WORKFLOW={{.Name}}
+
+log() { printf '%s: %s\n' "$WORKFLOW" "$*"; }
+
+{{.InlineWriter}}
+# --------------------------------------------------------------------------
+# Reporting seam
+#
+# `wefty run ...` when the binary is on PATH; the inline writer above
+# otherwise. Both produce the same event files, so an image without the wefty
+# binary reports exactly the same way.
+# --------------------------------------------------------------------------
+
+if command -v wefty >/dev/null 2>&1; then
+	WEFTY_HELPER=wefty
+else
+	WEFTY_HELPER=
+	log "wefty is not on PATH: using the inline run-mailbox writer"
+fi
+
+# param NAME -- one run parameter, empty when it was not submitted. The helper
+# reads params.json properly; the fallback reads top-level string params only
+# (see wefty_param above for the exact limits).
+param() {
+	if [ -n "$WEFTY_HELPER" ]; then
+		wefty run params "$1"
+	else
+		wefty_param "$1"
+	fi
+}
+
+# emit_step NAME started|ended SUMMARY
+emit_step() {
+	if [ -z "$WEFTY_HELPER" ]; then
+		wefty_event step "$1" "" "$2" "" "$3" "" ""
+	elif [ "$2" = ended ]; then
+		wefty run step --name "$1" --end --summary "$3"
+	else
+		wefty run step --name "$1" --summary "$3"
+	fi
+}
+
+# emit_envelope STEP succeeded|failed|partial SUMMARY [DETAIL_FILE]
+emit_envelope() {
+	if [ -n "$WEFTY_HELPER" ]; then
+		if [ -n "${4:-}" ]; then
+			wefty run envelope --step "$1" --status "$2" --summary "$3" --payload-file "$4"
+		else
+			wefty run envelope --step "$1" --status "$2" --summary "$3"
+		fi
+	else
+		wefty_event envelope "" "$1" "$2" "" "$3" "${4:-}" ""
+	fi
+}
+
+# emit_gate NAME pass|fail|error|skipped SUMMARY [EVIDENCE_FILE]
+emit_gate() {
+	if [ -n "$WEFTY_HELPER" ]; then
+		if [ -n "${4:-}" ]; then
+			wefty run gate --name "$1" --outcome "$2" --summary "$3" --evidence-file "$4"
+		else
+			wefty run gate --name "$1" --outcome "$2" --summary "$3"
+		fi
+	else
+		wefty_event gate "$1" "" "" "$2" "$3" "${4:-}" ""
+	fi
+}
+
+# emit_result FILE succeeded|failed|partial SUMMARY
+# The document also lands in the handoff directory as result.json, which is
+# what an operator reads off the node when a failing attempt retains it.
+emit_result() {
+	if [ -n "$WEFTY_HELPER" ]; then
+		wefty run result --file "$1" --status "$2" --summary "$3"
+		return 0
+	fi
+	# The handoff directory is writable by this job and anything it started,
+	# so `result.json` may already exist -- as a symlink, even. mktemp creates
+	# a fresh private regular file and never follows one, and the rename means
+	# a reader sees the whole document or the previous one. This is also the
+	# one step deliberately allowed to fail: the mailbox event below is the
+	# copy that survives the handoff directory being removed.
+	if [ -n "${WEFTY_HANDOFF_DIR:-}" ]; then
+		if ! {
+			mkdir -p "$WEFTY_HANDOFF_DIR" &&
+				staged=$(umask 077 && mktemp "$WEFTY_HANDOFF_DIR/.result.json.XXXXXX") &&
+				cat "$1" >"$staged" &&
+				mv "$staged" "$WEFTY_HANDOFF_DIR/result.json"
+		}; then
+			log "WARNING: could not publish result.json into $WEFTY_HANDOFF_DIR"
+			[ -z "${staged:-}" ] || rm -f "$staged"
+		fi
+	fi
+	# The fallback always declares a text payload: this shell has no JSON
+	# parser, and an event that claims `json` and then fails to decode is
+	# refused outright. The document still reaches the ledger verbatim, and
+	# result.json above is the copy an operator reads.
+	wefty_event result "" "" "$2" "" "$3" "$1" ""
+}
+
+# --------------------------------------------------------------------------
+# Do the work
+# --------------------------------------------------------------------------
+
+SUBJECT=$(param subject)
+[ -n "$SUBJECT" ] || SUBJECT=world
+
+WORK_DIR=${TMPDIR:-/tmp}/wefty-$WORKFLOW-$$
+mkdir -p "$WORK_DIR" || {
+	log "cannot create $WORK_DIR"
+	exit 1
+}
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+emit_step work started "greeting $SUBJECT"
+
+DETAIL_FILE=$WORK_DIR/detail.txt
+printf 'hello, %s\n' "$SUBJECT" >"$DETAIL_FILE"
+OUTCOME=pass
+STATUS=succeeded
+PASSED=true
+if [ ! -s "$DETAIL_FILE" ]; then
+	OUTCOME=fail
+	STATUS=failed
+	PASSED=false
+fi
+
+emit_envelope work "$STATUS" "greeted $SUBJECT" "$DETAIL_FILE"
+emit_step work ended "greeting $SUBJECT"
+emit_gate "$WORKFLOW" "$OUTCOME" "the greeting is $OUTCOME"
+
+# Every string that reaches the document is JSON-escaped: a subject carrying a
+# quote or a backslash would otherwise produce a document the agent refuses.
+RESULT_FILE=$WORK_DIR/result.json
+printf '{"schema_version":1,"workflow":"%s","subject":"%s","passed":%s}\n' \
+	"$(wefty_json_escape "$WORKFLOW")" "$(wefty_json_escape "$SUBJECT")" "$PASSED" >"$RESULT_FILE"
+emit_result "$RESULT_FILE" "$STATUS" "$WORKFLOW finished: $OUTCOME"
+
+log "done: $OUTCOME"
+[ "$OUTCOME" = pass ] || exit 1
+exit 0

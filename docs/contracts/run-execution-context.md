@@ -306,6 +306,25 @@ are:
 | `payload` | `text` (default) or `json`. |
 | `created-at` | RFC3339. Defaults to when the agent first observed the file. |
 
+The file protocol above is the contract, and any producer that writes it is
+valid. The recommended producer is the CLI: `wefty run envelope|step|gate|result`
+writes these files, and `wefty run params` reads `params.json`, so a workflow
+never assembles a header block or an idempotency key by hand. It is not
+privileged — it writes files, exactly as a hand-rolled writer would, and
+changes no rule in this section — but it is the only producer that refuses an
+event this section would reject, writes each file exclusively through an opened
+mailbox root, and flushes it before the rename. `wefty workflow init NAME`
+scaffolds a starter that uses it, and, for the image that does not ship the
+binary, an inline POSIX writer that is parser-compatible but neither hardened
+nor durable; prefer the CLI wherever the binary exists.
+
+Publication order within a sweep is the file name's, and a producer that writes
+two events at the same clock reading has no way to order them: names carry a
+nanosecond stamp and a per-process sequence, so two separate processes that
+read the same nanosecond are ordered arbitrarily. This is a best-effort limit
+of the protocol, not of any one producer; a workflow that needs a strict order
+should not rely on two concurrent writers.
+
 The agent builds the protocol document and omits `attempt_id`: only L3 knows
 which attempt its run token is bound to, and it binds the field itself. A text
 payload becomes a gate's evidence entry or an envelope extension under

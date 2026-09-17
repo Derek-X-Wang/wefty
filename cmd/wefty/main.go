@@ -233,6 +233,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if commandArgs[0] == "node" {
 		return executeLocalNode(ctx, options, commandArgs[1:], stdout, stderr)
 	}
+	// The authoring surface runs before the fabric is opened, like `wefty
+	// node`. It writes files and never speaks to the cluster: a job reporting
+	// through its run mailbox holds no credential and has no identity to dial
+	// with, so requiring one here would defeat the mailbox entirely.
+	if handled, err := executeAuthoringCommand(options, commandArgs, stdout, stderr); handled {
+		return err
+	}
 	plainIdentity := fabric.Identity{
 		NodeID: options.plainIdentity, UserID: options.plainUserID, DeviceID: options.plainDeviceID,
 		Tags: []string{l3.DefaultCallerPrincipalTag},
@@ -243,6 +250,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return usageError("plain person commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
 		}
 	}
+	resolveFabricEnvironment(&options)
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
 		Identity:       plainIdentity,
@@ -263,6 +271,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	defer clients.close()
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
+}
+
+// resolveFabricEnvironment fills the credential defaults immediately before
+// the fabric is opened. Reading them earlier would mean `wefty run` touched a
+// coordination credential on a path that exists precisely because the caller
+// has none.
+func resolveFabricEnvironment(options *globalOptions) {
+	if options.authKey == "" {
+		options.authKey = os.Getenv("TS_AUTHKEY")
+	}
+	if options.controlURL == "" {
+		options.controlURL = os.Getenv("TS_CONTROL_URL")
+	}
 }
 
 func usesPersonProtocol(args []string) bool {
@@ -295,8 +316,12 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.plainFabricID, "plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain- prefixed Fabric authority")
 	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "tsnet logical node name")
 	flags.StringVar(&options.stateDirectory, "state-dir", "", "tsnet state directory")
-	flags.StringVar(&options.authKey, "auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
-	flags.StringVar(&options.controlURL, "control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
+	// These two default from the environment, but the read happens at
+	// resolveFabricEnvironment, after the authoring commands have been
+	// dispatched. `wefty run` reports from inside a job that holds no
+	// credential; it must not so much as look at one on the way.
+	flags.StringVar(&options.authKey, "auth-key", "", "tsnet auth key (default $TS_AUTHKEY)")
+	flags.StringVar(&options.controlURL, "control-url", "", "optional tsnet coordination URL (default $TS_CONTROL_URL)")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by singular node commands")
 	flags.Usage = func() { fmt.Fprint(stderr, rootUsage) }
@@ -385,6 +410,17 @@ Commands:
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
   drain NODE_ID              Disable new claims using the current intent revision
+  run <envelope|step|gate|result|params>
+                             Report from inside a running job by writing run
+                             mailbox events; needs no credential and no cluster
+    envelope --step STEP [--status succeeded|failed|partial --summary TEXT
+             --payload-file FILE | --payload-json-file FILE --key KEY]
+    step --name NAME [--end --summary TEXT]
+    gate --name NAME --outcome pass|fail|error|skipped [--evidence-file FILE --summary TEXT]
+    result --file PATH [--status succeeded|failed|partial --summary TEXT]
+    params [--json] [NAME]
+  workflow init NAME         Scaffold a runnable bash workflow starter
+    [--lang bash] [--dir DIR]
 
 Global flags:
   --fabric plain|tsnet

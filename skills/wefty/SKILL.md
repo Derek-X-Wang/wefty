@@ -19,8 +19,11 @@ least one `wefty-agent`, and the `wefty` CLI. Single-machine setup and the
 full flag reference live in `docs/acceptance/v0.1-dogfood.md` (v0.1 section);
 build all four binaries with `go build -o .bin/<name> ./cmd/<name>`.
 
-Every CLI call needs the endpoints: `--l1=<host:port> --l3=<host:port>`
-(plain fabric) — or the tsnet flags on a fleet. Set them once per shell.
+Every CLI call that reaches the cluster needs the endpoints:
+`--l1=<host:port> --l3=<host:port>` (plain fabric) — or the tsnet flags on a
+fleet. Set them once per shell. `wefty run ...` and `wefty workflow init` are
+the exceptions: they only write files, so they need no endpoint, no identity
+and no credential — see "Reporting from a workflow".
 
 ## Core operations
 
@@ -77,6 +80,41 @@ every other job route answers `principal_forbidden`. The child's
 `parent_job_id` is your own job ID, which is how a workload learns it. It works
 only while your attempt holds the lease. Service and Computer attempts do not
 receive these two variables yet.
+
+## Reporting from a workflow
+
+Do not hand-roll HTTP or JSON to report. A job that L3 dispatched receives
+`WEFTY_RUN_DIR`, its **run mailbox**: it writes event files there and the node
+agent publishes them to the ledger with the credential it already holds, so the
+workload needs none. Use the CLI, which writes those files and speaks to
+nothing:
+
+```sh
+wefty run params ref                                   # a submitted param
+wefty run step --name build --summary "compiling"      # ... work ... then --end
+wefty run envelope --step build --status succeeded --summary "built" \
+  --payload-file detail.txt                            # or --payload-json-file
+wefty run gate --name vet --outcome fail --evidence-file failures.txt
+wefty run result --file result.json --status failed    # also lands in the handoff dir
+```
+
+Add `--json` to print the written event's path. Every subcommand fails with a
+clear message when `WEFTY_RUN_DIR` is absent — an OCI job does not receive one
+yet. Submit with `--required-envelope` so a job that exits 0 having reported
+nothing cannot pass for a success.
+
+Start a new workflow with `wefty workflow init NAME`: it writes a runnable bash
+starter using those subcommands (with an inline POSIX writer for an image that
+does not ship the binary — parser-compatible, but neither hardened nor durable,
+so prefer the binary), a README with the submit/follow/inspect commands, and a
+test that exercises the starter without a cluster. bash is the only language
+the scaffold writes; a TypeScript workflow needs a bundle step, because a
+submission carries one inline script that the node materializes without a file
+extension.
+
+Scope check before writing one: a mailbox write is a claim about the writing
+run and nothing else. Reporting through it confers no authority, so design the
+workflow as if reporting is all it can do.
 
 ## Judging results
 
