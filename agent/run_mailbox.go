@@ -1020,9 +1020,15 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 	}
 	raw, truncated, err := m.readEvent(name)
 	if err != nil {
-		if errors.Is(err, errRunMailboxEntryUnusable) || errors.Is(err, os.ErrNotExist) {
-			// Positively classified: this entry can never become an event, so
-			// removing it loses nothing.
+		if errors.Is(err, errRunMailboxEntryUnusable) {
+			// The implementation looked at the entry and says it can never
+			// become an event, so removing it loses nothing. This sentinel is
+			// the only thing that reaches discard. In particular a bare
+			// os.ErrNotExist is NOT enough: a missing helper socket is an
+			// ENOENT about the transport, not about the entry, and acting on
+			// it would delete a run's only copy of its evidence. An
+			// implementation that can genuinely tell an entry vanished says so
+			// with this sentinel itself.
 			m.log("agent: run %s mailbox entry %q is not a publishable event: %v", m.runID, name, err)
 			return m.discard(name)
 		}

@@ -274,9 +274,11 @@ func applyRunMailboxOwnership(root *os.Root, name string, mode os.FileMode, uid,
 
 // writeRunMailboxParams writes then renames inside the mailbox, so the
 // workload never observes a partial document and a name a workload planted is
-// replaced rather than written through. The document stays root-owned and
+// replaced rather than written through. The document is helper-owned and
 // world-readable: every uid the image might declare must be able to read its
-// own run's parameters, and none of them may rewrite them.
+// own run's parameters, and a non-root one cannot rewrite them. A uid-0
+// workload can, as it can rewrite anything in the volume; that is the
+// defense-in-depth limit stated above, not a boundary.
 func writeRunMailboxParams(mailbox *os.Root, document []byte) (resultErr error) {
 	staging := RunMailboxParamsFileName + ".tmp"
 	if err := mailbox.Remove(staging); err != nil && !errors.Is(err, os.ErrNotExist) {

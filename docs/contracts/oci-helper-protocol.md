@@ -486,9 +486,12 @@ A read proves the entry is a regular file before and after opening it, opens
 non-blocking so a FIFO planted in the directory cannot block the helper, and
 stops at the byte cap. A removal classifies the entry first and never recurses,
 so workload data is never walked. Nothing here creates a missing directory: an
-absent mailbox is a refusal, not an empty one. Every operation honours the
-operation context, so a closing session or an attempt whose reap has begun
-cannot leave an in-flight descent or read running behind it. The helper never
+absent mailbox is a refusal, not an empty one. Admission is fenced on the live
+attempt, and every operation then checks its own context cooperatively between
+steps: a cancelled or reaping session stops the next step rather than
+interrupting a filesystem call already executing, so an operation admitted
+before the reap may still complete and what it read may still be published. The
+helper never
 parses an event; the file protocol, the publication bounds and the ordering are
 all the agent's (`docs/contracts/run-execution-context.md`).
 
@@ -496,11 +499,12 @@ This descent is the boundary, and the volume's permissions are not. An image
 that declares no `USER` runs as uid 0 with no user namespace, so root inside the
 container is root on the bind mount and can rewrite anything in the volume. The
 permissions above are defense in depth for the ordinary non-root image; what
-holds at every uid is that the agent never opens the volume, the descent refuses
-whatever a workload plants, the volume is scoped to a single run so there is no
-sibling run inside it to reach, and the agent's own bookkeeping is not in the
-volume at all. A uid-0 workload can therefore corrupt its own run's evidence,
-which it could equally do by reporting nothing, and nothing further.
+holds at every uid is that confinement is to the handoff owner's volume. That
+volume is shared by a run and its cold reruns, which keep their source run as
+handoff owner, so it holds that lineage's retained evidence as well as this
+run's, and a uid-0 workload can alter all of it. What it cannot reach is
+anything outside that volume: another handoff owner's volume, the agent's
+bookkeeping, or the rest of the node.
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
 The helper emits an internal backend-ready marker only after that connection is

@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -425,5 +426,54 @@ func TestRemoteRunMailboxSeedAcceptsParamsAtTheLedgersOwnBound(t *testing.T) {
 					len(seed.Params), ocihelper.MaxRunMailboxParamsBytes)
 			}
 		})
+	}
+}
+
+// TestRemoteRunMailboxKeepsAnEntryWhoseTransportReportedENOENT is the exact
+// shape the second review found: a missing helper socket is an ENOENT about the
+// transport, and the client preserves that cause through its runtime-loss
+// wrapper. If the publisher took any os.ErrNotExist as "the entry is gone" it
+// would delete a run's only copy of evidence the helper never even looked at.
+// Only the runtime's own classification may reach removal.
+func TestRemoteRunMailboxKeepsAnEntryWhoseTransportReportedENOENT(t *testing.T) {
+	appender := newRecordingAppender("")
+	runtime := newFakeRunMailboxRuntime()
+	runtime.put("0001-alpha", mailboxAgnosticFirstEvent)
+	runtime.put("0002-beta", mailboxAgnosticLastEvent)
+	// A dial failure against an absent Unix socket, wrapped the way the OCI
+	// adapter's runtime-loss error wraps it. Removal is deliberately left
+	// working, so nothing but the classification rule protects the evidence.
+	runtime.readErr = fmt.Errorf("open OCI helper session: %w",
+		&fs.PathError{Op: "dial", Path: "/run/wefty/oci-helper.sock", Err: syscall.ENOENT})
+	mailbox, _ := newRemoteTestMailbox(t, appender, runtime, "")
+
+	if !errors.Is(runtime.readErr, fs.ErrNotExist) {
+		t.Fatal("the fixture no longer reproduces a transport ENOENT")
+	}
+	if drained := mailbox.sweep(context.Background()); drained {
+		t.Fatal("a sweep whose read failed on the transport reported the mailbox drained")
+	}
+	if removals := runtime.removals(); len(removals) != 0 {
+		t.Fatalf("a transport ENOENT removed %v", removals)
+	}
+	if remaining := runtime.remaining(); len(remaining) != 2 {
+		t.Fatalf("entries left = %v, want both preserved", remaining)
+	}
+	if documents := appender.snapshot(); len(documents) != 0 {
+		t.Fatalf("published %d documents while the transport was down", len(documents))
+	}
+
+	mailbox.finalize(context.Background())
+	if !mailbox.publicationIncomplete() {
+		t.Fatal("a transport failure across finalization did not latch publicationIncomplete")
+	}
+	if removals := runtime.removals(); len(removals) != 0 {
+		t.Fatalf("finalization removed %v", removals)
+	}
+	if remaining := runtime.remaining(); len(remaining) != 2 {
+		t.Fatalf("entries left after finalization = %v, want both preserved", remaining)
+	}
+	if documents := appender.snapshot(); len(documents) != 0 {
+		t.Fatalf("finalization published %d documents", len(documents))
 	}
 }

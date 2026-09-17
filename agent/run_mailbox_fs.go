@@ -81,7 +81,18 @@ func (fs *osRootMailboxFS) list(limit int) ([]string, bool, error) {
 // the size bound. The non-blocking open is what keeps a FIFO planted in the
 // events directory from holding finalization open forever.
 func (fs *osRootMailboxFS) read(name string, limit int) ([]byte, bool, error) {
-	return readBoundedRegularFile(fs.events, name, limit)
+	payload, truncated, err := readBoundedRegularFile(fs.events, name, limit)
+	if errors.Is(err, os.ErrNotExist) {
+		// An entry that was listed and is gone by the time it is read was
+		// retired by something else, or never survived its own rename. This
+		// implementation opened the directory itself, so the absence is a fact
+		// about the entry and is classified here rather than left as a generic
+		// error the publisher would have to interpret -- which is exactly what
+		// it must not do, because an ENOENT from a transport means something
+		// entirely different.
+		return nil, false, fmt.Errorf("%w: %q is absent", errRunMailboxEntryUnusable, name)
+	}
+	return payload, truncated, err
 }
 
 // remove never recursively walks workload data. Unknown objects and nonempty

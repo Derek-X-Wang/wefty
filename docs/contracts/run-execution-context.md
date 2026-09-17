@@ -521,13 +521,16 @@ only by opening each component relative to the one above it and refusing any
 symlink or non-directory (`docs/contracts/oci-helper-protocol.md`, "Run mailbox
 confinement"). An image that declares no `USER` runs as uid 0 with no user
 namespace, so root inside the container is root on this bind mount and can
-rewrite anything in it. That is contained rather than prevented: the volume is
-scoped to one run, so there is no sibling run inside it to reach; a workload
-that replaces `events/` with a symlink only makes its own mailbox unreadable,
-because the descent refuses it; and `.published/` is not in the volume at all —
-for an OCI attempt the bookkeeping is agent-local, per attempt, so no uid inside
-the container can forge it. The worst a uid-0 workload achieves is corrupting
-its own run's evidence, which it could equally do by writing nothing.
+rewrite anything in it. That is contained rather than prevented, and the
+containment is the volume: a workload reaches its handoff owner's volume and
+nothing outside it. That volume is not always one run's. A cold rerun keeps its
+source run as handoff owner, so a source run and its reruns on the same node
+share one volume, each with its own `.wefty/<run id>` inside it, and a uid-0
+workload can alter the retained evidence of its own lineage as well as its own.
+It cannot reach any other run, the agent's bookkeeping — `.published/` is not in
+the volume at all, and for an OCI attempt it is agent-local and per attempt — or
+anything else on the node; and a workload that replaces `events/` with a symlink
+only makes its own mailbox unreadable, because the descent refuses it.
 
 The permissions are defense in depth for the ordinary case, a non-root image.
 The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable
@@ -554,13 +557,14 @@ workload has returned and the attempt is still live, the only window in which
 every event is both complete and still reachable — and after it for a process
 attempt, whose quiescence that reap is what proves.
 
-A run whose evidence all reached the ledger is complete, and its handoff volume
-is removed immediately when the attempt finishes, by the agent's managed-volume
-finalizer through the helper. Retention is the failure path: if the drain cannot
-finish — the helper stopped answering, a deadman guardian reaped the attempt
-first, or an entry could not be read — publication is marked incomplete, the
-volume is retained under the ordinary failure rules instead of being removed,
-and the helper's boot sweep expires it after its retention window. A read that
+The handoff volume is removed immediately, by the agent's managed-volume
+finalizer through the helper, only when the attempt both executed successfully —
+no execution error and exit code zero — and published all of its evidence.
+Everything else retains it: a workload that failed keeps its volume even if
+every event it wrote reached the ledger, and a successful workload keeps it if
+the drain could not finish, because the helper stopped answering, a deadman
+guardian reaped the attempt first, or an entry could not be read. A retained
+volume is expired by the helper's boot sweep after its retention window. A read that
 fails for any reason other than the helper positively classifying the entry as
 unpublishable leaves that entry in place: an unreachable entry is never mistaken
 for junk, because deleting a run's only copy of its evidence on the strength of
