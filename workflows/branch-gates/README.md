@@ -23,21 +23,60 @@ scaffold, no `runs list`, no `wait`. Every awkward step is a requirement for
 | `test` | `go test ./...` | the expensive one |
 
 The default gate set is all four, in that order. `params.gates` selects a
-subset, e.g. `"gates":"gofmt,vet"` for a quick syntax pass. The list is
-validated before anything is cloned: an empty element (`","`), whitespace, an
-unknown name or a repeat is a workflow error, never a silently reduced run.
+subset, e.g. `"gates":"gofmt,vet"` for a quick syntax pass. An empty string
+means the same as omitting the param: the default set. Anything else that would
+silently reduce the set is rejected before anything is cloned — an empty element
+(`","`), whitespace, an unknown name or a repeat is a workflow error.
 
 ## Trust boundary
 
-The repository under test is untrusted code. The clone, the checkout and every
-gate run under `env -i` with a small allowlist (`PATH`, `HOME`, `LANG`,
-`LC_ALL`, `TMPDIR`, `GIT_TERMINAL_PROMPT`, `GOFLAGS`, `GOTOOLCHAIN`, `GOCACHE`,
-`GOMODCACHE`, `GOPATH`), so no `WEFTY_*` value — run token, attempt credential
-or anything the contract adds later — is visible to them. That matters twice:
-a gate's raw output is copied verbatim into `failures.txt` before the agent's
-log redaction ever sees it, and a credential reaching the subject would let it
-write its own run or submit L1 children. All L3 reporting happens in the
-workflow shell, outside every gate process.
+**The gates run under the run's own OS identity, as descendants of the workflow
+shell, and that shell holds the run token for the whole run. A deliberately
+hostile branch can therefore recover the run token — from an ancestor's
+environment, for example — and use it to write its own run or submit child
+jobs. Only run branch-gates on branches you trust. Removing the token from the
+job entirely, so the agent publishes envelopes from a file protocol and the
+workload never holds a credential, is a #476 design item; until then this is a
+convenience boundary, not a security one.**
+
+What the workflow does do, because it is cheap and it closes the ordinary
+accidents:
+
+- The clone, the checkout and every gate run under `env -i`, so no `WEFTY_*`
+  value is in the gate process's own environment. A failing test that prints
+  its environment — the usual way a token ends up in `failures.txt`, which is
+  copied verbatim before the agent's log redaction ever sees it — gets nothing.
+- The run token never appears in an argument vector: `curl` reads the
+  `Authorization` header from a `0600` config file inside the run's private
+  scratch directory.
+- `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `TMPDIR`, `GOCACHE`,
+  `GOMODCACHE` and `GOPATH` are fresh per-run directories under that scratch
+  directory, so the subject cannot read the operator's `.netrc`, `.gitconfig`,
+  credential helpers, SSH config or Go env file, and cannot poison a cache that
+  a later run or gate will use. The cost is a cold Go cache on every run.
+- `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`, so a checkout
+  cannot pick up a configured hook or filter from the operator's Git setup.
+- `PATH` is rebuilt from the tools this workflow resolved (`go`, `gofmt`,
+  `git`, `bash`, `sh`) plus `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+  not inherited.
+- All L3 reporting happens in the workflow shell, outside every gate process.
+
+The scratch directory is short and symlink-free by construction —
+`<root>/wefty-bg-<12 hex of the run id>`, with `<root>` defaulting to `/tmp`
+resolved to its physical path (`BRANCH_GATES_WORK_ROOT` overrides it). Both
+properties are load-bearing for a subject that is itself a systems project: a
+unix socket path is capped at 104 bytes, and wefty's own agent refuses a managed
+root reached through a symlink, which `/tmp` is on macOS. Running wefty's own
+`go test ./...` inside a branch-gates job fails on either.
+
+The complete environment handed to the subject is `env -i` plus: `PATH`,
+`HOME`, `TMPDIR`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `GOCACHE`, `GOMODCACHE`,
+`GOPATH`, `GOTOOLCHAIN`, `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_NOSYSTEM=1`, and — passed through only when set on the node, because
+they are configuration rather than secrets and a private or offline setup needs
+them — `LANG`, `LC_ALL`, `GOFLAGS`, `GOPROXY`, `GOSUMDB`, `GONOSUMDB`,
+`GOPRIVATE`, `GOINSECURE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, and the proxy
+variables in both cases (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`).
 
 ## Inputs (run params)
 
@@ -204,4 +243,14 @@ Kept here because #476 and #477 are supposed to remove it:
 - No handoff read: nothing reads a file back out of an OCI handoff volume, and
   a succeeding attempt deletes the directory outright.
 - No wait, no run listing: following `logs` is the only way to know the run
-  finished, and `inspect` needs a run ID you kept by hand.
+  finished (the workflow prints a final `done:` line so there is at least a
+  marker to wait for), and `inspect` needs a run ID you kept by hand.
+- A `fail` or `error` gate makes the run terminal in L3 *while the workload is
+  still running*: `.run.status` reads `failed` before the script has finished
+  writing files, echoing them and cleaning up its scratch directory. Anything
+  that treats terminal as "the job is done" — including tearing the stack down —
+  can truncate that teardown.
+- The job holds the reporting credential for its whole life, so isolating
+  untrusted work from it needs an OS boundary the workflow cannot build for
+  itself. A protocol where the agent publishes envelopes from a file the
+  workload writes would remove the token from the job entirely.

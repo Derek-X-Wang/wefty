@@ -13,7 +13,8 @@
 #
 #   ref        required   branch, tag or commit to test
 #   repo_url   optional   clone source (default: the public wefty repository)
-#   gates      optional   comma-separated subset of gofmt,fabric-boundary,vet,test
+#   gates      optional   comma-separated subset of gofmt,fabric-boundary,vet,test;
+#                         an empty string means the same as omitting it
 #   copy_to    optional   directory to copy the two result files into, for an
 #                         OCI run whose handoff volume is not reachable from the
 #                         host (pair it with an operator --mount)
@@ -21,13 +22,15 @@
 # BRANCH_GATES_REF / BRANCH_GATES_REPO_URL / BRANCH_GATES_GATES /
 # BRANCH_GATES_COPY_TO override the params for a local dry run.
 #
-# The repository under test is untrusted code. Every process that touches it —
-# the clone, the checkout and each gate — runs under `env -i` with a small
-# allowlist, so no run token, attempt credential or other WEFTY_* value is ever
-# visible to it. That matters twice: a gate's raw output is copied verbatim into
-# failures.txt before the agent's log redaction ever sees it, and a credential
-# reaching the subject would let it write its own run or submit L1 children.
-# All L3 reporting happens in this shell, outside every gate process.
+# Trust boundary: the gates run as the run's own OS user, as descendants of
+# this shell, which holds the run token for the whole run. `env -i` with a small
+# allowlist, fresh per-run HOME/XDG/Go caches and disabled global Git
+# configuration keep credentials and operator state out of the ordinary path --
+# it stops a failing test from printing the token into failures.txt, which is
+# copied verbatim before any log redaction -- but it is hygiene, not an OS
+# boundary: a deliberately hostile branch running under the same UID can still
+# reach this shell's environment. Only test branches you trust. Removing the
+# token from the job entirely is a #476 design item.
 #
 # Exit codes carry the verdict, deliberately. The node agent removes a handoff
 # directory as soon as its attempt succeeds (docs/contracts/run-execution-context.md,
@@ -88,6 +91,53 @@ STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 mkdir -p "$HANDOFF_DIR" || abort "cannot create handoff directory $HANDOFF_DIR"
 
+# Everything this run creates lives under one private scratch directory: the
+# curl auth config, the clone, the gate logs and every directory the subject is
+# allowed to write. The Go module cache makes its directories read-only, so the
+# sweep restores write permission before removing the tree.
+# Deliberately short and deliberately not under $TMPDIR: a subject's own tests
+# create unix sockets under the TMPDIR handed to them, and a socket path is
+# capped at 104 bytes on macOS. The per-user $TMPDIR there is already ~49 bytes,
+# so a work directory named after the full run ID pushes the subject's sockets
+# over the limit -- wefty's own suite fails that way. BRANCH_GATES_WORK_ROOT
+# overrides the root for a node whose /tmp is unsuitable.
+# The root is resolved to its physical path because /tmp is a symlink on macOS
+# and code under test refuses symlinked components (wefty's own agent does).
+WORK_ROOT=${BRANCH_GATES_WORK_ROOT:-/tmp}
+WORK_ROOT=$(cd "$WORK_ROOT" 2>/dev/null && pwd -P) ||
+	abort "work root ${BRANCH_GATES_WORK_ROOT:-/tmp} is not a usable directory"
+WORK_DIR=$WORK_ROOT/wefty-bg-$(printf '%.12s' "${RUN_ID##*_}")
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR" || abort "cannot create $WORK_DIR"
+chmod 0700 "$WORK_DIR" 2>/dev/null || true
+# shellcheck disable=SC2329 # invoked by the EXIT trap below.
+cleanup() {
+	status=$?
+	# The curl config carries the run token: remove it first and unconditionally.
+	rm -f "${CURL_CONFIG:-}" 2>/dev/null || true
+	if [ -d "$WORK_DIR" ]; then
+		# The Go module cache -- and a downloaded toolchain in particular --
+		# leaves read-only directories that u+w alone cannot make traversable.
+		chmod -R u+rwX "$WORK_DIR" 2>/dev/null || true
+		rm -rf "$WORK_DIR" || true
+		if [ -d "$WORK_DIR" ]; then
+			printf '%s: WARNING: scratch directory %s survived cleanup\n' "$WORKFLOW" "$WORK_DIR"
+		fi
+	fi
+	return "$status"
+}
+trap cleanup EXIT
+
+# The run token stays out of every argument vector: curl reads the
+# Authorization header from a 0600 config file instead of --header. This is
+# hygiene, not a boundary -- see "Trust boundary" in the README.
+CURL_CONFIG=$WORK_DIR/curl.conf
+(
+	umask 077
+	printf 'header = "Authorization: Bearer %s"\n' \
+		"$(printf '%s' "$RUN_TOKEN" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')" >"$CURL_CONFIG"
+) || abort "cannot write the curl authorization config"
+
 # --------------------------------------------------------------------------
 # JSON without a helper
 #
@@ -125,13 +175,18 @@ l3_call() {
 	method=$1
 	path=$2
 	body_file=${3:-}
+	# Never let a previous request's status decide this one.
+	L3_STATUS=000
 	[ -z "$L3_RESPONSE_FILE" ] || rm -f "$L3_RESPONSE_FILE"
-	L3_RESPONSE_FILE=$(mktemp) || return 1
+	L3_RESPONSE_FILE=$(mktemp) || {
+		L3_ERROR="cannot create a response file for $method $path"
+		return 1
+	}
 	if [ -n "$body_file" ]; then
 		L3_STATUS=$(curl --silent --show-error --max-time 60 \
 			--output "$L3_RESPONSE_FILE" --write-out '%{http_code}' \
 			--request "$method" \
-			--header "Authorization: Bearer $RUN_TOKEN" \
+			--config "$CURL_CONFIG" \
 			--header 'Content-Type: application/json' \
 			--data-binary "@$body_file" \
 			"$L3_ENDPOINT$path") || L3_STATUS=000
@@ -139,7 +194,7 @@ l3_call() {
 		L3_STATUS=$(curl --silent --show-error --max-time 60 \
 			--output "$L3_RESPONSE_FILE" --write-out '%{http_code}' \
 			--request "$method" \
-			--header "Authorization: Bearer $RUN_TOKEN" \
+			--config "$CURL_CONFIG" \
 			"$L3_ENDPOINT$path") || L3_STATUS=000
 	fi
 }
@@ -162,7 +217,10 @@ append_envelope() {
 		"$(json_escape "$summary")" \
 		"$extensions" \
 		"$(timestamp)" >"$body"
-	l3_call POST "/v1/runs/$RUN_ID/envelopes" "$body"
+	l3_call POST "/v1/runs/$RUN_ID/envelopes" "$body" || {
+		rm -f "$body"
+		return 1
+	}
 	rm -f "$body"
 	case "$L3_STATUS" in
 	200 | 201) return 0 ;;
@@ -188,7 +246,10 @@ append_gate() {
 		"$outcome" \
 		"$evidence" \
 		"$(timestamp)" >"$body"
-	l3_call POST "/v1/runs/$RUN_ID/gates" "$body"
+	l3_call POST "/v1/runs/$RUN_ID/gates" "$body" || {
+		rm -f "$body"
+		return 1
+	}
 	rm -f "$body"
 	case "$L3_STATUS" in
 	200 | 201) return 0 ;;
@@ -241,6 +302,9 @@ fail_workflow() {
 	append_gate "$WORKFLOW" error \
 		"[{\"kind\":\"step\",\"value\":\"$(json_escape "$step")\"},{\"kind\":\"error\",\"value\":\"$(json_escape "$message")\"}]" ||
 		log "WARNING: $L3_ERROR"
+	# Last line on this path. An operator (and the CI exercise) can wait for
+	# "done:" instead of guessing whether the log has settled.
+	log "done: workflow-error at $step"
 	exit 1
 }
 
@@ -265,7 +329,7 @@ done
 # Input
 # --------------------------------------------------------------------------
 
-l3_call GET "/v1/runs/$RUN_ID" || fail_workflow input "cannot read the run record"
+l3_call GET "/v1/runs/$RUN_ID" || fail_workflow input "$L3_ERROR"
 case "$L3_STATUS" in
 200) ;;
 *) fail_workflow input "read run params returned HTTP $L3_STATUS" "$(cat "$L3_RESPONSE_FILE")" ;;
@@ -290,6 +354,9 @@ REPO_URL=${BRANCH_GATES_REPO_URL:-$(param repo_url)}
 GATES=${BRANCH_GATES_GATES:-$(param gates)}
 COPY_TO=${BRANCH_GATES_COPY_TO:-$(param copy_to)}
 [ -n "$REPO_URL" ] || REPO_URL=$DEFAULT_REPO_URL
+# An absent and a present-but-empty gates param are deliberately the same
+# thing: the default set. Anything else that would silently reduce the set --
+# an empty element, whitespace, an unknown name, a repeat -- is rejected below.
 [ -n "$GATES" ] || GATES=$DEFAULT_GATES
 
 if [ -z "$REF" ]; then
@@ -330,24 +397,58 @@ log "run $RUN_ID: gates [$GATES] on $REF from $REPO_URL"
 # Checkout
 # --------------------------------------------------------------------------
 
-WORK_DIR=${TMPDIR:-/tmp}/wefty-branch-gates-$RUN_ID
-rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR" || fail_workflow environment "cannot create $WORK_DIR"
-trap 'rm -rf "$WORK_DIR"' EXIT
 CLONE_DIR=$WORK_DIR/repo
-# The gates shell out to the Go toolchain, which needs a cache directory. A
-# container rootfs may carry no HOME at all.
-[ -n "${HOME:-}" ] || { HOME=$WORK_DIR/home && export HOME && mkdir -p "$HOME"; }
-export GIT_TERMINAL_PROMPT=0
-export GOTOOLCHAIN=${GOTOOLCHAIN:-auto}
 
-# SUBJECT_ENV is the complete environment handed to untrusted code: `env -i`
-# plus the few names the clone and the gates genuinely need. Nothing else
-# crosses, so WEFTY_RUN_TOKEN and WEFTY_ATTEMPT_TOKEN cannot reach the subject
-# repository or its output.
-SUBJECT_ENV=(env -i)
-for name in PATH HOME LANG LC_ALL TMPDIR GIT_TERMINAL_PROMPT \
-	GOFLAGS GOTOOLCHAIN GOCACHE GOMODCACHE GOPATH; do
+# Every directory the subject may write is fresh and private to this run, so it
+# can neither read the operator's dotfiles (.netrc, .gitconfig, credential
+# helpers, SSH config, the Go env file) nor poison a shared cache for the next
+# run. The cost is a cold Go cache on every run; warm-cache seeding is a later
+# question, not a correctness one.
+SUBJECT_HOME=$WORK_DIR/subject-home
+SUBJECT_TMP=$WORK_DIR/subject-tmp
+SUBJECT_GOCACHE=$WORK_DIR/go-build
+SUBJECT_GOMODCACHE=$WORK_DIR/go-mod
+SUBJECT_GOPATH=$WORK_DIR/go-path
+mkdir -p "$SUBJECT_HOME/.config" "$SUBJECT_HOME/.cache" "$SUBJECT_TMP" \
+	"$SUBJECT_GOCACHE" "$SUBJECT_GOMODCACHE" "$SUBJECT_GOPATH" ||
+	fail_workflow environment "cannot create the subject directories under $WORK_DIR"
+
+# A fixed PATH built from the tools this workflow verified, plus the standard
+# system directories -- not the ambient PATH.
+SUBJECT_PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+for tool in go gofmt git bash sh; do
+	resolved=$(command -v "$tool" 2>/dev/null) || continue
+	directory=$(dirname "$resolved")
+	case ":$SUBJECT_PATH:" in
+	*":$directory:"*) ;;
+	*) SUBJECT_PATH="$directory:$SUBJECT_PATH" ;;
+	esac
+done
+
+# SUBJECT_ENV is the complete environment handed to the code under test: `env -i`
+# plus exactly these names. No WEFTY_* value crosses it, global and system Git
+# configuration are disabled so a hostile checkout cannot activate a configured
+# hook or filter, and the Go caches point into this run's scratch directory.
+SUBJECT_ENV=(
+	env -i
+	"PATH=$SUBJECT_PATH"
+	"HOME=$SUBJECT_HOME"
+	"TMPDIR=$SUBJECT_TMP"
+	"XDG_CONFIG_HOME=$SUBJECT_HOME/.config"
+	"XDG_CACHE_HOME=$SUBJECT_HOME/.cache"
+	"GOCACHE=$SUBJECT_GOCACHE"
+	"GOMODCACHE=$SUBJECT_GOMODCACHE"
+	"GOPATH=$SUBJECT_GOPATH"
+	"GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
+	GIT_TERMINAL_PROMPT=0
+	GIT_CONFIG_GLOBAL=/dev/null
+	GIT_CONFIG_NOSYSTEM=1
+)
+# Configuration, not secrets: a private or offline node needs these to resolve
+# modules and trust its CA at all, so they are passed through when set.
+for name in LANG LC_ALL GOFLAGS GOPROXY GOSUMDB GONOSUMDB GOPRIVATE GOINSECURE \
+	SSL_CERT_FILE SSL_CERT_DIR HTTP_PROXY HTTPS_PROXY NO_PROXY \
+	http_proxy https_proxy no_proxy; do
 	eval "value=\${$name:-}"
 	[ -z "$value" ] || SUBJECT_ENV+=("$name=$value")
 done
@@ -478,6 +579,8 @@ append_gate "$WORKFLOW" "$VERDICT" \
 log "verdict $VERDICT for $REF ($COMMIT): $FAILED_GATES of $RAN_GATES gates failed"
 if [ "$FAILED_GATES" -gt 0 ]; then
 	log "handoff directory $HANDOFF_DIR is retained because this attempt fails"
+	log "done: $VERDICT"
 	exit 1
 fi
+log "done: $VERDICT"
 exit 0

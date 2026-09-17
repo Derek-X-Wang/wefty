@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -47,6 +48,13 @@ const (
 	// shell exits, so the result.json line can still be in flight.
 	logSettleBudget = 60 * time.Second
 	resultPrefix    = `{"schema_version":1,"workflow":"branch-gates"`
+	// doneMarker is the workflow's last log line on every path, so the poll
+	// below can wait for a settled log instead of guessing.
+	doneMarker = "branch-gates: done"
+	// perRequestBudget caps one log read so a stalled request cannot consume
+	// the whole settle budget.
+	perRequestBudget = 10 * time.Second
+	probeMarker      = "wefty environment: ["
 )
 
 // gateResult mirrors one entry of the workflow's result.json.
@@ -127,6 +135,10 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 		wantPassed   bool
 		wantOutcomes map[string]string
 		wantFailures []string
+		// wantProbes is how many subject-environment probes must appear in the
+		// run log: the broken branch runs one in the boundary script and one in
+		// the failing test, and both are echoed with failures.txt.
+		wantProbes int
 	}{
 		{
 			name:         "clean branch passes every gate",
@@ -140,8 +152,9 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			ref:          "broken",
 			wantRunState: contract.RunFailed,
 			wantPassed:   false,
-			wantOutcomes: map[string]string{"gofmt": "fail", "fabric-boundary": "pass", "vet": "pass", "test": "fail"},
-			wantFailures: []string{"unformatted.go", "TestDeliberateFailure", "FAIL"},
+			wantOutcomes: map[string]string{"gofmt": "fail", "fabric-boundary": "fail", "vet": "pass", "test": "fail"},
+			wantFailures: []string{"unformatted.go", "fabric boundary probe", "TestDeliberateFailure", "FAIL"},
+			wantProbes:   2,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -223,15 +236,17 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 						t.Fatalf("failures.txt does not contain %q:\n%s", want, failures)
 					}
 				}
-				if strings.Contains(string(failures), "===== fabric-boundary") || strings.Contains(string(failures), "===== vet") {
+				if strings.Contains(string(failures), "===== vet") {
 					t.Fatalf("failures.txt carries output from a passing gate:\n%s", failures)
 				}
 				// The subject's test printed every WEFTY_* variable it could
 				// see. An empty list is the assertion: no run token, no
 				// attempt credential, nothing else from the contract.
-				assertNoCredentialLeak(t, "failures.txt", string(failures))
+				// One probe from the boundary script, one from the test.
+				assertCredentialProbe(t, "failures.txt", string(failures), 2)
 			}
-			assertNoCredentialLeak(t, "run log", logs)
+			assertCredentialProbe(t, "run log", logs, testCase.wantProbes)
+			assertScratchRemoved(t, accepted.RunID)
 
 			// The ledger carries one envelope per gate plus the single final
 			// gate result appended by hand through the L3 API.
@@ -395,20 +410,54 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 				record.Gates[0].Outcome != contract.GateError {
 				t.Fatalf("gates = %#v, want one branch-gates gate with outcome error", record.Gates)
 			}
-			assertNoCredentialLeak(t, "run log", logs)
+			assertCredentialProbe(t, "run log", logs, 0)
+			assertScratchRemoved(t, accepted.RunID)
 		})
 	}
 }
 
-// assertNoCredentialLeak fails when a credential the subject repository must
-// never see shows up in an operator-visible surface.
-func assertNoCredentialLeak(t *testing.T, surface, content string) {
+// assertScratchRemoved pins the workflow's own cleanup: the scratch directory
+// holds the clone, the Go caches and the 0600 curl config carrying the run
+// token, so it must not outlive the run on either path.
+//
+// It polls, because a `fail` or `error` gate makes the run terminal in L3 while
+// the workload is still exiting: the run reads as failed before the shell has
+// finished its EXIT trap. Tearing the stack down the instant a run goes
+// terminal truncates that teardown -- which is worth knowing for #477 as well
+// as here.
+func assertScratchRemoved(t *testing.T, runID string) {
 	t.Helper()
-	if strings.Contains(content, "wefty environment: [") &&
-		!strings.Contains(content, "wefty environment: []") {
-		t.Fatalf("%s shows WEFTY_* variables inside a gate process:\n%s", surface, content)
+	suffix := runID[strings.LastIndex(runID, "_")+1:]
+	if len(suffix) > 12 {
+		suffix = suffix[:12]
 	}
-	for _, needle := range []string{"WEFTY_RUN_TOKEN=", "WEFTY_ATTEMPT_TOKEN=", "Bearer "} {
+	scratch := filepath.Join("/tmp", "wefty-bg-"+suffix)
+	deadline := time.Now().Add(logSettleBudget)
+	for {
+		_, err := os.Stat(scratch)
+		if os.IsNotExist(err) {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("scratch directory %s survived the run by %s: %v", scratch, logSettleBudget, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// assertCredentialProbe requires wantProbes copies of the subject's environment
+// probe to be present and every one of them to be empty, then rejects any
+// credential that reached an operator-visible surface. Requiring the marker is
+// the point: a probe that silently stopped running would otherwise look clean.
+func assertCredentialProbe(t *testing.T, surface, content string, wantProbes int) {
+	t.Helper()
+	if got := strings.Count(content, probeMarker); got < wantProbes {
+		t.Fatalf("%s carries %d environment probes, want at least %d:\n%s", surface, got, wantProbes, content)
+	}
+	if empty := strings.Count(content, probeMarker+"]"); empty != strings.Count(content, probeMarker) {
+		t.Fatalf("%s shows WEFTY_* variables inside a subject process:\n%s", surface, content)
+	}
+	for _, needle := range []string{"WEFTY_RUN_TOKEN", "WEFTY_ATTEMPT_TOKEN", "Bearer "} {
 		if strings.Contains(content, needle) {
 			t.Fatalf("%s leaks %q:\n%s", surface, needle, content)
 		}
@@ -433,6 +482,15 @@ func initializeSubjectRepository(t *testing.T) string {
 
 	runGit(t, repo, "checkout", "-b", "broken")
 	writeFile(t, repo, "unformatted.go", "package subject\nfunc  Unformatted()   int {return   1}\n")
+	// The boundary script is the second executable boundary: a plain shell
+	// process rather than a Go test binary. It prints the same probe and fails,
+	// so its raw output also lands in failures.txt.
+	writeFile(t, repo, "scripts/check-fabric-boundary.sh", `#!/usr/bin/env bash
+set -u
+visible=$(env | grep '^WEFTY_' | tr '\n' ' ')
+printf 'fabric boundary probe; wefty environment: [%s]\n' "${visible% }"
+exit 1
+`)
 	// The failing test doubles as the credential-leak probe: it prints every
 	// WEFTY_* variable it can see, and that raw output is copied into
 	// failures.txt before any redaction. The assertion is that the list is
@@ -596,50 +654,72 @@ func waitForTerminalRun(t *testing.T, store *l3.Store, runID string, timeout tim
 	return contract.RunRecord{}
 }
 
-func runLogs(t *testing.T, client *http.Client, runID string) string {
-	t.Helper()
-	response, err := client.Get("http://run-ledger.invalid/v1/runs/" + runID + "/logs?limit=1000")
+// fetchRunLogs reads the run log under an explicit deadline.
+func fetchRunLogs(client *http.Client, runID string, budget time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://run-ledger.invalid/v1/runs/"+runID+"/logs?limit=1000", nil)
 	if err != nil {
-		t.Fatal(err)
+		return "", err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("get run logs = %d body=%s", response.StatusCode, body)
+		return "", fmt.Errorf("get run logs = %d body=%s", response.StatusCode, body)
 	}
 	var page l1.LogPage
 	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
-		t.Fatal(err)
+		return "", err
 	}
 	var output strings.Builder
 	for _, event := range page.Events {
 		output.Write(event.Bytes)
 	}
-	return output.String()
+	return output.String(), nil
 }
 
-// waitForResultJSON polls the run log for the result.json line the workflow
-// echoes. A failing gate makes the run terminal in L3 before the shell exits,
-// so the last log flush can still be in flight when the run is already
-// readable as failed.
+// waitForResultJSON polls the run log until the workflow's final "done:" line
+// has arrived and result.json is present. A failing gate makes the run terminal
+// in L3 before the shell exits, so both the result line and the failure output
+// can still be in flight when the run already reads as failed. Each request is
+// bounded so one stalled read cannot consume the whole settle budget.
 func waitForResultJSON(t *testing.T, client *http.Client, runID string, timeout time.Duration) ([]byte, string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var logs string
 	for {
-		logs = runLogs(t, client, runID)
-		for _, line := range strings.Split(logs, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, resultPrefix) {
-				return []byte(line), logs
-			}
-		}
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			break
+		}
+		if remaining > perRequestBudget {
+			remaining = perRequestBudget
+		}
+		fetched, err := fetchRunLogs(client, runID, remaining)
+		if err != nil {
+			if !time.Now().Before(deadline) {
+				t.Fatalf("read run logs within %s: %v", timeout, err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		logs = fetched
+		if strings.Contains(logs, doneMarker) {
+			for _, line := range strings.Split(logs, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, resultPrefix) {
+					return []byte(line), logs
+				}
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("run log does not carry result.json within %s:\n%s", timeout, logs)
+	t.Fatalf("run log does not carry %q and result.json within %s:\n%s", doneMarker, timeout, logs)
 	return nil, logs
 }
 
