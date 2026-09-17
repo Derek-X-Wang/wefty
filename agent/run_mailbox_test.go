@@ -1303,8 +1303,9 @@ func TestFencedAttemptPreservesComputerShutdownDeadline(t *testing.T) {
 	parent, cancelParent := context.WithDeadline(context.Background(), deadline)
 	defer cancelParent()
 	entered, releaseFence := make(chan struct{}), make(chan struct{})
+	var once sync.Once
 	attempt, cancelAttempt, release := fencedAttemptContext(parent, func(error) {
-		close(entered)
+		once.Do(func() { close(entered) })
 		<-releaseFence
 	})
 	defer release()
@@ -1328,6 +1329,23 @@ func TestFencedAttemptPreservesComputerShutdownDeadline(t *testing.T) {
 	<-attempt.Done()
 }
 
+// mailboxManualDeadline expires only when the test closes done, so appender
+// entry never races a wall-clock deadline. The real timer remains a watchdog.
+type mailboxManualDeadline struct {
+	context.Context
+	done chan struct{}
+}
+
+func (ctx mailboxManualDeadline) Done() <-chan struct{} { return ctx.done }
+func (ctx mailboxManualDeadline) Err() error {
+	select {
+	case <-ctx.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 func TestMailboxFinalizationDeadlineBoundsPollerJoinAndFinalSweep(t *testing.T) {
 	for _, polling := range []bool{false, true} {
 		t.Run(fmt.Sprintf("polling=%t", polling), func(t *testing.T) {
@@ -1343,39 +1361,58 @@ func TestMailboxFinalizationDeadlineBoundsPollerJoinAndFinalSweep(t *testing.T) 
 			mailbox, _, _ := newTestMailbox(t, appender, "")
 			writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
 			if polling {
-				// A deliberately wedged poller join exercises the deadline path
-				// independently of an appender honoring cancellation.
-				mailbox.cancel = func() {}
-				defer close(mailbox.finished)
+				// Hold the poller join until finalization has transferred cleanup.
+				mailbox.cancel = func() { close(entered) }
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-			defer cancel()
+			ctx := mailboxManualDeadline{Context: context.Background(), done: make(chan struct{})}
 			done := make(chan struct{})
 			go func() { defer close(done); mailbox.finalize(ctx) }()
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("finalization exceeded its caller's deadline")
-			}
+			waitMailboxSignal(t, entered)
+			close(ctx.done)
+			waitMailboxSignal(t, done)
 			if !mailbox.publicationIncomplete() || !mailbox.fenced.Load() || mailbox.publicationContext.Err() == nil {
 				t.Fatal("expired finalization did not stop publication and retain evidence")
 			}
 			mailbox.fence(context.DeadlineExceeded)
-			if !polling {
-				for _, signal := range []chan struct{}{entered, exited} {
-					select {
-					case <-signal:
-					case <-time.After(5 * time.Second):
-						t.Fatal("deadline test did not observe appender entry and cancellation")
-					}
-				}
-			}
 			before := calls.Load()
 			mailbox.sweep(context.Background())
 			if calls.Load() != before || !mailbox.pending() {
 				t.Fatal("deadline allowed a later append or discarded the event")
 			}
+			if polling {
+				close(mailbox.finished)
+				waitMailboxRootsClosed(t, mailbox)
+			} else {
+				waitMailboxSignal(t, exited)
+			}
 		})
+	}
+}
+
+func waitMailboxSignal(t *testing.T, signal <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mailbox handshake did not complete")
+	}
+}
+
+func waitMailboxRootsClosed(t *testing.T, mailbox *runMailbox) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := mailbox.root.Stat("."); errors.Is(err, os.ErrClosed) {
+			return
+		}
+		select {
+		case <-timer.C:
+			t.Fatal("detached cleanup did not close roots")
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -1453,13 +1490,10 @@ func TestMailboxValidJSONStateIsClampedAndFailsClosed(t *testing.T) {
 		{"excess rejections", func(s *runMailboxState) { s.Rejections = MaxRunMailboxRejections + 1 }},
 		{"zero timestamp", func(s *runMailboxState) { s.Events["0001-event"] = runMailboxEventState{} }},
 		{"future timestamp", func(s *runMailboxState) {
-			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin.Add(time.Second)}
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin.Add(runMailboxObservationClockTolerance + time.Second)}
 		}},
 		{"invalid name", func(s *runMailboxState) {
 			s.Events["../outside"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin}
-		}},
-		{"published live event", func(s *runMailboxState) {
-			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, Published: true}
 		}},
 		{"unaccounted reservation", func(s *runMailboxState) {
 			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, ChargedBytes: 1}
@@ -1503,7 +1537,7 @@ func TestMailboxValidJSONStateIsClampedAndFailsClosed(t *testing.T) {
 				t.Fatal("loaded counters or map were not clamped")
 			}
 			for name, event := range got.Events {
-				if !validRunMailboxEventName(name) || event.ObservedAt.Before(time.Unix(0, 0)) || event.ObservedAt.After(clock.Now()) || event.ChargedBytes < 0 || event.ChargedBytes > MaxRunMailboxTotalBytes || event.Published {
+				if !validRunMailboxEventName(name) || event.ObservedAt.Before(time.Unix(0, 0)) || event.ObservedAt.After(clock.Now()) || event.ChargedBytes < 0 || event.ChargedBytes > MaxRunMailboxTotalBytes {
 					t.Fatalf("loaded event was not clamped: %s %+v", name, event)
 				}
 			}
@@ -1534,5 +1568,181 @@ func TestMailboxRejectionBudgetAndPendingReservationSurviveRestart(t *testing.T)
 	restarted.finalize(context.Background())
 	if restarted.publicationIncomplete() || len(appender.snapshot()) != MaxRunMailboxRejections || restarted.state.Rejections != MaxRunMailboxRejections {
 		t.Fatalf("restart rejection budget = %d, published %d, incomplete=%t", restarted.state.Rejections, len(appender.snapshot()), restarted.publicationIncomplete())
+	}
+}
+
+func TestFencedAttemptMailboxInstallationOrders(t *testing.T) {
+	for _, beforeStore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel-before-store=%t", beforeStore), func(t *testing.T) {
+			appender := newRecordingAppender("")
+			mailbox, _, _ := newTestMailbox(t, appender, "")
+			writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
+			lifecycle := &attemptLifecycle{}
+			parent, cancelParent := context.WithCancel(context.Background())
+			defer cancelParent()
+			attempt, cancelAttempt, release := fencedAttemptContext(parent, lifecycle.fenceMailbox)
+			defer release()
+			defer cancelAttempt(nil)
+			if !beforeStore {
+				lifecycle.storeMailbox(mailbox)
+			}
+			cancelParent()
+			waitMailboxSignal(t, attempt.Done())
+			if beforeStore {
+				lifecycle.storeMailbox(mailbox)
+			}
+			mailbox.finalize(context.WithoutCancel(attempt))
+			if !mailbox.fenced.Load() || len(appender.snapshot()) != 0 || !mailbox.publicationIncomplete() || !mailbox.pending() {
+				t.Fatal("late mailbox installation lost cancellation or published after authority loss")
+			}
+		})
+	}
+}
+
+func TestFencedAttemptNormalCancellationAndWatcherRelease(t *testing.T) {
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	attempt, cancel, release := fencedAttemptContext(context.Background(), func(error) {
+		close(entered)
+		<-unblock
+	})
+	release()
+	if attempt.Err() != nil {
+		t.Fatal("watcher release cancelled the attempt without a fence")
+	}
+	done := make(chan struct{})
+	go func() { cancel(nil); close(done) }()
+	waitMailboxSignal(t, entered)
+	if attempt.Err() != nil {
+		t.Fatal("normal cancellation preceded the fence")
+	}
+	close(unblock)
+	waitMailboxSignal(t, done)
+	if !errors.Is(attempt.Err(), context.Canceled) {
+		t.Fatal("normal cancellation did not cancel the attempt")
+	}
+}
+
+func TestMailboxLedgerRefusalRetainsEvidence(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		for _, status := range []int{400, 401, 409} {
+			t.Run(fmt.Sprintf("malformed=%t/status=%d", malformed, status), func(t *testing.T) {
+				appender := newRecordingAppender("")
+				appender.failWith(&runLedgerRejection{statusCode: status, body: "refusal reason"})
+				mailbox, _, _ := newTestMailbox(t, appender, "")
+				var logs strings.Builder
+				mailbox.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
+				raw := "wefty-protocol: 1\nkind: envelope\n--\n"
+				if malformed {
+					raw = "not protocol\n"
+				}
+				writeMailboxEvent(t, mailbox.directory, "0001-event", raw)
+				mailbox.finalize(context.Background())
+				if !mailbox.publicationIncomplete() || mailbox.pending() != malformed || !strings.Contains(logs.String(), "refusal reason") {
+					t.Fatal("refused document lost its retention, retirement, or refusal log")
+				}
+				if malformed {
+					appender.failWith(nil)
+					mailbox.sweep(context.Background())
+					if mailbox.pending() || len(appender.snapshot()) != 1 || !mailbox.publicationIncomplete() {
+						t.Fatal("refused rejection report did not remain retryable with retention latched")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMailboxExhaustedRejectionBudgetRetiresWithLog(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	mailbox.state.Rejections = MaxRunMailboxRejections
+	var logs strings.Builder
+	mailbox.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
+	writeMailboxEvent(t, mailbox.directory, "0009-bad", "not protocol\n")
+	mailbox.finalize(context.Background())
+	if mailbox.pending() || len(appender.snapshot()) != 0 || !strings.Contains(logs.String(), "rejection-report budget exhausted; retiring") {
+		t.Fatal("budget-exhausted rejection was not retired with a log")
+	}
+}
+
+func TestMailboxFinalizationExpiryTransfersRootsUntilWorkerUnwinds(t *testing.T) {
+	for _, inAppend := range []bool{false, true} {
+		t.Run(fmt.Sprintf("in-append=%t", inAppend), func(t *testing.T) {
+			entered, unblock := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			release := func() { once.Do(func() { close(unblock) }) }
+			defer release()
+			appender := mailboxAppenderFunc(func(ctx context.Context, _, _, _ string, _ []byte) error {
+				if inAppend {
+					close(entered)
+					<-unblock // deliberately ignores cancellation
+					return ctx.Err()
+				}
+				return nil
+			})
+			mailbox, _, _ := newTestMailbox(t, appender, "")
+			if !inAppend {
+				mailbox.retireCheckpoint = func() bool {
+					close(entered)
+					<-unblock
+					return true // state write must still have live roots
+				}
+			}
+			writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
+			ctx := mailboxManualDeadline{Context: context.Background(), done: make(chan struct{})}
+			done := make(chan struct{})
+			go func() { defer close(done); mailbox.finalize(ctx) }()
+			waitMailboxSignal(t, entered)
+			close(ctx.done)
+			waitMailboxSignal(t, done)
+			if !mailbox.detached.Load() || !mailbox.publicationIncomplete() {
+				t.Fatal("blocked worker was not detached with incomplete evidence")
+			}
+			teardown := make(chan struct{})
+			go func() { mailbox.fence(nil); mailbox.close(); close(teardown) }()
+			waitMailboxSignal(t, teardown)
+			for _, root := range []*os.Root{mailbox.root, mailbox.events, mailbox.published} {
+				if _, err := root.Stat("."); err != nil {
+					t.Fatalf("teardown closed roots under an admitted worker: %v", err)
+				}
+			}
+			release()
+			waitMailboxRootsClosed(t, mailbox)
+			mailbox.mu.Lock()
+			corrupt := mailbox.corrupt
+			mailbox.mu.Unlock()
+			if corrupt {
+				t.Fatal("state write resumed against closed roots")
+			}
+		})
+	}
+}
+
+func TestMailboxExpiredFinalizationWithoutPendingEvidence(t *testing.T) {
+	mailbox, _, _ := newTestMailbox(t, newRecordingAppender(""), "")
+	ctx := mailboxManualDeadline{Context: context.Background(), done: make(chan struct{})}
+	close(ctx.done) // a slow reap consumed the caller's entire budget
+	mailbox.finalize(ctx)
+	if mailbox.publicationIncomplete() || mailbox.detached.Load() {
+		t.Fatal("empty mailbox retained solely because the caller's deadline expired")
+	}
+}
+
+func TestMailboxObservationSurvivesSmallBackwardsClockStep(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, handoff, _ := newTestMailbox(t, appender, "")
+	mailbox.retireCheckpoint = func() bool { return false }
+	writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
+	mailbox.sweep(context.Background())
+	clock := newManualClock(mailboxTestClockOrigin.Add(-runMailboxObservationClockTolerance))
+	restarted, err := prepareRunMailbox(mailboxSpec("run_mailbox", handoff, ""), mailboxTestAttempt, appender, time.Hour, clock, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.close()
+	restarted.finalize(context.Background())
+	documents := appender.snapshot()
+	if restarted.corrupt || restarted.publicationIncomplete() || len(documents) != 2 || !bytes.Equal(documents[0].body, documents[1].body) {
+		t.Fatal("small backwards clock correction broke byte-identical replay")
 	}
 }

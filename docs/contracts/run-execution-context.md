@@ -316,11 +316,16 @@ ended; that mapping is internal and may change without changing this file
 protocol. Headers outside the set above, a repeated header, a missing or
 misplaced `wefty-protocol` line, an unknown kind, status or outcome, and a
 missing separator are all refused; the first eight refusals of an attempt are
-reported as a `failed` envelope on step `mailbox`, and the file is then removed
-unpublished — but only once that report has been accepted, so an unreachable
-ledger never costs the evidence. An entry in `events/` that is not a readable
-regular file is refused. Cleanup removes only regular files, symlinks and empty
-directories, never recursively walking workload directories. Nonempty
+reported as a `failed` envelope on step `mailbox`, and those files are removed
+only once their reports are accepted. A refused rejection report (including
+HTTP 4xx) keeps its source pending and latches `publicationIncomplete`, retaining
+the handoff. The ninth and later malformed files, once the rejection-report
+budget is exhausted, are retired with a logged line. An HTTP 4xx refusal of the
+event itself permanently retires that document, logs the refusal reason, and
+latches `publicationIncomplete` so the run retains its handoff. An entry in
+`events/` that is not a readable regular file is refused. Cleanup removes only
+regular files, symlinks and empty directories, never recursively walking
+workload directories. Nonempty
 directories, unsupported objects and entries that cannot be classified or
 removed make the sweep not drained and retain the handoff; they do not hide
 later valid events in a complete listing.
@@ -349,15 +354,23 @@ the instant the workload wrote the file. Finalization, including the poller
 join and final sweep retries, uses the earlier of the caller's deadline and
 `DefaultFinalizationTimeout` (30 seconds). It runs after the workload is
 quiesced and before the handoff lifecycle may remove the directory. Expiry
-stops publication, marks `publicationIncomplete`, and retains the handoff.
+cancels publication and allows a second join bound of
+`runMailboxFenceJoinTimeout` (the 500 ms default poll interval). Pending or
+in-flight work marks `publicationIncomplete` and retains the handoff; an empty,
+idle mailbox does not become incomplete solely because the deadline expired.
+If the second bound expires, finalization marks incomplete, retains the handoff,
+and logs `mailbox_finalization_join_timeout`; the detached cleanup worker owns
+the open roots and closes them only after the poller and final sweep unwind.
 Publication is best effort: if evidence still has not reached
 the ledger when the final sweep ends, the agent logs that and the handoff
 directory is retained under the ordinary failure rules, so the files remain the
 run's only surviving copy rather than being deleted as a success. Losing the
 attempt's authority permanently fences publication: the fence cancels the
-mailbox-owned append context and waits for all admitted appends to finish.
-No append can start or remain in flight after the fence returns. A fenced
-attempt retains pending evidence the same way.
+mailbox-owned append context and normally waits for all admitted appends to
+finish. On finalization expiry, that join has the separate short bound above:
+no new append is admitted, but an uncooperative admitted operation may remain
+in flight with cleanup owning its roots. Subsequent teardown does not rejoin
+a detached worker. A fenced attempt retains pending evidence the same way.
 
 Each event's document is derived deterministically from its file — including
 its timestamp, which is pinned when the agent first observes the file — and its
@@ -371,17 +384,19 @@ removed with a successful run's handoff is gone.
 
 The bookkeeping under `.published/` is advisory and workload-writable. Loaded
 counters and reservations are validated and clamped to their bounds, timestamps
-must be whole seconds between the Unix epoch and the current agent time, names
-must be valid event names, and `Published` is allowed only for events absent
-from `events/`. Inconsistent reservations, out-of-range values, or bookkeeping
-that cannot be read, parsed or persisted latch `corrupt`: publication stops,
+must be whole seconds between the Unix epoch and the current agent time plus
+`runMailboxObservationClockTolerance` (5 seconds, allowing a small backwards
+clock correction across restart), and names must be valid event names.
+Inconsistent reservations, out-of-range values, or bookkeeping that cannot be
+read, parsed or persisted latch `corrupt`: publication stops,
 `publicationIncomplete` is set, and the handoff is retained. This is validation,
 not authentication. Forged bookkeeping can only suppress or truncate the
 workload's own run's evidence; it grants no append credential or authority over
 another run.
 
-The mailbox is delivered to `kind=process` one-shots that L3 dispatched. An OCI
-handoff volume is helper-owned inside the node and the helper protocol exposes
+The mailbox is delivered to `kind=process` one-shots that L3 dispatched and
+extends to OCI once the helper exposes a read path. An OCI handoff volume is
+helper-owned inside the node and the helper protocol exposes
 no read path, so an OCI attempt receives no `WEFTY_RUN_DIR` and the agent logs
 that publication is unavailable rather than delivering a directory nothing
 would ever read.

@@ -129,7 +129,8 @@ type attemptLifecycle struct {
 	// mailbox is this attempt's run mailbox, published by the workload path and
 	// read by the authority and completion paths. One lifecycle owns one
 	// attempt, so a single slot is the whole lifetime.
-	mailbox atomic.Pointer[runMailbox]
+	mailbox    atomic.Pointer[runMailbox]
+	fenceCause atomic.Pointer[error]
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -365,10 +366,9 @@ func (ctx attemptDeadlineContext) Deadline() (time.Time, bool) {
 }
 
 // fencedAttemptContext derives an attempt context whose every cancellation —
-// this lifecycle's own and the parent's alike — runs fence first and to
-// completion. An attempt that has lost its authority must not be able to win a
-// race against its own final publication and write to the run's ledger after
-// the fact, so the fence cannot be something the cancellation merely races.
+// this lifecycle's own and the parent's alike — runs fence first. The fence
+// joins admitted appends unless finalization already transferred a timed-out
+// join to cleanup; cancellation must not race new publication admission.
 func fencedAttemptContext(parent context.Context, fence func(error)) (context.Context, context.CancelCauseFunc, func()) {
 	gate, cancelGate := context.WithCancelCause(context.WithoutCancel(parent))
 	attempt, cancelAttempt := context.WithCancelCause(gate)
@@ -384,22 +384,30 @@ func fencedAttemptContext(parent context.Context, fence func(error)) (context.Co
 	}()
 	deadline, hasDeadline := parent.Deadline()
 	return attemptDeadlineContext{Context: attempt, deadline: deadline, hasDeadline: hasDeadline}, func(cause error) {
-			if cause != nil {
-				fence(cause)
-			}
+			fence(cause)
 			cancelAttempt(cause)
 		}, func() {
 			close(released)
-			cancelGate(context.Canceled)
 		}
+}
+
+// Latch before loading the mailbox: preparation can finish after cancellation.
+func (lifecycle *attemptLifecycle) fenceMailbox(cause error) {
+	lifecycle.fenceCause.CompareAndSwap(nil, &cause)
+	lifecycle.mailbox.Load().fence(cause)
+}
+
+func (lifecycle *attemptLifecycle) storeMailbox(mailbox *runMailbox) {
+	lifecycle.mailbox.Store(mailbox)
+	if cause := lifecycle.fenceCause.Load(); cause != nil {
+		mailbox.fence(*cause)
+	}
 }
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
 	// The attempt context is deliberately not a direct child of ctx: every
 	// route to its cancellation passes through the mailbox fence first.
-	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, func(cause error) {
-		lifecycle.mailbox.Load().fence(cause)
-	})
+	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, lifecycle.fenceMailbox)
 	defer releaseFenceGate()
 	defer cancelAttempt(nil)
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
@@ -1162,9 +1170,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 	}
 	// The run mailbox is prepared before the workload starts, so a job that
-	// writes its first event immediately has somewhere to write it. Publication
-	// authority is the agent's: the workload receives a directory, not a
-	// credential.
+	// writes its first event immediately has somewhere to write it. Mailbox
+	// reporting does not require or use the workload's credential; run-token
+	// delivery remains unchanged.
 	if lifecycle.dependencies.runLedger != nil && runMailboxAvailable(claim.Job.Spec) {
 		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID, lifecycle.dependencies.runLedger,
 			lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
@@ -1173,7 +1181,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		mailbox = prepared
 		defer mailbox.close()
-		lifecycle.mailbox.Store(mailbox)
+		lifecycle.storeMailbox(mailbox)
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
 	} else if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassOneShot &&

@@ -25,7 +25,7 @@ import (
 
 // The run mailbox is the job-owned directory in which a workload writes its
 // envelopes, steps, gate results and result files, and from which this agent
-// publishes them to the ledger under authority the workload never holds. The
+// publishes them without requiring or using the workload's credential. The
 // workload writes plain text; building protocol JSON that satisfies the v1
 // schemas is the agent's job, which is what lets a bash workflow report without
 // hand-rolling either HTTP or JSON escaping.
@@ -83,11 +83,16 @@ const (
 	runMailboxFinalPublishAttempts = 3
 	runMailboxFinalPublishBackoff  = 100 * time.Millisecond
 
+	// A finalization expiry gets one short join budget, matching the poll interval.
+	runMailboxFenceJoinTimeout = DefaultRunMailboxPollInterval
+	// Allow a small backwards wall-clock correction across agent restarts.
+	runMailboxObservationClockTolerance = 5 * time.Second
+
 	runMailboxTruncationNotice = "\n[truncated by the node agent: run mailbox event exceeded the size bound]"
 )
 
 // runLedgerAppender publishes one protocol document to L3 on a run's behalf.
-// The agent holds the run token; the workload does not.
+// The publisher uses the agent-held run token; workload token delivery is unchanged.
 type runLedgerAppender interface {
 	appendRunDocument(ctx context.Context, runToken, runID, collection string, body []byte) error
 }
@@ -311,7 +316,6 @@ type runMailboxState struct {
 
 type runMailboxEventState struct {
 	ObservedAt time.Time `json:"observed_at"`
-	Published  bool      `json:"published"`
 	// ChargedBytes reserves one event and its bytes before the first append.
 	// Replays use the reservation, including after a lost append response.
 	ChargedBytes      int64 `json:"charged_bytes,omitempty"`
@@ -362,6 +366,10 @@ type runMailbox struct {
 
 	fenced     atomic.Bool
 	incomplete atomic.Bool
+
+	// Once finalization detaches, its cleanup worker alone closes the roots.
+	detached  atomic.Bool
+	closeOnce sync.Once
 
 	stopOnce sync.Once
 	cancel   context.CancelFunc
@@ -545,18 +553,11 @@ func (m *runMailbox) loadState() {
 			delete(m.state.Events, name)
 			continue
 		}
-		if event.ObservedAt.Before(earliest) || event.ObservedAt.After(now) || event.ObservedAt.Nanosecond() != 0 {
+		if event.ObservedAt.Before(earliest) || event.ObservedAt.After(now.Add(runMailboxObservationClockTolerance)) || event.ObservedAt.Nanosecond() != 0 {
 			invalid = true
 			event.ObservedAt = now
 		}
 		event.ChargedBytes = clampBytes(event.ChargedBytes)
-		if event.Published {
-			// Never let an advisory Published flag bypass a live event's budget.
-			if _, err := m.events.Lstat(name); !errors.Is(err, os.ErrNotExist) {
-				invalid = true
-				event.Published = false
-			}
-		}
 		if event.ChargedBytes > 0 {
 			chargedCount++
 			chargedBytes += event.ChargedBytes
@@ -641,15 +642,21 @@ func (m *runMailbox) secrets() []string {
 }
 
 func (m *runMailbox) close() {
-	if m == nil {
+	if m == nil || m.detached.Load() {
 		return
 	}
-	m.cancelPublication()
-	for _, root := range []*os.Root{m.events, m.published, m.root} {
-		if root != nil {
-			root.Close()
+	m.closeRoots()
+}
+
+func (m *runMailbox) closeRoots() {
+	m.closeOnce.Do(func() {
+		m.cancelPublication()
+		for _, root := range []*os.Root{m.events, m.published, m.root} {
+			if root != nil {
+				root.Close()
+			}
 		}
-	}
+	})
 }
 
 // start begins streaming publication. Publishing only at attempt completion
@@ -682,13 +689,22 @@ func (m *runMailbox) fence(cause error) {
 	if m == nil {
 		return
 	}
-	first := !m.fenced.Swap(true)
-	m.cancelPublication()
+	m.stopPublication(cause)
+	// An expired finalization has already transferred the join and roots to
+	// cleanup. Teardown must not rejoin that worker without a bound.
+	if m.detached.Load() {
+		return
+	}
 	// Every caller joins, even if another caller has already set the fence.
 	// An append either holds appendMu and finishes before this returns, or
 	// acquires it later and observes the permanent fence.
 	m.appendMu.Lock()
 	m.appendMu.Unlock()
+}
+
+func (m *runMailbox) stopPublication(cause error) {
+	first := !m.fenced.Swap(true)
+	m.cancelPublication()
 	if first {
 		m.log("agent: run %s mailbox publication fenced: %v", m.runID, cause)
 	}
@@ -726,8 +742,8 @@ func (m *runMailbox) appendDocument(ctx context.Context, collection string, docu
 
 // finalize uses the existing lifecycle budget even when called without a
 // deadline. Its join and filesystem work are also bounded by that deadline;
-// expiry stops publication and retains the handoff, without waiting for an OS
-// operation to return. The worker owns no cleanup of workload directories.
+// expiry cancels publication and allows a short, separately bounded join.
+// If that expires too, cleanup owns the roots until all workers unwind.
 func (m *runMailbox) finalize(ctx context.Context) {
 	if m == nil {
 		return
@@ -777,12 +793,51 @@ func (m *runMailbox) finalize(ctx context.Context) {
 	case <-ctx.Done():
 	}
 	if ctx.Err() != nil {
-		m.fenced.Store(true)
-		m.cancelPublication()
-		m.incomplete.Store(true)
+		m.finishExpired(ctx.Err(), done)
 	}
 	if m.incomplete.Load() {
 		m.log("agent: run %s mailbox has unpublished evidence; retaining the handoff directory", m.runID)
+	}
+}
+
+// finishExpired cancels synchronously, then joins appends, both workers and
+// the pending check under a second bound. No lock or filesystem call on the
+// caller's path can extend that bound. The ownership decision is handed back
+// even if the join finishes at the same instant the timer fires.
+func (m *runMailbox) finishExpired(cause error, done <-chan struct{}) {
+	m.stopPublication(cause)
+	// A sweep holds mu across appends and state writes. Preserve incomplete
+	// evidence even if that admitted work finishes during the short join.
+	if m.mu.TryLock() {
+		m.mu.Unlock()
+	} else {
+		m.incomplete.Store(true)
+	}
+	joined := make(chan bool, 1)
+	ownership := make(chan bool, 1)
+	go func() {
+		m.appendMu.Lock()
+		m.appendMu.Unlock()
+		<-m.finished
+		<-done
+		joined <- m.pending() // includes the state lock and any filesystem I/O
+		if <-ownership {
+			m.closeRoots()
+		}
+	}()
+	timer := time.NewTimer(runMailboxFenceJoinTimeout)
+	defer timer.Stop()
+	select {
+	case pending := <-joined:
+		if pending {
+			m.incomplete.Store(true)
+		}
+		ownership <- false
+	case <-timer.C:
+		m.detached.Store(true)
+		m.incomplete.Store(true)
+		ownership <- true
+		m.log("agent: run %s mailbox_finalization_join_timeout: roots transferred to cleanup; retaining handoff", m.runID)
 	}
 }
 
@@ -938,6 +993,7 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 		var rejection *runLedgerRejection
 		if errors.As(err, &rejection) {
 			m.log("agent: run %s mailbox event %q was refused: %v", m.runID, name, err)
+			m.incomplete.Store(true)
 			return m.retire(name)
 		}
 		m.log("agent: publish run %s mailbox event %q: %v", m.runID, name, err)
@@ -953,7 +1009,7 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 func (m *runMailbox) reject(ctx context.Context, name string, cause error) error {
 	observation := m.state.Events[name]
 	if !observation.RejectionReserved && m.state.Rejections >= MaxRunMailboxRejections {
-		m.log("agent: run %s mailbox event %q rejected: %v", m.runID, name, cause)
+		m.log("agent: run %s mailbox event %q rejected after rejection-report budget exhausted; retiring: %v", m.runID, name, cause)
 		return nil
 	}
 	envelope := contract.Envelope{
@@ -982,7 +1038,8 @@ func (m *runMailbox) reject(ctx context.Context, name string, cause error) error
 		var rejection *runLedgerRejection
 		if errors.As(err, &rejection) {
 			m.log("agent: run %s rejection report for %q was refused: %v", m.runID, name, err)
-			return nil
+			m.incomplete.Store(true)
+			return err
 		}
 		m.log("agent: report rejected run %s mailbox event %q: %v", m.runID, name, err)
 		return err
@@ -991,8 +1048,8 @@ func (m *runMailbox) reject(ctx context.Context, name string, cause error) error
 }
 
 // retire removes an event the agent is finished with and forgets its
-// bookkeeping. The ledger holds what was published; what was refused is
-// described by its rejection envelope.
+// bookkeeping. The ledger holds accepted documents; permanent event refusals
+// and exhausted rejection reports are logged instead.
 func (m *runMailbox) retire(name string) error {
 	if m.retireCheckpoint != nil && !m.retireCheckpoint() {
 		return nil
