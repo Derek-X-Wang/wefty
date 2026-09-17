@@ -6,12 +6,16 @@ hand back a pass/fail verdict plus the failing output.
 `branch-gates.sh` is the whole workflow: a bash script that follows
 `docs/contracts/run-execution-context.md`. It clones the repository at the
 requested ref into a scratch directory inside the job, runs the gates, writes
-`result.json` and `failures.txt` into the run's handoff directory, appends one
-envelope per gate, and appends one final gate result named `branch-gates`.
+`result.json` and `failures.txt` into the run's handoff directory, reports one
+envelope per gate, and reports one final gate result named `branch-gates`.
 
-It is deliberately written against the raw run contract — no helper, no
-scaffold, no `runs list`, no `wait`. Every awkward step is a requirement for
-#476 (authoring helper) and #477 (observation).
+It reports through the run mailbox: `wefty run envelope|gate|result` writes
+event files into `WEFTY_RUN_DIR` and the node agent publishes them with the
+credential it already holds. The job holds none of its own. `wefty` must be on
+`PATH` in the job rootfs; an image without it can use the inline writer
+`wefty workflow init` ships instead.
+
+What remains raw is observation: no `runs list`, no `wait`. That is #477.
 
 ## Gates
 
@@ -31,33 +35,27 @@ silently reduce the set is rejected before anything is cloned — an empty eleme
 ## Trust boundary
 
 **The gates run under the run's own OS identity, as descendants of the workflow
-shell, and that shell holds the run token for the whole run. A deliberately
-hostile branch can therefore recover the run token — from an ancestor's
-environment, for example — and use it to write its own run or submit child
-jobs. Only run branch-gates on branches you trust. This is a convenience
-boundary, not a security one.**
+shell. A deliberately hostile branch running under the same UID can reach
+anything that identity can reach on the machine. Only run branch-gates on
+branches you trust. This is a convenience boundary, not a security one.**
 
-**Why it still holds a token.** Credential delivery is now opt-in: a dispatched
-run reports through its run mailbox and holds nothing unless it declares
-`--dispatch-authority` at submit. branch-gates still posts its envelopes and
-gates to L3 over HTTP, so every submit command below passes that flag and every
-submission in `branchgates_integration_test.go` sets `DispatchAuthority`.
-It over-grants deliberately and temporarily: branch-gates dispatches no child
-work and asks for the flag only for the reporting half. The mailbox now reaches
-`kind=oci` too, so nothing is missing any more — converting this workflow to it,
-after which the flag comes off and this whole section goes away, is the only
-thing left.
+**It holds no credential.** Credential delivery is opt-in, and branch-gates
+reports through its run mailbox and dispatches nothing, so it is submitted
+without `--dispatch-authority` and receives neither the run token nor the
+attempt credential. The worst a hostile branch can reach through this process is
+the run's own mailbox, where it could forge its own run's evidence and nothing
+else — it cannot write another run, submit a child job, or act on the cluster.
+The workflow prints the reserved credential names visible to its own shell on
+every run; that line is expected to be empty, and the integration test asserts
+it is.
 
-What the workflow does do, because it is cheap and it closes the ordinary
-accidents:
+What the workflow does on top of that, because it is cheap and it closes the
+ordinary accidents:
 
 - The clone, the checkout and every gate run under `env -i`, so no `WEFTY_*`
   value is in the gate process's own environment. A failing test that prints
   its environment — the usual way a token ends up in `failures.txt`, which is
   copied verbatim before the agent's log redaction ever sees it — gets nothing.
-- The run token never appears in an argument vector: `curl` reads the
-  `Authorization` header from a `0600` config file inside the run's private
-  scratch directory.
 - `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `TMPDIR`, `GOCACHE`,
   `GOMODCACHE` and `GOPATH` are fresh per-run directories under that scratch
   directory, so the subject cannot read the operator's `.netrc`, `.gitconfig`,
@@ -141,7 +139,7 @@ alias w='"$WEFTY_ROOT"/.bin/wefty --l1="$WEFTY_L1_ADDR" --l3="$WEFTY_L3_ADDR"'
 
 ### On a Linux OCI node (the intended path)
 
-The rootfs needs Go, git, bash and curl. The acceptance echo image is BusyBox
+The rootfs needs Go, git, bash and the `wefty` binary. The acceptance echo image is BusyBox
 and cannot run any of the gates, so this uses the upstream `golang` image;
 resolve its digest once and submit the pinned reference.
 
@@ -160,7 +158,6 @@ RUN_ID=$(w --json submit \
   --params-file /tmp/branch-gates-params.json \
   --tag "wefty:node:$NODE_ID" \
   --required-envelope \
-  --dispatch-authority \
   --max-runtime 3600 \
   --idempotency-key "branch-gates-my-branch-$(date -u +%Y%m%dT%H%M%SZ)" \
   | jq -er '.run_id')
@@ -184,7 +181,7 @@ w --json submit --image "$GOLANG_IMAGE@$GOLANG_DIGEST" \
   --argv bash --argv -c --argv "$(cat workflows/branch-gates/branch-gates.sh)" --argv branch-gates \
   --params-file /tmp/branch-gates-params.json \
   --mount "$WEFTY_MOUNT_ROOT/branch-gates:/out" --node "$NODE_ID" \
-  --required-envelope --dispatch-authority --max-runtime 3600 --idempotency-key "branch-gates-$(date -u +%s)"
+  --required-envelope --max-runtime 3600 --idempotency-key "branch-gates-$(date -u +%s)"
 ```
 
 `$WEFTY_MOUNT_ROOT` must be a strict descendant of the node's configured
@@ -192,8 +189,8 @@ allowed mount root (`docs/runbooks/oci-node.md`).
 
 ### As a process job (local check, no container)
 
-Any node with Go, git, bash and curl on `PATH` can run the same script with the
-inline-script arm:
+Any node with Go, git, bash and `wefty` on `PATH` can run the same script with
+the inline-script arm:
 
 ```sh
 cd "$WEFTY_ROOT"
@@ -205,7 +202,6 @@ RUN_ID=$(w --json submit \
   --params-file /tmp/branch-gates-params.json \
   --tag wefty:node:dogfood-local \
   --required-envelope \
-  --dispatch-authority \
   --max-runtime 3600 \
   --idempotency-key "branch-gates-local-$(date -u +%s)" \
   | jq -er '.run_id')
@@ -240,14 +236,21 @@ subject repository rather than against wefty itself: cloning wefty and running
 
 ## What the raw contract cost
 
-Kept here because #476 and #477 are supposed to remove it:
+Retired by #476:
 
-- No helper: every envelope and gate body is hand-assembled JSON, escaped by a
+- ~~No helper: every envelope and gate body is hand-assembled JSON, escaped by a
   hand-written `json_escape`, and posted with hand-written `curl` calls that
-  have no retry and no typed errors.
-- No params delivery: the script must call back into L3 and text-scrape its own
-  params, because `jq` is not in the reference rootfs and params never reach the
-  job as arguments or environment.
+  have no retry and no typed errors.~~ `wefty run envelope|gate|result` writes
+  the protocol; what is still assembled by hand is `result.json`, which is this
+  workflow's own schema rather than the contract's.
+- ~~No params delivery: the script must call back into L3 and text-scrape its
+  own params.~~ `wefty run params NAME` reads them out of the mailbox, with no
+  cluster call and no credential.
+- ~~The job holds the reporting credential for its whole life.~~ It holds
+  nothing; see "Trust boundary".
+
+Still outstanding, for #477 and #483:
+
 - No inline script for `kind=oci`: the whole script travels through `--argv`.
 - No attempt identity in the job: the workflow cannot see its own `attempt_id`,
   so idempotency keys cannot be made retry-safe.
@@ -261,9 +264,6 @@ Kept here because #476 and #477 are supposed to remove it:
   writing files, echoing them and cleaning up its scratch directory. Anything
   that treats terminal as "the job is done" — including tearing the stack down —
   can truncate that teardown.
-- The job holds the reporting credential for its whole life, so isolating
-  untrusted work from it needs an OS boundary the workflow cannot build for
-  itself. The run mailbox now removes the token from a dispatched job by
-  default; branch-gates still opts back in with `--dispatch-authority` because
-  it reports over HTTP, and converting it to the mailbox — now available for
-  `kind=oci` as well — is what retires that.
+- A gate carries exactly one evidence value through the mailbox, so the
+  per-entry structure the HTTP path used now lives inside a single JSON
+  document. That is a protocol shape, not a loss.
