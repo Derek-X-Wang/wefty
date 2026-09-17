@@ -135,6 +135,12 @@ type attemptLifecycle struct {
 	// attempt, so a single slot is the whole lifetime.
 	mailbox    atomic.Pointer[runMailbox]
 	fenceCause atomic.Pointer[error]
+	// resultsRetained latches the one retention this attempt performs. The
+	// completion path records the real verdict; every other exit -- an
+	// authority loss, a cancelled context, a completion that never landed --
+	// falls back to the conservative one, so no path leaves a run unbounded
+	// and unaccounted.
+	resultsRetained atomic.Bool
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -414,6 +420,18 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, lifecycle.fenceMailbox)
 	defer releaseFenceGate()
 	defer cancelAttempt(nil)
+	// Every exit from an attempt retains and accounts for its results, not only
+	// the one that completes cleanly. A completion that never landed, an
+	// authority loss or a cancelled context used to leave the run's directory
+	// unbounded and invisible to the node's budget. The latch means this fires
+	// only when the completion path did not already record the real verdict,
+	// and the conservative values it records -- not succeeded, not published --
+	// are the ones that keep a run's files longest.
+	defer func() {
+		if err := lifecycle.retainResults(claim, false, false); err != nil {
+			lifecycle.log("agent: retain results for attempt %s: %v", claim.Lease.AttemptID, err)
+		}
+	}()
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
@@ -703,10 +721,8 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 	// first when it runs out of room, so it is recorded rather than folded into
 	// the verdict.
 	published := !lifecycle.mailbox.Load().publicationIncomplete()
-	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
-			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
-		}
+	if err := lifecycle.retainResults(claim, succeeded, published); err != nil {
+		return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
 	}
 	if succeeded {
 		volumes := runtimeManagedVolumesForSuccessfulCompletion(claim.Job.Spec)
@@ -1516,6 +1532,28 @@ func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
 // what this milestone stopped throwing away on success: the results live there,
 // and the helper's own boot sweep expires them on the same retention window the
 // agent applies to a process run's directory.
+// retainResults records this run's retention and then collects. It is latched:
+// whichever path reaches it first owns the verdict, and the fallback on the
+// error paths cannot overwrite a completion that already recorded the truth.
+//
+// Collection runs here rather than only at startup because this is the moment
+// a node's retained bytes actually change, and because the per-run bound has to
+// apply to a run that ended without a clean completion just as much as to one
+// that ended with one.
+func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
+	if lifecycle.dependencies.handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
+		return nil
+	}
+	if !lifecycle.resultsRetained.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := lifecycle.dependencies.handoffs.finish(
+		claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
+		return err
+	}
+	return lifecycle.dependencies.handoffs.collect()
+}
+
 func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
 	return nil
 }

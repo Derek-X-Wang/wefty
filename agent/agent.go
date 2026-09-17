@@ -23,11 +23,14 @@ import (
 )
 
 const (
-	DefaultHeartbeatInterval       = 15 * time.Second
-	DefaultCapabilityProbeTimeout  = 10 * time.Second
-	DefaultClaimInterval           = time.Second
-	DefaultRenewalInterval         = 10 * time.Second
-	DefaultHandoffRetention        = contract.DefaultResultRetention
+	DefaultHeartbeatInterval      = 15 * time.Second
+	DefaultCapabilityProbeTimeout = 10 * time.Second
+	DefaultClaimInterval          = time.Second
+	DefaultRenewalInterval        = 10 * time.Second
+	DefaultHandoffRetention       = contract.DefaultResultRetention
+	// resultCollectionInterval is how often a running agent expires and evicts
+	// retained results on its own, independently of any attempt finishing.
+	resultCollectionInterval       = time.Hour
 	DefaultLogBatchSize            = 32
 	DefaultLogFlushInterval        = 100 * time.Millisecond
 	DefaultLogRetryInterval        = 100 * time.Millisecond
@@ -432,7 +435,7 @@ func New(config Config) (*Agent, error) {
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
-		handoffs:         newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
+		handoffs:         newHandoffManager(config.HandoffRoot, logSpoolDirectory, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
 		runLedger:        newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
 		mailboxPoll:      durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
 		mailboxStateRoot: logSpoolDirectory,
@@ -523,9 +526,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 	if a.handoffs != nil {
-		if err := a.handoffs.cleanupExpired(""); err != nil {
-			return fmt.Errorf("agent: clean expired handoff directories: %w", err)
+		if err := a.handoffs.collect(); err != nil {
+			return fmt.Errorf("agent: collect retained results: %w", err)
 		}
+		// Startup is not enough on its own: an agent that runs for weeks would
+		// otherwise never expire or evict anything it retained while up.
+		go a.collectResultsPeriodically(ctx)
 	}
 	if a.outbox != nil && a.session != nil {
 		a.outbox.startRecovery(ctx, a.session.client, func(err error) {
@@ -579,6 +585,25 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		computerTokens:         a.computerTokens,
 		computerControlTokens:  a.computerControlTokens,
 	})
+}
+
+// collectResultsPeriodically expires and evicts on a timer, so retention holds
+// on a node that is never restarted. Attempt completion collects too; this is
+// what covers a node that finishes nothing for a long time and one whose runs
+// all finished while it was over budget with work in flight.
+func (a *Agent) collectResultsPeriodically(ctx context.Context) {
+	for {
+		timer := a.clock.NewTimer(resultCollectionInterval)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return
+		case <-timer.C():
+		}
+		if err := a.handoffs.collect(); err != nil {
+			a.log("collect retained results: %v", err)
+		}
+	}
 }
 
 func (a *Agent) currentOCIRuntimeGeneration() (workloadrunner.RuntimeGeneration, bool) {

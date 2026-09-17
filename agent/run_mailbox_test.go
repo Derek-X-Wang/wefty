@@ -506,7 +506,7 @@ func TestMailboxEventsArePublishedWhileTheAttemptRuns(t *testing.T) {
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
 		runtimes:     testRuntimeSet(runner),
-		handoffs:     newHandoffManager(root, time.Hour, nil),
+		handoffs:     newHandoffManager(root, t.TempDir(), time.Hour, nil),
 		runLedger:    appender,
 		mailboxPoll:  5 * time.Millisecond,
 	}
@@ -554,7 +554,7 @@ func TestMailboxFinalSweepCompletesBeforeHandoffFinalization(t *testing.T) {
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
 		runtimes:     testRuntimeSet(runner),
-		handoffs:     newHandoffManager(root, time.Hour, nil),
+		handoffs:     newHandoffManager(root, t.TempDir(), time.Hour, nil),
 		runLedger:    appender,
 		// Long enough that no poll can fire: only the final sweep can publish.
 		mailboxPoll: time.Hour,
@@ -598,7 +598,7 @@ func TestUnpublishedMailboxEvidenceRetainsTheHandoffOnSuccess(t *testing.T) {
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
 		runtimes:     testRuntimeSet(runner),
-		handoffs:     newHandoffManager(root, time.Hour, nil),
+		handoffs:     newHandoffManager(root, t.TempDir(), time.Hour, nil),
 		runLedger:    appender,
 		mailboxPoll:  time.Hour,
 	}
@@ -620,6 +620,43 @@ func TestUnpublishedMailboxEvidenceRetainsTheHandoffOnSuccess(t *testing.T) {
 	events := filepath.Join(handoff, runMailboxDirectoryName, runID, runMailboxEventsDirectoryName, "0001-gate-test")
 	if _, err := os.Stat(events); err != nil {
 		t.Fatalf("the unpublished event did not survive: %v", err)
+	}
+
+	// Survival alone is not the guarantee. Unpublished evidence is the only
+	// copy of what this run did, so the record has to classify it as such --
+	// and that classification is what makes the node give up a published run
+	// of the same age first when it runs out of room.
+	record := requireRetentionRecord(t, a.handoffs, runID)
+	if record.Published {
+		t.Fatalf("a run whose evidence never reached the ledger was recorded as published: %#v", record)
+	}
+	published := filepath.Join(root, "run_published_peer")
+	peerSpec := handoffClaim("run_published_peer", published, nil).Job.Spec
+	if err := a.handoffs.prepare(peerSpec, a.registration.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(published, "result.json"), make([]byte, 512), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.handoffs.finish(peerSpec, a.registration.NodeID, true, true); err != nil {
+		t.Fatal(err)
+	}
+	// A budget that exactly one eviction satisfies, so what this proves is the
+	// order rather than "evict everything": giving up the published peer is
+	// enough, and the unpublished run is what the node keeps.
+	unpublishedSize, err := measureRetainedResults(handoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.handoffs.rootBytes = unpublishedSize
+	if err := a.handoffs.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(published); !os.IsNotExist(err) {
+		t.Fatalf("the published peer survived eviction ahead of unpublished evidence: %v", err)
+	}
+	if _, err := os.Stat(handoff); err != nil {
+		t.Fatalf("unpublished evidence was evicted before a published run: %v", err)
 	}
 }
 

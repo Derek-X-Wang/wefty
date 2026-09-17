@@ -455,7 +455,7 @@ func TestLogFinalizationDeadlineStillFinishesProcessHandoff(t *testing.T) {
 			preparedAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 			finishedAt := preparedAt.Add(time.Minute)
 			nowCalls := 0
-			handoffs := newHandoffManager(root, time.Hour, nil)
+			handoffs := newHandoffManager(root, t.TempDir(), time.Hour, nil)
 			handoffs.now = func() time.Time {
 				nowCalls++
 				if nowCalls == 1 {
@@ -481,14 +481,15 @@ func TestLogFinalizationDeadlineStillFinishesProcessHandoff(t *testing.T) {
 			if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			// Both outcomes are retained now, and both carry a marker; the
-			// deadline this test is about must not stop either from landing.
-			marker, exists, err := readHandoffMarker(path)
-			if err != nil || !exists {
-				t.Fatalf("retained deadline handoff marker exists=%t err=%v", exists, err)
+			// Both outcomes are retained now, and the deadline this test is
+			// about must not stop either from being recorded. Retention lives
+			// in the agent's own record, which is what a sweep reads.
+			record := requireRetentionRecord(t, handoffs, runID)
+			if want := finishedAt.Add(time.Hour); !record.RetainUntil.Equal(want) {
+				t.Fatalf("retained deadline handoff expires at %s, want %s", record.RetainUntil, want)
 			}
-			if want := finishedAt.Add(time.Hour); !marker.RetainUntil.Equal(want) {
-				t.Fatalf("retained deadline handoff expires at %s, want %s", marker.RetainUntil, want)
+			if record.Succeeded != test.succeeded {
+				t.Fatalf("retention record succeeded = %t, want %t", record.Succeeded, test.succeeded)
 			}
 		})
 	}
@@ -3228,7 +3229,7 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 				if test.successfulHandoff {
 					root := filepath.Join(t.TempDir(), "handoffs")
 					handoffPath = filepath.Join(root, "directive-run")
-					handoffs = newHandoffManager(root, time.Hour, nil)
+					handoffs = newHandoffManager(root, t.TempDir(), time.Hour, nil)
 					claim.Job.Spec.Class = contract.JobClassOneShot
 					claim.Job.Spec.Labels = map[string]string{"run_id": "directive-run"}
 					claim.Job.Spec.Execution.WorkingDirectory = t.TempDir()

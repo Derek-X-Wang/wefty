@@ -23,7 +23,7 @@ func TestHandoffDirectoryExistsPrivatelyBeforeExecutionAndIsRetainedOnSuccess(t 
 	root := filepath.Join(t.TempDir(), "handoffs")
 	runID := "run_lifecycle"
 	path := filepath.Join(root, runID)
-	manager := newHandoffManager(root, time.Hour, nil)
+	manager := newHandoffManager(root, t.TempDir(), time.Hour, nil)
 	runner := &handoffAssertingRunner{t: t, path: path}
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
@@ -50,12 +50,14 @@ func TestHandoffDirectoryExistsPrivatelyBeforeExecutionAndIsRetainedOnSuccess(t 
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("a successful run's results were not retained: %v", err)
 	}
-	marker, exists, err := readHandoffMarker(path)
-	if err != nil || !exists {
-		t.Fatalf("retained results carry no marker: %v (exists=%t)", err, exists)
+	// Retention lives in the agent's own record, not in the directory the
+	// workload can write.
+	record := requireRetentionRecord(t, manager, runID)
+	if !record.Succeeded || !record.Published || record.RetainedAt.IsZero() || record.RetainUntil.IsZero() {
+		t.Fatalf("retention record = %#v, want a published success with both timestamps", record)
 	}
-	if !marker.Succeeded || !marker.Published || marker.RetainedAt.IsZero() || marker.RetainUntil.IsZero() {
-		t.Fatalf("retention marker = %#v, want a published success with both timestamps", marker)
+	if record.Directory != path {
+		t.Fatalf("retention record directory = %q, want %q", record.Directory, path)
 	}
 }
 
@@ -64,7 +66,7 @@ func TestColdRerunWithHandoffFilesPinsOrFailsExplicitly(t *testing.T) {
 	runID := "run_retry"
 	path := filepath.Join(root, runID)
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	manager := newHandoffManager(root, time.Hour, nil)
+	manager := newHandoffManager(root, t.TempDir(), time.Hour, nil)
 	manager.now = func() time.Time { return now }
 	claim := handoffClaim(runID, path, []string{"linux"})
 
@@ -87,7 +89,7 @@ func TestColdRerunWithHandoffFilesPinsOrFailsExplicitly(t *testing.T) {
 		t.Fatal(err)
 	}
 	now = now.Add(time.Hour)
-	if err := manager.cleanupExpired(""); err != nil {
+	if err := manager.collect(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -105,7 +107,7 @@ func TestHandoffDirectoryRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
-	manager := newHandoffManager(root, time.Hour, nil)
+	manager := newHandoffManager(root, t.TempDir(), time.Hour, nil)
 	err := manager.prepare(handoffClaim("run_symlink", path, nil).Job.Spec, "node-1")
 	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("symlink prepare error = %v", err)
@@ -134,7 +136,7 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 			a := &Agent{
 				registration: contract.NodeRegistration{NodeID: "node-1"},
 				runtimes:     testRuntimeSet(processrunner.New(processrunner.Config{})),
-				handoffs:     newHandoffManager(root, time.Hour, nil),
+				handoffs:     newHandoffManager(root, t.TempDir(), time.Hour, nil),
 				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 					return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
 						if event.Stream == contract.LogStdout {

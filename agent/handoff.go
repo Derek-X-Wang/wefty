@@ -24,7 +24,10 @@ const (
 )
 
 type handoffManager struct {
-	root      string
+	root string
+	// stateRoot is the agent's own directory, outside anything a workload can
+	// write. The authority for retention and eviction lives under it.
+	stateRoot string
 	retention time.Duration
 	// runBytes and rootBytes are fields rather than direct constant reads so a
 	// test can prove each bound without writing 64 MiB.
@@ -41,29 +44,23 @@ type handoffPathLock struct {
 	refs  int
 }
 
+// handoffMarker is advisory and lives inside the workload-writable handoff
+// directory. Its whole remaining job is to prove to a cold rerun that the files
+// it found are its own. Retention, publication and eviction are decided by the
+// agent-local record instead (handoff_records.go), because a workload shares
+// this agent's OS identity and anything in here is a file it can rewrite.
 type handoffMarker struct {
 	RunID       string    `json:"run_id"`
 	NodeID      string    `json:"node_id"`
 	RetainUntil time.Time `json:"retain_until"`
-	// RetainedAt is when this run finished and its retention began. Eviction
-	// orders by it, so it is recorded rather than derived from RetainUntil,
-	// which a later rerun of the same run would move.
-	RetainedAt time.Time `json:"retained_at,omitempty"`
-	// Published records that everything the workload reported reached the
-	// ledger. A published run's files are a convenience and are evicted first;
-	// an unpublished run's files are the only copy of what it did.
-	Published bool `json:"published,omitempty"`
-	// Succeeded is the run's own verdict, kept because an operator reading a
-	// retained directory should not have to infer it from the files.
-	Succeeded bool `json:"succeeded,omitempty"`
 }
 
-func newHandoffManager(root string, retention time.Duration, logf func(string, ...any)) *handoffManager {
+func newHandoffManager(root, stateRoot string, retention time.Duration, logf func(string, ...any)) *handoffManager {
 	if strings.TrimSpace(root) == "" {
 		root = contract.DefaultHandoffRoot
 	}
 	return &handoffManager{
-		root: filepath.Clean(root), retention: retention,
+		root: filepath.Clean(root), stateRoot: strings.TrimSpace(stateRoot), retention: retention,
 		runBytes: contract.MaxRetainedResultBytes, rootBytes: contract.MaxRetainedResultRootBytes,
 		now: time.Now, logf: logf,
 		paths: make(map[string]*handoffPathLock),
@@ -179,11 +176,16 @@ func (m *handoffManager) finish(spec contract.JobSpec, nodeID string, succeeded,
 		return fmt.Errorf("handoff directory %q lost its ownership marker", path)
 	}
 	now := m.now().UTC()
-	marker.RetainUntil = now.Add(m.retention)
-	marker.RetainedAt = now
-	marker.Succeeded = succeeded
-	marker.Published = published
-	if err := writeHandoffMarker(path, marker); err != nil {
+	// The record is the agent's, in the agent's own directory. Nothing is
+	// written back into the handoff directory here: the marker there proves
+	// ownership to a cold rerun and is advisory, and rewriting it after the
+	// workload has had the directory is a write into a tree the workload
+	// controls.
+	if err := m.writeRecord(retentionRecord{
+		RunID: runID, NodeID: nodeID, Directory: path,
+		RetainedAt: now, RetainUntil: now.Add(m.retention),
+		Published: published, Succeeded: succeeded,
+	}); err != nil {
 		return err
 	}
 	return m.enforceRunBound(path, runID)
@@ -198,6 +200,24 @@ func (m *handoffManager) enforceRunBound(path, runID string) error {
 	if err != nil {
 		return err
 	}
+	// A result.json that is not a regular file is removed before anything is
+	// measured against the bound. Leaving it would be the worst outcome of the
+	// two the protection exists to avoid: the alias survives as a result while
+	// trimming deletes whatever it pointed at, so what an operator finds is a
+	// dangling link named like a verdict.
+	for index, entry := range entries {
+		if entry.name != handoffResultName || entry.regular {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(path, entry.name)); err != nil {
+			return fmt.Errorf("remove an unusable %s for run %q: %w", handoffResultName, runID, err)
+		}
+		m.log("agent: run %s had a %s that is not a regular file (%s); it is not a result and was removed",
+			runID, handoffResultName, entry.mode)
+		size -= entry.size
+		entries = slices.Delete(entries, index, index+1)
+		break
+	}
 	if size <= m.runBytes {
 		return nil
 	}
@@ -206,7 +226,11 @@ func (m *handoffManager) enforceRunBound(path, runID string) error {
 		if size <= m.runBytes {
 			break
 		}
-		if entry.name == handoffMarkerName || entry.name == handoffResultName {
+		if entry.name == handoffMarkerName {
+			continue
+		}
+		if entry.name == handoffResultName {
+			// Protected, and by now guaranteed to be a regular file.
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(path, entry.name)); err != nil {
@@ -227,53 +251,83 @@ func (m *handoffManager) enforceRunBound(path, runID string) error {
 
 // retainedRun is one run's retained results as the sweep sees them.
 type retainedRun struct {
-	path   string
-	marker handoffMarker
+	record retentionRecord
 	size   int64
 }
 
-// cleanupExpired removes direct children of the configured root whose retention
-// deadline has elapsed, then evicts until the node's retained results fit the
-// root bound. Both halves touch only directories carrying an agent-owned
-// marker: anything else under the root is someone else's and is left alone.
-func (m *handoffManager) cleanupExpired(except string) error {
+// collect expires and evicts. It is the node's whole storage discipline for
+// results, and it runs at startup, after every attempt finishes, and on a
+// timer -- not only at startup, which is how a long-lived agent used to be
+// able to accumulate results without bound.
+//
+// It acts only on directories the agent has a record for. A directory under
+// the root with no record is someone else's and is never measured, never
+// evicted and never removed, however full the node is.
+func (m *handoffManager) collect() error {
 	if err := ensurePrivateDirectory(m.root); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(m.root)
-	if err != nil {
-		return err
-	}
+	active := m.activePaths()
 	now := m.now().UTC()
-	retained := make([]retainedRun, 0, len(entries))
-	var total int64
-	for _, entry := range entries {
-		path := filepath.Join(m.root, entry.Name())
-		if path == except || !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-			continue
-		}
-		marker, exists, err := readHandoffMarker(path)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			continue
-		}
-		if !marker.RetainUntil.IsZero() && !now.Before(marker.RetainUntil) {
-			if err := os.RemoveAll(path); err != nil {
-				return fmt.Errorf("remove expired handoff directory %q: %w", path, err)
+	retained := make([]retainedRun, 0, 8)
+	var total, activeBytes int64
+	for _, record := range m.loadRecords() {
+		info, err := os.Lstat(record.Directory)
+		if errors.Is(err, fs.ErrNotExist) {
+			// The directory is gone; the record has nothing left to describe.
+			if err := m.removeRecord(record.RunID); err != nil {
+				m.log("agent: remove orphaned retention record for run %s: %v", record.RunID, err)
 			}
-			m.log("agent: retained results for run %s expired and were removed", marker.RunID)
 			continue
 		}
-		_, size, err := handoffEntries(path)
 		if err != nil {
-			return err
+			m.log("agent: inspect retained results for run %s: %v", record.RunID, err)
+			continue
 		}
-		retained = append(retained, retainedRun{path: path, marker: marker, size: size})
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			m.log("agent: retained results for run %s are not a directory; leaving them alone", record.RunID)
+			continue
+		}
+		size, err := measureRetainedResults(record.Directory)
+		if err != nil {
+			m.log("agent: measure retained results for run %s: %v", record.RunID, err)
+			continue
+		}
+		if _, live := active[record.Directory]; live {
+			// An attempt owns this path right now. It is never expired and
+			// never evicted, but its bytes are still the node's bytes.
+			activeBytes += size
+			total += size
+			continue
+		}
+		if !record.RetainUntil.IsZero() && !now.Before(record.RetainUntil) {
+			if err := os.RemoveAll(record.Directory); err != nil {
+				return fmt.Errorf("remove expired handoff directory %q: %w", record.Directory, err)
+			}
+			if err := m.removeRecord(record.RunID); err != nil {
+				m.log("agent: remove retention record for expired run %s: %v", record.RunID, err)
+			}
+			m.log("agent: retained results for run %s expired and were removed", record.RunID)
+			continue
+		}
+		retained = append(retained, retainedRun{record: record, size: size})
 		total += size
 	}
-	return m.evictToRootBound(retained, total)
+	return m.evictToRootBound(retained, total, activeBytes)
+}
+
+// activePaths is the real answer to "which runs are in flight": the lock
+// registry every attempt passes through to own its handoff path. A sweep that
+// took the caller's word for it would be one refactor away from deleting a
+// directory a running attempt is writing into.
+func (m *handoffManager) activePaths() map[string]struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	active := make(map[string]struct{}, len(m.paths))
+	for path := range m.paths {
+		active[path] = struct{}{}
+	}
+	return active
 }
 
 // evictToRootBound removes whole runs until the node fits. Order is the
@@ -281,48 +335,79 @@ func (m *handoffManager) cleanupExpired(except string) error {
 // evidence did not, because the ledger still has the first run's story and
 // nothing has the second's. Within each group the oldest goes first.
 //
-// This is the agent's own bound. Cache-pressure rules elsewhere -- the OCI
-// image cache, a node running out of disk -- act on their own resources and are
-// unaffected by it; where they and this bound both apply to the same node, each
+// This is the agent's own bound over the process handoff root. Cache-pressure
+// rules elsewhere -- the OCI image cache, a node running out of disk -- act on
+// their own resources; where they and this bound both apply to one node, each
 // enforces its own budget and neither defers to the other.
-func (m *handoffManager) evictToRootBound(retained []retainedRun, total int64) error {
+func (m *handoffManager) evictToRootBound(retained []retainedRun, total, activeBytes int64) error {
 	if total <= m.rootBytes {
 		return nil
 	}
 	slices.SortFunc(retained, func(left, right retainedRun) int {
-		if left.marker.Published != right.marker.Published {
-			if left.marker.Published {
+		if left.record.Published != right.record.Published {
+			if left.record.Published {
 				return -1
 			}
 			return 1
 		}
-		return left.marker.RetainedAt.Compare(right.marker.RetainedAt)
+		return left.record.RetainedAt.Compare(right.record.RetainedAt)
 	})
 	for _, run := range retained {
 		if total <= m.rootBytes {
 			break
 		}
-		if err := os.RemoveAll(run.path); err != nil {
-			return fmt.Errorf("evict retained handoff directory %q: %w", run.path, err)
+		if err := os.RemoveAll(run.record.Directory); err != nil {
+			return fmt.Errorf("evict retained handoff directory %q: %w", run.record.Directory, err)
+		}
+		if err := m.removeRecord(run.record.RunID); err != nil {
+			m.log("agent: remove retention record for evicted run %s: %v", run.record.RunID, err)
 		}
 		m.log("agent: node retained %d bytes of results, past the %d byte bound; evicted run %s (%d bytes, published=%t)",
-			total, m.rootBytes, run.marker.RunID, run.size, run.marker.Published)
-		total -= run.size
+			total, m.rootBytes, run.record.RunID, run.size, run.record.Published)
+		// Remeasured rather than subtracted: the snapshot was taken before the
+		// removal, and what matters is what is on the node now.
+		measured, err := m.measureRetained(retained)
+		if err != nil {
+			return err
+		}
+		total = measured + activeBytes
 	}
 	if total > m.rootBytes {
-		m.log("agent: node still retains %d bytes of results after evicting every eligible run", total)
+		// Runs still executing can exceed the budget on their own. Nothing in
+		// flight is ever evicted to make room -- that would delete a directory
+		// a workload is writing into -- so the node reports the overrun once
+		// and collects again when those runs finish.
+		m.log("agent: node retains %d bytes of results, past the %d byte bound, with %d bytes still in flight; "+
+			"nothing further is evictable until those runs finish", total, m.rootBytes, activeBytes)
 	}
 	return nil
 }
 
-type handoffEntry struct {
-	name string
-	size int64
+// measureRetained re-walks what is left after a removal.
+func (m *handoffManager) measureRetained(retained []retainedRun) (int64, error) {
+	var total int64
+	for _, run := range retained {
+		size, err := measureRetainedResults(run.record.Directory)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += size
+	}
+	return total, nil
 }
 
-// handoffEntries measures one retained run. It walks the directory rather than
-// stat-ing it, because a run's results are files it wrote and the sizes are
-// what the bounds are about.
+type handoffEntry struct {
+	name    string
+	size    int64
+	regular bool
+	mode    os.FileMode
+}
+
+// handoffEntries measures one retained run's direct children, which is the
+// granularity the per-run bound trims at.
 func handoffEntries(path string) ([]handoffEntry, int64, error) {
 	children, err := os.ReadDir(path)
 	if err != nil {
@@ -330,21 +415,46 @@ func handoffEntries(path string) ([]handoffEntry, int64, error) {
 	}
 	entries := make([]handoffEntry, 0, len(children))
 	var total int64
+	seen := map[inodeIdentity]struct{}{}
 	for _, child := range children {
-		size, err := handoffEntrySize(filepath.Join(path, child.Name()))
+		childPath := filepath.Join(path, child.Name())
+		info, err := os.Lstat(childPath)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, 0, fmt.Errorf("inspect %q: %w", childPath, err)
+		}
+		size, err := measureEntry(childPath, seen)
 		if err != nil {
 			return nil, 0, err
 		}
-		entries = append(entries, handoffEntry{name: child.Name(), size: size})
+		entries = append(entries, handoffEntry{
+			name: child.Name(), size: size,
+			regular: info.Mode().IsRegular(), mode: info.Mode(),
+		})
 		total += size
 	}
 	return entries, total, nil
 }
 
-// handoffEntrySize never follows a symlink and never leaves the entry: a
-// workload writes into this directory, and measuring it must not become a way
-// to walk the node.
-func handoffEntrySize(path string) (int64, error) {
+func measureRetainedResults(path string) (int64, error) {
+	_, total, err := handoffEntries(path)
+	return total, err
+}
+
+// inodeIdentity is how a hard-linked file is charged once. Two names for one
+// inode are one file on the disk, and charging both would evict results that
+// are not actually using the space.
+type inodeIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+// measureEntry sums the logical length of the regular files under one entry.
+// It never follows a symlink: a link into the node is not this run's storage,
+// and following one would make measurement a way to walk the filesystem.
+func measureEntry(path string, seen map[inodeIdentity]struct{}) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(path, func(current string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -360,9 +470,18 @@ func handoffEntrySize(path string) (int64, error) {
 			}
 			return err
 		}
-		if info.Mode().IsRegular() {
-			total += info.Size()
+		if !info.Mode().IsRegular() {
+			// Directories, symlinks, sockets and devices contribute nothing:
+			// the budgets are logical bytes of regular files.
+			return nil
 		}
+		if identity, links, ok := inodeOf(info); ok && links > 1 {
+			if _, counted := seen[identity]; counted {
+				return nil
+			}
+			seen[identity] = struct{}{}
+		}
+		total += info.Size()
 		return nil
 	})
 	if err != nil {

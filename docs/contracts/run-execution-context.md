@@ -616,31 +616,82 @@ Three bounds apply, and all three are contract values rather than node
 configuration, because a person reading `wefty inspect` has to know when their
 results stop existing:
 
-| Bound | Value | What happens past it |
-| --- | --- | --- |
-| Retention window | 7 days from the run finishing | The whole directory is swept, process and OCI alike. |
-| Per run | 64 MiB | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. |
-| Per node | 1 GiB across every retained run | Whole runs are evicted until the node fits. |
+| Bound | Value | Applies to | What happens past it |
+| --- | --- | --- | --- |
+| Retention window | 7 days | both kinds | The whole directory or volume is swept. |
+| Per run | 64 MiB | the process handoff root | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. A `result.json` that is not a regular file is not a result at all and is removed, because the alternative is a dangling link named like a verdict. |
+| Per node | 1 GiB | the process handoff root | Whole runs are evicted until the node fits. |
+
+**Part 1 bounds the process handoff root only.** An OCI run's results live in a
+helper-owned volume the agent cannot measure, so in part 1 those volumes are
+bounded by the window alone: neither byte budget covers them, and the node's
+1 GiB is not a combined process-plus-OCI figure. Per-volume byte accounting and
+publication-aware eviction inside the helper are #494.
+
+**The OCI window runs from the volume's last preparation, not from the run
+finishing.** The helper stamps the volume's mtime when it prepares or reuses it
+and expires it on that stamp, so a job that creates its files early and then
+runs for a long time can see its results expire sooner than seven days after it
+finished. A uid-0 workload can also move that timestamp, by the same ownership
+limit the mailbox records (`oci-helper-protocol.md`, "Run mailbox
+confinement"): the volume is a bind mount it can write. A helper-owned terminal
+timestamp, recorded after quiescence and validated, is #494.
 
 Eviction order is the one place this design chooses what to lose. A run whose
 evidence reached the ledger goes before a run whose evidence did not, because
 the ledger still holds the first run's story and nothing holds the second's;
-within each group the oldest goes first. The run currently executing is never
-swept. Directories under the handoff root that carry no agent ownership marker
-are never touched at all, however full the node is.
+within each group the oldest goes first. A run an attempt currently holds is
+never swept and never evicted, and its bytes still count against the node: if
+work in flight alone exceeds the budget, the node logs the overrun once and
+collects again when those runs finish rather than deleting a directory a
+workload is writing into.
 
-This bound is the agent's own. Cache-pressure rules elsewhere — the OCI image
+Collection runs at agent startup, after every attempt finishes — including the
+attempts that never completed cleanly — and hourly. The authority it acts on is
+a record the agent keeps under its own state directory, never a file inside the
+handoff directory: a process workload shares the agent's OS identity, so
+anything in there is a file it can rewrite to make another run expire, to prefer
+its own results, or to escape accounting. A directory with no agent record is
+not the agent's and is never measured, evicted or removed, however full the node
+is. A record that cannot be read or does not match where it is filed is skipped
+with a logged reason and never stops the sweep.
+
+**The budgets are logical bytes**, summed over regular files: the length a file
+reports, not the blocks it occupies. A hard-linked file is charged once, a
+symlink is never followed and contributes nothing, and sparse files are charged
+their logical length. There is no inode or entry-count bound in part 1, so many
+tiny files can consume node resources while barely moving these budgets;
+whether to add one is part of #494.
+
+These are the agent's own bounds. Cache-pressure rules elsewhere — the OCI image
 cache, a node running out of disk — govern their own resources and neither
-defers to nor overrides it; where both apply to one node, each enforces its own
-budget.
+defers to nor overrides them; where both apply to one node, each enforces its
+own budget.
 
 **How results are read.** Today: on the node, under the handoff directory, by
 someone with access to that node. `wefty inspect` reports where a finished run's
 results are and when they are scheduled to expire, computed from the run's
 finish time and the retention window above rather than observed on the node —
 so a node configured with a different window, or one that evicted the run early
-for room, will differ, and the report says so. Reading a result file remotely,
-for `kind=process` and `kind=oci` alike, is #483 D2 and is not implemented.
+for room, will differ, and the report says so.
+
+Reading a result remotely is #483 part 2, and its shape is decided: the result
+document is **uploaded**, not fetched. At completion the node agent pushes
+`result.json` to L1 over an agent route beside the one it already uses for logs,
+L1 stores one document per job — replaced on retry, expiring with the job's logs
+— and L3 exposes it per run. `wefty results RUN_ID [--out FILE]` then reads it
+through L3 with the person's own Fabric identity, exactly as `wefty logs` does,
+and works whether or not the node is still reachable. `kind=oci` uploads the
+same way: the agent reads `result.json` out of the helper-owned volume through
+the confined helper read path before the attempt is reaped.
+
+The upload is bounded separately and much more tightly than the node's own
+retention, because it is a document in a database rather than files on a disk:
+the on-node bounds above keep up to 64 MiB of a run's files, while the uploaded
+document is capped at 1 MiB. A run whose `result.json` exceeds that keeps its
+file on the node and uploads nothing, which `inspect` will report. That split is
+the point of doing both: the ledger holds the document an operator reads, and
+the node holds everything the run produced.
 
 Handoff files are node-local. If a cold rerun finds files in an existing
 managed directory, its job must include the reserved routing tag
