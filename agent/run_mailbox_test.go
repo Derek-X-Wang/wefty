@@ -1504,6 +1504,17 @@ func TestMailboxValidJSONStateIsClampedAndFailsClosed(t *testing.T) {
 		{"unaccounted rejection", func(s *runMailboxState) {
 			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, RejectionReserved: true}
 		}},
+		{"unaccounted refusal", func(s *runMailboxState) {
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, Refused: &runMailboxRefusal{Status: 400}}
+		}},
+		{"invalid refusal status", func(s *runMailboxState) {
+			s.Rejections = 1
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, RejectionReserved: true, Refused: &runMailboxRefusal{Status: 500}}
+		}},
+		{"oversized refusal reason", func(s *runMailboxState) {
+			s.Rejections = 1
+			s.Events["0001-event"] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin, RejectionReserved: true, Refused: &runMailboxRefusal{Status: 400, Reason: strings.Repeat("x", runMailboxRefusalReasonBytes+1)}}
+		}},
 		{"excess entries", func(s *runMailboxState) {
 			for i := range MaxRunMailboxScanEntries + 1 {
 				s.Events[fmt.Sprintf("event-%04d", i)] = runMailboxEventState{ObservedAt: mailboxTestClockOrigin}
@@ -1626,9 +1637,16 @@ func TestMailboxLedgerRefusalRetainsEvidence(t *testing.T) {
 	for _, malformed := range []bool{false, true} {
 		for _, status := range []int{400, 401, 409} {
 			t.Run(fmt.Sprintf("malformed=%t/status=%d", malformed, status), func(t *testing.T) {
-				appender := newRecordingAppender("")
-				appender.failWith(&runLedgerRejection{statusCode: status, body: "refusal reason"})
-				mailbox, _, _ := newTestMailbox(t, appender, "")
+				accepted := newRecordingAppender("")
+				calls := 0
+				appender := mailboxAppenderFunc(func(ctx context.Context, token, run, collection string, body []byte) error {
+					calls++
+					if calls == 1 {
+						return &runLedgerRejection{statusCode: status, body: "refusal reason"}
+					}
+					return accepted.appendRunDocument(ctx, token, run, collection, body)
+				})
+				mailbox, handoff, clock := newTestMailbox(t, appender, "")
 				var logs strings.Builder
 				mailbox.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
 				raw := "wefty-protocol: 1\nkind: envelope\n--\n"
@@ -1636,20 +1654,86 @@ func TestMailboxLedgerRefusalRetainsEvidence(t *testing.T) {
 					raw = "not protocol\n"
 				}
 				writeMailboxEvent(t, mailbox.directory, "0001-event", raw)
-				mailbox.finalize(context.Background())
-				if !mailbox.publicationIncomplete() || mailbox.pending() != malformed || !strings.Contains(logs.String(), "refusal reason") {
-					t.Fatal("refused document lost its retention, retirement, or refusal log")
+				writeMailboxEvent(t, mailbox.directory, "0002-later", "wefty-protocol: 1\nkind: gate\nname: later\noutcome: pass\n--\n")
+				// Stop before finalization to model a crash after the refusal.
+				mailbox.sweep(context.Background())
+				if calls != 2 || len(accepted.snapshot()) != 1 {
+					t.Fatal("refusal blocked a later event in the same sweep")
 				}
-				if malformed {
-					appender.failWith(nil)
+				if !mailbox.publicationIncomplete() || !mailbox.pending() || !strings.Contains(logs.String(), "refusal reason") {
+					t.Fatal("refused document lost its source, retention, or refusal log")
+				}
+				for range 3 {
 					mailbox.sweep(context.Background())
-					if mailbox.pending() || len(appender.snapshot()) != 1 || !mailbox.publicationIncomplete() {
-						t.Fatal("refused rejection report did not remain retryable with retention latched")
-					}
+				}
+				if calls != 2 {
+					t.Fatal("repeated sweeps resent a terminal refusal")
+				}
+				mailbox.close()
+				restarted, err := prepareRunMailbox(mailboxSpec("run_mailbox", handoff, ""), mailboxTestAttempt, appender, time.Hour, clock, t.Logf)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer restarted.close()
+				if restarted.corrupt || !restarted.publicationIncomplete() {
+					t.Fatal("reopening before finalization lost the durable refusal retention marker")
+				}
+				if refused := restarted.state.Events["0001-event"].Refused; refused == nil || refused.Status != status || refused.Reason != "refusal reason" {
+					t.Fatalf("reopening lost refusal status or reason: %+v", refused)
+				}
+				restarted.finalize(context.Background())
+				if calls != 2 || !restarted.pending() {
+					t.Fatal("reopening resent the refusal or lost its source")
+				}
+				if source, err := os.ReadFile(filepath.Join(restarted.directory, runMailboxEventsDirectoryName, "0001-event")); err != nil || string(source) != raw {
+					t.Fatalf("refused source was not retained intact: %v", err)
 				}
 			})
 		}
 	}
+}
+
+func TestFencedAttemptWaitingBeforeMailboxTransferReturnsWithoutAppend(t *testing.T) {
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(unblock) }) }
+	defer release()
+	appender := mailboxAppenderFunc(func(ctx context.Context, _, _, _ string, _ []byte) error {
+		close(entered)
+		<-unblock // deliberately ignores cancellation
+		return ctx.Err()
+	})
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	writeMailboxEvent(t, mailbox.directory, "0001-event", "wefty-protocol: 1\nkind: envelope\n--\n")
+	ctx := mailboxManualDeadline{Context: context.Background(), done: make(chan struct{})}
+	finalized := make(chan struct{})
+	go func() { defer close(finalized); mailbox.finalize(ctx) }()
+	waitMailboxSignal(t, entered)
+	attempt, cancelAttempt, releaseWatcher := fencedAttemptContext(context.Background(), mailbox.fence)
+	defer releaseWatcher()
+	fenced := make(chan struct{})
+	go func() { defer close(fenced); cancelAttempt(context.Canceled) }()
+	// Only the pre-transfer fence can cancel publication at this point.
+	waitMailboxSignal(t, mailbox.publicationContext.Done())
+	if mailbox.detached.Load() || attempt.Err() != nil {
+		t.Fatal("fence did not wait for the admitted append before transfer")
+	}
+	close(ctx.done)
+	waitMailboxSignal(t, finalized)
+	waitMailboxSignal(t, fenced)
+	if !mailbox.detached.Load() || !errors.Is(attempt.Err(), context.Canceled) {
+		t.Fatal("ownership transfer did not release the fence and attempt cancellation")
+	}
+	select {
+	case <-unblock:
+		t.Fatal("appender was released before the fence returned")
+	default:
+	}
+	if _, err := mailbox.root.Stat("."); err != nil {
+		t.Fatalf("fence closed the detached worker's roots: %v", err)
+	}
+	release()
+	waitMailboxRootsClosed(t, mailbox)
 }
 
 func TestMailboxExhaustedRejectionBudgetRetiresWithLog(t *testing.T) {

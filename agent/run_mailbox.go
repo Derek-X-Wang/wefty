@@ -25,7 +25,8 @@ import (
 
 // The run mailbox is the job-owned directory in which a workload writes its
 // envelopes, steps, gate results and result files, and from which this agent
-// publishes them without requiring or using the workload's credential. The
+// publishes them without requiring the workload to hold or use a credential
+// (the agent publishes with the run token it holds). The
 // workload writes plain text; building protocol JSON that satisfies the v1
 // schemas is the agent's job, which is what lets a bash workflow report without
 // hand-rolling either HTTP or JSON escaping.
@@ -73,6 +74,9 @@ const (
 	// named at the name bound — so a legitimate state is never mistaken for a
 	// corrupt one.
 	MaxRunMailboxStateBytes = 4 << 20
+	// Bound refusal reasons so terminal markers fit in the state budget,
+	// including JSON escaping at the event and rejection limits.
+	runMailboxRefusalReasonBytes = 256
 	// DefaultRunMailboxPollInterval is how often a running attempt's mailbox
 	// is swept. Step timestamps are therefore accurate to this interval, not
 	// to the instant the workload wrote the file.
@@ -103,7 +107,7 @@ const (
 )
 
 // runLedgerRejection is L3 refusing a document on its own merits. Retrying it
-// unchanged cannot succeed, so the event is retired instead of republished.
+// unchanged cannot succeed, so the source is retained with a terminal marker.
 type runLedgerRejection struct {
 	statusCode int
 	body       string
@@ -318,8 +322,14 @@ type runMailboxEventState struct {
 	ObservedAt time.Time `json:"observed_at"`
 	// ChargedBytes reserves one event and its bytes before the first append.
 	// Replays use the reservation, including after a lost append response.
-	ChargedBytes      int64 `json:"charged_bytes,omitempty"`
-	RejectionReserved bool  `json:"rejection_reserved,omitempty"`
+	ChargedBytes      int64              `json:"charged_bytes,omitempty"`
+	RejectionReserved bool               `json:"rejection_reserved,omitempty"`
+	Refused           *runMailboxRefusal `json:"refused,omitempty"`
+}
+
+type runMailboxRefusal struct {
+	Status int    `json:"status"`
+	Reason string `json:"reason"`
 }
 
 // runMailbox owns one attempt's mailbox directory and publishes from it.
@@ -363,13 +373,16 @@ type runMailbox struct {
 	publicationContext context.Context
 	cancelPublication  context.CancelFunc
 	appendCheckpoint   func(context.Context) // test seam, under appendMu
+	appendJoinOnce     sync.Once
+	appendsJoined      chan struct{}
 
 	fenced     atomic.Bool
 	incomplete atomic.Bool
 
 	// Once finalization detaches, its cleanup worker alone closes the roots.
-	detached  atomic.Bool
-	closeOnce sync.Once
+	detached     atomic.Bool
+	detachedDone chan struct{}
+	closeOnce    sync.Once
 
 	stopOnce sync.Once
 	cancel   context.CancelFunc
@@ -444,6 +457,9 @@ func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedg
 		maxBytes:  MaxRunMailboxTotalBytes,
 		maxScan:   MaxRunMailboxScanEntries,
 		finished:  make(chan struct{}),
+
+		appendsJoined: make(chan struct{}),
+		detachedDone:  make(chan struct{}),
 	}
 	mailbox.publicationContext, mailbox.cancelPublication = context.WithCancel(context.Background())
 	mailbox.loadState()
@@ -564,6 +580,12 @@ func (m *runMailbox) loadState() {
 		}
 		if event.RejectionReserved {
 			reservedRejections++
+		}
+		if event.Refused != nil {
+			m.incomplete.Store(true)
+			if event.Refused.Status < 400 || event.Refused.Status >= 500 || len(event.Refused.Reason) > runMailboxRefusalReasonBytes || (event.ChargedBytes == 0 && !event.RejectionReserved) {
+				invalid = true
+			}
 		}
 		m.state.Events[name] = event
 	}
@@ -695,11 +717,20 @@ func (m *runMailbox) fence(cause error) {
 	if m.detached.Load() {
 		return
 	}
-	// Every caller joins, even if another caller has already set the fence.
-	// An append either holds appendMu and finishes before this returns, or
-	// acquires it later and observes the permanent fence.
-	m.appendMu.Lock()
-	m.appendMu.Unlock()
+	// All callers share a join, including callers already waiting when an
+	// expired finalization transfers ownership to cleanup. Later appends
+	// observe the permanent fence under appendMu.
+	m.appendJoinOnce.Do(func() {
+		go func() {
+			m.appendMu.Lock()
+			m.appendMu.Unlock()
+			close(m.appendsJoined)
+		}()
+	})
+	select {
+	case <-m.appendsJoined:
+	case <-m.detachedDone:
+	}
 }
 
 func (m *runMailbox) stopPublication(cause error) {
@@ -834,9 +865,12 @@ func (m *runMailbox) finishExpired(cause error, done <-chan struct{}) {
 		}
 		ownership <- false
 	case <-timer.C:
-		m.detached.Store(true)
+		transferred := m.detached.CompareAndSwap(false, true)
 		m.incomplete.Store(true)
 		ownership <- true
+		if transferred {
+			close(m.detachedDone)
+		}
 		m.log("agent: run %s mailbox_finalization_join_timeout: roots transferred to cleanup; retaining handoff", m.runID)
 	}
 }
@@ -921,6 +955,9 @@ func (m *runMailbox) scanEvents() ([]string, bool, error) {
 }
 
 func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
+	if m.state.Events[name].Refused != nil {
+		return errRunMailboxEntryNotDrained
+	}
 	if !validRunMailboxEventName(name) {
 		m.log("agent: run %s mailbox event name %q is not acceptable", m.runID, name)
 		return m.discard(name)
@@ -993,8 +1030,7 @@ func (m *runMailbox) publishEvent(ctx context.Context, name string) error {
 		var rejection *runLedgerRejection
 		if errors.As(err, &rejection) {
 			m.log("agent: run %s mailbox event %q was refused: %v", m.runID, name, err)
-			m.incomplete.Store(true)
-			return m.retire(name)
+			return m.recordRefusal(name, rejection)
 		}
 		m.log("agent: publish run %s mailbox event %q: %v", m.runID, name, err)
 		return err
@@ -1038,8 +1074,7 @@ func (m *runMailbox) reject(ctx context.Context, name string, cause error) error
 		var rejection *runLedgerRejection
 		if errors.As(err, &rejection) {
 			m.log("agent: run %s rejection report for %q was refused: %v", m.runID, name, err)
-			m.incomplete.Store(true)
-			return err
+			return m.recordRefusal(name, rejection)
 		}
 		m.log("agent: report rejected run %s mailbox event %q: %v", m.runID, name, err)
 		return err
@@ -1047,9 +1082,25 @@ func (m *runMailbox) reject(ctx context.Context, name string, cause error) error
 	return nil
 }
 
+// recordRefusal retains the source and a terminal marker so later sweeps and
+// reopenings skip it while still publishing later events in lexical order.
+func (m *runMailbox) recordRefusal(name string, rejection *runLedgerRejection) error {
+	m.incomplete.Store(true)
+	observation := m.state.Events[name]
+	observation.Refused = &runMailboxRefusal{
+		Status: rejection.statusCode,
+		Reason: strings.ToValidUTF8(rejection.body[:min(len(rejection.body), runMailboxRefusalReasonBytes)], "?"),
+	}
+	m.state.Events[name] = observation
+	if err := m.persistState(); err != nil {
+		return err
+	}
+	return errRunMailboxEntryNotDrained
+}
+
 // retire removes an event the agent is finished with and forgets its
-// bookkeeping. The ledger holds accepted documents; permanent event refusals
-// and exhausted rejection reports are logged instead.
+// bookkeeping. The ledger holds accepted documents; exhausted rejection
+// reports are logged instead.
 func (m *runMailbox) retire(name string) error {
 	if m.retireCheckpoint != nil && !m.retireCheckpoint() {
 		return nil
