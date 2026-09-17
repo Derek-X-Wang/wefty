@@ -2,7 +2,6 @@ package agent
 
 import (
 	"os"
-	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -21,27 +20,20 @@ const attemptCredentialFollowsDispatchAuthority = true
 // submittedByRunLedger reports L1's own answer to "did the run ledger submit
 // this job?".
 //
-// The submitter is derived by L1 from the authenticated Fabric identity of the
-// caller that created the job and stored on the job; no request body can set
-// it. That is what makes it usable as a credential control, unlike the job's
-// environment, which a direct-L1 submitter may fill with anything including
-// WEFTY_L3_ENDPOINT.
+// L1 classifies the authenticated submitter against its configured trusted
+// run-ledger identity when the job is created, stores the verdict, and returns
+// it on the claim. The agent must not recompute it: the submitter identity is
+// whatever the active fabric issues — a friendly Node ID on plain, a Tailscale
+// StableID on tsnet — so an agent comparing against a configured literal would
+// silently classify every genuine L3 run as direct-L1 on the supported tsnet
+// fabric. L1's configuration is the single point.
 //
-// A job spawned through an attempt credential inherits its root's originating
-// submitter, so a descendant of an L3 run would otherwise read as an L3
-// dispatch. L3 submits only root jobs, so a job with a parent never counts.
-func submittedByRunLedger(claim l1.Claim, runLedgerNodeID string) bool {
-	runLedgerNodeID = strings.TrimSpace(runLedgerNodeID)
-	if runLedgerNodeID == "" {
-		// An unset value means the default, never "match nothing". Treating it
-		// as the latter would turn one missing configuration line into a
-		// silently absent credential control.
-		runLedgerNodeID = contract.DefaultRunLedgerNodeID
-	}
-	if claim.Job.ParentJobID != "" {
-		return false
-	}
-	return strings.TrimSpace(claim.Job.OriginatingSubmitter) == runLedgerNodeID
+// The parent check is defence in depth. L1 already refuses the classification
+// to a job spawned through an attempt credential, which inherits its root's
+// originating submitter but has no Run of its own; asserting it here too keeps
+// the spawn chain ADR-0006 exists for from depending on one side alone.
+func submittedByRunLedger(claim l1.Claim) bool {
+	return claim.SubmittedByRunLedger && claim.Job.ParentJobID == ""
 }
 
 // withholdsWorkloadCredentials is the whole delivery rule, in one place.
@@ -51,15 +43,15 @@ func submittedByRunLedger(claim l1.Claim, runLedgerNodeID string) bool {
 // upgrade, omits it and a new agent would hand a reporting run both
 // credentials. The positive label alone fails closed in the other direction:
 // an agent that predates it withholds from a run that declared dispatch
-// authority and the run's child dispatch breaks. L1's provenance bit closes
-// the first gap without a wire change, and sending both labels closes the
-// second.
+// authority and the run's child dispatch breaks. L1's server-owned provenance
+// bit closes the first gap, and sending both labels closes the second.
 //
-// Forging is not a way in. A submitter cannot set the provenance bit at all,
-// and a direct-L1 job carries neither label, so it keeps its credentials by
-// construction; the most a forged withhold label achieves is deleting the
-// forger's own job's credentials.
-func withholdsWorkloadCredentials(claim l1.Claim, runLedgerNodeID string) bool {
+// Forging is not a way in. The provenance bit is L1's, derived from the
+// authenticated identity and never from a request body, and a direct-L1 job
+// carries neither label, so it keeps its credentials by construction; the most
+// a forged withhold label achieves is deleting the forger's own job's
+// credentials.
+func withholdsWorkloadCredentials(claim l1.Claim) bool {
 	spec := claim.Job.Spec
 	if spec.Class != contract.JobClassOneShot {
 		return false
@@ -67,7 +59,7 @@ func withholdsWorkloadCredentials(claim l1.Claim, runLedgerNodeID string) bool {
 	if contract.WithholdsWorkloadCredentials(spec.Labels) {
 		return true
 	}
-	return submittedByRunLedger(claim, runLedgerNodeID) && !contract.DeclaresDispatchAuthority(spec.Labels)
+	return submittedByRunLedger(claim) && !contract.DeclaresDispatchAuthority(spec.Labels)
 }
 
 // withheldWorkloadCredentialNames are the reserved names an attempt removes
@@ -94,7 +86,7 @@ func withheldWorkloadCredentialNames() []string {
 // It returns the values it withheld so the caller keeps redacting them. A
 // credential that is no longer in the environment — or that never belonged to
 // this job at all — is still a credential that must never reach a log sink.
-func withholdWorkloadCredentials(execution *contract.ExecutionSpec, claim l1.Claim, runLedgerNodeID string) []string {
+func withholdWorkloadCredentials(execution *contract.ExecutionSpec, claim l1.Claim) []string {
 	// The node agent's own environment is not this job's. If the operator
 	// exported a credential into the agent's process, a runtime that seeds a
 	// child from os.Environ() would hand it to the workload, so its value is
@@ -105,7 +97,7 @@ func withholdWorkloadCredentials(execution *contract.ExecutionSpec, claim l1.Cla
 	for _, name := range ambientCredentialNames {
 		withheld = appendCredential(withheld, os.Getenv(name))
 	}
-	if !withholdsWorkloadCredentials(claim, runLedgerNodeID) {
+	if !withholdsWorkloadCredentials(claim) {
 		return withheld
 	}
 	names := withheldWorkloadCredentialNames()

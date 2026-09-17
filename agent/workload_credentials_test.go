@@ -125,12 +125,11 @@ func (d *dispatchedRun) claim() l1.Claim {
 	return l1.Claim{
 		Job: l1.Job{
 			JobID: "job-" + d.runID, Spec: d.spec, State: contract.JobClaimed,
-			// L1 derived this from the authenticated identity that submitted
-			// the job. It is the provenance the agent trusts.
-			OriginatingSubmitter: contract.DefaultRunLedgerNodeID,
 		},
-		Lease:        l1.AttemptLease{AttemptID: "attempt-" + d.runID},
-		AttemptToken: undeliveredAttemptBearer,
+		// L1 classified the authenticated submitter when the job was created.
+		SubmittedByRunLedger: true,
+		Lease:                l1.AttemptLease{AttemptID: "attempt-" + d.runID},
+		AttemptToken:         undeliveredAttemptBearer,
 	}
 }
 
@@ -143,7 +142,6 @@ func (d *dispatchedRun) node(runner processrunner.Executor) *Agent {
 		fabric:           d.fabric,
 		controlPlaneAddr: "wefty://control-plane",
 		runLedgerAddr:    l3.DefaultL3Address,
-		runLedgerNodeID:  contract.DefaultRunLedgerNodeID,
 		runLedger:        newFabricRunLedgerAppender(d.fabric, l3.DefaultL3Address),
 		mailboxPoll:      time.Hour,
 	}
@@ -394,7 +392,6 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 				handoffs:         newHandoffManager(root, time.Hour),
 				fabric:           plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node-1"}),
 				controlPlaneAddr: "wefty://control-plane",
-				runLedgerNodeID:  contract.DefaultRunLedgerNodeID,
 				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 					return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
 						if event.Stream == contract.LogStdout {
@@ -415,7 +412,7 @@ func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
 			environment := map[string]string{contract.EnvRunID: runID, contract.EnvHandoffDir: handoff}
 			sensitive := map[string]string{}
 			if testCase.ledgerDispatched {
-				claim.Job.OriginatingSubmitter = contract.DefaultRunLedgerNodeID
+				claim.SubmittedByRunLedger = true
 				environment[contract.EnvL3Endpoint] = "wefty://l3"
 				sensitive[contract.EnvRunToken] = deliveredRunToken
 			} else {
@@ -494,7 +491,7 @@ func TestCredentialDeliveryMatrixAcrossLabelsAndProvenance(t *testing.T) {
 					claim := matrixClaim(kind, labels.withhold, labels.declare, provenance.ledger, "")
 					execution := claim.Job.Spec.Execution
 					execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
-					withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+					withholdWorkloadCredentials(&execution, claim)
 					assertCredentialDelivery(t, execution, !want, matrixRunToken, matrixAttemptToken)
 				})
 			}
@@ -506,7 +503,7 @@ func TestCredentialDeliveryMatrixAcrossLabelsAndProvenance(t *testing.T) {
 		claim := matrixClaim(contract.JobKindProcess, false, false, true, "")
 		execution := claim.Job.Spec.Execution
 		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
-		withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+		withholdWorkloadCredentials(&execution, claim)
 		// Provenance alone must close it: an unlabelled ledger job is a
 		// reporting run until it says otherwise.
 		assertCredentialDelivery(t, execution, false, matrixRunToken, matrixAttemptToken)
@@ -520,8 +517,19 @@ func TestCredentialDeliveryMatrixAcrossLabelsAndProvenance(t *testing.T) {
 		}
 		execution := claim.Job.Spec.Execution
 		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
-		withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+		withholdWorkloadCredentials(&execution, claim)
 		assertCredentialDelivery(t, execution, true, matrixRunToken, matrixAttemptToken)
+	})
+
+	// The misconfiguration the contract calls out: L1's trusted ledger identity
+	// is unset or wrong, so the classification is false for every job. A
+	// current L3's withhold label is what still protects a reporting run.
+	t.Run("misconfigured L1 still withholds a labelled reporting run", func(t *testing.T) {
+		claim := matrixClaim(contract.JobKindProcess, true, false, false, "")
+		execution := claim.Job.Spec.Execution
+		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+		withholdWorkloadCredentials(&execution, claim)
+		assertCredentialDelivery(t, execution, false, matrixRunToken, matrixAttemptToken)
 	})
 
 	// A job spawned through an attempt credential inherits its root's
@@ -532,7 +540,7 @@ func TestCredentialDeliveryMatrixAcrossLabelsAndProvenance(t *testing.T) {
 		claim := matrixClaim(contract.JobKindProcess, false, false, true, "job-parent")
 		execution := claim.Job.Spec.Execution
 		execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
-		withholdWorkloadCredentials(&execution, claim, contract.DefaultRunLedgerNodeID)
+		withholdWorkloadCredentials(&execution, claim)
 		assertCredentialDelivery(t, execution, true, matrixRunToken, matrixAttemptToken)
 	})
 }
@@ -545,13 +553,10 @@ func matrixClaim(kind string, withhold, declare, ledgerProvenance bool, parentJo
 	if declare {
 		labels[contract.LabelDispatchAuthority] = contract.LabelTrue
 	}
-	submitter := "some-operator-workstation"
-	if ledgerProvenance {
-		submitter = contract.DefaultRunLedgerNodeID
-	}
 	return l1.Claim{
+		SubmittedByRunLedger: ledgerProvenance,
 		Job: l1.Job{
-			JobID: "job-matrix", ParentJobID: parentJobID, OriginatingSubmitter: submitter,
+			JobID: "job-matrix", ParentJobID: parentJobID,
 			Spec: contract.JobSpec{
 				Kind: kind, Class: contract.JobClassOneShot, Labels: labels,
 				Execution: contract.ExecutionSpec{

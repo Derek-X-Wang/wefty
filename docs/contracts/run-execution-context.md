@@ -27,32 +27,47 @@ declaration delivers both credentials exactly as before. The declaration is
 recorded on the run record, so `wefty --json inspect` shows which runs hold
 credentials.
 
-On the wire the agent decides from three inputs, and withholds when **either**
-the public job label `withhold_workload_credentials` is present, **or** L1's
-own record says the run ledger submitted the job and the public job label
-`dispatch_authority` is absent. L3 sets exactly one of the two labels on every
-run it dispatches. The provenance is `originating_submitter`, which L1 derives
-from the authenticated Fabric identity of whoever created the job and returns
-on the claim; it matches the Node ID configured as the run ledger on both L1
-(`--run-ledger-node-id`) and the agent (the flag of the same name), which
-default to the same value and must be overridden together.
+On the wire the agent withholds when **either** the public job label
+`withhold_workload_credentials` is present, **or** the claim's
+`submitted_by_run_ledger` is true and the public job label `dispatch_authority`
+is absent. L3 sets exactly one of the two labels on every run it dispatches.
+
+`submitted_by_run_ledger` is L1's own classification, not the agent's. L1
+compares the authenticated Fabric identity that created the job against its
+configured trusted run-ledger identity (`--run-ledger-node-id`), stores the
+verdict with the job, and returns it on the claim. The agent must not
+reconstruct it, because the submitter identity's form is fabric-specific: a
+friendly Node ID on the plain fabric, a Tailscale **StableID** on tsnet. An
+agent comparing against a configured literal would classify every genuine L3
+run as direct-L1 on the supported fabric. L1's configuration is the single
+point, and on tsnet it must be set to the ledger's StableID.
 
 Three properties follow, and each one is why a single signal was not enough.
 The agent never infers L3 provenance from anything a submitter can write — a
 process `JobSpec` may legally carry any environment name, `WEFTY_L3_ENDPOINT`
-included. Neither direction fails open across a rolling upgrade: an older L3
-that sets no label still meets the provenance test, so its reporting runs are
-withheld from, and a newer L3 still sets the positive marker an older agent
-looks for, so a declaring run's child dispatch keeps working. And no forgery is
-a way in: a submitter cannot set the provenance at all, a job submitted
-straight to L1 carries neither label and keeps its credentials by construction,
-and the most a forged `withhold_workload_credentials` achieves is deleting the
-forger's own job's credentials.
+included, and `JobSpec` decoding rejects the classification outright. Neither
+direction fails open across a rolling upgrade: an older L3 that sets no label
+still meets the provenance test, so its reporting runs are withheld from, and a
+newer L3 still sets the positive marker an older agent looks for, so a
+declaring run's child dispatch keeps working. And no forgery is a way in: a
+submitter cannot set the classification at all, a job submitted straight to L1
+carries neither label and keeps its credentials by construction, and the most a
+forged `withhold_workload_credentials` achieves is deleting the forger's own
+job's credentials.
+
+If L1's trusted run-ledger identity is unset or wrong, the classification is
+false for every job. That is a degradation, not a hole: a current L3 marks its
+reporting runs with `withhold_workload_credentials`, so their credentials are
+still withheld, and only an unlabelled job from an older L3 would receive
+credentials under that misconfiguration. What such a job does lose either way
+is its run mailbox and its `/l3` route, so a misconfiguration shows up as runs
+that cannot report rather than as runs that hold more than they should.
 
 A job spawned through an attempt credential inherits its root's originating
-submitter, so a descendant of an L3 run would otherwise read as an L3 dispatch.
-L3 submits only root jobs, so a job with a parent never counts as run-ledger
-provenance and keeps the credential its spawn chain depends on.
+submitter but is its own direct-L1 submission with no Run, so L1 classifies it
+false and it keeps the credential its spawn chain depends on. The agent asserts
+the same thing from the claim's parent link, so neither side owns that rule
+alone.
 
 The run token still travels to the agent on every dispatch, in `SensitiveEnv`
 as always, because the mailbox publisher needs it; the decision above governs

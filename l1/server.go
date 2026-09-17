@@ -115,7 +115,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	}
 	runLedgerNodeID := strings.TrimSpace(config.RunLedgerNodeID)
 	if runLedgerNodeID == "" {
-		runLedgerNodeID = contract.DefaultRunLedgerNodeID
+		runLedgerNodeID = "run-ledger"
 	}
 	if policyFreshness <= policyWatchWait {
 		return nil, fmt.Errorf("l1: Computer policy freshness must exceed watch wait")
@@ -981,14 +981,31 @@ func (s *Server) listComputerTakeoverAudit(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, page)
 }
 
+// isRunLedgerSubmitter reports whether an authenticated submitter is the
+// configured run ledger. An unset or mismatched configuration makes this false
+// for every job, which is the fail-closed direction for new work: a current L3
+// also marks its reporting runs with the withhold label, so only an unlabelled
+// job from an older L3 would then keep credentials.
+func (s *Server) isRunLedgerSubmitter(submitter string) bool {
+	submitter = strings.TrimSpace(submitter)
+	return submitter != "" && submitter == s.runLedgerNodeID
+}
+
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	var spec contract.JobSpec
 	if err := decodeJSON(r, &spec); err != nil {
 		writeError(w, err)
 		return
 	}
+	// The trusted run-ledger identity is L1 configuration and is compared here,
+	// where the caller has just been authenticated. Whatever form the identity
+	// takes on the active fabric, this is the one place that knows it.
+	submitter := identityFromRequest(r).NodeID
 	job, replayed, err := s.store.CreateJobAs(r.Context(), spec,
-		JobOrigin{OriginatingSubmitter: identityFromRequest(r).NodeID})
+		JobOrigin{
+			OriginatingSubmitter: submitter,
+			SubmittedByRunLedger: s.isRunLedgerSubmitter(submitter),
+		})
 	if err != nil {
 		writeError(w, err)
 		return

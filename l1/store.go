@@ -256,6 +256,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   parent_job_id TEXT,
   parent_attempt_id TEXT,
   originating_submitter TEXT NOT NULL DEFAULT '',
+  submitted_by_run_ledger INTEGER NOT NULL DEFAULT 0 CHECK(submitted_by_run_ledger IN (0, 1)),
   spawn_depth INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0),
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL
@@ -334,6 +335,7 @@ CREATE TABLE IF NOT EXISTS attempt_credentials (
   job_id TEXT NOT NULL,
   node_id TEXT NOT NULL,
   originating_submitter TEXT NOT NULL DEFAULT '',
+  submitted_by_run_ledger INTEGER NOT NULL DEFAULT 0 CHECK(submitted_by_run_ledger IN (0, 1)),
   spawn_depth INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0),
   created_ns INTEGER NOT NULL
 );
@@ -921,6 +923,11 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		{"parent_job_id", "TEXT"},
 		{"parent_attempt_id", "TEXT"},
 		{"originating_submitter", "TEXT NOT NULL DEFAULT ''"},
+		// A job stored before L1 classified its submitter reads as not the run
+		// ledger. That is the fail-closed direction for new work: a current L3
+		// also sends the withhold label, so only an unlabelled legacy job is
+		// affected, and it keeps the credentials it was created expecting.
+		{"submitted_by_run_ledger", "INTEGER NOT NULL DEFAULT 0 CHECK(submitted_by_run_ledger IN (0, 1))"},
 		{"spawn_depth", "INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0)"},
 	} {
 		if err := s.ensureColumn(ctx, "jobs", column.name, column.definition); err != nil {
@@ -1794,6 +1801,13 @@ func (s *Store) Close() error { return s.db.Close() }
 // never read from the request body, so parentage cannot be forged.
 type JobOrigin struct {
 	OriginatingSubmitter string
+	// SubmittedByRunLedger is L1's own classification of the authenticated
+	// submitter against its configured trusted run-ledger identity. The server
+	// decides it, because only the server holds that configuration and only it
+	// knows what form the identity takes on the active fabric — a literal Node
+	// ID on plain, a Tailscale StableID on tsnet. It is never read from a
+	// request body.
+	SubmittedByRunLedger bool
 	Parent               *AttemptCredentialScope
 }
 
@@ -1811,6 +1825,7 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 		return Job{}, false, err
 	}
 	originatingSubmitter := strings.TrimSpace(origin.OriginatingSubmitter)
+	submittedByRunLedger := origin.SubmittedByRunLedger
 	var parentJobID, parentAttemptID sql.NullString
 	spawnDepth := 0
 	if origin.Parent != nil {
@@ -1828,6 +1843,10 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 		// A child never widens authority: it inherits the root submitter rather
 		// than adopting whoever happens to hold the credential.
 		originatingSubmitter = origin.Parent.OriginatingSubmitter
+		// It does not inherit the classification, though. A job spawned through
+		// an attempt credential is its own direct-L1 submission with no Run, so
+		// it keeps the credential its spawn chain depends on.
+		submittedByRunLedger = false
 	}
 	if isComputerSpec(spec) {
 		return Job{}, false, protocolError(contract.ErrorComputerResourceRequired,
@@ -1893,9 +1912,9 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state,
-                 parent_job_id, parent_attempt_id, originating_submitter, spawn_depth, created_ns, updated_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON, job.State,
-		parentJobID, parentAttemptID, originatingSubmitter, spawnDepth, now.UnixNano(), now.UnixNano())
+                 parent_job_id, parent_attempt_id, originating_submitter, submitted_by_run_ledger, spawn_depth, created_ns, updated_ns)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON, job.State,
+		parentJobID, parentAttemptID, originatingSubmitter, submittedByRunLedger, spawnDepth, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		// A concurrent identical submit can win the unique dispatch key. Read
 		// it after rolling this transaction back and preserve replay semantics.
@@ -2392,6 +2411,7 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var prestartDeadlineNS sql.NullInt64
 	var claimedParentJobID, claimedParentAttemptID sql.NullString
 	var originatingSubmitter string
+	var submittedByRunLedger bool
 	var spawnDepth int
 	// SQLite's immediate writer transaction serializes this count-then-insert.
 	// A Postgres adapter must instead lock the node row or retry serializable
@@ -2489,7 +2509,7 @@ WHERE job_id=(
 AND state=@job_queued
 	RETURNING job_id, spec_json, fence_counter, created_ns,
 	          image_resolution_json, prestart_budget_deadline_ns,
-	          parent_job_id, parent_attempt_id, originating_submitter, spawn_depth`
+	          parent_job_id, parent_attempt_id, originating_submitter, submitted_by_run_ledger, spawn_depth`
 	claimArguments := []any{
 		sql.Named("job_claimed", contract.JobClaimed),
 		sql.Named("attempt_id", attemptID),
@@ -2510,7 +2530,7 @@ AND state=@job_queued
 	claimArguments = append(claimArguments, exclusionArguments...)
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(claimQuery, exclusionClause), claimArguments...).
 		Scan(&jobID, &specJSON, &fence, &createdNS, &imageResolutionJSON, &prestartDeadlineNS,
-			&claimedParentJobID, &claimedParentAttemptID, &originatingSubmitter, &spawnDepth)
+			&claimedParentJobID, &claimedParentAttemptID, &originatingSubmitter, &submittedByRunLedger, &spawnDepth)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, internalError(err, "commit empty claim")
@@ -2633,6 +2653,7 @@ AND state=@job_queued
 		return nil, internalError(err, "commit job claim")
 	}
 	claim := &Claim{
+		SubmittedByRunLedger: submittedByRunLedger,
 		Job: Job{
 			JobID: jobID, NodeID: nodeID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID,
 			ParentJobID: claimedParentJobID.String, ParentAttemptID: claimedParentAttemptID.String,

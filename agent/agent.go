@@ -47,15 +47,11 @@ type Config struct {
 	Fabric              fabric.Fabric
 	ControlPlaneAddress string
 	RunLedgerAddress    string
-	// RunLedgerNodeID is the authenticated Fabric Node ID this agent treats as
-	// run-ledger job provenance. It must match L1's own setting; both default
-	// to contract.DefaultRunLedgerNodeID.
-	RunLedgerNodeID string
-	NodeID          string
-	BootSessionID   string
-	Version         string
-	OS              string
-	Architecture    string
+	NodeID              string
+	BootSessionID       string
+	Version             string
+	OS                  string
+	Architecture        string
 	// Capabilities is the complete advertised execution set; nil advertises none.
 	Capabilities map[string]bool
 	// CapabilityProbe earns and continuously revalidates OCI-related
@@ -120,9 +116,8 @@ type Config struct {
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
-	fabric          fabric.Fabric
-	runLedgerAddr   string
-	runLedgerNodeID string
+	fabric        fabric.Fabric
+	runLedgerAddr string
 	// controlPlaneAddr is the same L1 address the agent's own client dials. The
 	// attempt-credential bridge forwards to it over the agent's authenticated
 	// Fabric connection; L1 still requires the credential.
@@ -429,7 +424,6 @@ func New(config Config) (*Agent, error) {
 	constructionSucceeded = true
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
-		runLedgerNodeID:  stringOrDefault(config.RunLedgerNodeID, contract.DefaultRunLedgerNodeID),
 		controlPlaneAddr: config.ControlPlaneAddress,
 		registration:     registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
@@ -563,7 +557,6 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		finalizationTimeout: a.finalizationTimeout,
 		outputSinkFactory:   a.outputSinkFactory, handoffs: a.handoffs,
 		runLedger: a.runLedger, mailboxPoll: a.mailboxPoll,
-		runLedgerNodeID: a.runLedgerNodeID,
 		managedResource: a.managedResource,
 		nodeID:          a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,

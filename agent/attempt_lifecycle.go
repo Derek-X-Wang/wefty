@@ -1175,7 +1175,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	// why a run that only reports is dispatched without one at all.
 	// L1 derived this from the authenticated identity that submitted the job,
 	// so it is the one L3-provenance answer nothing in the JobSpec can forge.
-	ledgerDispatched := submittedByRunLedger(claim, lifecycle.dependencies.runLedgerNodeID)
+	ledgerDispatched := submittedByRunLedger(claim)
 	if lifecycle.dependencies.runLedger != nil && ledgerDispatched && runMailboxAvailable(claim.Job.Spec) {
 		prepared, err := prepareRunMailbox(claim.Job.Spec, claim.Lease.AttemptID, lifecycle.dependencies.runLedger,
 			lifecycle.dependencies.mailboxPoll, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
@@ -1196,7 +1196,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// dispatches child work, because that is the only way it holds a
 		// credential to report with.
 		lifecycle.log("agent: run mailbox publication is unavailable for kind=oci attempt %s; the handoff volume is helper-owned and exposes no read path", claim.Lease.AttemptID)
-		if withholdsWorkloadCredentials(claim, lifecycle.dependencies.runLedgerNodeID) {
+		if withholdsWorkloadCredentials(claim) {
 			lifecycle.log("agent: kind=oci attempt %s was dispatched without dispatch authority and has no mailbox, so it can report nothing to the run ledger", claim.Lease.AttemptID)
 		}
 	}
@@ -1253,7 +1253,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	// credential have both reached this point — the mailbox publisher needs the
 	// first and L1 minted the second at claim — and this is the last moment
 	// before either could enter the workload's environment.
-	withheldCredentials := withholdWorkloadCredentials(&executionSpec, claim, lifecycle.dependencies.runLedgerNodeID)
+	withheldCredentials := withholdWorkloadCredentials(&executionSpec, claim)
 	var sinks multiOutputSink
 	if lifecycle.dependencies.logSinkFactory != nil {
 		var candidate attemptLogSink
