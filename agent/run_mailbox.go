@@ -398,9 +398,10 @@ type runMailbox struct {
 	detachedDone chan struct{}
 	closeOnce    sync.Once
 
-	stopOnce sync.Once
-	cancel   context.CancelFunc
-	finished chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+	cancel    context.CancelFunc
+	finished  chan struct{}
 
 	// retireCheckpoint is a test-only seam that withholds retirement, so
 	// an agent lost between a successful publication and its bookkeeping can be
@@ -761,6 +762,16 @@ func (m *runMailbox) start(ctx context.Context) {
 	}()
 }
 
+// startIfRemote begins streaming publication for a mailbox served by the
+// runtime, once its attempt is admitted and a read can actually be authorized.
+// It is safe to call when there is no mailbox, and safe to call twice.
+func (m *runMailbox) startIfRemote(ctx context.Context) {
+	if !m.readsThroughRuntime() {
+		return
+	}
+	m.startOnce.Do(func() { m.start(ctx) })
+}
+
 // fence stops publication immediately and permanently. Authority loss is not a
 // reason to finish reporting: an attempt that no longer holds its lease must
 // not write anything further on the run's behalf.
@@ -794,7 +805,13 @@ func (m *runMailbox) stopPublication(cause error) {
 	first := !m.fenced.Swap(true)
 	m.cancelPublication()
 	if first {
-		m.log("agent: run %s mailbox publication fenced: %v", m.runID, cause)
+		// An ordinary teardown fences with no cause at all. Saying "<nil>"
+		// reads as a lost error; saying so plainly reads as what it is.
+		reason := "attempt teardown"
+		if cause != nil {
+			reason = cause.Error()
+		}
+		m.log("agent: run %s mailbox publication fenced: %s", m.runID, reason)
 	}
 }
 

@@ -2531,6 +2531,16 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	if value, ok := request.Execution.SensitiveEnv[contract.EnvAttemptToken]; ok && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvAttemptToken) {
 		input.AttemptToken = value
 	}
+	// The attempt credential and the endpoint it authenticates to are one
+	// surface, and the helper refuses a request carrying only half of it. That
+	// refusal is right and stays: an endpoint without a credential is a route
+	// to nothing, and a credential without its endpoint is unusable. Credential
+	// delivery is opt-in, so an ordinary reporting run arrives here with the
+	// credential already withheld and the endpoint still set; dropping the
+	// endpoint with it is what keeps that run startable.
+	if input.AttemptToken == "" || input.L1Endpoint == "" {
+		input.AttemptToken, input.L1Endpoint = "", ""
+	}
 	if value, ok := request.Execution.Env[contract.EnvL3Endpoint]; ok && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL3Endpoint) {
 		input.L3Endpoint = value
 	}

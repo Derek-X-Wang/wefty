@@ -365,3 +365,36 @@ func TestRunMailboxDirectoryIsNotSubmitterSupplied(t *testing.T) {
 		}
 	}
 }
+
+// TestWithheldAttemptCredentialIsAcceptedByTheHelper is the other side of the
+// same regression: the pairing rule below is sound and stays, so what had to
+// change was the caller. This pins both directions of the rule so neither can
+// drift without the other noticing.
+func TestWithheldAttemptCredentialIsAcceptedByTheHelper(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		token         string
+		endpoint      string
+		wantRefusedBy string
+	}{
+		{name: "a reporting run supplies neither"},
+		{name: "a dispatching run supplies both", token: "attempt-bearer", endpoint: "http://127.0.0.1:7001"},
+		{name: "an endpoint without a credential", endpoint: "http://127.0.0.1:7001", wantRefusedBy: "supplied together"},
+		{name: "a credential without an endpoint", token: "attempt-bearer", wantRefusedBy: "supplied together"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			input := testRunMailboxRunRequest(testAuthority()).Workload
+			input.AttemptToken, input.L1Endpoint = testCase.token, testCase.endpoint
+			err := validateWorkloadWire(input)
+			if testCase.wantRefusedBy == "" {
+				if err != nil {
+					t.Fatalf("the helper refused a complete pair: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), testCase.wantRefusedBy) {
+				t.Fatalf("refusal = %v, want one mentioning %q", err, testCase.wantRefusedBy)
+			}
+		})
+	}
+}

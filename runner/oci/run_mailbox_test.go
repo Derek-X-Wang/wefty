@@ -151,3 +151,66 @@ func TestAdapterCarriesTheRunMailboxSeedIntoTheHelperRun(t *testing.T) {
 }
 
 func stringPointer(value string) *string { return &value }
+
+// TestWorkloadInputPairsTheAttemptCredentialWithItsEndpoint is the regression
+// for a defect #485 left latent and this milestone's first default OCI run
+// surfaced: credential delivery became opt-in, so an ordinary reporting run
+// reaches the adapter with its attempt credential already withheld and the L1
+// endpoint still set beside it. The helper refuses that pair on sight -- and
+// should -- so every such run failed at spawn with "attempt credential and L1
+// endpoint must be supplied together" and was retried forever.
+func TestWorkloadInputPairsTheAttemptCredentialWithItsEndpoint(t *testing.T) {
+	execution := func(mutate func(contract.ExecutionSpec) contract.ExecutionSpec) workloadrunner.Request {
+		spec := contract.ExecutionSpec{
+			OCI: &contract.OCIExecutionSpec{
+				Image: contract.OCIImageSpec{
+					Reference: "example.test/image:v1",
+					Digest:    stringPointer("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+				},
+				Argv: []string{"/bin/sh"},
+			},
+			Env: map[string]string{
+				contract.EnvL1Endpoint: "http://127.0.0.1:7001",
+				contract.EnvL3Endpoint: "http://127.0.0.1:7002",
+			},
+			SensitiveEnv: map[string]string{},
+		}
+		return workloadrunner.Request{Authority: mailboxAdapterAuthority(), Execution: mutate(spec)}
+	}
+
+	t.Run("a reporting run carries neither", func(t *testing.T) {
+		// Exactly what withholdWorkloadCredentials leaves behind: the endpoint
+		// still named, the credential gone.
+		input := workloadInput(execution(func(spec contract.ExecutionSpec) contract.ExecutionSpec { return spec }))
+		if input.AttemptToken != "" || input.L1Endpoint != "" {
+			t.Fatalf("a withheld attempt carried token=%q endpoint=%q, which the helper refuses as a half pair",
+				input.AttemptToken, input.L1Endpoint)
+		}
+		// The run ledger is a separate surface and is not withheld with it.
+		if input.L3Endpoint != "http://127.0.0.1:7002" {
+			t.Fatalf("L3 endpoint = %q, want it untouched", input.L3Endpoint)
+		}
+	})
+
+	t.Run("a dispatching run carries both", func(t *testing.T) {
+		input := workloadInput(execution(func(spec contract.ExecutionSpec) contract.ExecutionSpec {
+			spec.SensitiveEnv[contract.EnvAttemptToken] = "attempt-bearer"
+			return spec
+		}))
+		if input.AttemptToken != "attempt-bearer" || input.L1Endpoint != "http://127.0.0.1:7001" {
+			t.Fatalf("a dispatching attempt carried token=%q endpoint=%q, want both",
+				input.AttemptToken, input.L1Endpoint)
+		}
+	})
+
+	t.Run("a credential without its endpoint carries neither", func(t *testing.T) {
+		input := workloadInput(execution(func(spec contract.ExecutionSpec) contract.ExecutionSpec {
+			delete(spec.Env, contract.EnvL1Endpoint)
+			spec.SensitiveEnv[contract.EnvAttemptToken] = "attempt-bearer"
+			return spec
+		}))
+		if input.AttemptToken != "" || input.L1Endpoint != "" {
+			t.Fatalf("a credential with no endpoint carried token=%q endpoint=%q", input.AttemptToken, input.L1Endpoint)
+		}
+	})
+}

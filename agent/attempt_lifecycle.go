@@ -881,7 +881,20 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
 		}
 		if deadmanAdmission != nil {
-			request.OCIHelperAdmitted = deadmanAdmission.admit
+			admitDeadman := deadmanAdmission.admit
+			request.OCIHelperAdmitted = func(generation workloadrunner.RuntimeGeneration) error {
+				if err := admitDeadman(generation); err != nil {
+					return err
+				}
+				// A mailbox read through the runtime is authorized against a
+				// live attempt, and the attempt is not live until the helper
+				// says so. Sweeping before this point asks about an attempt
+				// that is outside the session and is refused every time, which
+				// is noise that reads like a fault. This is the earliest
+				// moment a read can succeed.
+				lifecycle.mailbox.Load().startIfRemote(ctx)
+				return nil
+			}
 		}
 		request.OCIRuntimeUnavailable = func(generation workloadrunner.RuntimeGeneration) {
 			generation = ociRuntimeLoss.record(generation)
@@ -1345,7 +1358,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	if redactingSink != nil {
 		sink = redactingSink
 	}
-	if mailbox != nil {
+	if mailbox != nil && !mailbox.readsThroughRuntime() {
+		// A mailbox this process opened can be swept immediately: the
+		// directory exists and nothing else gates reading it.
 		mailbox.start(ctx)
 	}
 	request.Execution = executionSpec

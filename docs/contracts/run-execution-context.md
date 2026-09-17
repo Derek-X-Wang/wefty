@@ -77,11 +77,19 @@ decision governs reachability: an attempt without run-ledger provenance gets no
 run mailbox. Declaring dispatch authority is not an escalation: a run can only
 declare it at submit, and a credential-free job cannot submit anything.
 
-The two endpoints are unaffected. `WEFTY_L3_ENDPOINT` and `WEFTY_L1_ENDPOINT`
-remain present on a default job: they are transport, not authority. A call from
-a credential-free job is refused the same way any unauthenticated call is —
-`forbidden`, because no Fabric privilege is projected into the workload, and
-`unauthorized` if it presents a bearer that is not a valid credential.
+`WEFTY_L3_ENDPOINT` is unaffected: it remains present on a default job because
+it is transport, not authority. A call from a credential-free job is refused the
+same way any unauthenticated call is — `forbidden`, because no Fabric privilege
+is projected into the workload, and `unauthorized` if it presents a bearer that
+is not a valid credential.
+
+`WEFTY_L1_ENDPOINT` is different, and only for `kind=oci`. It and the attempt
+credential are one surface, and the OCI helper refuses a request that carries
+only half of the pair — an endpoint with no credential is a route to nothing,
+and a credential with no endpoint is unusable. A `kind=oci` job whose attempt
+credential is withheld therefore receives no `WEFTY_L1_ENDPOINT` either. A
+`kind=process` job keeps the endpoint, because nothing there enforces the pair
+and seeing the refusal is more useful than hiding the route.
 
 `WEFTY_L1_ENDPOINT` and `WEFTY_ATTEMPT_TOKEN` are delivered by the node agent
 to every `class=one-shot` attempt it launches, for both `kind=process` and
