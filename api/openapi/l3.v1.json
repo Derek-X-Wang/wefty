@@ -244,6 +244,11 @@
                     "description": "Restricted JSON Schema 2020-12 dialect. Local fragment references are allowed; remote references, dynamic references, vocabularies, and content decoders are forbidden."
                   },
                   "required_envelope": { "type": "boolean", "default": false },
+                  "dispatch_authority": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Declares that this run's workload dispatches child work, which delivers WEFTY_RUN_TOKEN and WEFTY_ATTEMPT_TOKEN to the job. By default a dispatched job holds neither credential and reports through its run mailbox."
+                  },
                   "parent_run_id": { "type": "string" }
                 },
                 "oneOf": [

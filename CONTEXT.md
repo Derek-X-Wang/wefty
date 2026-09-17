@@ -45,6 +45,12 @@ publishes them to the ledger without requiring the workload to hold or use a cre
 _Avoid_: outbox (the agent's own durable evidence outbox), handoff directory
 (a different lifecycle), spool, queue, drop box
 
+**Dispatch authority**:
+The submitter's declaration, made when a run is created, that this run's
+workload dispatches child work. It is what delivers the in-job credentials to
+the workload; a run without it reports through its run mailbox and holds none.
+_Avoid_: token flag, credential flag, privileged run
+
 **Pattern** _(reserved — does not exist yet)_:
 A future declarative plan, expressed as data, that the ledger itself would
 interpret into runs. Named for what a loom follows. Reserved so it can never

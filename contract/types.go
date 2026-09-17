@@ -67,7 +67,27 @@ const (
 	// only: RedactJobLabels removes it from every public job projection, the
 	// way SensitiveEnv is removed.
 	LabelRunParams = "run_params_json"
+
+	// LabelDispatchAuthority carries the submitter's declaration that this run
+	// dispatches child work, and is therefore the switch that puts the in-job
+	// credentials into the workload's environment. Without it a dispatched job
+	// reports through the run mailbox and holds nothing. The run token still
+	// reaches the node agent on every dispatch — the agent publishes the
+	// mailbox with it — so this label governs delivery to the workload, not
+	// delivery to the node. It states a fact about the run rather than a
+	// secret, so unlike LabelRunParams it stays in public job projections.
+	LabelDispatchAuthority = "dispatch_authority"
+
+	// LabelTrue is the only value either boolean label is written with, so a
+	// producer and a reader cannot drift over "1" versus "true".
+	LabelTrue = "true"
 )
+
+// DeclaresDispatchAuthority reports whether a job carries its submitter's
+// declaration that the workload dispatches child work.
+func DeclaresDispatchAuthority(labels map[string]string) bool {
+	return labels[LabelDispatchAuthority] == LabelTrue
+}
 
 // RedactJobLabels returns labels without any reserved agent-only value. It
 // copies rather than mutates, because the caller's map is shared with the
@@ -560,14 +580,18 @@ type RunRecord struct {
 	Trigger       Trigger         `json:"trigger"`
 	Workflow      WorkflowSource  `json:"workflow"`
 	Params        json.RawMessage `json:"params"`
-	Tags          []string        `json:"tags,omitempty"`
-	Limits        *RunLimits      `json:"limits,omitempty"`
-	Envelopes     []Envelope      `json:"envelopes,omitempty"`
-	Gates         []GateResult    `json:"gates,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	StartedAt     *time.Time      `json:"started_at,omitempty"`
-	FinishedAt    *time.Time      `json:"finished_at,omitempty"`
+	// DispatchAuthority records that this run was submitted as one that
+	// dispatches child work, so its workload receives the in-job credentials
+	// instead of reporting through the run mailbox alone.
+	DispatchAuthority bool         `json:"dispatch_authority,omitempty"`
+	Tags              []string     `json:"tags,omitempty"`
+	Limits            *RunLimits   `json:"limits,omitempty"`
+	Envelopes         []Envelope   `json:"envelopes,omitempty"`
+	Gates             []GateResult `json:"gates,omitempty"`
+	CreatedAt         time.Time    `json:"created_at"`
+	UpdatedAt         time.Time    `json:"updated_at"`
+	StartedAt         *time.Time   `json:"started_at,omitempty"`
+	FinishedAt        *time.Time   `json:"finished_at,omitempty"`
 }
 
 type Trigger struct {

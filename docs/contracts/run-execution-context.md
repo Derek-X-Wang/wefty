@@ -10,18 +10,42 @@ depend on additional variables.
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
 | `WEFTY_L1_ENDPOINT` | public | An attempt-local HTTP base URL for the L1 attempt-credential surface. |
 | `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
-| `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. |
-| `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
+| `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. Opt-in; see below. |
+| `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. Opt-in; see below. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
 | `WEFTY_RUN_DIR` | public | The run mailbox: the job-owned directory the workload writes protocol events into and the node agent publishes from. |
 
 The first four L3 variables are delivered only when L3 dispatched the job.
+
+**Credential delivery is opt-in.** By default a job L3 dispatched receives
+neither credential: no `WEFTY_RUN_TOKEN` and no `WEFTY_ATTEMPT_TOKEN`. It
+reports through the run mailbox, which needs none, and the node agent publishes
+what it writes there using the run token the agent holds. A run whose workload
+dispatches child work declares that at submit — `dispatch_authority` on the run
+request, `wefty submit --dispatch-authority` on the command line — and that
+declaration delivers both credentials exactly as before. The declaration is
+recorded on the run record, so `wefty --json inspect` shows which runs hold
+credentials. It reaches the node agent as the public job label
+`dispatch_authority`. The run token still travels to the agent on every
+dispatch, in `SensitiveEnv` as always, because the mailbox publisher needs it;
+the declaration governs whether the agent then places it in the workload's own
+environment. Declaring dispatch authority is not an escalation: a run can only
+declare it at submit, and a credential-free job cannot submit anything.
+
+The two endpoints are unaffected. `WEFTY_L3_ENDPOINT` and `WEFTY_L1_ENDPOINT`
+remain present on a default job: they are transport, not authority. A call from
+a credential-free job is refused the same way any unauthenticated call is —
+`forbidden`, because no Fabric privilege is projected into the workload, and
+`unauthorized` if it presents a bearer that is not a valid credential.
+
 `WEFTY_L1_ENDPOINT` and `WEFTY_ATTEMPT_TOKEN` are delivered by the node agent
 to every `class=one-shot` attempt it launches, for both `kind=process` and
-`kind=oci`, whether or not L3 is running. In v1 they are **not** delivered to
-`class=service` attempts or to Computer attempts; L1 still mints the attempt
-credential at every claim, so service and Computer delivery is a follow-up that
-changes no authority rule.
+`kind=oci`, whether or not L3 is running — subject, when L3 dispatched the job,
+to the declaration above. A job submitted straight to L1 has no run to declare
+anything about and always receives its attempt credential. In v1 neither is
+delivered to `class=service` attempts or to Computer attempts; L1 still mints
+the attempt credential at every claim, so service and Computer delivery is a
+follow-up that changes no authority rule.
 
 L3 places `WEFTY_RUN_TOKEN` only in `ExecutionSpec.SensitiveEnv`, and the agent
 places `WEFTY_ATTEMPT_TOKEN` only there; the other variables are in
@@ -93,7 +117,16 @@ it.
 `POST /v1/jobs`, `GET /v1/jobs/{job_id}`, and `GET /v1/jobs/{job_id}/children`
 accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
 `WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
-attempt and stores only its SHA-256 digest. The credential authorizes exactly
+attempt and stores only its SHA-256 digest.
+
+Delivery of this credential to a job L3 dispatched is governed by the same
+`dispatch_authority` declaration as the run token, and by a single named switch
+in the node agent, so the two can be separated with a one-line change if the
+rule ever diverges. Minting and admission are untouched: L1 mints the bearer at
+every claim and authenticates it identically whether or not the agent handed it
+to the workload. Withholding it removes only the workload's copy.
+
+The credential authorizes exactly
 three things: submitting a child job, reading its own job, and listing and
 reading that job's children. No other route accepts it, so no operator-level
 action is reachable with it; the service collection read `GET /v1/jobs` is
@@ -401,9 +434,13 @@ no read path, so an OCI attempt receives no `WEFTY_RUN_DIR` and the agent logs
 that publication is unavailable rather than delivering a directory nothing
 would ever read.
 
-`WEFTY_RUN_TOKEN` delivery is unchanged by the mailbox: a workflow that
-dispatches child runs still needs it. Withholding it from jobs that only report
-is a separate, opt-in change.
+Because the mailbox needs no credential, it is what a dispatched job reports
+through by default: `WEFTY_RUN_TOKEN` and `WEFTY_ATTEMPT_TOKEN` are withheld
+unless the run declared `dispatch_authority` at submit. A workflow that
+dispatches child runs still needs the run token and still declares it. The
+mailbox does not yet reach `kind=oci`, so until it does an OCI run that reports
+anything must declare dispatch authority; the agent logs that it can report
+nothing when a dispatched OCI attempt has neither.
 
 ## Node-local handoff lifecycle
 

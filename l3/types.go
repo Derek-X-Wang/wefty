@@ -109,7 +109,12 @@ type CreateRunRequest struct {
 	Limits           *contract.RunLimits    `json:"limits,omitempty"`
 	EnvelopeSchema   json.RawMessage        `json:"envelope_schema,omitempty"`
 	RequiredEnvelope bool                   `json:"required_envelope,omitempty"`
-	ParentRunID      string                 `json:"parent_run_id,omitempty"`
+	// DispatchAuthority declares that this run's workload dispatches child
+	// work. Declaring it delivers the in-job credentials to the workload;
+	// leaving it false — the default — means the job reports through its run
+	// mailbox and holds no credential at all.
+	DispatchAuthority bool   `json:"dispatch_authority,omitempty"`
+	ParentRunID       string `json:"parent_run_id,omitempty"`
 }
 
 type CreateRunInput struct {

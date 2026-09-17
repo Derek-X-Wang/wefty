@@ -104,49 +104,65 @@ func TestHandoffDirectoryRejectsSymlink(t *testing.T) {
 }
 
 func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "handoffs")
-	runID := "run_environment"
-	handoff := filepath.Join(root, runID)
-	token := "wrun_process_secret"
-	script := []byte("#!/bin/sh\nprintf '%s\\n' \"$WEFTY_RUN_ID\" \"$WEFTY_L3_ENDPOINT\" \"${WEFTY_L1_ENDPOINT-unset}\" \"$WEFTY_RUN_TOKEN\" \"$WEFTY_HANDOFF_DIR\"\n")
-	digest := sha256.Sum256(script)
-	var output bytes.Buffer
-	a := &Agent{
-		registration: contract.NodeRegistration{NodeID: "node-1"},
-		runtimes:     testRuntimeSet(processrunner.New(processrunner.Config{})),
-		handoffs:     newHandoffManager(root, time.Hour),
-		outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
-			return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
-				if event.Stream == contract.LogStdout {
-					_, _ = output.Write(event.Bytes)
-				}
-				return nil
-			})
-		},
-	}
-	claim := handoffClaim(runID, handoff, nil)
-	claim.Job.Spec.Execution = contract.ExecutionSpec{
-		Executable: contract.ExecutableSpec{
-			InlineBase64: base64.StdEncoding.EncodeToString(script),
-			SHA256:       hex.EncodeToString(digest[:]),
-			Interpreter:  []string{"/bin/sh"},
-			Mode:         0o700,
-		},
-		Argv: []string{"wefty-inline-" + runID},
-		Env: map[string]string{
-			contract.EnvRunID: runID, contract.EnvL3Endpoint: "wefty://l3", contract.EnvHandoffDir: handoff,
-		},
-		SensitiveEnv:     map[string]string{contract.EnvRunToken: token},
-		WorkingDirectory: t.TempDir(),
-		HandoffDirectory: handoff,
-	}
-	result, err := a.runWorkload(context.Background(), claim)
-	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("runWorkload() = (%#v, %v)", result, err)
-	}
-	want := runID + "\nwefty://l3\nunset\n[REDACTED]\n" + handoff + "\n"
-	if output.String() != want {
-		t.Fatalf("process environment output = %q, want %q", output.String(), want)
+	for _, testCase := range []struct {
+		name string
+		// declares is the submitter's dispatch-authority declaration, which is
+		// the only thing that puts the run token into the job's environment.
+		declares  bool
+		wantToken string
+	}{
+		{name: "reporting run holds no run token", declares: false, wantToken: ""},
+		{name: "dispatching run holds the run token", declares: true, wantToken: "[REDACTED]"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "handoffs")
+			runID := "run_environment"
+			handoff := filepath.Join(root, runID)
+			token := "wrun_process_secret"
+			script := []byte("#!/bin/sh\nprintf '%s\\n' \"$WEFTY_RUN_ID\" \"$WEFTY_L3_ENDPOINT\" \"${WEFTY_L1_ENDPOINT-unset}\" \"$WEFTY_RUN_TOKEN\" \"$WEFTY_HANDOFF_DIR\"\n")
+			digest := sha256.Sum256(script)
+			var output bytes.Buffer
+			a := &Agent{
+				registration: contract.NodeRegistration{NodeID: "node-1"},
+				runtimes:     testRuntimeSet(processrunner.New(processrunner.Config{})),
+				handoffs:     newHandoffManager(root, time.Hour),
+				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
+					return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+						if event.Stream == contract.LogStdout {
+							_, _ = output.Write(event.Bytes)
+						}
+						return nil
+					})
+				},
+			}
+			claim := handoffClaim(runID, handoff, nil)
+			if testCase.declares {
+				claim.Job.Spec.Labels[contract.LabelDispatchAuthority] = contract.LabelTrue
+			}
+			claim.Job.Spec.Execution = contract.ExecutionSpec{
+				Executable: contract.ExecutableSpec{
+					InlineBase64: base64.StdEncoding.EncodeToString(script),
+					SHA256:       hex.EncodeToString(digest[:]),
+					Interpreter:  []string{"/bin/sh"},
+					Mode:         0o700,
+				},
+				Argv: []string{"wefty-inline-" + runID},
+				Env: map[string]string{
+					contract.EnvRunID: runID, contract.EnvL3Endpoint: "wefty://l3", contract.EnvHandoffDir: handoff,
+				},
+				SensitiveEnv:     map[string]string{contract.EnvRunToken: token},
+				WorkingDirectory: t.TempDir(),
+				HandoffDirectory: handoff,
+			}
+			result, err := a.runWorkload(context.Background(), claim)
+			if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+				t.Fatalf("runWorkload() = (%#v, %v)", result, err)
+			}
+			want := runID + "\nwefty://l3\nunset\n" + testCase.wantToken + "\n" + handoff + "\n"
+			if output.String() != want {
+				t.Fatalf("process environment output = %q, want %q", output.String(), want)
+			}
+		})
 	}
 }
 

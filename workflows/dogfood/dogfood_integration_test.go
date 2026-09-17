@@ -149,6 +149,9 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 		Tags:             []string{"linux", contract.StableNodeTagPrefix + "dogfood-node"},
 		Limits:           &contract.RunLimits{MaxRuntimeSeconds: 120},
 		RequiredEnvelope: true,
+		// The dogfood workflow dispatches its own child runs and reports over
+		// HTTP, so it is one of the runs that declares dispatch authority.
+		DispatchAuthority: true,
 	}
 	root := submitRun(t, caller, request)
 	rootRecord := waitForTerminalRun(t, l3Store, root.RunID, 30*time.Second)
