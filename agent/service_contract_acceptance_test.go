@@ -39,7 +39,7 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	agent := &Agent{
 		runtimes:        testRuntimeSet(runner),
 		managedResource: resource,
-		handoffs:        newHandoffManager(t.TempDir(), DefaultHandoffRetention),
+		handoffs:        newHandoffManager(t.TempDir(), t.TempDir(), "node-1", DefaultHandoffRetention, nil),
 	}
 	workingDirectory := t.TempDir()
 	operatorFile := filepath.Join(workingDirectory, "operator-owned")

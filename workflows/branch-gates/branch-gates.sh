@@ -40,20 +40,20 @@
 # running under the same UID still shares this user's access to the machine.
 # Only test branches you trust.
 #
-# Exit codes carry the verdict, deliberately. The node agent removes a handoff
-# directory as soon as its attempt succeeds (docs/contracts/run-execution-context.md,
-# "Node-local handoff lifecycle"), so a workflow that exits 0 leaves no files
-# behind. Exiting non-zero on a failing verdict is what keeps result.json and
-# failures.txt on the node for the 24-hour retention window — which is the case
-# an operator actually wants to read. A failing one-shot is terminal in L1; it
-# is not re-executed. The run is failed either way, because L3 fails a run whose
-# gate result is `fail`.
+# Exit codes carry the verdict, deliberately, and they no longer decide whether
+# the files survive: a finished run's handoff directory is retained on every
+# outcome (docs/contracts/run-execution-context.md, "Results and their
+# retention"). Exiting non-zero on a failing verdict is the verdict itself, not
+# a way to keep evidence. A failing one-shot is terminal in L1; it is not
+# re-executed. The run is failed either way, because L3 fails a run whose gate
+# result is `fail`.
 #
 # Every exit after the execution context is known goes through one path and
 # leaves the same two files: a verdict writes the gate results, a workflow error
 # writes a result.json carrying `workflow_error` plus a diagnostic failures.txt.
-# Both paths also echo result.json into the run log, which is the only result
-# surface reachable from the host for an OCI run.
+# Both paths also echo result.json into the run log. The files are now retained
+# on the node, but nothing reads one back off a node yet, so the log remains the
+# only result surface reachable from the host -- for an OCI run especially.
 
 # The embedded inline writer below is a verbatim copy, so its functions cannot
 # carry their own directives, and this workflow reaches them indirectly --

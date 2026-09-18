@@ -951,8 +951,10 @@ pending-sweep inventory and evidence; it does not renew any retention deadline.
 Handoff volumes live under a distinct helper-owned durable root, not the
 attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
-intact; reuse refreshes the default 24-hour retry age, and sweep removes only
-expired direct children with the deterministic handoff prefix. Attempt and
+intact; reuse refreshes the default retention age, and sweep removes only
+expired direct children with the deterministic handoff prefix. That age is the
+contract's result-retention window (7 days), not a retry window: a handoff
+volume holds the run's results and is retained on every outcome. Attempt and
 namespace quiescence therefore project only unexpired handoff volumes (the
 retained bindings) out of their absence decision. `Verify` returns the observed
 inventory unchanged alongside the exact, disjoint runtime-residue and

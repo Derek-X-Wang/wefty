@@ -86,7 +86,44 @@ type runInspection struct {
 	Run       contract.RunRecord   `json:"run"`
 	Lineage   l3.RunLineage        `json:"lineage"`
 	Runs      []contract.RunRecord `json:"runs"`
+	Results   *runResults          `json:"results,omitempty"`
 	Execution *l3.RunExecution     `json:"execution,omitempty"`
+}
+
+// runResults says where a finished run's files are and how long they last.
+//
+// It is computed, not observed. The node that ran the job is the only thing
+// that knows what is actually on disk, and nothing reads a file back off a node
+// yet -- that is #483 D2. What is knowable here is the rule: results live in the
+// run's handoff directory on the node that produced it, and the node sweeps them
+// on the contract's retention window. A node configured with a different window,
+// or one that evicted the run early because it ran out of room, will differ; the
+// honest word for this field is therefore "scheduled", not "observed".
+type runResults struct {
+	Location      string     `json:"location"`
+	NodeID        string     `json:"node_id,omitempty"`
+	RetainedUntil *time.Time `json:"retained_until,omitempty"`
+	Expired       bool       `json:"expired"`
+	Observed      bool       `json:"observed"`
+	Note          string     `json:"note"`
+}
+
+// runResultsFor is nil for a run that has not finished: there are no results to
+// locate until there is an outcome.
+func runResultsFor(run contract.RunRecord, now time.Time) *runResults {
+	if run.FinishedAt == nil {
+		return nil
+	}
+	retainedUntil := run.FinishedAt.Add(contract.DefaultResultRetention)
+	return &runResults{
+		Location:      "the run's handoff directory on the node that produced it",
+		NodeID:        run.NodeID,
+		RetainedUntil: &retainedUntil,
+		Expired:       now.After(retainedUntil),
+		Observed:      false,
+		Note: "scheduled under the default retention window; reading results off the node" +
+			" is not implemented yet",
+	}
 }
 
 func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
@@ -110,7 +147,10 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	if err != nil {
 		return err
 	}
-	inspection := runInspection{Run: root, Lineage: lineage, Runs: []contract.RunRecord{root}}
+	inspection := runInspection{
+		Run: root, Lineage: lineage, Runs: []contract.RunRecord{root},
+		Results: runResultsFor(root, time.Now().UTC()),
+	}
 	for _, descendant := range lineage.Descendants {
 		record, err := clients.getRun(ctx, descendant.RunID)
 		if err != nil {

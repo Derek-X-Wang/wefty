@@ -177,13 +177,16 @@ type ContainerdEngine struct {
 }
 
 const (
-	defaultAttemptPortMin                  uint16 = 42000
-	defaultAttemptPortMax                  uint16 = 42999
-	defaultHandoffRetention                       = 24 * time.Hour
-	defaultLostAttemptRetention                   = 5 * time.Minute
-	defaultComputerReimagePreflightTimeout        = 10 * time.Second
-	doctorRuntimeReadTimeout                      = 2 * time.Second
-	hostBridgeAcceptPollInterval                  = 250 * time.Millisecond
+	defaultAttemptPortMin uint16 = 42000
+	defaultAttemptPortMax uint16 = 42999
+	// defaultHandoffRetention matches the agent's window for a process run's
+	// handoff directory, because a person reading results should not find that
+	// how long they last depends on which kind of job produced them.
+	defaultHandoffRetention                = contract.DefaultResultRetention
+	defaultLostAttemptRetention            = 5 * time.Minute
+	defaultComputerReimagePreflightTimeout = 10 * time.Second
+	doctorRuntimeReadTimeout               = 2 * time.Second
+	hostBridgeAcceptPollInterval           = 250 * time.Millisecond
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {

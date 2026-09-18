@@ -115,13 +115,13 @@ handles top-level strings only.
 1. **The run log** — `result.json` is echoed verbatim, and the first 200 lines
    of `failures.txt` when something failed. This is the only result surface
    reachable from the host for an OCI run, so read it first.
-2. **The handoff directory** — `result.json` and `failures.txt`.
-   The node agent removes a handoff directory as soon as its attempt succeeds,
-   so these files survive exactly when the verdict is `fail`: the script exits
-   non-zero on a failing verdict, which keeps the directory for the 24-hour
-   retention window. For `kind=process` that is
+2. **The handoff directory** — `result.json` and `failures.txt`, retained on
+   every outcome for the contract's retention window (7 days), whether the
+   verdict passed or failed. For `kind=process` that is
    `/tmp/wefty/handoffs/<run_id>/`; for `kind=oci` it is a helper-managed
-   volume inside the node, reachable only through `copy_to` plus a mount.
+   volume inside the node, reachable only through `copy_to` plus a mount until
+   a remote read exists. `wefty inspect` reports when they are scheduled to
+   expire.
 3. **The ledger** — `wefty --json inspect <run_id>` shows one envelope per gate
    (`status` `succeeded`/`failed`), then one `result` envelope carrying the
    verdict document, then one `branch-gates` gate whose outcome is the verdict.

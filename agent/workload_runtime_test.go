@@ -157,7 +157,7 @@ func TestOCIOneshotDelegatesHandoffToRuntime(t *testing.T) {
 	handoffRoot := t.TempDir()
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime},
-		handoffs: newHandoffManager(handoffRoot, time.Hour),
+		handoffs: newHandoffManager(handoffRoot, t.TempDir(), "node-1", time.Hour, nil),
 		observer: newLifecycleObserver(systemClock{}),
 		clock:    systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
 	})
@@ -454,7 +454,7 @@ func TestProcessPreflightRejectsBeforeAgentResourceAcquisition(t *testing.T) {
 			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 				runtimes: workloadRuntimeSet{contract.JobKindProcess: processrunner.NewAdapter(executor)},
 				clock:    systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
-				managedResource: managed, handoffs: newHandoffManager(t.TempDir(), 0),
+				managedResource: managed, handoffs: newHandoffManager(t.TempDir(), t.TempDir(), "node-1", 0, nil),
 				reservePublishedPort: func(l1.Claim) (net.Listener, *contract.SpawnFailure) {
 					portReservations++
 					return nil, nil

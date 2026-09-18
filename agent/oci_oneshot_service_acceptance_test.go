@@ -187,8 +187,11 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	if !slices.Equal(volumeOwners, []string{accepted.RunID, accepted.RunID, accepted.RunID}) {
 		t.Fatalf("managed handoff owners = %v, want stable source-run identity across retry and rerun", volumeOwners)
 	}
-	if !slices.Equal(finalizedOwners, []string{accepted.RunID}) {
-		t.Fatalf("finalized handoff owners = %v, want deletion only after accepted success", finalizedOwners)
+	// A successful one-shot no longer gives up its handoff volume: the volume
+	// is where its results are, and the helper's own boot sweep expires it on
+	// the contract's retention window. Nothing is finalized on any path here.
+	if len(finalizedOwners) != 0 {
+		t.Fatalf("finalized handoff owners = %v, want none: a successful run's results are retained", finalizedOwners)
 	}
 	if calls, _, generation := deadman.snapshot(); calls < 1 || generation != readyOCIHelperGeneration() {
 		t.Fatalf("ordinary L3 OCI deadman renewals=%d generation=%+v, want at least one renewal for %+v", calls, generation, readyOCIHelperGeneration())

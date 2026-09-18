@@ -417,10 +417,12 @@ directories. An OCI one-shot does not reinterpret the forbidden flat
 agent puts exactly one `handoff` requirement on the runtime request, keyed by
 the stable job or `handoff_owner_run_id`. The adapter passes that key opaquely
 to the helper and unconditionally makes `/wefty/handoff` the reserved guest
-value. Attempt reap preserves this helper-owned volume on failed or interrupted
-runs and refreshes its default 24-hour retry window when another attempt or
-rerun reuses it. Only after L1 accepts a successful completion does the agent
-ask the runtime to delete the volume and require a positive absence receipt.
+value. Attempt reap preserves this helper-owned volume on every outcome and refreshes
+its retention window when another attempt or rerun reuses it. The agent no
+longer asks the runtime to delete it after a successful completion: the volume
+holds the run's results, and the helper's boot sweep expires it on the
+contract's retention window (`run-execution-context.md`, "Results and their
+retention").
 The payload sees only the reserved container path, never the helper source
 path. The named `usesAgentHandoffLifecycle` predicate positively selects only
 `kind=process`, `class=one-shot`; no negative kind gate can accidentally add a

@@ -19,11 +19,11 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
-func TestHandoffDirectoryExistsPrivatelyBeforeExecutionAndCleansOnSuccess(t *testing.T) {
+func TestHandoffDirectoryExistsPrivatelyBeforeExecutionAndIsRetainedOnSuccess(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "handoffs")
 	runID := "run_lifecycle"
 	path := filepath.Join(root, runID)
-	manager := newHandoffManager(root, time.Hour)
+	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
 	runner := &handoffAssertingRunner{t: t, path: path}
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
@@ -42,11 +42,26 @@ func TestHandoffDirectoryExistsPrivatelyBeforeExecutionAndCleansOnSuccess(t *tes
 	if markerInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("marker permissions = %#o, want 0600", markerInfo.Mode().Perm())
 	}
-	if err := manager.finish(claim.Job.Spec, "node-1", true); err != nil {
-		t.Fatal(err)
+	// The results of a run that worked are the ones an operator most wants to
+	// read, and they used to be the only ones thrown away. Retention is
+	// recorded by the lifecycle while it still owns the path, so nothing here
+	// has to ask for it.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a successful run's results were not retained: %v", err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("successful handoff directory still exists: %v", err)
+	// Retention lives in the agent's own record, not in the directory the
+	// workload can write.
+	// This entry point runs the workload without completing the attempt, so the
+	// verdict recorded is the conservative one the error paths use. What it
+	// proves is that retention happens at all, while the path is still owned,
+	// and names this directory and a window. The completed-attempt verdict is
+	// asserted where an attempt actually completes.
+	record := requireRetentionRecord(t, manager, runID)
+	if record.RetainedAt.IsZero() || record.RetainUntil.IsZero() {
+		t.Fatalf("retention record = %#v, want both timestamps", record)
+	}
+	if record.Directory != path {
+		t.Fatalf("retention record directory = %q, want %q", record.Directory, path)
 	}
 }
 
@@ -55,30 +70,33 @@ func TestColdRerunWithHandoffFilesPinsOrFailsExplicitly(t *testing.T) {
 	runID := "run_retry"
 	path := filepath.Join(root, runID)
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	manager := newHandoffManager(root, time.Hour)
+	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
 	manager.now = func() time.Time { return now }
 	claim := handoffClaim(runID, path, []string{"linux"})
 
-	if err := manager.prepare(claim.Job.Spec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
+	owner := prepareHandoffForTest(t, manager, claim.Job.Spec)
 	if err := os.WriteFile(filepath.Join(path, "plan.md"), []byte("handoff"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.prepare(claim.Job.Spec, "node-1"); err == nil || !strings.Contains(err.Error(), contract.StableNodeTagPrefix+"node-1") {
-		t.Fatalf("unpinned cold rerun error = %v, want explicit stable-node tag failure", err)
-	}
-	rerun := handoffClaim("run_retry_2", path, []string{"linux", contract.StableNodeTagPrefix + "node-1"})
-	rerun.Job.Spec.Labels["handoff_owner_run_id"] = runID
-	if err := manager.prepare(rerun.Job.Spec, "node-1"); err != nil {
-		t.Fatalf("pinned cold rerun: %v", err)
-	}
-
-	if err := manager.finish(rerun.Job.Spec, "node-1", false); err != nil {
+	owner.lease.release()
+	lease, err := manager.lock(t.Context(), claim.Job.Spec)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := manager.prepare(lease, claim.Job.Spec, "node-1"); err == nil || !strings.Contains(err.Error(), contract.StableNodeTagPrefix+"node-1") {
+		t.Fatalf("unpinned cold rerun error = %v, want explicit stable-node tag failure", err)
+	}
+	lease.release()
+	rerun := handoffClaim("run_retry_2", path, []string{"linux", contract.StableNodeTagPrefix + "node-1"})
+	rerun.Job.Spec.Labels["handoff_owner_run_id"] = runID
+	owner = prepareHandoffForTest(t, manager, rerun.Job.Spec)
+
+	if err := manager.finish(owner, rerun.Job.Spec, "node-1", false, false); err != nil {
+		t.Fatal(err)
+	}
+	owner.lease.release()
 	now = now.Add(time.Hour)
-	if err := manager.cleanupExpired(""); err != nil {
+	if err := manager.collect(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -96,8 +114,14 @@ func TestHandoffDirectoryRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
-	manager := newHandoffManager(root, time.Hour)
-	err := manager.prepare(handoffClaim("run_symlink", path, nil).Job.Spec, "node-1")
+	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
+	spec := handoffClaim("run_symlink", path, nil).Job.Spec
+	lease, err := manager.lock(t.Context(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.release()
+	_, err = manager.prepare(lease, spec, "node-1")
 	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("symlink prepare error = %v", err)
 	}
@@ -125,7 +149,7 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 			a := &Agent{
 				registration: contract.NodeRegistration{NodeID: "node-1"},
 				runtimes:     testRuntimeSet(processrunner.New(processrunner.Config{})),
-				handoffs:     newHandoffManager(root, time.Hour),
+				handoffs:     newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil),
 				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 					return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
 						if event.Stream == contract.LogStdout {

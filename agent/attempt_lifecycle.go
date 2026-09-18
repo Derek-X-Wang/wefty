@@ -135,6 +135,13 @@ type attemptLifecycle struct {
 	// attempt, so a single slot is the whole lifetime.
 	mailbox    atomic.Pointer[runMailbox]
 	fenceCause atomic.Pointer[error]
+	// resultsRetained latches the one retention this attempt performs. The
+	// completion path records the real verdict; every other exit -- an
+	// authority loss, a cancelled context, a completion that never landed --
+	// falls back to the conservative one, so no path leaves a run unbounded
+	// and unaccounted.
+	resultsRetained  atomic.Bool
+	handoffOwnership *handoffOwnership
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -474,6 +481,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			handoffUnlock()
 		}
 	}()
+	// The last resort, and deliberately the last defer registered before the
+	// attempt runs: it fires after the completion path has had its chance to
+	// record the real verdict, and before the path lock is released. Terminal
+	// recording and trimming touch the run's directory, so doing either after
+	// the unlock would let this attempt trim a successor's live directory.
+	defer lifecycle.retainResultsFallback(claim)
 	completed := make(chan runOutcome, 1)
 	go func() {
 		if claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
@@ -698,16 +711,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
 	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
-	if succeeded && lifecycle.mailbox.Load().publicationIncomplete() {
-		// Evidence the workload wrote never reached the ledger, so the files
-		// are the only remaining copy. Removing them here would destroy the
-		// result of a run that looks successful.
-		succeeded = false
-	}
-	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
-			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
-		}
+	// Publication completeness no longer decides whether the files survive --
+	// both outcomes are retained -- but it still decides what the node gives up
+	// first when it runs out of room, so it is recorded rather than folded into
+	// the verdict.
+	published := !lifecycle.mailbox.Load().publicationIncomplete()
+	if err := lifecycle.retainResults(claim, succeeded, published); err != nil {
+		return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
 	}
 	if succeeded {
 		volumes := runtimeManagedVolumesForSuccessfulCompletion(claim.Job.Spec)
@@ -1125,15 +1135,22 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
 		}
 	}
+	var handoffLease *handoffLease
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		unlock, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
+		lease, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
+		handoffLease = lease
 		if retainHandoffLock != nil {
-			retainHandoffLock(unlock)
+			retainHandoffLock(lease.release)
 		} else {
-			defer unlock()
+			// This path owns the lock for its own duration and never reaches a
+			// completion verdict, so the fallback belongs here, registered
+			// after the unlock so it runs before it and while the path is
+			// still owned.
+			defer lease.release()
+			defer lifecycle.retainResultsFallback(claim)
 		}
 	}
 	executionSpec := request.Execution
@@ -1197,9 +1214,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		lifecycle.dependencies.observer.configurePortfulAttempt(claim.Lease.AttemptID)
 	}
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
+		owner, err := lifecycle.dependencies.handoffs.prepare(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID)
+		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
+		lifecycle.handoffOwnership = owner
 	}
 	// The run mailbox is prepared before the workload starts, so a job that
 	// writes its first event immediately has somewhere to write it. Mailbox
@@ -1508,11 +1527,49 @@ func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
 	return nil
 }
 
-func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
-	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot {
+// runtimeManagedVolumesForSuccessfulCompletion names the runtime-managed
+// volumes a successful one-shot gives up immediately.
+//
+// It is now empty, and the seam is kept rather than deleted because the answer
+// is a policy that could change per volume kind, not an absence. A one-shot
+// OCI job's only managed volume is its handoff volume, and that is precisely
+// what this milestone stopped throwing away on success: the results live there,
+// and the helper's own boot sweep expires them on the same retention window the
+// agent applies to a process run's directory.
+// retainResults records this run's retention and then collects. It is latched:
+// whichever path reaches it first owns the verdict, and the fallback on the
+// error paths cannot overwrite a completion that already recorded the truth.
+//
+// Collection runs here rather than only at startup because this is the moment
+// a node's retained bytes actually change, and because the per-run bound has to
+// apply to a run that ended without a clean completion just as much as to one
+// that ended with one.
+// retainResultsFallback records the conservative outcome for an attempt that
+// never reached a verdict -- a completion that never landed, an authority loss,
+// a cancelled context. It is latched behind the completion path, so it does
+// nothing at all when a real verdict was already recorded.
+func (lifecycle *attemptLifecycle) retainResultsFallback(claim l1.Claim) {
+	if err := lifecycle.retainResults(claim, false, false); err != nil {
+		lifecycle.log("agent: retain results for attempt %s: %v", claim.Lease.AttemptID, err)
+	}
+}
+
+func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
+	if lifecycle.dependencies.handoffs == nil || lifecycle.handoffOwnership == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return nil
 	}
-	return runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: spec}})
+	if !lifecycle.resultsRetained.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := lifecycle.dependencies.handoffs.finish(
+		lifecycle.handoffOwnership, claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
+		return err
+	}
+	return lifecycle.dependencies.handoffs.collect()
+}
+
+func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
+	return nil
 }
 
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch, deadmanAdmission *attemptDeadmanAdmission) {

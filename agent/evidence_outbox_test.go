@@ -455,7 +455,7 @@ func TestLogFinalizationDeadlineStillFinishesProcessHandoff(t *testing.T) {
 			preparedAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 			finishedAt := preparedAt.Add(time.Minute)
 			nowCalls := 0
-			handoffs := newHandoffManager(root, time.Hour)
+			handoffs := newHandoffManager(root, t.TempDir(), "handoff-deadline-node", time.Hour, nil)
 			handoffs.now = func() time.Time {
 				nowCalls++
 				if nowCalls == 1 {
@@ -481,24 +481,21 @@ func TestLogFinalizationDeadlineStillFinishesProcessHandoff(t *testing.T) {
 			if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			if test.succeeded {
-				if _, err := os.Stat(path); !os.IsNotExist(err) {
-					t.Fatalf("successful deadline handoff still exists: %v", err)
-				}
-				return
+			// Both outcomes are retained now, and the deadline this test is
+			// about must not stop either from being recorded. Retention lives
+			// in the agent's own record, which is what a sweep reads.
+			record := requireRetentionRecord(t, handoffs, runID)
+			if want := finishedAt.Add(time.Hour); !record.RetainUntil.Equal(want) {
+				t.Fatalf("retained deadline handoff expires at %s, want %s", record.RetainUntil, want)
 			}
-			marker, exists, err := readHandoffMarker(path)
-			if err != nil || !exists {
-				t.Fatalf("retained deadline handoff marker exists=%t err=%v", exists, err)
-			}
-			if want := finishedAt.Add(time.Hour); !marker.RetainUntil.Equal(want) {
-				t.Fatalf("retained deadline handoff expires at %s, want %s", marker.RetainUntil, want)
+			if record.Succeeded != test.succeeded {
+				t.Fatalf("retention record succeeded = %t, want %t", record.Succeeded, test.succeeded)
 			}
 		})
 	}
 }
 
-func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
+func TestLogFinalizationDeadlineRetainsSuccessfulOCIManagedVolumes(t *testing.T) {
 	handler := http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
 		<-request.Context().Done()
 	})
@@ -531,13 +528,13 @@ func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
 	if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.finalizations) != 1 {
-		t.Fatalf("managed-volume finalizations = %d, want 1", len(runtime.finalizations))
-	}
-	request := runtime.finalizations[0]
-	if request.Authority.AttemptID != claim.Lease.AttemptID || len(request.Volumes) != 1 ||
-		request.Volumes[0].Kind != workloadrunner.ManagedVolumeHandoff || request.Volumes[0].OwnerKey != "run-oci-deadline" {
-		t.Fatalf("managed-volume finalization = %+v", request)
+	// A successful one-shot's handoff volume is no longer given up: it holds
+	// the run's results, and the helper's own retention window expires it on
+	// the same rule the agent applies to a process run's directory. The
+	// deadline this test is about must not resurrect the deletion.
+	if len(runtime.finalizations) != 0 {
+		t.Fatalf("managed-volume finalizations = %d, want none: a successful run's results are retained",
+			len(runtime.finalizations))
 	}
 }
 
@@ -3232,7 +3229,7 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 				if test.successfulHandoff {
 					root := filepath.Join(t.TempDir(), "handoffs")
 					handoffPath = filepath.Join(root, "directive-run")
-					handoffs = newHandoffManager(root, time.Hour)
+					handoffs = newHandoffManager(root, t.TempDir(), "stable-node", time.Hour, nil)
 					claim.Job.Spec.Class = contract.JobClassOneShot
 					claim.Job.Spec.Labels = map[string]string{"run_id": "directive-run"}
 					claim.Job.Spec.Execution.WorkingDirectory = t.TempDir()
@@ -3246,7 +3243,12 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 						record("runtime_failure")
 						return contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "controlled runtime failure"}}, nil
 					}
-					marker, exists, err := readHandoffMarker(handoffPath)
+					handoffRoot, err := os.OpenRoot(handoffPath)
+					if err != nil {
+						return contract.ProcessResult{}, err
+					}
+					defer handoffRoot.Close()
+					marker, exists, err := readHandoffMarker(handoffRoot)
 					if err != nil || !exists || marker.NodeID != "stable-node" {
 						return contract.ProcessResult{}, errors.New("real handoff preparation did not establish ownership")
 					}
@@ -3255,7 +3257,7 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					}
 					if test.loseOwnership {
 						marker.NodeID = "other-node"
-						if err := writeHandoffMarker(handoffPath, marker); err != nil {
+						if err := writeHandoffMarker(handoffRoot, marker); err != nil {
 							return contract.ProcessResult{}, err
 						}
 					}
@@ -3289,19 +3291,34 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					return
 				}
 				if test.loseOwnership {
-					if destination != errorDestinationUnclassified || executeErr == nil || !strings.Contains(executeErr.Error(), "finish handoff lifecycle") || !strings.Contains(executeErr.Error(), "lost its ownership marker") {
-						t.Fatalf("handoff failure absorbed: destination=%d err=%v", destination, executeErr)
+					// The workload rewrote the ownership marker to name another
+					// node. That used to change the agent's behaviour, which is
+					// precisely why retention no longer reads it: ownership is
+					// agent-held, so a forged marker changes nothing at all.
+					if destination != errorDestinationUnclassified || executeErr != nil {
+						t.Fatalf("a forged ownership marker changed the attempt: destination=%d err=%v", destination, executeErr)
 					}
 					if _, err := os.Stat(filepath.Join(handoffPath, "result")); err != nil {
-						t.Fatalf("unowned handoff mutated: %v", err)
+						t.Fatalf("handoff mutated: %v", err)
+					}
+					record := requireRetentionRecord(t, handoffs, "directive-run")
+					if !record.Succeeded || record.NodeID != "stable-node" {
+						t.Fatalf("a forged marker reached the retention record: %#v", record)
 					}
 				} else {
 					if destination != errorDestinationUnclassified || executeErr != nil {
 						t.Fatalf("successful completion failed: destination=%d err=%v", destination, executeErr)
 					}
-					if _, err := os.Stat(handoffPath); !os.IsNotExist(err) {
-						t.Fatalf("successful handoff not removed before replay: %v", err)
+					// Retained, not removed: a completion replay must find the
+					// results still there.
+					if _, err := os.Stat(handoffPath); err != nil {
+						t.Fatalf("successful handoff not retained across replay: %v", err)
 					}
+					record := requireRetentionRecord(t, handoffs, "directive-run")
+					if !record.Succeeded || !record.Published || record.NodeID != "stable-node" || record.Directory != handoffPath || record.RetainedAt.IsZero() || !record.RetainUntil.Equal(record.RetainedAt.Add(time.Hour)) {
+						t.Fatalf("completion replay retained the wrong terminal record: %#v", record)
+					}
+
 				}
 				pending := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 				if pending.State != "durable_completion" || live.Result.ExitCode == nil || *live.Result.ExitCode != 0 || !reflect.DeepEqual(pending.Result, live.Result) {
@@ -3322,6 +3339,10 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					state = "sealed_incomplete"
 				}
 				waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, state, 2*time.Second)
+				retained := requireRetentionRecord(t, handoffs, "directive-run")
+				if !retained.Succeeded || !retained.Published || retained.NodeID != "stable-node" || retained.Directory != handoffPath || retained.RetainedAt.IsZero() || !retained.RetainUntil.Equal(retained.RetainedAt.Add(time.Hour)) {
+					t.Fatalf("replay changed retained terminal values: %#v", retained)
+				}
 				if test.rejectReplay {
 					select {
 					case err := <-recoveryErrors:
