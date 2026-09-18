@@ -2757,6 +2757,178 @@ func TestSuppressedHeartbeatsStopSendingWithoutClosingTheControlConnection(t *te
 	}
 }
 
+// newHeartbeatPumpTestSession builds a Session with a live heartbeatPump
+// goroutine but no server on the other end, for tests that only need to race
+// the pump's own select statements. The heartbeat interval is long enough
+// that the timer never fires during a test, so the only way the pump moves is
+// through the channels under test.
+func newHeartbeatPumpTestSession(control net.Conn) *Session {
+	pumpCtx, pumpCancel := context.WithCancel(context.Background())
+	return &Session{
+		client:      &Client{HeartbeatInterval: time.Hour},
+		control:     control,
+		controlWire: newFramedConn(control),
+		response:    AcquireSessionResponse{HeartbeatTimeout: 2 * time.Hour, MaximumAttemptDeadman: time.Hour},
+		pending:     make(map[string]pendingRenewal),
+		queued:      make(chan struct{}, 1),
+		pumpCtx:     pumpCtx, pumpCancel: pumpCancel, pumpDone: make(chan struct{}),
+		suppress: make(chan chan error),
+	}
+}
+
+// A suppression command that reaches the pump's select at the same instant as
+// a concurrent Close must never be acknowledged with nil: Close has already
+// recorded closed and canceled pumpCtx by the time either select case can
+// fire, so nil would tell the caller suppression took effect on a session
+// that, at that same linearization point, is already gone (#470 item 1).
+func TestSuppressionRacingCloseIsNeverAcknowledgedWithNil(t *testing.T) {
+	t.Run("suppress queued after Close has already recorded closed and canceled", func(t *testing.T) {
+		// This ordering forces the pump's top-of-loop priority check to be the
+		// one that observes both facts at once, deterministically: the
+		// cancellation and the closed flag are already visible before the
+		// suppression command is even sent, so whichever loop iteration the
+		// pump is on, it cannot acknowledge before it can see pumpCtx is done.
+		control, peer := net.Pipe()
+		defer peer.Close()
+		session := newHeartbeatPumpTestSession(control)
+		go session.heartbeatPump()
+		session.queueMu.Lock()
+		session.closed = true
+		session.queueMu.Unlock()
+		session.pumpCancel()
+		acknowledged := make(chan error, 1)
+		go func() { acknowledged <- session.suppressHeartbeats() }()
+		select {
+		case err := <-acknowledged:
+			if err == nil {
+				t.Fatal("suppression racing a concurrent Close was acknowledged with nil")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("suppression never returned after Close")
+		}
+		<-session.pumpDone
+	})
+
+	t.Run("suppress sent after Close while the pump is already parked in its select", func(t *testing.T) {
+		// The sleep lets the pump reach its blocking select before Close runs,
+		// so canceling there makes the runtime's own choice between the
+		// pumpCtx.Done() and suppress cases a genuine race -- exactly "wins
+		// the pump's select" from the review. closed and the cancellation are
+		// still fully recorded, in this goroutine, strictly before the
+		// suppression command is sent below, so nil can never be a legitimate
+		// answer regardless of which case the runtime happens to pick.
+		// Repeated so a scheduler that favors one case on a given run does
+		// not hide a regression in the other.
+		for i := 0; i < 25; i++ {
+			control, peer := net.Pipe()
+			session := newHeartbeatPumpTestSession(control)
+			go session.heartbeatPump()
+			time.Sleep(time.Millisecond)
+
+			session.queueMu.Lock()
+			session.closed = true
+			session.queueMu.Unlock()
+			session.pumpCancel()
+
+			acknowledged := make(chan error, 1)
+			go func() { acknowledged <- session.suppressHeartbeats() }()
+
+			select {
+			case err := <-acknowledged:
+				if err == nil {
+					t.Fatalf("iteration %d: suppression racing a concurrent Close was acknowledged with nil", i)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: suppression never returned after Close", i)
+			}
+			<-session.pumpDone
+			peer.Close()
+		}
+	})
+}
+
+// gateConn lets a test see exactly when the heartbeat pump's flush has
+// entered its first network write and hold it there until the test decides
+// the write should fail, without racing a timer to land inside the window.
+type gateConn struct {
+	net.Conn
+	entered  chan struct{}
+	release  chan struct{}
+	enterOne sync.Once
+	failWith error
+}
+
+func (connection *gateConn) Write(payload []byte) (int, error) {
+	connection.enterOne.Do(func() { close(connection.entered) })
+	<-connection.release
+	return 0, connection.failWith
+}
+
+// A suppression command queued while a heartbeat flush is already blocked in
+// its network write cannot be acknowledged until that flush resolves, because
+// the pump is not selecting again until it does. When the blocked flush then
+// fails, the pump must mark the session lost and the queued suppression must
+// come back as that same typed loss rather than a nil success or an untyped
+// error (#470 item 2, the B2 path -- previously covered only by static
+// reasoning about the code, not a test).
+func TestSuppressionQueuedBehindABlockedHeartbeatFlushReturnsTheFlushsTypedLossOnFailure(t *testing.T) {
+	control, peer := net.Pipe()
+	defer peer.Close()
+	gate := &gateConn{
+		Conn: control, entered: make(chan struct{}), release: make(chan struct{}),
+		failWith: errors.New("simulated control connection failure"),
+	}
+	pumpCtx, pumpCancel := context.WithCancel(context.Background())
+	session := &Session{
+		client:      &Client{HeartbeatInterval: 10 * time.Millisecond},
+		control:     gate,
+		controlWire: newFramedConn(gate),
+		response:    AcquireSessionResponse{HeartbeatTimeout: time.Second, MaximumAttemptDeadman: time.Minute},
+		pending:     make(map[string]pendingRenewal),
+		queued:      make(chan struct{}, 1),
+		pumpCtx:     pumpCtx, pumpCancel: pumpCancel, pumpDone: make(chan struct{}),
+		suppress: make(chan chan error),
+	}
+	go session.heartbeatPump()
+
+	select {
+	case <-gate.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat flush never attempted its control-connection write")
+	}
+
+	suppressResult := make(chan error, 1)
+	go func() { suppressResult <- session.suppressHeartbeats() }()
+
+	// The suppression command cannot be acknowledged while the flush it is
+	// queued behind is still blocked -- prove it stays pending.
+	select {
+	case err := <-suppressResult:
+		t.Fatalf("suppression was acknowledged (%v) before the blocked flush resolved", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(gate.release)
+
+	var suppressErr error
+	select {
+	case suppressErr = <-suppressResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("suppression never returned after the blocked flush failed")
+	}
+	if suppressErr == nil {
+		t.Fatal("suppression queued behind a flush that then failed reported success")
+	}
+	var loss *RuntimeLossError
+	if !errors.As(suppressErr, &loss) {
+		t.Fatalf("suppression queued behind a failed flush = %T %v, want the typed runtime loss", suppressErr, suppressErr)
+	}
+	if session.HealthError() == nil {
+		t.Fatal("the failed blocked flush did not mark the session lost")
+	}
+	<-session.pumpDone
+}
+
 // The lane unit starts the helper with no heartbeat flag, so the live blackhole
 // waits on whatever a zero-valued ServerConfig compiles to and reads it back
 // from the handshake. Prove an unflagged helper really publishes that default.

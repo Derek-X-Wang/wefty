@@ -209,8 +209,10 @@ func TestNativeLinuxHeartbeatBlackholeReapsLiveOCIAttempt(t *testing.T) {
 			identity.ContainerID, receipt.SweptInventory.Containers)
 	}
 	if !slices.ContainsFunc(receipt.Attempts, func(swept ocihelper.SweptAttemptAuthority) bool {
-		return swept.AttemptID == authority.AttemptID && swept.JobID == authority.JobID &&
-			swept.FencingToken == authority.FencingToken && swept.Class == authority.Class
+		return swept.NodeID == authority.NodeID && swept.JobID == authority.JobID &&
+			swept.AttemptID == authority.AttemptID && swept.FencingToken == authority.FencingToken &&
+			swept.PriorBootSessionID == authority.BootSessionID && swept.Class == authority.Class &&
+			swept.RemovalGeneration == authority.RemovalGeneration
 	}) {
 		t.Fatalf("fresh session's sweep does not attribute the reap to attempt %s: %+v", authority.AttemptID, receipt.Attempts)
 	}
