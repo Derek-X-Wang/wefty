@@ -3243,7 +3243,12 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 						record("runtime_failure")
 						return contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "controlled runtime failure"}}, nil
 					}
-					marker, exists, err := readHandoffMarker(handoffPath)
+					handoffRoot, err := os.OpenRoot(handoffPath)
+					if err != nil {
+						return contract.ProcessResult{}, err
+					}
+					defer handoffRoot.Close()
+					marker, exists, err := readHandoffMarker(handoffRoot)
 					if err != nil || !exists || marker.NodeID != "stable-node" {
 						return contract.ProcessResult{}, errors.New("real handoff preparation did not establish ownership")
 					}
@@ -3252,7 +3257,7 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					}
 					if test.loseOwnership {
 						marker.NodeID = "other-node"
-						if err := writeHandoffMarker(handoffPath, marker); err != nil {
+						if err := writeHandoffMarker(handoffRoot, marker); err != nil {
 							return contract.ProcessResult{}, err
 						}
 					}
@@ -3309,6 +3314,11 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					if _, err := os.Stat(handoffPath); err != nil {
 						t.Fatalf("successful handoff not retained across replay: %v", err)
 					}
+					record := requireRetentionRecord(t, handoffs, "directive-run")
+					if !record.Succeeded || !record.Published || record.NodeID != "stable-node" || record.Directory != handoffPath || record.RetainedAt.IsZero() || !record.RetainUntil.Equal(record.RetainedAt.Add(time.Hour)) {
+						t.Fatalf("completion replay retained the wrong terminal record: %#v", record)
+					}
+
 				}
 				pending := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 				if pending.State != "durable_completion" || live.Result.ExitCode == nil || *live.Result.ExitCode != 0 || !reflect.DeepEqual(pending.Result, live.Result) {
@@ -3329,6 +3339,10 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					state = "sealed_incomplete"
 				}
 				waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, state, 2*time.Second)
+				retained := requireRetentionRecord(t, handoffs, "directive-run")
+				if !retained.Succeeded || !retained.Published || retained.NodeID != "stable-node" || retained.Directory != handoffPath || retained.RetainedAt.IsZero() || !retained.RetainUntil.Equal(retained.RetainedAt.Add(time.Hour)) {
+					t.Fatalf("replay changed retained terminal values: %#v", retained)
+				}
 				if test.rejectReplay {
 					select {
 					case err := <-recoveryErrors:

@@ -643,16 +643,19 @@ the same ownership limit the mailbox records (`oci-helper-protocol.md`, "Run
 mailbox confinement"). A helper-owned terminal timestamp, recorded after
 quiescence and validated, is #494.
 
-Collection expires and nothing else. It runs at agent startup, after every
-attempt finishes — including attempts that never completed cleanly — and hourly;
-the collector is the agent's own and is cancelled and joined before the node
+Collection expires and nothing else. It runs at agent startup, after finalizing
+an attempt's prepared handoff — including attempts that never completed cleanly
+— and hourly.
+The collector is the agent's own and is cancelled and joined before the node
 lock is released. A run an attempt is holding is never swept: the sweep takes
-the same path lock an attempt does, and re-checks ownership under that lock
-immediately before deleting.
+the same path lock an attempt does, re-checks its ownership immediately before
+deleting, and releases the lock to attempts that arrived during deletion.
 
 The authority it acts on is a record the agent keeps under its own state
 directory, never a file inside the handoff directory: a process workload shares
-the agent's OS identity, so anything in there is a file it can rewrite. A
+the agent's OS identity, so anything in there is a file it can rewrite. Keeping
+records separately avoids casual alteration through the handoff directory; it
+is not a tamper boundary against another process with the same OS identity. A
 directory with no agent record is not the agent's and is never measured or
 removed, however full the node is. A record is validated against the file it was
 found in, the root, this node's identity and the retention window, and one that
@@ -661,10 +664,22 @@ skipped with a logged reason and never stops the sweep. The marker inside the
 handoff directory keeps only its cold-rerun ownership job and is read once, at
 preparation.
 
-Terminal recording and trimming happen while the attempt still owns the path,
-only for a directory that attempt prepared, and reach it through an opened
-directory handle rather than by rebuilding pathnames. A handoff path that is a
-symlink is skipped and logged, never followed.
+Terminal recording and trimming require the opaque preparation receipt from
+that attempt's lock acquisition. A canceled waiter has no receipt and performs
+no finalization. Completion records its verdict before the fallback can run;
+both finish before releasing the lock. Preparation opens the run directory with
+Unix no-follow and directory-only flags, verifies its identity, and retains that
+handle for trimming even if the name is later replaced. Marker reads are
+nonblocking, bounded, and verify the opened regular file's identity. A symlink
+at run-directory acquisition is refused; preparation reports the failure and
+collection logs and skips it.
+
+Expiry removes contents through the verified run handle and removes the empty
+run name through the configured root handle after another identity check.
+These operations do not provide isolation from arbitrary same-UID renames or
+writes: configured ancestor directories remain trusted, and another process
+with that identity can still move or alter files. The agent's path locks exclude
+its own attempts while it collects.
 
 **The budgets are logical bytes**, summed over regular files: the length a file
 reports, not the blocks it occupies. A symlink is never followed and contributes

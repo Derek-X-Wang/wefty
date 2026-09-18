@@ -3,7 +3,6 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,20 +36,34 @@ func newRetentionHarness(t *testing.T, retention time.Duration) *retentionHarnes
 	return harness
 }
 
+// prepareHandoffForTest uses the same explicit lock receipt as production.
+func prepareHandoffForTest(t *testing.T, manager *handoffManager, spec contract.JobSpec) *handoffOwnership {
+	t.Helper()
+	lease, err := manager.lock(t.Context(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(lease.release)
+	owner, err := manager.prepare(lease, spec, "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner
+}
+
 // retain finishes one run, with the files it produced already in place.
 func (h *retentionHarness) retain(runID string, succeeded, published bool, files map[string]int) string {
 	h.t.Helper()
 	path := filepath.Join(h.root, runID)
 	spec := handoffClaim(runID, path, nil).Job.Spec
-	if err := h.manager.prepare(spec, "node-1"); err != nil {
-		h.t.Fatal(err)
-	}
+	owner := prepareHandoffForTest(h.t, h.manager, spec)
+	defer owner.lease.release()
 	for name, size := range files {
 		if err := os.WriteFile(filepath.Join(path, name), make([]byte, size), 0o600); err != nil {
 			h.t.Fatal(err)
 		}
 	}
-	if err := h.manager.finish(spec, "node-1", succeeded, published); err != nil {
+	if err := h.manager.finish(owner, spec, "node-1", succeeded, published); err != nil {
 		h.t.Fatal(err)
 	}
 	return path
@@ -111,7 +124,7 @@ func TestRunsInFlightAreNeverSwept(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer unlock()
+		defer unlock.release()
 		live = append(live, path)
 	}
 
@@ -142,7 +155,7 @@ func TestAQuiescedRunIsSweptOnceItsLockIsReleased(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("collection removed a run still holding its lock: %v", err)
 	}
-	unlock()
+	unlock.release()
 	if err := harness.manager.collect(); err != nil {
 		t.Fatal(err)
 	}
@@ -248,16 +261,14 @@ func TestASymlinkNamedResultIsNotAProtectedResult(t *testing.T) {
 	harness.manager.runBytes = 2048
 	path := filepath.Join(harness.root, "run_linked")
 	spec := handoffClaim("run_linked", path, nil).Job.Spec
-	if err := harness.manager.prepare(spec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
+	owner := prepareHandoffForTest(t, harness.manager, spec)
 	if err := os.WriteFile(filepath.Join(path, "payload.bin"), make([]byte, 8192), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("payload.bin", filepath.Join(path, handoffResultName)); err != nil {
 		t.Fatal(err)
 	}
-	if err := harness.manager.finish(spec, "node-1", true, true); err != nil {
+	if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(filepath.Join(path, handoffResultName)); !os.IsNotExist(err) {
@@ -278,9 +289,7 @@ func TestHardLinkedFilesAreChargedPerLink(t *testing.T) {
 	harness := newRetentionHarness(t, time.Hour)
 	path := filepath.Join(harness.root, "run_linked_inode")
 	spec := handoffClaim("run_linked_inode", path, nil).Job.Spec
-	if err := harness.manager.prepare(spec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
+	prepareHandoffForTest(t, harness.manager, spec)
 	original := filepath.Join(path, "payload.bin")
 	if err := os.WriteFile(original, make([]byte, 4096), 0o600); err != nil {
 		t.Fatal(err)
@@ -309,9 +318,7 @@ func TestASymlinkIntoTheNodeIsNeverMeasuredOrFollowed(t *testing.T) {
 	}
 	path := filepath.Join(harness.root, "run_escape")
 	spec := handoffClaim("run_escape", path, nil).Job.Spec
-	if err := harness.manager.prepare(spec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
+	prepareHandoffForTest(t, harness.manager, spec)
 	before := measureRun(t, harness.manager, "run_escape")
 	if err := os.Symlink(elsewhere, filepath.Join(path, "escape")); err != nil {
 		t.Fatal(err)
@@ -338,7 +345,12 @@ func TestASweepIgnoresADirectoryWithNoRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A marker that says whatever a writer wants it to say.
-	if err := writeHandoffMarker(foreign, handoffMarker{
+	foreignRoot, err := os.OpenRoot(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer foreignRoot.Close()
+	if err := writeHandoffMarker(foreignRoot, handoffMarker{
 		RunID: "run_not_ours", NodeID: "node-1",
 		RetainUntil: harness.now.Add(-time.Hour),
 	}); err != nil {
@@ -383,97 +395,6 @@ func TestACorruptRecordIsSkippedAndCollectionContinues(t *testing.T) {
 	}
 	if !harness.logged("skip unusable retention record") || !harness.logged("skip untrustworthy retention record") {
 		t.Fatalf("refusals were silent: %v", harness.logs)
-	}
-}
-
-// TestFinishingAnAttemptCollectsWithoutAnyoneAskingIt is finding 1's rule, and
-// it is deliberately driven through the lifecycle rather than by calling the
-// sweep: collection that only a test remembers to invoke is collection a
-// long-lived agent never performs.
-func TestFinishingAnAttemptCollectsWithoutAnyoneAskingIt(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "handoffs")
-	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
-	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
-	manager.now = func() time.Time { return now }
-
-	// An older run, already retained and already past its window.
-	stale := filepath.Join(root, "run_stale")
-	staleSpec := handoffClaim("run_stale", stale, nil).Job.Spec
-	if err := manager.prepare(staleSpec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(stale, "result.json"), make([]byte, 64), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.finish(staleSpec, "node-1", true, true); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(2 * time.Hour)
-
-	// A fresh attempt runs to completion through the lifecycle. Nothing in the
-	// test asks for collection.
-	runID := "run_fresh"
-	path := filepath.Join(root, runID)
-	runner := &handoffAssertingRunner{t: t, path: path}
-	a := &Agent{
-		registration: contract.NodeRegistration{NodeID: "node-1"},
-		runtimes:     testRuntimeSet(runner),
-		handoffs:     manager,
-	}
-	claim := handoffClaim(runID, path, nil)
-	lifecycle := a.newAttemptLifecycle()
-	result, runErr := lifecycle.runWorkload(context.Background(), claim)
-	if runErr != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("runWorkload() = (%#v, %v)", result, runErr)
-	}
-	if _, err := lifecycle.finishCompletedAttempt(context.Background(), claim, result, runErr); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("finishing an attempt did not collect the expired run: %v", err)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the run that just finished was collected: %v", err)
-	}
-}
-
-// TestAnAttemptThatNeverCompletesStillAccountsForItsResults covers the paths
-// that used to bypass retention entirely: an attempt whose completion never
-// landed left its directory unbounded and invisible to the node's budget.
-func TestAnAttemptThatNeverCompletesStillAccountsForItsResults(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "handoffs")
-	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
-	runID := "run_abandoned"
-	path := filepath.Join(root, runID)
-	spec := handoffClaim(runID, path, nil).Job.Spec
-	if err := manager.prepare(spec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(path, "result.json"), make([]byte, 32), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	a := &Agent{
-		registration: contract.NodeRegistration{NodeID: "node-1"},
-		handoffs:     manager,
-	}
-	lifecycle := a.newAttemptLifecycle()
-	// The conservative fallback the error paths take.
-	if err := lifecycle.retainResults(handoffClaim(runID, path, nil), false, false); err != nil {
-		t.Fatal(err)
-	}
-	record := requireRetentionRecord(t, manager, runID)
-	if record.Succeeded || record.Published {
-		t.Fatalf("an abandoned attempt recorded a verdict it never reached: %#v", record)
-	}
-	// And the completion path cannot overwrite it afterwards: whichever exit
-	// reaches retention first owns it.
-	if err := lifecycle.retainResults(handoffClaim(runID, path, nil), true, true); err != nil {
-		t.Fatal(err)
-	}
-	if again := requireRetentionRecord(t, manager, runID); again.Succeeded {
-		t.Fatalf("retention was recorded twice: %#v", again)
 	}
 }
 

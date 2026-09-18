@@ -140,7 +140,8 @@ type attemptLifecycle struct {
 	// authority loss, a cancelled context, a completion that never landed --
 	// falls back to the conservative one, so no path leaves a run unbounded
 	// and unaccounted.
-	resultsRetained atomic.Bool
+	resultsRetained  atomic.Bool
+	handoffOwnership *handoffOwnership
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -1134,19 +1135,21 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
 		}
 	}
+	var handoffLease *handoffLease
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		unlock, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
+		lease, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
+		handoffLease = lease
 		if retainHandoffLock != nil {
-			retainHandoffLock(unlock)
+			retainHandoffLock(lease.release)
 		} else {
 			// This path owns the lock for its own duration and never reaches a
 			// completion verdict, so the fallback belongs here, registered
 			// after the unlock so it runs before it and while the path is
 			// still owned.
-			defer unlock()
+			defer lease.release()
 			defer lifecycle.retainResultsFallback(claim)
 		}
 	}
@@ -1211,9 +1214,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		lifecycle.dependencies.observer.configurePortfulAttempt(claim.Lease.AttemptID)
 	}
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
+		owner, err := lifecycle.dependencies.handoffs.prepare(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID)
+		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
+		lifecycle.handoffOwnership = owner
 	}
 	// The run mailbox is prepared before the workload starts, so a job that
 	// writes its first event immediately has somewhere to write it. Mailbox
@@ -1550,14 +1555,14 @@ func (lifecycle *attemptLifecycle) retainResultsFallback(claim l1.Claim) {
 }
 
 func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
-	if lifecycle.dependencies.handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
+	if lifecycle.dependencies.handoffs == nil || lifecycle.handoffOwnership == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return nil
 	}
 	if !lifecycle.resultsRetained.CompareAndSwap(false, true) {
 		return nil
 	}
 	if err := lifecycle.dependencies.handoffs.finish(
-		claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
+		lifecycle.handoffOwnership, claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
 		return err
 	}
 	return lifecycle.dependencies.handoffs.collect()

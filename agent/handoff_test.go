@@ -74,24 +74,27 @@ func TestColdRerunWithHandoffFilesPinsOrFailsExplicitly(t *testing.T) {
 	manager.now = func() time.Time { return now }
 	claim := handoffClaim(runID, path, []string{"linux"})
 
-	if err := manager.prepare(claim.Job.Spec, "node-1"); err != nil {
-		t.Fatal(err)
-	}
+	owner := prepareHandoffForTest(t, manager, claim.Job.Spec)
 	if err := os.WriteFile(filepath.Join(path, "plan.md"), []byte("handoff"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.prepare(claim.Job.Spec, "node-1"); err == nil || !strings.Contains(err.Error(), contract.StableNodeTagPrefix+"node-1") {
-		t.Fatalf("unpinned cold rerun error = %v, want explicit stable-node tag failure", err)
-	}
-	rerun := handoffClaim("run_retry_2", path, []string{"linux", contract.StableNodeTagPrefix + "node-1"})
-	rerun.Job.Spec.Labels["handoff_owner_run_id"] = runID
-	if err := manager.prepare(rerun.Job.Spec, "node-1"); err != nil {
-		t.Fatalf("pinned cold rerun: %v", err)
-	}
-
-	if err := manager.finish(rerun.Job.Spec, "node-1", false, false); err != nil {
+	owner.lease.release()
+	lease, err := manager.lock(t.Context(), claim.Job.Spec)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := manager.prepare(lease, claim.Job.Spec, "node-1"); err == nil || !strings.Contains(err.Error(), contract.StableNodeTagPrefix+"node-1") {
+		t.Fatalf("unpinned cold rerun error = %v, want explicit stable-node tag failure", err)
+	}
+	lease.release()
+	rerun := handoffClaim("run_retry_2", path, []string{"linux", contract.StableNodeTagPrefix + "node-1"})
+	rerun.Job.Spec.Labels["handoff_owner_run_id"] = runID
+	owner = prepareHandoffForTest(t, manager, rerun.Job.Spec)
+
+	if err := manager.finish(owner, rerun.Job.Spec, "node-1", false, false); err != nil {
+		t.Fatal(err)
+	}
+	owner.lease.release()
 	now = now.Add(time.Hour)
 	if err := manager.collect(); err != nil {
 		t.Fatal(err)
@@ -112,7 +115,13 @@ func TestHandoffDirectoryRejectsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil)
-	err := manager.prepare(handoffClaim("run_symlink", path, nil).Job.Spec, "node-1")
+	spec := handoffClaim("run_symlink", path, nil).Job.Spec
+	lease, err := manager.lock(t.Context(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.release()
+	_, err = manager.prepare(lease, spec, "node-1")
 	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("symlink prepare error = %v", err)
 	}

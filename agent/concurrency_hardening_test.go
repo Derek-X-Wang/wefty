@@ -32,8 +32,9 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.prepare(spec, "node-1"); err != nil {
-		unlockFirst()
+	owner, err := manager.prepare(unlockFirst, spec, "node-1")
+	if err != nil {
+		unlockFirst.release()
 		t.Fatal(err)
 	}
 
@@ -45,8 +46,9 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 			secondPrepared <- err
 			return
 		}
-		defer unlockSecond()
-		secondPrepared <- manager.prepare(spec, "node-1")
+		defer unlockSecond.release()
+		_, err = manager.prepare(unlockSecond, spec, "node-1")
+		secondPrepared <- err
 		<-releaseSecond
 	}()
 
@@ -62,23 +64,23 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			unlockFirst()
+			unlockFirst.release()
 			t.Fatal("second attempt did not wait on the shared handoff path")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	select {
 	case err := <-secondPrepared:
-		unlockFirst()
+		unlockFirst.release()
 		t.Fatalf("second prepare completed before first finish: %v", err)
 	default:
 	}
 
-	if err := manager.finish(spec, "node-1", true, true); err != nil {
-		unlockFirst()
+	if err := manager.finish(owner, spec, "node-1", true, true); err != nil {
+		unlockFirst.release()
 		t.Fatal(err)
 	}
-	unlockFirst()
+	unlockFirst.release()
 	if err := <-secondPrepared; err != nil {
 		close(releaseSecond)
 		t.Fatalf("second prepare after first finish: %v", err)
