@@ -18,15 +18,27 @@ becomes a **job** in the cluster queue (L1); a node's agent claims it as an
 wefty --json status
 ```
 
-One command, bounded to five seconds even when nothing is listening. It reports
-the endpoints it resolved, the identity it used, every node with what it can run
-and how many slots are free, and one verdict line. Its exit code is the answer:
+One command. The verdict is printed within five seconds even when nothing is
+listening -- on a tsnet fabric the process itself may take a little longer to
+exit, flushing state that belongs to the fabric rather than to this command. It
+reports
+the endpoints it resolved, the caller the control plane recognised — a person, or
+a machine principal, which is what most scripts are and is not a problem — every
+node with what it can run and how many slots are free, and one verdict line. Its
+exit code is the answer:
 
 | Exit | Meaning |
 | --- | --- |
 | 0 | `ready` — submit |
 | 12 | `not ready: <what is missing>` — read the line; it names the thing to fix |
 | 2 | you passed something wrong |
+
+`status` prints the endpoints it was configured with and whatever the servers
+said, verbatim. Those are the person's own addresses on the person's own
+terminal, which is exactly what makes the output useful — and exactly why you
+must not paste it somewhere else. **Do not copy `status` output into a file, a
+commit, an issue or a message.** Report the verdict line and what it means; if
+someone needs the detail, let them run the command themselves.
 
 **If `status` says not ready, stop.** Do not submit and do not retry in a loop.
 Bringing the stack up and enrolling machines into the Fabric are **human steps**,
@@ -59,8 +71,23 @@ RUN_ID=$(wefty --json submit \
 
 wefty wait "$RUN_ID" --timeout 30m     # exit 0 / 10 / 11; see below
 wefty --json inspect "$RUN_ID"         # the evidence
-wefty --json results "$RUN_ID"         # the document the run uploaded, if any
+wefty results "$RUN_ID"                # the result document, exact bytes
 ```
+
+`results` has two shapes, and the difference matters if you are going to hash or
+re-parse the document. Plain `wefty results RUN_ID` writes the document's exact
+bytes to stdout and nothing else; `--out FILE` writes those same bytes to a
+file. `--json` wraps it in provenance — which attempt produced it, its size, its
+sha256, when it arrived — with the document itself under `document`:
+
+```sh
+wefty results "$RUN_ID" --out result.json      # exact bytes, byte for byte
+wefty --json results "$RUN_ID" | jq -e '.sha256, .uploaded_at'
+wefty --json results "$RUN_ID" | jq -e '.document.passed'   # the document, parsed
+```
+
+The digest in the `--json` wrapper covers the exact bytes, not the re-indented
+copy inside the wrapper, so verify against `--out` or plain stdout.
 
 Each of those proves something different, and the difference matters:
 
@@ -68,7 +95,7 @@ Each of those proves something different, and the difference matters:
 | --- | --- |
 | `wait` | the run's **status**, as an exit code. Nothing about what it produced |
 | `inspect` | the evidence: lineage, every envelope, every gate, steps and durations, node placement |
-| `results` | the run's own result document, byte for byte, if it uploaded one |
+| `results` | the run's own result document. Plain or `--out`: exact bytes. `--json`: a wrapper with provenance and the document under `document` |
 
 `wait`'s exit codes:
 

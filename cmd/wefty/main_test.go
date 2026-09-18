@@ -137,16 +137,21 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	}
 	// The first command the skill tells an agent to run, against a stack that
 	// is actually up: ready, with the node's capabilities and free slots.
-	var statusOut, statusErr bytes.Buffer
-	if err := execute(ctx, clients, true, []string{"status"}, &statusOut, &statusErr); err != nil {
-		t.Fatalf("status on a running stack: %v stderr=%s\n%s", err, statusErr.String(), statusOut.String())
-	}
-	var clusterState clusterStatus
-	if err := json.Unmarshal(statusOut.Bytes(), &clusterState); err != nil {
-		t.Fatalf("status --json is not JSON: %v\n%s", err, statusOut.String())
-	}
+	// The node registers on its own schedule, so this waits for `status` to
+	// flip rather than assuming it already has -- which is also the proof that
+	// it does flip, from a real not-ready to a real ready.
+	clusterState := waitForReadyStatus(ctx, t, clients)
 	if !clusterState.Ready || clusterState.Verdict != "ready" {
 		t.Fatalf("status on a running stack = %#v", clusterState)
+	}
+	// The fixture's operator is a machine principal (it carries the client tag
+	// and no person identity), and status must say that plainly rather than
+	// surfacing the person protocol's refusal.
+	if clusterState.Identity.Kind != identityMachine {
+		t.Fatalf("status identity = %#v", clusterState.Identity)
+	}
+	if strings.Contains(clusterState.Identity.Detail, "principal_forbidden") {
+		t.Fatalf("status leaked a protocol error as an identity: %q", clusterState.Identity.Detail)
 	}
 	if len(clusterState.Services) != 2 {
 		t.Fatalf("status services = %#v", clusterState.Services)
@@ -536,6 +541,28 @@ func serveTestServer(_ context.Context, serve func() error) <-chan error {
 // waitForCLIResult polls `wefty results` until the node's upload has landed.
 // The log follow above returns when the run is terminal, and the upload happens
 // as the attempt completes, so the two are close but not ordered.
+// waitForReadyStatus polls `wefty status` until the cluster reports ready, and
+// returns that answer. A stack that never becomes ready fails here with the
+// last verdict, which is the sentence that explains why.
+func waitForReadyStatus(ctx context.Context, t *testing.T, clients *apiClients) clusterStatus {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var last clusterStatus
+	for time.Now().Before(deadline) {
+		var out, errOut bytes.Buffer
+		err := execute(ctx, clients, true, []string{"status"}, &out, &errOut)
+		if decodeErr := json.Unmarshal(out.Bytes(), &last); decodeErr != nil {
+			t.Fatalf("status --json is not JSON: %v\n%s", decodeErr, out.String())
+		}
+		if err == nil {
+			return last
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the fixture stack never became ready; last verdict: %s", last.Verdict)
+	return clusterStatus{}
+}
+
 func waitForCLIResult(ctx context.Context, t *testing.T, clients *apiClients, runID string) string {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)

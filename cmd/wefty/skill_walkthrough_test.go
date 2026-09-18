@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"net"
 	"os"
 	"regexp"
 	"strings"
@@ -111,6 +112,123 @@ func TestSkillLoopUsesCommandsThisBinaryHas(t *testing.T) {
 	}
 }
 
+// TestSkillExamplesUseFlagsThisBinaryHas parses every flag in every documented
+// example against the real flag set of the command it belongs to. A skill that
+// tells an agent to pass a flag that was renamed or removed sends it into a
+// usage error it cannot diagnose, and a prose-only check would never catch it.
+func TestSkillExamplesUseFlagsThisBinaryHas(t *testing.T) {
+	t.Parallel()
+
+	skill := readSkill(t)
+	examples := regexp.MustCompile("(?s)```sh\n(.*?)```").FindAllStringSubmatch(skill, -1)
+	if len(examples) == 0 {
+		t.Fatal("the skill has no shell examples")
+	}
+	checked := 0
+	for _, block := range examples {
+		for _, line := range splitContinuedLines(block[1]) {
+			command, flags, ok := parseSkillCommand(line)
+			if !ok {
+				continue
+			}
+			known := knownFlags(t, command)
+			if known == nil {
+				continue
+			}
+			for _, flag := range flags {
+				if _, present := known[flag]; !present {
+					t.Fatalf("the skill passes --%s to `wefty %s`, which has no such flag",
+						flag, strings.Join(command, " "))
+				}
+			}
+			checked++
+		}
+	}
+	if checked < 5 {
+		t.Fatalf("only %d documented commands were checked; the parser is not reading the examples", checked)
+	}
+}
+
+// splitContinuedLines joins shell line continuations so one command is one line.
+func splitContinuedLines(block string) []string {
+	joined := strings.ReplaceAll(block, "\\\n", " ")
+	return strings.Split(joined, "\n")
+}
+
+// parseSkillCommand pulls the wefty subcommand and its long flags out of one
+// documented line, ignoring shell around it.
+func parseSkillCommand(line string) ([]string, []string, bool) {
+	line = strings.TrimSpace(line)
+	if index := strings.Index(line, "wefty "); index >= 0 {
+		line = line[index:]
+	} else {
+		return nil, nil, false
+	}
+	line = strings.SplitN(line, "|", 2)[0]
+	line = strings.SplitN(line, "#", 2)[0]
+	fields := strings.Fields(line)
+	var command, flags []string
+	for _, field := range fields[1:] {
+		switch {
+		case field == "--json":
+			continue
+		case strings.HasPrefix(field, "--"):
+			name := strings.TrimPrefix(field, "--")
+			name = strings.SplitN(name, "=", 2)[0]
+			if name == "" {
+				continue
+			}
+			flags = append(flags, name)
+		case strings.HasPrefix(field, "-"), strings.HasPrefix(field, "$"), strings.HasPrefix(field, "<"),
+			strings.HasPrefix(field, "\""):
+			continue
+		default:
+			if len(flags) == 0 && isSkillSubcommand(command, field) {
+				command = append(command, field)
+			}
+		}
+	}
+	if len(command) == 0 {
+		return nil, nil, false
+	}
+	return command, flags, true
+}
+
+// isSkillSubcommand keeps run IDs and file paths from being read as verbs.
+func isSkillSubcommand(command []string, field string) bool {
+	if len(command) == 0 {
+		return true
+	}
+	// Only the two-word commands this skill documents take a second verb.
+	switch command[0] {
+	case "run", "workflow", "runs":
+		return len(command) == 1
+	default:
+		return false
+	}
+}
+
+// knownFlags builds the flag set a command really has, by asking the command
+// itself for its usage. A command this test cannot introspect returns nil and
+// is skipped rather than guessed at.
+func knownFlags(t *testing.T, command []string) map[string]struct{} {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	_ = execute(t.Context(), nil, false, append(append([]string{}, command...), "--wefty-unknown-flag"), &out, &errOut)
+	usage := out.String() + errOut.String()
+	if !strings.Contains(usage, "-") {
+		return nil
+	}
+	flags := map[string]struct{}{}
+	for _, match := range regexp.MustCompile(`(?m)^\s+-([A-Za-z0-9][-A-Za-z0-9]*)`).FindAllStringSubmatch(usage, -1) {
+		flags[match[1]] = struct{}{}
+	}
+	if len(flags) == 0 {
+		return nil
+	}
+	return flags
+}
+
 // TestStatusStopsAnAgentWhenNothingIsListening is the second half of the
 // ticket's acceptance: on a machine without the stack, an agent following the
 // skill stops here, quickly, with a reason.
@@ -148,4 +266,52 @@ func TestStatusStopsAnAgentWhenNothingIsListening(t *testing.T) {
 			t.Fatalf("the refusal does not mention %q:\n%s", want, rendered)
 		}
 	}
+}
+
+// TestStatusStopsAnAgentWhenTheConnectionIsRefused is the other shape of
+// "nothing is running": an address that exists and refuses, rather than a name
+// that resolves to nothing. A real port is bound and released so the refusal is
+// the operating system's rather than the Fabric's.
+func TestStatusStopsAnAgentWhenTheConnectionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	refused := releasedAddress(t)
+	network := plain.NewNetwork()
+	participant := network.NewFabric(fabric.Identity{NodeID: "operator", UserID: "alice"})
+	clients, err := newAPIClients(participant, refused, releasedAddress(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(clients.close)
+
+	var out, errOut bytes.Buffer
+	started := time.Now()
+	statusErr := executeStatus(t.Context(), clients, false, nil, &out, &errOut)
+	if statusErr == nil {
+		t.Fatalf("status reported ready against a refused port:\n%s", out.String())
+	}
+	if code := commandExitCode(statusErr); code != exitNotReady {
+		t.Fatalf("status exited %d (%v), want %d", code, statusErr, exitNotReady)
+	}
+	if elapsed := time.Since(started); elapsed > statusBudget+2*time.Second {
+		t.Fatalf("a refused connection took %s to report", elapsed)
+	}
+	if !strings.Contains(out.String(), refused) {
+		t.Fatalf("the refusal does not name the endpoint it tried:\n%s", out.String())
+	}
+}
+
+// releasedAddress binds a loopback port and gives it back, so the address is
+// real and refuses connections instead of hanging.
+func releasedAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
 }

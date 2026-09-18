@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -29,7 +30,12 @@ func main() {
 
 // commandExitCodeForArgs preserves the historical exit 1 contract for all
 // pre-existing commands. Typed exits are explicit contracts only for the
-// Computer lifecycle, access, and Storage surfaces introduced in M3.5.
+// surfaces that published one: the Computer lifecycle, access and Storage
+// surfaces introduced in M3.5, and the two commands whose whole purpose is an
+// exit code -- `wefty status` and `wefty wait`. A command that advertises an
+// exit code it cannot deliver is worse than one that advertises none, so this
+// list and the documented codes have to be kept in step; the walkthrough test
+// checks that they are.
 func commandExitCodeForArgs(err error, args []string) int {
 	if !isTypedExitCLIArgs(args) {
 		return exitFailure
@@ -37,10 +43,15 @@ func commandExitCodeForArgs(err error, args []string) int {
 	return commandExitCode(err)
 }
 
+// typedExitCommands are the single-word commands whose exit code is part of
+// what they promise. `status` answers with 12 when a cluster cannot take work
+// and `wait` with 10 or 11; both are useless if the process exits 1 instead.
+var typedExitCommands = []string{"whoami", "status", "wait"}
+
 func isTypedExitCLIArgs(args []string) bool {
 	for _, arg := range args {
 		if !strings.HasPrefix(arg, "-") {
-			if arg == "whoami" {
+			if slices.Contains(typedExitCommands, arg) {
 				return true
 			}
 			break

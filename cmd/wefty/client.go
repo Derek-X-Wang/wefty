@@ -56,6 +56,10 @@ func (e *apiResponseError) Error() string {
 // blank the returned apiClients still has a usable l3 field (never nil),
 // but calling any of its methods fails fast with a clear, short error
 // instead of dialing an empty address — see apiClient.doWithResponse.
+// dialBudget bounds one dial. It matches the per-probe bound `wefty status`
+// uses, so a dial can never be the reason a bounded command overruns.
+const dialBudget = statusProbeBudget
+
 func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*apiClients, error) {
 	if participant == nil {
 		return nil, fmt.Errorf("wefty: fabric is required")
@@ -89,7 +93,14 @@ func waitForContext(ctx context.Context, duration time.Duration) error {
 
 func newAPIClient(name, flagName string, participant fabric.Fabric, address string) *apiClient {
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return participant.Dial(ctx, network, address)
+		// net/http detaches dial cancellation so a connection can be reused,
+		// which means a dial can outlive the request that started it. A
+		// command with a deadline needs its dials to share one, so the dial is
+		// bounded here too. Without this, `wefty status` could report inside
+		// its budget while a dial kept running behind it.
+		dialCtx, cancel := context.WithTimeout(ctx, dialBudget)
+		defer cancel()
+		return participant.Dial(dialCtx, network, address)
 	}}
 	return &apiClient{name: name, flag: flagName, address: address, client: &http.Client{Transport: transport}}
 }
