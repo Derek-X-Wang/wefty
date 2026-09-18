@@ -261,10 +261,7 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 	if owner == nil {
 		return nil
 	}
-	m.mu.Lock()
-	owned := owner.lease.manager == m && owner.lease.path == path && owner.lease.pathLock.owner == owner.lease && owner.lease.ownership == owner
-	m.mu.Unlock()
-	if !owned {
+	if !m.holdsReceipt(owner, path) {
 		return nil
 	}
 	runID := handoffOwnerRunID(spec)
@@ -281,6 +278,34 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 		return err
 	}
 	return m.enforceRunBound(owner.run, runID)
+}
+
+// readResult reads this run's result document through the same receipt that
+// authorizes retention. It is a no-op without that receipt, for the same reason
+// finish is: the handle belongs to an acquisition this attempt still holds, and
+// a successor attempt's directory is not this one's to read.
+func (m *handoffManager) readResult(owner *handoffOwnership, spec contract.JobSpec, nodeID string) attemptResult {
+	if owner == nil {
+		return attemptResult{skip: contract.ResultUploadSkipAbsent}
+	}
+	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	if !m.holdsReceipt(owner, path) || owner.runID != handoffOwnerRunID(spec) || owner.nodeID != nodeID {
+		return attemptResult{skip: contract.ResultUploadSkipAbsent}
+	}
+	return readHandoffResult(owner.run)
+}
+
+// holdsReceipt reports that this receipt is still the live one for this path on
+// this manager. It is the single definition of "this attempt still owns the
+// directory", so retention and the result read cannot drift apart.
+func (m *handoffManager) holdsReceipt(owner *handoffOwnership, path string) bool {
+	if owner == nil || owner.lease == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return owner.lease.manager == m && owner.lease.path == path &&
+		owner.lease.pathLock.owner == owner.lease && owner.lease.ownership == owner
 }
 
 // openRun opens one run's directory as a root, so every operation below is

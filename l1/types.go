@@ -724,3 +724,36 @@ const (
 	ServiceLogRetentionBytes ServiceLogRetentionBound = "bytes"
 	ServiceLogRetentionAge   ServiceLogRetentionBound = "age"
 )
+
+// AttemptResultRequest is one attempt's result document, uploaded by the node
+// that produced it. Document travels as bytes rather than as a parsed object:
+// L1 stores what the run wrote, and does not become a second opinion on the
+// shape of a workflow's own result schema.
+type AttemptResultRequest struct {
+	FencingToken string `json:"fencing_token"`
+	Document     []byte `json:"document,omitempty"`
+	// SkipReason is the alternative to a document: the run produced a result
+	// the node could not upload, and this says why, so a reader knows to look
+	// on the node instead of concluding the run produced nothing.
+	SkipReason contract.ResultUploadSkipReason `json:"skip_reason,omitempty"`
+	// SHA256 is optional and checked when present, so a truncated upload is
+	// refused rather than stored.
+	SHA256 string `json:"sha256,omitempty"`
+}
+
+type AttemptResultResponse struct {
+	SHA256     string                          `json:"sha256,omitempty"`
+	Bytes      int                             `json:"bytes"`
+	SkipReason contract.ResultUploadSkipReason `json:"skip_reason,omitempty"`
+	UploadedAt time.Time                       `json:"uploaded_at"`
+}
+
+// JobResult is the stored document plus what a reader needs to trust it.
+type JobResult struct {
+	JobID      string                          `json:"job_id"`
+	AttemptID  string                          `json:"attempt_id"`
+	Document   []byte                          `json:"document,omitempty"`
+	SHA256     string                          `json:"sha256,omitempty"`
+	SkipReason contract.ResultUploadSkipReason `json:"skip_reason,omitempty"`
+	UploadedAt time.Time                       `json:"uploaded_at"`
+}

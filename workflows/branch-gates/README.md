@@ -112,17 +112,22 @@ handles top-level strings only.
 
 ## Outputs
 
-1. **The run log** — `result.json` is echoed verbatim, and the first 200 lines
-   of `failures.txt` when something failed. This is the only result surface
-   reachable from the host for an OCI run, so read it first.
-2. **The handoff directory** — `result.json` and `failures.txt`, retained on
+1. **`wefty results <run_id>`** — the verdict document itself, byte for byte as
+   the workflow wrote it, read through L3 with your own identity and no node
+   involved. `--out FILE` writes it to a file; `--json` adds which attempt
+   produced it, its digest and when it arrived. This is the first place to
+   look, for both kinds. The run log no longer echoes the document.
+2. **The run log** — the first 200 lines of `failures.txt` when something
+   failed, and one `result: wefty results <run_id>` line pointing at the
+   document.
+3. **The handoff directory** — `result.json` and `failures.txt`, retained on
    every outcome for the contract's retention window (7 days), whether the
    verdict passed or failed. For `kind=process` that is
    `/tmp/wefty/handoffs/<run_id>/`; for `kind=oci` it is a helper-managed
-   volume inside the node, reachable only through `copy_to` plus a mount until
-   a remote read exists. `wefty inspect` reports when they are scheduled to
-   expire.
-3. **The ledger** — `wefty --json inspect <run_id>` shows one envelope per gate
+   volume inside the node. `failures.txt` is not uploaded anywhere, so
+   `copy_to` plus an operator mount is still how an OCI run gets that one out.
+   `wefty inspect` reports when the files are scheduled to expire.
+4. **The ledger** — `wefty --json inspect <run_id>` shows one envelope per gate
    (`status` `succeeded`/`failed`), then one `result` envelope carrying the
    verdict document, then one `branch-gates` gate whose outcome is the verdict.
    Envelope data is nested under the mailbox's own extension namespace,
@@ -139,9 +144,9 @@ Every exit after the execution context is known writes the same two files. A
 workflow error writes a `result.json` with `"passed":false`, `"gates":[]` and a
 `workflow_error` object naming the step (`environment`, `input`, `checkout`,
 `publish`, `results`) and the message, plus a `failures.txt` whose first line is
-`===== workflow-error: <step> =====`. Both are echoed into the run log and
-copied through `copy_to` exactly like a verdict, and the non-zero exit retains
-them on the node.
+`===== workflow-error: <step> =====`. The result document is uploaded and the
+files copied through `copy_to` exactly as for a verdict, and the non-zero exit
+retains them on the node.
 
 ## Running it
 
@@ -234,7 +239,7 @@ RUN_ID=$(w --json submit \
   | jq -er '.run_id')
 
 w logs "$RUN_ID" --follow
-cat "/tmp/wefty/handoffs/$RUN_ID/result.json"    # only when the verdict is fail
+w results "$RUN_ID"                              # the verdict document itself
 ```
 
 Pointing `repo_url` at a local checkout clones from it directly, which is the

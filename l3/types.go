@@ -303,3 +303,15 @@ type ComputerTokenScopeProof struct {
 	HostNodeID                string `json:"host_node_id"`
 	SubmitMaxInflight         int    `json:"submit_max_inflight"`
 }
+
+// RunResult is one run's uploaded result document as a Run-shaped reader sees
+// it. It is the ledger's job-scoped row with the run's own identity on it, so
+// nothing above L3 has to know that a Run is backed by a Job.
+type RunResult struct {
+	RunID      string                          `json:"run_id"`
+	AttemptID  string                          `json:"attempt_id"`
+	Document   []byte                          `json:"document,omitempty"`
+	SHA256     string                          `json:"sha256,omitempty"`
+	SkipReason contract.ResultUploadSkipReason `json:"skip_reason,omitempty"`
+	UploadedAt time.Time                       `json:"uploaded_at"`
+}

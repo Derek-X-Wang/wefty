@@ -949,6 +949,17 @@ func (m *runMailbox) finishExpired(cause error, done <-chan struct{}) {
 	}
 }
 
+// handoffFiles exposes the bounded read of the handoff volume's own root when
+// the backing implementation has one. Only a helper-backed mailbox does: a
+// process attempt's agent already holds a verified handle on that directory.
+func (m *runMailbox) handoffFiles() (handoffFileReader, bool) {
+	if m == nil || m.fs == nil {
+		return nil, false
+	}
+	reader, ok := m.fs.(handoffFileReader)
+	return reader, ok
+}
+
 // readsThroughRuntime reports a mailbox whose evidence is only reachable while
 // its attempt is still live at the runtime.
 func (m *runMailbox) readsThroughRuntime() bool {

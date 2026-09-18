@@ -47,6 +47,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeRerun(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "logs":
 		return executeLogs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "results":
+		return executeResults(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "inspect":
 		return executeInspect(ctx, clients, jsonOutput, args[1:], stdout)
 	case "drain":
@@ -90,22 +92,32 @@ type runInspection struct {
 	Execution *l3.RunExecution     `json:"execution,omitempty"`
 }
 
-// runResults says where a finished run's files are and how long they last.
+// runResults says where a finished run's files are, how long they last, and
+// whether its result document reached the ledger.
 //
-// It is computed, not observed. The node that ran the job is the only thing
-// that knows what is actually on disk, and nothing reads a file back off a node
-// yet -- that is #483 D2. What is knowable here is the rule: results live in the
-// run's handoff directory on the node that produced it, and the node sweeps them
-// on the contract's retention window. A node configured with a different window,
-// or one that evicted the run early because it ran out of room, will differ; the
-// honest word for this field is therefore "scheduled", not "observed".
+// The two halves are known differently, and the field names say so. Uploaded is
+// observed: the ledger either holds the document or it does not, and that answer
+// is exact. Everything about the files on the node is computed -- the node that
+// ran the job is the only thing that knows what is actually on its disk, and
+// nothing reads a file back off a node. What is knowable is the rule: files live
+// in the run's handoff directory on the node that produced it, and the node
+// sweeps them on the contract's retention window. A node configured with a
+// different window, or one that evicted the run early because it ran out of
+// room, will differ; the honest word for that is "scheduled", not "observed".
 type runResults struct {
 	Location      string     `json:"location"`
 	NodeID        string     `json:"node_id,omitempty"`
 	RetainedUntil *time.Time `json:"retained_until,omitempty"`
 	Expired       bool       `json:"expired"`
 	Observed      bool       `json:"observed"`
-	Note          string     `json:"note"`
+	// Uploaded reports that the ledger holds this run's result document, so it
+	// can be read with `wefty results` from anywhere, with no node involved.
+	Uploaded bool `json:"uploaded"`
+	// UploadSkipReason names why a result that exists on the node did not
+	// travel. It is empty both when the document was uploaded and when the run
+	// simply wrote none.
+	UploadSkipReason contract.ResultUploadSkipReason `json:"upload_skip_reason,omitempty"`
+	Note             string                          `json:"note"`
 }
 
 // runResultsFor is nil for a run that has not finished: there are no results to
@@ -121,9 +133,106 @@ func runResultsFor(run contract.RunRecord, now time.Time) *runResults {
 		RetainedUntil: &retainedUntil,
 		Expired:       now.After(retainedUntil),
 		Observed:      false,
-		Note: "scheduled under the default retention window; reading results off the node" +
-			" is not implemented yet",
+		Note: "files are scheduled under the default retention window;" +
+			" an uploaded result document is read with `wefty results`",
 	}
+}
+
+// observeUploadedResult folds in the one thing about a run's results that is
+// not a computed rule. A run whose result was never uploaded is the common
+// case, not an error, so a not-found answer leaves the block as it was.
+func observeUploadedResult(results *runResults, result l3.RunResult, err error) error {
+	if results == nil {
+		return nil
+	}
+	if err != nil {
+		// Only "there is no result" is an ordinary answer here. Anything else
+		// -- unauthorized, unreachable, a broken ledger -- would otherwise
+		// print as a confident "not uploaded", which is exactly the kind of
+		// unknown this command must not launder into a result.
+		var responseErr *apiResponseError
+		if errors.As(err, &responseErr) && responseErr.APIError.Code == contract.ErrorNotFound {
+			return nil
+		}
+		return err
+	}
+	results.Uploaded = len(result.Document) > 0 && result.SkipReason == ""
+	results.UploadSkipReason = result.SkipReason
+	return nil
+}
+
+// executeResults reads the result document the run uploaded when it finished.
+//
+// The document is the run's own, byte for byte as it wrote it, so the default
+// output writes it straight to stdout or to a file: a result is usually input
+// to the next thing, not something to read. --json wraps it in the provenance a
+// person needs to trust it -- which attempt produced it, its digest, when it
+// arrived -- and is how you see that a run produced a result it could not
+// upload, and where to go looking for it.
+func executeResults(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
+	args = moveFirstPositionalToEnd(args)
+	flags := flag.NewFlagSet("results", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var out string
+	flags.StringVar(&out, "out", "", "write the result document to this file instead of stdout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return usageError("usage: wefty results RUN_ID [--out FILE]")
+	}
+	result, err := clients.getRunResult(ctx, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(stdout, newResultDocumentView(result))
+	}
+	if result.SkipReason != "" {
+		// Not an empty document and not an error: the run produced a result
+		// the node could not upload, and the useful answer names the reason
+		// and the node rather than printing nothing.
+		return fmt.Errorf("run %s produced a result that was not uploaded (%s); it is retained on the node that ran it",
+			result.RunID, result.SkipReason)
+	}
+	if out != "" {
+		if err := os.WriteFile(out, result.Document, 0o600); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(stdout, "%s\t%d bytes\tsha256:%s\n", out, len(result.Document), result.SHA256)
+		return err
+	}
+	if _, err := stdout.Write(result.Document); err != nil {
+		return err
+	}
+	if len(result.Document) > 0 && result.Document[len(result.Document)-1] != '\n' {
+		_, err = io.WriteString(stdout, "\n")
+	}
+	return err
+}
+
+// resultDocumentView is the --json shape. Document stays raw JSON rather than a
+// base64 string, because a caller piping this into jq wants the run's own
+// object, not an encoding of it.
+type resultDocumentView struct {
+	RunID      string                          `json:"run_id"`
+	AttemptID  string                          `json:"attempt_id"`
+	Bytes      int                             `json:"bytes"`
+	SHA256     string                          `json:"sha256,omitempty"`
+	UploadedAt time.Time                       `json:"uploaded_at"`
+	SkipReason contract.ResultUploadSkipReason `json:"skip_reason,omitempty"`
+	Document   json.RawMessage                 `json:"document,omitempty"`
+}
+
+func newResultDocumentView(result l3.RunResult) resultDocumentView {
+	view := resultDocumentView{
+		RunID: result.RunID, AttemptID: result.AttemptID, Bytes: len(result.Document),
+		SHA256: result.SHA256, UploadedAt: result.UploadedAt, SkipReason: result.SkipReason,
+	}
+	if json.Valid(result.Document) {
+		view.Document = json.RawMessage(result.Document)
+	}
+	return view
 }
 
 func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
@@ -150,6 +259,12 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	inspection := runInspection{
 		Run: root, Lineage: lineage, Runs: []contract.RunRecord{root},
 		Results: runResultsFor(root, time.Now().UTC()),
+	}
+	if inspection.Results != nil {
+		result, resultErr := clients.getRunResult(ctx, runID)
+		if err := observeUploadedResult(inspection.Results, result, resultErr); err != nil {
+			return err
+		}
 	}
 	for _, descendant := range lineage.Descendants {
 		record, err := clients.getRun(ctx, descendant.RunID)

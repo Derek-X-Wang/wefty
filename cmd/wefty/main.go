@@ -407,6 +407,8 @@ Commands:
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
+  results RUN_ID [--out FILE]
+                             Read the result document the run uploaded
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
   drain NODE_ID              Disable new claims using the current intent revision

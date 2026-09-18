@@ -450,6 +450,44 @@
         }
       }
     },
+    "/v1/runs/{run_id}/result": {
+      "parameters": [
+        {
+          "name": "run_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getRunResult",
+        "summary": "Read the result document this run uploaded",
+        "description": "Proxies the ledger row for the run's current attempt, authorized as the run's logs are. Computer passes are not authorized for this route.",
+        "responses": {
+          "200": {
+            "description": "The run's result document, or the reason a result that exists on the node did not travel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/RunResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/v1/runs/{run_id}/envelopes": {
       "parameters": [
         { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }

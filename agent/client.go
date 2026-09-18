@@ -169,6 +169,13 @@ func (c *Client) AppendLogs(ctx context.Context, jobID, attemptID string, reques
 	return response, err
 }
 
+// SetAttemptResult uploads the result document this attempt produced.
+func (c *Client) SetAttemptResult(ctx context.Context, jobID, attemptID string, request l1.AttemptResultRequest) (l1.AttemptResultResponse, error) {
+	var response l1.AttemptResultResponse
+	err := c.post(ctx, attemptPath(jobID, attemptID)+"/result", request, &response)
+	return response, err
+}
+
 func (c *Client) Complete(ctx context.Context, jobID, attemptID string, request l1.CompletionRequest) (l1.Job, error) {
 	var job l1.Job
 	err := c.post(ctx, attemptPath(jobID, attemptID)+"/complete", request, &job)

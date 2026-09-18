@@ -140,7 +140,16 @@ type attemptLifecycle struct {
 	// authority loss, a cancelled context, a completion that never landed --
 	// falls back to the conservative one, so no path leaves a run unbounded
 	// and unaccounted.
-	resultsRetained  atomic.Bool
+	resultsRetained atomic.Bool
+	// resultUploaded latches the one result upload this attempt performs, for
+	// the same reason retention is latched: several exits reach it and only
+	// the first one's answer is the run's.
+	resultUploaded atomic.Bool
+	// capturedResult holds a result read before the runtime was reaped. An OCI
+	// attempt's handoff volume is only readable while its attempt is live, so
+	// the read happens at the same moment the mailbox drains and the bytes
+	// wait here for the upload that follows completion.
+	capturedResult   atomic.Pointer[attemptResult]
 	handoffOwnership *handoffOwnership
 }
 
@@ -719,6 +728,7 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 	if err := lifecycle.retainResults(claim, succeeded, published); err != nil {
 		return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
 	}
+	lifecycle.uploadResult(ctx, claim)
 	if succeeded {
 		volumes := runtimeManagedVolumesForSuccessfulCompletion(claim.Job.Spec)
 		if len(volumes) > 0 {
@@ -1035,6 +1045,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// volume is retained rather than expiring as a clean success.
 		if mailbox.readsThroughRuntime() {
 			mailbox.finalize(finalizationContext)
+			// The result document lives in the same helper-owned volume and is
+			// readable under the same live-attempt authority, so it is read
+			// here for the same reason and in the same window. The upload
+			// itself happens after completion; only the read has to be here.
+			lifecycle.captureRemoteResult(finalizationContext, mailbox)
 		}
 		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
 			Authority: authority, ManagedResources: managedResources,
@@ -1566,6 +1581,67 @@ func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, publ
 		return err
 	}
 	return lifecycle.dependencies.handoffs.collect()
+}
+
+// captureRemoteResult reads an OCI attempt's result.json through the helper
+// while the attempt is still live. A failure here is not an error for the
+// attempt: it becomes a named skip reason, and the document stays on the node.
+func (lifecycle *attemptLifecycle) captureRemoteResult(ctx context.Context, mailbox *runMailbox) {
+	reader, ok := mailbox.handoffFiles()
+	if !ok {
+		return
+	}
+	result := readRemoteHandoffResult(ctx, reader)
+	lifecycle.capturedResult.Store(&result)
+}
+
+// uploadResult pushes this attempt's result document to the ledger, so that a
+// run's conclusion outlives the node that produced it and can be read without
+// one. It never fails the attempt: a result that did not travel is recorded as
+// a named skip and the file is retained on the node either way.
+//
+// The document comes from whichever read path this kind has. A process attempt
+// reads it here, through the ownership receipt it still holds. An OCI attempt
+// read it before its runtime was reaped, because that was the last moment it
+// could.
+func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Claim) {
+	if lifecycle.dependencies.client == nil {
+		return
+	}
+	if !lifecycle.resultUploaded.CompareAndSwap(false, true) {
+		return
+	}
+	result, found := lifecycle.attemptResult(claim)
+	if !found || result.empty() {
+		return
+	}
+	uploadContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+	defer cancel()
+	recorded, err := uploadAttemptResult(uploadContext, lifecycle.dependencies.client,
+		claim.Job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken, result)
+	if err != nil {
+		lifecycle.log("agent: upload result for attempt %s: %v", claim.Lease.AttemptID, err)
+	}
+	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
+		if noteErr := lifecycle.dependencies.handoffs.noteResultUpload(
+			handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID, recorded); noteErr != nil {
+			lifecycle.log("agent: record result upload for attempt %s: %v", claim.Lease.AttemptID, noteErr)
+		}
+	}
+}
+
+// attemptResult returns what this attempt has to upload, reading it now for the
+// kinds whose directory the agent can open itself.
+func (lifecycle *attemptLifecycle) attemptResult(claim l1.Claim) (attemptResult, bool) {
+	if captured := lifecycle.capturedResult.Load(); captured != nil {
+		return *captured, true
+	}
+	if lifecycle.dependencies.handoffs == nil || lifecycle.handoffOwnership == nil ||
+		!usesAgentHandoffLifecycle(claim.Job.Spec) {
+		return attemptResult{}, false
+	}
+	return lifecycle.dependencies.handoffs.readResult(
+		lifecycle.handoffOwnership, claim.Job.Spec, lifecycle.dependencies.nodeID), true
 }
 
 func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {

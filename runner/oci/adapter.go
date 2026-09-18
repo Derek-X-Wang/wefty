@@ -2413,6 +2413,11 @@ func (adapter *Adapter) ReadRunMailbox(ctx context.Context, reference workloadru
 	if err != nil {
 		return nil, false, err
 	}
+	if response.Absent {
+		// The same answer an agent-opened directory gives for a name that is
+		// not there, so both implementations of the mailbox read behave alike.
+		return nil, false, fs.ErrNotExist
+	}
 	if response.Unusable {
 		// The helper looked at the entry and says it can never be an event.
 		// That is the only answer on which the caller may delete it; a
@@ -2452,6 +2457,7 @@ func (adapter *Adapter) runMailboxRequest(reference workloadrunner.RunMailboxRef
 	}
 	return session, ocihelper.RunMailboxReference{
 		Authority: HelperAuthority(reference.Authority),
+		Scope:     ocihelper.RunMailboxScope(reference.Scope),
 		OwnerKey:  reference.OwnerKey,
 		RunID:     reference.RunID,
 	}, nil

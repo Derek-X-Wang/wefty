@@ -1150,6 +1150,66 @@
           "truncation": { "$ref": "#/components/schemas/ServiceLogTruncation" }
         }
       },
+      "ResultUploadSkipReason": {
+        "type": "string",
+        "description": "Why a finished run has no result document here. The set is closed: a reason is an answer a person acts on, not free text a node invents. A node normally uploads nothing at all for \"absent\" -- the run wrote no result -- and uploads one of the others when a result exists on the node and could not travel.",
+        "enum": ["absent", "not_a_regular_file", "exceeds_upload_bound", "not_json", "unreadable", "upload_failed"]
+      },
+      "AttemptResultRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fencing_token"],
+        "properties": {
+          "fencing_token": { "type": "string" },
+          "document": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "The run's own result.json, byte for byte, at most 1 MiB. Exactly one of document or skip_reason is sent."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Optional digest of document, checked when present so a truncated upload is refused rather than stored."
+          },
+          "skip_reason": { "$ref": "#/components/schemas/ResultUploadSkipReason" }
+        }
+      },
+      "AttemptResultResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bytes", "uploaded_at"],
+        "properties": {
+          "sha256": { "type": "string" },
+          "bytes": { "type": "integer" },
+          "skip_reason": { "$ref": "#/components/schemas/ResultUploadSkipReason" },
+          "uploaded_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "JobResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_id", "attempt_id", "uploaded_at"],
+        "properties": {
+          "job_id": { "type": "string" },
+          "attempt_id": { "type": "string" },
+          "document": { "type": "string", "contentEncoding": "base64" },
+          "sha256": { "type": "string" },
+          "skip_reason": { "$ref": "#/components/schemas/ResultUploadSkipReason" },
+          "uploaded_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RunResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "attempt_id", "uploaded_at"],
+        "properties": {
+          "run_id": { "type": "string" },
+          "attempt_id": { "type": "string" },
+          "document": { "type": "string", "contentEncoding": "base64" },
+          "sha256": { "type": "string" },
+          "skip_reason": { "$ref": "#/components/schemas/ResultUploadSkipReason" },
+          "uploaded_at": { "type": "string", "format": "date-time" }
+        }
+      },
       "NodeRegistration": {
         "type": "object",
         "additionalProperties": false,

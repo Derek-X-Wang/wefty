@@ -236,6 +236,10 @@ func TestComputerHTTPAuthoritySurfaceAndNodeBinding(t *testing.T) {
 		body         any
 	}{
 		{http.MethodGet, "/v1/runs/" + accepted.RunID + "/execution", nil},
+		// A Computer pass may read a run's logs and not its result. The pass
+		// registry is the authority on what a Computer reaches, and a new read
+		// is not granted by arriving next to one that was.
+		{http.MethodGet, "/v1/runs/" + accepted.RunID + "/result", nil},
 		{http.MethodPost, "/v1/runs/" + accepted.RunID + "/envelopes", map[string]any{}},
 		{http.MethodPost, "/v1/runs/" + accepted.RunID + "/gates", map[string]any{}},
 		{http.MethodPost, "/v1/runs/" + accepted.RunID + "/rerun", map[string]any{}},

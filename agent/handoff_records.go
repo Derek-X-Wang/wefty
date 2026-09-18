@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // A retained run's authority lives here, on the agent's side of the boundary,
@@ -43,6 +45,36 @@ type retentionRecord struct {
 	RetainUntil time.Time `json:"retain_until"`
 	Published   bool      `json:"published,omitempty"`
 	Succeeded   bool      `json:"succeeded,omitempty"`
+	// Uploaded and UploadSkipReason are this node's own account of whether the
+	// run's result reached the ledger. The ledger is authoritative for what it
+	// holds; this is the node-side answer to "why is there nothing there", and
+	// it is the only place a transport failure is recorded at all.
+	Uploaded         bool                            `json:"uploaded,omitempty"`
+	UploadSkipReason contract.ResultUploadSkipReason `json:"upload_skip_reason,omitempty"`
+}
+
+// noteResultUpload amends an already-written retention record with the outcome
+// of the upload. It amends rather than writes: retention is decided at
+// completion and must not be re-dated by a later, slower network call, and a
+// record that is not this node's is not this node's to touch.
+func (m *handoffManager) noteResultUpload(runID, nodeID string, result attemptResult) error {
+	if m == nil || strings.TrimSpace(m.stateRoot) == "" || strings.TrimSpace(runID) == "" {
+		return nil
+	}
+	path := filepath.Join(m.recordRoot(), recordComponent(runID))
+	record, err := m.readRecord(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if record.RunID != runID || record.NodeID != nodeID {
+		return nil
+	}
+	record.Uploaded = len(result.document) > 0 && result.skip == ""
+	record.UploadSkipReason = result.skip
+	return m.writeRecord(record)
 }
 
 func (m *handoffManager) recordRoot() string {

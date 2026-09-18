@@ -119,12 +119,24 @@ type RunMailboxSeed struct {
 	Params []byte
 }
 
+// RunMailboxScope selects which directory of the attempt's handoff volume a
+// bounded read addresses. The zero value is the run mailbox's event directory.
+type RunMailboxScope string
+
+const (
+	RunMailboxScopeEvents       RunMailboxScope = ""
+	RunMailboxScopeHandoffFiles RunMailboxScope = "handoff_files"
+)
+
 // RunMailboxReference names one attempt's mailbox for a bounded read. OwnerKey
 // is the same stable handoff owner key the attempt's managed volume carries.
 type RunMailboxReference struct {
 	Authority AttemptAuthority
 	OwnerKey  string
 	RunID     string
+	// Scope is the directory within that volume. The zero value keeps the
+	// original meaning: the run mailbox's events.
+	Scope RunMailboxScope
 }
 
 // ErrRunMailboxEntryUnusable is a runtime's positive classification of one

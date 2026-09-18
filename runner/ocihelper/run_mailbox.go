@@ -26,10 +26,15 @@ import (
 // components. A read proves the opened object is a regular file before it
 // returns a byte, and opens non-blocking so a FIFO cannot hold the helper.
 
-// openRunMailboxEvents descends managedRoot -> handoffs -> <volume> ->
-// .wefty -> <run id> -> events and returns the events directory. The caller
-// closes it.
-func openRunMailboxEvents(managedRoot string, reference RunMailboxReference) (*os.Root, error) {
+// openRunMailboxScope descends managedRoot -> handoffs -> <volume> and then,
+// for the event scope, on through .wefty -> <run id> -> events. The handoff
+// scope stops at the volume, which is where a run writes result.json. The
+// caller closes the returned root.
+//
+// Both descents use the identical confinement: one component at a time, no
+// symlink followed, SameFile proof on every step. The scope chooses between two
+// fixed descents and is never itself a path component.
+func openRunMailboxScope(managedRoot string, reference RunMailboxReference) (*os.Root, error) {
 	volume, err := DeterministicHandoffVolumeDirectory(reference.OwnerKey)
 	if err != nil {
 		return nil, err
@@ -37,8 +42,15 @@ func openRunMailboxEvents(managedRoot string, reference RunMailboxReference) (*o
 	if !ValidRunMailboxName(reference.RunID) {
 		return nil, errors.New("run mailbox run ID is not a bounded mailbox name")
 	}
-	return openConfinedDirectory(managedRoot,
-		"handoffs", volume, RunMailboxDirectoryName, reference.RunID, RunMailboxEventsDirectoryName)
+	switch reference.Scope {
+	case RunMailboxScopeHandoffFiles:
+		return openConfinedDirectory(managedRoot, "handoffs", volume)
+	case RunMailboxScopeEvents:
+		return openConfinedDirectory(managedRoot,
+			"handoffs", volume, RunMailboxDirectoryName, reference.RunID, RunMailboxEventsDirectoryName)
+	default:
+		return nil, fmt.Errorf("run mailbox scope %q is not a known scope", string(reference.Scope))
+	}
 }
 
 // openConfinedDirectory opens the managed root and then walks one component at
@@ -317,7 +329,7 @@ func listRunMailbox(ctx context.Context, runtimeRoot string, request ListRunMail
 	if err := ctx.Err(); err != nil {
 		return ListRunMailboxResponse{}, err
 	}
-	events, err := openRunMailboxEvents(runtimeRoot, request.RunMailboxReference)
+	events, err := openRunMailboxScope(runtimeRoot, request.RunMailboxReference)
 	if err != nil {
 		return ListRunMailboxResponse{}, err
 	}
@@ -352,7 +364,7 @@ func readRunMailbox(ctx context.Context, runtimeRoot string, request ReadRunMail
 	if !ValidRunMailboxName(request.Name) {
 		return ReadRunMailboxResponse{}, errors.New("run mailbox entry name is not a bounded mailbox name")
 	}
-	events, err := openRunMailboxEvents(runtimeRoot, request.RunMailboxReference)
+	events, err := openRunMailboxScope(runtimeRoot, request.RunMailboxReference)
 	if err != nil {
 		return ReadRunMailboxResponse{}, err
 	}
@@ -363,6 +375,12 @@ func readRunMailbox(ctx context.Context, runtimeRoot string, request ReadRunMail
 	limit := request.boundedLimit()
 	payload, truncated, err := readConfinedRegularFile(events, request.Name, limit)
 	if err != nil {
+		// An entry that is not there is reported as absent rather than as a
+		// failure, so the caller can tell "nothing was written" apart from "I
+		// could not read what was written".
+		if errors.Is(err, os.ErrNotExist) {
+			return ReadRunMailboxResponse{Absent: true}, nil
+		}
 		// An entry the helper positively classified as unpublishable is a
 		// fact about the entry, reported in the response. Everything else --
 		// an I/O failure, a cancelled context -- stays an error, because the
@@ -384,7 +402,7 @@ func removeRunMailboxEntry(ctx context.Context, runtimeRoot string, request Remo
 	if !ValidRunMailboxName(request.Name) {
 		return RemoveRunMailboxEntryResponse{}, errors.New("run mailbox entry name is not a bounded mailbox name")
 	}
-	events, err := openRunMailboxEvents(runtimeRoot, request.RunMailboxReference)
+	events, err := openRunMailboxScope(runtimeRoot, request.RunMailboxReference)
 	if err != nil {
 		return RemoveRunMailboxEntryResponse{}, err
 	}

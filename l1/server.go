@@ -267,6 +267,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
 	client.HandleFunc("GET /v1/jobs/{job_id}/children", s.listChildJobs)
 	client.HandleFunc("GET /v1/jobs/{job_id}/logs", s.getJobLogs)
+	client.HandleFunc("GET /v1/jobs/{job_id}/result", s.getJobResult)
 	client.HandleFunc("PUT /v1/jobs/{job_id}/desired-state", s.setServiceDesiredState)
 	client.HandleFunc("POST /v1/jobs/{job_id}/restart", s.restartService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/remove", s.removeService)
@@ -319,6 +320,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication", s.setAttemptPublication)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/takeover-audit", s.appendComputerTakeoverAudit)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs", s.appendLogs)
+	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/result", s.setAttemptResult)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
@@ -2101,6 +2103,45 @@ func (s *Server) appendLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// setAttemptResult takes the result document the attempt's node uploaded. It is
+// the logs route's sibling in every way that matters: same mux, same identity,
+// same attempt evidence check inside the store.
+func (s *Server) setAttemptResult(w http.ResponseWriter, r *http.Request) {
+	var request AttemptResultRequest
+	if err := decodeJSONWithLimit(r, &request, MaxResultUploadBodyBytes); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	response, err := s.store.SetAttemptResult(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// getJobResult reads it back with the same authorization as the job's logs: a
+// result is evidence about the job, and whoever may read the job's logs may
+// read what it concluded.
+func (s *Server) getJobResult(w http.ResponseWriter, r *http.Request) {
+	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := validateJobRouteClass(r, job); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.store.GetJobResult(r.Context(), job.JobID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) appendComputerTakeoverAudit(w http.ResponseWriter, r *http.Request) {

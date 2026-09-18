@@ -37,6 +37,13 @@ type JobLogClient interface {
 	GetJobLogs(context.Context, string, string, int) (l1.LogPage, error)
 }
 
+// JobResultClient is the L1 result-read dependency of the L3 API. It is its
+// own interface rather than another method on JobLogClient so an existing
+// client or fake does not have to grow a method to keep compiling.
+type JobResultClient interface {
+	GetJobResult(context.Context, string) (l1.JobResult, error)
+}
+
 type ComputerGrantVerifier interface {
 	ProveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error)
 }
@@ -137,6 +144,15 @@ func (c *L1Client) GetJobLogs(ctx context.Context, jobID, cursor string, limit i
 	return page, nil
 }
 
+func (c *L1Client) GetJobResult(ctx context.Context, jobID string) (l1.JobResult, error) {
+	var result l1.JobResult
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "/result"
+	if err := c.do(ctx, http.MethodGet, path, nil, &result, http.StatusOK); err != nil {
+		return l1.JobResult{}, err
+	}
+	return result, nil
+}
+
 func (c *L1Client) ProveComputerTokenScope(ctx context.Context, computerID, attemptID, hostIdentityNodeID, hostNodeID string) (ComputerTokenScopeProof, error) {
 	var proof l1.ComputerTokenScopeProof
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/token-scope-proof"
@@ -210,6 +226,7 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 var _ JobClient = (*L1Client)(nil)
 var _ JobImageEvidenceClient = (*L1Client)(nil)
 var _ JobLogClient = (*L1Client)(nil)
+var _ JobResultClient = (*L1Client)(nil)
 var _ ComputerGrantVerifier = (*L1Client)(nil)
 
 // Keep the response origin internal while preserving errors.As(*Error).

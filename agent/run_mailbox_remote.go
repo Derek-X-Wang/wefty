@@ -12,6 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 // A remote mailbox is one the agent cannot open: an OCI attempt's handoff
@@ -36,6 +37,11 @@ const (
 	// runMailboxStateDirectoryName is the agent-local root under which each
 	// remote attempt's bookkeeping lives.
 	runMailboxStateDirectoryName = "run-mailbox"
+	// maxHandoffFileReadBytes is what one helper response can carry. The
+	// contract's upload bound is larger, and an OCI result above this is
+	// recorded as oversize rather than truncated: a partial result document
+	// still parses, which makes it worse than none.
+	maxHandoffFileReadBytes = ocihelper.MaxRunMailboxHandoffFileBytes
 )
 
 // helperMailboxFS is the publisher's view of a helper-owned mailbox. It holds
@@ -51,12 +57,15 @@ type helperMailboxFS struct {
 	timeout time.Duration
 }
 
-func (fs *helperMailboxFS) call() (context.Context, context.CancelFunc) {
-	timeout := fs.timeout
-	if timeout <= 0 {
-		timeout = runMailboxRemoteCallTimeout
+func (fs *helperMailboxFS) callTimeout() time.Duration {
+	if fs.timeout <= 0 {
+		return runMailboxRemoteCallTimeout
 	}
-	return context.WithTimeout(fs.parent, timeout)
+	return fs.timeout
+}
+
+func (fs *helperMailboxFS) call() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(fs.parent, fs.callTimeout())
 }
 
 func (fs *helperMailboxFS) list(limit int) ([]string, bool, error) {
@@ -87,6 +96,31 @@ func (fs *helperMailboxFS) remove(name string) error {
 	defer cancel()
 	return fs.runtime.RemoveRunMailboxEntry(ctx, fs.reference, name)
 }
+
+// readHandoffFile reads one file from the handoff volume root through the
+// helper's handoff scope. It is the same attempt authority, the same owner key
+// and the same confinement as an event read; only the final descent differs.
+func (fs *helperMailboxFS) readHandoffFile(ctx context.Context, name string, limit int64) ([]byte, bool, error) {
+	reference := fs.reference
+	reference.Scope = workloadrunner.RunMailboxScopeHandoffFiles
+	callContext, cancel := context.WithTimeout(ctx, fs.callTimeout())
+	defer cancel()
+	bounded := int(min(limit, int64(maxHandoffFileReadBytes)))
+	payload, truncated, err := fs.runtime.ReadRunMailbox(callContext, reference, name, bounded)
+	if err != nil {
+		return nil, false, err
+	}
+	// The helper cannot serve more than one frame, so a document at its bound
+	// is reported as truncated even when the helper did not say so. The caller
+	// treats that as oversize and uploads nothing, which is the correct answer
+	// for a document it cannot have whole.
+	if !truncated && len(payload) >= bounded {
+		truncated = true
+	}
+	return payload, truncated, nil
+}
+
+var _ handoffFileReader = (*helperMailboxFS)(nil)
 
 // close has nothing to release: the helper session is the adapter's and
 // outlives every attempt that borrows it.

@@ -455,3 +455,165 @@ func TestRunMailboxOperationsHonourTheirContext(t *testing.T) {
 		t.Fatalf("a cancelled removal still deleted the entry: %v", err)
 	}
 }
+
+// TestHandoffFileScopeIsConfinedTheSameWayTheEventScopeIs runs the confinement
+// suite against the second scope.
+//
+// The scope changes where the descent stops and nothing about how it descends,
+// so the shapes a hostile workload can plant are the same shapes, and each one
+// must fail closed here too. The handoff volume root is more interesting than
+// the event directory, not less: it is where a run writes result.json, and it
+// is the directory the container mounts read-write.
+func TestHandoffFileScopeIsConfinedTheSameWayTheEventScopeIs(t *testing.T) {
+	secret := filepath.Join(stableTempDir(t), "node-secret")
+	if err := os.WriteFile(secret, []byte("a credential the helper must never serve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handoffReference := func() RunMailboxReference {
+		reference := confinementReference()
+		reference.Scope = RunMailboxScopeHandoffFiles
+		return reference
+	}
+	volumeRoot := func(t *testing.T, runtimeRoot string) string {
+		t.Helper()
+		volume, err := DeterministicHandoffVolumeDirectory(mailboxTestOwnerKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(runtimeRoot, "handoffs", volume)
+	}
+
+	t.Run("the volume root is what the scope opens", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		if err := os.WriteFile(filepath.Join(volumeRoot(t, runtimeRoot), "result.json"), []byte(`{"ok":1}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		response, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+			RunMailboxReference: handoffReference(), Name: "result.json",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(response.Payload) != `{"ok":1}` || response.Truncated || response.Unusable {
+			t.Fatalf("handoff read = %#v", response)
+		}
+		// The same name in the event scope is a different file, and absent:
+		// the scope chooses the directory, so neither scope can reach into the
+		// other's.
+		eventScope, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+			RunMailboxReference: confinementReference(), Name: "result.json",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !eventScope.Absent || len(eventScope.Payload) != 0 {
+			t.Fatalf("the event scope served a file from the volume root: %#v", eventScope)
+		}
+	})
+
+	t.Run("a symlinked volume is refused", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		volume := volumeRoot(t, runtimeRoot)
+		elsewhere := stableTempDir(t)
+		if err := os.WriteFile(filepath.Join(elsewhere, "result.json"), []byte("planted"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(volume); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(elsewhere, volume); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+			RunMailboxReference: handoffReference(), Name: "result.json",
+		})
+		requireConfinementRefusal(t, err, "is not a directory")
+	})
+
+	t.Run("a symlinked result is refused rather than followed", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		if err := os.Symlink(secret, filepath.Join(volumeRoot(t, runtimeRoot), "result.json")); err != nil {
+			t.Fatal(err)
+		}
+		response, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+			RunMailboxReference: handoffReference(), Name: "result.json",
+		})
+		requireUnusableEntry(t, response, err, "is not a regular file")
+	})
+
+	t.Run("a FIFO is refused and never blocks", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		if err := unix.Mkfifo(filepath.Join(volumeRoot(t, runtimeRoot), "result.json"), 0o600); err != nil {
+			t.Skipf("this filesystem cannot create a FIFO: %v", err)
+		}
+		done := make(chan struct{})
+		var response ReadRunMailboxResponse
+		var readErr error
+		go func() {
+			response, readErr = readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+				RunMailboxReference: handoffReference(), Name: "result.json",
+			})
+			close(done)
+		}()
+		select {
+		case <-done:
+			requireUnusableEntry(t, response, readErr, "is not a regular file")
+		case <-t.Context().Done():
+			t.Fatal("reading a FIFO blocked the helper")
+		}
+	})
+
+	t.Run("a traversing name never becomes a path", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		for _, name := range []string{"..", "../../secret", "sub/result.json", "/etc/passwd", ".wefty"} {
+			_, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+				RunMailboxReference: handoffReference(), Name: name,
+			})
+			requireConfinementRefusal(t, err, "bounded mailbox name")
+		}
+	})
+
+	t.Run("an unknown scope is refused before anything is opened", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		reference := confinementReference()
+		reference.Scope = RunMailboxScope("../../etc")
+		if err := reference.validate(); err == nil {
+			t.Fatal("an unknown scope validated")
+		}
+		_, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+			RunMailboxReference: reference, Name: "result.json",
+		})
+		requireConfinementRefusal(t, err, "not a known scope")
+	})
+
+	t.Run("an oversize result is truncated at the handoff bound", func(t *testing.T) {
+		runtimeRoot, _ := newConfinementRoot(t)
+		oversize := strings.Repeat("x", MaxRunMailboxHandoffFileBytes+4096)
+		if err := os.WriteFile(filepath.Join(volumeRoot(t, runtimeRoot), "result.json"), []byte(oversize), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		response, err := readRunMailbox(t.Context(), runtimeRoot, ReadRunMailboxRequest{
+			RunMailboxReference: handoffReference(), Name: "result.json",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Payload) != MaxRunMailboxHandoffFileBytes || !response.Truncated {
+			t.Fatalf("read %d bytes truncated=%t, want the handoff cap and truncated",
+				len(response.Payload), response.Truncated)
+		}
+	})
+
+	t.Run("an absent volume is refused, not created", func(t *testing.T) {
+		empty := stableTempDir(t)
+		_, err := readRunMailbox(t.Context(), empty, ReadRunMailboxRequest{
+			RunMailboxReference: handoffReference(), Name: "result.json",
+		})
+		if err == nil {
+			t.Fatal("reading an absent volume succeeded")
+		}
+		if entries, _ := os.ReadDir(empty); len(entries) != 0 {
+			t.Fatalf("a refused read created %v", entries)
+		}
+	})
+}

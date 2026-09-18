@@ -459,12 +459,29 @@ heartbeats.
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the bridge and the helper issued that attempt's separate capability. It is mandatory for Computers because their private network namespace cannot address the agent's Node-loopback listener directly; ordinary OCI uses it only for the Mac bind-failure fallback. It never accepts an arbitrary host address or port. |
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
-| `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from that mailbox's `events/` directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
-| `ReadRunMailbox` | Same authority, plus one bounded entry name. Returns at most 64 KiB of one regular file, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. |
-| `RemoveRunMailboxEntry` | Same authority and name. Removes one regular file, symlink or empty directory and reports whether it removed one or found it already absent, so a replayed retirement is not a failure. It never recurses: a nonempty directory or an unclassifiable object stays where it is. |
+| `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from the scope's directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
+| `ReadRunMailbox` | Same authority, plus one bounded entry name. Returns at most 64 KiB of one regular file in the `events` scope and at most 640 KiB in the `handoff_files` scope, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. An entry that is not there at all comes back as `absent`, which is what an agent-opened directory reports for a missing name, so both implementations of the read answer alike. |
+| `RemoveRunMailboxEntry` | Same authority, scope and name. Removes one regular file, symlink or empty directory and reports whether it removed one or found it already absent, so a replayed retirement is not a failure. It never recurses: a nonempty directory or an unclassifiable object stays where it is. |
 | `Run` (run mailbox seed) | A `Run` may carry one run-mailbox seed: a bounded run ID and an optional JSON params document of at most 64 KiB, valid only alongside a handoff managed volume and never for a Computer. The helper creates `.wefty/<run id>/{tmp,events}` inside that volume, writes `params.json` by write-then-rename, and mints `WEFTY_RUN_DIR` from the seed as reserved environment. The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable but not writable (0711) — the volume root included, because containerd creates it 0700 and mounts it at `/wefty/handoff`, so without this a non-root image could not reach its mailbox at all; `tmp/` and `events/` are chowned to the image's process owner (0700); `params.json` is root-owned and world-readable (0644). Every mode and owner is applied through the descriptor just opened, never by name, and always explicitly, so a directory left by an earlier attempt is restored rather than trusted. No guest path is ever supplied by a caller. |
 
 ## Run mailbox confinement
+
+Each of the three methods carries a `Scope`, and the scope is an enum, never a
+path. It selects between two fixed descents into the same volume, under the same
+attempt authority and the same owner key:
+
+| Scope | Directory | What lives there |
+| --- | --- | --- |
+| `` (empty, the default) | `<volume>/.wefty/<run id>/events` | The run mailbox's events. Every caller written before scopes existed means this, and keeps meaning it. |
+| `handoff_files` | `<volume>` | The handoff volume's own root, where a run writes `result.json`. |
+
+`handoff_files` grants the agent nothing the workload does not already have: the
+container mounts that directory read-write, and the agent is reading a file the
+workload put there. The read bound differs because the content does — an event
+is a verdict and a result is a document — and the handoff bound stops at 640 KiB
+because one response must fit in a single 1 MiB frame once the payload is
+encoded into it. A result larger than that is reported as truncated and the
+agent uploads nothing rather than a partial document.
 
 The three run-mailbox methods are the only route by which bytes a workload wrote
 leave the managed root, and the helper runs as root over a directory that
@@ -477,10 +494,12 @@ ID; and an entry name. The run ID and the entry name must each be one bounded
 component of `[A-Za-z0-9._-]` that does not begin with a dot, so neither can name
 `.`, `..`, a nested path, or the agent's own bookkeeping. Only the managed root
 is opened by absolute path, and it is refused if any of its own components is a
-symlink. Every component below it — `handoffs`, the volume, `.wefty`, the run ID,
-`events` — is opened relative to the descriptor above it, refused if it is a
-symlink or not a directory, and proved with `SameFile` both before and after the
-open, so a component swapped mid-descent fails closed instead of being followed.
+symlink. Every component below it — `handoffs`, the volume, and for the events scope
+`.wefty`, the run ID and `events` — is opened relative to the descriptor above
+it, refused if it is a symlink or not a directory, and proved with `SameFile`
+both before and after the open, so a component swapped mid-descent fails closed
+instead of being followed. The scope changes where the descent stops and nothing
+about how it descends.
 
 A read proves the entry is a regular file before and after opening it, opens
 non-blocking so a FIFO planted in the directory cannot block the helper, and

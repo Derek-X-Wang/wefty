@@ -45,11 +45,10 @@ const (
 	// runBudget bounds one run. go test's own default timeout (10m) is the
 	// outer bound, and the CI job's timeout-minutes sits outside both.
 	runBudget = 5 * time.Minute
-	// logSettleBudget bounds the wait for the agent's final log upload after
-	// the run is already terminal: a failing gate makes L3 terminal before the
-	// shell exits, so the result.json line can still be in flight.
+	// logSettleBudget bounds the wait for the agent's final log upload and the
+	// result upload after the run is already terminal: a failing gate makes L3
+	// terminal before the shell exits, so both can still be in flight.
 	logSettleBudget = 60 * time.Second
-	resultPrefix    = `{"schema_version":1,"workflow":"branch-gates"`
 	// doneMarker is the workflow's last log line on every path, so the poll
 	// below can wait for a settled log instead of guessing.
 	doneMarker = "branch-gates: done"
@@ -184,8 +183,9 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			}, "branch-gates-exercise-"+testCase.ref)
 
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
-			// result.json is echoed into the run log on both paths, because
-			// that is the only result surface an OCI run has today.
+			// The verdict document is read from the ledger, which is where a
+			// person reads it: the node uploads it at completion and the log
+			// no longer carries a copy.
 			raw, logs := waitForResultJSON(t, caller, accepted.RunID, logSettleBudget)
 			if record.Status != testCase.wantRunState {
 				t.Fatalf("run status = %q, want %q; logs:\n%s", record.Status, testCase.wantRunState, logs)
@@ -751,10 +751,46 @@ func fetchRunLogs(client *http.Client, runID string, budget time.Duration) (stri
 	return output.String(), nil
 }
 
-// waitForResultJSON polls the run log until the workflow's final "done:" line
-// has arrived and result.json is present. A failing gate makes the run terminal
-// in L3 before the shell exits, so both the result line and the failure output
-// can still be in flight when the run already reads as failed. Each request is
+// fetchRunResult reads the run's uploaded result document under an explicit
+// deadline. A run that has not uploaded one yet answers 404, which is an
+// ordinary "not yet" here rather than a failure.
+func fetchRunResult(client *http.Client, runID string, budget time.Duration) ([]byte, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://run-ledger.invalid/v1/runs/"+runID+"/result", nil)
+	if err != nil {
+		return nil, false, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return nil, false, fmt.Errorf("get run result = %d body=%s", response.StatusCode, body)
+	}
+	var result l3.RunResult
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return nil, false, err
+	}
+	if result.SkipReason != "" {
+		return nil, false, fmt.Errorf("run %s uploaded no document: %s", runID, result.SkipReason)
+	}
+	return result.Document, true, nil
+}
+
+// waitForResultJSON waits for the workflow's final "done:" line and then for
+// the result document to arrive in the ledger.
+//
+// The document is no longer echoed into the run log, so this reads it where a
+// person now reads it -- `wefty results`, over the same L3 route. The two waits
+// are separate on purpose: the log settles when the shell exits, and the upload
+// happens after that, when the node completes the attempt. Each request is
 // bounded so one stalled read cannot consume the whole settle budget.
 func waitForResultJSON(t *testing.T, client *http.Client, runID string, timeout time.Duration) ([]byte, string) {
 	t.Helper()
@@ -768,26 +804,31 @@ func waitForResultJSON(t *testing.T, client *http.Client, runID string, timeout 
 		if remaining > perRequestBudget {
 			remaining = perRequestBudget
 		}
-		fetched, err := fetchRunLogs(client, runID, remaining)
+		if fetched, err := fetchRunLogs(client, runID, remaining); err == nil {
+			logs = fetched
+		}
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if remaining > perRequestBudget {
+			remaining = perRequestBudget
+		}
+		document, found, err := fetchRunResult(client, runID, remaining)
 		if err != nil {
 			if !time.Now().Before(deadline) {
-				t.Fatalf("read run logs within %s: %v", timeout, err)
+				t.Fatalf("read run result within %s: %v; logs:\n%s", timeout, err, logs)
 			}
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		logs = fetched
-		if strings.Contains(logs, doneMarker) {
-			for _, line := range strings.Split(logs, "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, resultPrefix) {
-					return []byte(line), logs
-				}
-			}
+		if found && strings.Contains(logs, doneMarker) {
+			return document, logs
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("run log does not carry %q and result.json within %s:\n%s", doneMarker, timeout, logs)
+	t.Fatalf("run log does not carry %q and the ledger has no result document within %s:\n%s",
+		doneMarker, timeout, logs)
 	return nil, logs
 }
 

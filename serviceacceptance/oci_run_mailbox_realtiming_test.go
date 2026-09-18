@@ -59,6 +59,12 @@ wefty_event step gates gates started '' 'running the gates'
 wefty_event gate vet gates '' pass 'vet is clean' /tmp/vet-evidence
 wefty_event step gates gates ended '' 'gates finished'
 wefty_event result result result succeeded '' "branch $branch is green" /tmp/result-evidence
+# The run's result document goes into the handoff volume, which this container
+# mounts read-write and the agent can only reach through the helper. Proving it
+# arrives in the ledger is proving the handoff_files read path.
+[ -n "${WEFTY_HANDOFF_DIR:-}" ] || wefty_refuse "the attempt received no WEFTY_HANDOFF_DIR" 70
+printf '{"branch":"%s","passed":true}' "$branch" > "$WEFTY_HANDOFF_DIR/result.json" ||
+	wefty_refuse "could not write the result document" 71
 exit 0
 `
 }
@@ -102,6 +108,22 @@ func TestOCIRunMailboxEventsReachTheRunLedgerThroughTheHelper(t *testing.T) {
 		t.Fatalf("published %d gates, want exactly one:\n%s", len(gates), joinBodies(gates))
 	}
 
+	// The result document the workload wrote into its helper-owned handoff
+	// volume reached the ledger. Nothing else in this system can read that
+	// directory: the agent got it through the helper's handoff_files scope,
+	// while the attempt was still live, and pushed it to L1.
+	document := waitForOCIMailboxResult(t, harness, runID)
+	var uploaded struct {
+		Branch string `json:"branch"`
+		Passed bool   `json:"passed"`
+	}
+	if err := json.Unmarshal(document, &uploaded); err != nil {
+		t.Fatalf("uploaded result is not the document the workload wrote: %v (%s)", err, document)
+	}
+	if uploaded.Branch != "acceptance-branch" || !uploaded.Passed {
+		t.Fatalf("uploaded result = %s", document)
+	}
+
 	// Every document the agent built for this run is the agent's, not the
 	// workload's: L3 binds the attempt from the authenticated run token, and
 	// the workload never held one.
@@ -114,6 +136,36 @@ func TestOCIRunMailboxEventsReachTheRunLedgerThroughTheHelper(t *testing.T) {
 			t.Fatalf("envelope run = %q, want %q", envelope.RunID, runID)
 		}
 	}
+}
+
+// waitForOCIMailboxResult polls the run's result route until the node's upload
+// has landed. The run reads terminal when its attempt completes and the upload
+// happens as part of that completion, so the two are close but not ordered.
+func waitForOCIMailboxResult(t *testing.T, harness *acceptanceHarness, runID string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastStatus int
+	var lastBody []byte
+	for time.Now().Before(deadline) {
+		var result l3.RunResult
+		status, body := runLedgerJSON(t, harness, http.MethodGet, "/v1/runs/"+runID+"/result", "", nil, &result)
+		lastStatus, lastBody = status, body
+		if status == http.StatusOK {
+			if result.SkipReason != "" {
+				t.Fatalf("the node uploaded no result document: %s", result.SkipReason)
+			}
+			if len(result.Document) == 0 {
+				t.Fatalf("the ledger holds an empty result document: %s", body)
+			}
+			return result.Document
+		}
+		if status != http.StatusNotFound {
+			t.Fatalf("read run result status = %d body=%s", status, body)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("run %s never uploaded a result (last status %d body=%s)", runID, lastStatus, lastBody)
+	return nil
 }
 
 // ociAgentArguments enables kind=oci on the acceptance agent and makes the
