@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -269,6 +270,88 @@ func TestContainerdSealsLogsWhenExitedTaskIsBrieflyStillReportedRunning(t *testi
 	}
 	if got := releases.Load(); got < 2 {
 		t.Fatalf("release attempts = %d, want the refusal to be retried", got)
+	}
+}
+
+// TestContainerdSealsLogsWhenTerminatedLoggerReachedPipeEOF is the engine-level
+// regression for issue #434. containerd tears its binary-v2 logger down while
+// deleting the exited task: binaryIO.Close closes both pipe write ends and only
+// then sends SIGTERM. Closure precedes delivery, yet the logger can still
+// record termination before its copy goroutine observes the EOF that closure
+// produced, so a stream routinely seals with termination already requested.
+// That is a lifecycle fact about the logger process, not a gap in the stream,
+// and a clean one-shot run must not report log_evidence_incomplete because of
+// it.
+func TestContainerdSealsLogsWhenTerminatedLoggerReachedPipeEOF(t *testing.T) {
+	root := t.TempDir()
+	paths := emptyLogSegments(t, root)
+	authority := testAuthority()
+	attempt := &containerdAttempt{
+		authority:       authority,
+		stdout:          paths["stdout"],
+		stderr:          paths["stderr"],
+		terminalReady:   make(chan struct{}),
+		logAcknowledged: make(map[string]uint64),
+		releaseTask: func(context.Context) error {
+			terminatedLoggerSegments(t, paths)
+			return nil
+		},
+	}
+	engine := &ContainerdEngine{
+		config:   NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 2 * time.Second},
+		attempts: map[string]*containerdAttempt{authority.key(): attempt},
+	}
+	wait := make(chan containerd.ExitStatus, 1)
+	wait <- *containerd.NewExitStatus(0, time.Now(), nil)
+	close(wait)
+	go attempt.cacheTerminal(wait, root, 2*time.Second)
+
+	result, seals := watchTerminalEvidence(t, engine, authority)
+	if result == nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("terminal result = %+v, want exit 0", result)
+	}
+	if result.LogEvidenceIncomplete {
+		t.Fatalf("clean exit 0 behind a terminated logger reported incomplete log evidence: seals=%+v", seals)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		if !seals[stream].Complete || seals[stream].ReleaseReason != "" {
+			t.Fatalf("%s seal = %+v, want complete with no release reason", stream, seals[stream])
+		}
+	}
+}
+
+// terminatedLoggerSegments writes each stream through the real binary-v2 logger
+// copy with termination already requested and the pipe write end closed, which
+// is the containerd task-delete shape. It runs on the cacheTerminal goroutine,
+// so every failure is reported with t.Errorf rather than ending that goroutine.
+func terminatedLoggerSegments(t *testing.T, paths map[string]string) {
+	t.Helper()
+	var terminated atomic.Bool
+	terminated.Store(true)
+	for stream, path := range paths {
+		source, writer, err := os.Pipe()
+		if err != nil {
+			t.Errorf("open %s logger pipe: %v", stream, err)
+			return
+		}
+		if _, err := writer.Write([]byte(stream + " complete")); err != nil {
+			t.Errorf("write %s logger pipe: %v", stream, err)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			t.Errorf("close %s logger pipe: %v", stream, err)
+			return
+		}
+		target, err := openLogSegment(path)
+		if err != nil {
+			t.Errorf("open %s segment: %v", stream, err)
+			return
+		}
+		copyErr := copyLoggerStream(source, target, &terminated)
+		if err := errors.Join(copyErr, source.Close(), target.Close()); err != nil {
+			t.Errorf("copy %s logger stream: %v", stream, err)
+			return
+		}
 	}
 }
 

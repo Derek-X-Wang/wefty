@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -137,6 +138,82 @@ func waitForLoggerIncompleteSegments(t *testing.T, segments map[string]string, t
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("logger incomplete seals within %s = %v, want both streams", timeout, confirmed)
+}
+
+// TestLoggerSealsPipeEOFReachedAfterTerminationWasRequested is the logger-level
+// regression for issue #434. containerd tears its binary-v2 logger down while
+// deleting the exited task: binaryIO.Close closes both pipe write ends and only
+// then sends SIGTERM. Closure precedes delivery, but the logger's own two
+// observations are racing -- nothing orders the signal goroutine recording
+// termination after the copy goroutine observes the EOF that closure produced.
+// Pipe EOF is the completeness proof itself, so scoring the stream on which of
+// those two landed first made a clean one-shot run report
+// log_evidence_incomplete on nothing but a scheduling race.
+func TestLoggerSealsPipeEOFReachedAfterTerminationWasRequested(t *testing.T) {
+	source, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if _, err := writer.Write([]byte("wefty-echo-once-stdout\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var terminated atomic.Bool
+	terminated.Store(true)
+	var segment bytes.Buffer
+	if err := copyLoggerStream(source, &segment, &terminated); err != nil {
+		t.Fatal(err)
+	}
+	kind, sequence, payload, err := readLogRecord(&segment)
+	if err != nil || kind != logRecordData || sequence != 0 || string(payload) != "wefty-echo-once-stdout\n" {
+		t.Fatalf("data record kind=%v sequence=%d payload=%q err=%v", kind, sequence, payload, err)
+	}
+	kind, sequence, payload, err = readLogRecord(&segment)
+	if err != nil || kind != logRecordSeal || sequence != 1 || len(payload) != 0 {
+		t.Fatalf("terminal record kind=%v sequence=%d payload=%q err=%v, want a pipe-EOF seal", kind, sequence, payload, err)
+	}
+	if _, _, _, err := readLogRecord(&segment); err != io.EOF {
+		t.Fatalf("record tail error = %v, want EOF", err)
+	}
+}
+
+// TestLoggerRecordsLostBytesWhenTerminationDrainEndsBeforePipeEOF keeps the
+// other half honest: a drain that ends while the pipe still holds unread bytes
+// really did lose output, and it still says so with its discarded byte extent.
+func TestLoggerRecordsLostBytesWhenTerminationDrainEndsBeforePipeEOF(t *testing.T) {
+	source, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	// The write end stays open, so this stream never reaches pipe EOF.
+	defer writer.Close()
+	if _, err := writer.Write([]byte("lost")); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var terminated atomic.Bool
+	terminated.Store(true)
+	var segment bytes.Buffer
+	if err := copyLoggerStream(source, &segment, &terminated); err != nil {
+		t.Fatal(err)
+	}
+	kind, sequence, payload, err := readLogRecord(&segment)
+	if err != nil || kind != logRecordIncomplete || sequence != 0 {
+		t.Fatalf("terminal record kind=%v sequence=%d payload=%q err=%v, want an incomplete seal", kind, sequence, payload, err)
+	}
+	var evidence loggerIncompleteEvidence
+	if err := json.Unmarshal(payload, &evidence); err != nil {
+		t.Fatalf("incomplete evidence = %q: %v", payload, err)
+	}
+	if evidence.Reason != "logger termination drain ended before pipe EOF" || evidence.LostByteCount != 4 {
+		t.Fatalf("incomplete evidence = %+v, want the drain reason and the four unread bytes", evidence)
+	}
 }
 
 func TestLoggerRecordsIncompleteSourceWithoutLosingWrittenBytes(t *testing.T) {

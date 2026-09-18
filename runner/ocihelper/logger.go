@@ -172,7 +172,7 @@ func copyLoggerStream(source *os.File, target io.Writer, terminated *atomic.Bool
 			return []byte(reason)
 		}
 		return payload
-	}, terminated)
+	})
 }
 
 func unreadLoggerBytes(file *os.File) uint64 {
@@ -198,10 +198,10 @@ func openLogSegment(path string) (*os.File, error) {
 }
 
 func copyLogFrames(source io.Reader, target io.Writer) error {
-	return copyLogFramesWithEvidence(source, target, func(readErr error) []byte { return []byte(readErr.Error()) }, nil)
+	return copyLogFramesWithEvidence(source, target, func(readErr error) []byte { return []byte(readErr.Error()) })
 }
 
-func copyLogFramesWithEvidence(source io.Reader, target io.Writer, incomplete func(error) []byte, terminated *atomic.Bool) error {
+func copyLogFramesWithEvidence(source io.Reader, target io.Writer, incomplete func(error) []byte) error {
 	reader := bufio.NewReaderSize(source, 32<<10)
 	buffer := make([]byte, 32<<10)
 	sequence := uint64(0)
@@ -214,14 +214,13 @@ func copyLogFramesWithEvidence(source io.Reader, target io.Writer, incomplete fu
 			sequence++
 		}
 		if readErr != nil {
+			// Pipe EOF is the completeness proof itself: every writer is gone
+			// and the pipe is drained, so every byte the workload produced has
+			// already been framed. Whether the logger was asked to terminate
+			// first is a lifecycle fact about this process, not a gap in the
+			// stream, and it must never downgrade a sealed stream to incomplete
+			// evidence. Only a drain that ends *before* EOF loses bytes.
 			if errors.Is(readErr, io.EOF) {
-				if terminated != nil && terminated.Load() {
-					payload, err := json.Marshal(loggerIncompleteEvidence{Reason: "logger terminated after draining pipe EOF"})
-					if err != nil {
-						payload = []byte("logger terminated after draining pipe EOF")
-					}
-					return writeLogRecord(target, logIncompleteMagic, sequence, payload)
-				}
 				return writeLogRecord(target, logSealMagic, sequence, nil)
 			}
 			if err := writeLogRecord(target, logIncompleteMagic, sequence, incomplete(readErr)); err != nil {
