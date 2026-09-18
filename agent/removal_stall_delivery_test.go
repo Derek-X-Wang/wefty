@@ -19,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 // TestRefusedOCIRemovalDeclaresAStallAndSurvivesALostResponse is the wedge end
@@ -597,5 +598,82 @@ func TestRestartAfterFinalizedStalledComputerCleanupClearsSurvivingLocalRecord(t
 	}
 	if pins.reconciles != 1 || len(pins.pinned) != 0 {
 		t.Fatalf("pin reconciliation after finalized stalled Computer replay = %+v", pins)
+	}
+}
+
+// backupCopyRefusal is a helper-side refusal of Backup-copy deletion. It is
+// deliberately a different code from wedgeRefusal so the declared evidence
+// names which cleanup the removal actually died on.
+func backupCopyRefusal() error {
+	return &ocihelper.RPCError{Code: ocihelper.CodeEngineFailure, Message: "Backup copy deletion refused by the engine"}
+}
+
+// TestWedgedBackupCopyDeletionDeclaresTheSameStall closes the hole #465 named.
+// Backup-copy deletion ran in front of all removal accounting and returned its
+// refusal straight to the caller, so a Computer whose copies could not be
+// deleted built no refusal streak, never reached noteRemovalFailure, and pinned
+// its Slot forever -- the #450 shape in the one path stalled_cleanup_unverified
+// could not reach. Backup-copy deletion is cleanup like any other: refused
+// identically past the same bound, it declares the same outcome and gives the
+// Slot back, with the copies still there and nothing claiming otherwise.
+func TestWedgedBackupCopyDeletionDeclaresTheSameStall(t *testing.T) {
+	fixture := newStalledComputerRemovalFixture(t)
+	defer fixture.close()
+	// L1 populates these claims from its own Backup rows; the seam under test
+	// is what the agent does when deleting them keeps being refused.
+	fixture.directive.ComputerBackupCopies = &l1.ComputerBackupCopyClaims{
+		Copies: []l1.ComputerBackupPruneDirective{{
+			BackupID: "backup-1", CopyID: "copy-1", ComputerID: "computer-1", StorageID: "storage-1",
+			StorageGeneration: 1, AllocatedSize: 1 << 30, BoundNodeID: "stall-node",
+			RootInstanceID: fixture.directive.RootInstanceID, OperationRevision: 1,
+			CleanupFence: fixture.directive.CleanupFence,
+		}},
+	}
+	deletionAttempts := 0
+	fixture.controller.removeBackupCopies = func(_ context.Context, copies []l1.ComputerBackupPruneDirective) error {
+		deletionAttempts++
+		if len(copies) != 1 || copies[0].CopyID != "copy-1" {
+			t.Fatalf("Backup copy deletion asked for %#v", copies)
+		}
+		return backupCopyRefusal()
+	}
+	// Nothing past the refused Backup copies may run: the copies are retained,
+	// so the runtime the removal would delete next must not be touched either.
+	fixture.controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		t.Error("runtime reap ran while Backup-copy deletion was still refused")
+		return workloadrunner.ReapReceipt{}, wedgeRefusal()
+	}
+	fixture.declareStall(t)
+
+	if deletionAttempts < l1.MinimumServiceRemovalStallAttempts {
+		t.Fatalf("Backup copy deletion attempted %d times; the streak never formed", deletionAttempts)
+	}
+	if fixture.accepted.Load() < 2 {
+		t.Fatalf("L1 accepted %d declarations; the lost response was never retried", fixture.accepted.Load())
+	}
+	observed, err := fixture.store.GetJob(fixture.ctx, fixture.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.State != contract.JobStalledCleanupUnverified || observed.Removal == nil ||
+		observed.Removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupStalled {
+		t.Fatalf("wedged Backup-copy removal projection = %#v", observed)
+	}
+	if observed.Removal.Stall == nil ||
+		observed.Removal.Stall.LastRefusalCode != string(ocihelper.CodeEngineFailure) ||
+		observed.Removal.Stall.Attempts < l1.MinimumServiceRemovalStallAttempts {
+		t.Fatalf("declared evidence does not name the Backup-copy refusal: %#v", observed.Removal.Stall)
+	}
+	// Cleanup is still outstanding: the declaration asserts no deletion, of
+	// the Backup copies or of anything else.
+	if observed.Removal.CleanupStatus != l1.ServiceRemovalCleanupPending {
+		t.Fatalf("declared stall claimed cleanup status %q", observed.Removal.CleanupStatus)
+	}
+	nodes, err := fixture.store.ListNodes(fixture.ctx)
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("nodes = %#v, %v", nodes, err)
+	}
+	if nodes[0].ServiceOccupancy != 0 {
+		t.Fatalf("service occupancy after a wedged Backup-copy removal = %d, want 0", nodes[0].ServiceOccupancy)
 	}
 }

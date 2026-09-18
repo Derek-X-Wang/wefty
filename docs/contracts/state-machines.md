@@ -64,7 +64,7 @@ resumable.
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
 | `removed_verified` | Remaining attempt/service rows were deleted and the verified tombstone was committed. Terminal. | none |
 | `forgotten_cleanup_unverified` | The operator waived proof. The deletion directive remains until a returning node cleans it, and the tombstone warning is permanent. Terminal operator outcome. | none |
-| `stalled_cleanup_unverified` | The bound agent declared, after the removal retried past the ten-minute bound against the same refusal, that cleanup cannot complete. The service slot is released and nothing claims runtime cleanup succeeded. The deletion directive remains for a returning node and the unverified outcome is permanent. Terminal agent outcome. | none |
+| `stalled_cleanup_unverified` | The bound agent declared, after the removal retried past the ten-minute bound against the same refusal, that cleanup cannot complete. The service slot is released and nothing claims any part of cleanup succeeded -- neither runtime deletion nor, for a Computer, deletion of the Backup copies the directive names. The deletion directive remains for a returning node and the unverified outcome is permanent. Terminal agent outcome. | none |
 
 Legal desired/observed pairings are: desired `running` with `queued`,
 `claimed`, `running`, or `failed`; and desired `stopped` with `stopping`,
@@ -93,6 +93,11 @@ The declaration is scoped to runtime removals -- `kind=oci` services and
 Computers -- because only a runtime cleanup can be refused with the typed code
 the evidence is built from; a process service has no such record and its
 removal can never be declared stalled.
+Deleting a Computer's Backup copies is part of the same cleanup and counts
+into the same streak: a refusal there is a typed helper refusal like any
+other, so it extends the same consecutive count, is weighed against the same
+bound, and declares the same outcome. There is one bound and one outcome for
+a removal, never a second accounting for one of its steps.
 The bound agent freezes the exact declaration durably before it first sends it
 and replays those bytes until L1 accepts them, under an idempotency key that
 does not vary with the boot session, so a lost response cannot turn an accepted
@@ -101,7 +106,8 @@ A later positive cleanup acknowledgement records the acknowledgement and, for
 a Computer, still earns the separate Storage-custody outcome, but it never
 upgrades the removal's own unverified terminal outcome. A stalled removal also
 retains its node-local binding image pin, which the standing directive still
-needs, until that positive cleanup releases it. The node doctor's
+needs, and any Backup copies it never deleted, which the standing directive
+still names, until that positive cleanup releases them. The node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is
 released.
 Retries after declaration, except a complete record's one returning-boot
@@ -341,7 +347,10 @@ tracked Backup copy, including a planned copy whose create was superseded
 after helper reservation but before L1 publication. The standing removal
 directive carries those copies and their exact source Storage generation,
 Node, root instance, copy, operation revision, and cleanup fence; no service
-cleanup acknowledgement is accepted while a copy lacks positive absence. For
+cleanup acknowledgement is accepted while a copy lacks positive absence. An
+agent's stall declaration is the one thing that is not such an
+acknowledgement: it asserts no absence at all, so it is admitted with copies
+still retained and releases the Slot on the unverified outcome instead. For
 a superseded create, the helper writes and syncs an operation-keyed
 supersession tombstone under the Backup mutex before it proves absence. A late
 create must observe that tombstone and refuse to publish bytes.

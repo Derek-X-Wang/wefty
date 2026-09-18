@@ -875,3 +875,102 @@ func TestStallAcknowledgementSessionReplacementReachesEnqueueFence(t *testing.T)
 		t.Fatal("stall acknowledgement session replacement never reached the enqueue fence")
 	}
 }
+
+// TestTransientBackupCopyRefusalRetriesInsteadOfStalling is the other half of
+// sharing one streak: a Backup-copy deletion that fails once and then succeeds
+// is a removal still working through a cause, not a wedge. The bound is
+// already elapsed here, so only the streak length separates the two -- exactly
+// as it does for a refused runtime reap.
+func TestTransientBackupCopyRefusalRetriesInsteadOfStalling(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "transient-backup-node", 1024)
+	defer spool.Close()
+	removal := testRuntimeRemoval("transient-backup-job")
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	manifest := testRuntimeResourceManifest(removal.jobID, "attempt")
+	if err := spool.storeRuntimeResourceManifest(t.Context(), manifest, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, prepared); err != nil {
+		t.Fatal(err)
+	}
+
+	now := prepared.Add(l1.DefaultRemovalStallBound + time.Minute)
+	deletions := 0
+	acknowledged := 0
+	controller := &removalController{nodeID: "transient-backup-node", bootSessionID: "boot",
+		stallBound: l1.DefaultRemovalStallBound, now: func() time.Time { return now }, logf: t.Logf}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.loadRuntimeRemoval = spool.runtimeRemoval
+	controller.removalStartedAt = spool.removalStartedAt
+	controller.recordRemovalFailure = func(ctx context.Context, target localRemoval, code, detail string) error {
+		return spool.recordRuntimeRemovalFailure(ctx, target, code, detail, controller.bootSessionID, now)
+	}
+	controller.recordUntypedFailure = func(ctx context.Context, target localRemoval) error {
+		return spool.recordRuntimeRemovalUntypedFailure(ctx, target, controller.bootSessionID, now)
+	}
+	controller.freezeStall = spool.freezeRuntimeRemovalStallDeclaration
+	controller.recordStallDeclared = func(ctx context.Context, target localRemoval) error {
+		return spool.recordRuntimeRemovalStallDeclared(ctx, target, now)
+	}
+	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
+		t.Fatal("one transient Backup-copy refusal declared the removal stalled")
+		return nil
+	}
+	controller.removeBackupCopies = func(context.Context, []l1.ComputerBackupPruneDirective) error {
+		deletions++
+		if deletions == 1 {
+			return &ocihelper.RPCError{Code: ocihelper.CodeEngineFailure, Message: "Backup copy busy"}
+		}
+		return nil
+	}
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			BootSessionID: controller.bootSessionID}, nil
+	}
+	controller.recordRuntimeQuiesced = func(ctx context.Context, target localRemoval, receipt workloadrunner.ReapReceipt) error {
+		return spool.recordRuntimeQuiesced(ctx, target, receipt, now)
+	}
+	controller.recordRuntimeAttested = func(ctx context.Context, target localRemoval, attestation workloadrunner.RuntimeRemovalAttestation) error {
+		return spool.recordRuntimeAttested(ctx, target, attestation, now)
+	}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, Attempts: request.Attempts}), nil
+	}
+	controller.ackRemoval = func(context.Context, localRemoval) error { acknowledged++; return nil }
+	controller.finishRemoval = func(ctx context.Context, target localRemoval) error {
+		return spool.completeRemoval(ctx, target)
+	}
+	directive := l1.RemovalDirective{JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: removal.kind,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
+		ComputerBackupCopies: &l1.ComputerBackupCopyClaims{Copies: []l1.ComputerBackupPruneDirective{{
+			BackupID: "backup", CopyID: "copy", ComputerID: "computer", StorageID: "storage",
+			StorageGeneration: 1, BoundNodeID: controller.nodeID, RootInstanceID: removal.rootInstanceID,
+			OperationRevision: 1, CleanupFence: removal.cleanupFence,
+		}}},
+	}
+
+	if err := controller.reconcile(t.Context(), directive); err == nil {
+		t.Fatal("the refused Backup-copy deletion was reported as a success")
+	}
+	// The refusal was counted, not swallowed: that is what would have let a
+	// repeat of it end the removal.
+	refused, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found || refused.failedAttempts != 1 ||
+		refused.lastRefusalCode != string(ocihelper.CodeEngineFailure) {
+		t.Fatalf("durable record after one Backup-copy refusal = %+v found=%t err=%v", refused, found, err)
+	}
+	now = now.Add(15 * time.Second)
+	if err := controller.reconcile(t.Context(), directive); err != nil {
+		t.Fatalf("the retried Backup-copy deletion did not finish the removal: %v", err)
+	}
+	if deletions != 2 || acknowledged != 1 {
+		t.Fatalf("Backup-copy deletions = %d, acknowledgements = %d, want 2 and 1", deletions, acknowledged)
+	}
+	if _, found, err := spool.runtimeRemoval(t.Context(), removal.jobID); err != nil || found {
+		t.Fatalf("completed removal kept its durable record: found=%t err=%v", found, err)
+	}
+}

@@ -849,7 +849,7 @@ func TestMixedRuntimeAndComputerStorageRemovalCannotBypassControllerReap(t *test
 		}}
 	removal := localRemoval{jobID: jobID, kind: contract.JobKindOCI, generation: 1, cleanupFence: "cleanup"}
 	done := make(chan error, 1)
-	go func() { done <- controller.continueRuntimeRemoval(t.Context(), removal, &record, nil) }()
+	go func() { done <- controller.continueRuntimeRemoval(t.Context(), removal, &record, nil, nil) }()
 	select {
 	case err := <-done:
 		t.Fatalf("mixed manifest bypassed admission barrier: %v", err)

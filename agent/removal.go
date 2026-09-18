@@ -229,18 +229,14 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if directive.ComputerStorage != nil && removal.kind != contract.JobKindOCI {
 		return fmt.Errorf("agent: Computer removal for service %q requires OCI workload kind", directive.JobID)
 	}
+	backupCopies := backupCopyDirectives(directive.ComputerBackupCopies)
+	if len(backupCopies) != 0 && removal.kind != contract.JobKindOCI {
+		return fmt.Errorf("agent: Computer Backup copy removal for service %q requires OCI workload kind", directive.JobID)
+	}
 	// This FULL-synchronous SQLite write must precede any signal sent to the
 	// guardian. A crash after it leaves an unambiguous local removing record.
 	if err := controller.beginRemoval(ctx, removal); err != nil {
 		return err
-	}
-	if directive.ComputerBackupCopies != nil && len(directive.ComputerBackupCopies.Copies) != 0 {
-		if controller.removeBackupCopies == nil {
-			return errors.New("Computer removal requires Backup copy removal support")
-		}
-		if err := controller.removeBackupCopies(ctx, directive.ComputerBackupCopies.Copies); err != nil {
-			return fmt.Errorf("delete Computer Backup copies: %w", err)
-		}
 	}
 	if controller.loadRuntimeRemoval != nil {
 		directiveStorages := computerStoragesFromDirective(directive.ComputerStorage, directive.ComputerStorageGenerations)
@@ -270,7 +266,7 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 			if err != nil {
 				return err
 			}
-			return controller.continueRuntimeRemoval(ctx, removal, &runtimeRemoval, computerStorages)
+			return controller.continueRuntimeRemoval(ctx, removal, &runtimeRemoval, computerStorages, backupCopies)
 		}
 	}
 	if removal.kind == contract.JobKindOCI {
@@ -463,7 +459,7 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 	return record, nil
 }
 
-func (controller *removalController) continueRuntimeRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
+func (controller *removalController) continueRuntimeRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage, backupCopies []l1.ComputerBackupPruneDirective) error {
 	if len(runtimeRemoval.manifest.Attempts) != 0 && removal.kind != contract.JobKindOCI {
 		return errors.New("agent: frozen runtime removal manifest requires OCI workload kind")
 	}
@@ -473,7 +469,7 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	if controller.declaredRemovalRetryDeferred(*runtimeRemoval) {
 		return nil
 	}
-	err := controller.continueRuntimeRemovalAttempt(ctx, removal, runtimeRemoval, computerStorages)
+	err := controller.continueRuntimeRemovalAttempt(ctx, removal, runtimeRemoval, computerStorages, backupCopies)
 	if err == nil {
 		if runtimeRemoval.stallDeclaredAt != nil {
 			controller.log("agent: service %q cleanup succeeded after its declared stall", removal.jobID)
@@ -504,7 +500,23 @@ func (controller *removalController) handleRemovalFailure(ctx context.Context, r
 	return cause
 }
 
-func (controller *removalController) continueRuntimeRemovalAttempt(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
+func (controller *removalController) continueRuntimeRemovalAttempt(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage, backupCopies []l1.ComputerBackupPruneDirective) error {
+	// Backup-copy deletion is part of this removal's cleanup, not a step in
+	// front of it. It used to run before any runtime-removal accounting and
+	// return its refusal straight to the caller, so a Computer whose copies
+	// could not be deleted built no refusal streak, never reached
+	// noteRemovalFailure, and pinned its Slot forever -- the #450 shape in a
+	// path the stalled outcome could not reach (#465). Refused here, it
+	// counts into the same streak, under the same bound, toward the same
+	// stalled_cleanup_unverified outcome.
+	if len(backupCopies) != 0 {
+		if controller.removeBackupCopies == nil {
+			return errors.New("Computer removal requires Backup copy removal support")
+		}
+		if err := controller.removeBackupCopies(ctx, backupCopies); err != nil {
+			return fmt.Errorf("delete Computer Backup copies: %w", err)
+		}
+	}
 	switch runtimeRemoval.phase {
 	case runtimeRemovalComplete:
 		// The post-delete receipt is already durable; continue to pin release
@@ -630,7 +642,9 @@ func (controller *removalController) resume(ctx context.Context) error {
 				// resume it without guessing from historical attempts.
 				continue
 			}
-			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, computerStorages); err != nil {
+			// Resume has no standing directive, so it carries no Backup-copy
+			// claims; the heartbeat path is what deletes them.
+			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, computerStorages, nil); err != nil {
 				return err
 			}
 		}
@@ -677,7 +691,7 @@ func (controller *removalController) resume(ctx context.Context) error {
 				// Do not guess a destructive subset during local-only resumption.
 				continue
 			}
-			if err := controller.continueRuntimeRemoval(ctx, removal, &record, computerStorages); err != nil {
+			if err := controller.continueRuntimeRemoval(ctx, removal, &record, computerStorages, nil); err != nil {
 				return err
 			}
 			continue
@@ -798,6 +812,13 @@ func computerStorageInventoryComplete(attempts []workloadrunner.RuntimeResourceM
 		}
 	}
 	return true
+}
+
+func backupCopyDirectives(claims *l1.ComputerBackupCopyClaims) []l1.ComputerBackupPruneDirective {
+	if claims == nil {
+		return nil
+	}
+	return claims.Copies
 }
 
 func storageGenerationClaims(claims *l1.ComputerStorageGenerationClaims) []l1.ComputerStorageGenerationClaim {
