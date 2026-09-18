@@ -361,16 +361,18 @@ func (session *Session) heartbeatPumpStopped() error {
 
 // suppressionAcknowledgement is what the pump hands back to a blackhole
 // command it is about to acknowledge. A command that wins the pump's select
-// against a concurrent Close proves nothing: Close records closed and cancels
-// pumpCtx strictly before that cancellation can ever be observed here, so a
-// canceled pumpCtx at this exact point means Close has already begun tearing
-// the session down. Acknowledging such a command with nil would tell the
-// caller suppression took effect on a session that is, at that same
-// linearization point, already gone; report the same cancellation/health
-// error HealthError would once the pump has actually stopped instead.
+// against a concurrent Close proves nothing, so this must agree with
+// HealthError about whether the session is still usable -- and Close
+// publishes closed under queueMu strictly before it cancels pumpCtx, so
+// checking pumpCtx here would miss the window in which closed is already true
+// but the cancellation has not happened yet. Acknowledging in that window
+// with nil would tell the caller suppression took effect on a session that
+// is, at that same linearization point, already gone; checking the same
+// closed/pumpErr state under the same lock HealthError uses closes that
+// window entirely, regardless of whether pumpCtx has been canceled yet.
 func (session *Session) suppressionAcknowledgement() error {
-	if session.pumpCtx.Err() != nil {
-		return session.heartbeatPumpStopped()
+	if err := session.HealthError(); err != nil {
+		return fmt.Errorf("suppress OCI helper heartbeats: %w", err)
 	}
 	return nil
 }

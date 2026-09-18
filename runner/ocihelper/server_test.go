@@ -2776,75 +2776,84 @@ func newHeartbeatPumpTestSession(control net.Conn) *Session {
 	}
 }
 
-// A suppression command that reaches the pump's select at the same instant as
-// a concurrent Close must never be acknowledged with nil: Close has already
-// recorded closed and canceled pumpCtx by the time either select case can
-// fire, so nil would tell the caller suppression took effect on a session
-// that, at that same linearization point, is already gone (#470 item 1).
-func TestSuppressionRacingCloseIsNeverAcknowledgedWithNil(t *testing.T) {
-	t.Run("suppress queued after Close has already recorded closed and canceled", func(t *testing.T) {
-		// This ordering forces the pump's top-of-loop priority check to be the
-		// one that observes both facts at once, deterministically: the
-		// cancellation and the closed flag are already visible before the
-		// suppression command is even sent, so whichever loop iteration the
-		// pump is on, it cannot acknowledge before it can see pumpCtx is done.
-		control, peer := net.Pipe()
-		defer peer.Close()
-		session := newHeartbeatPumpTestSession(control)
-		go session.heartbeatPump()
-		session.queueMu.Lock()
-		session.closed = true
-		session.queueMu.Unlock()
-		session.pumpCancel()
-		acknowledged := make(chan error, 1)
-		go func() { acknowledged <- session.suppressHeartbeats() }()
-		select {
-		case err := <-acknowledged:
-			if err == nil {
-				t.Fatal("suppression racing a concurrent Close was acknowledged with nil")
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("suppression never returned after Close")
-		}
-		<-session.pumpDone
-	})
+// Close (client.go) publishes closed under queueMu strictly before it cancels
+// pumpCtx:
+//
+//	session.queueMu.Lock(); session.closed = true; session.queueMu.Unlock()
+//	session.pumpCancel()
+//
+// A suppression command acknowledged in the window between those two lines
+// sees an uncanceled pumpCtx but an already-closed session. An earlier
+// version of this fix checked pumpCtx there and missed that window, returning
+// nil; checking the same closed/pumpErr state HealthError reports, under the
+// same lock, cannot miss it regardless of whether pumpCtx has been canceled
+// yet (#470 item 1).
+//
+// This is a direct, single-goroutine unit test of the acknowledgement
+// function rather than a race against a live Close: reproducing the window
+// above by actually racing Close's two statements against a concurrent
+// suppression send is not reliably steerable (an earlier attempt at exactly
+// that -- cancel-and-send from one goroutine before the pump could react --
+// let the pump exit via pumpCtx.Done() before ever reading the suppress
+// channel, so the assertion exercised suppressHeartbeats' pumpDone fallback,
+// not this function, and passed unchanged on the pre-fix code). Setting
+// closed without canceling pumpCtx reproduces the exact interleaving
+// deterministically, with no sleep and no scheduler dependence.
+func TestSuppressionAcknowledgementReportsClosedEvenWithoutCancellation(t *testing.T) {
+	session := &Session{pumpCtx: context.Background()}
+	session.queueMu.Lock()
+	session.closed = true
+	session.queueMu.Unlock()
+	if err := session.suppressionAcknowledgement(); err == nil {
+		t.Fatal("suppressionAcknowledgement returned nil for a closed session whose pumpCtx was never canceled")
+	}
+}
 
-	t.Run("suppress sent after Close while the pump is already parked in its select", func(t *testing.T) {
-		// The sleep lets the pump reach its blocking select before Close runs,
-		// so canceling there makes the runtime's own choice between the
-		// pumpCtx.Done() and suppress cases a genuine race -- exactly "wins
-		// the pump's select" from the review. closed and the cancellation are
-		// still fully recorded, in this goroutine, strictly before the
-		// suppression command is sent below, so nil can never be a legitimate
-		// answer regardless of which case the runtime happens to pick.
-		// Repeated so a scheduler that favors one case on a given run does
-		// not hide a regression in the other.
-		for i := 0; i < 25; i++ {
-			control, peer := net.Pipe()
-			session := newHeartbeatPumpTestSession(control)
-			go session.heartbeatPump()
-			time.Sleep(time.Millisecond)
+// drainSuppress is the pump's other call site for suppressionAcknowledgement
+// (the top-of-loop priority check and its mid-select recheck); prove it is
+// wired to the same fixed logic, not a separate copy that could regress on
+// its own.
+func TestDrainSuppressReportsClosedEvenWithoutCancellation(t *testing.T) {
+	session := &Session{pumpCtx: context.Background(), suppress: make(chan chan error, 1)}
+	session.queueMu.Lock()
+	session.closed = true
+	session.queueMu.Unlock()
+	acknowledge := make(chan error, 1)
+	session.suppress <- acknowledge // buffered: no reader needed to accept it
+	if !session.drainSuppress() {
+		t.Fatal("drainSuppress did not take the waiting command")
+	}
+	if err := <-acknowledge; err == nil {
+		t.Fatal("drainSuppress acknowledged a closed session with nil")
+	}
+}
 
-			session.queueMu.Lock()
-			session.closed = true
-			session.queueMu.Unlock()
-			session.pumpCancel()
+// The two tests above prove the shared function; this proves the wiring end
+// to end through the public API and a live pump, landing on the pump's
+// blocking select (not its top-of-loop priority check, which a freshly
+// started pump has already passed with nothing queued by the time this send
+// exists -- so this can only be served by the select's own suppress case).
+// pumpCtx is never canceled here, so the pump cannot exit and this cannot be
+// served by suppressHeartbeats' stopped-pump pumpDone fallback (client.go
+// ~342/~350) either: the value asserted below is the live acknowledgement.
+func TestSuppressHeartbeatsReportsClosedFromTheLivePumpsSelect(t *testing.T) {
+	control, peer := net.Pipe()
+	defer peer.Close()
+	session := newHeartbeatPumpTestSession(control)
+	go session.heartbeatPump()
+	defer func() { _ = session.Close() }()
 
-			acknowledged := make(chan error, 1)
-			go func() { acknowledged <- session.suppressHeartbeats() }()
+	session.queueMu.Lock()
+	session.closed = true
+	session.queueMu.Unlock()
 
-			select {
-			case err := <-acknowledged:
-				if err == nil {
-					t.Fatalf("iteration %d: suppression racing a concurrent Close was acknowledged with nil", i)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatalf("iteration %d: suppression never returned after Close", i)
-			}
-			<-session.pumpDone
-			peer.Close()
-		}
-	})
+	err := session.suppressHeartbeats()
+	if err == nil {
+		t.Fatal("suppressHeartbeats acknowledged a closed session with nil")
+	}
+	if !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("suppressHeartbeats error = %v, want it to report the session as closed", err)
+	}
 }
 
 // gateConn lets a test see exactly when the heartbeat pump's flush has
@@ -2898,15 +2907,18 @@ func TestSuppressionQueuedBehindABlockedHeartbeatFlushReturnsTheFlushsTypedLossO
 	}
 
 	suppressResult := make(chan error, 1)
-	go func() { suppressResult <- session.suppressHeartbeats() }()
-
-	// The suppression command cannot be acknowledged while the flush it is
-	// queued behind is still blocked -- prove it stays pending.
-	select {
-	case err := <-suppressResult:
-		t.Fatalf("suppression was acknowledged (%v) before the blocked flush resolved", err)
-	case <-time.After(50 * time.Millisecond):
-	}
+	suppressSent := make(chan struct{})
+	go func() {
+		close(suppressSent)
+		suppressResult <- session.suppressHeartbeats()
+	}()
+	// suppressHeartbeats does nothing blocking before its channel send, so
+	// once the goroutine above has started, that send is the very next thing
+	// it does -- and with the flush still gated, the pump cannot read it. No
+	// wait is needed to know the command is now queued behind the flush
+	// rather than resolved: gate.release below is the only thing that can
+	// ever let the pump reach a select again.
+	<-suppressSent
 
 	close(gate.release)
 
@@ -2923,8 +2935,15 @@ func TestSuppressionQueuedBehindABlockedHeartbeatFlushReturnsTheFlushsTypedLossO
 	if !errors.As(suppressErr, &loss) {
 		t.Fatalf("suppression queued behind a failed flush = %T %v, want the typed runtime loss", suppressErr, suppressErr)
 	}
-	if session.HealthError() == nil {
+	recordedLoss := session.HealthError()
+	if recordedLoss == nil {
 		t.Fatal("the failed blocked flush did not mark the session lost")
+	}
+	if !errors.Is(suppressErr, recordedLoss) {
+		t.Fatalf("suppression error = %v, want the session's own recorded loss %v, not merely the same type", suppressErr, recordedLoss)
+	}
+	if !errors.Is(suppressErr, gate.failWith) {
+		t.Fatalf("suppression error = %v, does not trace back to the flush's own failure %v", suppressErr, gate.failWith)
 	}
 	<-session.pumpDone
 }
