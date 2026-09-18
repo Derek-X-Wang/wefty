@@ -47,6 +47,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeRerun(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "logs":
 		return executeLogs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "wait":
+		return executeWait(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "results":
 		return executeResults(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "inspect":
@@ -85,11 +87,16 @@ func executeAdmin(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 }
 
 type runInspection struct {
-	Run       contract.RunRecord   `json:"run"`
-	Lineage   l3.RunLineage        `json:"lineage"`
-	Runs      []contract.RunRecord `json:"runs"`
-	Results   *runResults          `json:"results,omitempty"`
-	Execution *l3.RunExecution     `json:"execution,omitempty"`
+	Run     contract.RunRecord   `json:"run"`
+	Lineage l3.RunLineage        `json:"lineage"`
+	Runs    []contract.RunRecord `json:"runs"`
+	// Steps is the root run's step intervals, derived from its own envelopes.
+	// It is what "how long did each part take" is answered with, and it is
+	// computed here from the record already fetched rather than by asking the
+	// ledger a second question.
+	Steps     l3.RunSteps      `json:"steps"`
+	Results   *runResults      `json:"results,omitempty"`
+	Execution *l3.RunExecution `json:"execution,omitempty"`
 }
 
 // runResults says where a finished run's files are, how long they last, and
@@ -267,6 +274,7 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	}
 	inspection := runInspection{
 		Run: root, Lineage: lineage, Runs: []contract.RunRecord{root},
+		Steps:   l3.DeriveRunSteps(root.Envelopes),
 		Results: runResultsFor(root, time.Now().UTC()),
 	}
 	if inspection.Results != nil {

@@ -198,6 +198,10 @@ type LineageEntry struct {
 	ParentRunID string            `json:"parent_run_id,omitempty"`
 	Status      contract.RunState `json:"status"`
 	Depth       int               `json:"depth"`
+	// CurrentStep is where that run is now, so a lineage reads as progress
+	// rather than as a list of identifiers. It is empty for a run that
+	// reported no steps and for one that has finished.
+	CurrentStep string `json:"current_step,omitempty"`
 }
 
 type RunLineage struct {

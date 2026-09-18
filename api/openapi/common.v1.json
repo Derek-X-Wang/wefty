@@ -1197,6 +1197,44 @@
           "uploaded_at": { "type": "string", "format": "date-time" }
         }
       },
+      "RunSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "status", "trigger", "created_at", "updated_at"],
+        "properties": {
+          "run_id": { "type": "string" },
+          "parent_run_id": { "type": "string" },
+          "status": { "type": "string" },
+          "trigger": {
+            "type": "object",
+            "description": "The Run's immutable trigger provenance, the same projection RunRecord carries.",
+            "required": ["type", "principal"],
+            "properties": {
+              "type": { "enum": ["manual", "chain", "rerun", "computer"] },
+              "principal": { "type": "string" },
+              "source_run_id": { "type": "string" },
+              "computer_id": { "type": "string" },
+              "computer_attempt_id": { "type": "string" },
+              "computer_storage_generation": { "type": "integer" },
+              "submit_intent_revision": { "type": "integer" }
+            }
+          },
+          "current_step": { "type": "string", "description": "Where the Run is now; empty for a Run in no step." },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "started_at": { "type": "string", "format": "date-time" },
+          "finished_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RunListPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runs"],
+        "description": "The general Run listing, newest first. It carries no cursor: this listing is the head of the list, and limit is the whole of the request.",
+        "properties": {
+          "runs": { "type": "array", "items": { "$ref": "#/components/schemas/RunSummary" } }
+        }
+      },
       "RunResult": {
         "type": "object",
         "additionalProperties": false,

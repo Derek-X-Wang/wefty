@@ -1297,10 +1297,22 @@ func (m *runMailbox) document(event runMailboxEvent, name string) (string, []byt
 // never shape the envelope's own extension object.
 func (m *runMailbox) extensions(event runMailboxEvent) (json.RawMessage, error) {
 	payload := bytes.TrimSpace(event.body)
-	if len(payload) == 0 && event.name == "" && !event.truncated {
-		return nil, nil
-	}
 	inner := map[string]any{}
+	// The kind travels with the envelope, because the envelope is the only
+	// thing the ledger keeps and the kind is not otherwise recoverable from
+	// it. A step bracket and an ordinary envelope both carry a step ID and a
+	// status; without this, telling them apart would mean parsing a summary
+	// string the workload is free to replace. It is the kind that already
+	// exists in the file protocol, recorded rather than invented.
+	if event.kind != "" {
+		inner["kind"] = event.kind
+	}
+	// A step's status is its bracket: which end of the interval this is. The
+	// envelope's own status cannot carry it, because that field says how the
+	// step went and these two answers are not the same question.
+	if event.kind == runMailboxKindStep {
+		inner["step_status"] = event.status
+	}
 	if event.name != "" {
 		inner["name"] = event.name
 	}

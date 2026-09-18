@@ -55,10 +55,31 @@ wefty --json submit \
 Follow and inspect:
 
 ```sh
-wefty logs <run_id> --follow      # live tail (poll-based)
-wefty --json inspect <run_id>     # full lineage: runs, envelopes, gates, node placement
-wefty rerun <run_id>              # NEW run from the stored immutable snapshot
+wefty --json runs list                    # the most recent runs, newest first
+wefty --json runs list --status running   # just what is in flight
+wefty wait <run_id> --timeout 30m         # block until terminal; see exit codes below
+wefty logs <run_id> --follow              # live tail (poll-based)
+wefty --json inspect <run_id>             # lineage, envelopes, gates, steps, node placement
+wefty --json results <run_id>             # the result document the run uploaded
+wefty rerun <run_id>                      # NEW run from the stored immutable snapshot
 ```
+
+Every command above accepts `--json`, and `--json` is what a script should use:
+the table forms are for people and their columns are not a contract.
+
+`wefty wait` is how a script branches on an outcome without parsing anything:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | the run succeeded |
+| 10 | the run reached a terminal state that is not success |
+| 11 | `--timeout` elapsed while the run was still going |
+
+Steps: a workflow brackets its work with `wefty run step --name NAME` and
+`--end`, and the ledger derives the intervals from those envelopes. `runs list`
+shows the run's current step — the most recently started step that has not
+ended — and `inspect` shows every step with how long it took. A step still
+running has no duration, because the time so far is not the time it took.
 
 ## Inside a workflow script
 
@@ -128,5 +149,6 @@ workflow as if reporting is all it can do.
 
 A run is only good when `inspect` shows: status `succeeded`, expected
 lineage, every envelope `succeeded`, every gate `pass`, and the artifacts
-(e.g. `git:<sha>`) actually exist. The reference workflow is
+(e.g. `git:<sha>`) actually exist. `wefty wait` gives the same verdict as an
+exit code when a script needs to branch rather than read. The reference workflow is
 `workflows/dogfood/` — plan → implement → cross-review with real agent CLIs.

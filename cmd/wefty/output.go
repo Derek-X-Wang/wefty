@@ -16,6 +16,40 @@ import (
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
+// writeRunSteps prints the run's step intervals and how long each took. A step
+// still running shows its name and no duration, because the time so far is not
+// the time it took and printing one as the other would be a different claim.
+func writeRunSteps(writer io.Writer, steps l3.RunSteps) error {
+	if len(steps.Steps) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(writer, "\nsteps: %s\n", currentStepLine(steps)); err != nil {
+		return err
+	}
+	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "STEP\tSTARTED\tDURATION"); err != nil {
+		return err
+	}
+	for _, step := range steps.Steps {
+		duration := "running"
+		if step.Seconds != nil {
+			duration = fmt.Sprintf("%.1fs", *step.Seconds)
+		}
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n",
+			step.Name, step.StartedAt.Format(time.RFC3339), duration); err != nil {
+			return err
+		}
+	}
+	return table.Flush()
+}
+
+func currentStepLine(steps l3.RunSteps) string {
+	if steps.Current == "" {
+		return "no step is open"
+	}
+	return "currently in " + steps.Current
+}
+
 func writeJSON(writer io.Writer, value any) error {
 	encoder := json.NewEncoder(writer)
 	encoder.SetIndent("", "  ")
@@ -300,6 +334,9 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 		}
 	}
 	if err := table.Flush(); err != nil {
+		return err
+	}
+	if err := writeRunSteps(writer, inspection.Steps); err != nil {
 		return err
 	}
 	if results := inspection.Results; results != nil {

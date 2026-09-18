@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -182,6 +183,12 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 				RequiredEnvelope: true,
 			}, "branch-gates-exercise-"+testCase.ref)
 
+			// Observation, proved on a real running job rather than described:
+			// while the workflow is going, the general listing names the gate
+			// it is on.
+			observed := make(chan string, 1)
+			go watchCurrentStep(t.Context(), caller, accepted.RunID, observed)
+
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
 			// The verdict document is read from the ledger, which is where a
 			// person reads it: the node uploads it at completion and the log
@@ -197,6 +204,44 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			if result.SchemaVersion != 1 || result.Workflow != "branch-gates" || result.RunID != accepted.RunID {
 				t.Fatalf("result identity = %#v", result)
 			}
+			// #477 acceptance, all three parts, on the real stack.
+			//
+			// One: a running job appears in `runs list` with its current gate
+			// as the step it is in. The watcher above polls the same route the
+			// CLI does. Whether it catches the run mid-gate depends on how long
+			// the gates take over this fixture subject, which is small, so a
+			// sighting is asserted when it happens and never required -- a
+			// timing race is not evidence of anything. The deterministic proof
+			// that a non-terminal run's listing carries its current step is
+			// TestTheCurrentStepTravelsWithTheListingAndTheLineage in l3.
+			select {
+			case step := <-observed:
+				if !slices.Contains(strings.Split(allGates, ","), step) {
+					t.Fatalf("runs list reported current step %q, which is not one of the gates", step)
+				}
+			default:
+			}
+
+			// Two: every gate that ran is a closed interval with a duration, so
+			// `inspect` can show per-gate timings. Three -- a failing branch
+			// exits non-zero from `wefty wait` -- is the run status asserted
+			// above, which is exactly what wait turns into its exit code.
+			steps := l3.DeriveRunSteps(record.Envelopes)
+			if steps.Current != "" {
+				t.Fatalf("a terminal run is still in step %q", steps.Current)
+			}
+			if len(steps.Steps) == 0 {
+				t.Fatalf("no gate was bracketed as a step:\n%s", logs)
+			}
+			for _, step := range steps.Steps {
+				if step.Open || step.Seconds == nil {
+					t.Fatalf("gate step %q has no duration: %#v", step.Name, step)
+				}
+				if !slices.Contains(strings.Split(allGates, ","), step.Name) {
+					t.Fatalf("step %q is not one of the gates", step.Name)
+				}
+			}
+
 			if result.Ref != testCase.ref || result.Commit == "" || result.RepoURL != subject {
 				t.Fatalf("result subject = ref %q commit %q repo %q", result.Ref, result.Commit, result.RepoURL)
 			}
@@ -256,8 +301,16 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			// The ledger carries one envelope per gate, the run's result event,
 			// and the single final gate result -- all of them published by the
 			// node agent from the mailbox, none of them by this job.
+			//
+			// The step brackets are envelopes too, sharing a step ID with the
+			// gate's own envelope, and they report where the run is rather than
+			// how the gate went. They are counted as steps below and skipped
+			// here, which is the same distinction DeriveRunSteps makes.
 			gotSteps := make([]string, 0, len(record.Envelopes))
 			for _, envelope := range record.Envelopes {
+				if isStepBracket(envelope) {
+					continue
+				}
 				gotSteps = append(gotSteps, envelope.StepID)
 				if envelope.AttemptID == "" {
 					t.Fatalf("envelope %s carries no server-bound attempt", envelope.EnvelopeID)
@@ -376,6 +429,12 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 				Limits:           &contract.RunLimits{MaxRuntimeSeconds: int(runBudget.Seconds())},
 				RequiredEnvelope: true,
 			}, "branch-gates-negative-"+testCase.name)
+
+			// Observation, proved on a real running job rather than described:
+			// while the workflow is going, the general listing names the gate
+			// it is on.
+			observed := make(chan string, 1)
+			go watchCurrentStep(t.Context(), caller, accepted.RunID, observed)
 
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
 			raw, logs := waitForResultJSON(t, caller, accepted.RunID, logSettleBudget)
@@ -988,4 +1047,65 @@ func TestBranchGatesReportsWithoutTheWeftyBinary(t *testing.T) {
 	if err != nil || len(events) == 0 {
 		t.Fatalf("the inline writer wrote no mailbox events: %v", err)
 	}
+}
+
+// watchCurrentStep polls the general Run listing while a run is going and
+// reports the first current step it sees. It is the same route and the same
+// derivation `wefty runs list` uses; the only difference is that a test can say
+// what it expects to find there.
+func watchCurrentStep(ctx context.Context, client *http.Client, runID string, observed chan<- string) {
+	for ctx.Err() == nil {
+		func() {
+			requestCtx, cancel := context.WithTimeout(ctx, perRequestBudget)
+			defer cancel()
+			request, err := http.NewRequestWithContext(requestCtx, http.MethodGet,
+				"http://run-ledger.invalid/v1/runs?limit=100", nil)
+			if err != nil {
+				return
+			}
+			response, err := client.Do(request)
+			if err != nil {
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				return
+			}
+			var page l3.RunListPage
+			if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
+				return
+			}
+			for _, run := range page.Runs {
+				if run.RunID != runID || run.CurrentStep == "" {
+					continue
+				}
+				select {
+				case observed <- run.CurrentStep:
+				default:
+				}
+				return
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// isStepBracket reports the envelopes a workload wrote with `wefty run step`.
+// It reads the mailbox's own extension namespace, exactly as the ledger's
+// derivation does.
+func isStepBracket(envelope contract.Envelope) bool {
+	if len(envelope.Extensions) == 0 {
+		return false
+	}
+	var namespaces map[string]struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(envelope.Extensions, &namespaces); err != nil {
+		return false
+	}
+	return namespaces["dev.wefty.mailbox"].Kind == "step"
 }

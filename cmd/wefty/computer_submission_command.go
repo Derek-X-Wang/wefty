@@ -197,18 +197,25 @@ func writeComputerSubmissionOutput(writer io.Writer, output computerSubmissionOu
 	return table.Flush()
 }
 
+// executeRuns lists Runs. Without --origin it is the general listing -- the
+// most recent Runs on this fabric, which is what someone asking "what is
+// running" means. With --origin it stays the Computer-scoped, cursor-paged
+// membership listing it has always been; the two answer different questions and
+// share only a route.
 func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] != "list" {
-		return usageError("usage: wefty runs list --origin computer:COMPUTER_ID [--include-descendants] [--limit LIMIT] [--cursor CURSOR]")
+		return usageError("usage: wefty runs list [--status STATUS] [--limit LIMIT]" +
+			" | wefty runs list --origin computer:COMPUTER_ID [--include-descendants] [--limit LIMIT] [--cursor CURSOR]")
 	}
 	flags := flag.NewFlagSet("runs list", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var origin, cursor string
+	var origin, cursor, status string
 	var includeDescendants bool
 	var limit int
 	flags.StringVar(&origin, "origin", "", "immutable Run origin, currently computer:COMPUTER_ID")
+	flags.StringVar(&status, "status", "", "only Runs in this state")
 	flags.BoolVar(&includeDescendants, "include-descendants", false, "include chain descendants of matching roots")
-	flags.IntVar(&limit, "limit", l3.DefaultComputerRunPageLimit, "Runs per page")
+	flags.IntVar(&limit, "limit", 0, "how many Runs to list")
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor returned by the previous page")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -216,9 +223,43 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if flags.NArg() != 0 {
 		return usageError("runs list does not accept positional arguments")
 	}
+	// An unset --limit takes the listing's own default; a --limit that was
+	// typed is validated as typed, so `--limit 0` stays the mistake it is
+	// rather than silently becoming the default.
+	limitSet := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "limit" {
+			limitSet = true
+		}
+	})
+	if origin == "" {
+		if includeDescendants || cursor != "" {
+			return usageError("--include-descendants and --cursor apply to --origin listings")
+		}
+		if !limitSet {
+			limit = l3.DefaultRunListLimit
+		}
+		if limit < 1 || limit > l3.MaxRunListLimit {
+			return usageError(fmt.Sprintf("--limit must be between 1 and %d", l3.MaxRunListLimit))
+		}
+		page, err := clients.listRuns(ctx, status, limit)
+		if err != nil {
+			return err
+		}
+		if jsonOutput {
+			return writeJSON(stdout, page)
+		}
+		return writeRunListing(stdout, page, time.Now().UTC())
+	}
+	if status != "" {
+		return usageError("--status applies to the general listing; an --origin listing is not filtered by state")
+	}
 	computerID, ok := strings.CutPrefix(origin, "computer:")
 	if !ok || strings.TrimSpace(computerID) == "" || computerID == "self" || computerID != strings.TrimSpace(computerID) {
 		return usageError("runs list requires --origin computer:COMPUTER_ID")
+	}
+	if !limitSet {
+		limit = l3.DefaultComputerRunPageLimit
 	}
 	if limit < 1 || limit > l3.MaxComputerRunPageLimit {
 		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l3.MaxComputerRunPageLimit))
@@ -231,6 +272,52 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return writeJSON(stdout, page)
 	}
 	return writeComputerOriginRuns(stdout, page)
+}
+
+// writeRunListing is the operator's table. AGE is relative because "how long
+// has this been going" is the question, and STEP is the run's current step,
+// which is empty for a run that reported none -- shown as a dash rather than
+// blank so a column never reads as missing data.
+func writeRunListing(writer io.Writer, page l3.RunListPage, now time.Time) error {
+	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "RUN ID\tSTATUS\tTRIGGER\tAGE\tSTEP"); err != nil {
+		return err
+	}
+	for _, run := range page.Runs {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n",
+			run.RunID, run.Status, run.Trigger.Type, runAge(run, now), valueOrNA(run.CurrentStep)); err != nil {
+			return err
+		}
+	}
+	return table.Flush()
+}
+
+// runAge is how long the run has been going, or how long it took. A finished
+// run's age stops at its finish: the useful number for work that is over is how
+// long it lasted, not how long ago it was.
+func runAge(run l3.RunSummary, now time.Time) string {
+	start := run.CreatedAt
+	if run.StartedAt != nil {
+		start = *run.StartedAt
+	}
+	end := now
+	if run.FinishedAt != nil {
+		end = *run.FinishedAt
+	}
+	elapsed := end.Sub(start)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	switch {
+	case elapsed < time.Minute:
+		return fmt.Sprintf("%ds", int(elapsed.Seconds()))
+	case elapsed < time.Hour:
+		return fmt.Sprintf("%dm%ds", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
+	case elapsed < 24*time.Hour:
+		return fmt.Sprintf("%dh%dm", int(elapsed.Hours()), int(elapsed.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(elapsed.Hours())/24, int(elapsed.Hours())%24)
+	}
 }
 
 func writeComputerOriginRuns(writer io.Writer, page l3.ComputerRunPage) error {

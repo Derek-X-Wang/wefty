@@ -591,6 +591,16 @@ func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID st
 	return result, err == nil && headers.Get("Idempotent-Replay") == "true", err
 }
 
+func (c *apiClients) listRuns(ctx context.Context, status string, limit int) (l3.RunListPage, error) {
+	query := url.Values{"limit": []string{strconv.Itoa(limit)}}
+	if status != "" {
+		query.Set("status", status)
+	}
+	var page l3.RunListPage
+	err := c.l3.do(ctx, http.MethodGet, "/v1/runs?"+query.Encode(), nil, nil, &page, http.StatusOK)
+	return page, err
+}
+
 func (c *apiClients) listRunsByOrigin(ctx context.Context, origin, cursor string, limit int, includeDescendants bool) (l3.ComputerRunPage, error) {
 	query := url.Values{
 		"origin":              []string{origin},

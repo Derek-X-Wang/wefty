@@ -296,6 +296,90 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatalf("rerun did not use stored snapshot: %q", logsOut.String())
 	}
 
+	// Observation: the general listing, the wait, and the --json arm of every
+	// command an agent parses.
+	var listOut bytes.Buffer
+	if err := execute(ctx, clients, true, []string{"runs", "list"}, &listOut, &commandErr); err != nil {
+		t.Fatalf("runs list: %v stderr=%s", err, commandErr.String())
+	}
+	var listing l3.RunListPage
+	if err := json.Unmarshal(listOut.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Runs) < 3 {
+		t.Fatalf("runs list returned %d runs, want every run this test submitted", len(listing.Runs))
+	}
+	// Newest first, so the most recently created run leads -- here the rerun,
+	// which was submitted after everything else.
+	if listing.Runs[0].RunID != rerun.RunID {
+		t.Fatalf("runs list is not newest first: %s leads, want %s", listing.Runs[0].RunID, rerun.RunID)
+	}
+	var succeededOut bytes.Buffer
+	if err := execute(ctx, clients, true, []string{"runs", "list", "--status", "succeeded", "--limit", "2"},
+		&succeededOut, &commandErr); err != nil {
+		t.Fatalf("runs list --status: %v stderr=%s", err, commandErr.String())
+	}
+	if err := json.Unmarshal(succeededOut.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Runs) == 0 || len(listing.Runs) > 2 {
+		t.Fatalf("filtered listing returned %d runs", len(listing.Runs))
+	}
+	for _, run := range listing.Runs {
+		if run.Status != contract.RunSucceeded {
+			t.Fatalf("a %s run answered --status succeeded", run.Status)
+		}
+	}
+
+	// wait on a run that has already succeeded returns immediately and zero.
+	var waitOut bytes.Buffer
+	if err := execute(ctx, clients, false, []string{"wait", submitted.RunID, "--timeout", "60s"},
+		&waitOut, &commandErr); err != nil {
+		t.Fatalf("wait on a succeeded run: %v", err)
+	}
+	if strings.TrimSpace(waitOut.String()) != string(contract.RunSucceeded) {
+		t.Fatalf("wait printed %q", waitOut.String())
+	}
+	waitOut.Reset()
+	if err := execute(ctx, clients, true, []string{"wait", submitted.RunID}, &waitOut, &commandErr); err != nil {
+		t.Fatalf("wait --json: %v", err)
+	}
+	var waited contract.RunRecord
+	if err := json.Unmarshal(waitOut.Bytes(), &waited); err != nil {
+		t.Fatalf("wait --json is not JSON: %v (%s)", err, waitOut.String())
+	}
+	if waited.RunID != submitted.RunID {
+		t.Fatalf("wait --json returned %s", waited.RunID)
+	}
+
+	// Every command an agent parses answers --json with JSON. This is the
+	// audit, executed rather than asserted in prose.
+	var whoOut bytes.Buffer
+	if err := execute(ctx, personClients, true, []string{"whoami"}, &whoOut, &commandErr); err != nil {
+		t.Fatalf("whoami --json: %v", err)
+	}
+	var person l1.AuthenticatedPerson
+	if err := json.Unmarshal(whoOut.Bytes(), &person); err != nil {
+		t.Fatalf("`wefty --json whoami` did not emit JSON: %v\n%s", err, whoOut.String())
+	}
+	for _, command := range [][]string{
+		{"runs", "list"},
+		{"nodes", "list"},
+		{"inspect", submitted.RunID},
+		{"logs", submitted.RunID},
+		{"results", resultRun.RunID},
+		{"wait", submitted.RunID},
+	} {
+		var machine bytes.Buffer
+		if err := execute(ctx, clients, true, command, &machine, &commandErr); err != nil {
+			t.Fatalf("%v --json: %v stderr=%s", command, err, commandErr.String())
+		}
+		var any any
+		if err := json.Unmarshal(machine.Bytes(), &any); err != nil {
+			t.Fatalf("`wefty --json %s` did not emit JSON: %v\n%s", strings.Join(command, " "), err, machine.String())
+		}
+	}
+
 	var nodesOut bytes.Buffer
 	if err := execute(ctx, clients, false, []string{"nodes", "list"}, &nodesOut, &commandErr); err != nil {
 		t.Fatalf("nodes list: %v", err)
