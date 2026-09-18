@@ -407,6 +407,18 @@ control=%q
 args_file=%q
 body_file=%q
 case "$1 ${2:-}" in
+"pr list")
+	printf '%%s
+' "$*" >>"$args_file.list"
+	if [ -f "$control/existing-pr" ]; then
+		printf '[{"url":"https://github.invalid/example/subject/pull/7","headRefOid":"deadbeef"}]
+'
+	else
+		printf '[]
+'
+	fi
+	exit 0
+	;;
 "issue view")
 	if [ "${3:-}" != %q ]; then
 		printf 'unknown issue %%s\n' "${3:-}" >&2
@@ -461,6 +473,10 @@ implement)
 		exit 0
 	fi
 	printf 'package subject\n\n// Greeting is what the issue asked for.\nfunc Greeting() string { return "hello" }\n' >greeting.go
+	if [ -f "$control/agent-leaves-dirty-tree" ]; then
+		# The edits are the work; this agent simply forgot to commit them.
+		exit 0
+	fi
 	git add -A
 	git -c user.name=agent -c user.email=agent@wefty.invalid commit --quiet -m "implement issue %s"
 	;;
@@ -912,4 +928,212 @@ func uploadedResult(t *testing.T, client *http.Client, runID string, timeout tim
 	}
 	t.Fatalf("run %s never uploaded a result", runID)
 	return nil
+}
+
+// TestAForgedMarkerCannotSkipTheGates is the resume rule's point. A commit on
+// the branch whose subject looks like a marker is prose an agent can write; a
+// phase is skipped only for a trailer naming this issue and this phase, carried
+// by a commit this workflow authored -- and the gates cannot be skipped at all,
+// so even a perfect forgery buys nothing but repeated work.
+func TestAForgedMarkerCannotSkipTheGates(t *testing.T) {
+	requireExercise(t)
+	origin := initializeOriginRepository(t)
+	tools := installStubTools(t, origin)
+	caller, store := startStack(t)
+
+	// A branch that looks finished: every phase's marker as a subject line,
+	// written by someone who is not this workflow and carrying no trailers.
+	branch := "issue-to-pr/" + issueNumber + "-forged"
+	forge := t.TempDir()
+	runGit(t, forge, "clone", origin, "work")
+	work := filepath.Join(forge, "work")
+	runGit(t, work, "checkout", "-b", branch)
+	runGit(t, work, "config", "user.name", "Not The Workflow")
+	runGit(t, work, "config", "user.email", "somebody@example.test")
+	// A change the gates will reject, so a run that skipped them would be
+	// visibly wrong rather than accidentally right.
+	writeFile(t, work, "broken.go", "package subject\nfunc  Broken()   int {return   1}\n")
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "subject: unformatted")
+	for _, phase := range []string{"read-issue", "plan", "implement", "gates", "push", "open-pr"} {
+		runGit(t, work, "commit", "--allow-empty", "-m", "issue-to-pr: phase "+phase+" complete")
+	}
+	runGit(t, work, "push", "origin", branch)
+
+	accepted := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject", "continue_from": branch,
+	})
+	record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
+	logs := runLogs(t, caller, accepted.RunID, settleBudget)
+	if record.Status != contract.RunFailed {
+		t.Fatalf("a forged branch produced a %q run, want failed; logs:\n%s", record.Status, logs)
+	}
+
+	// The gates ran -- they are not skippable -- and they failed on the
+	// unformatted file the forger committed.
+	steps := l3.DeriveRunSteps(record.Envelopes)
+	ran := map[string]bool{}
+	for _, step := range steps.Steps {
+		ran[step.Name] = true
+	}
+	if !ran["gates"] {
+		t.Fatalf("a forged marker skipped the gates:\n%s", logs)
+	}
+	if !ran["read-issue"] || !ran["plan"] || !ran["implement"] {
+		t.Fatalf("a marker with no trailers was believed:\n%s", logs)
+	}
+	if _, err := os.Stat(tools.prArgsFile); err == nil {
+		t.Fatal("a forged branch reached a pull request")
+	}
+}
+
+// TestAnotherWritersCommitIsNeverDiscarded is the push rule, seen from the side
+// that can be arranged deterministically. Something else advanced the branch
+// between two runs; the second run builds on it and publishes by
+// fast-forwarding, so the foreign commit is still there afterwards.
+//
+// The non-fast-forward itself -- the remote moving after this run has already
+// cloned -- is a race a test cannot stage from outside the script without a
+// test-only hold inside it, which would be a worse trade than the static
+// guarantee alongside this: the script contains no force push at all, so there
+// is no path by which that race ends in an overwrite.
+func TestAnotherWritersCommitIsNeverDiscarded(t *testing.T) {
+	requireExercise(t)
+	origin := initializeOriginRepository(t)
+	installStubTools(t, origin)
+	caller, store := startStack(t)
+
+	// Run once to get a real branch with real markers.
+	first := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject",
+	})
+	firstRecord := waitForTerminalRun(t, store, first.RunID, runBudget)
+	firstLogs := runLogs(t, caller, first.RunID, settleBudget)
+	if firstRecord.Status != contract.RunSucceeded {
+		t.Fatalf("the first run ended %q; logs:\n%s", firstRecord.Status, firstLogs)
+	}
+	branch := branchFromLogs(t, firstLogs)
+
+	// Someone else pushes to it.
+	intruder := t.TempDir()
+	runGit(t, intruder, "clone", origin, "work")
+	work := filepath.Join(intruder, "work")
+	runGit(t, work, "checkout", branch)
+	runGit(t, work, "config", "user.name", "Somebody Else")
+	runGit(t, work, "config", "user.email", "somebody@example.test")
+	runGit(t, work, "commit", "--allow-empty", "-m", "somebody else was here")
+	runGit(t, work, "push", "origin", branch)
+	intruderHead := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
+
+	second := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject", "continue_from": branch,
+	})
+	secondRecord := waitForTerminalRun(t, store, second.RunID, runBudget)
+	secondLogs := runLogs(t, caller, second.RunID, settleBudget)
+	if secondRecord.Status != contract.RunSucceeded {
+		t.Fatalf("the resumed run ended %q, want succeeded; logs:\n%s", secondRecord.Status, secondLogs)
+	}
+
+	// Whatever the run decided, the other writer's commit is still there.
+	after := strings.TrimSpace(runGit(t, origin, "rev-parse", branch))
+	if !strings.Contains(runGit(t, origin, "log", "--format=%s", branch), "somebody else was here") {
+		t.Fatalf("the run discarded another writer's commit (branch is now %s, was %s):\n%s",
+			after, intruderHead, secondLogs)
+	}
+}
+
+// TestTheWorkflowNeverForcePushes is the static half of the rule above. A force
+// push is the only way this workflow could lose a commit it did not write, so
+// there simply is not one.
+func TestTheWorkflowNeverForcePushes(t *testing.T) {
+	t.Parallel()
+
+	script := readFile(t, "issue-to-pr.sh")
+	// Narrow to the push-shaped forms: `-f` alone also spells the shell's
+	// file test, which this script uses everywhere and which is not a push.
+	for _, forbidden := range []string{"--force", "push -f", "+refs/heads", "push --delete", "push origin :"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("the workflow contains %q, which can overwrite or remove a branch", forbidden)
+		}
+	}
+	if !strings.Contains(script, `push --quiet origin "HEAD:refs/heads/$BRANCH"`) {
+		t.Fatal("the workflow no longer publishes with a plain fast-forward push")
+	}
+}
+
+// TestOpenPRReusesAnExistingPullRequest is the reconcile. A resumed run whose
+// branch already has a pull request must not try to open a second one, and must
+// still write this run's own handoff documents.
+func TestOpenPRReusesAnExistingPullRequest(t *testing.T) {
+	requireExercise(t)
+	origin := initializeOriginRepository(t)
+	tools := installStubTools(t, origin)
+	caller, store := startStack(t)
+
+	writeFile(t, tools.controlDir, "existing-pr", "1")
+	accepted := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject",
+	})
+	record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
+	logs := runLogs(t, caller, accepted.RunID, settleBudget)
+	if record.Status != contract.RunSucceeded {
+		t.Fatalf("run status = %q, want succeeded; logs:\n%s", record.Status, logs)
+	}
+
+	// It asked, and it did not create.
+	listed := readFile(t, tools.prArgsFile+".list")
+	if !strings.Contains(listed, "--head") || !strings.Contains(listed, "--base") {
+		t.Fatalf("gh pr list was not asked about this branch:\n%s", listed)
+	}
+	if _, err := os.Stat(tools.prArgsFile); err == nil {
+		t.Fatalf("a second pull request was opened for a branch that already had one:\n%s",
+			readFile(t, tools.prArgsFile))
+	}
+
+	// This run's own handoff directory still carries the documents, pointing
+	// at the pull request that already existed.
+	handoff := filepath.Join(l3.DefaultHandoffRoot, accepted.RunID)
+	var pr struct {
+		URL string `json:"url"`
+	}
+	readJSONFile(t, filepath.Join(handoff, "pr.json"), &pr)
+	if !strings.Contains(pr.URL, "/pull/7") {
+		t.Fatalf("pr.json does not name the existing pull request: %#v", pr)
+	}
+	if _, err := os.Stat(filepath.Join(handoff, "summary.md")); err != nil {
+		t.Fatalf("the resumed run wrote no summary.md: %v", err)
+	}
+}
+
+// TestAnAgentThatEditsWithoutCommittingStillCounts is the other half of the
+// no-op rule. The edits are the work; forgetting to commit them is not a reason
+// to throw them away, and the failure is reserved for an agent that produced
+// nothing at all.
+func TestAnAgentThatEditsWithoutCommittingStillCounts(t *testing.T) {
+	requireExercise(t)
+	origin := initializeOriginRepository(t)
+	tools := installStubTools(t, origin)
+	caller, store := startStack(t)
+
+	writeFile(t, tools.controlDir, "agent-leaves-dirty-tree", "1")
+	accepted := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject",
+	})
+	record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
+	logs := runLogs(t, caller, accepted.RunID, settleBudget)
+	if record.Status != contract.RunSucceeded {
+		t.Fatalf("an agent that edited but did not commit failed the run: %q; logs:\n%s",
+			record.Status, logs)
+	}
+	if !strings.Contains(logs, "left uncommitted changes") {
+		t.Fatalf("the workflow did not say it committed the agent's edits:\n%s", logs)
+	}
+	branch := branchFromLogs(t, logs)
+	if !strings.Contains(runGit(t, origin, "log", "--format=%s", branch), "issue-to-pr: implement issue") {
+		t.Fatalf("the agent's edits did not reach origin:\n%s",
+			runGit(t, origin, "log", "--format=%s", branch))
+	}
+	if !strings.Contains(runGit(t, origin, "show", "--name-only", "--format=", branch+"^{/implement issue}"), "greeting.go") {
+		t.Fatal("the commit does not carry the file the agent edited")
+	}
 }

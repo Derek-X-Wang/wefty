@@ -147,9 +147,41 @@ TREE_DIR=$WORK_DIR/tree
 RESULT_FILE=$WORK_DIR/result.json
 ISSUE_FILE=$WORK_DIR/issue.md
 
+# FINALIZED is set once a verdict -- success or workflow error -- has been
+# written. Anything that leaves this script without setting it is an exit nobody
+# planned for, and the finalizer below turns it into the same documents every
+# other outcome produces.
+FINALIZED=
+
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via the EXIT trap below.
+finalize_unplanned_exit() {
+	exit_status=$1
+	[ -z "$FINALIZED" ] || return 0
+	[ "$exit_status" -ne 0 ] || return 0
+	FINALIZED=1
+	message="the workflow exited $exit_status without recording a verdict"
+	printf '%s: %s\n' "$WORKFLOW" "$message" >&2
+	# Best effort, and it says so: this runs on the way out of the shell, so it
+	# cannot promise anything after a SIGKILL, a power loss, or a node that
+	# stopped. What it does cover is the ordinary unplanned exit -- an unset
+	# variable, a tool that vanished, a bug in this script.
+	write_result_document false unknown "$message" 2>/dev/null || true
+	cp "$RESULT_FILE" "$HANDOFF_DIR/result.json" 2>/dev/null || true
+	chmod 0600 "$HANDOFF_DIR/result.json" 2>/dev/null || true
+	{
+		printf '===== workflow-error: unknown =====\n'
+		printf '%s\n' "$message"
+	} >>"$HANDOFF_DIR/failures.txt" 2>/dev/null || true
+	chmod 0600 "$HANDOFF_DIR/failures.txt" 2>/dev/null || true
+	publish_result failed "$message" 2>/dev/null || true
+}
+
 # shellcheck disable=SC2317,SC2329 # invoked indirectly via the EXIT trap below.
 cleanup() {
 	status=$?
+	# The verdict is written before the scratch directory is swept, because the
+	# result document is assembled in it.
+	finalize_unplanned_exit "$status"
 	if [ -d "$WORK_DIR" ]; then
 		chmod -R u+rwX "$WORK_DIR" 2>/dev/null || true
 		rm -rf "$WORK_DIR" || true
@@ -433,6 +465,7 @@ fail_workflow() {
 	fail_step=$1
 	fail_message=$2
 	fail_detail=${3:-}
+	FINALIZED=1
 	log "WORKFLOW ERROR at $fail_step: $fail_message"
 
 	write_result_document false "$fail_step" "$fail_message"
@@ -457,6 +490,19 @@ for tool in git gh; do
 	command -v "$tool" >/dev/null 2>&1 ||
 		fail_workflow environment "$tool is required in the job rootfs"
 done
+# The wall clock is not optional. An agent phase without one can run until the
+# job's own max-runtime kills it, which is a much blunter instrument and leaves
+# no verdict. macOS installs coreutils under a g- prefix, and gtimeout is the
+# same program, so either satisfies this.
+TIMEOUT_CMD=
+for candidate in timeout gtimeout; do
+	if command -v "$candidate" >/dev/null 2>&1; then
+		TIMEOUT_CMD=$candidate
+		break
+	fi
+done
+[ -n "$TIMEOUT_CMD" ] ||
+	fail_workflow environment "timeout (GNU coreutils; gtimeout on macOS) is required to bound the agent"
 
 # --------------------------------------------------------------------------
 # Input
@@ -476,16 +522,25 @@ AGENT=${ISSUE_TO_PR_AGENT:-$(param agent)}
 CONTINUE_FROM=${ISSUE_TO_PR_CONTINUE_FROM:-$(param continue_from)}
 BUDGET_MINUTES=${ISSUE_TO_PR_BUDGET_MINUTES:-$(param budget_minutes)}
 MAX_TURNS=${ISSUE_TO_PR_MAX_TURNS:-$(param max_turns)}
+# Whether the submitter asked for a cap, as opposed to taking the default. The
+# two are different: a default this workflow cannot apply is not an error, a
+# request it cannot honour is.
+MAX_TURNS_REQUESTED=$MAX_TURNS
 
 [ -n "$REPO" ] || REPO=$DEFAULT_REPO
 [ -n "$AGENT" ] || AGENT=$DEFAULT_AGENT
 [ -n "$BUDGET_MINUTES" ] || BUDGET_MINUTES=$DEFAULT_BUDGET_MINUTES
 [ -n "$MAX_TURNS" ] || MAX_TURNS=$DEFAULT_MAX_TURNS
 
+# The numbers are read as bounded decimal integers. A leading zero is refused
+# rather than normalised: "07" and "7" would be the same issue but different
+# branch names, and a branch name is what a resumed run matches on.
 case $ISSUE in
 '') fail_workflow input "params.issue is required: submit with --param issue=<number>" ;;
-*[!0-9]*) fail_workflow input "params.issue must be a number, got \"$ISSUE\"" ;;
+*[!0-9]*) fail_workflow input "params.issue must be a decimal number, got \"$ISSUE\"" ;;
+0*) fail_workflow input "params.issue must not carry a leading zero, got \"$ISSUE\"" ;;
 esac
+[ "${#ISSUE}" -le 9 ] || fail_workflow input "params.issue is implausibly long: \"$ISSUE\""
 case $REPO in
 */*) : ;;
 *) fail_workflow input "params.repo must be owner/name, got \"$REPO\"" ;;
@@ -495,23 +550,51 @@ case " $KNOWN_AGENTS " in
 *) fail_workflow input "params.agent must be one of $KNOWN_AGENTS, got \"$AGENT\"" ;;
 esac
 case $BUDGET_MINUTES in
-'' | *[!0-9]*) fail_workflow input "params.budget_minutes must be a number, got \"$BUDGET_MINUTES\"" ;;
+'' | *[!0-9]*) fail_workflow input "params.budget_minutes must be a decimal number, got \"$BUDGET_MINUTES\"" ;;
+0*) fail_workflow input "params.budget_minutes must not carry a leading zero, got \"$BUDGET_MINUTES\"" ;;
 esac
+[ "${#BUDGET_MINUTES}" -le 4 ] ||
+	fail_workflow input "params.budget_minutes is implausibly large: \"$BUDGET_MINUTES\""
 [ "$BUDGET_MINUTES" -gt 0 ] 2>/dev/null ||
 	fail_workflow input "params.budget_minutes must be positive, got \"$BUDGET_MINUTES\""
 case $MAX_TURNS in
-'' | *[!0-9]*) fail_workflow input "params.max_turns must be a number, got \"$MAX_TURNS\"" ;;
+'' | *[!0-9]*) fail_workflow input "params.max_turns must be a decimal number, got \"$MAX_TURNS\"" ;;
+0*) fail_workflow input "params.max_turns must not carry a leading zero, got \"$MAX_TURNS\"" ;;
 esac
+[ "${#MAX_TURNS}" -le 4 ] || fail_workflow input "params.max_turns is implausibly large: \"$MAX_TURNS\""
 [ "$MAX_TURNS" -gt 0 ] 2>/dev/null ||
 	fail_workflow input "params.max_turns must be positive, got \"$MAX_TURNS\""
-# A branch name reaches git and gh as an argument. Keep it to what a branch may
-# safely be rather than trusting a param that arrived from outside.
+# A turn cap this workflow cannot actually apply is refused rather than
+# silently ignored: `codex exec` has no equivalent of claude's --max-turns, so
+# accepting the parameter would promise a bound that does not exist.
+if [ -n "$MAX_TURNS_REQUESTED" ] && [ "$AGENT" = codex ]; then
+	fail_workflow input "params.max_turns cannot be honoured with agent=codex: codex exec has no turn cap; use the budget_minutes wall clock instead"
+fi
+# A branch name reaches git and gh as an argument, so it is bounded to what a
+# branch may safely be. It is then bounded much further: only a branch this
+# workflow itself created, for this issue. Resuming onto an arbitrary branch
+# would let a run push its commits and open a pull request against whatever the
+# submitter named -- the repository's default branch included -- which is not
+# resumption, it is a different operation wearing its name.
 case $CONTINUE_FROM in
 '') : ;;
 *[!A-Za-z0-9._/-]* | -* | */ | *..*)
 	fail_workflow input "params.continue_from is not a usable branch name: \"$CONTINUE_FROM\""
 	;;
 esac
+if [ -n "$CONTINUE_FROM" ]; then
+	case $CONTINUE_FROM in
+	"issue-to-pr/$ISSUE-"?*) : ;;
+	*)
+		fail_workflow input "params.continue_from must be a branch this workflow created for issue $ISSUE (issue-to-pr/$ISSUE-<suffix>), got \"$CONTINUE_FROM\""
+		;;
+	esac
+	case ${CONTINUE_FROM#"issue-to-pr/$ISSUE-"} in
+	*[!A-Za-z0-9._-]*)
+		fail_workflow input "params.continue_from has a suffix this workflow does not create: \"$CONTINUE_FROM\""
+		;;
+	esac
+fi
 
 BUDGET_SECONDS=$((BUDGET_MINUTES * 60))
 DEADLINE=$(($(date -u +%s) + BUDGET_SECONDS))
@@ -527,12 +610,42 @@ DEADLINE=$(($(date -u +%s) + BUDGET_SECONDS))
 
 marker_subject() { printf '%s: phase %s complete' "$WORKFLOW" "$1"; }
 
-# phase_done reports whether this phase's marker is already on the branch. It
-# asks git rather than any state this run wrote, so a half-finished earlier run
-# cannot claim a phase it did not complete.
+# SKIPPABLE_PHASES is deliberately short. Reading the issue, planning and
+# implementing are expensive, produce a durable artefact on the branch, and are
+# the only phases worth not paying for twice. The gates, the push and the pull
+# request are cheap and are the run's own verification, so they run on every
+# start: a resumed run that skipped its gates would be trusting whatever is on
+# the branch to have been gated by something else.
+SKIPPABLE_PHASES="read-issue plan implement"
+
+# phase_done reports whether this phase's marker is on the branch as origin had
+# it when this run cloned.
+#
+# Three things make that answer worth trusting, and none of them is a security
+# boundary -- the agent runs on this branch and can write commits -- so they are
+# stacked deliberately:
+#
+#   - The snapshot is the commit origin had at clone time, fixed for the run.
+#     Local history evolves as this run works; asking it would let a phase this
+#     run just performed answer a question about what an earlier run did.
+#   - A marker is a trailer, not a subject line. A subject is prose the agent
+#     may write for any reason; a trailer naming this issue and this phase is a
+#     structured claim, and it must also carry a run identity and the
+#     workflow's own author address.
+#   - Only the three phases above can be skipped at all, so forging a marker
+#     can at worst re-use work, never bypass the gates.
 phase_done() {
 	[ -n "$RESUMING" ] || return 1
-	git -C "$TREE_DIR" log --format=%s -- 2>/dev/null | grep -Fxq "$(marker_subject "$1")"
+	case " $SKIPPABLE_PHASES " in
+	*" $1 "*) : ;;
+	*) return 1 ;;
+	esac
+	[ -n "$ORIGIN_SNAPSHOT" ] || return 1
+	git -C "$TREE_DIR" log \
+		--format='%(trailers:key=Issue-To-PR-Marker,valueonly,separator=%x2C)%x09%(trailers:key=Issue-To-PR-Run,valueonly,separator=%x2C)%x09%ae' \
+		"$ORIGIN_SNAPSHOT" 2>/dev/null |
+		awk -F'\t' -v want="$ISSUE/$1" -v who="$MARKER_EMAIL" \
+			'$1 == want && $2 != "" && $3 == who { found = 1 } END { exit found ? 0 : 1 }'
 }
 
 # phase_complete records the phase and publishes it. The commit is empty when
@@ -541,14 +654,19 @@ phase_done() {
 phase_complete() {
 	complete_phase=$1
 	git -C "$TREE_DIR" add -A >/dev/null 2>&1 || true
-	if ! git -C "$TREE_DIR" commit --allow-empty --quiet -m "$(marker_subject "$complete_phase")" \
+	if ! git -C "$TREE_DIR" commit --allow-empty --quiet \
+		-m "$(marker_subject "$complete_phase")" \
+		-m "$(printf 'Issue-To-PR-Marker: %s/%s\nIssue-To-PR-Run: %s' "$ISSUE" "$complete_phase" "$RUN_ID")" \
 		>"$WORK_DIR/commit.log" 2>&1; then
 		fail_workflow "$complete_phase" "cannot record the phase marker commit" \
 			"$(tail -n 20 "$WORK_DIR/commit.log")"
 	fi
+	# A plain push, never a force. A branch that has moved under this run is
+	# something this run does not understand, and overwriting it would discard
+	# whatever moved it -- another run, or a person.
 	if ! git -C "$TREE_DIR" push --quiet origin "HEAD:refs/heads/$BRANCH" \
 		>"$WORK_DIR/push.log" 2>&1; then
-		fail_workflow "$complete_phase" "cannot push the $complete_phase marker to origin" \
+		fail_workflow "$complete_phase" "cannot fast-forward $BRANCH on origin; it moved under this run" \
 			"$(tail -n 20 "$WORK_DIR/push.log")"
 	fi
 	HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
@@ -613,17 +731,13 @@ run_agent() {
 	fi
 
 	agent_status=0
-	if command -v timeout >/dev/null 2>&1; then
-		(cd "$TREE_DIR" && timeout "$remaining" "$@") >"$agent_log" 2>&1 || agent_status=$?
-	else
-		# A node without coreutils `timeout` still gets the turn cap and the
-		# between-phase budget check; it does not get a hard wall clock, and
-		# saying so is better than pretending otherwise.
-		log "WARNING: timeout is not available; the ${BUDGET_MINUTES}-minute budget is checked between phases only"
-		(cd "$TREE_DIR" && "$@") >"$agent_log" 2>&1 || agent_status=$?
-	fi
+	# -k 30s: an agent that ignores the polite signal gets half a minute to
+	# finish what it was writing and is then killed. Without the escalation a
+	# process that traps SIGTERM defeats the budget entirely.
+	(cd "$TREE_DIR" && "$TIMEOUT_CMD" -k 30s "$remaining" "$@") >"$agent_log" 2>&1 || agent_status=$?
 
-	if [ "$agent_status" -eq 124 ]; then
+	# 124 is the polite timeout; 137 is the escalation actually killing it.
+	if [ "$agent_status" -eq 124 ] || [ "$agent_status" -eq 137 ]; then
 		fail_workflow "$agent_phase" "the agent exceeded the ${BUDGET_MINUTES}-minute budget" \
 			"$(tail -c "$FAILURE_BYTE_LIMIT" "$agent_log" 2>/dev/null)"
 	fi
@@ -641,6 +755,13 @@ run_agent() {
 REMOTE=${ISSUE_TO_PR_REMOTE:-https://github.com/$REPO.git}
 BRANCH=${CONTINUE_FROM:-issue-to-pr/$ISSUE-${RUN_ID##*_}}
 RESUMING=
+# MARKER_EMAIL is the author address this workflow commits its markers under,
+# and the one a marker must carry to be believed.
+MARKER_EMAIL=issue-to-pr@wefty.invalid
+# ORIGIN_SNAPSHOT is what origin had for this branch when this run cloned. Every
+# resume decision is made against it rather than against local history, which
+# this run is itself changing as it goes.
+ORIGIN_SNAPSHOT=
 
 log "run $RUN_ID: issue $ISSUE in $REPO with the $AGENT agent, branch $BRANCH"
 
@@ -652,13 +773,22 @@ BASE_BRANCH=$(git -C "$CLONE_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null)
 [ -n "$BASE_BRANCH" ] || BASE_BRANCH=main
 
 if [ -n "$CONTINUE_FROM" ]; then
+	# The default branch is refused by name as well as by pattern. A repository
+	# whose default branch happened to match would otherwise be one push away
+	# from this workflow committing to it.
+	if [ "$CONTINUE_FROM" = "$BASE_BRANCH" ]; then
+		fail_workflow input "params.continue_from is the repository's default branch ($BASE_BRANCH); this workflow never works on it"
+	fi
 	if ! git -C "$CLONE_DIR" worktree add --quiet "$TREE_DIR" "origin/$CONTINUE_FROM" \
 		>"$clone_log" 2>&1; then
 		fail_workflow checkout "params.continue_from names a branch origin does not have: $CONTINUE_FROM" \
 			"$(tail -n 20 "$clone_log")"
 	fi
+	ORIGIN_SNAPSHOT=$(git -C "$CLONE_DIR" rev-parse "origin/$CONTINUE_FROM" 2>/dev/null) || ORIGIN_SNAPSHOT=
+	[ -n "$ORIGIN_SNAPSHOT" ] ||
+		fail_workflow checkout "cannot resolve origin/$CONTINUE_FROM after checking it out"
 	RESUMING=1
-	log "resuming on $CONTINUE_FROM"
+	log "resuming on $CONTINUE_FROM at $ORIGIN_SNAPSHOT"
 else
 	if ! git -C "$CLONE_DIR" worktree add --quiet -b "$BRANCH" "$TREE_DIR" "origin/$BASE_BRANCH" \
 		>"$clone_log" 2>&1; then
@@ -696,10 +826,16 @@ else
 	phase_complete read-issue
 fi
 
-# The resumed run needs the issue text for the later phases even when it skipped
-# reading it, because the text lives in scratch and scratch is new every run.
+# A resumed run skipped the phase but still needs the text, because the text
+# lives in scratch and scratch is new every run. A failure here is a failure:
+# the later phases build the agent's prompt and the pull request body out of it,
+# and doing that from an empty file would produce a confidently empty result.
 if [ ! -s "$ISSUE_FILE" ]; then
-	gh issue view "$ISSUE" --repo "$REPO" >"$ISSUE_FILE" 2>/dev/null || true
+	if ! gh issue view "$ISSUE" --repo "$REPO" >"$ISSUE_FILE" 2>"$WORK_DIR/gh.log"; then
+		fail_workflow read-issue "cannot re-read issue $ISSUE while resuming" \
+			"$(tail -n 20 "$WORK_DIR/gh.log")"
+	fi
+	[ -s "$ISSUE_FILE" ] || fail_workflow read-issue "issue $ISSUE rendered empty while resuming"
 fi
 
 # --------------------------------------------------------------------------
@@ -746,10 +882,22 @@ else
 	AFTER_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || AFTER_SHA=
 	# A run that changed nothing is a failed run, not a successful empty one:
 	# the marker commit this phase is about to record would otherwise make an
-	# agent that did nothing look like an agent that was finished.
+	# agent that did nothing look like an agent that was finished. The test is
+	# both halves -- HEAD unchanged AND the tree clean -- because an agent that
+	# edited files and forgot to commit did the work, and those edits are the
+	# work; this phase commits them rather than throwing them away.
 	if [ "$AFTER_SHA" = "$BEFORE_SHA" ] && [ -z "$(git -C "$TREE_DIR" status --porcelain 2>/dev/null)" ]; then
 		fail_workflow implement "the $AGENT agent produced no commit and left no changes" \
 			"$(tail -c "$FAILURE_BYTE_LIMIT" "$WORK_DIR/agent-implement.log" 2>/dev/null)"
+	fi
+	if [ -n "$(git -C "$TREE_DIR" status --porcelain 2>/dev/null)" ]; then
+		log "the agent left uncommitted changes; committing them as the implementation"
+		git -C "$TREE_DIR" add -A >/dev/null 2>&1 || true
+		if ! git -C "$TREE_DIR" commit --quiet -m "issue-to-pr: implement issue $ISSUE" \
+			>"$WORK_DIR/commit.log" 2>&1; then
+			fail_workflow implement "cannot commit the changes the agent left" \
+				"$(tail -n 20 "$WORK_DIR/commit.log")"
+		fi
 	fi
 	phase_complete implement
 fi
@@ -770,10 +918,11 @@ gate_command() {
 	esac
 }
 
-if phase_done gates; then
-	phase_skipped gates
-else
-	phase_start gates "running the repository gates"
+# The gates are not skippable. A resumed run that trusted an earlier run's
+# verdict would be trusting a branch to have been gated by something it cannot
+# check, so they run every time, on whatever is actually there now.
+phase_start gates "running the repository gates"
+{
 	FAILED_GATES=0
 	: >"$HANDOFF_DIR/failures.txt" 2>/dev/null || true
 	for gate in $GATE_NAMES; do
@@ -810,8 +959,8 @@ else
 		fail_workflow gates "$FAILED_GATES of the repository gates failed on $BRANCH" \
 			"$(head -c "$FAILURE_BYTE_LIMIT" "$HANDOFF_DIR/failures.txt" 2>/dev/null)"
 	fi
-	phase_complete gates
-fi
+}
+phase_complete gates
 
 # --------------------------------------------------------------------------
 # push
@@ -822,16 +971,15 @@ fi
 # which is the state open-pr depends on.
 # --------------------------------------------------------------------------
 
-if phase_done push; then
-	phase_skipped push
-else
-	phase_start push "publishing $BRANCH"
-	if ! git -C "$TREE_DIR" push --quiet --force-with-lease origin "HEAD:refs/heads/$BRANCH" \
-		>"$WORK_DIR/push.log" 2>&1; then
-		fail_workflow push "cannot push $BRANCH to origin" "$(tail -n 20 "$WORK_DIR/push.log")"
-	fi
-	phase_complete push
+# Publishing is not skippable either: it is what open-pr depends on, and a
+# fast-forward push of a branch that is already published costs nothing.
+phase_start push "publishing $BRANCH"
+if ! git -C "$TREE_DIR" push --quiet origin "HEAD:refs/heads/$BRANCH" \
+	>"$WORK_DIR/push.log" 2>&1; then
+	fail_workflow push "cannot fast-forward $BRANCH on origin; it moved under this run" \
+		"$(tail -n 20 "$WORK_DIR/push.log")"
 fi
+phase_complete push
 
 # --------------------------------------------------------------------------
 # open-pr
@@ -840,10 +988,13 @@ fi
 SUMMARY_FILE=$HANDOFF_DIR/summary.md
 PR_FILE=$HANDOFF_DIR/pr.json
 
-if phase_done open-pr; then
-	phase_skipped open-pr
-else
-	phase_start open-pr "opening a draft pull request"
+# open-pr always runs, including on a resume. It reconciles first: a branch this
+# workflow already pushed may already have a pull request, and opening a second
+# one is neither possible nor wanted. The artifacts are regenerated either way,
+# because they belong to *this* run's handoff directory and an earlier run's
+# copy is somewhere this run's reader cannot see.
+phase_start open-pr "opening a draft pull request"
+{
 	{
 		printf 'Implements #%s.\n\n' "$ISSUE"
 		# shellcheck disable=SC2016 # the backticks are markdown, not a shell expansion.
@@ -857,31 +1008,57 @@ else
 	chmod 0600 "$SUMMARY_FILE" 2>/dev/null || true
 
 	pr_title="issue-to-pr: #$ISSUE"
-	if ! gh pr create --repo "$REPO" --draft --base "$BASE_BRANCH" --head "$BRANCH" \
-		--title "$pr_title" --body-file "$WORK_DIR/pr-body.md" >"$WORK_DIR/pr.log" 2>&1; then
-		fail_workflow open-pr "cannot open a draft pull request for $BRANCH" \
-			"$(tail -n 20 "$WORK_DIR/pr.log")"
+	PR_URL=
+	# Reconcile before creating. `gh pr list` is read-only, so asking costs
+	# nothing and answers the one question that decides what to do next.
+	if gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+		--json url,headRefOid >"$WORK_DIR/pr-list.json" 2>"$WORK_DIR/pr-list.log"; then
+		PR_URL=$(grep -Eo 'https://[^"[:space:]]+' "$WORK_DIR/pr-list.json" | head -n 1)
+	else
+		log "WARNING: could not list existing pull requests for $BRANCH; assuming there is none"
 	fi
-	PR_URL=$(grep -Eo 'https://[^[:space:]]+' "$WORK_DIR/pr.log" | tail -n 1)
-	[ -n "$PR_URL" ] ||
-		fail_workflow open-pr "gh printed no pull request URL" "$(tail -n 20 "$WORK_DIR/pr.log")"
+	if [ -n "$PR_URL" ]; then
+		log "reusing the existing pull request $PR_URL"
+	else
+		if ! gh pr create --repo "$REPO" --draft --base "$BASE_BRANCH" --head "$BRANCH" \
+			--title "$pr_title" --body-file "$WORK_DIR/pr-body.md" >"$WORK_DIR/pr.log" 2>&1; then
+			fail_workflow open-pr "cannot open a draft pull request for $BRANCH" \
+				"$(tail -n 20 "$WORK_DIR/pr.log")"
+		fi
+		PR_URL=$(grep -Eo 'https://[^[:space:]]+' "$WORK_DIR/pr.log" | tail -n 1)
+		[ -n "$PR_URL" ] ||
+			fail_workflow open-pr "gh printed no pull request URL" "$(tail -n 20 "$WORK_DIR/pr.log")"
+	fi
 	HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
 	printf '{"url":"%s","head_sha":"%s","branch":"%s","issue":"%s","repo":"%s"}\n' \
 		"$(json_escape "$PR_URL")" "$(json_escape "$HEAD_SHA")" "$(json_escape "$BRANCH")" \
 		"$(json_escape "$ISSUE")" "$(json_escape "$REPO")" >"$PR_FILE" 2>/dev/null ||
 		log "WARNING: could not write $PR_FILE"
 	chmod 0600 "$PR_FILE" 2>/dev/null || true
-	log "opened $PR_URL"
-	phase_complete open-pr
-fi
+	[ -s "$PR_FILE" ] || fail_workflow open-pr "cannot write $PR_FILE"
+	log "pull request $PR_URL"
+}
+phase_complete open-pr
 
 # --------------------------------------------------------------------------
 # Verdict
 # --------------------------------------------------------------------------
 
+# The artifacts are prerequisites for success, not a best-effort flourish. A run
+# that opened a pull request and then could not tell anyone about it has not
+# succeeded: `wefty results` would answer nothing and the handoff directory
+# would be empty, which reads exactly like a run that never got this far.
+for required in "$PR_FILE" "$SUMMARY_FILE"; do
+	[ -s "$required" ] ||
+		fail_workflow open-pr "the run could not write $required, so its outcome is unreadable"
+done
 write_result_document true "" ""
-publish_result succeeded "issue $ISSUE: draft pull request $PR_URL" ||
-	log "WARNING: $REPORT_ERROR"
+if ! publish_result succeeded "issue $ISSUE: draft pull request $PR_URL"; then
+	fail_workflow open-pr "the run could not publish its result" "$REPORT_ERROR"
+fi
+[ -s "$HANDOFF_DIR/result.json" ] ||
+	fail_workflow open-pr "the run could not write $HANDOFF_DIR/result.json"
+FINALIZED=1
 append_gate "$WORKFLOW" pass "$PR_FILE" || log "WARNING: $REPORT_ERROR"
 log "ran:[${RAN_PHASES# }] skipped:[${SKIPPED_PHASES# }]"
 log "done: draft pull request for issue $ISSUE"
