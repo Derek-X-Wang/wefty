@@ -359,6 +359,37 @@ func (session *Session) heartbeatPumpStopped() error {
 	return errors.New("the OCI helper heartbeat pump stopped before heartbeat suppression took effect")
 }
 
+// suppressionAcknowledgement is what the pump hands back to a blackhole
+// command it is about to acknowledge. A command that wins the pump's select
+// against a concurrent Close proves nothing, so this must agree with
+// HealthError about whether the session is still usable -- and Close
+// publishes closed under queueMu strictly before it cancels pumpCtx, so
+// checking pumpCtx here would miss the window in which closed is already true
+// but the cancellation has not happened yet. Acknowledging in that window
+// with nil would tell the caller suppression took effect on a session that
+// is, at that same linearization point, already gone; checking the same
+// closed/pumpErr state under the same lock HealthError uses closes that
+// window entirely, regardless of whether pumpCtx has been canceled yet.
+func (session *Session) suppressionAcknowledgement() error {
+	if err := session.HealthError(); err != nil {
+		return fmt.Errorf("suppress OCI helper heartbeats: %w", err)
+	}
+	return nil
+}
+
+// drainSuppress non-blockingly takes one waiting blackhole command, if any,
+// and acknowledges it. It reports whether it did, so a caller can fold the
+// result into the pump's own "suppressed" state.
+func (session *Session) drainSuppress() bool {
+	select {
+	case acknowledge := <-session.suppress:
+		acknowledge <- session.suppressionAcknowledgement()
+		return true
+	default:
+		return false
+	}
+}
+
 func (session *Session) heartbeatPump() {
 	defer close(session.pumpDone)
 	interval := session.client.HeartbeatInterval
@@ -373,25 +404,30 @@ func (session *Session) heartbeatPump() {
 	suppressed := false
 	for {
 		// A waiting blackhole command is taken before anything else, so the
-		// transition never sits behind another flush. Both this and the arm
-		// below acknowledge from the pump's own goroutine and between flushes,
-		// which is what makes the acknowledgement a fence.
-		select {
-		case acknowledge := <-session.suppress:
+		// transition is picked up as soon as the pump is free to look for it.
+		// Both this and the recheck below acknowledge from the pump's own
+		// goroutine and between flushes, which is what makes the
+		// acknowledgement a fence.
+		if session.drainSuppress() {
 			suppressed = true
-			acknowledge <- nil
-		default:
 		}
 		select {
 		case <-session.pumpCtx.Done():
 			return
 		case acknowledge := <-session.suppress:
 			suppressed = true
-			acknowledge <- nil
+			acknowledge <- session.suppressionAcknowledgement()
 			timer.Reset(interval)
 			continue
 		case <-session.queued:
 		case <-timer.C:
+		}
+		// A command queued in the instant this select resolved on <-queued or
+		// <-timer.C -- racing those cases rather than losing to them -- would
+		// otherwise sit behind the flush about to start below. Recheck once
+		// more, still non-blocking, before committing to that flush.
+		if session.drainSuppress() {
+			suppressed = true
 		}
 		if suppressed {
 			timer.Reset(interval)
