@@ -475,6 +475,13 @@ func (c *apiClients) getRunLogs(ctx context.Context, runID, cursor string, limit
 	return page, err
 }
 
+func (c *apiClients) getRunResult(ctx context.Context, runID string) (l3.RunResult, error) {
+	var result l3.RunResult
+	path := "/v1/runs/" + url.PathEscape(runID) + "/result"
+	err := c.l3.do(ctx, http.MethodGet, path, nil, nil, &result, http.StatusOK)
+	return result, err
+}
+
 func (c *apiClients) getComputerSubmission(ctx context.Context, computerID string) (l1.ComputerSubmissionState, error) {
 	var state l1.ComputerSubmissionState
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/submission"

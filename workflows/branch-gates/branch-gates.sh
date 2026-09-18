@@ -51,9 +51,11 @@
 # Every exit after the execution context is known goes through one path and
 # leaves the same two files: a verdict writes the gate results, a workflow error
 # writes a result.json carrying `workflow_error` plus a diagnostic failures.txt.
-# Both paths also echo result.json into the run log. The files are now retained
-# on the node, but nothing reads one back off a node yet, so the log remains the
-# only result surface reachable from the host -- for an OCI run especially.
+# The node uploads result.json to the ledger when the run completes, so the
+# document is read with `wefty results RUN_ID` from anywhere, with no node
+# involved. It is no longer echoed into the run log: the log carried it only
+# because nothing else could reach it, and a result document duplicated into a
+# log stream is noise once it has a home of its own.
 
 # The embedded inline writer below is a verbatim copy, so its functions cannot
 # carry their own directives, and this workflow reaches them indirectly --
@@ -414,9 +416,6 @@ fail_workflow() {
 		log "WARNING: could not write $HANDOFF_DIR/failures.txt"
 	chmod 0600 "$HANDOFF_DIR/failures.txt" 2>/dev/null || true
 
-	log "result.json:"
-	cat "$RESULT_FILE" 2>/dev/null || true
-
 	append_envelope "$step" failed "$message" "" || log "WARNING: $REPORT_ERROR"
 	publish_result failed "$message" || log "WARNING: $REPORT_ERROR"
 	evidence_file=$WORK_DIR/error-evidence.txt
@@ -429,8 +428,8 @@ fail_workflow() {
 	exit 1
 }
 
-# There is no command that reads a handoff file out of an OCI handoff volume,
-# so an OCI run can also copy the two files through an operator mount.
+# failures.txt is not uploaded anywhere -- only result.json is -- so an OCI run
+# can still copy both files out through an operator mount when one is configured.
 copy_results_out() {
 	[ -n "$COPY_TO" ] || return 0
 	if mkdir -p "$COPY_TO/$RUN_ID" 2>/dev/null &&
@@ -689,8 +688,7 @@ publish_result "$RESULT_STATUS" "verdict $VERDICT for $REF ($COMMIT): $FAILED_GA
 	fail_workflow publish "$REPORT_ERROR"
 copy_results_out
 
-log "result.json:"
-cat "$RESULT_FILE"
+log "result: wefty results $RUN_ID"
 if [ "$FAILED_GATES" -gt 0 ]; then
 	log "failures.txt (first 200 lines):"
 	head -n 200 "$HANDOFF_DIR/failures.txt"

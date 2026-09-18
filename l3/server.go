@@ -23,6 +23,7 @@ type ServerConfig struct {
 	Reconciler         *Reconciler
 	Jobs               JobClient
 	Logs               JobLogClient
+	Results            JobResultClient
 	ComputerGrants     ComputerGrantVerifier
 }
 
@@ -34,6 +35,7 @@ type Server struct {
 	reconciler          *Reconciler
 	jobs                JobClient
 	logs                JobLogClient
+	results             JobResultClient
 	computerGrants      ComputerGrantVerifier
 	filterRunVisibility func(context.Context, string, string) (bool, error)
 	handler             http.Handler
@@ -58,12 +60,21 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if jobs == nil && config.Reconciler != nil {
 		jobs = config.Reconciler.jobs
 	}
+	results := config.Results
+	if results == nil {
+		// The same L1 client usually carries both reads; deriving it keeps
+		// every existing caller working without a new config field.
+		results, _ = config.Logs.(JobResultClient)
+	}
+	if results == nil {
+		results, _ = jobs.(JobResultClient)
+	}
 	computerGrants := config.ComputerGrants
 	if computerGrants == nil {
 		computerGrants, _ = jobs.(ComputerGrantVerifier)
 	}
 	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
-		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, computerGrants: computerGrants}
+		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants}
 	server.handler = server.routes()
 	return server, nil
 }
@@ -108,6 +119,7 @@ type computerTokenContextKey struct{}
 func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
 	runs.HandleFunc("GET /v1/runs/{run_id}/execution", s.getRunExecution)
+	runs.HandleFunc("GET /v1/runs/{run_id}/result", s.getRunResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
 	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.appendGateResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
@@ -667,6 +679,55 @@ func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// getRunResult proxies the result document the run's current attempt uploaded.
+//
+// Authorization follows the run's logs: a result is what the run concluded, and
+// whoever may read its logs may read its conclusion. Computer passes are the
+// exception -- they are not granted a new read here, because the pass registry
+// is the authority on what a Computer may reach and this route is not on it.
+func (s *Server) getRunResult(w http.ResponseWriter, r *http.Request) {
+	// Authorization runs before anything else, so a deployment that cannot
+	// serve results never becomes a way for an unauthorized caller to learn
+	// that, or to learn anything about the run.
+	runID := r.PathValue("run_id")
+	if scope, ok := runTokenFromRequest(r); ok {
+		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
+			return
+		}
+	} else if _, ok := computerTokenFromRequest(r); ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "Computer tokens are not authorized to read Run results"))
+		return
+	}
+	if s.results == nil {
+		writeError(w, internalError(errors.New("L1 result client is not configured"), "read run result"))
+		return
+	}
+	jobID, dispatched, err := s.store.runJobID(r.Context(), runID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !dispatched {
+		writeError(w, protocolError(contract.ErrorNotFound, "run %s has no uploaded result", runID))
+		return
+	}
+	result, err := s.results.GetJobResult(r.Context(), jobID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, RunResult{
+		RunID: runID, AttemptID: result.AttemptID, Document: result.Document,
+		SHA256: result.SHA256, SkipReason: result.SkipReason, UploadedAt: result.UploadedAt,
+	})
 }
 
 func parseRunLogLimit(value string) (int, error) {

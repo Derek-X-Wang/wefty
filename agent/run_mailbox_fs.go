@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,15 @@ type mailboxFS interface {
 	// caller can treat an already-retired event as retired.
 	remove(name string) error
 	close() error
+}
+
+// handoffFileReader is the bounded read of one file from the handoff volume's
+// own root -- where a run writes result.json -- rather than from the mailbox's
+// event directory. Only the helper-backed implementation has it: a process
+// attempt's agent already holds a verified handle on that directory and has no
+// reason to go through a runtime for it.
+type handoffFileReader interface {
+	readHandoffFile(ctx context.Context, name string, limit int64) (payload []byte, truncated bool, err error)
 }
 
 // errRunMailboxEntryUnusable marks an entry that can never become an event:

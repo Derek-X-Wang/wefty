@@ -697,30 +697,58 @@ cache, a node running out of disk — govern their own resources and neither
 defers to nor overrides them; where both apply to one node, each enforces its
 own budget.
 
-**How results are read.** Today: on the node, under the handoff directory, by
-someone with access to that node. `wefty inspect` reports where a finished run's
-results are and when they are scheduled to expire, computed from the run's
-finish time and the retention window above rather than observed on the node —
-so a node configured with a different window, or one that evicted the run early
-for room, will differ, and the report says so.
+**How results are read.** A run's result document is **uploaded, not fetched**.
+Nothing in this system lets the ledger ask a node for a file, and a result that
+only exists on the node that produced it stops being readable the moment that
+node does. So at completion the agent reads `result.json` once and pushes it to
+L1, on an agent route beside the one it already uses for logs and authorized the
+same way — attempt evidence, so a result produced by an attempt whose lease has
+just expired is still accepted.
 
-Reading a result remotely is #483 part 2, and its shape is decided: the result
-document is **uploaded**, not fetched. At completion the node agent pushes
-`result.json` to L1 over an agent route beside the one it already uses for logs,
-L1 stores one document per job — replaced on retry, expiring with the job's logs
-— and L3 exposes it per run. `wefty results RUN_ID [--out FILE]` then reads it
-through L3 with the person's own Fabric identity, exactly as `wefty logs` does,
-and works whether or not the node is still reachable. `kind=oci` uploads the
-same way: the agent reads `result.json` out of the helper-owned volume through
-the confined helper read path before the attempt is reaped.
+L1 keeps one row per job and **that row belongs to the job's latest attempt**.
+An upload from an attempt a later one has already superseded is refused
+(`superseded_attempt`), and every completion writes the row — the document, or
+the named reason there is none, `absent` included — so a retry that produced no
+result displaces its predecessor's document and a reader is never shown an
+earlier attempt's result as this run's answer. The row is removed with the job,
+exactly as its logs are; L3 exposes it per run.
+
+    wefty results RUN_ID [--out FILE]
+
+reads it through L3 with the person's own Fabric identity, exactly as `wefty
+logs` does, and works whether or not the node is still reachable. The default
+output is the document itself, byte for byte as the run wrote it; `--json` adds
+the provenance around it — which attempt produced it, its digest, when it
+arrived. `kind=oci` uploads the same way: the agent reads `result.json` out of
+the helper-owned volume through the confined helper read path
+(`Scope=handoff_files`) before the attempt is reaped, because that read is
+authorized against the live attempt and there is no read path afterwards.
 
 The upload is bounded separately and much more tightly than the node's own
 retention, because it is a document in a database rather than files on a disk:
 the on-node bounds above keep up to 64 MiB of a run's files, while the uploaded
-document is capped at 1 MiB. A run whose `result.json` exceeds that keeps its
-file on the node and uploads nothing, which `inspect` will report. That split is
-the point of doing both: the ledger holds the document an operator reads, and
-the node holds everything the run produced.
+document is capped at 1 MiB. A `kind=oci` run is bounded tighter still, at 640
+KiB, because one helper response must fit in a single 1 MiB protocol frame once
+the document is encoded into it. A run whose `result.json` exceeds its bound
+keeps the file on the node and uploads nothing: a truncated result document
+still parses as a result, which makes a partial upload worse than none.
+
+Not every run has a result, and the reasons are named rather than collapsed
+into silence. A run that wrote no `result.json` uploads `absent`. A run that
+wrote one the node could not use — it is not a regular file, it is empty or
+otherwise not a JSON document, or it exceeds the bound — uploads that reason
+instead of the document, so a reader is told the file is on the node rather than
+being told the run produced nothing.
+
+**An upload that never reaches the ledger leaves no row at all.** A refused or
+unreachable L1, and an attempt that lost its authority before it could upload,
+are exactly the cases the ledger cannot describe, because nothing of theirs got
+there. The reader sees an ordinary not-found, and the reason lives on the node
+that ran the job: the agent writes an upload record beside the run's retained
+files, for every runtime including `kind=oci`, whose handoff volume is the
+helper's and has no retention record of its own. `wefty inspect` says so rather
+than guessing — it reports `uploaded`, which is observed from the ledger, the
+named reason when the ledger holds one, and where to look when it does not.
 
 Handoff files are node-local. If a cold rerun finds files in an existing
 managed directory, its job must include the reserved routing tag

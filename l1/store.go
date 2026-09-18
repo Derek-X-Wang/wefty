@@ -32,6 +32,11 @@ const (
 	MaxLogBatchEvents     = 256
 	MaxLogEventBytes      = 4 << 20
 	MaxLogUploadBodyBytes = 20 << 20
+	// MaxResultUploadBodyBytes bounds the request body of a result upload. It
+	// leaves room for the base64 expansion of a document at
+	// contract.MaxUploadedResultBytes plus the small envelope around it; the
+	// document bound itself is enforced after decoding.
+	MaxResultUploadBodyBytes = 2 << 20
 )
 
 type StoreOptions struct {
@@ -857,6 +862,19 @@ CREATE TABLE IF NOT EXISTS log_events (
   UNIQUE(attempt_id, stream, sequence)
 );
 CREATE INDEX IF NOT EXISTS log_events_job_order ON log_events(job_id, ordinal);
+-- job_results holds one result document per job: the run's own verdict,
+-- uploaded by the node that produced it. It is one row, not a log: a retry
+-- replaces it, because the result of a job is whatever its latest attempt
+-- concluded. It cascades with the job for the same reason logs do -- the
+-- document is evidence about that job and outlives nothing else.
+CREATE TABLE IF NOT EXISTS job_results (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL,
+  document BLOB NOT NULL,
+  sha256 TEXT NOT NULL,
+  skip_reason TEXT NOT NULL DEFAULT '',
+  uploaded_ns INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS service_log_truncations (
   job_id TEXT PRIMARY KEY REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age')),
@@ -4297,4 +4315,139 @@ func newID(prefix string) string {
 		panic(fmt.Sprintf("l1: crypto/rand failed: %v", err))
 	}
 	return prefix + "_" + hex.EncodeToString(bytes[:])
+}
+
+// SetAttemptResult stores the result document one attempt uploaded for its job.
+//
+// Authorization mirrors the log-append path exactly, because the two carry the
+// same kind of thing for the same reason: evidence produced by an attempt,
+// pushed by the node that ran it. Attempt evidence rather than live attempt
+// authority is the right bar -- a result is uploaded at completion, and an
+// attempt whose lease has just expired still produced it.
+//
+// A retry replaces the row. The result of a job is what its latest attempt
+// concluded, not an append-only history of what every attempt thought.
+func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, attemptID string, request AttemptResultRequest) (AttemptResultResponse, error) {
+	if request.FencingToken == "" {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest, "fencing_token is required")
+	}
+	// A row is either the document or the reason there is none. A run that
+	// wrote no result at all uploads nothing and has no row; this arm is for a
+	// result that exists on the node and could not travel, where a bare 404
+	// would tell the reader the wrong thing.
+	if (len(request.Document) == 0) == (request.SkipReason == "") {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
+			"exactly one of document or skip_reason is required")
+	}
+	if request.SkipReason != "" && !contract.ValidResultUploadSkipReason(request.SkipReason) {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
+			"skip_reason %q is not a known reason", string(request.SkipReason))
+	}
+	if int64(len(request.Document)) > contract.MaxUploadedResultBytes {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
+			"document exceeds %d bytes", contract.MaxUploadedResultBytes)
+	}
+	// The document is a JSON document by contract, and the ledger checks that
+	// rather than trusting it. It still does not look inside: what the object
+	// means is the workflow's business, but that it is an object at all is
+	// this protocol's, and a reader asking for the run's result must never be
+	// handed arbitrary bytes that a node called a result.
+	if len(request.Document) > 0 && !json.Valid(request.Document) {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
+			"document is not valid JSON")
+	}
+	// A skip receipt has no document, and the column is NOT NULL: store an
+	// explicit empty blob rather than a nil that reads as a missing value.
+	document := request.Document
+	if document == nil {
+		document = []byte{}
+	}
+	encoded := ""
+	if len(request.Document) > 0 {
+		digest := sha256.Sum256(request.Document)
+		encoded = hex.EncodeToString(digest[:])
+	}
+	if request.SHA256 != "" && !strings.EqualFold(request.SHA256, encoded) {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
+			"document does not match its declared sha256")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AttemptResultResponse{}, internalError(err, "begin result upload")
+	}
+	defer tx.Rollback()
+	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
+	if err != nil {
+		return AttemptResultResponse{}, err
+	}
+	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+		return AttemptResultResponse{}, err
+	}
+	// Evidence acceptance is deliberately generous about time -- an attempt
+	// whose lease has just lapsed still produced what it produced -- but a
+	// result is one row rather than an append, so generosity about time must
+	// not become generosity about order. The row belongs to the job's latest
+	// attempt, and this check runs inside the same transaction as the write so
+	// a retry that starts between them cannot be overwritten by its
+	// predecessor's late upload.
+	latest, err := latestAttemptID(ctx, tx, jobID)
+	if err != nil {
+		return AttemptResultResponse{}, err
+	}
+	if latest != attemptID {
+		return AttemptResultResponse{}, protocolError(contract.ErrorSupersededAttempt,
+			"attempt %s is not the latest attempt of job %s", attemptID, jobID)
+	}
+	now := canonicalTime(s.clock.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_results(job_id, attempt_id, document, sha256, skip_reason, uploaded_ns)
+		VALUES(?, ?, ?, ?, ?, ?)
+		ON CONFLICT(job_id) DO UPDATE SET attempt_id=excluded.attempt_id, document=excluded.document,
+			sha256=excluded.sha256, skip_reason=excluded.skip_reason, uploaded_ns=excluded.uploaded_ns`,
+		jobID, attemptID, document, encoded, string(request.SkipReason), now.UnixNano()); err != nil {
+		return AttemptResultResponse{}, internalError(err, "store attempt result")
+	}
+	if err := tx.Commit(); err != nil {
+		return AttemptResultResponse{}, internalError(err, "commit attempt result")
+	}
+	return AttemptResultResponse{SHA256: encoded, Bytes: len(request.Document),
+		SkipReason: request.SkipReason, UploadedAt: now}, nil
+}
+
+// latestAttemptID names the attempt that currently speaks for a job. Order is
+// creation order, with the attempt ID breaking a tie, so two attempts created
+// in the same nanosecond still have exactly one answer.
+func latestAttemptID(ctx context.Context, q queryer, jobID string) (string, error) {
+	var attemptID string
+	err := q.QueryRowContext(ctx,
+		`SELECT attempt_id FROM attempts WHERE job_id=? ORDER BY created_ns DESC, attempt_id DESC LIMIT 1`,
+		jobID).Scan(&attemptID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", protocolError(contract.ErrorAttemptNotFound, "job %s has no attempts", jobID)
+	}
+	if err != nil {
+		return "", internalError(err, "read latest attempt")
+	}
+	return attemptID, nil
+}
+
+// GetJobResult reads the stored result document. Absence is a typed not-found
+// rather than an empty document: "this run uploaded nothing" and "this run's
+// result was empty" are different answers.
+func (s *Store) GetJobResult(ctx context.Context, jobID string) (JobResult, error) {
+	var result JobResult
+	var uploadedNS int64
+	var skipReason string
+	err := s.db.QueryRowContext(ctx, `SELECT job_id, attempt_id, document, sha256, skip_reason, uploaded_ns
+		FROM job_results WHERE job_id=?`, jobID).
+		Scan(&result.JobID, &result.AttemptID, &result.Document, &result.SHA256, &skipReason, &uploadedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return JobResult{}, protocolError(contract.ErrorNotFound, "job %s has no uploaded result", jobID)
+	}
+	if err != nil {
+		return JobResult{}, internalError(err, "read job result")
+	}
+	result.SkipReason = contract.ResultUploadSkipReason(skipReason)
+	result.UploadedAt = time.Unix(0, uploadedNS).UTC()
+	return result, nil
 }

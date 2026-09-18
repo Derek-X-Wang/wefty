@@ -473,6 +473,68 @@
         }
       }
     },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/result": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "attempt_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "setAttemptResult",
+        "summary": "Upload this attempt's result document",
+        "description": "Authorized on attempt evidence exactly as log append is, so a result produced by an attempt whose lease has just expired is still accepted. The row belongs to the job's latest attempt: an upload from a superseded attempt is refused with superseded_attempt. Exactly one of document or skip_reason is sent, and every completion sends one, so a retry that produced no result displaces its predecessor's document.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/AttemptResultRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored row's digest, size and time.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/AttemptResultResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          }
+        }
+      }
+    },
     "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete": {
       "parameters": [
         { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },

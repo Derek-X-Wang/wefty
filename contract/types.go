@@ -72,6 +72,13 @@ const (
 	// else may assume.
 	DefaultResultRetention = 7 * 24 * time.Hour
 
+	// MaxUploadedResultBytes bounds the result document a node uploads to the
+	// ledger. It is far tighter than the on-node bound beside it, and on
+	// purpose: this one is a document in a database that every read of the run
+	// pays for, while the other is files on a disk the node already has. A run
+	// whose result.json is larger keeps it on the node and uploads nothing.
+	MaxUploadedResultBytes int64 = 1 << 20
+
 	// MaxRetainedResultBytes bounds one finished run's retained results. Past
 	// it the run keeps result.json -- the document the whole retention exists
 	// for -- and loses the rest with a logged reason.
@@ -190,6 +197,37 @@ var ociReservedEnvironmentNames = [...]string{
 	EnvComputerToken,
 	EnvComputerViewPort,
 	EnvComputerControlPort,
+}
+
+// ResultUploadSkipReason says why a finished run has no result document in the
+// ledger. It is a closed vocabulary because "no result" is three different
+// situations and an operator acts on each differently: the run wrote nothing
+// (absent); the run wrote something that is not a result document, or is one
+// the upload bound refuses (not_a_regular_file, not_json, exceeds_upload_bound)
+// -- the file is on the node and worth looking at; or the node could not read
+// or send it (unreadable, upload_failed), which is a failure worth chasing.
+type ResultUploadSkipReason string
+
+const (
+	ResultUploadSkipAbsent     ResultUploadSkipReason = "absent"
+	ResultUploadSkipNotFile    ResultUploadSkipReason = "not_a_regular_file"
+	ResultUploadSkipOversize   ResultUploadSkipReason = "exceeds_upload_bound"
+	ResultUploadSkipNotJSON    ResultUploadSkipReason = "not_json"
+	ResultUploadSkipUnreadable ResultUploadSkipReason = "unreadable"
+	ResultUploadSkipTransport  ResultUploadSkipReason = "upload_failed"
+)
+
+// ValidResultUploadSkipReason keeps the ledger from storing a reason no reader
+// can interpret. The set is closed on purpose: a reason is an answer a person
+// acts on, not free text a node invents.
+func ValidResultUploadSkipReason(reason ResultUploadSkipReason) bool {
+	switch reason {
+	case ResultUploadSkipAbsent, ResultUploadSkipNotFile, ResultUploadSkipOversize,
+		ResultUploadSkipNotJSON, ResultUploadSkipUnreadable, ResultUploadSkipTransport:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsOCIReservedEnvironmentName reports whether name is one of the exact

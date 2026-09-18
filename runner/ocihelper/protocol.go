@@ -691,6 +691,14 @@ const (
 	// not a page size: at the name bound the whole response stays inside
 	// MaxFrameBytes.
 	MaxRunMailboxListNames = 4096
+	// MaxRunMailboxHandoffFileBytes bounds one file served from the handoff
+	// scope. It is larger than an event because a result document is, and
+	// smaller than contract.MaxUploadedResultBytes because a helper response
+	// must fit inside MaxFrameBytes once the payload is base64-encoded into
+	// JSON. An OCI run whose result.json is larger than this is not truncated:
+	// the agent reads it as oversize, keeps the file on the node, and uploads
+	// nothing, because half a result document is worse than none.
+	MaxRunMailboxHandoffFileBytes = 640 << 10
 	// MaxRunMailboxNameBytes bounds one entry name, matching the agent's rule.
 	MaxRunMailboxNameBytes = 128
 	// MaxRunMailboxParamsBytes bounds the params document the helper seeds.
@@ -712,6 +720,34 @@ func (seed RunMailboxSeed) ContainerDirectory() string {
 	return contract.OCIContainerHandoffDirectory + "/" + RunMailboxDirectoryName + "/" + seed.RunID
 }
 
+// RunMailboxScope selects which directory of an attempt's handoff volume the
+// bounded read path addresses. It is an enum rather than a path because no path
+// from the wire is ever joined into a filesystem path: the scope names one of a
+// fixed set of descents the helper knows how to perform.
+type RunMailboxScope string
+
+const (
+	// RunMailboxScopeEvents is the run mailbox's event directory, and the
+	// default, so every caller written before the scope existed keeps its
+	// meaning exactly.
+	RunMailboxScopeEvents RunMailboxScope = ""
+	// RunMailboxScopeHandoffFiles is the handoff volume's own root -- where a
+	// run writes result.json. It is the same volume, the same owner key and
+	// the same live-attempt authority as the events scope; only the last
+	// descent differs. It grants the agent nothing the workload does not
+	// already have: the container mounts this directory read-write.
+	RunMailboxScopeHandoffFiles RunMailboxScope = "handoff_files"
+)
+
+func (scope RunMailboxScope) valid() bool {
+	switch scope {
+	case RunMailboxScopeEvents, RunMailboxScopeHandoffFiles:
+		return true
+	default:
+		return false
+	}
+}
+
 // RunMailboxReference names exactly one attempt's mailbox. Every field is
 // checked: the authority must match a live attempt of this session, and the
 // owner key must be the one that attempt's Run declared, so a live attempt
@@ -720,6 +756,9 @@ type RunMailboxReference struct {
 	Authority AttemptAuthority `json:"authority"`
 	OwnerKey  string           `json:"owner_key"`
 	RunID     string           `json:"run_id"`
+	// Scope selects the directory within the volume. Empty is the event
+	// directory, which is what every pre-scope caller meant.
+	Scope RunMailboxScope `json:"scope,omitempty"`
 }
 
 type ListRunMailboxRequest struct {
@@ -751,6 +790,13 @@ type ReadRunMailboxResponse struct {
 	// that read as junk would delete a workload's only copy of its evidence.
 	Unusable bool   `json:"unusable,omitempty"`
 	Reason   string `json:"reason,omitempty"`
+	// Absent reports that the entry is not there at all. It is separate from
+	// Unusable for the same reason Unusable is separate from an error: an
+	// entry that was never written and an entry the helper could not reach are
+	// different answers, and the caller acts on them differently. It also
+	// keeps this read path answering the way an agent-opened directory does,
+	// where a missing name is simply a not-exist error.
+	Absent bool `json:"absent,omitempty"`
 }
 
 type RemoveRunMailboxEntryRequest struct {
@@ -804,6 +850,9 @@ func (reference RunMailboxReference) validate() error {
 	if err := reference.Authority.validate(); err != nil {
 		return err
 	}
+	if !reference.Scope.valid() {
+		return fmt.Errorf("run mailbox scope %q is not a known scope", string(reference.Scope))
+	}
 	if !ValidRunMailboxName(reference.RunID) {
 		return errors.New("run mailbox run ID is not a bounded mailbox name")
 	}
@@ -821,8 +870,12 @@ func (request ListRunMailboxRequest) boundedLimit() int {
 }
 
 func (request ReadRunMailboxRequest) boundedLimit() int {
-	if request.Limit <= 0 || request.Limit > MaxRunMailboxReadBytes {
-		return MaxRunMailboxReadBytes
+	bound := MaxRunMailboxReadBytes
+	if request.Scope == RunMailboxScopeHandoffFiles {
+		bound = MaxRunMailboxHandoffFileBytes
+	}
+	if request.Limit <= 0 || request.Limit > bound {
+		return bound
 	}
 	return request.Limit
 }

@@ -157,6 +157,7 @@ The full pass criteria and evidence commands are in the
 - `wefty nodes set-claims NODE_ID --claims-enabled=false --intent-revision=REV --reason="maintenance"` records revision-guarded operator intent; the authenticated Fabric identity is recorded as the actor.
 - `wefty submit` submits a saved workflow or inline script to the run ledger.
 - `wefty logs RUN_ID --follow` reads a run's logs until it settles.
+- `wefty results RUN_ID [--out FILE]` reads the result document the run uploaded when it finished, from the ledger rather than from the node that produced it.
 - `wefty rerun RUN_ID` creates a new run from the original stored snapshot.
 - `wefty drain NODE_ID` stops new claims on a node while current work finishes.
 

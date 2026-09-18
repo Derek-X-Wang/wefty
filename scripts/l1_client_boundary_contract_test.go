@@ -46,8 +46,14 @@ const fabricSubpackagePrefix = fabricImportPath + "/"
 // If a new l1 identifier is needed to answer "yes", it belongs in the
 // OpenAPI contract before it belongs in this allowlist.
 var allowedL1Identifiers = map[string]bool{
-	"Job":                     true,
-	"LogPage":                 true,
+	"Job":     true,
+	"LogPage": true,
+	// JobResult is the result-read arm of the same client protocol LogPage
+	// belongs to, and it is published in api/openapi/l1-client.v1.json under
+	// GET /v1/jobs/{job_id}/result. A third party building their own L3 from
+	// that document can decode this type from the contract alone, which is the
+	// ADR-0006 litmus test.
+	"JobResult":               true,
 	"DefaultLogPageLimit":     true,
 	"MaxLogPageLimit":         true,
 	"ComputerTokenScopeProof": true,

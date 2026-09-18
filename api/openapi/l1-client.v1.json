@@ -363,6 +363,47 @@
         }
       }
     },
+    "/v1/jobs/{job_id}/result": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getJobResult",
+        "summary": "Read the result document the job's latest attempt uploaded",
+        "description": "Authorized exactly as the job's logs are. The row is replaced by a retry and removed with the job, so it answers for the job's latest attempt only.",
+        "responses": {
+          "200": {
+            "description": "The stored result document, or the reason a result that exists on the node did not travel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/JobResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/v1/jobs/{job_id}/desired-state": {
       "parameters": [
         { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }

@@ -477,3 +477,74 @@ func TestRemoteRunMailboxKeepsAnEntryWhoseTransportReportedENOENT(t *testing.T) 
 		t.Fatalf("finalization published %d documents", len(documents))
 	}
 }
+
+// TestHandoffFileReadTrustsTheHelpersTruncationFlag pins the boundary. The
+// helper reads one byte past the bound, so it can tell a document that exactly
+// fits from one that does not; inferring truncation from the length instead
+// would refuse a complete result at exactly the bound.
+func TestHandoffFileReadTrustsTheHelpersTruncationFlag(t *testing.T) {
+	bound := ocihelper.MaxRunMailboxHandoffFileBytes
+	for name, size := range map[string]int{
+		"just under the bound": bound - 1,
+		"exactly at the bound": bound,
+		"one byte over":        bound + 1,
+	} {
+		size := size
+		t.Run(name, func(t *testing.T) {
+			runtime := newFakeRunMailboxRuntime()
+			runtime.put("result.json", string(sizedJSONDocument(size)))
+			fs := &helperMailboxFS{
+				runtime:   runtime,
+				reference: workloadrunner.RunMailboxReference{OwnerKey: "run_x", RunID: "run_x"},
+				parent:    t.Context(),
+				timeout:   time.Second,
+			}
+			payload, truncated, err := fs.readHandoffFile(t.Context(), "result.json", contract.MaxUploadedResultBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if size > bound {
+				if !truncated {
+					t.Fatalf("a %d-byte document past the %d-byte bound was not reported truncated", size, bound)
+				}
+				return
+			}
+			if truncated {
+				t.Fatalf("a whole %d-byte document was reported truncated at the %d-byte bound", size, bound)
+			}
+			if len(payload) != size {
+				t.Fatalf("read %d bytes, want %d", len(payload), size)
+			}
+			if result := classifyResultDocument(payload, truncated); result.skip != "" {
+				t.Fatalf("a whole document classified as %q", result.skip)
+			}
+		})
+	}
+	// The read also asks for the handoff scope rather than the events one,
+	// because the two name different directories in the same volume.
+	runtime := newFakeRunMailboxRuntime()
+	runtime.put("result.json", "{}")
+	fs := &helperMailboxFS{
+		runtime:   runtime,
+		reference: workloadrunner.RunMailboxReference{OwnerKey: "run_x", RunID: "run_x"},
+		parent:    t.Context(),
+		timeout:   time.Second,
+	}
+	if _, _, err := fs.readHandoffFile(t.Context(), "result.json", contract.MaxUploadedResultBytes); err != nil {
+		t.Fatal(err)
+	}
+	seen := runtime.seen()
+	if len(seen) != 1 || seen[0].Scope != workloadrunner.RunMailboxScopeHandoffFiles {
+		t.Fatalf("handoff read asked for %#v", seen)
+	}
+}
+
+// sizedJSONDocument builds a valid JSON document of exactly size bytes.
+func sizedJSONDocument(size int) []byte {
+	document := make([]byte, 0, size)
+	document = append(document, `{"x":"`...)
+	for len(document) < size-2 {
+		document = append(document, 'y')
+	}
+	return append(document, `"}`...)
+}
