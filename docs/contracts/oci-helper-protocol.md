@@ -1424,7 +1424,12 @@ task runs and retains each segment until the corresponding events have been
 acknowledged into the agent's `OutputSink`. A corrupt, missing, or truncated
 record emits an exact gap when its discarded byte extent is known and always
 emits an incomplete seal; finalization is anchored on logger pipe EOF or that
-explicit incomplete seal, never file-size stability. Pipe EOF is produced by
+explicit incomplete seal, never file-size stability. Pipe EOF is the stream's
+own completeness proof: every writer is gone and the pipe is drained, so a
+stream that reaches it always seals, including when the logger was already
+asked to terminate. Only a bounded termination drain that ends *before* pipe
+EOF writes an incomplete seal, carrying the bytes it had to discard. Pipe EOF
+is produced by
 deleting the exited task, and the runtime reports a task's exit and its
 task-state transition separately: deletion is refused with a failed
 precondition while the task is still reported running. The helper therefore
