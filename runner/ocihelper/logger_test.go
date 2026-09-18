@@ -141,10 +141,13 @@ func waitForLoggerIncompleteSegments(t *testing.T, segments map[string]string, t
 }
 
 // TestLoggerSealsPipeEOFReachedAfterTerminationWasRequested is the logger-level
-// regression for issue #434. containerd terminates its binary-v2 logger while
-// deleting the exited task, so SIGTERM routinely lands before the shim closes
-// the pipe write ends. Pipe EOF is the completeness proof itself, and treating
-// that ordering as incomplete evidence made a clean one-shot run report
+// regression for issue #434. containerd tears its binary-v2 logger down while
+// deleting the exited task: binaryIO.Close closes both pipe write ends and only
+// then sends SIGTERM. Closure precedes delivery, but the logger's own two
+// observations are racing -- nothing orders the signal goroutine recording
+// termination after the copy goroutine observes the EOF that closure produced.
+// Pipe EOF is the completeness proof itself, so scoring the stream on which of
+// those two landed first made a clean one-shot run report
 // log_evidence_incomplete on nothing but a scheduling race.
 func TestLoggerSealsPipeEOFReachedAfterTerminationWasRequested(t *testing.T) {
 	source, writer, err := os.Pipe()
@@ -208,8 +211,8 @@ func TestLoggerRecordsLostBytesWhenTerminationDrainEndsBeforePipeEOF(t *testing.
 	if err := json.Unmarshal(payload, &evidence); err != nil {
 		t.Fatalf("incomplete evidence = %q: %v", payload, err)
 	}
-	if evidence.Reason != "logger termination drain ended before pipe EOF" || evidence.LostByteCount == 0 {
-		t.Fatalf("incomplete evidence = %+v, want the drain reason and a non-zero discarded extent", evidence)
+	if evidence.Reason != "logger termination drain ended before pipe EOF" || evidence.LostByteCount != 4 {
+		t.Fatalf("incomplete evidence = %+v, want the drain reason and the four unread bytes", evidence)
 	}
 }
 

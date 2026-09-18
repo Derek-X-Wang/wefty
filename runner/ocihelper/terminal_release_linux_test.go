@@ -274,12 +274,14 @@ func TestContainerdSealsLogsWhenExitedTaskIsBrieflyStillReportedRunning(t *testi
 }
 
 // TestContainerdSealsLogsWhenTerminatedLoggerReachedPipeEOF is the engine-level
-// regression for issue #434. containerd signals its binary-v2 logger while
-// deleting the exited task and only then closes the pipe write ends, so the
-// logger routinely reaches pipe EOF with termination already requested. That
-// ordering is a lifecycle fact about the logger process, not a gap in the
-// stream, and a clean one-shot run must not report log_evidence_incomplete
-// because of it.
+// regression for issue #434. containerd tears its binary-v2 logger down while
+// deleting the exited task: binaryIO.Close closes both pipe write ends and only
+// then sends SIGTERM. Closure precedes delivery, yet the logger can still
+// record termination before its copy goroutine observes the EOF that closure
+// produced, so a stream routinely seals with termination already requested.
+// That is a lifecycle fact about the logger process, not a gap in the stream,
+// and a clean one-shot run must not report log_evidence_incomplete because of
+// it.
 func TestContainerdSealsLogsWhenTerminatedLoggerReachedPipeEOF(t *testing.T) {
 	root := t.TempDir()
 	paths := emptyLogSegments(t, root)
