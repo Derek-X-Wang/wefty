@@ -702,3 +702,202 @@ func TestForceForgottenAcknowledgementPrecedesTombstoneFinalization(t *testing.T
 	t.Log("explicit finalization records non-NULL acknowledgement without upgrading forgotten outcome")
 	assertRemovedServiceRows(t, h, job.JobID)
 }
+
+// TestLateCleanupNeverUpgradesAWaivedRemoval holds the waiver terminal for
+// both service kinds. An operator who force-forgets accepts an outcome nobody
+// proved; when a returning node finally acknowledges cleanup, that
+// acknowledgement is evidence of what the node did, not the proof the operator
+// waived. The ordinary-service branch has always refused the upgrade by
+// leaving the force-forgotten tombstone's outcome alone. The Computer branch
+// runs first in finalization and wrote removed_verified unconditionally, so a
+// waived Computer would have ended up claiming a proof nobody made.
+//
+// The Computer half drives the waiver at the store level on purpose: today
+// ForceForgetService refuses a Computer-mapped Job, so the only way to pin the
+// invariant before Computers gain an operator waiver is to write the waived
+// row the waiver will write. It deliberately leaves removed_ns NULL, because
+// removed_ns is the Computer branch's "already finalized" marker and setting
+// it would make the test pass through an unrelated guard.
+func TestLateCleanupNeverUpgradesAWaivedRemoval(t *testing.T) {
+	computer := finalizeWaivedComputerRemoval(t)
+	ordinary := finalizeWaivedOrdinaryRemoval(t)
+	if computer.State != contract.JobForgottenCleanupUnverified || ordinary.State != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("waived states = Computer %q, ordinary %q, want forgotten_cleanup_unverified for both",
+			computer.State, ordinary.State)
+	}
+	if computer.State != ordinary.State {
+		t.Fatalf("the two kinds disagree about a waived removal: Computer %q, ordinary %q",
+			computer.State, ordinary.State)
+	}
+	if computer.Removal.RemovalOutcome != ServiceRemovalForgotten ||
+		ordinary.Removal.RemovalOutcome != ServiceRemovalForgotten {
+		t.Fatalf("waived outcomes = Computer %q, ordinary %q, want force_forgotten for both",
+			computer.Removal.RemovalOutcome, ordinary.Removal.RemovalOutcome)
+	}
+	if computer.Removal.CleanupAcknowledgedAt == nil || ordinary.Removal.CleanupAcknowledgedAt == nil {
+		t.Fatalf("the late acknowledgement was not recorded: Computer %#v, ordinary %#v",
+			computer.Removal, ordinary.Removal)
+	}
+}
+
+// finalizeWaivedComputerRemoval waives proof on a Computer-projecting removal,
+// lets the bound node acknowledge cleanup afterwards, and finalizes.
+func finalizeWaivedComputerRemoval(t *testing.T) Job {
+	t.Helper()
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {
+			Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1,
+		},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+		Name: "waived", Spec: computerCapabilityJobSpec("computer:waived-removal"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID,
+		node.BootSessionID, contract.JobClassService); err != nil || claim == nil {
+		t.Fatalf("claim = %#v err=%v", claim, err)
+	}
+	if computer, err = h.store.GetComputer(context.Background(), computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID, ComputerRemoveRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node",
+		node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("Computer removal directives = %#v, %v", directives, err)
+	}
+	directive := directives[0]
+	waiveComputerRemoval(t, h.store, computer.CurrentJobID)
+
+	completion := RemovalAcknowledgementRequest{
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, IdempotencyKey: "removal:computer-waived-late",
+	}
+	acknowledged, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		computer.CurrentJobID, completion)
+	if err != nil {
+		t.Fatalf("late cleanup acknowledgement on a waived Computer: %v", err)
+	}
+	if acknowledged.State != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("acknowledgement state = %q, want the waiver to stand", acknowledged.State)
+	}
+	finalized, changed, err := h.store.FinalizeServiceRemoval(context.Background(), computer.CurrentJobID)
+	if err != nil || !changed {
+		t.Fatalf("finalize waived Computer removal = %#v changed=%v err=%v", finalized, changed, err)
+	}
+	// The durable row, not just the projection, must still say unverified.
+	var status contract.JobState
+	if err := h.store.db.QueryRow(`SELECT status FROM service_removals WHERE job_id=?`,
+		computer.CurrentJobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	var state contract.JobState
+	if err := h.store.db.QueryRow(`SELECT state FROM jobs WHERE job_id=?`, computer.CurrentJobID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if status != contract.JobForgottenCleanupUnverified || state != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("finalization upgraded the waiver: service_removals.status=%q jobs.state=%q", status, state)
+	}
+	// The Computer's Storage-custody outcome is a separate claim about secret
+	// absence and is still earned by the same positive acknowledgement, exactly
+	// as it is for a removal that was declared stalled.
+	var custody string
+	if err := h.store.db.QueryRow(`SELECT removal_outcome FROM computers WHERE computer_id=?`,
+		computer.ComputerID).Scan(&custody); err != nil {
+		t.Fatal(err)
+	}
+	if custody != "removed_verified" {
+		t.Fatalf("Computer custody outcome = %q, want the acknowledgement to still earn removed_verified", custody)
+	}
+	if finalized.Removal == nil {
+		t.Fatalf("finalized waived Computer has no removal projection: %#v", finalized)
+	}
+	return finalized
+}
+
+// waiveComputerRemoval writes the waiver an operator waiver for Computers will
+// write. It asserts its own fixture: a removal that is not actually waived, or
+// one that already carries the Computer branch's finalized marker, would let
+// the test pass without exercising the guard at all.
+func waiveComputerRemoval(t *testing.T, store *Store, jobID string) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE service_removals SET status=? WHERE job_id=?`,
+		contract.JobForgottenCleanupUnverified, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE jobs SET state=? WHERE job_id=?`,
+		contract.JobForgottenCleanupUnverified, jobID); err != nil {
+		t.Fatal(err)
+	}
+	var status contract.JobState
+	var removedNS sql.NullInt64
+	if err := store.db.QueryRow(`SELECT status, removed_ns FROM service_removals WHERE job_id=?`, jobID).
+		Scan(&status, &removedNS); err != nil {
+		t.Fatal(err)
+	}
+	if status != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("waiver fixture left status=%q; the guard would never be reached", status)
+	}
+	if removedNS.Valid {
+		t.Fatalf("waiver fixture set removed_ns=%d; finalization would stop at the already-finalized guard",
+			removedNS.Int64)
+	}
+	var projections int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_job_projections WHERE job_id=?`, jobID).
+		Scan(&projections); err != nil {
+		t.Fatal(err)
+	}
+	if projections != 1 {
+		t.Fatalf("waiver fixture job has %d Computer projections; finalization would take the ordinary branch",
+			projections)
+	}
+}
+
+// finalizeWaivedOrdinaryRemoval is the same story through the operator path
+// that exists today, so the two branches can be compared on one run.
+func finalizeWaivedOrdinaryRemoval(t *testing.T) Job {
+	t.Helper()
+	harness := newRemovalStallHarness(t)
+	waived, err := harness.h.store.ForceForgetService(context.Background(), harness.job.JobID)
+	if err != nil || waived.State != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("force forget = %#v, %v", waived, err)
+	}
+	completion := RemovalAcknowledgementRequest{
+		NodeID: harness.node.NodeID, BootSessionID: harness.node.BootSessionID,
+		RemovalGeneration: harness.directive.RemovalGeneration, CleanupFence: harness.directive.CleanupFence,
+		RootInstanceID: harness.directive.RootInstanceID, IdempotencyKey: "removal:ordinary-waived-late",
+	}
+	acknowledged, err := harness.declare(t, completion)
+	if err != nil {
+		t.Fatalf("late cleanup acknowledgement on a waived service: %v", err)
+	}
+	if acknowledged.State != contract.JobForgottenCleanupUnverified {
+		t.Fatalf("acknowledgement state = %q, want the waiver to stand", acknowledged.State)
+	}
+	finalized, changed, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID)
+	if err != nil || !changed {
+		t.Fatalf("finalize waived service removal = %#v changed=%v err=%v", finalized, changed, err)
+	}
+	var outcome string
+	if err := harness.h.store.db.QueryRow(`SELECT outcome FROM service_tombstones WHERE job_id=?`,
+		harness.job.JobID).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if ServiceRemovalOutcome(outcome) != ServiceRemovalForgotten {
+		t.Fatalf("tombstone outcome = %q, want force_forgotten", outcome)
+	}
+	if finalized.Removal == nil {
+		t.Fatalf("finalized waived service has no removal projection: %#v", finalized)
+	}
+	return finalized
+}

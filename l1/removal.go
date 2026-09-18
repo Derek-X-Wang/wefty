@@ -883,13 +883,17 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		// release; finalization records the terminal observation in place rather
 		// than deleting the Job into an ordinary-service tombstone.
 		//
-		// A removal already declared stalled keeps that terminal label. The
-		// Slot was released without proof, and a later cleanup cannot retell
-		// that story; the Computer's own custody outcome below is separate and
-		// may still be earned.
+		// A removal already declared stalled, or whose proof an operator
+		// waived, keeps that terminal label. In both cases the Slot went back
+		// without proof and the record says so permanently; a later cleanup
+		// cannot retell that story, exactly as the ordinary-service branch
+		// below refuses to upgrade a force-forgotten tombstone. The Computer's
+		// own custody outcome is separate and may still be earned from the
+		// same acknowledgement.
 		terminal := contract.JobRemovedVerified
-		if removal.status == contract.JobStalledCleanupUnverified {
-			terminal = contract.JobStalledCleanupUnverified
+		if removal.status == contract.JobStalledCleanupUnverified ||
+			removal.status == contract.JobForgottenCleanupUnverified {
+			terminal = removal.status
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, removed_ns=? WHERE job_id=?`,
 			terminal, now.UnixNano(), jobID); err != nil {
@@ -1118,6 +1122,13 @@ func applyServiceRemoval(job *Job, removal serviceRemovalRow) {
 	job.CurrentAttemptID = ""
 	job.ServiceJob = nil
 	outcome := removal.outcome
+	// A waived removal names its own outcome when no tombstone carries one. An
+	// ordinary service reads force_forgotten off the tombstone force-forget
+	// wrote; a Computer keeps its removal row and has no tombstone to read, so
+	// without this the two kinds would answer the same waiver differently.
+	if outcome == "" && removal.status == contract.JobForgottenCleanupUnverified {
+		outcome = ServiceRemovalForgotten
+	}
 	if removal.cleanupStatus == ServiceRemovalCleanupQuarantined {
 		outcome = ServiceRemovalOutcomeCleanupQuarantined
 	}
