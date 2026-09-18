@@ -1567,6 +1567,10 @@ func (lifecycle *attemptLifecycle) retainResultsFallback(claim l1.Claim) {
 	if err := lifecycle.retainResults(claim, false, false); err != nil {
 		lifecycle.log("agent: retain results for attempt %s: %v", claim.Lease.AttemptID, err)
 	}
+	// The upload is latched separately, so a completion that already uploaded
+	// is untouched and an exit that never reached one still accounts for its
+	// result rather than leaving it unexplained.
+	lifecycle.uploadResult(context.Background(), claim)
 }
 
 func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
@@ -1598,7 +1602,13 @@ func (lifecycle *attemptLifecycle) captureRemoteResult(ctx context.Context, mail
 // uploadResult pushes this attempt's result document to the ledger, so that a
 // run's conclusion outlives the node that produced it and can be read without
 // one. It never fails the attempt: a result that did not travel is recorded as
-// a named skip and the file is retained on the node either way.
+// a named skip on the node and the file is retained either way.
+//
+// It runs on every exit that reaches a verdict and on the fallback exits that
+// do not, latched so exactly one of them wins. The fallback matters: an attempt
+// that lost its authority still produced whatever is in its directory, and the
+// ledger refusing that upload is the answer -- no row, and the reason recorded
+// here -- rather than a silence nobody can account for later.
 //
 // The document comes from whichever read path this kind has. A process attempt
 // reads it here, through the ownership receipt it still holds. An OCI attempt
@@ -1622,9 +1632,13 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 	if err != nil {
 		lifecycle.log("agent: upload result for attempt %s: %v", claim.Lease.AttemptID, err)
 	}
-	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		if noteErr := lifecycle.dependencies.handoffs.noteResultUpload(
-			handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID, recorded); noteErr != nil {
+	// The outcome is recorded for every runtime, not only the ones whose
+	// handoff directory this agent owns. An upload that never landed leaves no
+	// ledger row at all, so this record is the only place the reason exists.
+	if lifecycle.dependencies.handoffs != nil {
+		if noteErr := lifecycle.dependencies.handoffs.recordUpload(
+			handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID,
+			claim.Lease.AttemptID, recorded); noteErr != nil {
 			lifecycle.log("agent: record result upload for attempt %s: %v", claim.Lease.AttemptID, noteErr)
 		}
 	}

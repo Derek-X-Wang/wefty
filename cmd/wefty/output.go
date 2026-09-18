@@ -314,10 +314,12 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 		// The uploaded document is what a person can actually read, so it
 		// leads. A result that exists on the node but did not travel says so
 		// and names the reason, because "no result" would be wrong.
-		document := "no result document was uploaded"
+		document := "no result document reached the ledger; the node that ran it records whether the run wrote one"
 		switch {
 		case results.Uploaded:
 			document = "result document uploaded; read it with `wefty results`"
+		case results.UploadSkipReason == contract.ResultUploadSkipAbsent:
+			document = "the run wrote no result document"
 		case results.UploadSkipReason != "":
 			document = "result document not uploaded (" + string(results.UploadSkipReason) + "); it is on the node"
 		}

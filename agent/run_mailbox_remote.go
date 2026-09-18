@@ -106,18 +106,11 @@ func (fs *helperMailboxFS) readHandoffFile(ctx context.Context, name string, lim
 	callContext, cancel := context.WithTimeout(ctx, fs.callTimeout())
 	defer cancel()
 	bounded := int(min(limit, int64(maxHandoffFileReadBytes)))
-	payload, truncated, err := fs.runtime.ReadRunMailbox(callContext, reference, name, bounded)
-	if err != nil {
-		return nil, false, err
-	}
-	// The helper cannot serve more than one frame, so a document at its bound
-	// is reported as truncated even when the helper did not say so. The caller
-	// treats that as oversize and uploads nothing, which is the correct answer
-	// for a document it cannot have whole.
-	if !truncated && len(payload) >= bounded {
-		truncated = true
-	}
-	return payload, truncated, nil
+	// Truncation is the helper's answer, not an inference from the length.
+	// The helper reads one byte past the bound, so it can tell a document that
+	// exactly fits from one that does not, and a document at exactly the bound
+	// is whole. Guessing here would refuse a complete result.
+	return fs.runtime.ReadRunMailbox(callContext, reference, name, bounded)
 }
 
 var _ handoffFileReader = (*helperMailboxFS)(nil)

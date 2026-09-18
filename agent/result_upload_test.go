@@ -121,15 +121,19 @@ func TestASucceedingRunUploadsItsResultExactlyOnce(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(path, "result.json")); err != nil {
 		t.Fatalf("upload consumed the node's own copy: %v", err)
 	}
-	record := requireRetentionRecord(t, harness.manager, "run_uploaded")
-	if !record.Uploaded || record.UploadSkipReason != "" {
-		t.Fatalf("retention record does not record the upload: %#v", record)
+	upload := requireUploadRecord(t, harness.manager, "run_uploaded")
+	if !upload.Uploaded || upload.Reason != "" {
+		t.Fatalf("upload record does not record the upload: %#v", upload)
+	}
+	if upload.AttemptID != retentionClaim(t, "run_uploaded", path).Lease.AttemptID {
+		t.Fatalf("upload record names attempt %q", upload.AttemptID)
 	}
 }
 
-// TestARunThatWroteNoResultUploadsNothing keeps the common case free. Absence is
-// what an empty answer already means, so it costs no row and no request.
-func TestARunThatWroteNoResultUploadsNothing(t *testing.T) {
+// TestARunThatWroteNoResultStillClaimsTheRow is the ordering rule seen from the
+// agent's side. A retry that produced nothing must displace its predecessor's
+// document, so "nothing" is uploaded too, as a named absence.
+func TestARunThatWroteNoResultStillClaimsTheRow(t *testing.T) {
 	harness := newRetentionHarness(t, time.Hour)
 	recorder := &resultUploadRecorder{}
 	path := filepath.Join(harness.root, "run_silent")
@@ -137,12 +141,33 @@ func TestARunThatWroteNoResultUploadsNothing(t *testing.T) {
 	if _, err := lifecycle.execute(t.Context(), retentionClaim(t, "run_silent", path), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if requests, _ := recorder.observed(); len(requests) != 0 {
-		t.Fatalf("uploaded %d requests for a run with no result: %#v", len(requests), requests)
+	requests, _ := recorder.observed()
+	if len(requests) != 1 {
+		t.Fatalf("uploaded %d requests, want one absence receipt: %#v", len(requests), requests)
 	}
-	record := requireRetentionRecord(t, harness.manager, "run_silent")
-	if record.Uploaded || record.UploadSkipReason != contract.ResultUploadSkipAbsent {
-		t.Fatalf("retention record = %#v", record)
+	if len(requests[0].Document) != 0 || requests[0].SkipReason != contract.ResultUploadSkipAbsent {
+		t.Fatalf("absence receipt = %#v", requests[0])
+	}
+	upload := requireUploadRecord(t, harness.manager, "run_silent")
+	if upload.Uploaded || upload.Reason != contract.ResultUploadSkipAbsent {
+		t.Fatalf("upload record = %#v", upload)
+	}
+}
+
+// TestAnEmptyResultFileIsNotAnAbsentOne separates two facts a reader acts on
+// differently: a run that wrote nothing, and a run that created the file and
+// left it empty.
+func TestAnEmptyResultFileIsNotAnAbsentOne(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	recorder := &resultUploadRecorder{}
+	path := filepath.Join(harness.root, "run_empty")
+	lifecycle := uploadingLifecycle(t, harness.manager, recorder, writingRun(path, "result.json", nil))
+	if _, err := lifecycle.execute(t.Context(), retentionClaim(t, "run_empty", path), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	requests, _ := recorder.observed()
+	if len(requests) != 1 || requests[0].SkipReason != contract.ResultUploadSkipNotJSON {
+		t.Fatalf("empty result receipt = %#v", requests)
 	}
 }
 
@@ -153,7 +178,9 @@ func TestAResultTooLargeToUploadSaysSoInsteadOfTravellingTruncated(t *testing.T)
 	harness := newRetentionHarness(t, time.Hour)
 	recorder := &resultUploadRecorder{}
 	path := filepath.Join(harness.root, "run_oversize")
-	oversize := append([]byte(`{"big":"`), make([]byte, contract.MaxUploadedResultBytes)...)
+	// Valid JSON, and only the bound is over: the refusal must be about size
+	// rather than about shape.
+	oversize := oversizeResultDocument(contract.MaxUploadedResultBytes + 1)
 	lifecycle := uploadingLifecycle(t, harness.manager, recorder, writingRun(path, "result.json", oversize))
 	if _, err := lifecycle.execute(t.Context(), retentionClaim(t, "run_oversize", path), time.Now()); err != nil {
 		t.Fatal(err)
@@ -187,10 +214,69 @@ func TestAnUploadTheLedgerRefusesIsRecordedAsOneAndDoesNotFailTheRun(t *testing.
 	if _, err := lifecycle.execute(t.Context(), retentionClaim(t, "run_refused", path), time.Now()); err != nil {
 		t.Fatalf("a refused upload failed the attempt: %v", err)
 	}
-	record := requireRetentionRecord(t, harness.manager, "run_refused")
-	if record.Uploaded || record.UploadSkipReason != contract.ResultUploadSkipTransport {
-		t.Fatalf("retention record = %#v", record)
+	upload := requireUploadRecord(t, harness.manager, "run_refused")
+	if upload.Uploaded || upload.Reason != contract.ResultUploadSkipTransport {
+		t.Fatalf("upload record = %#v", upload)
 	}
+}
+
+// TestAnOCIAttemptRecordsItsUploadOutcomeToo is the runtime the ledger cannot
+// speak for: an OCI run's handoff volume is the helper's, it has no retention
+// record at all, and a refused upload leaves no ledger row. The node's own
+// upload record is therefore the only account of what happened.
+func TestAnOCIAttemptRecordsItsUploadOutcomeToo(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	recorder := &resultUploadRecorder{status: http.StatusConflict}
+	client, stop := startEvidenceReplayServer(t, recorder.handler(), time.Second)
+	t.Cleanup(stop)
+	t.Cleanup(client.Close)
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, handoffs: harness.manager, nodeID: "node-1",
+		bootSessionID: "upload-boot", clock: systemClock{},
+		observer: newLifecycleObserver(systemClock{}), renewalInterval: 10 * time.Second,
+	})
+	claim := retentionClaim(t, "run_oci", filepath.Join(harness.root, "run_oci"))
+	claim.Job.Spec.Kind = contract.JobKindOCI
+	captured := attemptResult{document: []byte(`{"ok":true}`)}
+	lifecycle.capturedResult.Store(&captured)
+
+	lifecycle.uploadResult(t.Context(), claim)
+
+	if requests, _ := recorder.observed(); len(requests) != 1 {
+		t.Fatalf("OCI attempt uploaded %d requests", len(requests))
+	}
+	upload := requireUploadRecord(t, harness.manager, "run_oci")
+	if upload.Uploaded || upload.Reason != contract.ResultUploadSkipTransport {
+		t.Fatalf("OCI upload record = %#v", upload)
+	}
+	// The retention record belongs to the handoff lifecycle this runtime does
+	// not use, so nothing wrote one, and that is the point of a separate
+	// upload record rather than a field on that one.
+	if records := harness.manager.loadRecords(); len(records) != 0 {
+		t.Fatalf("an OCI run wrote %d retention records", len(records))
+	}
+}
+
+func requireUploadRecord(t *testing.T, manager *handoffManager, runID string) uploadRecord {
+	t.Helper()
+	record, found, err := manager.readUploadRecord(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("no upload record for run %s", runID)
+	}
+	return record
+}
+
+// oversizeResultDocument builds a valid JSON document just past a bound.
+func oversizeResultDocument(bytes int64) []byte {
+	document := make([]byte, 0, bytes+16)
+	document = append(document, `{"big":"`...)
+	for int64(len(document)) < bytes-2 {
+		document = append(document, 'x')
+	}
+	return append(document, `"}`...)
 }
 
 // TestReadingAResultRequiresThisAttemptsOwnReceipt is the same rule the
@@ -275,6 +361,15 @@ func TestWhatCountsAsAResultDocument(t *testing.T) {
 		t.Fatalf("non-JSON result = %#v", result)
 	}
 
+	// An empty file is a file the run wrote and did not fill. That is not the
+	// same fact as a run that wrote nothing, and it must not read as one.
+	if err := os.WriteFile(filepath.Join(directory, "result.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result := readHandoffResult(root); result.skip != contract.ResultUploadSkipNotJSON {
+		t.Fatalf("empty result file = %#v", result)
+	}
+
 	if err := os.WriteFile(filepath.Join(directory, "result.json"), []byte(`{"ok":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -310,6 +405,10 @@ func TestTheHelperReadPathClassifiesTheSameWayTheLocalOneDoes(t *testing.T) {
 	if result := readRemoteHandoffResult(t.Context(), &stubHandoffFileReader{
 		payload: make([]byte, 16), truncated: true}); result.skip != contract.ResultUploadSkipOversize {
 		t.Fatalf("truncated result = %#v", result)
+	}
+	// An empty payload with no error is an empty file, not a missing one.
+	if result := readRemoteHandoffResult(t.Context(), &stubHandoffFileReader{}); result.skip != contract.ResultUploadSkipNotJSON {
+		t.Fatalf("empty remote result = %#v", result)
 	}
 	if result := readRemoteHandoffResult(t.Context(), &stubHandoffFileReader{
 		err: errRunMailboxEntryUnusable}); result.skip != contract.ResultUploadSkipNotFile {

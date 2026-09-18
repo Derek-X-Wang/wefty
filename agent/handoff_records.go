@@ -27,6 +27,9 @@ import (
 // and eviction is only ever a record under this root.
 const (
 	retentionRecordDirectoryName = "run-results"
+	// uploadRecordDirectoryName holds one document per run saying what became
+	// of its result upload.
+	uploadRecordDirectoryName = "run-uploads"
 	// maxRetentionRecordBytes bounds one record read. A record is a handful of
 	// fields; anything larger is not one.
 	maxRetentionRecordBytes = 8 << 10
@@ -45,36 +48,69 @@ type retentionRecord struct {
 	RetainUntil time.Time `json:"retain_until"`
 	Published   bool      `json:"published,omitempty"`
 	Succeeded   bool      `json:"succeeded,omitempty"`
-	// Uploaded and UploadSkipReason are this node's own account of whether the
-	// run's result reached the ledger. The ledger is authoritative for what it
-	// holds; this is the node-side answer to "why is there nothing there", and
-	// it is the only place a transport failure is recorded at all.
-	Uploaded         bool                            `json:"uploaded,omitempty"`
-	UploadSkipReason contract.ResultUploadSkipReason `json:"upload_skip_reason,omitempty"`
 }
 
-// noteResultUpload amends an already-written retention record with the outcome
-// of the upload. It amends rather than writes: retention is decided at
-// completion and must not be re-dated by a later, slower network call, and a
-// record that is not this node's is not this node's to touch.
-func (m *handoffManager) noteResultUpload(runID, nodeID string, result attemptResult) error {
+// uploadRecord is this node's own account of what happened to a run's result
+// document. It is separate from the retention record on purpose, and written
+// for every runtime rather than only the ones whose directory this agent owns.
+//
+// Separate, because retention is authority -- what may be deleted and when --
+// and this is diagnosis. Folding a slower network outcome into the record that
+// decides deletion would let a failed upload re-date a retention window.
+//
+// For every runtime, because the case this exists for is precisely the one the
+// ledger cannot answer: an upload that never landed leaves no row there, so a
+// reader sees an ordinary absence and the reason lives only here. An OCI run's
+// handoff volume is the helper's and has no retention record at all, which is
+// exactly why the upload outcome cannot live in one.
+type uploadRecord struct {
+	RunID     string                          `json:"run_id"`
+	NodeID    string                          `json:"node_id"`
+	AttemptID string                          `json:"attempt_id"`
+	Uploaded  bool                            `json:"uploaded"`
+	Reason    contract.ResultUploadSkipReason `json:"reason,omitempty"`
+	At        time.Time                       `json:"at"`
+}
+
+func (m *handoffManager) uploadRecordRoot() string {
+	return filepath.Join(m.stateRoot, uploadRecordDirectoryName)
+}
+
+// recordUpload writes what became of this attempt's result. It is best effort
+// by design: it never fails an attempt, because a node that cannot write its
+// own diagnosis has not changed what the run did.
+func (m *handoffManager) recordUpload(runID, nodeID, attemptID string, result attemptResult) error {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" || strings.TrimSpace(runID) == "" {
 		return nil
 	}
-	path := filepath.Join(m.recordRoot(), recordComponent(runID))
-	record, err := m.readRecord(path)
+	record := uploadRecord{
+		RunID: runID, NodeID: nodeID, AttemptID: attemptID,
+		Uploaded: len(result.document) > 0 && result.skip == "",
+		Reason:   result.skip, At: m.now().UTC(),
+	}
+	return writeStateDocument(m.uploadRecordRoot(), recordComponent(runID), record)
+}
+
+// readUploadRecord reads one run's upload outcome back. Nothing in the agent
+// acts on it; it exists so an operator on the node, and the tests, can see the
+// reason a result never reached the ledger.
+func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, error) {
+	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
+		return uploadRecord{}, false, nil
+	}
+	path := filepath.Join(m.uploadRecordRoot(), recordComponent(runID))
+	payload, err := readStateDocument(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return uploadRecord{}, false, nil
 	}
 	if err != nil {
-		return err
+		return uploadRecord{}, false, err
 	}
-	if record.RunID != runID || record.NodeID != nodeID {
-		return nil
+	var record uploadRecord
+	if err := json.Unmarshal(payload, &record); err != nil {
+		return uploadRecord{}, false, err
 	}
-	record.Uploaded = len(result.document) > 0 && result.skip == ""
-	record.UploadSkipReason = result.skip
-	return m.writeRecord(record)
+	return record, true, nil
 }
 
 func (m *handoffManager) recordRoot() string {
@@ -107,24 +143,29 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return nil
 	}
-	root := m.recordRoot()
+	return writeStateDocument(m.recordRoot(), recordComponent(record.RunID), record)
+}
+
+// writeStateDocument writes one small agent-owned JSON document by
+// write-then-rename. The staging name is removed first rather than truncated,
+// so a name that is anything but the file the agent expects is replaced rather
+// than written through.
+func writeStateDocument(root, name string, value any) error {
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return fmt.Errorf("create retention record directory: %w", err)
+		return fmt.Errorf("create %s: %w", root, err)
 	}
-	payload, err := json.Marshal(record)
+	payload, err := json.Marshal(value)
 	if err != nil {
-		return fmt.Errorf("encode retention record: %w", err)
+		return fmt.Errorf("encode agent state document: %w", err)
 	}
-	path := filepath.Join(root, recordComponent(record.RunID))
+	path := filepath.Join(root, name)
 	staging := path + ".tmp"
-	// Remove-then-create-exclusive, so a name that is anything but the file the
-	// agent expects is replaced rather than written through.
 	if err := os.Remove(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	file, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("write retention record: %w", err)
+		return fmt.Errorf("write agent state document: %w", err)
 	}
 	if _, err := file.Write(payload); err != nil {
 		file.Close()
@@ -186,37 +227,50 @@ func (m *handoffManager) loadRecords() []retentionRecord {
 // readRecord is bounded, refuses anything that is not a regular file, and
 // proves the object it opened is the object it checked.
 func (m *handoffManager) readRecord(path string) (retentionRecord, error) {
-	info, err := os.Lstat(path)
+	payload, err := readStateDocument(path)
 	if err != nil {
 		return retentionRecord{}, err
-	}
-	if !info.Mode().IsRegular() {
-		return retentionRecord{}, fmt.Errorf("retention record is not a regular file")
-	}
-	file, err := os.OpenFile(path, os.O_RDONLY|noFollowOpenFlag|runMailboxNonBlockingOpen, 0)
-	if err != nil {
-		return retentionRecord{}, err
-	}
-	defer file.Close()
-	opened, err := file.Stat()
-	if err != nil {
-		return retentionRecord{}, err
-	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return retentionRecord{}, fmt.Errorf("retention record changed identity while opening")
-	}
-	payload, err := io.ReadAll(io.LimitReader(file, maxRetentionRecordBytes+1))
-	if err != nil {
-		return retentionRecord{}, err
-	}
-	if len(payload) > maxRetentionRecordBytes {
-		return retentionRecord{}, fmt.Errorf("retention record exceeds %d bytes", maxRetentionRecordBytes)
 	}
 	var record retentionRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
 		return retentionRecord{}, err
 	}
 	return record, nil
+}
+
+// readStateDocument reads one small agent-owned JSON document. It refuses
+// anything that is not a regular file, never follows a link, opens
+// non-blocking, proves the opened object is the one it checked, and stops at
+// the bound -- the same rules every other agent-side read in this package
+// applies, because this directory shares the agent's own OS identity.
+func readStateDocument(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("agent state document is not a regular file")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|noFollowOpenFlag|runMailboxNonBlockingOpen, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, fmt.Errorf("agent state document changed identity while opening")
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, maxRetentionRecordBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxRetentionRecordBytes {
+		return nil, fmt.Errorf("agent state document exceeds %d bytes", maxRetentionRecordBytes)
+	}
+	return payload, nil
 }
 
 // validRetentionRecord refuses a record whose identity does not match its own

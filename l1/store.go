@@ -4347,6 +4347,15 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
 			"document exceeds %d bytes", contract.MaxUploadedResultBytes)
 	}
+	// The document is a JSON document by contract, and the ledger checks that
+	// rather than trusting it. It still does not look inside: what the object
+	// means is the workflow's business, but that it is an object at all is
+	// this protocol's, and a reader asking for the run's result must never be
+	// handed arbitrary bytes that a node called a result.
+	if len(request.Document) > 0 && !json.Valid(request.Document) {
+		return AttemptResultResponse{}, protocolError(contract.ErrorInvalidRequest,
+			"document is not valid JSON")
+	}
 	// A skip receipt has no document, and the column is NOT NULL: store an
 	// explicit empty blob rather than a nil that reads as a missing value.
 	document := request.Document
@@ -4375,6 +4384,21 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return AttemptResultResponse{}, err
 	}
+	// Evidence acceptance is deliberately generous about time -- an attempt
+	// whose lease has just lapsed still produced what it produced -- but a
+	// result is one row rather than an append, so generosity about time must
+	// not become generosity about order. The row belongs to the job's latest
+	// attempt, and this check runs inside the same transaction as the write so
+	// a retry that starts between them cannot be overwritten by its
+	// predecessor's late upload.
+	latest, err := latestAttemptID(ctx, tx, jobID)
+	if err != nil {
+		return AttemptResultResponse{}, err
+	}
+	if latest != attemptID {
+		return AttemptResultResponse{}, protocolError(contract.ErrorSupersededAttempt,
+			"attempt %s is not the latest attempt of job %s", attemptID, jobID)
+	}
 	now := canonicalTime(s.clock.Now())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_results(job_id, attempt_id, document, sha256, skip_reason, uploaded_ns)
 		VALUES(?, ?, ?, ?, ?, ?)
@@ -4388,6 +4412,23 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 	}
 	return AttemptResultResponse{SHA256: encoded, Bytes: len(request.Document),
 		SkipReason: request.SkipReason, UploadedAt: now}, nil
+}
+
+// latestAttemptID names the attempt that currently speaks for a job. Order is
+// creation order, with the attempt ID breaking a tie, so two attempts created
+// in the same nanosecond still have exactly one answer.
+func latestAttemptID(ctx context.Context, q queryer, jobID string) (string, error) {
+	var attemptID string
+	err := q.QueryRowContext(ctx,
+		`SELECT attempt_id FROM attempts WHERE job_id=? ORDER BY created_ns DESC, attempt_id DESC LIMIT 1`,
+		jobID).Scan(&attemptID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", protocolError(contract.ErrorAttemptNotFound, "job %s has no attempts", jobID)
+	}
+	if err != nil {
+		return "", internalError(err, "read latest attempt")
+	}
+	return attemptID, nil
 }
 
 // GetJobResult reads the stored result document. Absence is a typed not-found

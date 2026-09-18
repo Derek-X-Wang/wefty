@@ -45,12 +45,15 @@ func (result attemptResult) empty() bool {
 
 // classifyResultDocument applies the one rule every read path shares: what the
 // node uploads is a bounded JSON document, or nothing.
+//
+// It never answers "absent". Absence is a fact about the directory, not about
+// bytes, and only the caller that looked for the file knows it. A file that
+// exists and is empty is a file the run wrote and did not fill, which is a
+// different thing an operator would want to hear about, so it reads as
+// not_json like any other content that is not a JSON document.
 func classifyResultDocument(document []byte, truncated bool) attemptResult {
 	if truncated || int64(len(document)) > contract.MaxUploadedResultBytes {
 		return attemptResult{skip: contract.ResultUploadSkipOversize}
-	}
-	if len(document) == 0 {
-		return attemptResult{skip: contract.ResultUploadSkipAbsent}
 	}
 	if !json.Valid(document) {
 		return attemptResult{skip: contract.ResultUploadSkipNotJSON}
@@ -126,14 +129,17 @@ func readRemoteHandoffResult(ctx context.Context, reader handoffFileReader) atte
 	return classifyResultDocument(document, truncated)
 }
 
-// uploadAttemptResult pushes what the node found. A skip that says the run
-// simply wrote no result uploads nothing at all: absence is what an empty read
-// already means, and a row saying "absent" would only cost a write. Every other
-// skip is uploaded, because it is the difference between "no result" and "the
-// result is over there and this is why it did not travel".
+// uploadAttemptResult pushes what the node found -- always, including the fact
+// that it found nothing.
+//
+// Every completion that holds the receipt writes exactly one row, because the
+// row belongs to the job's latest attempt and a retry that produced no result
+// must still displace its predecessor's. Uploading nothing for an absent result
+// would leave the earlier attempt's document standing as the run's answer,
+// which is the one thing this row exists to prevent.
 func uploadAttemptResult(ctx context.Context, client *Client, jobID, attemptID, fencingToken string,
 	result attemptResult) (attemptResult, error) {
-	if client == nil || result.empty() || result.skip == contract.ResultUploadSkipAbsent {
+	if client == nil || result.empty() {
 		return result, nil
 	}
 	request := l1.AttemptResultRequest{FencingToken: fencingToken, SkipReason: result.skip}
@@ -143,10 +149,12 @@ func uploadAttemptResult(ctx context.Context, client *Client, jobID, attemptID, 
 		request.SHA256 = hex.EncodeToString(digest[:])
 	}
 	if _, err := client.SetAttemptResult(ctx, jobID, attemptID, request); err != nil {
-		// A document that did not travel is recorded locally as a transport
-		// skip. It is not retried here: the run is finishing, the file is
-		// retained on the node, and a retry loop at this point would hold a
-		// completion open behind a ledger that is already failing.
+		// An upload that did not land -- a refused ledger, an unreachable one,
+		// an attempt a successor has already superseded -- is recorded locally
+		// as a transport skip and leaves no ledger row at all. It is not
+		// retried here: the run is finishing, the file is retained on the
+		// node, and a retry loop at this point would hold a completion open
+		// behind a ledger that is already failing.
 		return attemptResult{skip: contract.ResultUploadSkipTransport}, err
 	}
 	return result, nil

@@ -703,8 +703,15 @@ only exists on the node that produced it stops being readable the moment that
 node does. So at completion the agent reads `result.json` once and pushes it to
 L1, on an agent route beside the one it already uses for logs and authorized the
 same way — attempt evidence, so a result produced by an attempt whose lease has
-just expired is still accepted. L1 keeps one document per job, replaced by a
-retry and removed with the job exactly as its logs are; L3 exposes it per run.
+just expired is still accepted.
+
+L1 keeps one row per job and **that row belongs to the job's latest attempt**.
+An upload from an attempt a later one has already superseded is refused
+(`superseded_attempt`), and every completion writes the row — the document, or
+the named reason there is none, `absent` included — so a retry that produced no
+result displaces its predecessor's document and a reader is never shown an
+earlier attempt's result as this run's answer. The row is removed with the job,
+exactly as its logs are; L3 exposes it per run.
 
     wefty results RUN_ID [--out FILE]
 
@@ -726,15 +733,22 @@ the document is encoded into it. A run whose `result.json` exceeds its bound
 keeps the file on the node and uploads nothing: a truncated result document
 still parses as a result, which makes a partial upload worse than none.
 
-Not every run has a result to upload, and the reasons are named rather than
-collapsed into silence. A run that wrote no `result.json` uploads nothing and
-reads back as an ordinary "no result". A run that wrote one the node could not
-upload — it is not a regular file, it exceeds the bound, it is not JSON, it
-could not be read, or the upload itself failed — uploads the reason instead of
-the document, so a reader is told the result is on the node rather than being
-told the run produced nothing. `wefty inspect` reports the same two facts side
-by side: `uploaded`, which is observed, and the on-node retention window, which
-is computed.
+Not every run has a result, and the reasons are named rather than collapsed
+into silence. A run that wrote no `result.json` uploads `absent`. A run that
+wrote one the node could not use — it is not a regular file, it is empty or
+otherwise not a JSON document, or it exceeds the bound — uploads that reason
+instead of the document, so a reader is told the file is on the node rather than
+being told the run produced nothing.
+
+**An upload that never reaches the ledger leaves no row at all.** A refused or
+unreachable L1, and an attempt that lost its authority before it could upload,
+are exactly the cases the ledger cannot describe, because nothing of theirs got
+there. The reader sees an ordinary not-found, and the reason lives on the node
+that ran the job: the agent writes an upload record beside the run's retained
+files, for every runtime including `kind=oci`, whose handoff volume is the
+helper's and has no retention record of its own. `wefty inspect` says so rather
+than guessing — it reports `uploaded`, which is observed from the ledger, the
+named reason when the ledger holds one, and where to look when it does not.
 
 Handoff files are node-local. If a cold rerun finds files in an existing
 managed directory, its job must include the reserved routing tag

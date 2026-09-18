@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -205,6 +207,9 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err := execute(ctx, clients, false, []string{"logs", resultRun.RunID, "--follow", "--poll-interval", "5ms"}, &logsOut, &logsErr); err != nil {
 		t.Fatalf("follow result run logs: %v", err)
 	}
+	// Raw stdout, not trimmed: the document must come back byte for byte, so
+	// redirecting it to a file and using --out give the same bytes and the
+	// same digest.
 	document := waitForCLIResult(ctx, t, clients, resultRun.RunID)
 	if document != `{"passed":true,"gates":[]}` {
 		t.Fatalf("wefty results printed %q", document)
@@ -220,8 +225,8 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(written) != `{"passed":true,"gates":[]}` {
-		t.Fatalf("--out wrote %q", written)
+	if string(written) != document {
+		t.Fatalf("--out wrote %q, stdout wrote %q", written, document)
 	}
 	var resultJSON bytes.Buffer
 	if err := execute(ctx, clients, true, []string{"results", resultRun.RunID}, &resultJSON, &commandErr); err != nil {
@@ -231,8 +236,14 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err := json.Unmarshal(resultJSON.Bytes(), &view); err != nil {
 		t.Fatal(err)
 	}
-	if view.RunID != resultRun.RunID || view.Bytes != len(written) || view.SHA256 == "" || view.UploadedAt.IsZero() {
+	if view.RunID != resultRun.RunID || view.Bytes != len(written) || view.UploadedAt.IsZero() {
 		t.Fatalf("--json results = %#v", view)
+	}
+	// The digest the ledger stored is the digest of exactly those bytes, which
+	// is only true because nothing was appended on the way out.
+	digest := sha256.Sum256(written)
+	if view.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("stored digest %q does not cover the bytes the CLI emitted", view.SHA256)
 	}
 	// The document is embedded as JSON rather than a base64 string, so a
 	// caller piping this into jq gets the run's own object. The encoder
@@ -374,7 +385,7 @@ func waitForCLIResult(ctx context.Context, t *testing.T, clients *apiClients, ru
 	for time.Now().Before(deadline) {
 		var out, errOut bytes.Buffer
 		if err := execute(ctx, clients, false, []string{"results", runID}, &out, &errOut); err == nil {
-			return strings.TrimSpace(out.String())
+			return out.String()
 		} else {
 			last = err
 		}
@@ -422,13 +433,26 @@ func TestInspectResultsBlockSeparatesUploadedFromRetained(t *testing.T) {
 	if !strings.Contains(skipped, "not uploaded (exceeds_upload_bound)") || !strings.Contains(skipped, "on the node") {
 		t.Errorf("a result that did not travel is not reported:\n%s", skipped)
 	}
-	silent := render(t, func(*runResults) {})
-	if !strings.Contains(silent, "no result document was uploaded") {
-		t.Errorf("a run with no result is not reported:\n%s", silent)
+	// Nothing in the ledger is not proof the run wrote nothing: an upload that
+	// never landed leaves no row either, so this line must send the reader to
+	// the node rather than state a conclusion.
+	unknown := render(t, func(*runResults) {})
+	if !strings.Contains(unknown, "no result document reached the ledger") ||
+		!strings.Contains(unknown, "the node that ran it records") {
+		t.Errorf("an absent ledger row is reported as a conclusion:\n%s", unknown)
+	}
+	// A run that positively reported writing none says so.
+	silent := render(t, func(results *runResults) {
+		results.UploadSkipReason = contract.ResultUploadSkipAbsent
+	})
+	if !strings.Contains(silent, "the run wrote no result document") {
+		t.Errorf("a run that wrote no result is not reported:\n%s", silent)
 	}
 	// The node-side retention line survives in every case: the files are a
 	// separate fact from the document, and the block must not collapse them.
-	for name, out := range map[string]string{"uploaded": uploaded, "skipped": skipped, "silent": silent} {
+	for name, out := range map[string]string{
+		"uploaded": uploaded, "skipped": skipped, "silent": silent, "unknown": unknown,
+	} {
 		if !strings.Contains(out, "files: retained until") || !strings.Contains(out, "node node-1") {
 			t.Errorf("%s output lost the retention line:\n%s", name, out)
 		}

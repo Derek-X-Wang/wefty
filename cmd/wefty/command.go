@@ -133,8 +133,7 @@ func runResultsFor(run contract.RunRecord, now time.Time) *runResults {
 		RetainedUntil: &retainedUntil,
 		Expired:       now.After(retainedUntil),
 		Observed:      false,
-		Note: "files are scheduled under the default retention window;" +
-			" an uploaded result document is read with `wefty results`",
+		Note:          resultsNote,
 	}
 }
 
@@ -160,6 +159,14 @@ func observeUploadedResult(results *runResults, result l3.RunResult, err error) 
 	results.UploadSkipReason = result.SkipReason
 	return nil
 }
+
+// resultsNote says what the block's two halves mean, including the case the
+// ledger cannot describe: a node that could not upload at all leaves no row,
+// so absence here is not proof the run produced nothing.
+const resultsNote = "files are scheduled under the default retention window;" +
+	" an uploaded result document is read with `wefty results`." +
+	" A run with no result here either wrote none or could not upload one;" +
+	" the node that ran it records which, beside its retained files"
 
 // executeResults reads the result document the run uploaded when it finished.
 //
@@ -188,6 +195,9 @@ func executeResults(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	if jsonOutput {
 		return writeJSON(stdout, newResultDocumentView(result))
 	}
+	if result.SkipReason == contract.ResultUploadSkipAbsent {
+		return fmt.Errorf("run %s wrote no result document", result.RunID)
+	}
 	if result.SkipReason != "" {
 		// Not an empty document and not an error: the run produced a result
 		// the node could not upload, and the useful answer names the reason
@@ -202,12 +212,11 @@ func executeResults(ctx context.Context, clients *apiClients, jsonOutput bool, a
 		_, err := fmt.Fprintf(stdout, "%s\t%d bytes\tsha256:%s\n", out, len(result.Document), result.SHA256)
 		return err
 	}
-	if _, err := stdout.Write(result.Document); err != nil {
-		return err
-	}
-	if len(result.Document) > 0 && result.Document[len(result.Document)-1] != '\n' {
-		_, err = io.WriteString(stdout, "\n")
-	}
+	// Exactly the document's bytes and nothing else. A trailing newline added
+	// for the terminal's benefit would make redirected stdout differ from
+	// --out and from the digest the ledger stored, which is the one thing a
+	// byte-for-byte contract cannot afford.
+	_, err = stdout.Write(result.Document)
 	return err
 }
 
