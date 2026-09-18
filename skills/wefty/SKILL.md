@@ -129,6 +129,37 @@ shows the run's current step — the most recently started step that has not
 ended — and `inspect` shows every step with how long it took. A step still
 running has no duration, because the time so far is not the time it took.
 
+## Recipe: an issue to a draft PR
+
+`workflows/issue-to-pr/` reads a GitHub issue, lets a coding agent implement it,
+runs the repository's gates, and opens a **draft** pull request. It runs as a
+`kind=process` job on a node you own, using your `gh` and agent logins, so pin it
+to that node:
+
+```sh
+RUN_ID=$(wefty --json submit \
+  --script=workflows/issue-to-pr/issue-to-pr.sh \
+  --interpreter=bash \
+  --params '{"issue":"479"}' \
+  --tag=wefty:node:<your-mac> \
+  --required-envelope \
+  --max-runtime=5400 \
+  --idempotency-key="issue-to-pr-479-$(date -u +%s)" | jq -er '.run_id')
+
+wefty wait "$RUN_ID" --timeout 90m
+wefty --json results "$RUN_ID" | jq -er '.document.pr_url'
+```
+
+Six phases — `read-issue`, `plan`, `implement`, `gates`, `push`, `open-pr` — so
+`wefty runs list` names the one it is in and `inspect` shows how long each took.
+Each pushes a marker commit, so a run that stopped part-way resumes with
+`--params '{"issue":"479","continue_from":"<branch>"}'` and skips what is done.
+
+The pull request is a draft and nobody has reviewed it. Read it before you ask
+anyone else to. Its URL is in the verdict document's `pr_url` and in `pr.json`
+in the run's handoff directory. `workflows/issue-to-pr/README.md` has the rest,
+including what makes the run fail.
+
 ## Writing the workflow
 
 `wefty workflow init NAME` writes a runnable bash starter that reports through
@@ -208,4 +239,5 @@ envelope, so still read `inspect` before trusting the work, and `results` for
 the document the run itself concluded with. The reference workflow is
 `workflows/dogfood/` — plan → implement → cross-review with real agent CLIs.
 `workflows/branch-gates/` is the smaller one to copy: it gates a branch and
-hands back a pass/fail verdict.
+hands back a pass/fail verdict. `workflows/issue-to-pr/` is the one that writes
+code — see the recipe above.
