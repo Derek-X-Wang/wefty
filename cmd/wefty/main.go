@@ -116,6 +116,10 @@ const (
 	// waiting" lead a script to different next actions.
 	exitRunFailed   = 10
 	exitWaitTimeout = 11
+	// exitNotReady is `wefty status` answering no. The command worked; the
+	// cluster cannot take work, which is a different thing from the command
+	// failing and gets its own code so a script can tell them apart.
+	exitNotReady = 12
 )
 
 func commandExitCode(err error) int {
@@ -139,6 +143,10 @@ func commandExitCode(err error) int {
 	var outcome *runOutcomeError
 	if errors.As(err, &outcome) {
 		return exitRunFailed
+	}
+	var notReady *notReadyError
+	if errors.As(err, &notReady) {
+		return exitNotReady
 	}
 	var waitTimeout *waitTimeoutError
 	if errors.As(err, &waitTimeout) {
@@ -375,6 +383,7 @@ func removeBoolFlag(args []string, name string) ([]string, bool) {
 const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
+  status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
   admin policy get           Read the current administrator policy revision and members

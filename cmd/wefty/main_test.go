@@ -135,6 +135,46 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if adminPolicy.Revision != 1 || len(adminPolicy.Admins) != 1 || adminPolicy.Admins[0].UserID != "person-alice" {
 		t.Fatalf("admin bootstrap policy = %#v", adminPolicy)
 	}
+	// The first command the skill tells an agent to run, against a stack that
+	// is actually up: ready, with the node's capabilities and free slots.
+	var statusOut, statusErr bytes.Buffer
+	if err := execute(ctx, clients, true, []string{"status"}, &statusOut, &statusErr); err != nil {
+		t.Fatalf("status on a running stack: %v stderr=%s\n%s", err, statusErr.String(), statusOut.String())
+	}
+	var clusterState clusterStatus
+	if err := json.Unmarshal(statusOut.Bytes(), &clusterState); err != nil {
+		t.Fatalf("status --json is not JSON: %v\n%s", err, statusOut.String())
+	}
+	if !clusterState.Ready || clusterState.Verdict != "ready" {
+		t.Fatalf("status on a running stack = %#v", clusterState)
+	}
+	if len(clusterState.Services) != 2 {
+		t.Fatalf("status services = %#v", clusterState.Services)
+	}
+	for _, service := range clusterState.Services {
+		if !service.Reachable {
+			t.Fatalf("%s unreachable on a running stack: %#v", service.Name, service)
+		}
+		if service.Endpoint == "" {
+			t.Fatalf("%s reported no endpoint: %#v", service.Name, service)
+		}
+	}
+	if len(clusterState.Nodes) != 1 || clusterState.Nodes[0].NodeID != "node-cli" {
+		t.Fatalf("status nodes = %#v", clusterState.Nodes)
+	}
+	statusNode := clusterState.Nodes[0]
+	// The capabilities come from what the agent advertised, not from a probe
+	// this command ran: this agent declares kind:process only.
+	if strings.Join(statusNode.Kinds, ",") != "process" {
+		t.Fatalf("status kinds = %v, want the agent's advertised process capability", statusNode.Kinds)
+	}
+	if statusNode.TotalOneshot <= 0 || statusNode.FreeOneshot <= 0 || !statusNode.AcceptsOneshot {
+		t.Fatalf("status slots = %#v", statusNode)
+	}
+	if statusNode.State != contract.NodeAlive || !statusNode.ClaimsEnabled {
+		t.Fatalf("status node = %#v", statusNode)
+	}
+
 	scriptPath := filepath.Join(t.TempDir(), "workflow.sh")
 	script := "#!/bin/sh\nprintf 'cli-output\\n'\nprintf 'cli-error\\n' >&2\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
@@ -396,6 +436,7 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatalf("`wefty --json whoami` did not emit JSON: %v\n%s", err, whoOut.String())
 	}
 	for _, command := range [][]string{
+		{"status"},
 		{"runs", "list"},
 		{"nodes", "list"},
 		{"inspect", submitted.RunID},
