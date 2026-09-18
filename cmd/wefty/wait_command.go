@@ -65,7 +65,7 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	var timeout time.Duration
 	flags.DurationVar(&timeout, "timeout", 0, "give up after this long (default: wait indefinitely)")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty wait RUN_ID [--timeout D]")

@@ -152,6 +152,7 @@ The full pass criteria and evidence commands are in the
 
 ## CLI tour
 
+- `wefty status` answers whether the cluster can take work right now: the endpoints and identity it used, every node with its capabilities and free slots, and one verdict line. It exits 12 when the answer is no, and it answers within five seconds even when nothing is listening.
 - `wefty whoami` shows the authenticated person identity used for operator actions; `wefty --json whoami` emits the same projection as JSON. Machine principals and missing person identity fail with the typed unauthorized exit code `3`, while invalid arguments fail with usage exit code `2`.
 - `wefty nodes list` shows reachability separately from claim eligibility, per-class slot occupancy, durable intent, and tags.
 - `wefty nodes set-claims NODE_ID --claims-enabled=false --intent-revision=REV --reason="maintenance"` records revision-guarded operator intent; the authenticated Fabric identity is recorded as the actor.
