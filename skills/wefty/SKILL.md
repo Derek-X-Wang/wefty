@@ -149,6 +149,8 @@ workflow as if reporting is all it can do.
 
 A run is only good when `inspect` shows: status `succeeded`, expected
 lineage, every envelope `succeeded`, every gate `pass`, and the artifacts
-(e.g. `git:<sha>`) actually exist. `wefty wait` gives the same verdict as an
-exit code when a script needs to branch rather than read. The reference workflow is
+(e.g. `git:<sha>`) actually exist. `wefty wait` is narrower: it reports the
+run's *status* as an exit code, which is the right gate for a script but not the
+same judgement -- a run can succeed with a missing artifact or a failed
+envelope, so still read `inspect` before trusting the work. The reference workflow is
 `workflows/dogfood/` — plan → implement → cross-review with real agent CLIs.

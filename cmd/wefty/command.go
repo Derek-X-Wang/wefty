@@ -127,6 +127,22 @@ type runResults struct {
 	Note             string                          `json:"note"`
 }
 
+// runStepsFor projects a run's step intervals for a reader.
+//
+// A terminal run is in no step. If its last bracket never closed -- a workload
+// that crashed mid-step -- the interval stays in the list, unmatched and
+// without a duration, but the run is not described as running and no end time
+// is invented for it. The listing and the lineage suppress the current step for
+// a terminal run the same way, and inspection must not be the one surface that
+// disagrees with them.
+func runStepsFor(run contract.RunRecord) l3.RunSteps {
+	steps := l3.DeriveRunSteps(run.Envelopes)
+	if runIsTerminal(run.Status) {
+		steps.Current = ""
+	}
+	return steps
+}
+
 // runResultsFor is nil for a run that has not finished: there are no results to
 // locate until there is an outcome.
 func runResultsFor(run contract.RunRecord, now time.Time) *runResults {
@@ -274,7 +290,7 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	}
 	inspection := runInspection{
 		Run: root, Lineage: lineage, Runs: []contract.RunRecord{root},
-		Steps:   l3.DeriveRunSteps(root.Envelopes),
+		Steps:   runStepsFor(root),
 		Results: runResultsFor(root, time.Now().UTC()),
 	}
 	if inspection.Results != nil {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -73,6 +74,7 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return usageError("--timeout must not be negative")
 	}
 	runID := flags.Arg(0)
+	cancelRequest := context.CancelFunc(func() {})
 
 	started := time.Now()
 	deadline := time.Time{}
@@ -80,24 +82,42 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		deadline = started.Add(timeout)
 	}
 	delay := waitPollInitial
+	var last contract.RunState
 	for {
-		record, err := clients.getRun(ctx, runID)
+		// The deadline is checked before every request and applied to it. A
+		// request with no bound of its own would defeat --timeout entirely:
+		// this client has no timeout, so a ledger that accepts a connection
+		// and never answers would hold the wait open forever.
+		if expired(deadline) {
+			return waitExpired(stdout, runID, last, started, jsonOutput)
+		}
+		record, err := clients.getRun(requestContext(ctx, deadline, &cancelRequest), runID)
+		cancelRequest()
 		if err != nil {
-			return err
-		}
-		if runIsTerminal(record.Status) {
-			return reportTerminalRun(stdout, record, jsonOutput)
-		}
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			// The last read is the one reported, so the message names the state
-			// the run was actually in rather than the one it was in when the
-			// wait began.
-			if jsonOutput {
-				if err := writeJSON(stdout, record); err != nil {
-					return err
-				}
+			if ctx.Err() != nil {
+				// The caller stopped waiting, which is not a timeout.
+				return ctx.Err()
 			}
-			return &waitTimeoutError{runID: runID, status: record.Status, waited: time.Since(started)}
+			if permanentWaitFailure(err) {
+				return err
+			}
+			// Everything else -- a dropped connection, a ledger restarting, a
+			// 5xx -- is a reason to keep waiting rather than to give a verdict.
+			// The command's job is the run's outcome, and a transient failure
+			// to read it is not one.
+			if expired(deadline) {
+				return waitExpired(stdout, runID, last, started, jsonOutput)
+			}
+		} else {
+			// A response that arrives after the deadline is not an answer this
+			// command may report: --timeout said when to stop believing it.
+			if expired(deadline) {
+				return waitExpired(stdout, runID, record.Status, started, jsonOutput)
+			}
+			last = record.Status
+			if runIsTerminal(record.Status) {
+				return reportTerminalRun(stdout, record, jsonOutput)
+			}
 		}
 		sleep := delay
 		if !deadline.IsZero() {
@@ -119,6 +139,53 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			}
 		}
 	}
+}
+
+// requestContext bounds one poll by whatever is left of the wait. Without a
+// --timeout there is nothing to bound it with, and the caller's own context is
+// the only limit.
+func requestContext(ctx context.Context, deadline time.Time, cancel *context.CancelFunc) context.Context {
+	if deadline.IsZero() {
+		*cancel = func() {}
+		return ctx
+	}
+	bounded, stop := context.WithDeadline(ctx, deadline)
+	*cancel = stop
+	return bounded
+}
+
+// permanentWaitFailure separates "this will never work" from "not yet". A 4xx
+// is the ledger answering: the run does not exist, or this identity may not
+// read it, and waiting longer cannot change either. Anything else is the
+// connection or the server, and the run may still be fine.
+func permanentWaitFailure(err error) bool {
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+	return responseErr.StatusCode >= 400 && responseErr.StatusCode < 500
+}
+
+func expired(deadline time.Time) bool {
+	return !deadline.IsZero() && !time.Now().Before(deadline)
+}
+
+// waitExpired reports the third outcome. The status named is the last one
+// actually read, so the message describes the run as the command last saw it
+// rather than as it was when the wait began.
+func waitExpired(stdout io.Writer, runID string, status contract.RunState, started time.Time, jsonOutput bool) error {
+	if status == "" {
+		status = contract.RunState("unread")
+	}
+	if jsonOutput {
+		if err := writeJSON(stdout, map[string]any{
+			"run_id": runID, "status": status, "waited_seconds": time.Since(started).Seconds(),
+			"timed_out": true,
+		}); err != nil {
+			return err
+		}
+	}
+	return &waitTimeoutError{runID: runID, status: status, waited: time.Since(started)}
 }
 
 // reportTerminalRun prints the outcome and then turns it into an exit code. The

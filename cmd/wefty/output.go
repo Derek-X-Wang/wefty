@@ -31,9 +31,15 @@ func writeRunSteps(writer io.Writer, steps l3.RunSteps) error {
 		return err
 	}
 	for _, step := range steps.Steps {
-		duration := "running"
-		if step.Seconds != nil {
+		// An open interval on a terminal run is a step whose end never
+		// arrived. Its duration is unknown, and calling it "running" would
+		// claim something about a run that has stopped.
+		duration := "incomplete"
+		switch {
+		case step.Seconds != nil:
 			duration = fmt.Sprintf("%.1fs", *step.Seconds)
+		case step.Open && steps.Current != "":
+			duration = "running"
 		}
 		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n",
 			step.Name, step.StartedAt.Format(time.RFC3339), duration); err != nil {

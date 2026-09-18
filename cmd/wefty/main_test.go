@@ -352,6 +352,39 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatalf("wait --json returned %s", waited.RunID)
 	}
 
+	// A failing run's wait exits 10, invoked as the CLI rather than read off a
+	// status field. This is the branch-gates acceptance criterion, proved here
+	// because the branch-gates exercise cannot import package main and the
+	// in-process plain fabric does not span processes.
+	failingScript := filepath.Join(t.TempDir(), "failing.sh")
+	if err := os.WriteFile(failingScript, []byte("#!/bin/sh\nexit 3\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var failingSubmit bytes.Buffer
+	if err := execute(ctx, clients, true, []string{
+		"submit", "--script", failingScript, "--params", `{}`,
+		"--tag", "linux", "--tag", contract.StableNodeTagPrefix + "node-cli",
+		"--idempotency-key", "cli-submit-failing",
+	}, &failingSubmit, &commandErr); err != nil {
+		t.Fatalf("submit failing run: %v stderr=%s", err, commandErr.String())
+	}
+	var failingRun l3.RunAccepted
+	if err := json.Unmarshal(failingSubmit.Bytes(), &failingRun); err != nil {
+		t.Fatal(err)
+	}
+	var failingWait bytes.Buffer
+	waitErr := execute(ctx, clients, false, []string{"wait", failingRun.RunID, "--timeout", "120s"},
+		&failingWait, &commandErr)
+	if waitErr == nil {
+		t.Fatalf("wait on a failing run exited zero: %s", failingWait.String())
+	}
+	if code := commandExitCode(waitErr); code != exitRunFailed {
+		t.Fatalf("wait on a failing run exited %d (%v), want %d", code, waitErr, exitRunFailed)
+	}
+	if strings.TrimSpace(failingWait.String()) != string(contract.RunFailed) {
+		t.Fatalf("wait on a failing run printed %q", failingWait.String())
+	}
+
 	// Every command an agent parses answers --json with JSON. This is the
 	// audit, executed rather than asserted in prose.
 	var whoOut bytes.Buffer

@@ -171,13 +171,13 @@
           { "name": "origin", "in": "query", "description": "Omit for the general listing. computer:<id> or computer:self selects the Computer-origin listing.", "schema": { "type": "string", "pattern": "^computer:.+$" } },
           { "name": "status", "in": "query", "description": "General listing only: narrow to one Run state.", "schema": { "type": "string" } },
           { "name": "include_descendants", "in": "query", "schema": { "type": "boolean", "default": false } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+          { "name": "limit", "in": "query", "description": "Two regimes, because one parameter serves two listings: the general listing (no origin) accepts 1-500 and defaults to 50; an origin listing accepts 1-1000 and defaults to 100. The schema below is the union of the two, so a value valid for one arm may be refused by the other.", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
           { "name": "cursor", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": {
           "200": {
             "description": "The general Run listing (RunListPage) when origin is omitted, or the Computer-originated Run page with exact immutable trigger projections when it is supplied.",
-            "content": { "application/json": { "schema": { "oneOf": [{ "$ref": "./common.v1.json#/components/schemas/RunListPage" }, { "$ref": "#/components/schemas/ComputerRunPage" }] } } }
+            "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "./common.v1.json#/components/schemas/RunListPage" }, { "$ref": "#/components/schemas/ComputerRunPage" }] } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

@@ -446,6 +446,14 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocolError(contract.ErrorInvalidRequest, "exactly one origin is required"))
 		return
 	}
+	// status belongs to the general listing. Accepting it here and ignoring it
+	// would answer a narrower question than the caller asked, which is worse
+	// than refusing: an unfiltered page that looks filtered.
+	if _, present := query["status"]; present {
+		writeError(w, protocolError(contract.ErrorInvalidRequest,
+			"status applies to the general listing; an origin listing is not filtered by state"))
+		return
+	}
 	includeDescendants := false
 	if values, present := query["include_descendants"]; present {
 		if len(values) != 1 || (values[0] != "true" && values[0] != "false") {

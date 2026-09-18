@@ -88,6 +88,10 @@ func TestGeneralRunListingRefusesWhatItCannotAnswer(t *testing.T) {
 
 	for _, query := range []string{
 		"/v1/runs?status=not-a-state",
+		// status belongs to the general listing. The origin arm refuses it
+		// rather than returning an unfiltered page that looks filtered.
+		"/v1/runs?origin=computer:one&status=failed",
+		"/v1/runs?origin=computer:one&status=",
 		"/v1/runs?limit=0",
 		"/v1/runs?limit=huge",
 		// A caller that sent a cursor believes this listing pages; it does not.
