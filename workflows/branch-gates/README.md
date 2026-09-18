@@ -130,6 +130,10 @@ handles top-level strings only.
 4. **The ledger** — `wefty --json inspect <run_id>` shows one envelope per gate
    (`status` `succeeded`/`failed`), then one `result` envelope carrying the
    verdict document, then one `branch-gates` gate whose outcome is the verdict.
+   Each gate is also bracketed as a step, so `wefty runs list` names the gate a
+   running job is on and `inspect` shows how long each gate took. Those brackets
+   are envelopes too, carrying `dev.wefty.mailbox.kind: "step"`; a reader
+   counting one envelope per gate should skip them.
    Envelope data is nested under the mailbox's own extension namespace,
    `dev.wefty.mailbox`: `payload` when it was published by `wefty run`, `detail`
    when the inline writer published it as text. The gate carries its evidence as

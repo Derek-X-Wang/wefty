@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 var protocolFiles = []string{
@@ -1079,4 +1080,109 @@ func stringSet(t *testing.T, value any) map[string]bool {
 		set[text] = true
 	}
 	return set
+}
+
+// TestRunListResponseAdmitsBothArmsIncludingEmptyPages is finding 2 turned into
+// a check. `GET /v1/runs` serves two shapes, and an empty page satisfies both,
+// so the response schema has to be a union that accepts rather than a choice
+// that demands exactly one match.
+func TestRunListResponseAdmitsBothArmsIncludingEmptyPages(t *testing.T) {
+	t.Parallel()
+
+	doc := readObject(t, "l3.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	runs := object(t, paths["/v1/runs"], "/v1/runs")
+	get := object(t, runs["get"], "get")
+	responses := object(t, get["responses"], "responses")
+	ok := object(t, responses["200"], "200")
+	content := object(t, ok["content"], "content")
+	body := object(t, content["application/json"], "application/json")
+	schema := object(t, body["schema"], "schema")
+	if _, forbidden := schema["oneOf"]; forbidden {
+		t.Fatal("the list response uses oneOf; an empty page matches both arms and would be refused")
+	}
+	if _, present := schema["anyOf"]; !present {
+		t.Fatal("the list response does not union its two arms")
+	}
+
+	// The protocol documents reach the ratified contract schemas, which name
+	// themselves by URL, so every one of them is registered before compiling.
+	// Nothing here is fetched: a validator that went to the network would be
+	// testing the network.
+	compiler := jsonschema.NewCompiler()
+	resources := map[string]string{
+		"file:///api/openapi/l3.v1.json":     "l3.v1.json",
+		"file:///api/openapi/common.v1.json": "common.v1.json",
+	}
+	for _, name := range []string{"job-spec", "envelope", "gate-result", "run-record"} {
+		resources["file:///contract/schemas/v1/"+name+".schema.json"] =
+			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
+		resources["https://wefty.dev/schemas/v1/"+name+".schema.json"] =
+			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
+	}
+	for id, path := range resources {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := compiler.AddResource(id, decoded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compiled, err := compiler.Compile(
+		"file:///api/openapi/l3.v1.json#/paths/~1v1~1runs/get/responses/200/content/application~1json/schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, payload := range map[string]string{
+		"an empty general page":     `{"runs":[]}`,
+		"an empty origin page":      `{"runs":[],"next_cursor":""}`,
+		"a general page with a run": `{"runs":[{"run_id":"run_1","status":"running","trigger":{"type":"manual","principal":"alice"},"current_step":"gates","created_at":"2026-09-17T12:00:00Z","updated_at":"2026-09-17T12:00:01Z"}]}`,
+	} {
+		instance, err := jsonschema.UnmarshalJSON(strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := compiled.Validate(instance); err != nil {
+			t.Fatalf("%s is refused by the published response schema: %v", name, err)
+		}
+	}
+}
+
+// TestRunListLimitDocumentsBothRegimes keeps the published bound honest: one
+// parameter serves two listings with different maxima, and a reader that
+// believes the schema alone would send a value one arm refuses.
+func TestRunListLimitDocumentsBothRegimes(t *testing.T) {
+	t.Parallel()
+
+	doc := readObject(t, "l3.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	runs := object(t, paths["/v1/runs"], "/v1/runs")
+	get := object(t, runs["get"], "get")
+	parameters, ok := get["parameters"].([]any)
+	if !ok {
+		t.Fatal("/v1/runs get has no parameters")
+	}
+	for _, value := range parameters {
+		parameter := object(t, value, "parameter")
+		if parameter["name"] != "limit" {
+			continue
+		}
+		description, _ := parameter["description"].(string)
+		for _, want := range []string{"500", "50", "1000", "100"} {
+			if !strings.Contains(description, want) {
+				t.Fatalf("the limit parameter does not document %s: %q", want, description)
+			}
+		}
+		schema := object(t, parameter["schema"], "limit schema")
+		if _, present := schema["default"]; present {
+			t.Fatal("the limit parameter publishes one default for two different defaults")
+		}
+		return
+	}
+	t.Fatal("/v1/runs get publishes no limit parameter")
 }

@@ -344,6 +344,28 @@ append_envelope() {
 	report wefty_event envelope "" "$step" "$status" "" "$summary" "$payload_file"
 }
 
+# append_step brackets one gate as a named interval. The ledger derives the
+# run's current step and each step's duration from these two events, which is
+# what makes a running branch-gates job say which gate it is on.
+# Its locals are prefixed because this is POSIX sh: a function assigns globals,
+# and the gate loop below is mid-iteration with its own `name`, `status` and
+# `summary` when this is called. Reusing those names here would rewrite the
+# loop's state, which is exactly the bug the prefix prevents.
+append_step() {
+	step_name=$1
+	step_state=$2
+	step_summary=$3
+	if [ "$REPORTER" = wefty ]; then
+		if [ "$step_state" = ended ]; then
+			report wefty run step --name "$step_name" --end --summary "$step_summary"
+			return
+		fi
+		report wefty run step --name "$step_name" --summary "$step_summary"
+		return
+	fi
+	report wefty_event step "$step_name" "" "$step_state" "" "$step_summary" ""
+}
+
 append_gate() {
 	name=$1
 	outcome=$2
@@ -601,6 +623,7 @@ for gate in "${SELECTED_GATES[@]}"; do
 	gate_log=$WORK_DIR/gate-$gate.log
 	started=$(date -u +%s)
 	log "gate $gate: $command_line"
+	append_step "$gate" started "gate $gate on $REF" || log "WARNING: $REPORT_ERROR"
 	(cd "$CLONE_DIR" && "${SUBJECT_ENV[@]}" sh -c "$command_line") >"$gate_log" 2>&1
 	exit_code=$?
 	# gofmt reports unformatted files on stdout and still exits 0.
@@ -640,6 +663,7 @@ for gate in "${SELECTED_GATES[@]}"; do
 		"$(json_escape "$REF")" "$(json_escape "$COMMIT")" "$(json_escape "$gate")" \
 		"$outcome" "$exit_code" "$duration" >"$envelope_payload" ||
 		fail_workflow publish "cannot write the $gate envelope payload"
+	append_step "$gate" ended "$summary" || log "WARNING: $REPORT_ERROR"
 	append_envelope "$gate" "$status" "$summary" "$envelope_payload" ||
 		fail_workflow publish "$REPORT_ERROR"
 done

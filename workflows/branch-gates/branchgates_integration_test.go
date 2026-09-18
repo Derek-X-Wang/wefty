@@ -24,8 +24,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,7 +59,17 @@ const (
 	// the whole settle budget.
 	perRequestBudget = 10 * time.Second
 	probeMarker      = "wefty environment: ["
+	// holdingGateTag guards a fixture test that sleeps, so the exercise has a
+	// deterministic window in which a gate is running and the listing can be
+	// asked what it is. branch-gates passes GOFLAGS into the subject
+	// environment, which is how the tag reaches the code under gate.
+	holdingGateTag = "weftyholdinggate"
 )
+
+// holdingGateHold is how long the fixture's `test` gate holds. It is comfortably
+// longer than the watcher's 100ms poll and short enough not to matter to a
+// two-minute exercise.
+const holdingGateHold = 3 * time.Second
 
 // gateResult mirrors one entry of the workflow's result.json.
 type gateResult struct {
@@ -128,6 +141,9 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	subject := initializeSubjectRepository(t)
+	// The holding gate is on for this exercise only, through the one name
+	// branch-gates forwards into the subject environment.
+	t.Setenv("GOFLAGS", strings.TrimSpace(os.Getenv("GOFLAGS")+" -tags="+holdingGateTag))
 	caller, store := startStack(t)
 
 	for _, testCase := range []struct {
@@ -182,6 +198,14 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 				RequiredEnvelope: true,
 			}, "branch-gates-exercise-"+testCase.ref)
 
+			// Observation, proved on a real running job rather than described:
+			// while the workflow is going, the general listing names the gate
+			// it is on. The `test` gate holds for a known interval (see the
+			// fixture subject), so there is a deterministic window to see it
+			// in, and the watcher reports its own failures rather than
+			// swallowing them into an empty answer.
+			watch := newStepWatch(t.Context(), caller, accepted.RunID)
+
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
 			// The verdict document is read from the ledger, which is where a
 			// person reads it: the node uploads it at completion and the log
@@ -197,6 +221,39 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			if result.SchemaVersion != 1 || result.Workflow != "branch-gates" || result.RunID != accepted.RunID {
 				t.Fatalf("result identity = %#v", result)
 			}
+			// #477 acceptance, all three parts, on the real stack.
+			//
+			// One: a running job appears in `runs list` with its current gate
+			// as the step it is in.
+			step, watchErr := watch.result()
+			if watchErr != nil {
+				t.Fatalf("watching the run listing failed: %v", watchErr)
+			}
+			if !slices.Contains(strings.Split(allGates, ","), step) {
+				t.Fatalf("runs list reported current step %q, which is not one of the gates", step)
+			}
+
+			// Two: every gate that ran is one closed interval with a duration,
+			// named for that gate, so `inspect` can show per-gate timings.
+			steps := l3.DeriveRunSteps(record.Envelopes)
+			if steps.Current != "" {
+				t.Fatalf("a terminal run is still in step %q", steps.Current)
+			}
+			intervals := map[string]int{}
+			for _, interval := range steps.Steps {
+				if interval.Open || interval.Seconds == nil {
+					t.Fatalf("gate step %q has no duration: %#v", interval.Name, interval)
+				}
+				intervals[interval.Name]++
+			}
+			wantIntervals := map[string]int{}
+			for _, gate := range strings.Split(allGates, ",") {
+				wantIntervals[gate] = 1
+			}
+			if !reflect.DeepEqual(intervals, wantIntervals) {
+				t.Fatalf("gate intervals = %v, want exactly one per gate %v:\n%s", intervals, wantIntervals, logs)
+			}
+
 			if result.Ref != testCase.ref || result.Commit == "" || result.RepoURL != subject {
 				t.Fatalf("result subject = ref %q commit %q repo %q", result.Ref, result.Commit, result.RepoURL)
 			}
@@ -256,8 +313,16 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			// The ledger carries one envelope per gate, the run's result event,
 			// and the single final gate result -- all of them published by the
 			// node agent from the mailbox, none of them by this job.
+			//
+			// The step brackets are envelopes too, sharing a step ID with the
+			// gate's own envelope, and they report where the run is rather than
+			// how the gate went. They are counted as steps below and skipped
+			// here, which is the same distinction DeriveRunSteps makes.
 			gotSteps := make([]string, 0, len(record.Envelopes))
 			for _, envelope := range record.Envelopes {
+				if isStepBracket(envelope) {
+					continue
+				}
 				gotSteps = append(gotSteps, envelope.StepID)
 				if envelope.AttemptID == "" {
 					t.Fatalf("envelope %s carries no server-bound attempt", envelope.EnvelopeID)
@@ -377,6 +442,9 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 				RequiredEnvelope: true,
 			}, "branch-gates-negative-"+testCase.name)
 
+			// No watch here: these runs fail before any gate starts, so there
+			// is no step to observe and asserting one would be asserting the
+			// wrong thing.
 			record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
 			raw, logs := waitForResultJSON(t, caller, accepted.RunID, logSettleBudget)
 			if record.Status != contract.RunFailed {
@@ -519,6 +587,24 @@ func initializeSubjectRepository(t *testing.T) string {
 	writeFile(t, repo, "go.mod", "module branch-gates-subject\n\ngo 1.24\n")
 	writeFile(t, repo, "subject.go", "package subject\n\n// Answer is the subject under gate.\nfunc Answer() int { return 42 }\n")
 	writeFile(t, repo, "subject_test.go", "package subject\n\nimport \"testing\"\n\nfunc TestAnswer(t *testing.T) {\n\tif Answer() != 42 {\n\t\tt.Fatal(\"wrong answer\")\n\t}\n}\n")
+	// A gate that holds for a known interval, so observing a running job's
+	// current step is a fact rather than a race. It is behind a build tag the
+	// exercise turns on through GOFLAGS -- one of the few names branch-gates
+	// passes into the subject environment -- so an ordinary clone of this
+	// fixture is unaffected.
+	writeFile(t, repo, "slow_test.go", fmt.Sprintf(`//go:build %s
+
+package subject
+
+import (
+	"testing"
+	"time"
+)
+
+func TestHoldsSoTheGateCanBeObserved(t *testing.T) {
+	time.Sleep(%d * time.Millisecond)
+}
+`, holdingGateTag, holdingGateHold.Milliseconds()))
 	writeFile(t, repo, "scripts/check-fabric-boundary.sh", "#!/usr/bin/env bash\nset -eu\necho 'fabric boundary holds'\n")
 	runGit(t, repo, "add", ".")
 	runGit(t, repo, "commit", "-m", "subject: passing baseline")
@@ -988,4 +1074,116 @@ func TestBranchGatesReportsWithoutTheWeftyBinary(t *testing.T) {
 	if err != nil || len(events) == 0 {
 		t.Fatalf("the inline writer wrote no mailbox events: %v", err)
 	}
+}
+
+// stepWatch polls the general Run listing while a run is going and holds the
+// first current step it sees -- or the failure that stopped it looking. A
+// watcher that swallowed its own errors would let this exercise pass with
+// observation completely broken, which is the one thing it exists to prove.
+type stepWatch struct {
+	done chan struct{}
+	mu   sync.Mutex
+	step string
+	err  error
+}
+
+func newStepWatch(ctx context.Context, client *http.Client, runID string) *stepWatch {
+	watch := &stepWatch{done: make(chan struct{})}
+	go watch.poll(ctx, client, runID)
+	return watch
+}
+
+func (w *stepWatch) poll(ctx context.Context, client *http.Client, runID string) {
+	defer close(w.done)
+	for ctx.Err() == nil {
+		step, err := currentStepOf(ctx, client, runID)
+		if err != nil {
+			w.finish("", err)
+			return
+		}
+		if step != "" {
+			w.finish(step, nil)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func (w *stepWatch) finish(step string, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.step, w.err = step, err
+}
+
+// result reports what the watch saw. An unfinished watch means the run ended
+// without the listing ever naming a step, which is a failure of the thing under
+// test rather than a timing accident: one gate holds long enough to be seen.
+func (w *stepWatch) result() (string, error) {
+	select {
+	case <-w.done:
+	case <-time.After(logSettleBudget):
+		return "", fmt.Errorf("the run listing watch did not settle within %s", logSettleBudget)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return "", w.err
+	}
+	if w.step == "" {
+		return "", fmt.Errorf("the run listing never named a current step while the run was going")
+	}
+	return w.step, nil
+}
+
+// currentStepOf reads the same route, with the same parameters, that
+// `wefty runs list` reads.
+func currentStepOf(ctx context.Context, client *http.Client, runID string) (string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, perRequestBudget)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet,
+		"http://run-ledger.invalid/v1/runs?limit=100", nil)
+	if err != nil {
+		return "", err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		// The ledger is in this process; a refused or dropped request is a
+		// real failure rather than weather.
+		return "", fmt.Errorf("read run listing: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("read run listing = %d body=%s", response.StatusCode, body)
+	}
+	var page l3.RunListPage
+	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
+		return "", fmt.Errorf("decode run listing: %w", err)
+	}
+	for _, run := range page.Runs {
+		if run.RunID == runID {
+			return run.CurrentStep, nil
+		}
+	}
+	return "", nil
+}
+
+// isStepBracket reports the envelopes a workload wrote with `wefty run step`.
+// It reads the mailbox's own extension namespace, exactly as the ledger's
+// derivation does.
+func isStepBracket(envelope contract.Envelope) bool {
+	if len(envelope.Extensions) == 0 {
+		return false
+	}
+	var namespaces map[string]struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(envelope.Extensions, &namespaces); err != nil {
+		return false
+	}
+	return namespaces["dev.wefty.mailbox"].Kind == "step"
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -422,7 +423,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	for name, values := range query {
 		switch name {
-		case "origin", "include_descendants", "limit", "cursor":
+		case "origin", "include_descendants", "limit", "cursor", "status":
 			if len(values) != 1 {
 				writeError(w, protocolError(contract.ErrorInvalidRequest, "%s must be supplied at most once", name))
 				return
@@ -433,8 +434,24 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	origins, present := query["origin"]
-	if !present || len(origins) != 1 {
+	if !present {
+		// No origin is the general listing: the most recent Runs on this
+		// fabric, which is what an operator or an agent asking "what is
+		// happening" means. The Computer-scoped arm below is a membership
+		// question and keeps its own parameters.
+		s.listRecentRuns(w, r, query)
+		return
+	}
+	if len(origins) != 1 {
 		writeError(w, protocolError(contract.ErrorInvalidRequest, "exactly one origin is required"))
+		return
+	}
+	// status belongs to the general listing. Accepting it here and ignoring it
+	// would answer a narrower question than the caller asked, which is worse
+	// than refusing: an unfiltered page that looks filtered.
+	if _, present := query["status"]; present {
+		writeError(w, protocolError(contract.ErrorInvalidRequest,
+			"status applies to the general listing; an origin listing is not filtered by state"))
 		return
 	}
 	includeDescendants := false
@@ -552,6 +569,50 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	writeRunAccepted(w, record, replayed)
 }
 
+// listRecentRuns is the general listing. Its authorization is the read side of
+// this ledger stated plainly: a scoped bearer may read the Runs its scope
+// names, and neither scope names "all of them", so neither may enumerate.
+// Reaching this route at all already required an authenticated Fabric identity.
+func (s *Server) listRecentRuns(w http.ResponseWriter, r *http.Request, query url.Values) {
+	if _, ok := runTokenFromRequest(r); ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "run tokens cannot enumerate Runs"))
+		return
+	}
+	if _, ok := computerTokenFromRequest(r); ok {
+		writeError(w, protocolError(contract.ErrorForbidden,
+			"Computer tokens list their own Runs with origin=computer:self"))
+		return
+	}
+	filter := RunListFilter{Status: contract.RunState(strings.TrimSpace(query.Get("status")))}
+	if value := query.Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > MaxRunListLimit {
+			writeError(w, protocolError(contract.ErrorInvalidRequest,
+				"limit must be an integer between 1 and %d", MaxRunListLimit))
+			return
+		}
+		filter.Limit = parsed
+	}
+	if value := query.Get("include_descendants"); value != "" {
+		writeError(w, protocolError(contract.ErrorInvalidRequest,
+			"include_descendants applies to an origin listing"))
+		return
+	}
+	if value := query.Get("cursor"); value != "" {
+		// Saying so is better than ignoring it: a caller that sent a cursor
+		// believes this listing pages, and it does not.
+		writeError(w, protocolError(contract.ErrorInvalidRequest,
+			"the general Run listing is not paged; narrow it with status and limit"))
+		return
+	}
+	page, err := s.store.ListRuns(r.Context(), filter)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
 	if scope, ok := runTokenFromRequest(r); ok {
@@ -625,6 +686,10 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.annotateLineageSteps(r.Context(), &lineage); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -739,6 +804,25 @@ func parseRunLogLimit(value string) (int, error) {
 		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be an integer between 1 and %d", l1.MaxLogPageLimit)
 	}
 	return limit, nil
+}
+
+// annotateLineageSteps fills in where each still-running run in the lineage is.
+// A terminal run is skipped: it is in no step, and reading its envelopes to
+// learn that would be work for an answer already known.
+func (s *Server) annotateLineageSteps(ctx context.Context, lineage *RunLineage) error {
+	for _, entries := range [][]LineageEntry{lineage.Ancestors, lineage.Descendants} {
+		for index := range entries {
+			if terminalRunState(entries[index].Status) {
+				continue
+			}
+			envelopes, err := s.store.ListEnvelopes(ctx, entries[index].RunID)
+			if err != nil {
+				return err
+			}
+			entries[index].CurrentStep = DeriveRunSteps(envelopes).Current
+		}
+	}
+	return nil
 }
 
 func (s *Server) filterVisibleLineage(ctx context.Context, ownerRunID string, entries []LineageEntry) ([]LineageEntry, error) {

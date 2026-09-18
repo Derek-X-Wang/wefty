@@ -111,6 +111,11 @@ const (
 	exitCustodyImportQuarantined = 7
 	exitCustodyImportFailed      = 8
 	exitCustodyImportSuperseded  = 9
+	// exitRunFailed and exitWaitTimeout are `wefty wait`'s two non-zero
+	// answers. They are distinct because "the run failed" and "I stopped
+	// waiting" lead a script to different next actions.
+	exitRunFailed   = 10
+	exitWaitTimeout = 11
 )
 
 func commandExitCode(err error) int {
@@ -130,6 +135,14 @@ func commandExitCode(err error) int {
 		case custodyImportSuperseded:
 			return exitCustodyImportSuperseded
 		}
+	}
+	var outcome *runOutcomeError
+	if errors.As(err, &outcome) {
+		return exitRunFailed
+	}
+	var waitTimeout *waitTimeoutError
+	if errors.As(err, &waitTimeout) {
+		return exitWaitTimeout
 	}
 	var apiError contract.APIError
 	var localErr *ocicontrol.ResponseError
@@ -403,10 +416,13 @@ Commands:
                              Clone one Backup into a new stopped Computer with no grants
   services custody <verb>    Export, import, or attest external storage custody
     export|import|attest
-  runs list                  List Runs by immutable Computer origin
+  runs list [--status STATUS --limit LIMIT]
+                             List the most recent Runs, newest first
+    --origin computer:ID     List Runs by immutable Computer origin instead
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
+  wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout
   results RUN_ID [--out FILE]
                              Read the result document the run uploaded
   inspect RUN_ID [--execution]

@@ -47,6 +47,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeRerun(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "logs":
 		return executeLogs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "wait":
+		return executeWait(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "results":
 		return executeResults(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "inspect":
@@ -85,11 +87,16 @@ func executeAdmin(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 }
 
 type runInspection struct {
-	Run       contract.RunRecord   `json:"run"`
-	Lineage   l3.RunLineage        `json:"lineage"`
-	Runs      []contract.RunRecord `json:"runs"`
-	Results   *runResults          `json:"results,omitempty"`
-	Execution *l3.RunExecution     `json:"execution,omitempty"`
+	Run     contract.RunRecord   `json:"run"`
+	Lineage l3.RunLineage        `json:"lineage"`
+	Runs    []contract.RunRecord `json:"runs"`
+	// Steps is the root run's step intervals, derived from its own envelopes.
+	// It is what "how long did each part take" is answered with, and it is
+	// computed here from the record already fetched rather than by asking the
+	// ledger a second question.
+	Steps     l3.RunSteps      `json:"steps"`
+	Results   *runResults      `json:"results,omitempty"`
+	Execution *l3.RunExecution `json:"execution,omitempty"`
 }
 
 // runResults says where a finished run's files are, how long they last, and
@@ -118,6 +125,22 @@ type runResults struct {
 	// simply wrote none.
 	UploadSkipReason contract.ResultUploadSkipReason `json:"upload_skip_reason,omitempty"`
 	Note             string                          `json:"note"`
+}
+
+// runStepsFor projects a run's step intervals for a reader.
+//
+// A terminal run is in no step. If its last bracket never closed -- a workload
+// that crashed mid-step -- the interval stays in the list, unmatched and
+// without a duration, but the run is not described as running and no end time
+// is invented for it. The listing and the lineage suppress the current step for
+// a terminal run the same way, and inspection must not be the one surface that
+// disagrees with them.
+func runStepsFor(run contract.RunRecord) l3.RunSteps {
+	steps := l3.DeriveRunSteps(run.Envelopes)
+	if runIsTerminal(run.Status) {
+		steps.Current = ""
+	}
+	return steps
 }
 
 // runResultsFor is nil for a run that has not finished: there are no results to
@@ -267,6 +290,7 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	}
 	inspection := runInspection{
 		Run: root, Lineage: lineage, Runs: []contract.RunRecord{root},
+		Steps:   runStepsFor(root),
 		Results: runResultsFor(root, time.Now().UTC()),
 	}
 	if inspection.Results != nil {

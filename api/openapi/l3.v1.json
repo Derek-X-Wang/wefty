@@ -163,20 +163,21 @@
     },
     "/v1/runs": {
       "get": {
-        "operationId": "listRunsByComputerOrigin",
-        "summary": "List Runs by immutable Computer origin",
-        "description": "This is an operator-level query: only the L3 caller client tag may use origin=computer:<id>; a tokenless bridge agent identity is rejected. Computer-token callers must use origin=computer:self and remain limited to the authenticated Computer and current Storage generation. Both scopes share one root-selection, descendant-expansion, ordering, hydration, and cursor primitive.",
+        "operationId": "listRuns",
+        "summary": "List Runs, generally or by immutable Computer origin",
+        "description": "Without origin this is the general listing: the most recent Runs, newest first, optionally narrowed by status, with no cursor -- a caller asking what is happening wants the head of the list, and limit is the whole of that request. Only an authenticated Fabric identity may enumerate: a run token and a Computer pass each name a scope that is not every Run, so both are refused, and a Computer pass lists its own with origin=computer:self. With origin this is the operator-level query it has always been: only the L3 caller client tag may use origin=computer:<id>; a tokenless bridge agent identity is rejected. Computer-token callers must use origin=computer:self and remain limited to the authenticated Computer and current Storage generation. Both scopes share one root-selection, descendant-expansion, ordering, hydration, and cursor primitive.",
         "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
-          { "name": "origin", "in": "query", "required": true, "schema": { "type": "string", "pattern": "^computer:.+$" } },
+          { "name": "origin", "in": "query", "description": "Omit for the general listing. computer:<id> or computer:self selects the Computer-origin listing.", "schema": { "type": "string", "pattern": "^computer:.+$" } },
+          { "name": "status", "in": "query", "description": "General listing only: narrow to one Run state.", "schema": { "type": "string" } },
           { "name": "include_descendants", "in": "query", "schema": { "type": "boolean", "default": false } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+          { "name": "limit", "in": "query", "description": "Two regimes, because one parameter serves two listings: the general listing (no origin) accepts 1-500 and defaults to 50; an origin listing accepts 1-1000 and defaults to 100. The schema below is the union of the two, so a value valid for one arm may be refused by the other.", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
           { "name": "cursor", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": {
           "200": {
-            "description": "Computer-originated Run page with exact immutable trigger projections.",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerRunPage" } } }
+            "description": "The general Run listing (RunListPage) when origin is omitted, or the Computer-originated Run page with exact immutable trigger projections when it is supplied.",
+            "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "./common.v1.json#/components/schemas/RunListPage" }, { "$ref": "#/components/schemas/ComputerRunPage" }] } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -899,7 +900,8 @@
           "run_id": { "type": "string", "minLength": 1 },
           "parent_run_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"] },
-          "depth": { "type": "integer", "minimum": 1 }
+          "depth": { "type": "integer", "minimum": 1 },
+          "current_step": { "type": "string", "description": "Where that Run is now, derived from its own step envelopes. Empty for a Run in no step and for a terminal one." }
         }
       },
       "RunLineage": {

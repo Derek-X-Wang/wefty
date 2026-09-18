@@ -381,11 +381,25 @@ func TestComputerRootRunListIsPaginatedAndCurrentGenerationScoped(t *testing.T) 
 	if len(descendants.Runs) != 3 || !slices.ContainsFunc(descendants.Runs, func(run contract.RunRecord) bool { return run.RunID == child.RunID }) {
 		t.Fatalf("descendant page = %+v", descendants)
 	}
-	for _, invalid := range []string{"/v1/runs", "/v1/runs?origin=computer:other", "/v1/runs?origin=computer:self&origin=computer:self"} {
+	for _, invalid := range []string{
+		"/v1/runs?origin=computer:other",
+		"/v1/runs?origin=computer:self&origin=computer:self",
+		// A Computer pass gets the same refusal an operator does: status
+		// narrows the general listing, not this one.
+		"/v1/runs?origin=computer:self&status=failed",
+		"/v1/runs?origin=computer:self&status=",
+	} {
 		status, _, body = doComputerHTTP(t, client, http.MethodGet, invalid, grant.Token, "", nil)
 		if status != http.StatusBadRequest {
 			t.Fatalf("invalid list %q status=%d body=%s", invalid, status, body)
 		}
+	}
+	// An omitted origin is now the general listing rather than a malformed
+	// request, so a Computer pass asking for it is refused for what it is: a
+	// scope that names its own Runs and not every Run.
+	status, _, body = doComputerHTTP(t, client, http.MethodGet, "/v1/runs", grant.Token, "", nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("general list under a Computer pass status=%d body=%s", status, body)
 	}
 }
 

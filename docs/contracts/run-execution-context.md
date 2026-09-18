@@ -427,10 +427,24 @@ The agent builds the protocol document and omits `attempt_id`: only L3 knows
 which attempt its run token is bound to, and it binds the field itself. A text
 payload becomes a gate's evidence entry or an envelope extension under
 `dev.wefty.mailbox`; a `json` payload is nested under that same namespace, so a
-workload can never shape the envelope's own extension object. A `step` becomes
-an envelope on its own step ID, `partial` while started and `succeeded` once
-ended; that mapping is internal and may change without changing this file
-protocol. Headers outside the set above, a repeated header, a missing or
+workload can never shape the envelope's own extension object. That namespace
+also carries the event's own `kind`, and for a `step` its `step_status`
+(`started` or `ended`). A `step` becomes an envelope on its own step ID,
+`partial` while started and `succeeded` once ended; that mapping is internal and
+may change without changing this file protocol, which is why the kind is
+recorded rather than left to be inferred from the envelope's shape.
+
+**Steps.** The ledger derives a run's step intervals from those brackets: a
+start opens a named interval, an end closes the most recent open one of that
+name, and the run's *current step* is the most recently started interval that
+has not ended. A repeated name is two intervals rather than one replaced, an end
+with no open start is ignored rather than turned into a zero-length interval,
+and ordering is the events' own creation time -- publication is a sweep, so
+arrival order is not the run's order. `wefty runs list` shows the current step,
+`wefty inspect` shows every interval with its duration, and a lineage entry
+carries the current step of each run in the tree. A step that is still running
+has no duration: the time so far is not the time it took. The word is *step*,
+the term CONTEXT.md ratified; it is deliberately not called a phase. Headers outside the set above, a repeated header, a missing or
 misplaced `wefty-protocol` line, an unknown kind, status or outcome, and a
 missing separator are all refused; the first eight refusals of an attempt are
 reported as a `failed` envelope on step `mailbox`, and those files are removed
