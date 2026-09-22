@@ -147,6 +147,18 @@ func lockComputerReimageMutex(ctx context.Context, mutex *sync.Mutex) bool {
 	}
 }
 
+// admitComputerStorage waits for one Node-wide Computer disk admission mutex
+// under the caller's own deadline. Expiry is a typed contention refusal rather
+// than an untyped engine failure, because the caller never reached the
+// generation: nothing was created, mutated, or deleted, and the same authority
+// is replayable.
+func admitComputerStorage(ctx context.Context, mutex *sync.Mutex, admission string) error {
+	if lockComputerReimageMutex(ctx, mutex) {
+		return nil
+	}
+	return &computerStorageAdmissionContendedError{Admission: admission, cause: context.Cause(ctx)}
+}
+
 func openExistingComputerDiskLock(ctx context.Context, root string) (*os.File, error) {
 	type openResult struct {
 		lock *os.File

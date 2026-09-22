@@ -304,9 +304,12 @@ func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, reques
 
 // openComputerStorageDestination orders root publication against absence
 // observation/deletion without taking reimageMu underneath storageResetMu.
+// It is the only way a caller may reach openComputerDiskLock, because that
+// call MkdirAlls the root: a creator that skipped this admission could take a
+// replacement inode inside the interval a deletion has already proved empty.
 func (engine *ContainerdEngine) openComputerStorageDestination(ctx context.Context, root string) (*os.File, error) {
-	if !lockComputerReimageMutex(ctx, &engine.computerStorageRootMu) {
-		return nil, context.Cause(ctx)
+	if err := admitComputerStorage(ctx, &engine.computerStorageRootMu, "Storage root"); err != nil {
+		return nil, err
 	}
 	defer engine.computerStorageRootMu.Unlock()
 	return openComputerDiskLock(root)

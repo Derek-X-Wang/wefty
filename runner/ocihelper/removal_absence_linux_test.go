@@ -45,7 +45,11 @@ func TestRefusedCloneTombstoneInventoryAndRemoval(t *testing.T) {
 					case "root":
 						wrong.RootInstanceID = "other-root"
 					case "job":
+						// A tombstone binds to the Job that refused the copy,
+						// which reconfiguration may have rotated into the
+						// removal's prior Job; neither id naming it is refused.
 						wrong.Removal.JobID = "other-job"
+						wrong.Removal.PriorJobID = "other-job"
 					}
 					if _, err := engine.InventoryRemoval(t.Context(), wrong); err == nil {
 						t.Errorf("tombstone inventory accepted conflicting %s authority", field)

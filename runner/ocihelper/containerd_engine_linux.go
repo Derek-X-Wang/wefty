@@ -1893,8 +1893,12 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 		if request.ComputerStorage == nil || request.Removal == nil || request.Removal.PriorJobID == "" {
 			return DeleteManagedVolumeResponse{}, errors.New("Computer disk deletion requires Storage and removal authority")
 		}
-		if err := engine.deleteComputerDiskWithAbsence(*request.ComputerStorage, *request.Removal, request.StorageAbsent); err != nil {
-			if !request.StorageAbsent && request.QuarantineOnFailure && request.FailureAttempts > 0 {
+		if err := engine.deleteComputerDiskUnderAdmission(ctx, *request.ComputerStorage, *request.Removal, request.StorageAbsent); err != nil {
+			// Contended admission is a deadline, not a cleanup failure: the
+			// same authority is replayable, so it must never be latched into
+			// an operator-visible cleanup quarantine.
+			var contended *computerStorageAdmissionContendedError
+			if !errors.As(err, &contended) && !request.StorageAbsent && request.QuarantineOnFailure && request.FailureAttempts > 0 {
 				receipt, quarantineErr := engine.quarantineComputerDiskCleanup(request)
 				if quarantineErr != nil {
 					return DeleteManagedVolumeResponse{}, errors.Join(err, quarantineErr)
@@ -2052,8 +2056,8 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 			return InventoryRemovalResponse{}, fmt.Errorf("legacy Computer removal inventory is anomalous: %s", anomaly)
 		}
 	}
-	if !lockComputerReimageMutex(ctx, &engine.computerReimageMu) {
-		return InventoryRemovalResponse{}, fmt.Errorf("acquire Computer removal inventory serialization: %w", context.Cause(ctx))
+	if err := admitComputerStorage(ctx, &engine.computerReimageMu, "removal inventory attachment"); err != nil {
+		return InventoryRemovalResponse{}, err
 	}
 	reimageLocked := true
 	defer func() {
@@ -2061,8 +2065,8 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 			engine.computerReimageMu.Unlock()
 		}
 	}()
-	if !lockComputerReimageMutex(ctx, &engine.computerStorageRootMu) {
-		return InventoryRemovalResponse{}, fmt.Errorf("acquire Computer root admission: %w", context.Cause(ctx))
+	if err := admitComputerStorage(ctx, &engine.computerStorageRootMu, "removal inventory Storage root"); err != nil {
+		return InventoryRemovalResponse{}, err
 	}
 	rootLocked := true
 	defer func() {
@@ -2102,9 +2106,17 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 	if refusal, absent, refusalErr := refusedComputerStorageAbsent(root, name); refusalErr != nil {
 		return InventoryRemovalResponse{}, refusalErr
 	} else if absent {
+		// The tombstone is bound to the Computer Storage identity it was
+		// written for, the Node, and the managed-root instance -- facts that
+		// cannot rotate under a live generation. A Job id can: reconfiguration
+		// rotates `current_job_id`, so the Job that refused the copy is the
+		// removal's prior Job as often as it is its current one, and binding
+		// to the current id alone would refuse a removal whose own authority
+		// names the refusing Job.
+		refusingJob := refusal.Receipt.JobID
 		if !sameComputerStorageIdentity(refusal.Storage, storage) ||
 			refusal.Receipt.NodeID != request.Removal.NodeID || refusal.Receipt.RootInstanceID != request.RootInstanceID ||
-			refusal.Receipt.JobID != request.Removal.JobID {
+			refusingJob == "" || refusingJob != request.Removal.JobID && refusingJob != request.Removal.PriorJobID {
 			return InventoryRemovalResponse{}, errors.New("Computer refusal does not match removal authority")
 		}
 		attempt, err := absentComputerStorageRemovalAttempt(request, storage)

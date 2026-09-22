@@ -2276,6 +2276,13 @@ func decodeRequest(connection *framedConn, raw json.RawMessage, target any) bool
 
 func writeEngineResponseWithMethod(connection *framedConn, method Method, response any, err error) error {
 	if err != nil {
+		// A call whose own deadline expired waiting for Node-wide Computer
+		// disk admission never reached the generation. It is a busy Node, not
+		// a failed engine, and the same authority may be replayed.
+		var admissionContended *computerStorageAdmissionContendedError
+		if errors.As(err, &admissionContended) {
+			return writeFailure(connection, CodeComputerStorageBusy, admissionContended.Error())
+		}
 		var storageDeferred *ComputerStorageResumeDeferredError
 		if errors.As(err, &storageDeferred) {
 			return writeFailure(connection, CodeComputerStorageResumeDeferred, storageDeferred.Error())

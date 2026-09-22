@@ -260,7 +260,13 @@ helper sweep/operator workflow rather than an unbounded silent loop. Neither a
 retry nor quarantine invalidates the live helper session.
 `computer_storage_busy` and `computer_storage_retired` are definitive
 attempt-scoped `Run` refusals only after the helper positively reaps the losing
-attempt and verifies no runtime remains. The retired form means a durable reset
+attempt and verifies no runtime remains. `computer_storage_busy` is also the
+refusal a Computer Storage call gets when its own deadline expires while it is
+still waiting for one of the Node-wide disk admission mutexes: the call never
+reached the generation, so it created, mutated, and deleted nothing, and the
+same authority is replayable under a fresh deadline. That is contention, not an
+engine failure, and a deletion refused this way is never latched into a cleanup
+quarantine. The retired form means a durable reset
 fence makes that Storage generation permanently ineligible for attachment;
 `computer_storage_grow_uncertain` keeps the same grow
 authority pending for inspection and retry after the filesystem may have
@@ -1505,7 +1511,12 @@ exact prepared disk with no attached, pending, previously detached, or retired
 authority, or an exact typed absent-Storage authority. The latter covers a
 missing root or a refused generation containing only its lock and durable
 refusal tombstone, with no payload. The refusal must match the requested
-Computer/Storage generation, Node, root instance, and Job. It is absence
+Computer/Storage generation, Node, and managed-root instance, and must name a
+Job the removal itself names -- its current Job or its prior Job. Those first
+three facts cannot rotate under a live generation; `current_job_id` can, so the
+Job that refused the copy is as often the removal's prior Job as its current
+one, and binding to the current Job alone would refuse a removal whose own
+authority names the refusing Job. It is absence
 evidence, not preparation evidence, and does not create a missing root.
 Every result remains bound to the authenticated current helper session and
 durable removal fence. Malformed, anomalous, or identity-mismatched disks still
@@ -1516,16 +1527,41 @@ authority, and reconstruction refuses only when neither scan proves authority.
 
 Frozen `storage_absent` evidence is carried as a restrictive precondition through
 Computer disk finalization to `DeleteManagedVolume`. Deletion revalidates it under
-the generation flock: only a missing root or the exact lock-and-tombstone shape
-may remain. Reappeared payload is refused and never converted to cleanup
-quarantine, even after retries. Copy/import and reset root creation share root
-admission with absence inventory and deletion. Creators release admission once
-they own the generation flock, before copying or formatting. Deletion retains
-root admission and attachment admission through cleanup and the final absence
-proof, in the existing reimage-then-root lock order, because unlinking the root
-also unlinks its flock. Attachment rechecks refusal after acquiring the flock
-before interpreting any missing manifest or image. Prepared, Attached, Pending,
-detachment, mount, and loop checks remain in force.
+the generation flock, and revalidates a shape rather than a provenance: only a
+missing root, the exact lock-and-tombstone shape, or a root holding nothing but
+its lock may remain, and when a tombstone was written is not asked. Reappeared
+payload is refused and never converted to cleanup quarantine, even after
+retries. Every path that can create a generation root shares root admission
+with absence inventory and deletion -- copy/import, reset, the Backup source
+lock, and the startup disk sweep -- because each of them reaches a lock open
+that creates the root it is about to own. Creators release admission once they
+own the generation flock, before copying or formatting.
+
+Deletion holds admission only where nothing else can carry the exclusion. Once
+it owns the generation flock, the root and the lock inode inside it are still
+there, so no creator can take a replacement: the payload and any quarantined
+payloads come off under the flock alone, and removing a fully allocated image
+no longer stalls attach, start, and reimage preflight for every other Computer
+on the Node. Admission is retaken, in the existing reimage-then-root lock
+order, for exactly the root unlink and the final absence proof -- the interval
+where the flock is unlinked along with the root it lives in and can no longer
+exclude anyone. A root that was never there has no flock to stand in for
+admission, so that path holds admission from the first observation through the
+proof.
+
+An authorized removal reads a root holding nothing but `attachment.lock` as
+residue it deletes whole, not as bytes without an authority manifest. That is
+what a creator leaves when it takes the flock and fails before writing
+anything, and what a removal leaves if retaking admission expires after the
+payload is gone; reading it any other way would wedge the removal of a refused
+clone for good. Only removal reads a root that way: a lock-only root is also
+the ordinary first-allocation shape, so attachment, inventory, and the startup
+sweep keep judging it by the narrower refusal rule. A retained refusal
+tombstone is likewise not a Storage generation for the reader that decides
+whether a Computer still holds Storage on the Node, so it never defers the
+custody write-record sweep. Attachment rechecks refusal after acquiring the
+flock before interpreting any missing manifest or image. Prepared, Attached,
+Pending, detachment, mount, and loop checks remain in force.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows. Ordinary services
