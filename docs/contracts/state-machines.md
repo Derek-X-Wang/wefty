@@ -129,8 +129,20 @@ therefore suppress the duplicate Backup-prune reconciliation for a removal
 whose stall L1 has accepted -- exactly the copies its standing directive names,
 matched on copy and Backup identity, Storage identity and generation, bound
 node, root instance, cleanup fence and operation revision -- leaving that
-removal's own retries as the only cadence that touches them. Every other
-directive in the same response is reconciled and still gates, so a node whose
+removal's own retries as the only cadence that touches them.
+Those retries are that removal's cadence rather than the node's health, so a
+declared-stalled removal's own retry failures, of any shape, do not gate the
+barrier -- a typed helper refusal, an untyped transport loss, an engine failure
+that carries no code, or any other failure of one of its retries is accounted
+and logged on the removal and never returned to the boot sequence. Its refusal
+streak, durable backoff and stall accounting are unchanged, and the removal
+stays visible in node status with its last failure and that failure's shape. A
+failure is attributed to a declared-stalled removal only when the standing
+directive and the node's own durable record agree on job, removal generation,
+cleanup fence, root instance and bound node; boot resumption, which carries no
+directive, attributes it from that same durable record alone. Every other
+directive in the same response -- another removal, a prune, a Storage copy, a
+reap for a live attempt -- is reconciled and still gates, so a node whose
 sole outstanding cleanup is a stalled one publishes `kind:oci` again. This
 exempts nothing from the helper's namespace sweep and verification: runtime
 residue belonging to a stalled Computer is still refused by that proof, and its

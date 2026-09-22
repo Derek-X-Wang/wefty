@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,10 @@ import (
 // with the refusal.
 type immutableBackupRuntime struct {
 	deleted chan string
+	// untyped turns the same refusal into the shape #513's exclusion could not
+	// see: a transport loss that carries no code at all. It is the same retry
+	// of the same removal, one lost connection away from the typed refusal.
+	untyped atomic.Bool
 }
 
 func newImmutableBackupRuntime() *immutableBackupRuntime {
@@ -50,6 +55,9 @@ func (runtime *immutableBackupRuntime) DeleteComputerBackupCopy(_ context.Contex
 	select {
 	case runtime.deleted <- request.CopyID:
 	default:
+	}
+	if runtime.untyped.Load() {
+		return workloadrunner.ComputerBackupCopyRemovalReceipt{}, errors.New("OCI helper session is unavailable")
 	}
 	return workloadrunner.ComputerBackupCopyRemovalReceipt{}, &ocihelper.RPCError{
 		Code: ocihelper.CodeEngineFailure, Message: "OCI engine operation failed",
@@ -130,9 +138,18 @@ func newStalledRemovalNode(t *testing.T, name string, declareStall bool) *stalle
 		rootInstanceID: nodeAgent.session.registration.RootInstanceID,
 	}
 	prepared := time.Now().UTC()
+	computerID, storageID := name+"-computer", name+"-storage"
 	manifest := testRuntimeResourceManifest(removal.jobID, "attempt")
 	manifest.NodeID = name
 	manifest.BootSessionID = nodeAgent.session.registration.BootSessionID
+	// A Computer removal's frozen manifest carries the Storage it owns. Boot
+	// resumption reads it to decide that this removal needs the authoritative
+	// generation inventory only the standing directive carries, which is what
+	// keeps resume from guessing a destructive subset.
+	manifest.ComputerStorage = &workloadrunner.ComputerStorage{
+		ComputerID: computerID, StorageID: storageID, StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
+	}
+	manifest.ServiceDataVolume, manifest.ServiceDataOwnerRecord = "", ""
 	if err := spool.storeRuntimeResourceManifest(t.Context(), manifest, prepared); err != nil {
 		t.Fatal(err)
 	}
@@ -164,14 +181,14 @@ func newStalledRemovalNode(t *testing.T, name string, declareStall bool) *stalle
 
 	node := &stalledRemovalNode{
 		agent: nodeAgent, runtime: runtime, removal: removal,
-		computer: name + "-computer",
+		computer: computerID,
 		copyIDs:  []string{name + "-copy-a", name + "-copy-b"},
 	}
 	copies := make([]l1.ComputerBackupPruneDirective, 0, len(node.copyIDs))
 	for index, copyID := range node.copyIDs {
 		copies = append(copies, l1.ComputerBackupPruneDirective{
 			BackupID: name + "-backup", CopyID: copyID, ComputerID: node.computer,
-			StorageID: name + "-storage", StorageGeneration: 1, AllocatedSize: 1 << 20,
+			StorageID: storageID, StorageGeneration: 1, AllocatedSize: 1 << 20,
 			BoundNodeID: name, RootInstanceID: removal.rootInstanceID,
 			OperationRevision: int64(index + 1), CleanupFence: removal.cleanupFence,
 		})
@@ -181,7 +198,7 @@ func newStalledRemovalNode(t *testing.T, name string, declareStall bool) *stalle
 			JobID: removal.jobID, BoundNodeID: name, Kind: contract.JobKindOCI,
 			RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
 			RootInstanceID:       removal.rootInstanceID,
-			ComputerStorage:      &l1.ComputerStorageClaim{ComputerID: node.computer, StorageID: name + "-storage", StorageGeneration: 1},
+			ComputerStorage:      &l1.ComputerStorageClaim{ComputerID: node.computer, StorageID: storageID, StorageGeneration: 1},
 			ComputerBackupCopies: &l1.ComputerBackupCopyClaims{Copies: copies},
 		}},
 		BackupPruneDirectives: copies,
@@ -365,5 +382,180 @@ func TestStalledRetentionRequiresMatchingRemovalAuthority(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// releaseDeclaredRetryBackoff moves the removal controller's injected clock
+// past the declared removal's durable backoff, so its own retry runs in this
+// pass instead of being deferred. The removal fixtures assert the outcome of
+// that retry, never who won a race with a ticker.
+func (node *stalledRemovalNode) releaseDeclaredRetryBackoff(t *testing.T) runtimeRemovalRecord {
+	t.Helper()
+	record, found, err := node.agent.session.removals.outbox.spool.runtimeRemoval(t.Context(), node.removal.jobID)
+	if err != nil || !found {
+		t.Fatalf("seeded removal record found=%t err=%v", found, err)
+	}
+	if record.stallDeclaredAt == nil || record.lastAttemptedAt == nil {
+		t.Fatal("the seeded removal was not declared stalled with a recorded attempt")
+	}
+	released := record.lastAttemptedAt.Add(declaredRemovalRetryMax + time.Second)
+	node.agent.session.removals.now = func() time.Time { return released }
+	return record
+}
+
+// seedNeighbourRemoval adds a second Computer removal to the same node's
+// durable state -- never declared stalled -- and returns the standing directive
+// L1 keeps redispatching for it.
+func (node *stalledRemovalNode) seedNeighbourRemoval(t *testing.T, jobID string) l1.RemovalDirective {
+	t.Helper()
+	session := node.agent.session
+	spool := session.removals.outbox.spool
+	computerID, storageID := jobID+"-computer", jobID+"-storage"
+	removal := localRemoval{
+		jobID: jobID, kind: contract.JobKindOCI,
+		generation: l1.InitialServiceRemovalGeneration, cleanupFence: jobID + "-fence",
+		rootInstanceID: session.registration.RootInstanceID,
+	}
+	prepared := time.Now().UTC()
+	manifest := testRuntimeResourceManifest(jobID, jobID+"-attempt")
+	manifest.NodeID = session.registration.NodeID
+	manifest.BootSessionID = session.registration.BootSessionID
+	manifest.ComputerStorage = &workloadrunner.ComputerStorage{
+		ComputerID: computerID, StorageID: storageID, StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
+	}
+	manifest.ServiceDataVolume, manifest.ServiceDataOwnerRecord = "", ""
+	if err := spool.storeRuntimeResourceManifest(t.Context(), manifest, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.beginRemoval(t.Context(), removal, prepared); err != nil {
+		t.Fatal(err)
+	}
+	return l1.RemovalDirective{
+		JobID: jobID, BoundNodeID: session.registration.NodeID, Kind: contract.JobKindOCI,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
+		RootInstanceID:  removal.rootInstanceID,
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: computerID, StorageID: storageID, StorageGeneration: 1},
+		ComputerBackupCopies: &l1.ComputerBackupCopyClaims{Copies: []l1.ComputerBackupPruneDirective{{
+			BackupID: jobID + "-backup", CopyID: jobID + "-copy", ComputerID: computerID,
+			StorageID: storageID, StorageGeneration: 1, AllocatedSize: 1 << 20,
+			BoundNodeID: session.registration.NodeID, RootInstanceID: removal.rootInstanceID,
+			OperationRevision: 1, CleanupFence: removal.cleanupFence,
+		}}},
+	}
+}
+
+// TestUntypedRetryFailureOfADeclaredStalledRemovalDoesNotGateTheBarrier is the
+// half of the Mac Computer wedge #513 left behind. Excluding the duplicate
+// prune took the typed per-copy refusal off the boot sequence's gate, but the
+// same retry of the same removal reaching the helper over a connection that
+// drops fails untyped -- and an untyped failure carries no refusal code, so
+// nothing about a declaration could recognize it. The node withdrew `kind:oci`
+// again, for work it had already told L1 it cannot finish, while that
+// removal's Slot stood free.
+//
+// A declared stall is L1's own record that this cleanup is not proven and the
+// Slot is released. Its retries are that removal's cadence, whatever shape
+// their failures take, so the node keeps admitting OCI work and the failure is
+// accounted and kept visible on the removal instead.
+func TestUntypedRetryFailureOfADeclaredStalledRemovalDoesNotGateTheBarrier(t *testing.T) {
+	node := newStalledRemovalNode(t, "untyped-stalled-node", true)
+	session := node.agent.session
+	node.runtime.untyped.Store(true)
+	before := node.releaseDeclaredRetryBackoff(t)
+
+	// The restrictive observation the boot sequence publishes before it runs
+	// the standing directives; kind:oci is withdrawn at this point.
+	session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed,
+		errors.New("OCI helper session requires a new boot sweep"))
+
+	if err := session.processStandingDirectives(t.Context(), node.response); err != nil {
+		t.Fatalf("standing directives while a declared-stalled removal's retry lost its transport = %v, "+
+			"want the boot sequence's gate open", err)
+	}
+	attempted := node.runtime.attempted()
+	if len(attempted) != 1 || !slices.Contains(node.copyIDs, attempted[0]) {
+		t.Fatalf("Backup-copy deletions = %v, want exactly one of the removal's own copies %v "+
+			"(the retry must really have run)", attempted, node.copyIDs)
+	}
+
+	// The gate is open, so the boot sequence reaches its probe and its pinned
+	// positive publication, and the heartbeat that carries it goes out.
+	if err := node.agent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+		t.Fatalf("OCI recovery while the stalled removal keeps failing untyped = %v, want the node to re-earn kind:oci", err)
+	}
+	earned := node.agent.CapabilitySnapshot()
+	if !earned.Capabilities["kind:oci"] || earned.ReasonCode != "" {
+		t.Fatalf("published observation = %+v, want kind:oci earned with no reason", earned)
+	}
+
+	// The failure is not swallowed: it is accounted on the removal, and the
+	// record `wefty node doctor` reads shows the attempt and its shape.
+	after, found, err := session.removals.outbox.spool.runtimeRemoval(t.Context(), node.removal.jobID)
+	if err != nil || !found {
+		t.Fatalf("removal record after the failed retry found=%t err=%v", found, err)
+	}
+	if after.stallDeclaredAt == nil {
+		t.Fatal("the removal stopped being declared stalled")
+	}
+	if after.stallRetryAttempts <= before.stallRetryAttempts {
+		t.Fatalf("stall retry attempts = %d, want more than the %d recorded before the retry failed",
+			after.stallRetryAttempts, before.stallRetryAttempts)
+	}
+	if after.lastAttemptedAt == nil || !after.lastAttemptedAt.After(*before.lastAttemptedAt) {
+		t.Fatalf("last attempted = %v, want the failed retry recorded after %v", after.lastAttemptedAt, before.lastAttemptedAt)
+	}
+	if after.lastRefusalCode != "" || after.failedAttempts != 0 {
+		t.Fatalf("refusal streak = %q/%d, want an untyped failure to leave no refusal code and end the streak",
+			after.lastRefusalCode, after.failedAttempts)
+	}
+}
+
+// TestUntypedRetryFailureWithoutADeclarationStillGatesTheBarrier is the
+// preservation test: it passes before this change as well as after. Only L1's
+// accepted declaration -- its own record that cleanup is not proven and the
+// Slot is released -- takes a removal's failures off the gate. The identical
+// untyped failure of a removal that has declared nothing is an unfinished boot
+// step, and it must still hold `kind:oci` back.
+func TestUntypedRetryFailureWithoutADeclarationStillGatesTheBarrier(t *testing.T) {
+	node := newStalledRemovalNode(t, "untyped-undeclared-node", false)
+	node.runtime.untyped.Store(true)
+
+	err := node.agent.session.processStandingDirectives(t.Context(), node.response)
+	if err == nil {
+		t.Fatal("an undeclared removal whose retry failed untyped left the boot sequence's gate open")
+	}
+	if !strings.Contains(err.Error(), node.removal.jobID) {
+		t.Fatalf("standing-directive failure = %v, want it to name the unfinished removal %q", err, node.removal.jobID)
+	}
+	if attempted := node.runtime.attempted(); len(attempted) == 0 {
+		t.Fatal("the undeclared removal's retry never reached the runtime")
+	}
+}
+
+// TestAnotherRemovalsFailureStillGatesWhileOneStandsStalled is the boundary.
+// The exemption is attributed to one removal's own retries, not to "a node has
+// a stalled removal on it". A second removal on the same node, failing in the
+// very same untyped way, is work L1 is still waiting on with nothing declared
+// about it, so it still withdraws the node's OCI capability.
+func TestAnotherRemovalsFailureStillGatesWhileOneStandsStalled(t *testing.T) {
+	node := newStalledRemovalNode(t, "two-removal-node", true)
+	session := node.agent.session
+	node.runtime.untyped.Store(true)
+	node.releaseDeclaredRetryBackoff(t)
+	neighbour := node.seedNeighbourRemoval(t, "two-removal-node-neighbour")
+
+	response := node.response
+	response.RemovalDirectives = []l1.RemovalDirective{node.response.RemovalDirectives[0], neighbour}
+
+	err := session.processStandingDirectives(t.Context(), response)
+	if err == nil || !strings.Contains(err.Error(), neighbour.JobID) {
+		t.Fatalf("standing directives = %v, want the undeclared second removal still reconciled and still gating", err)
+	}
+	if strings.Contains(err.Error(), node.removal.jobID) {
+		t.Fatalf("standing-directive failure named the declared-stalled removal %q", node.removal.jobID)
+	}
+	attempted := node.runtime.attempted()
+	if !slices.Contains(attempted, "two-removal-node-neighbour-copy") {
+		t.Fatalf("Backup-copy deletions = %v, want the second removal's own copy attempted", attempted)
 	}
 }
