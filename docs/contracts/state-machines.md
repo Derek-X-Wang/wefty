@@ -134,24 +134,33 @@ Those retries are that removal's cadence rather than the node's health, so a
 declared-stalled removal's own retry failures, of any shape, do not gate the
 barrier -- a typed helper refusal, an untyped transport loss, an engine failure
 that carries no code, or any other failure of one of its retries is accounted
-and logged on the removal and never returned to the boot sequence. Its refusal
-streak, durable backoff and stall accounting are unchanged, and the removal
-stays visible in node status with its last failure and that failure's shape. A
-failure is attributed to a declared-stalled removal only when the standing
-directive and the node's own durable record agree on job, removal generation,
-cleanup fence, root instance and bound node; boot resumption, which carries no
-directive, attributes it from that same durable record alone. Every other
-directive in the same response -- another removal, a prune, a Storage copy, a
-reap for a live attempt -- is reconciled and still gates, so a node whose
-sole outstanding cleanup is a stalled one publishes `kind:oci` again. This
+and logged on the removal instead of being returned to the boot sequence. The
+one exception is cancellation: a failure observed while the pass's own context
+is already cancelled is returned unchanged and still gates, because a cancelled
+pass has learned nothing about that removal. Its refusal streak, durable
+backoff and stall accounting are unchanged, and the removal stays visible in
+node status with its last failure and that failure's shape. A failure is
+attributed to a declared-stalled removal only when the standing directive and
+the node's own durable record agree on job, removal generation, cleanup fence,
+root instance and bound node; boot resumption, which carries no directive,
+attributes it from that same durable record alone.
+What gates is every other failure this reconciliation returns: an undeclared
+removal, a Backup prune, a Computer Storage reset or grow, a reimage preflight,
+and the runtime reaps those perform for live attempts. Work the same response
+dispatches asynchronously -- a Backup creation, a Computer Storage copy, a
+custody export -- has never gated the barrier and does not start to; each
+reports through its own operation outcome. A node whose sole outstanding
+cleanup is a stalled one therefore publishes `kind:oci` again. This
 exempts nothing from the helper's namespace sweep and verification: runtime
 residue belonging to a stalled Computer is still refused by that proof, and its
 durable-retention rules are unchanged. The suppression is derived on every pass
 from the node's own durable removal record, which carries the accepted
 declaration, joined with the standing directive, and only when the two agree on
 job, removal generation, cleanup fence, root instance and bound node; any
-disagreement reconciles normally. Nothing is latched, so releasing the record
-restores ordinary reconciliation. There is still one bound and one outcome for
+disagreement reconciles normally. Boot resumption is the one pass with no
+standing directive to join: it derives the same attribution from that durable
+record alone, and only from a record this agent can validate. Nothing is
+latched, so releasing the record restores ordinary reconciliation. There is still one bound and one outcome for
 a removal, never a second accounting for one of its steps. The
 node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is

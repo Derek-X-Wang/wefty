@@ -324,10 +324,18 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 // kind:oci. A declared stall is L1's own record that this cleanup is not proven
 // and the Slot is released, so a retry that fails again, of any shape, is that
 // removal's cadence and not the node's health (#530). Its failure is accounted
-// and logged on the removal and kept out of this joined error. Every other
-// directive in the response -- another removal, a prune, a Storage copy -- is
-// reconciled and still gates, and nothing about the helper's namespace sweep
-// and verification changes.
+// and logged on the removal and kept out of this joined error, unless the pass
+// was already cancelled, which teaches nothing about that removal.
+//
+// What this joined error gates on is the work reconciled synchronously here:
+// boot resumption, the standing removal directives, Backup prunes, Computer
+// Storage resets and grows, and reimage preflights. Every failure of theirs
+// other than the declared removal's own retries still withdraws kind:oci
+// exactly as before. Backup creations, Computer Storage copies and custody
+// exports are dispatched asynchronously below and return nil here, so they
+// never gated the barrier and are untouched by this change; each reports
+// through its own operation outcome. Nothing about the helper's namespace
+// sweep and verification changes either.
 func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
 	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 	return errors.Join(session.resumePendingRemovals(ctx),
