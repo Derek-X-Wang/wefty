@@ -92,9 +92,12 @@ type RetainedResultsStatus struct {
 	// "excluded from accounting", and excluding them would make quarantine a
 	// way to hide storage.
 	QuarantinedRecords int `json:"quarantined_records"`
-	// Unaccounted counts what is under the handoff root that no record names.
-	// Those entries are neither measured nor removed -- they are not this
-	// agent's -- and this is the count that stops them being invisible.
+	// Unaccounted counts the bytes on this node that the figures above do not
+	// include: entries under the handoff root that no record names, which are
+	// neither measured nor removed because they are not this agent's, plus
+	// subtrees a mid-pass identity change put out of the walk's reach. Both
+	// are storage the node is holding and cannot charge, which is the one
+	// thing a budget must not be allowed to forget.
 	Unaccounted int `json:"unaccounted"`
 }
 
@@ -235,6 +238,22 @@ func (observer *lifecycleObserver) recordRetainedResults(status RetainedResultsS
 	observer.mu.Lock()
 	observer.retainedResults = &status
 	observer.mu.Unlock()
+}
+
+// retainedResultsSnapshot reports the last pass, and whether one has run. It is
+// separate from snapshot() because the node doctor asks for this alone and
+// building a whole lifecycle projection to answer it would make the doctor pay
+// for the attempt map it does not read.
+func (observer *lifecycleObserver) retainedResultsSnapshot() (RetainedResultsStatus, bool) {
+	if observer == nil {
+		return RetainedResultsStatus{}, false
+	}
+	observer.mu.RLock()
+	defer observer.mu.RUnlock()
+	if observer.retainedResults == nil {
+		return RetainedResultsStatus{}, false
+	}
+	return *observer.retainedResults, true
 }
 
 func (observer *lifecycleObserver) finishAttempt(attemptID string) {

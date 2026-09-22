@@ -715,6 +715,22 @@ func run() error {
 					CapabilitySnapshot: func() ocicontrol.CapabilitySnapshot {
 						return ocicontrol.CapabilitySnapshot(nodeAgent.CapabilitySnapshot())
 					},
+					// The operator-control package holds its own transport
+					// shape on purpose, so the conversion lives here rather
+					// than making doctor depend on the agent it reports on.
+					RetainedResults: func() (ocicontrol.RetainedResultsFacts, bool) {
+						status, measured := nodeAgent.RetainedResults()
+						if !measured {
+							return ocicontrol.RetainedResultsFacts{}, false
+						}
+						measuredAt := status.MeasuredAt
+						return ocicontrol.RetainedResultsFacts{
+							MeasuredAt: &measuredAt, Runs: status.Runs, InFlight: status.InFlight,
+							Entries: status.Entries, LogicalBytes: status.LogicalBytes,
+							ChargedBytes: status.ChargedBytes, QuarantinedRecords: status.QuarantinedRecords,
+							Unaccounted: status.Unaccounted,
+						}, true
+					},
 					Intent:                        (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
 					LimaFacts:                     limaFacts,
 					Helper:                        doctorHelperSource(ociAdapter),

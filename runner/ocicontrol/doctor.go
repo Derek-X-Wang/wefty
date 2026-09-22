@@ -200,6 +200,31 @@ type ComputerStorageRecoveryFacts struct {
 	Quarantined      []ocihelper.ComputerStorageRecoveryInventoryEntry `json:"quarantined"`
 }
 
+// RetainedResultsFacts is what the node agent's last retained-results
+// accounting pass found under its process handoff root.
+//
+// It is a measurement, not a budget: nothing on the node enforces any of these
+// figures yet (#494). It reaches an operator here because the alternative is
+// the agent log, and a number nobody can ask for is a number nobody reads.
+//
+// Both byte figures are carried because they answer different questions.
+// LogicalBytes is what the files hold, with a file two runs hard-link counted
+// once. ChargedBytes is the same measurement with a floor under every entry, so
+// a tree of a million empty files -- no logical bytes and a node out of inodes
+// -- is a number somebody can see. Unaccounted is what the node is holding that
+// neither figure includes.
+type RetainedResultsFacts struct {
+	Outcome            DiagnosticOutcome `json:"outcome"`
+	MeasuredAt         *time.Time        `json:"measured_at,omitempty"`
+	Runs               int               `json:"runs"`
+	InFlight           int               `json:"in_flight"`
+	Entries            int64             `json:"entries"`
+	LogicalBytes       int64             `json:"logical_bytes"`
+	ChargedBytes       int64             `json:"charged_bytes"`
+	QuarantinedRecords int               `json:"quarantined_records"`
+	Unaccounted        int               `json:"unaccounted"`
+}
+
 type DiagnosticFinding struct {
 	Check       string                        `json:"check"`
 	Outcome     DiagnosticOutcome             `json:"outcome"`
@@ -236,6 +261,7 @@ type DoctorResponse struct {
 	LastSessionInvalidation *ocihelper.SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
 	Convergence             ConvergenceDoctorFacts                `json:"convergence"`
 	ComputerStorageRecovery ComputerStorageRecoveryFacts          `json:"computer_storage_recovery"`
+	RetainedResults         RetainedResultsFacts                  `json:"retained_results"`
 	// AttemptOwnershipQuarantines names durable Attempt ownership records the
 	// boot sweep moved aside rather than wedge helper startup on. Empty is the
 	// healthy shape.
@@ -289,6 +315,10 @@ type DoctorConfig struct {
 	ReadDesiredSetupState      func(string) (SetupState, error)
 	InstalledSystemdVersion    func(context.Context) (int, error)
 	InstalledHelperServiceUnit func(context.Context) (string, error)
+	// RetainedResults reads the node-local agent's last retained-results
+	// accounting pass. The second result is false before the first pass has
+	// run, so "not measured yet" never arrives as a node holding nothing.
+	RetainedResults func() (RetainedResultsFacts, bool)
 	// Removals reads the durable runtime removals the node-local agent is
 	// carrying. A removal the agent cannot validate holds its node service
 	// slot for as long as the row exists, and until this finding existed that
@@ -373,7 +403,8 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 		Convergence:             ConvergenceDoctorFacts{Outcome: DiagnosticNotRun},
 		ComputerStorageRecovery: ComputerStorageRecoveryFacts{Outcome: DiagnosticNotRun,
 			Deferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{}, Quarantined: []ocihelper.ComputerStorageRecoveryInventoryEntry{}},
-		Findings: []DiagnosticFinding{},
+		RetainedResults: RetainedResultsFacts{Outcome: DiagnosticNotRun},
+		Findings:        []DiagnosticFinding{},
 		Limitations: []DoctorLimitation{{
 			Code:   DoctorUIDLimitation,
 			Detail: "process-kind payloads currently share the agent user; operator peer credentials do not distinguish them",
@@ -395,7 +426,50 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildHelperStartupBound(config, &report)
 	buildHelper(ctx, config, &report)
 	buildRemovalRecords(ctx, config, now, &report)
+	buildRetainedResults(config, &report)
 	return report
+}
+
+// buildRetainedResults puts the agent's retained-results accounting on the
+// doctor response.
+//
+// The measurement exists on the node either way; what this adds is a way to ask
+// for it. Two things are worth an operator's attention and neither is a
+// failure: how much the node is holding, and how much of what it is holding it
+// cannot account for -- a directory no record names is never measured and never
+// removed, however full the node gets, so an unaccounted count that keeps
+// growing is the shape of a node quietly filling up.
+func buildRetainedResults(config DoctorConfig, report *DoctorResponse) {
+	if config.RetainedResults == nil {
+		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+			code: "oci_retained_results_not_read", notRunCause: NotRunNotConfigured,
+			detail: "the node-local retained-results reader was not available to the doctor",
+		}))
+		return
+	}
+	facts, measured := config.RetainedResults()
+	if !measured {
+		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+			code: "oci_retained_results_not_read", notRunCause: NotRunSourceUnavailable,
+			detail: "the node agent has not completed a retained-results accounting pass yet",
+		}))
+		return
+	}
+	facts.Outcome = DiagnosticOK
+	report.RetainedResults = facts
+	detail := fmt.Sprintf("the node retains %d run(s) (%d still in flight) across %d entries: %d logical bytes, %d charged bytes, %d quarantined record(s) still charged",
+		facts.Runs, facts.InFlight, facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords)
+	if facts.Unaccounted == 0 {
+		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+			ran: true, passed: true, code: "oci_retained_results_measured", detail: detail,
+		}))
+		return
+	}
+	report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+		ran: true, code: "oci_retained_results_unaccounted", severity: DiagnosticWarn,
+		detail: fmt.Sprintf("%s; %d entr(ies) under the handoff root are not this agent's and are neither measured nor removed, however full the node is",
+			detail, facts.Unaccounted),
+	}))
 }
 
 // removalStallBound is how long a durable removal row may sit unfinished
@@ -1263,6 +1337,7 @@ func StableDoctorCodes() []string {
 		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
 		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable", "oci_removal_stalled",
 		"oci_removal_stalled_declared",
+		"oci_retained_results_not_read", "oci_retained_results_measured", "oci_retained_results_unaccounted",
 	}
 }
 
@@ -1271,7 +1346,8 @@ func (report DoctorResponse) Validate() error {
 		return fmt.Errorf("invalid doctor header")
 	}
 	if len(report.Findings) == 0 || report.Probe.Capabilities == nil || report.Probe.MissingCapabilities == nil || report.Mounts.AllowedRoots == nil ||
-		!report.ComputerStorageRecovery.Outcome.Valid() || !report.ComputerScreenIsolation.Outcome.Valid() {
+		!report.ComputerStorageRecovery.Outcome.Valid() || !report.ComputerScreenIsolation.Outcome.Valid() ||
+		!report.RetainedResults.Outcome.Valid() {
 		return fmt.Errorf("doctor report is incomplete")
 	}
 	if len(report.Limitations) != 1 || report.Limitations[0].Code != DoctorUIDLimitation || report.Limitations[0].Issue != DoctorUIDIssue || report.Limitations[0].Detail == "" {
@@ -1305,7 +1381,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy", "removal-records"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy", "removal-records", "retained-results"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}
@@ -1361,6 +1437,11 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t after_endpoint_ready=%t target_x_live=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.HostAbstractSocketObservedAfterEndpointReady, report.ComputerScreenIsolation.TargetAbstractSocketLive, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
+		fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unaccounted=%d",
+			report.RetainedResults.Outcome, formatOptionalTime(report.RetainedResults.MeasuredAt),
+			report.RetainedResults.Runs, report.RetainedResults.InFlight, report.RetainedResults.Entries,
+			report.RetainedResults.LogicalBytes, report.RetainedResults.ChargedBytes,
+			report.RetainedResults.QuarantinedRecords, report.RetainedResults.Unaccounted),
 	}
 	if report.ResourceAdmission != nil {
 		admission := report.ResourceAdmission

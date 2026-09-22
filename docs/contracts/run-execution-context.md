@@ -689,12 +689,25 @@ marker, and one carrying neither a record nor such a marker is left exactly as
 it is and counted in the accounting pass rather than left invisible. A record
 is validated against the file it was found in, the root, this node's identity
 and the retention window, and one that fails any of those — including one from
-an older agent missing fields — is skipped with a logged reason and never stops the sweep. The marker inside the
-handoff directory keeps its cold-rerun ownership job and that adoption, and is
-read at preparation and, for a directory no record names, once at startup.
-Adoption only ever adds a directory this agent created to this agent's own
-accounting, and the deadline it takes from the marker is clamped to the
-retention window, so a forged marker can at worst expire its own run early.
+an older agent missing fields — is skipped with a logged reason and never stops
+the sweep. The marker inside the handoff directory keeps its cold-rerun
+ownership job and that adoption, and is read at preparation, at startup for a
+directory no record names, and at startup for a record that carries an
+admission and no deadline.
+
+**What adoption can and cannot claim.** The marker is a file inside a
+workload-writable directory, so it is not proof the agent created what it
+names: a directory a workload made under this node's handoff root, carrying a
+marker naming this node and that run, qualifies. What adoption may do with it
+is bounded instead. It only ever creates a record, never replaces one that
+already stands at that run's name, and it gives no authority beyond an expiry
+schedule over a directory under this node's own root. The deadline it takes
+from the marker is at most one retention window **after the adoption**, so a
+forged marker may shorten its own run's retention freely and may extend nothing
+past a window from the moment the node adopted it. A record whose run was
+admitted and never finished is reconciled the same way, and one whose directory
+is gone is removed rather than left without a deadline; one whose name is not a
+directory is given its admitted deadline and left alone, never followed.
 
 Terminal recording and trimming require the opaque preparation receipt from
 that attempt's lock acquisition. A canceled waiter has no receipt and performs
@@ -715,10 +728,24 @@ its own attempts while it collects.
 
 **The budgets are logical bytes**, summed over regular files: the length a file
 reports, not the blocks it occupies. A symlink is never followed and contributes
-nothing; a hard-linked file is charged once per link, because part 1 tracks no
-inode identity. Sparse files are charged their logical length. There is no inode
-or entry-count bound, so many tiny files can consume node resources while barely
-moving the per-run budget; whether to add one is part of #494.
+nothing; the per-run bound charges a hard-linked file once per link, because
+that bound trims names and dropping one name recovers nothing while another
+still holds the inode. Sparse files are charged their logical length. No budget
+bounds inodes or entry counts, so many tiny files can consume node resources
+while barely moving the per-run budget.
+
+**What the node reports is measured differently from what it enforces.** The
+agent's accounting pass reports two figures over the runs its records name, and
+enforces neither. Logical bytes are as above, except that a file two runs
+hard-link is counted once per pass rather than once per link, because one inode
+is one piece of storage however many names reach it. Charged bytes are that
+same measurement with a floor of 4 KiB under every directory entry, which is
+what makes a tree of a million empty files — no logical bytes, and a node out
+of inodes — a number an operator can see. The pass also counts what it cannot
+charge: entries under the handoff root that no record names, which are neither
+measured nor removed however full the node is. All of it reaches a person
+through the agent log and the node doctor's retained-results line. The budget
+that will enforce a node-wide figure is #494.
 
 The record also carries whether the run's evidence reached the ledger. Nothing
 in part 1 reads it — there is no eviction order for it to inform — and it is

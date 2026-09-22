@@ -723,6 +723,20 @@ func (a *Agent) Status() Status {
 	)
 }
 
+// RetainedResults returns what the agent's last retained-results accounting
+// pass found, and whether a pass has completed at all.
+//
+// The second result is not a formality. A node that has not measured yet and a
+// node holding nothing produce the same zeroes, and reporting the first as the
+// second would tell an operator the node is empty at exactly the moment nobody
+// knows what it is holding.
+func (a *Agent) RetainedResults() (RetainedResultsStatus, bool) {
+	if a == nil || a.observer == nil {
+		return RetainedResultsStatus{}, false
+	}
+	return a.observer.retainedResultsSnapshot()
+}
+
 // CapabilitySnapshot returns the same immutable observation used by local
 // admission, registration, and heartbeat publication.
 func (a *Agent) CapabilitySnapshot() CapabilitySnapshot {

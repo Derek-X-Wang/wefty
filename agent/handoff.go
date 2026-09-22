@@ -110,7 +110,9 @@ type handoffPathLock struct {
 
 // handoffMarker is advisory and lives inside the workload-writable handoff
 // directory. Its whole remaining job is to prove to a cold rerun that the files
-// it found are its own, and it is read only at preparation. Retention is
+// it found are its own, and, at startup, letting the agent adopt a directory or
+// an unfinished admission back into its own accounting (adoptResidue). It is
+// read nowhere else, and never at finish. Retention is
 // decided by the agent-local record instead (handoff_records.go), because a
 // workload shares this agent's OS identity and anything in here is a file it
 // can rewrite.
@@ -460,8 +462,11 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 // on the retention record, and nothing is deleted. The bound is no longer
 // silently skipped; it is openly not met.
 //
-// The ownership marker is therefore still read exactly once, at preparation, as
-// docs/contracts/run-execution-context.md says.
+// The ownership marker is therefore not read here at all. It is read at
+// preparation, and at startup for the directories and unfinished admissions
+// adoption reconciles, exactly as docs/contracts/run-execution-context.md says
+// -- and never on the finish path, where a workload-writable file would be
+// standing in as proof of whose files a directory holds.
 //
 // It never fails the attempt. A workload that destroyed its own handoff
 // directory has not failed its run.
@@ -511,7 +516,7 @@ func (m *handoffManager) admissionOf(runID, nodeID, path string, now time.Time) 
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return now
 	}
-	current, err := m.readRecord(filepath.Join(m.recordRoot(), recordComponent(runID)))
+	current, err := m.readRecord(m.existingRecordPath(runID))
 	switch {
 	case err != nil:
 		m.log("agent: run %s: no admission record to update at finish (%v); recording this run as admitted when it finished", runID, err)
@@ -852,7 +857,7 @@ func (m *handoffManager) rewriteRecord(snapshot, updated retentionRecord) bool {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return true
 	}
-	current, err := m.readRecord(filepath.Join(m.recordRoot(), recordComponent(snapshot.RunID)))
+	current, err := m.readRecord(m.existingRecordPath(snapshot.RunID))
 	if err != nil {
 		m.log("agent: leave run %s's retention record alone: re-reading it failed: %v", snapshot.RunID, err)
 		return false
@@ -906,15 +911,15 @@ func (m *handoffManager) currentRecord(snapshot retentionRecord) (retentionRecor
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return snapshot, true
 	}
-	name := recordComponent(snapshot.RunID)
-	record, err := m.readRecord(filepath.Join(m.recordRoot(), name))
+	path := m.existingRecordPath(snapshot.RunID)
+	record, err := m.readRecord(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			m.log("agent: skip run %s this sweep: re-reading its retention record failed: %v", snapshot.RunID, err)
 		}
 		return retentionRecord{}, false
 	}
-	if err := validRetentionRecord(record, name, m.root, m.nodeID, m.retention, m.now().UTC()); err != nil {
+	if err := validRetentionRecord(record, filepath.Base(path), m.root, m.nodeID, m.retention, m.now().UTC()); err != nil {
 		m.log("agent: skip run %s this sweep: its retention record is no longer trustworthy: %v", snapshot.RunID, err)
 		return retentionRecord{}, false
 	}

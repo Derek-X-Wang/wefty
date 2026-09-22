@@ -1263,3 +1263,86 @@ func TestDoctorSeparatesIneligibleEvidenceFromFailedDeclaration(t *testing.T) {
 		}
 	}
 }
+
+// TestDoctorReportsRetainedResults: the agent measures what it is holding every
+// collection, and until this finding the only place that reached a person was
+// the agent log. The doctor is where an operator asks.
+func TestDoctorReportsRetainedResults(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	measured := now.Add(-3 * time.Minute)
+	config := healthyDoctorConfig(now, "")
+	config.RetainedResults = func() (RetainedResultsFacts, bool) {
+		return RetainedResultsFacts{
+			MeasuredAt: &measured, Runs: 6, InFlight: 1, Entries: 4096,
+			LogicalBytes: 12 << 20, ChargedBytes: 20 << 20,
+			QuarantinedRecords: 1, Unaccounted: 3,
+		}, true
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if report.RetainedResults.Outcome != DiagnosticOK {
+		t.Fatalf("retained results outcome = %q", report.RetainedResults.Outcome)
+	}
+	if report.RetainedResults.Runs != 6 || report.RetainedResults.InFlight != 1 ||
+		report.RetainedResults.LogicalBytes != 12<<20 || report.RetainedResults.ChargedBytes != 20<<20 ||
+		report.RetainedResults.Entries != 4096 || report.RetainedResults.QuarantinedRecords != 1 ||
+		report.RetainedResults.Unaccounted != 3 {
+		t.Fatalf("the doctor lost the measurement: %#v", report.RetainedResults)
+	}
+	item, found := findingFor(report, "retained-results")
+	if !found {
+		t.Fatal("the doctor carries no retained-results finding")
+	}
+	// Unaccounted entries are neither measured nor removed however full the
+	// node is, so a count that keeps growing is the shape of a node quietly
+	// filling up: it is a finding an operator is meant to see, not a footnote.
+	if item.Code != "oci_retained_results_unaccounted" || item.Outcome != DiagnosticFailed {
+		t.Fatalf("unaccounted entries did not raise the finding: %#v", item)
+	}
+	if !strings.Contains(item.Detail, "12582912 logical bytes") ||
+		!strings.Contains(item.Detail, "20971520 charged bytes") ||
+		!strings.Contains(item.Detail, "3 entr") {
+		t.Fatalf("the finding does not name what it measured: %q", item.Detail)
+	}
+
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human.String(), "RETAINED RESULTS\tOK measured_at=2026-09-22T11:57:00Z runs=6 in_flight=1 entries=4096 logical_bytes=12582912 charged_bytes=20971520 quarantined=1 unaccounted=3") {
+		t.Fatalf("the human report does not carry the measurement:\n%s", human.String())
+	}
+}
+
+// TestDoctorSaysRetainedResultsAreUnmeasuredRatherThanEmpty: a node that has not
+// run an accounting pass and a node holding nothing produce the same zeroes.
+func TestDoctorSaysRetainedResultsAreUnmeasuredRatherThanEmpty(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	config.RetainedResults = func() (RetainedResultsFacts, bool) { return RetainedResultsFacts{}, false }
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	item, found := findingFor(report, "retained-results")
+	if !found {
+		t.Fatal("the doctor carries no retained-results finding")
+	}
+	if item.Outcome != DiagnosticNotRun || item.Code != "oci_retained_results_not_read" {
+		t.Fatalf("an unmeasured node was reported as measured: %#v", item)
+	}
+	if report.RetainedResults.Outcome != DiagnosticNotRun {
+		t.Fatalf("retained results outcome = %q, want NOT-RUN", report.RetainedResults.Outcome)
+	}
+}
+
+func findingFor(report DoctorResponse, check string) (DiagnosticFinding, bool) {
+	for _, item := range report.Findings {
+		if item.Check == check {
+			return item, true
+		}
+	}
+	return DiagnosticFinding{}, false
+}

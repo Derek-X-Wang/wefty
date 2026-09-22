@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +54,10 @@ const (
 	// quarantine reason, so one long OS error cannot push a record past
 	// maxRetentionRecordBytes and make it unreadable.
 	maxQuarantineDetailBytes = 256
+	// maxRecordComponentBytes bounds the run-derived part of a record's file
+	// name. A run ID may be 128 bytes and escaping can double that, so a name
+	// past this carries a digest of the whole ID rather than a cut of it.
+	maxRecordComponentBytes = 96
 )
 
 // handoffRecordAnomaly is a typed reason the agent could not do to a run's
@@ -209,6 +215,13 @@ func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, err
 	path := filepath.Join(m.uploadRecordRoot(), recordComponent(runID))
 	payload, err := readStateDocument(path)
 	if errors.Is(err, os.ErrNotExist) {
+		// An older agent's name for the same run. The run ID inside is checked
+		// below, because the old name was shared between run IDs.
+		if legacy := legacyRecordComponent(runID); legacy != recordComponent(runID) {
+			payload, err = readStateDocument(filepath.Join(m.uploadRecordRoot(), legacy))
+		}
+	}
+	if errors.Is(err, os.ErrNotExist) {
 		return uploadRecord{}, false, nil
 	}
 	if err != nil {
@@ -218,6 +231,9 @@ func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, err
 	if err := json.Unmarshal(payload, &record); err != nil {
 		return uploadRecord{}, false, err
 	}
+	if record.RunID != runID {
+		return uploadRecord{}, false, nil
+	}
 	return record, true, nil
 }
 
@@ -225,9 +241,76 @@ func (m *handoffManager) recordRoot() string {
 	return filepath.Join(m.stateRoot, retentionRecordDirectoryName)
 }
 
-// recordComponent maps a run ID to one safe file name. A run ID is L1's, not a
-// workload's, but it still becomes a path component here.
+// recordComponent maps a run ID to one safe file name, and maps two different
+// run IDs to two different file names.
+//
+// The mapping it replaces did neither reliably. It rewrote every character
+// outside [A-Za-z0-9_-] to "_" and cut the result at 96 bytes, so "run.live"
+// and "run_live" shared a file, as did any two runs agreeing on their first 96
+// characters -- and a run ID may be 128 bytes and may contain "." by the same
+// rule the run mailbox applies (validRunMailboxSegment). A shared file is not a
+// cosmetic collision: a record is deletion authority over a directory, so one
+// run's record standing in for another's is one run holding another's expiry,
+// and adoption writing at a colliding key would hand a workload a way to
+// replace a record it does not own.
+//
+// So every byte outside [A-Za-z0-9_-] is escaped rather than folded, and a name
+// too long for one component keeps a prefix and carries a digest of the whole
+// run ID instead of being cut. Both directions are reversible enough to be
+// injective, which is the only property that matters here.
+//
+// Names that need neither -- the ordinary case -- come out byte-for-byte as the
+// old mapping produced them, so an upgraded node reads its own existing
+// records. The rest are read through legacyRecordComponent as well.
 func recordComponent(runID string) string {
+	escaped, complete := escapedRecordName(runID, maxRecordComponentBytes)
+	if escaped == "" {
+		// Not reachable for a validated run ID, which is never empty. A record
+		// still needs a name rather than ".json".
+		return "run.json"
+	}
+	if complete {
+		return escaped + ".json"
+	}
+	digest := sha256.Sum256([]byte(runID))
+	suffix := "-" + hex.EncodeToString(digest[:8])
+	prefix, _ := escapedRecordName(runID, maxRecordComponentBytes-len(suffix))
+	return prefix + suffix + ".json"
+}
+
+// escapedRecordName escapes one run ID into at most limit bytes, and reports
+// whether the whole ID fit. An escape is never split across the limit: half of
+// "%2E" would still be a legal file name, but it would stop being the answer to
+// "which run is this".
+func escapedRecordName(runID string, limit int) (string, bool) {
+	var builder strings.Builder
+	for index := 0; index < len(runID); index++ {
+		value := runID[index]
+		piece := string(value)
+		switch {
+		case value >= 'a' && value <= 'z', value >= 'A' && value <= 'Z',
+			value >= '0' && value <= '9', value == '-', value == '_':
+		default:
+			piece = fmt.Sprintf("%%%02X", value)
+		}
+		if builder.Len()+len(piece) > limit {
+			return builder.String(), false
+		}
+		builder.WriteString(piece)
+	}
+	return builder.String(), true
+}
+
+// legacyRecordComponent is the mapping recordComponent replaced. It exists so a
+// node that upgrades keeps reading the records it already wrote: those files
+// are its only authority to expire directories, and a mapping change that made
+// them unreadable would turn every retained run on the node into residue the
+// sweep no longer owns.
+//
+// Nothing is ever written at this name. A record found under one is rewritten
+// to the current name and the legacy file is removed, so no run ends up with
+// two records.
+func legacyRecordComponent(runID string) string {
 	var builder strings.Builder
 	for _, value := range runID {
 		switch {
@@ -247,11 +330,66 @@ func recordComponent(runID string) string {
 	return builder.String() + ".json"
 }
 
+// recordPath is where this run's record is written. Writes only ever use this
+// name.
+func (m *handoffManager) recordPath(runID string) string {
+	return filepath.Join(m.recordRoot(), recordComponent(runID))
+}
+
+// existingRecordPath is where this run's record is *read* from: the current
+// name when a file is there, and otherwise the name an older agent would have
+// written. It returns the current name when neither exists, so a caller that
+// reports "not found" reports it against the name a write would create.
+func (m *handoffManager) existingRecordPath(runID string) string {
+	path := m.recordPath(runID)
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		return path
+	}
+	if legacy, ok := m.legacyRecordPath(runID); ok {
+		return legacy
+	}
+	return path
+}
+
+// legacyRecordPath reports the older name this run's record may still be under,
+// and only when the file there really is this run's.
+//
+// The check is not a formality. The old mapping was not injective, so run
+// "a.b"'s legacy name is run "a_b"'s legacy name, and following it blindly
+// would hand one run the other's record -- as expiry authority over a directory
+// it does not own, which is the whole failure the new mapping exists to remove.
+func (m *handoffManager) legacyRecordPath(runID string) (string, bool) {
+	legacy := filepath.Join(m.recordRoot(), legacyRecordComponent(runID))
+	if legacy == m.recordPath(runID) {
+		return "", false
+	}
+	record, err := m.readRecord(legacy)
+	if err != nil || record.RunID != runID {
+		return "", false
+	}
+	return legacy, true
+}
+
 func (m *handoffManager) writeRecord(record retentionRecord) error {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return nil
 	}
-	return writeStateDocument(m.recordRoot(), recordComponent(record.RunID), record)
+	if err := writeStateDocument(m.recordRoot(), recordComponent(record.RunID), record); err != nil {
+		return err
+	}
+	// A record that arrived under the old name is now at the new one. Leaving
+	// the old file would give one run two records, and loadRecords would sweep
+	// on both. Only this run's own old file is removed: the old name is shared
+	// with other run IDs, and removing one of those would delete a record this
+	// run has no claim on.
+	legacy, ok := m.legacyRecordPath(record.RunID)
+	if !ok {
+		return nil
+	}
+	if err := os.Remove(legacy); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.log("agent: run %s: remove the record's superseded file name %q: %v", record.RunID, legacy, err)
+	}
+	return nil
 }
 
 // writeStateDocument writes one small agent-owned JSON document by
@@ -285,13 +423,24 @@ func writeStateDocument(root, name string, value any) error {
 	return os.Rename(staging, path)
 }
 
+// removeRecord drops both names a run's record can be under. Removing only the
+// current one would leave an older agent's file behind as authority nothing
+// updates.
 func (m *handoffManager) removeRecord(runID string) error {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return nil
 	}
-	err := os.Remove(filepath.Join(m.recordRoot(), recordComponent(runID)))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	paths := []string{m.recordPath(runID)}
+	// Again only this run's own older file: the old name is shared, so
+	// removing it unconditionally would delete another run's record.
+	if legacy, ok := m.legacyRecordPath(runID); ok {
+		paths = append(paths, legacy)
+	}
+	for _, path := range paths {
+		err := os.Remove(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }
@@ -395,7 +544,12 @@ func validRetentionRecord(record retentionRecord, fileName, root, nodeID string,
 	if !validRunMailboxSegment(record.RunID) {
 		return fmt.Errorf("record run %q is not one safe path component", record.RunID)
 	}
-	if recordComponent(record.RunID) != fileName {
+	// Either name the record could legitimately be filed under: the one a
+	// write produces now, or the one an older agent wrote before the mapping
+	// became injective. Anything else is a record that does not belong to the
+	// file it was found in, which is the check that stops one run's record
+	// standing in as another's deletion authority.
+	if recordComponent(record.RunID) != fileName && legacyRecordComponent(record.RunID) != fileName {
 		return fmt.Errorf("record names run %q but is filed as %q", record.RunID, fileName)
 	}
 	if record.Directory != filepath.Join(root, record.RunID) {
