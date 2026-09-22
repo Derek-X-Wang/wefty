@@ -217,10 +217,15 @@ capability fact and withdrawn with the rest of that probe's facts. The Node's
 registered host platform is never the comparison: a Mac Node's host is
 darwin/arm64 while every image it can run is linux/arm64. A Node that
 advertises no runtime platform, or more than one, has nothing to compare and
-refuses the receipt. A verified receipt L1 refuses for either reason is counted,
-and the third consecutive refusal of the same operation latches the typed
-failure through the ordinary refused-preflight path. No Computer is left in
-`reimaging` behind a refusal that repeats on every poll with no failure to read.
+refuses the receipt. Counting is scoped exactly to this refusal: an otherwise
+valid verified receipt refused because the Node's runtime platform is
+unavailable, ambiguous, or does not match the image's is counted, and the third
+consecutive such refusal of the same operation latches the typed failure through
+the ordinary refused-preflight path, so no Computer is left in `reimaging`
+behind a platform refusal that repeats on every poll with no failure to read. A
+receipt that fails the identity, authority, or ownership checks is refused
+before the counter and never latches, because a malformed or foreign receipt is
+a fact about the sender rather than about the operation.
 
 A grow intent is strictly larger than `desired_disk_bytes`. It preserves the
 current immutable Job, attempt, Computer identity, Storage identity, and

@@ -1211,52 +1211,105 @@ func TestComputerReimageAdmitsTheNodesRuntimePlatformNotItsHostPlatform(t *testi
 }
 
 func TestComputerReimageRefusesAnImageTheNodesRuntimeCannotRunAndLatchesTheTypedFailure(t *testing.T) {
-	h, node, staged := stagedReimageOnRuntimePlatformNode(t, "mac-wrong-image", "darwin", "arm64", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/arm64": true,
-	}, '2')
-	_, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
-	// The darwin image matches the host platform exactly and is still the one
-	// image this Node can never run.
-	request.Receipt.PlatformOS, request.Receipt.PlatformArchitecture = "darwin", "arm64"
-	for refusal := int64(1); refusal < MaximumComputerReimagePreflightRefusals; refusal++ {
-		_, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
-			staged.ComputerID, request)
-		if errorCode(err) != contract.ErrorConflict || !strings.Contains(err.Error(), "advertised runtime platform linux/arm64") {
-			t.Fatalf("refusal %d = %v", refusal, err)
-		}
-		held, err := h.store.GetComputer(t.Context(), staged.ComputerID)
-		if err != nil || held.ReconfigurationPhase != ComputerReconfigurationReimaging {
-			t.Fatalf("Computer after refusal %d = %#v err=%v", refusal, held, err)
-		}
+	for _, test := range []struct {
+		name                      string
+		imageOS, imageArchiteture string
+		target                    byte
+	}{
+		// The darwin image matches the Node's host platform exactly and is
+		// still the one image this Node can never run.
+		{name: "foreign os", imageOS: "darwin", imageArchiteture: "arm64", target: '2'},
+		// Same operating system, wrong machine: refused on the architecture
+		// alone, which the operating-system comparison cannot catch.
+		{name: "foreign architecture", imageOS: "linux", imageArchiteture: "amd64", target: '7'},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h, node, staged := stagedReimageOnRuntimePlatformNode(t, "mac-wrong-image", "darwin", "arm64", map[string]bool{
+				"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/arm64": true,
+			}, test.target)
+			_, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
+			request.Receipt.PlatformOS = test.imageOS
+			request.Receipt.PlatformArchitecture = test.imageArchiteture
+			wantRefusal := "image platform " + test.imageOS + "/" + test.imageArchiteture +
+				" is not the bound Node's advertised runtime platform linux/arm64"
+			for refusal := int64(1); refusal < MaximumComputerReimagePreflightRefusals; refusal++ {
+				_, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+					staged.ComputerID, request)
+				if errorCode(err) != contract.ErrorConflict || !strings.Contains(err.Error(), wantRefusal) {
+					t.Fatalf("refusal %d = %v", refusal, err)
+				}
+				held, err := h.store.GetComputer(t.Context(), staged.ComputerID)
+				if err != nil || held.ReconfigurationPhase != ComputerReconfigurationReimaging {
+					t.Fatalf("Computer after refusal %d = %#v err=%v", refusal, held, err)
+				}
+			}
+			latched, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+				staged.ComputerID, request)
+			var failure contract.SpawnFailure
+			if err != nil || latched.ReconfigurationPhase != ComputerReconfigurationStable ||
+				latched.AppliedRevision != staged.IntentRevision ||
+				json.Unmarshal(latched.CurrentJob.LastFailure, &failure) != nil ||
+				failure.Code != contract.SpawnFailureImagePlatformUnsupported ||
+				!strings.Contains(failure.Message, "refused 3 times in a row") ||
+				!strings.Contains(failure.Message, wantRefusal) {
+				t.Fatalf("latched platform refusal = %#v failure=%#v err=%v", latched, failure, err)
+			}
+			replayed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+				staged.ComputerID, request)
+			if err != nil || replayed.CurrentJobID != latched.CurrentJobID {
+				t.Fatalf("latched refusal replay = %#v err=%v", replayed, err)
+			}
+			// Not wedged: the released reconfiguration authority accepts a
+			// fresh operator intent without a removal.
+			aborted, _, err := h.store.AbortComputerReconfiguration(t.Context(), latched.ComputerID,
+				ComputerReconfigurationAbortRequest{ComputerMutationPrecondition: computerPrecondition(latched, "operator"),
+					IdempotencyKey: "abort-after-latch"})
+			if errorCode(err) == "" {
+				t.Fatalf("abort after the latch = %#v err=%v", aborted, err)
+			}
+			restaged, err := h.store.ReimageComputer(t.Context(), latched.ComputerID, ComputerReimageRequest{
+				ComputerMutationPrecondition: computerPrecondition(latched, "operator"), Image: reimageTarget('3'),
+				IdempotencyKey: "reimage-after-latch"})
+			if err != nil || restaged.ReconfigurationPhase != ComputerReconfigurationReimaging {
+				t.Fatalf("reimage after the latch = %#v err=%v", restaged, err)
+			}
+		})
 	}
-	latched, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+}
+
+// A helper-reported failure receipt is already a typed outcome on its way to
+// being latched. Comparing its platform would refuse the very receipt that says
+// the image cannot be used, which recreates the wedge one level down, so the
+// comparison is deliberately scoped to verified receipts.
+func TestComputerReimageFailureReceiptIsLatchedWithoutAPlatformComparison(t *testing.T) {
+	h, node, staged := stagedReimageOnRuntimePlatformNode(t, "failure-receipt-exempt", "darwin", "arm64", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/arm64": true,
+	}, '8')
+	_, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
+	request.Receipt.Kind = computerReimagePreflightFailedReceiptKind
+	request.Receipt.FailureCode = string(contract.SpawnFailureImagePlatformUnsupported)
+	request.Receipt.FailureStage = "image_identity"
+	request.Receipt.FailureReason = "image_platform_unsupported"
+	// The helper could not resolve a usable platform, so the receipt names one
+	// this Node's runtime does not run. A verified receipt spelled this way is
+	// refused; this one must be latched exactly as the helper reported it.
+	request.Receipt.PlatformOS, request.Receipt.PlatformArchitecture = "windows", "amd64"
+	failed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
 		staged.ComputerID, request)
 	var failure contract.SpawnFailure
-	if err != nil || latched.ReconfigurationPhase != ComputerReconfigurationStable ||
-		latched.AppliedRevision != staged.IntentRevision ||
-		json.Unmarshal(latched.CurrentJob.LastFailure, &failure) != nil ||
+	if err != nil || failed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		failed.AppliedRevision != staged.IntentRevision ||
+		json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
 		failure.Code != contract.SpawnFailureImagePlatformUnsupported ||
-		!strings.Contains(failure.Message, "refused 3 times in a row") {
-		t.Fatalf("latched platform refusal = %#v failure=%#v err=%v", latched, failure, err)
+		!strings.Contains(failure.Message, "image_identity") ||
+		strings.Contains(failure.Message, "advertised runtime platform") {
+		t.Fatalf("mismatched-platform failure receipt = %#v failure=%#v err=%v", failed, failure, err)
 	}
-	replayed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
-		staged.ComputerID, request)
-	if err != nil || replayed.CurrentJobID != latched.CurrentJobID {
-		t.Fatalf("latched refusal replay = %#v err=%v", replayed, err)
-	}
-	// Not wedged: the released reconfiguration authority accepts a fresh
-	// operator intent without a removal.
-	aborted, _, err := h.store.AbortComputerReconfiguration(t.Context(), latched.ComputerID,
-		ComputerReconfigurationAbortRequest{ComputerMutationPrecondition: computerPrecondition(latched, "operator"),
-			IdempotencyKey: "abort-after-latch"})
-	if errorCode(err) == "" {
-		t.Fatalf("abort after the latch = %#v err=%v", aborted, err)
-	}
-	restaged, err := h.store.ReimageComputer(t.Context(), latched.ComputerID, ComputerReimageRequest{
-		ComputerMutationPrecondition: computerPrecondition(latched, "operator"), Image: reimageTarget('3'),
-		IdempotencyKey: "reimage-after-latch"})
-	if err != nil || restaged.ReconfigurationPhase != ComputerReconfigurationReimaging {
-		t.Fatalf("reimage after the latch = %#v err=%v", restaged, err)
+	var refusals int64
+	if err := h.store.db.QueryRow(`SELECT preflight_refusals FROM computer_reimage_operations
+		WHERE computer_id=? AND operation_revision=?`, staged.ComputerID, staged.IntentRevision).Scan(&refusals); err != nil ||
+		refusals != 0 {
+		t.Fatalf("failure receipt counted %d platform refusals err=%v", refusals, err)
 	}
 }
 
