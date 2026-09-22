@@ -403,6 +403,39 @@ it. The source Computer, its Storage, and its Backup are untouched. Quarantine
 stays reserved for a copy whose integrity is in doubt and is never how a clone
 reports that the disk was too small.
 
+A clone whose destination generation is quarantined, or whose helper session
+is lost while it copies, is terminal. Runtime loss proves a lost observation,
+not unrecoverable bytes: what it leaves behind depends on how far the copy had
+got. Before the destination manifest is written, helper recovery rolls the
+attempt back, deleting the staged image and the copy's own authority record
+and leaving a root holding nothing but its lock; from `manifest_written` on,
+recovery finishes the helper's *local* publication and persists a verified
+receipt beside the bytes. Neither path consults L1, and neither is L1
+publication: the generation L1 retired is never started, never attached, and
+never becomes a Computer's current Storage, whatever the helper holds. A local
+receipt that arrives after the terminal outcome is evidence of what the node
+did, not authority to publish. What the acknowledgement itself does is delete
+nothing at all -- whatever the helper kept stays exactly where it is, readable
+for inspection, and ordinary removal is the one thing that clears it.
+
+L1's side is the same shape the capacity refusal has: the operation records
+`failed` with the exact typed code the helper authored
+(`computer_storage_quarantined` or `computer_storage_preparation_interrupted`),
+the never-published destination generation is retired, that same code is
+latched on the destination Job's `last_failure` with `next_restart_at` null,
+and the destination returns to `stable` and latched failed, so no later start
+can format an empty disk under an identity whose copy never happened. A
+`computer_storage_resume_deferred` outcome is not terminal: the helper kept the
+payload and asked to be called again, so it is recorded as the retryable
+observation a Custody import records and the directive stays live. The bound
+on that is not elapsed time alone -- ordinary reconciliation of a deferred
+destination runs the recovery step itself and counts the attempt, so a
+deferral either clears or reaches `resume_abandoned` quarantine, which ends
+here. Restore acquires no such path: its destination is a live Computer whose
+predecessor still owns the bytes. Removal is always available: a destination
+rolled back to a lock-only root proves exact absence through the same removal
+inventory a refused clone uses.
+
 A Computer whose current Storage generation was never published owns no bytes
 to start from or to change. Start, restart, and claim admission refuse it with
 the typed reason `storage_generation_retired`, and so do reimage, projection

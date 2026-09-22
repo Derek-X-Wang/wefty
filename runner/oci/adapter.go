@@ -2306,7 +2306,10 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 	})
 	if err != nil {
 		var runtimeLoss *ocihelper.RuntimeLossError
-		if request.Operation == "import" && errors.As(err, &runtimeLoss) {
+		// A clone owns a fresh destination generation exactly as an import
+		// does, so helper runtime loss mid-copy reaches the agent as the
+		// generation-bound fact it is and not as an opaque engine failure.
+		if (request.Operation == "import" || request.Operation == "clone") && errors.As(err, &runtimeLoss) {
 			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.RuntimeLossError{
 				Generation: workloadrunner.RuntimeGeneration{InstanceID: handshake.HelperInstanceID, Generation: handshake.SessionGeneration},
 				Err:        err,

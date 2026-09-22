@@ -12,6 +12,89 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// The whole chain a clone interrupted before `manifest_written` walks: the
+// copy is lost mid-flight, the boot sweep rolls it back to a root holding
+// nothing but its own lock, L1 latches the terminal outcome, and ordinary
+// removal must still be able to finish. Inventory used to refuse that root --
+// it carries neither a tombstone nor an attachment manifest -- so the agent's
+// reconstruction failed before deletion was ever reached (#526).
+func TestRolledBackCloneLeavesALockOnlyRootThatRemovalCanStillFinish(t *testing.T) {
+	for _, residue := range []string{"", "disk.ext4"} {
+		t.Run("residue="+residue, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+				storageCopyFinalize: fakeCloneFinalize(t), capacityReservations: make(map[string]*capacityReservation),
+				attempts: make(map[string]*containerdAttempt)}
+			crash := errors.New("injected helper runtime loss before the destination manifest")
+			engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+				if phase == computerStorageCopyCopied {
+					return crash
+				}
+				return nil
+			}
+			if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+				t.Fatalf("interrupted clone error = %v", err)
+			}
+			storage := request.Destination
+			name, _ := deterministicComputerDiskName(storage)
+			diskRoot := filepath.Join(root, "computer-disks", name)
+			engine.storageCopyHook = nil
+			if err := engine.sweepComputerDisks(t.Context(), "startup-rollback"); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(diskRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != computerDiskAttachmentLockFile {
+				names := make([]string, 0, len(entries))
+				for _, entry := range entries {
+					names = append(names, entry.Name())
+				}
+				t.Fatalf("rolled-back generation root = %v, want only the lock", names)
+			}
+			removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: "removal-boot",
+				JobID: request.Authority.JobID, PriorJobID: request.Authority.JobID, RemovalGeneration: 2,
+				CleanupFence: "remove-rolled-back-clone"}
+			inventoryRequest := InventoryRemovalRequest{Removal: removal,
+				RootInstanceID: request.Authority.RootInstanceID, ComputerStorage: &storage}
+			if residue != "" {
+				// Bytes under a lock-only root are not absence, whatever the
+				// rollback left a moment earlier.
+				if err := os.WriteFile(filepath.Join(diskRoot, residue), []byte("must survive"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if response, err := engine.InventoryRemoval(t.Context(), inventoryRequest); err == nil {
+					t.Fatalf("lock-only root with payload was inventoried as absent: %+v", response)
+				}
+				if payload, err := os.ReadFile(filepath.Join(diskRoot, residue)); err != nil || string(payload) != "must survive" {
+					t.Fatalf("reappeared payload changed: %q err=%v", payload, err)
+				}
+				return
+			}
+			inventory, err := engine.InventoryRemoval(t.Context(), inventoryRequest)
+			if err != nil || len(inventory.Attempts) != 1 || !inventory.Attempts[0].StorageAbsent ||
+				!inventory.Attempts[0].StorageOnly {
+				t.Fatalf("lock-only removal inventory = %+v err=%v", inventory, err)
+			}
+			if inventory.Attempts[0].Authority.JobID != removal.JobID ||
+				inventory.Attempts[0].Authority.FencingToken != removal.CleanupFence {
+				t.Fatalf("inventory lost removal authority: %+v", inventory)
+			}
+			deleted, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+				Kind: ManagedVolumeComputerDisk, ComputerStorage: &storage, Removal: &removal,
+				StorageAbsent: inventory.Attempts[0].StorageAbsent, QuarantineOnFailure: true, FailureAttempts: 3})
+			if err != nil || !deleted.Deleted || deleted.Quarantine != nil {
+				t.Fatalf("lock-only removal = %+v err=%v", deleted, err)
+			}
+			if _, statErr := os.Lstat(diskRoot); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("rolled-back generation root survived removal: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestRefusedCloneTombstoneInventoryAndRemoval(t *testing.T) {
 	for _, residue := range []string{"", "disk.ext4", "unexpected-payload"} {
 		t.Run("residue="+residue, func(t *testing.T) {

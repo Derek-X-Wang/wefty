@@ -200,35 +200,124 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 	}
 }
 
-func TestComputerStorageCopyReturnsDeferredAfterStartupRecoveryDefers(t *testing.T) {
-	root, system, source := publishedStorageCopySource(t)
-	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
-		storageCopyFinalize: fakeCloneFinalize(t)}
-	crash := errors.New("injected helper runtime loss")
-	engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
-		if phase == computerStorageCopyAllocated {
-			return crash
+// A destination a boot sweep deferred used to answer `resume_deferred` to
+// every later copy without ever running recovery again: healthy heartbeats
+// sweep nothing, and the abandonment bound counts attempts as well as hours,
+// so the clone stayed reserved indefinitely even after the fault cleared.
+// Ordinary reconciliation now drives it (#526).
+func TestDeferredComputerStorageCopyIsDrivenByOrdinaryReconciliation(t *testing.T) {
+	// The fault is gone by the time the next ordinary copy arrives: recovery
+	// rolls the interrupted attempt back and the copy finishes for real.
+	t.Run("recovery_succeeds", func(t *testing.T) {
+		root, system, source := publishedStorageCopySource(t)
+		request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+		clock := newManualClock(time.Date(2026, 9, 22, 4, 0, 0, 0, time.UTC))
+		engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: clock}, diskSystem: system,
+			storageCopyFinalize: fakeCloneFinalize(t)}
+		crash := errors.New("injected helper runtime loss")
+		engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+			if phase == computerStorageCopyAllocated {
+				return crash
+			}
+			return nil
 		}
-		return nil
-	}
-	if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, crash) {
-		t.Fatalf("initial copy error = %v", err)
-	}
-	name, _ := deterministicComputerDiskName(request.Destination)
-	destinationRoot := filepath.Join(root, "computer-disks", name)
+		if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+			t.Fatalf("initial copy error = %v", err)
+		}
+		name, _ := deterministicComputerDiskName(request.Destination)
+		destinationRoot := filepath.Join(root, "computer-disks", name)
+		deferComputerStorageCopyForTest(t, destinationRoot, clock.Now(), 1)
+		engine.storageCopyHook = nil
+		response, err := engine.CopyComputerStorage(t.Context(), request)
+		if err != nil || response.Receipt.Kind != "computer_storage_copy_verified" {
+			t.Fatalf("copy after the fault cleared = %+v err=%v", response.Receipt, err)
+		}
+		manifest, present, err := readComputerStorageCopyManifest(filepath.Join(destinationRoot, "storage-copy.json"))
+		if err != nil || !present || manifest.Phase != computerStorageCopyPublished || manifest.Recovery.Attempts != 0 {
+			t.Fatalf("published copy record = %+v present=%t err=%v", manifest, present, err)
+		}
+	})
+	// The fault persists. Each ordinary copy counts one attempt and answers
+	// deferred, until the bound is reached and the generation is quarantined
+	// -- which is terminal, and answers quarantined from then on.
+	t.Run("recovery_keeps_faulting_until_the_bound", func(t *testing.T) {
+		root, system, source := publishedStorageCopySource(t)
+		request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+		clock := newManualClock(time.Date(2026, 9, 22, 4, 0, 0, 0, time.UTC))
+		engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: clock}, diskSystem: system,
+			storageCopyFinalize: fakeCloneFinalize(t)}
+		crash := errors.New("injected helper runtime loss after the destination manifest")
+		engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+			if phase == computerStorageCopyManifestWritten {
+				return crash
+			}
+			return nil
+		}
+		if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+			t.Fatalf("initial copy error = %v", err)
+		}
+		name, _ := deterministicComputerDiskName(request.Destination)
+		destinationRoot := filepath.Join(root, "computer-disks", name)
+		deferComputerStorageCopyForTest(t, destinationRoot, clock.Now(), 1)
+		engine.storageCopyHook = nil
+		// Recovery reaches the destination digest and cannot read it: a
+		// structural-invalid failure, so the copy manifest's own attempt
+		// counter is what advances.
+		engine.computerRecoveryDigest = func(context.Context, string) (string, error) {
+			return "", errors.New("injected recovery digest failure")
+		}
+		// The elapsed floor alone advances nothing: the bound also needs
+		// counted attempts, which is exactly what used to be unreachable.
+		clock.Advance(48 * time.Hour)
+		// One attempt is already on the record: the boot sweep that deferred
+		// this destination. Every ordinary reconciliation adds exactly one,
+		// and the bound is reached by counted attempts, never by the clock.
+		counted := 1
+		reached := false
+		for range defaultComputerStorageRecoveryAttempts + 2 {
+			_, err := engine.CopyComputerStorage(t.Context(), request)
+			var deferred *ComputerStorageResumeDeferredError
+			var quarantined *ComputerStorageQuarantinedError
+			counted++
+			if errors.As(err, &quarantined) {
+				reached = true
+				break
+			}
+			if !errors.As(err, &deferred) || deferred.Storage != request.Destination {
+				t.Fatalf("deferred reconciliation %d = %T %v", counted, err, err)
+			}
+			manifest, present, manifestErr := readComputerStorageCopyManifest(filepath.Join(destinationRoot, "storage-copy.json"))
+			if manifestErr != nil || !present || manifest.Recovery.Attempts != counted {
+				t.Fatalf("counted attempts = %+v present=%t err=%v, want %d", manifest.Recovery, present, manifestErr, counted)
+			}
+		}
+		if !reached || counted != defaultComputerStorageRecoveryAttempts {
+			t.Fatalf("quarantine reached=%t after %d counted attempts, want exactly %d", reached, counted, defaultComputerStorageRecoveryAttempts)
+		}
+		if _, statErr := os.Lstat(destinationRoot); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("quarantined generation root remained in the active namespace: %v", statErr)
+		}
+		_, err := engine.CopyComputerStorage(t.Context(), request)
+		var quarantined *ComputerStorageQuarantinedError
+		if !errors.As(err, &quarantined) {
+			t.Fatalf("copy after the abandonment bound = %T %v", err, err)
+		}
+	})
+}
+
+// deferComputerStorageCopyForTest records the deferral a boot sweep would have
+// written for an interrupted copy, so the next ordinary call takes the
+// deferred-destination path.
+func deferComputerStorageCopyForTest(t *testing.T, destinationRoot string, now time.Time, attempts int) {
+	t.Helper()
 	manifest, present, err := readComputerStorageCopyManifest(filepath.Join(destinationRoot, "storage-copy.json"))
 	if err != nil || !present {
 		t.Fatalf("durable copy manifest = %+v present=%t err=%v", manifest, present, err)
 	}
-	manifest.Recovery = computerStorageRecoveryDeferral{Attempts: 1, FirstDeferredAt: time.Now().UTC(), Reason: "operational_failure"}
+	manifest.Recovery = computerStorageRecoveryDeferral{Attempts: attempts, FirstDeferredAt: now.UTC(),
+		Reason: "operational_failure"}
 	if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
 		t.Fatal(err)
-	}
-	_, err = engine.CopyComputerStorage(t.Context(), request)
-	var deferred *ComputerStorageResumeDeferredError
-	if !errors.As(err, &deferred) || deferred.Storage != request.Destination {
-		t.Fatalf("copy after deferred startup recovery = %T %v", err, err)
 	}
 }
 

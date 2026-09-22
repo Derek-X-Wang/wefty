@@ -730,23 +730,6 @@ func (s *Store) GetComputerCustodyImport(ctx context.Context, importID string) (
 	return observation, nil
 }
 
-func validateCustodyImportPreparationOutcome(row computerStorageCopyRow, outcome *ComputerStoragePreparationOutcome) error {
-	if outcome == nil || (outcome.Code != ComputerStoragePreparationInterrupted && outcome.Code != ComputerStoragePreparationResumeDeferred && outcome.Code != ComputerStoragePreparationQuarantined) ||
-		outcome.DestinationComputerID != row.DestinationComputerID || outcome.DestinationStorageID != row.DestinationStorageID ||
-		outcome.DestinationGeneration != row.DestinationGeneration || outcome.IntentRevision != row.OperationRevision ||
-		outcome.DiskBytes != row.DestinationSize || outcome.HelperGeneration == 0 || outcome.RecordedAt == nil || outcome.RecordedAt.IsZero() {
-		return protocolError(contract.ErrorStorageReferenceConflict, "Custody import preparation outcome does not bind the reserved destination generation")
-	}
-	if outcome.Code == ComputerStoragePreparationInterrupted &&
-		(outcome.SweepEpoch != "" || outcome.DiskName != "" || outcome.Operation != "computer_storage_copy" || outcome.Reason == "") {
-		return protocolError(contract.ErrorInvalidRequest, "interrupted Custody import preparation outcome is incomplete")
-	}
-	if outcome.SweepEpoch != "" && (outcome.DiskName == "" || outcome.Operation == "" || outcome.Reason == "") {
-		return protocolError(contract.ErrorInvalidRequest, "receipt-backed Custody import preparation outcome is incomplete")
-	}
-	return nil
-}
-
 func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
 	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Custody import acknowledgement is required")
@@ -786,7 +769,7 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 		if row.Status != "reserved" {
 			return Computer{}, protocolError(contract.ErrorConflict, "Custody import is not awaiting preparation")
 		}
-		if err := validateCustodyImportPreparationOutcome(row, request.PreparationOutcome); err != nil {
+		if err := validateStorageCopyPreparationOutcome(row, "Custody import", request.PreparationOutcome); err != nil {
 			return Computer{}, err
 		}
 		var storedOutcomeJSON []byte

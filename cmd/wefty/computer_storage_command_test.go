@@ -1218,3 +1218,71 @@ func TestComputerCloneWaitReportsTheCapacityRefusal(t *testing.T) {
 		t.Fatalf("refused clone output = %s err=%v", stdout.String(), err)
 	}
 }
+
+// A clone whose destination generation is quarantined, or whose helper session
+// was lost while it copied, is equally a failure `--wait` must report rather
+// than a revision that copied no bytes (#526).
+func TestComputerCloneWaitReportsAnUnpreparableDestination(t *testing.T) {
+	h := newStorageCLIHarness(t)
+	runStorageCLI(t, h.ctx, h.clients, true, "services", "backup", "set-cap", h.computer.ComputerID,
+		"--cap", "1", "--expect-current")
+	runStorageCLI(t, h.ctx, h.clients, true, "services", "backup", "create", h.computer.ComputerID,
+		"--expect-current", "--idempotency-key", "quarantined-clone-source", "--allow-power-off")
+	h.completeBackupHelper(t)
+	backups, err := h.store.ListComputerBackups(h.ctx, h.computer.ComputerID)
+	if err != nil || len(backups.Backups) != 1 {
+		t.Fatalf("quarantined clone source = %#v err=%v", backups, err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			directives, err := h.store.ListNodeComputerStorageCopyDirectives(h.ctx, "fabric-storage-node", h.node.NodeID, h.node.BootSessionID)
+			if err != nil {
+				done <- err
+				return
+			}
+			for _, directive := range directives {
+				if directive.Operation != "clone" {
+					continue
+				}
+				recordedAt := time.Now().UTC()
+				_, err := h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
+					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
+						IdempotencyKey: "preparation-quarantined",
+						PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
+							Code:                  l1.ComputerStoragePreparationQuarantined,
+							DestinationComputerID: directive.DestinationComputerID,
+							DestinationStorageID:  directive.DestinationStorageID,
+							DestinationGeneration: directive.DestinationGeneration,
+							IntentRevision:        directive.OperationRevision,
+							DiskBytes:             directive.DestinationSize, HelperGeneration: 9,
+							SweepEpoch: "sweep-clone", DiskName: "disk-clone",
+							Operation: "computer_storage_copy", Reason: "computer_disk_anomaly_quarantined",
+							RecordedAt: &recordedAt,
+						}})
+				done <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		done <- errors.New("no clone directive appeared before the deadline")
+	}()
+	var stdout, stderr bytes.Buffer
+	cloneErr := execute(h.ctx, h.clients, true, []string{"services", "clone", h.computer.ComputerID,
+		backups.Backups[0].BackupID, "--name", "quarantined-clone", "--disk-bytes", fmt.Sprint(backups.Backups[0].AllocatedSize),
+		"--expect-current", "--idempotency-key", "quarantined-clone", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	if helperErr := <-done; helperErr != nil {
+		t.Fatal(helperErr)
+	}
+	var refusal *apiResponseError
+	if !errors.As(cloneErr, &refusal) || refusal.APIError.Code != contract.ErrorConflict ||
+		refusal.APIError.Details["failure_code"] != string(contract.SpawnFailureComputerStorageQuarantined) {
+		t.Fatalf("quarantined clone wait error = %v (%#v) stdout=%s", cloneErr, refusal, stdout.String())
+	}
+	var output storageMutationOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || output.Computer == nil ||
+		output.Computer.ReconfigurationPhase != l1.ComputerReconfigurationStable {
+		t.Fatalf("quarantined clone output = %s err=%v", stdout.String(), err)
+	}
+}

@@ -505,6 +505,32 @@ func refusedComputerStorageAbsent(root, name string) (computerStorageCopyRefusal
 	return refusal, true, nil
 }
 
+// reconcileDeferredComputerStorageCopy runs one recovery attempt for a
+// destination a previous sweep deferred, and translates its outcome into the
+// same typed answers the sweep records. It is the same code path the boot
+// sweep uses, called with the copy's own generation lock already held, so the
+// attempt cannot interleave with another copy of the same generation.
+func (engine *ContainerdEngine) reconcileDeferredComputerStorageCopy(ctx context.Context, root, name string,
+	destination ComputerStorageReference) error {
+	_, resumeErr := engine.resumeComputerStorageCopy(ctx, root, name)
+	if resumeErr != nil {
+		evidence, resolveErr := engine.resolveComputerStorageRecoveryFailure(root, name, "computer_storage_copy",
+			destination, resumeErr, true)
+		if resolveErr != nil {
+			return errors.Join(resumeErr, resolveErr)
+		}
+		switch evidence.Action {
+		case SweepActionQuarantined:
+			return &ComputerStorageQuarantinedError{Storage: destination}
+		default:
+			return &ComputerStorageResumeDeferredError{Storage: destination}
+		}
+	}
+	// The fault cleared. Drop the deferral record so the next ordinary call
+	// is an ordinary copy again rather than another counted attempt.
+	return engine.clearOperationalComputerRecoveryDeferral(root, name, "computer_storage_copy")
+}
+
 // computerDiskRemovalResidueAbsent reports the generation-root shapes that
 // hold no bytes at all, which an authorized removal therefore deletes whole:
 // the exact refusal shape -- its own lock and its own durable tombstone -- and
@@ -514,9 +540,11 @@ func refusedComputerStorageAbsent(root, name string) (computerStorageCopyRefusal
 // unlinking the root. Reading it as bytes without an authority manifest would
 // wedge the removal of a refused clone for good.
 //
-// Only removal may read a root this way. A lock-only root is also the ordinary
-// first-allocation shape, so attachment, inventory, and the startup sweep keep
-// judging it by the narrower refusal rule.
+// Only removal may read a root this way -- its per-generation inventory as
+// well as its deletion, because an inventory that refused the shape would
+// never let deletion be reached. A lock-only root is also the ordinary
+// first-allocation shape, so attachment, preparation, and the startup sweep
+// keep judging it by the narrower refusal rule.
 func computerDiskRemovalResidueAbsent(root, name string) (bool, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -770,8 +798,28 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	if present && !sameComputerStorageCopyRequest(manifest.Request, request) {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination has different durable authority")
 	}
+	// A destination a boot sweep deferred is not simply refused here. Nothing
+	// else ever ran another recovery: healthy heartbeats do not sweep, and the
+	// abandonment bound needs counted attempts as well as elapsed hours, so a
+	// copy that answered `resume_deferred` and stopped would stay deferred for
+	// as long as the node stayed healthy -- including after the underlying
+	// fault cleared. Ordinary reconciliation therefore runs the same recovery
+	// step the sweep runs, under the locks this call already holds, and counts
+	// the attempt. Success falls through into the ordinary copy below (a
+	// rolled-back destination starts again; a completed one replays its
+	// receipt); a still-faulted destination answers deferred with the
+	// incremented count; the bound answers quarantined, which is terminal.
 	if present && manifest.Phase != computerStorageCopyPublished && manifest.Recovery.Attempts > 0 {
-		return CopyComputerStorageResponse{}, &ComputerStorageResumeDeferredError{Storage: request.Destination}
+		if err := engine.reconcileDeferredComputerStorageCopy(ctx, destinationRoot, destinationName, request.Destination); err != nil {
+			return CopyComputerStorageResponse{}, err
+		}
+		manifest, present, err = readComputerStorageCopyManifest(manifestPath)
+		if err != nil {
+			return CopyComputerStorageResponse{}, err
+		}
+		if present && !sameComputerStorageCopyRequest(manifest.Request, request) {
+			return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination has different durable authority")
+		}
 	}
 	publishedPath := filepath.Join(destinationRoot, "disk.ext4")
 	stagingPath := filepath.Join(destinationRoot, "disk.ext4.staging")

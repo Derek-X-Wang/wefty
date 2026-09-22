@@ -90,8 +90,14 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence,
 	})
 	if err != nil {
+		// Clone and import are the two verbs that own a fresh, never-attached
+		// destination generation, so both may close a preparation outcome at
+		// L1 rather than retrying the same copy every sweep. A restore's
+		// destination is a live Computer whose predecessor still holds the
+		// bytes, so its failures stay ordinary errors.
+		acknowledges := directive.Operation == "import" || directive.Operation == "clone"
 		var runtimeLoss *workloadrunner.RuntimeLossError
-		if directive.Operation == "import" && errors.As(err, &runtimeLoss) && runtimeLoss.Generation.Generation > 0 {
+		if acknowledges && errors.As(err, &runtimeLoss) && runtimeLoss.Generation.Generation > 0 {
 			recordedAt := time.Now().UTC()
 			outcome := workloadrunner.ComputerStoragePreparationOutcome{
 				Code: workloadrunner.ComputerStoragePreparationInterrupted,
@@ -104,7 +110,7 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 			return controller.acknowledgePreparation(ctx, directive, outcome)
 		}
 		var preparation *workloadrunner.ComputerStoragePreparationError
-		if directive.Operation == "import" && errors.As(err, &preparation) {
+		if acknowledges && errors.As(err, &preparation) {
 			return controller.acknowledgePreparation(ctx, directive, preparation.Outcome)
 		}
 		return err
