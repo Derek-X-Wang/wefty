@@ -821,32 +821,59 @@ func backupCopyDirectives(claims *l1.ComputerBackupCopyClaims) []l1.ComputerBack
 	return claims.Copies
 }
 
-// stalledRemovalRetention names the resources still held by removals L1 has
-// already declared stalled: the Computer whose deletion was refused and the
-// Backup copies its standing directive still names. Those resources are the
-// declaration's own subject -- L1 recorded that nothing about their deletion
-// is proven -- so they are outside every absence proof the node's OCI boot
-// sequence makes, and a node holding only them earns `kind:oci` again (#513).
+// stalledBackupCopyKey is one physical Backup copy under the exact removal
+// authority a standing directive named it with. Matching on the copy ID alone
+// would let a record and a directive that merely share a job ID suppress work,
+// and matching on the Computer would suppress a copy of that Computer the
+// stalled directive does not name -- a copy the stalled removal's own retries
+// never receive, so nothing would reconcile it at all.
+type stalledBackupCopyKey struct {
+	backupID          string
+	copyID            string
+	computerID        string
+	storageID         string
+	storageGeneration int64
+	boundNodeID       string
+	rootInstanceID    string
+	operationRevision int64
+	cleanupFence      string
+}
+
+func stalledBackupCopy(directive l1.ComputerBackupPruneDirective) stalledBackupCopyKey {
+	return stalledBackupCopyKey{
+		backupID: directive.BackupID, copyID: directive.CopyID, computerID: directive.ComputerID,
+		storageID: directive.StorageID, storageGeneration: directive.StorageGeneration,
+		boundNodeID: directive.BoundNodeID, rootInstanceID: directive.RootInstanceID,
+		operationRevision: directive.OperationRevision, cleanupFence: directive.CleanupFence,
+	}
+}
+
+// stalledRemovalRetention is the exact set of Backup copies that removals L1
+// has already declared stalled are still holding, as those removals' standing
+// directives name them. Deleting them is that declaration's own subject --
+// L1 recorded that nothing about it is proven -- and the declared removal's
+// durable backoff is the one cadence that retries it, so reconciling the same
+// copy a second time through the ordinary prune list would be a second
+// accounting for one step of one removal, which the removal contract forbids
+// (#513).
 //
-// A stalled removal keeps exactly one cadence: the durable backoff its own
-// standing directive runs on. Reconciling the same physical Backup copy a
-// second time through the ordinary prune list would be a second accounting
-// for one step of one removal, which the removal contract forbids.
+// This suppresses a duplicate reconciliation above the helper. It exempts
+// nothing from the helper's namespace sweep and verification: runtime residue
+// belonging to a stalled Computer is still refused there.
 type stalledRemovalRetention struct {
-	computers map[string]struct{}
-	copies    map[string]struct{}
+	copies map[stalledBackupCopyKey]struct{}
 }
 
 func (retention stalledRemovalRetention) empty() bool {
-	return len(retention.computers) == 0 && len(retention.copies) == 0
+	return len(retention.copies) == 0
 }
 
 func (retention stalledRemovalRetention) retains(directive l1.ComputerBackupPruneDirective) bool {
-	if _, held := retention.copies[directive.CopyID]; held && directive.CopyID != "" {
-		return true
+	if directive.CopyID == "" {
+		return false
 	}
-	_, held := retention.computers[directive.ComputerID]
-	return held && directive.ComputerID != ""
+	_, held := retention.copies[stalledBackupCopy(directive)]
+	return held
 }
 
 // excludeBackupPrunes drops the prunes a stalled removal already owns. It
@@ -867,38 +894,44 @@ func (retention stalledRemovalRetention) excludeBackupPrunes(directives []l1.Com
 }
 
 // declaredStalledRetention reads the stalled set without any new L1 field. The
-// durable runtime removal record is the authority for "L1 declared this
-// stalled" -- `stall_declared_ns` is written only after L1 accepted the
-// declaration -- and the standing removal directive L1 already redispatches
-// for that same job names the resources it retains. A record this agent cannot
-// validate is never treated as stalled, so a broken row narrows nothing.
+// durable runtime removal record is the authority for "L1 accepted this
+// declaration" -- `stall_declared_ns` is written only after the acknowledgement
+// lands -- and the standing removal directive L1 already redispatches for that
+// job names the copies it retains.
+//
+// A shared job ID is not that correspondence. The record must be one this
+// agent can validate and must agree with the directive on removal generation,
+// cleanup fence and root instance, and the directive must be bound to this
+// node; record validation only proves a row internally consistent. Any
+// disagreement yields no retention at all, so the prunes are reconciled and
+// keep gating exactly as they did before.
 func (controller *removalController) declaredStalledRetention(ctx context.Context, directives []l1.RemovalDirective) stalledRemovalRetention {
 	retention := stalledRemovalRetention{}
 	if controller == nil || controller.loadRuntimeRemoval == nil {
 		return retention
 	}
 	for _, directive := range directives {
-		if directive.BoundNodeID != controller.nodeID {
+		if directive.BoundNodeID == "" || directive.BoundNodeID != controller.nodeID {
 			continue
 		}
 		record, found, err := controller.loadRuntimeRemoval(ctx, directive.JobID)
 		if err != nil || !found || record.invalidReason != "" || record.stallDeclaredAt == nil {
 			continue
 		}
-		if directive.ComputerStorage != nil && directive.ComputerStorage.ComputerID != "" {
-			if retention.computers == nil {
-				retention.computers = make(map[string]struct{})
-			}
-			retention.computers[directive.ComputerStorage.ComputerID] = struct{}{}
+		if !sameLocalRemoval(record.removal, localRemoval{
+			jobID: directive.JobID, generation: directive.RemovalGeneration,
+			cleanupFence: directive.CleanupFence, rootInstanceID: directive.RootInstanceID,
+		}) {
+			continue
 		}
 		for _, copy := range backupCopyDirectives(directive.ComputerBackupCopies) {
-			if copy.CopyID == "" {
+			if copy.CopyID == "" || copy.BoundNodeID != controller.nodeID {
 				continue
 			}
 			if retention.copies == nil {
-				retention.copies = make(map[string]struct{})
+				retention.copies = make(map[stalledBackupCopyKey]struct{})
 			}
-			retention.copies[copy.CopyID] = struct{}{}
+			retention.copies[stalledBackupCopy(copy)] = struct{}{}
 		}
 	}
 	return retention

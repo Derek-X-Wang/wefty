@@ -323,16 +323,17 @@ when node and boot-session IDs are textually identical. A failed or negative
 verification keeps every engine operation other than `Sweep` and namespace
 `Verify` behind `sweep_required`.
 
-That absence proof covers the `wefty` runtime namespace. It does not cover the
-durable resources a removal L1 has already declared `stalled_cleanup_unverified`
-still holds -- the Backup copies its standing directive names and the Computer
-they belong to. Those resources are the declaration's own subject, so the agent
-excludes them from the standing directives it reconciles at registration and at
-every OCI recovery, proves everything else absent exactly as before, and a node
-whose only leftovers are stalled ones earns `kind:oci` again. The exclusion is
-derived on every pass from the node's own durable removal record joined with
-the standing directive, never latched, so releasing that record restores
-ordinary reconciliation with no special case left behind.
+A removal L1 has declared `stalled_cleanup_unverified` changes nothing about
+that proof. Runtime residue belonging to a stalled Computer is refused here
+exactly as any other residue is, and the durable-retention rules that decide
+what counts as residue are unchanged; this protocol has no stalled-resource
+exemption. What changes is above the proof, in the agent: registration and
+every OCI recovery suppress the duplicate Backup-prune reconciliation they
+would otherwise run for such a removal -- exactly the copies its standing
+directive names, matched on their full removal authority -- so the declared
+removal's own durable retries are the only cadence that touches those copies,
+and a node is not held back from advertising OCI by work it has already
+reported to L1 that it cannot finish. `state-machines.md` owns that rule.
 
 The client-side boot barrier waits for an incumbent session's monotonic
 heartbeat deadline and reap rather than preempting it, then acquires exclusive

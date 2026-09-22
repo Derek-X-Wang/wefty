@@ -297,3 +297,73 @@ func TestStalledRetentionOnlyCoversItsOwnRemoval(t *testing.T) {
 		t.Fatalf("Backup-copy deletions = %v, want only %q", attempted, neighbour.CopyID)
 	}
 }
+
+// TestStalledRetentionOnlyCoversTheCopiesItsDirectiveNames keeps the
+// suppression inside the boundary the contract states. A Computer-wide match
+// looked equivalent and is not: the stalled removal's own retries receive only
+// the copies its standing directive names, so a copy of the same Computer that
+// the directive does not name would be reconciled by nothing at all, and the
+// boot sequence would return success without it.
+func TestStalledRetentionOnlyCoversTheCopiesItsDirectiveNames(t *testing.T) {
+	node := newStalledRemovalNode(t, "unlisted-copy-node", true)
+	named := node.response.BackupPruneDirectives[0]
+	unlisted := named
+	unlisted.CopyID = "unlisted-copy-node-copy-c"
+	unlisted.OperationRevision = 9
+	response := node.response
+	response.BackupPruneDirectives = []l1.ComputerBackupPruneDirective{named, unlisted}
+
+	err := node.agent.session.processStandingDirectives(t.Context(), response)
+	if err == nil || !strings.Contains(err.Error(), unlisted.CopyID) {
+		t.Fatalf("standing directives = %v, want the unlisted copy of the same Computer still reconciled and still gating", err)
+	}
+	if strings.Contains(err.Error(), named.CopyID) {
+		t.Fatalf("standing-directive failure named the stalled directive's own copy %q", named.CopyID)
+	}
+	if attempted := node.runtime.attempted(); len(attempted) != 1 || attempted[0] != unlisted.CopyID {
+		t.Fatalf("Backup-copy deletions = %v, want only %q", attempted, unlisted.CopyID)
+	}
+}
+
+// TestStalledRetentionRequiresMatchingRemovalAuthority refuses to suppress on
+// a shared job ID. The durable record proves only that some removal of that
+// job was declared stalled; record validation proves a row internally
+// consistent, never that it is the removal this standing directive carries.
+// A directive that disagrees on removal authority is reconciled like any other.
+func TestStalledRetentionRequiresMatchingRemovalAuthority(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		mutate  func(*l1.RemovalDirective)
+		mutated string
+	}{
+		{name: "removal generation", mutated: "generation", mutate: func(directive *l1.RemovalDirective) {
+			directive.RemovalGeneration++
+		}},
+		{name: "cleanup fence", mutated: "fence", mutate: func(directive *l1.RemovalDirective) {
+			directive.CleanupFence = "a-different-cleanup-fence"
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			node := newStalledRemovalNode(t, "authority-"+testCase.mutated+"-node", true)
+			response := node.response
+			directive := response.RemovalDirectives[0]
+			testCase.mutate(&directive)
+			response.RemovalDirectives = []l1.RemovalDirective{directive}
+
+			retention := node.agent.session.removals.declaredStalledRetention(t.Context(), response.RemovalDirectives)
+			if !retention.empty() {
+				t.Fatalf("retention derived from a directive whose %s disagrees with the durable record: %+v", testCase.name, retention)
+			}
+			err := node.agent.session.processStandingDirectives(t.Context(), response)
+			if err == nil {
+				t.Fatalf("a directive whose %s disagrees with the durable record left the boot sequence's gate open", testCase.name)
+			}
+			attempted := node.runtime.attempted()
+			for _, copyID := range node.copyIDs {
+				if !slices.Contains(attempted, copyID) {
+					t.Fatalf("Backup-copy deletions = %v, want %q reconciled", attempted, copyID)
+				}
+			}
+		})
+	}
+}

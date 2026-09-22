@@ -313,8 +313,10 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 // OCI capability while the stalled removal's own Slot was free: the operator
 // was told a fresh Computer could place, and nothing could (#513). A removal
 // that L1 has declared stalled is a standing chore with its own durable
-// backoff, not an unfinished boot step, so its retained resources are excluded
-// here and the rest of the namespace is still proven absent as before.
+// backoff, not an unfinished boot step, so the duplicate prune reconciliation
+// for exactly the copies its standing directive names is suppressed here.
+// Every other directive in the response is reconciled and still gates, and
+// nothing about the helper's namespace sweep and verification changes.
 func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
 	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 	return errors.Join(session.resumePendingRemovals(ctx),
