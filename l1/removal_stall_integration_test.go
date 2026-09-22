@@ -266,14 +266,10 @@ func TestLateCleanupAfterAStallNeverUpgradesTheUnverifiedOutcome(t *testing.T) {
 	if cleaned.State != contract.JobStalledCleanupUnverified || cleaned.Removal.CleanupAcknowledgedAt == nil {
 		t.Fatalf("late completion projection = %#v", cleaned)
 	}
-	finalized, done, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID)
-	if err != nil || !done {
-		t.Fatalf("finalize after a late cleanup = %#v, %t, %v", finalized, done, err)
-	}
-	if finalized.State != contract.JobStalledCleanupUnverified ||
-		finalized.Removal == nil || finalized.Removal.RemovalOutcome != ServiceRemovalOutcomeCleanupStalled {
-		t.Fatalf("finalized projection = %#v", finalized)
-	}
+	finalizeOrObserveRemoval(t, harness.h.store, harness.job.JobID, func(job Job) bool {
+		return job.State == contract.JobStalledCleanupUnverified &&
+			job.Removal != nil && job.Removal.RemovalOutcome == ServiceRemovalOutcomeCleanupStalled
+	})
 	var outcome string
 	if err := harness.h.store.db.QueryRow(`SELECT outcome FROM service_tombstones WHERE job_id=?`, harness.job.JobID).
 		Scan(&outcome); err != nil {
@@ -467,15 +463,11 @@ func TestFinalizedStalledRemovalKeepsItsEvidenceAndReplayIdentity(t *testing.T) 
 	if _, err := harness.declare(t, completion); err != nil {
 		t.Fatalf("late completion acknowledgement: %v", err)
 	}
-	finalized, done, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID)
-	if err != nil || !done {
-		t.Fatalf("finalize = %#v, %t, %v", finalized, done, err)
-	}
-	if finalized.Removal == nil || finalized.Removal.Stall == nil ||
-		finalized.Removal.Stall.LastRefusalCode != "unauthorized_attempt" ||
-		finalized.Removal.Stall.Attempts != 4 || finalized.Removal.StalledAt == nil {
-		t.Fatalf("finalized stalled projection lost its evidence: %#v", finalized.Removal)
-	}
+	finalizeOrObserveRemoval(t, harness.h.store, harness.job.JobID, func(job Job) bool {
+		return job.Removal != nil && job.Removal.Stall != nil &&
+			job.Removal.Stall.LastRefusalCode == "unauthorized_attempt" &&
+			job.Removal.Stall.Attempts == 4 && job.Removal.StalledAt != nil
+	})
 	replayed, err := harness.declare(t, declaration)
 	if err != nil || replayed.State != contract.JobStalledCleanupUnverified {
 		t.Fatalf("finalized declaration replay = %#v, %v", replayed, err)
