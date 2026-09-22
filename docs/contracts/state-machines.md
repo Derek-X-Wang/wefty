@@ -320,11 +320,25 @@ every managed branch, retained Computer outcomes may advance to
 
 A Custody export first CAS-records immutable source Backup, Storage, Node,
 managed-root, path, and fence evidence and moves the Computer through
-`exporting`; that commit permanently taints the branch before the agent may
-write the external manifest or its first storage byte. Missing or late helper
-completion cannot retract the event. Removal supersedes a still-planned export
-and closes its directive fence; the already-committed event remains permanent
-taint. A verified helper receipt advances the durable export from `planned` to
+`exporting`. The event is permanent, and every outcome taints the branch
+except one: a typed helper refusal that proves the destination was never
+touched — the path reached the managed root, lay outside every configured
+operator mount root, or lay under a root the helper could not prove is the
+filesystem the node shares with it — is recorded as evidence and taints
+nothing, because no byte of that Storage ever left managed custody. That
+proof is durable, not per-attempt: the helper records a write-started marker
+before its first external byte, rewrites it in place when the export
+verifies, never deletes it before the Computer's own removal, and answers
+every later attempt on that export `external_write_started` or
+`external_write_completed`, both of which taint. An acknowledgement lost
+between a verified receipt and L1 therefore cannot become a clean removal. Missing or late helper completion, a
+partial write, and a digest mismatch all still taint: taint follows the
+possibility of external bytes, not the operator's intent. A refusal that
+names the node's operator mount roots must name canonical absolute
+directories consistent with the recorded external path, or L1 refuses the
+acknowledgement rather than recording an untainting outcome it cannot check.
+Removal supersedes a still-planned export and closes its directive fence; the
+already-committed event remains permanent taint. A verified helper receipt advances the durable export from `planned` to
 `available`, meaning the complete external disk and `custody.json` manifest
 were both digest-verified. Typed helper failure evidence records `failed` and
 closes `exporting`, and a dead bound Node permits an explicit abort.

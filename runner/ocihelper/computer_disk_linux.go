@@ -577,7 +577,43 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 			return errors.New("Computer disk removal left quarantine residue")
 		}
 	}
+	// Custody write records outlive every export attempt and are taken away
+	// only here, once this Computer keeps no Storage generation on the node.
+	// A reset, which deletes a predecessor while its successor remains, must
+	// not take them.
+	remaining, err := engine.computerHasRemainingStorage(storage.ComputerID)
+	if err != nil {
+		return err
+	}
+	if !remaining {
+		return engine.removeCustodyWriteMarkersForComputer(storage.ComputerID)
+	}
 	return nil
+}
+
+// computerHasRemainingStorage reports whether any Storage generation of this
+// Computer still has a managed disk root on the node.
+func (engine *ContainerdEngine) computerHasRemainingStorage(computerID string) (bool, error) {
+	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks")
+	entries, err := readDirectoryIfPresent(diskRoot)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		manifest, present, readErr := readComputerDiskManifest(filepath.Join(diskRoot, entry.Name(), "attachment.json"))
+		if readErr != nil || !present {
+			// An unreadable neighbour is treated as still present: the
+			// records are only ever dropped on a certain answer.
+			return true, nil
+		}
+		if manifest.Storage.ComputerID == computerID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttachment, kind, sweepEpoch string) error {

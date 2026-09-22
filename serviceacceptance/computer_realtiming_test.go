@@ -588,7 +588,11 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	startedClone = waitForComputerCLI(t, harness, startedClone.ComputerID, 3*time.Minute, computerDisplayPublished)
 	cloneOutput.Computer = &startedClone
 	recordComputerAuthority(receipt, *cloneOutput.Computer)
-	exportDirectory := filepath.Join(t.TempDir(), "custody-export")
+	// The custody export must land under a configured operator mount root:
+	// the helper refuses any other path, because on a Node whose helper reads
+	// a translated view nothing else is provably the operator's storage (#511).
+	exportDirectory := filepath.Join(requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_OPERATOR_MOUNT_ROOT"),
+		"custody-export-"+reimaged.ComputerID)
 	if err := os.MkdirAll(exportDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}

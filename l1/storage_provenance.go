@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 type ComputerCustodyBranch struct {
@@ -134,7 +136,12 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 			rows.Close()
 			return ComputerStorageProvenance{}, internalError(scanErr, "scan Storage Custody export")
 		}
-		projection.CustodyTainted = true
+		// A refused export that the helper proved never reached the operator
+		// destination is evidence, not taint: no byte of this Storage left
+		// managed custody. Every other outcome taints permanently.
+		if !contract.CustodyExportLeftDestinationUntouched(exported.Status, exported.FailureCode) {
+			projection.CustodyTainted = true
+		}
 		projection.CustodyExports = append(projection.CustodyExports, exported)
 	}
 	if err := rows.Err(); err != nil {

@@ -450,7 +450,7 @@ heartbeats.
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. A prepared-removal Storage-only authority requires its helper-originated never-attached witness; reset/restore predecessor and failed-import cleanup use separate typed operation authorities and cannot claim that witness. After separate durable-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
-| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
+| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path that is outside the managed root and a strict descendant of one of the helper's configured operator mount roots. L1 has already committed the custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A missing manifest cannot be reconstructed as empty lineage when an immutable copy receipt or durable reset-preparation record proves prior storage preparation; that contradiction returns typed `computer_storage_grow_uncertain` before reserving capacity or mutating bytes. A failure after ext4 may have expanded returns the same typed uncertainty, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace. `namespace` is the mutating boot-barrier proof that may update pins, cache state, and sweep completion. `namespace_read_only` is an observation-only inventory route for acceptance baselines; it cannot satisfy the boot barrier or update helper policy state. |
@@ -1342,8 +1342,72 @@ Node, and root instance. It deletes only the deterministic Wefty-owned copy
 root and returns `computer_backup_copy_removed` only after positive absence.
 The helper does not choose retention, auto-delete, restore, clone, export,
 encryption, or replica policy. `ExportComputerCustody` accepts only an
-already-recorded event bound to one published Backup copy and rejects paths
-inside the managed root. It writes the external manifest before the disk,
+already-recorded event bound to one published Backup copy. It admits the
+operator's path before it creates anything and before any pathname is
+canonicalized: the node path is translated into the helper's own filesystem
+view exactly as an operator mount source is, is judged lexically against the
+managed root and against the helper's configured operator mount roots
+(`--oci-allowed-mount-root`, the list `node oci doctor` publishes), and is
+only then walked component by component through descriptors the helper opens
+itself. A path that reaches the managed root is `managed_root_path`; a path
+under no configured root, or one whose component is a symlink, is not a
+directory, or changes identity while being opened, is
+`external_path_unconfined`. Resolving symlinks before the walk is forbidden:
+it would let an in-root symlink evade that rejection.
+
+Where the helper reads a translated view of the node's paths — a Lima Node,
+whose operator mount root is the host directory the bootstrap shares into the
+guest — admission is additionally bound to that shared filesystem's identity.
+The configured guest mount root must itself be a mount, or the refusal is
+`external_root_unmounted`; every admitted component must then be on that same
+device, and any step onto another filesystem is `external_path_crosses_mount`.
+That binding reaches the leaf: the disk file is opened through the admitted
+directory and its own device is read from that descriptor before anything is
+changed or written through it, because a file bind-mounted from a guest
+filesystem is a regular operator-owned file that still never reaches host
+storage. A device boundary on its own proves nothing either: a guest-only
+filesystem below an unmounted root, or a nested guest bind under a live host
+mount, is storage that never reaches the host. All four refusals carry the
+node-facing roots in the receipt, and none of them writes a manifest, a disk
+byte, or reads a Backup byte. Such a refusal may leave empty operator-owned
+directories under a configured root — the place the export was allowed to go
+— and that is why it still leaves the source Storage untainted.
+
+The configured root is acquired the same way: one `O_NOFOLLOW` directory
+open per component from the filesystem root, the only anchor nothing can
+substitute, each component proved to be the non-symlink directory the helper
+had just looked at. Checking a path's components and then opening the whole
+path by name would leave a window in which an ancestor becomes a symlink.
+The descriptors admission opened then stay open. Every later step — creating
+the missing directories, reading and publishing `custody.json` through a
+temporary file and a rename, opening, truncating, writing, syncing and
+re-hashing `storage.ext4`, and fsyncing the directory — is performed relative
+to those descriptors, never by re-resolving a pathname. Each directory
+preparation creates or finds, including one that already exists, faces the
+admission checks again — non-symlink directory, same shared filesystem, not
+the managed root — before any chmod, chown or write reaches it, because a
+component missing at admission can appear as a mount of something else
+before preparation opens it. The shared mount's own device is likewise read
+from descriptors, not from a path.
+
+Before the first byte of the Storage the helper places on operator storage —
+the manifest and the disk; an empty operator-owned directory is not one — it
+durably records a write-started record in its own managed state, keyed to the
+Computer and export identity, published with the same create-write-fsync-
+rename-fsync discipline as any other durable record and with the managed root
+fsynced the first time that directory appears. While a record exists, no
+invocation of that export may return a refusal that claims the destination
+was never touched: the typed answer is `external_write_started`, or
+`external_write_completed` once the bytes and manifest have been verified.
+L1 treats both as tainting. The helper never deletes a record — a verified
+export rewrites it in place, so an acknowledgement lost between the receipt
+and L1 still leaves durable evidence that the bytes exist. The records for a
+Computer are removed only when its last Storage generation leaves the node,
+by the removal path, and nothing outside that directory is touched.
+
+`CopyComputerStorage(import)` admits its external source through the same
+decision and likewise keeps the verified disk descriptor open for the copy
+and both digests. It writes the external manifest before the disk,
 retains partial bytes after interruption, and returns a receipt only after
 size, content digest, and manifest digest are observed. Files remain mode
 `0600` but inherit the owner and group of the nearest existing ancestor of the

@@ -16,13 +16,16 @@ func TestRemovalAbsenceDoesNotDeletePublishedGeneration(t *testing.T) {
 	for _, operation := range []string{"clone", "import", "reset"} {
 		t.Run(operation, func(t *testing.T) {
 			root, system, source := publishedStorageCopySource(t)
-			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system, storageCopyFinalize: fakeCloneFinalize(t)}
+			// The import arm needs a real operator mount root: an export to
+			// an unconfined path is refused, and a refused export carries no
+			// manifest for the import to verify.
+			mountRoot, externalRoot := custodyOperatorMountRoot(t)
+			engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system, storageCopyFinalize: fakeCloneFinalize(t)}
 			copyRequest := storageCopyTestRequest(source, operation, source.Receipt.AllocatedSize)
 			if operation == "import" {
-				externalRoot := filepath.Join(t.TempDir(), "custody")
 				exported, err := engine.ExportComputerCustody(t.Context(), custodyExportTestRequest(source, externalRoot))
-				if err != nil {
-					t.Fatal(err)
+				if err != nil || exported.Receipt.Kind != "computer_custody_export_verified" || exported.Receipt.ManifestDigest == "" {
+					t.Fatalf("Custody export for import fixture = %+v err=%v", exported, err)
 				}
 				copyRequest.ExportID = exported.Receipt.ExportID
 				copyRequest.ExternalPath = externalRoot
