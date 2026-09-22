@@ -668,9 +668,10 @@ the same ownership limit the mailbox records (`oci-helper-protocol.md`, "Run
 mailbox confinement"). A helper-owned terminal timestamp, recorded after
 quiescence and validated, is #494.
 
-Collection expires and nothing else. It runs at agent startup, after finalizing
-an attempt's prepared handoff — including attempts that never completed cleanly
-— and hourly.
+Collection expires and evicts nothing; measuring what is left is a separate
+pass on the collector's own timer. Collection runs at agent startup, after
+finalizing an attempt's prepared handoff — including attempts that never
+completed cleanly — and hourly.
 The collector is the agent's own and is cancelled and joined before the node
 lock is released. A run an attempt is holding is never swept: the sweep takes
 the same path lock an attempt does, re-checks its ownership immediately before
@@ -681,13 +682,45 @@ directory, never a file inside the handoff directory: a process workload shares
 the agent's OS identity, so anything in there is a file it can rewrite. Keeping
 records separately avoids casual alteration through the handoff directory; it
 is not a tamper boundary against another process with the same OS identity. A
-directory with no agent record is not the agent's and is never measured or
-removed, however full the node is. A record is validated against the file it was
-found in, the root, this node's identity and the retention window, and one that
-fails any of those — including one from an older agent missing fields — is
-skipped with a logged reason and never stops the sweep. The marker inside the
-handoff directory keeps only its cold-rerun ownership job and is read once, at
-preparation.
+directory with no agent record is never measured or removed, however full the
+node is — including one this agent created and died before marking, which
+nothing distinguishes from a directory that was never the agent's and which
+therefore stays unrecorded — but at startup one carrying this node's own
+ownership marker for that run is adopted, which means given a record whose
+deadline comes from that
+marker, and one carrying neither a record nor such a marker is left exactly as
+it is and counted in the accounting pass rather than left invisible. A record
+is validated against the file it was found in, the root, this node's identity
+and the retention window, and one that fails any of those — including one from
+an older agent missing fields — is skipped with a logged reason and never stops
+the sweep. The marker inside the handoff directory keeps its cold-rerun
+ownership job and that adoption, and is read at preparation, at startup for a
+directory no record names, and at startup for a record that carries an
+admission and no deadline.
+
+**What adoption can and cannot claim.** The marker is a file inside a
+workload-writable directory, so it is not proof the agent created what it
+names: a directory a workload made under this node's handoff root, carrying a
+marker naming this node and that run, qualifies. What adoption may do with it
+is bounded instead. It only ever creates a record, never replaces one that
+already stands at that run's name, and it gives no authority beyond an expiry
+schedule over a directory under this node's own root. The deadline it takes
+from the marker is at most one retention window **after the adoption**, so a
+forged marker may shorten its own run's retention freely and may extend nothing
+past a window from the moment the node adopted it. A record whose run was
+admitted and never finished is reconciled the same way, and one whose directory
+is gone is removed rather than left without a deadline; one whose name is not a
+directory is given its admitted deadline, capped at one retention window from
+the reconciliation, and is left alone, never followed.
+
+**A record is written at preparation and completed at finish.** Preparation
+writes it with an admission and no deadline, before the workload starts, so an
+executing run is accounted for and a crash leaves a record instead of residue;
+finish updates that same record with the terminal window and verdict rather
+than replacing it. A cold rerun prepares again, so its admission record resets
+the `published` fact to false until that attempt finishes. That is deliberate,
+and it is the safe direction: eviction gives up published results first, so a
+run that looks unpublished is kept longer, never given up sooner.
 
 Terminal recording and trimming require the opaque preparation receipt from
 that attempt's lock acquisition. A canceled waiter has no receipt and performs
@@ -708,10 +741,37 @@ its own attempts while it collects.
 
 **The budgets are logical bytes**, summed over regular files: the length a file
 reports, not the blocks it occupies. A symlink is never followed and contributes
-nothing; a hard-linked file is charged once per link, because part 1 tracks no
-inode identity. Sparse files are charged their logical length. There is no inode
-or entry-count bound, so many tiny files can consume node resources while barely
-moving the per-run budget; whether to add one is part of #494.
+nothing; the per-run bound charges a hard-linked file once per link, because
+that bound trims names and dropping one name recovers nothing while another
+still holds the inode. Sparse files are charged their logical length. No budget
+bounds inodes or entry counts, so many tiny files can consume node resources
+while barely moving the per-run budget.
+
+**What the node reports is measured differently from what it enforces.** The
+agent's accounting pass reports two figures over the runs its records name, and
+enforces neither. Logical bytes are as above, except that a file two runs
+hard-link is counted once per pass rather than once per link, because one inode
+is one piece of storage however many names reach it — and it is charged to
+whichever run the pass reached first, so giving up the other run recovers none
+of those bytes. That is safe to act on only because the node remeasures after
+every deletion rather than subtracting what it thought a run was worth. Charged
+bytes are that same measurement with a floor of 4 KiB under every directory
+entry, which is what makes a tree of a million empty files — no logical bytes,
+and a node out of inodes — a number an operator can see. Each run's own share
+of both figures is kept in memory beside the totals and never on its record: a
+record is authority to delete, and has to stay what an attempt wrote.
+
+The pass also counts, separately, three things it cannot charge: entries under
+the handoff root that no record names, which are neither measured nor removed;
+subtrees that stopped being the directory the pass was measuring, which are
+left out rather than measured somewhere else; and runs the pass did not finish,
+because one pass has a bounded number of directories it may open and a shutdown
+interrupts it. A truncated run's figures are a floor, not a measurement. The
+pass runs at agent startup and on the collector's own timer, never on an
+attempt's finalization, so one workload's directory tree never sits in front of
+another run finishing or of the node lock being released. All of it reaches a
+person through the agent log and the node doctor's retained-results line. The
+budget that will enforce a node-wide figure is #494.
 
 The record also carries whether the run's evidence reached the ledger. Nothing
 in part 1 reads it — there is no eviction order for it to inform — and it is

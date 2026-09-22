@@ -64,12 +64,17 @@ const (
 	NotRunNoProbeReceipt     NotRunCause = "no_probe_receipt"
 	NotRunDependencyMissing  NotRunCause = "dependency_unavailable"
 	NotRunDesiredUnavailable NotRunCause = "desired_unavailable"
+	// NotRunPeerDoesNotReport is for a section this build knows about and the
+	// agent that answered does not report at all. It is a version gap, not a
+	// node fault, and it is a separate cause so an operator is not sent to
+	// look for a source that was never meant to be there.
+	NotRunPeerDoesNotReport NotRunCause = "peer_does_not_report"
 )
 
 func (cause NotRunCause) Valid() bool {
 	switch cause {
 	case NotRunSourceUnavailable, NotRunHelperUnreachable, NotRunNotConfigured, NotRunNotApplicable,
-		NotRunNoProbeReceipt, NotRunDependencyMissing, NotRunDesiredUnavailable:
+		NotRunNoProbeReceipt, NotRunDependencyMissing, NotRunDesiredUnavailable, NotRunPeerDoesNotReport:
 		return true
 	default:
 		return false
@@ -200,6 +205,35 @@ type ComputerStorageRecoveryFacts struct {
 	Quarantined      []ocihelper.ComputerStorageRecoveryInventoryEntry `json:"quarantined"`
 }
 
+// RetainedResultsFacts is what the node agent's last retained-results
+// accounting pass found under its process handoff root.
+//
+// It is a measurement, not a budget: nothing on the node enforces any of these
+// figures yet (#494). It reaches an operator here because the alternative is
+// the agent log, and a number nobody can ask for is a number nobody reads.
+//
+// Both byte figures are carried because they answer different questions.
+// LogicalBytes is what the files hold, with a file two runs hard-link counted
+// once. ChargedBytes is the same measurement with a floor under every entry, so
+// a tree of a million empty files -- no logical bytes and a node out of inodes
+// -- is a number somebody can see. The three counts below are what the node is
+// holding that neither figure includes, and each says which of three different
+// things it is: storage that is not the agent's, subtrees that stopped being
+// the ones being measured, and runs the pass did not finish.
+type RetainedResultsFacts struct {
+	Outcome            DiagnosticOutcome `json:"outcome"`
+	MeasuredAt         *time.Time        `json:"measured_at,omitempty"`
+	Runs               int               `json:"runs"`
+	InFlight           int               `json:"in_flight"`
+	Entries            int64             `json:"entries"`
+	LogicalBytes       int64             `json:"logical_bytes"`
+	ChargedBytes       int64             `json:"charged_bytes"`
+	QuarantinedRecords int               `json:"quarantined_records"`
+	Unrecorded         int               `json:"unrecorded"`
+	Replaced           int               `json:"replaced"`
+	Truncated          int               `json:"truncated"`
+}
+
 type DiagnosticFinding struct {
 	Check       string                        `json:"check"`
 	Outcome     DiagnosticOutcome             `json:"outcome"`
@@ -236,6 +270,13 @@ type DoctorResponse struct {
 	LastSessionInvalidation *ocihelper.SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
 	Convergence             ConvergenceDoctorFacts                `json:"convergence"`
 	ComputerStorageRecovery ComputerStorageRecoveryFacts          `json:"computer_storage_recovery"`
+	// RetainedResults is nil when the agent that answered does not report the
+	// section at all. That is how an older node looks to a newer CLI, and it
+	// must stay a readable report rather than a refusal: upgrading the CLI
+	// first is an ordinary order to upgrade in, and "doctor no longer runs" is
+	// the worst possible answer from the command an operator reaches for when
+	// something is already wrong.
+	RetainedResults *RetainedResultsFacts `json:"retained_results,omitempty"`
 	// AttemptOwnershipQuarantines names durable Attempt ownership records the
 	// boot sweep moved aside rather than wedge helper startup on. Empty is the
 	// healthy shape.
@@ -289,6 +330,10 @@ type DoctorConfig struct {
 	ReadDesiredSetupState      func(string) (SetupState, error)
 	InstalledSystemdVersion    func(context.Context) (int, error)
 	InstalledHelperServiceUnit func(context.Context) (string, error)
+	// RetainedResults reads the node-local agent's last retained-results
+	// accounting pass. The second result is false before the first pass has
+	// run, so "not measured yet" never arrives as a node holding nothing.
+	RetainedResults func() (RetainedResultsFacts, bool)
 	// Removals reads the durable runtime removals the node-local agent is
 	// carrying. A removal the agent cannot validate holds its node service
 	// slot for as long as the row exists, and until this finding existed that
@@ -395,7 +440,66 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildHelperStartupBound(config, &report)
 	buildHelper(ctx, config, &report)
 	buildRemovalRecords(ctx, config, now, &report)
+	buildRetainedResults(config, &report)
 	return report
+}
+
+// buildRetainedResults puts the agent's retained-results accounting on the
+// doctor response.
+//
+// The measurement exists on the node either way; what this adds is a way to ask
+// for it. Two things are worth an operator's attention and neither is a
+// failure: how much the node is holding, and how much of what it is holding it
+// cannot account for -- a directory no record names is never measured and never
+// removed, however full the node gets, so an unaccounted count that keeps
+// growing is the shape of a node quietly filling up.
+func buildRetainedResults(config DoctorConfig, report *DoctorResponse) {
+	report.RetainedResults = &RetainedResultsFacts{Outcome: DiagnosticNotRun}
+	if config.RetainedResults == nil {
+		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+			code: "oci_retained_results_not_read", notRunCause: NotRunNotConfigured,
+			detail: "the node-local retained-results reader was not available to the doctor",
+		}))
+		return
+	}
+	facts, measured := config.RetainedResults()
+	if !measured {
+		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+			code: "oci_retained_results_not_read", notRunCause: NotRunSourceUnavailable,
+			detail: "the node agent has not completed a retained-results accounting pass yet",
+		}))
+		return
+	}
+	facts.Outcome = DiagnosticOK
+	report.RetainedResults = &facts
+	detail := fmt.Sprintf("the node retains %d run(s) (%d still in flight) across %d entries: %d logical bytes, %d charged bytes, %d quarantined record(s) still charged",
+		facts.Runs, facts.InFlight, facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords)
+	if facts.Unrecorded == 0 && facts.Replaced == 0 && facts.Truncated == 0 {
+		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+			ran: true, passed: true, code: "oci_retained_results_measured", detail: detail,
+		}))
+		return
+	}
+	// Each of the three is a different thing to go and look at, so each is
+	// worded to its own number rather than summed into one that would be
+	// accurate about none of them.
+	gaps := make([]string, 0, 3)
+	if facts.Unrecorded != 0 {
+		gaps = append(gaps, fmt.Sprintf("%d entr(ies) under the handoff root are not this agent's and are neither measured nor removed, however full the node is",
+			facts.Unrecorded))
+	}
+	if facts.Replaced != 0 {
+		gaps = append(gaps, fmt.Sprintf("%d subtree(s) stopped being the directory the pass was measuring and are left out of the figures rather than measured elsewhere",
+			facts.Replaced))
+	}
+	if facts.Truncated != 0 {
+		gaps = append(gaps, fmt.Sprintf("%d run(s) were measured incompletely, so the figures above are a floor rather than a measurement",
+			facts.Truncated))
+	}
+	report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
+		ran: true, code: "oci_retained_results_unaccounted", severity: DiagnosticWarn,
+		detail: detail + "; " + strings.Join(gaps, "; "),
+	}))
 }
 
 // removalStallBound is how long a durable removal row may sit unfinished
@@ -1263,6 +1367,7 @@ func StableDoctorCodes() []string {
 		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
 		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable", "oci_removal_stalled",
 		"oci_removal_stalled_declared",
+		"oci_retained_results_not_read", "oci_retained_results_measured", "oci_retained_results_unaccounted",
 	}
 }
 
@@ -1277,6 +1382,11 @@ func (report DoctorResponse) Validate() error {
 	if len(report.Limitations) != 1 || report.Limitations[0].Code != DoctorUIDLimitation || report.Limitations[0].Issue != DoctorUIDIssue || report.Limitations[0].Detail == "" {
 		return fmt.Errorf("doctor UID-isolation limitation is missing")
 	}
+	// A section this build knows about and the answering agent does not report
+	// is absent, not invalid. Only what is present is checked.
+	if facts := report.RetainedResults; facts != nil && !facts.Outcome.Valid() {
+		return fmt.Errorf("invalid retained-results facts")
+	}
 	if evidence := report.LastSessionInvalidation; evidence != nil &&
 		(evidence.ObservedAt.IsZero() || evidence.SessionGeneration == 0 || evidence.RejectionCode == "") {
 		return fmt.Errorf("invalid helper session-invalidation receipt")
@@ -1290,9 +1400,12 @@ func (report DoctorResponse) Validate() error {
 		if item.Check == "" || !item.Outcome.Valid() || !item.Severity.Valid() || item.Code == "" || item.Detail == "" || !strings.HasPrefix(item.Runbook, DoctorRunbookPrefix) {
 			return fmt.Errorf("invalid doctor finding for %q", item.Check)
 		}
-		if _, ok := stableCodes[item.Code]; !ok {
-			return fmt.Errorf("doctor finding %q used undocumented code %q", item.Check, item.Code)
-		}
+		// An unrecognised code is a newer agent, not a broken report. Refusing
+		// it means a CLI one version behind cannot read doctor at all, which
+		// is the command an operator reaches for when something is already
+		// wrong; NoteUnreportedSections marks it instead so the reader is told
+		// to upgrade rather than told nothing.
+		_ = stableCodes
 		if item.ReasonCode != "" && !item.ReasonCode.Valid() {
 			return fmt.Errorf("invalid doctor reason %q", item.ReasonCode)
 		}
@@ -1361,6 +1474,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t after_endpoint_ready=%t target_x_live=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.HostAbstractSocketObservedAfterEndpointReady, report.ComputerScreenIsolation.TargetAbstractSocketLive, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
+		retainedResultsLine(report.RetainedResults),
 	}
 	if report.ResourceAdmission != nil {
 		admission := report.ResourceAdmission
@@ -1392,6 +1506,59 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 	)
 	_, err := fmt.Fprintln(writer, strings.Join(lines, "\n"))
 	return err
+}
+
+// retainedResultsLine renders the section, including the case where the agent
+// that answered does not carry one.
+func retainedResultsLine(facts *RetainedResultsFacts) string {
+	if facts == nil {
+		return "RETAINED RESULTS\tNOT-RUN not reported by this agent version"
+	}
+	return fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unrecorded=%d replaced=%d truncated=%d",
+		facts.Outcome, formatOptionalTime(facts.MeasuredAt), facts.Runs, facts.InFlight,
+		facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords,
+		facts.Unrecorded, facts.Replaced, facts.Truncated)
+}
+
+// NoteUnreportedSections returns the report with one finding added for every
+// section this build knows about that the agent which answered did not report.
+//
+// It is the reader's note, not the node's: a newer CLI against an older agent
+// has to say "this agent does not report that" rather than either refuse the
+// whole report or print a section of zeroes that reads like a measurement.
+func (report DoctorResponse) NoteUnreportedSections() DoctorResponse {
+	noted := report
+	noted.Findings = append([]DiagnosticFinding{}, report.Findings...)
+	// Skew runs both ways. A newer agent sends findings this build has never
+	// heard of, and the honest thing to say about one is that it exists and
+	// this reader cannot interpret it -- not to drop it, which hides a finding
+	// an operator is meant to act on, and not to refuse the report.
+	stable := make(map[string]struct{}, len(StableDoctorCodes()))
+	for _, code := range StableDoctorCodes() {
+		stable[code] = struct{}{}
+	}
+	for index, item := range noted.Findings {
+		if _, known := stable[item.Code]; known {
+			continue
+		}
+		noted.Findings[index].Detail = fmt.Sprintf(
+			"unknown finding code %q, upgrade the CLI to read it; the agent reported: %s", item.Code, item.Detail)
+		noted.Findings[index].Runbook = DoctorRunbookPrefix + "unknown-finding-code"
+	}
+	if report.RetainedResults != nil {
+		return noted
+	}
+	for _, item := range report.Findings {
+		if item.Check == "retained-results" {
+			return noted
+		}
+	}
+	noted.Findings = append(noted.Findings,
+		finding("retained-results", diagnosticReceipt{
+			code: "oci_retained_results_not_read", notRunCause: NotRunPeerDoesNotReport,
+			detail: "the agent that answered does not report retained-results accounting; it predates the measurement",
+		}))
+	return noted
 }
 
 func formatOptionalTime(value *time.Time) string {

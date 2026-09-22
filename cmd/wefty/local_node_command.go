@@ -62,6 +62,10 @@ func executeLocalDoctor(ctx context.Context, client *ocicontrol.Client, jsonOutp
 	if err := report.Validate(); err != nil {
 		return fmt.Errorf("validate node doctor response: %w", err)
 	}
+	// The node answered; what it left out is this build's note to add, in both
+	// formats, and after validation so the note is never mistaken for the
+	// node's own answer.
+	report = report.NoteUnreportedSections()
 	if jsonOutput {
 		return writeJSON(stdout, report)
 	}

@@ -47,6 +47,13 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		Intent: func(context.Context) (lima.OCIIntent, error) {
 			return lima.OCIIntent{Version: lima.OCIIntentVersion, Revision: 4, Enabled: true, UpdatedAt: now.Add(-time.Hour)}, nil
 		},
+		RetainedResults: func() (RetainedResultsFacts, bool) {
+			measured := now.Add(-time.Minute)
+			return RetainedResultsFacts{
+				MeasuredAt: &measured, Runs: 2, Entries: 12,
+				LogicalBytes: 1 << 20, ChargedBytes: 2 << 20,
+			}, true
+		},
 		Helper: func(context.Context) (HelperDoctorSnapshot, error) {
 			return HelperDoctorSnapshot{
 				ProtocolVersion: ocihelper.ProtocolVersion, Version: "v1.2.3", Checksum: "sha256:helper",
@@ -1261,5 +1268,204 @@ func TestDoctorSeparatesIneligibleEvidenceFromFailedDeclaration(t *testing.T) {
 		if !strings.Contains(item.Detail, want) {
 			t.Fatalf("mixed stall detail %q does not name %q", item.Detail, want)
 		}
+	}
+}
+
+// TestDoctorReportsRetainedResults: the agent measures what it is holding every
+// collection, and until this finding the only place that reached a person was
+// the agent log. The doctor is where an operator asks.
+func TestDoctorReportsRetainedResults(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	measured := now.Add(-3 * time.Minute)
+	config := healthyDoctorConfig(now, "")
+	config.RetainedResults = func() (RetainedResultsFacts, bool) {
+		return RetainedResultsFacts{
+			MeasuredAt: &measured, Runs: 6, InFlight: 1, Entries: 4096,
+			LogicalBytes: 12 << 20, ChargedBytes: 20 << 20,
+			QuarantinedRecords: 1, Unrecorded: 3, Replaced: 2, Truncated: 1,
+		}, true
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if report.RetainedResults == nil || report.RetainedResults.Outcome != DiagnosticOK {
+		t.Fatalf("retained results = %#v", report.RetainedResults)
+	}
+	if report.RetainedResults.Runs != 6 || report.RetainedResults.InFlight != 1 ||
+		report.RetainedResults.LogicalBytes != 12<<20 || report.RetainedResults.ChargedBytes != 20<<20 ||
+		report.RetainedResults.Entries != 4096 || report.RetainedResults.QuarantinedRecords != 1 ||
+		report.RetainedResults.Unrecorded != 3 || report.RetainedResults.Replaced != 2 ||
+		report.RetainedResults.Truncated != 1 {
+		t.Fatalf("the doctor lost the measurement: %#v", report.RetainedResults)
+	}
+	item, found := findingFor(report, "retained-results")
+	if !found {
+		t.Fatal("the doctor carries no retained-results finding")
+	}
+	// Unaccounted entries are neither measured nor removed however full the
+	// node is, so a count that keeps growing is the shape of a node quietly
+	// filling up: it is a finding an operator is meant to see, not a footnote.
+	if item.Code != "oci_retained_results_unaccounted" || item.Outcome != DiagnosticFailed {
+		t.Fatalf("unaccounted entries did not raise the finding: %#v", item)
+	}
+	if !strings.Contains(item.Detail, "12582912 logical bytes") ||
+		!strings.Contains(item.Detail, "20971520 charged bytes") {
+		t.Fatalf("the finding does not name what it measured: %q", item.Detail)
+	}
+	// Three different things to go and look at, each worded to its own number
+	// rather than summed into one that is accurate about none of them.
+	if !strings.Contains(item.Detail, "3 entr(ies) under the handoff root are not this agent's") ||
+		!strings.Contains(item.Detail, "2 subtree(s) stopped being the directory") ||
+		!strings.Contains(item.Detail, "1 run(s) were measured incompletely") {
+		t.Fatalf("the finding does not separate the three gaps: %q", item.Detail)
+	}
+
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human.String(), "RETAINED RESULTS\tOK measured_at=2026-09-22T11:57:00Z runs=6 in_flight=1 entries=4096 logical_bytes=12582912 charged_bytes=20971520 quarantined=1 unrecorded=3 replaced=2 truncated=1") {
+		t.Fatalf("the human report does not carry the measurement:\n%s", human.String())
+	}
+}
+
+// TestDoctorSaysRetainedResultsAreUnmeasuredRatherThanEmpty: a node that has not
+// run an accounting pass and a node holding nothing produce the same zeroes.
+func TestDoctorSaysRetainedResultsAreUnmeasuredRatherThanEmpty(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	config.RetainedResults = func() (RetainedResultsFacts, bool) { return RetainedResultsFacts{}, false }
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	item, found := findingFor(report, "retained-results")
+	if !found {
+		t.Fatal("the doctor carries no retained-results finding")
+	}
+	if item.Outcome != DiagnosticNotRun || item.Code != "oci_retained_results_not_read" {
+		t.Fatalf("an unmeasured node was reported as measured: %#v", item)
+	}
+	if report.RetainedResults == nil || report.RetainedResults.Outcome != DiagnosticNotRun {
+		t.Fatalf("retained results = %#v, want a NOT-RUN section", report.RetainedResults)
+	}
+}
+
+func findingFor(report DoctorResponse, check string) (DiagnosticFinding, bool) {
+	for _, item := range report.Findings {
+		if item.Check == check {
+			return item, true
+		}
+	}
+	return DiagnosticFinding{}, false
+}
+
+// TestDoctorAcceptsAnOlderAgentsResponse: doctor is the command an operator
+// reaches for when something is already wrong, and upgrading the CLI before the
+// node is an ordinary order to upgrade in. A section the answering agent
+// predates must read as unavailable, never as a refusal to print the report.
+func TestDoctorAcceptsAnOlderAgentsResponse(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
+
+	// Exactly what an older agent sends: no section, and no finding for it.
+	older := report
+	older.RetainedResults = nil
+	kept := make([]DiagnosticFinding, 0, len(report.Findings))
+	for _, item := range report.Findings {
+		if item.Check != "retained-results" {
+			kept = append(kept, item)
+		}
+	}
+	older.Findings = kept
+
+	// It must survive the wire as well as the struct: the CLI decodes JSON.
+	payload, err := json.Marshal(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded DoctorResponse
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RetainedResults != nil {
+		t.Fatalf("an absent section decoded as present: %#v", decoded.RetainedResults)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("a newer CLI refused an older agent's doctor response: %v", err)
+	}
+
+	noted := decoded.NoteUnreportedSections()
+	item, found := findingFor(noted, "retained-results")
+	if !found {
+		t.Fatal("the missing section was not reported at all")
+	}
+	if item.Outcome != DiagnosticNotRun || item.Code != "oci_retained_results_not_read" ||
+		item.NotRunCause != NotRunPeerDoesNotReport {
+		t.Fatalf("the missing section was not reported as a version gap: %#v", item)
+	}
+	if err := noted.Validate(); err != nil {
+		t.Fatalf("the noted report does not validate: %v", err)
+	}
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, noted); err != nil {
+		t.Fatalf("an older agent's report does not render: %v", err)
+	}
+	if !strings.Contains(human.String(), "RETAINED RESULTS\tNOT-RUN not reported by this agent version") {
+		t.Fatalf("the rendered report does not say the section is unavailable:\n%s", human.String())
+	}
+	// Noting is idempotent, so a report that already carries the finding is
+	// never given a second one.
+	if again := noted.NoteUnreportedSections(); len(again.Findings) != len(noted.Findings) {
+		t.Fatalf("noting twice added a second finding: %d vs %d", len(again.Findings), len(noted.Findings))
+	}
+}
+
+// TestDoctorAcceptsANewerAgentsFinding is the other skew direction. An agent
+// ahead of this CLI sends findings it has never heard of, and refusing the
+// whole report over one unknown code makes doctor unusable in exactly the
+// window an operator is most likely to be running it.
+func TestDoctorAcceptsANewerAgentsFinding(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
+	newer := report
+	newer.Findings = append(append([]DiagnosticFinding{}, report.Findings...), DiagnosticFinding{
+		Check: "something-this-build-has-never-heard-of", Outcome: DiagnosticFailed,
+		Severity: DiagnosticError, Code: "oci_from_a_later_agent",
+		Detail: "the node says something is wrong", Runbook: DoctorRunbookPrefix + "from-a-later-agent",
+	})
+
+	if err := newer.Validate(); err != nil {
+		t.Fatalf("an older CLI refused a newer agent's doctor response: %v", err)
+	}
+	noted := newer.NoteUnreportedSections()
+	item, found := findingFor(noted, "something-this-build-has-never-heard-of")
+	if !found {
+		t.Fatal("the unknown finding was dropped rather than reported")
+	}
+	if !strings.Contains(item.Detail, "unknown finding code") ||
+		!strings.Contains(item.Detail, "upgrade the CLI") ||
+		!strings.Contains(item.Detail, "the node says something is wrong") {
+		t.Fatalf("the unknown finding does not say what it is or keep what the node said: %q", item.Detail)
+	}
+	if item.Outcome != DiagnosticFailed {
+		t.Fatalf("the unknown finding lost its outcome: %#v", item)
+	}
+	if err := noted.Validate(); err != nil {
+		t.Fatalf("the noted report does not validate: %v", err)
+	}
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, noted); err != nil {
+		t.Fatalf("a newer agent's report does not render: %v", err)
+	}
+	if !strings.Contains(human.String(), "unknown finding code") {
+		t.Fatalf("the rendered report hides the unknown finding:\n%s", human.String())
+	}
+	// A code this build does know is left exactly as the node sent it.
+	known, _ := findingFor(noted, "retained-results")
+	original, _ := findingFor(report, "retained-results")
+	if known.Detail != original.Detail {
+		t.Fatalf("a known finding was rewritten: %q", known.Detail)
 	}
 }

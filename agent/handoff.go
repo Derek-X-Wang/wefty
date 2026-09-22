@@ -48,6 +48,13 @@ type handoffManager struct {
 	runBytes int64
 	now      func() time.Time
 	logf     func(string, ...any)
+	// observeAccounting publishes each accounting pass's figures onto the
+	// agent's status projection. It is a hook rather than a direct call
+	// because retention is filesystem work and the observer is session state;
+	// nothing here should have to know which. Nothing reads the figures yet
+	// beyond the log line and that projection -- the node budget that will is
+	// a later slice of #494.
+	observeAccounting func(RetainedResultsStatus)
 
 	mu    sync.Mutex
 	paths map[string]*handoffPathLock
@@ -103,7 +110,9 @@ type handoffPathLock struct {
 
 // handoffMarker is advisory and lives inside the workload-writable handoff
 // directory. Its whole remaining job is to prove to a cold rerun that the files
-// it found are its own, and it is read only at preparation. Retention is
+// it found are its own, and, at startup, letting the agent adopt a directory or
+// an unfinished admission back into its own accounting (adoptResidue). It is
+// read nowhere else, and never at finish. Retention is
 // decided by the agent-local record instead (handoff_records.go), because a
 // workload shares this agent's OS identity and anything in here is a file it
 // can rewrite.
@@ -344,6 +353,27 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 	if err != nil {
 		return nil, err
 	}
+	// The record is written here, at admission, not at finish.
+	//
+	// A record that appeared only when a run finished made two things
+	// impossible. An in-flight run's bytes were invisible to accounting, so a
+	// node could not know what it was holding until it was no longer being
+	// written; and an agent that died mid-run left a directory no record
+	// named, which nothing measures and nothing sweeps -- residue by
+	// construction. It carries no deadline: a run that has not finished has
+	// nothing to retain yet, and the sweep skips a record with no deadline.
+	// Startup is where an admission that never finished gets one
+	// (adoptResidue).
+	//
+	// It fails preparation rather than being best effort. A node that cannot
+	// write the record is a node that will not be able to account for, bound
+	// or expire this run's results, and saying so before the workload starts
+	// is better than discovering it at finish with the files already written.
+	if err := m.writeRecord(retentionRecord{
+		RunID: runID, NodeID: nodeID, Directory: path, AdmittedAt: m.now().UTC(),
+	}); err != nil {
+		return nil, fmt.Errorf("record the admission of handoff directory %q: %w", path, err)
+	}
 	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, run: run, prepared: prepared}
 	m.mu.Lock()
 	lease.ownership = owner
@@ -378,6 +408,7 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 	now := m.now().UTC()
 	record := retentionRecord{
 		RunID: runID, NodeID: nodeID, Directory: path,
+		AdmittedAt: m.admissionOf(runID, nodeID, path, now),
 		RetainedAt: now, RetainUntil: now.Add(m.retention),
 		Published: published, Succeeded: succeeded,
 	}
@@ -431,8 +462,11 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 // on the retention record, and nothing is deleted. The bound is no longer
 // silently skipped; it is openly not met.
 //
-// The ownership marker is therefore still read exactly once, at preparation, as
-// docs/contracts/run-execution-context.md says.
+// The ownership marker is therefore not read here at all. It is read at
+// preparation, and at startup for the directories and unfinished admissions
+// adoption reconciles, exactly as docs/contracts/run-execution-context.md says
+// -- and never on the finish path, where a workload-writable file would be
+// standing in as proof of whose files a directory holds.
 //
 // It never fails the attempt. A workload that destroyed its own handoff
 // directory has not failed its run.
@@ -463,6 +497,46 @@ func (m *handoffManager) pinnedDirectoryDrift(owner *handoffOwnership, runID, pa
 	m.log("agent: run %s: %q is no longer the directory preparation pinned (it is now %s); the per-run bound trimmed nothing and both directories are left untouched",
 		runID, path, current.Mode())
 	return handoffBoundDirectoryReplaced
+}
+
+// admissionOf carries this run's admission across from the record preparation
+// wrote, so finishing updates one record rather than replacing it with a
+// different one for the same run.
+//
+// Identity has to survive that update. When a run was admitted is how a later
+// pass tells an in-flight run from residue, and rewriting it at finish would
+// make every finished run look freshly admitted. The caller holds this path's
+// lease, so nothing else is writing this record while it is read.
+//
+// A missing or mismatched admission is not a failure: it is an older agent's
+// record, or one something removed mid-run, and the run's own finish time is
+// the honest answer then. It is logged because the agent removing its own
+// record mid-run is not an ordinary thing to have happened.
+func (m *handoffManager) admissionOf(runID, nodeID, path string, now time.Time) time.Time {
+	if strings.TrimSpace(m.stateRoot) == "" {
+		return now
+	}
+	current, err := m.readRecord(m.existingRecordPath(runID))
+	switch {
+	case err != nil:
+		m.log("agent: run %s: no admission record to update at finish (%v); recording this run as admitted when it finished", runID, err)
+	case current.RunID != runID || current.NodeID != nodeID || current.Directory != path || current.AdmittedAt.IsZero():
+		m.log("agent: run %s: the record at finish is not the one its preparation wrote; recording this run as admitted when it finished", runID)
+	default:
+		admitted := current.AdmittedAt.UTC()
+		if admitted.After(now) {
+			// A record admitted after the moment this run finished is a clock
+			// that moved backwards between the two writes. Carrying it forward
+			// would hand the validator a record it refuses -- "admitted in the
+			// future" -- which would make the run's own retention record
+			// untrustworthy and stop the sweep acting on it at all.
+			m.log("agent: run %s: its admission is recorded after this finish (%s > %s); the earlier of the two is kept so the record stays one the sweep will act on",
+				runID, admitted.Format(time.RFC3339), now.Format(time.RFC3339))
+			return now
+		}
+		return admitted
+	}
+	return now
 }
 
 // readResult reads this run's result document through the same receipt that
@@ -603,13 +677,17 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 	return nil
 }
 
-// collect expires. That is all it does: a recorded run whose window has closed
-// and which no attempt is holding is removed, together with its record.
+// collect expires. A recorded run whose window has closed and which no attempt
+// is holding is removed, together with its record.
 //
-// There is no node-wide byte budget here and no eviction order. Part 1 keeps
-// the two rules it can enforce correctly -- a window and a per-run bound -- and
-// the node budget, which needs accounting and ordering this layer could not get
-// right, is #494.
+// It does not measure the node. Every attempt's finalization calls this
+// synchronously, and the node pass walks every retained run on the node, so
+// measuring here put one workload's tree in front of every other run's
+// finalization -- and in front of shutdown, which joins the collector before
+// releasing the node lock. The pass runs on the collector's own timer instead
+// (accountNode), and status and the doctor read its last figures.
+//
+// There is still no node-wide byte budget here and no eviction order.
 //
 // It acts only on directories the agent has a record for. A directory under
 // the root with no record is someone else's and is never measured or removed.
@@ -631,6 +709,9 @@ func (m *handoffManager) collect() error {
 	now := m.now().UTC()
 	for _, record := range m.loadRecords() {
 		if record.Quarantine == "" && (record.RetainUntil.IsZero() || now.Before(record.RetainUntil)) {
+			// A record with no deadline is a run that was admitted and has not
+			// finished. There is nothing to expire yet, and the accounting
+			// pass below still counts what it is writing.
 			continue
 		}
 		m.expireRun(root, record, now)
@@ -787,7 +868,7 @@ func (m *handoffManager) rewriteRecord(snapshot, updated retentionRecord) bool {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return true
 	}
-	current, err := m.readRecord(filepath.Join(m.recordRoot(), recordComponent(snapshot.RunID)))
+	current, err := m.readRecord(m.existingRecordPath(snapshot.RunID))
 	if err != nil {
 		m.log("agent: leave run %s's retention record alone: re-reading it failed: %v", snapshot.RunID, err)
 		return false
@@ -805,10 +886,18 @@ func (m *handoffManager) rewriteRecord(snapshot, updated retentionRecord) bool {
 }
 
 // sameRetainedRun compares the facts an attempt writes and a sweep must never
-// invent: who the record is for, and the terminal verdict and window it carries.
+// invent: who the record is for, when it was admitted, and the terminal verdict
+// and window it carries.
+//
+// An admission with no window and a finished record for the same run are
+// therefore *different*, which is the point: the preparation record is a
+// legitimate earlier state of that run, and a sweep still holding it has the
+// older copy. Refusing its write is the same rule that stopped a sweep
+// overwriting a rerun's results, applied to the one new state a record has.
 func sameRetainedRun(left, right retentionRecord) bool {
 	return left.RunID == right.RunID && left.NodeID == right.NodeID &&
 		left.Directory == right.Directory &&
+		left.AdmittedAt.Equal(right.AdmittedAt) &&
 		left.RetainedAt.Equal(right.RetainedAt) &&
 		left.RetainUntil.Equal(right.RetainUntil) &&
 		left.Published == right.Published && left.Succeeded == right.Succeeded
@@ -833,15 +922,15 @@ func (m *handoffManager) currentRecord(snapshot retentionRecord) (retentionRecor
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return snapshot, true
 	}
-	name := recordComponent(snapshot.RunID)
-	record, err := m.readRecord(filepath.Join(m.recordRoot(), name))
+	path := m.existingRecordPath(snapshot.RunID)
+	record, err := m.readRecord(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			m.log("agent: skip run %s this sweep: re-reading its retention record failed: %v", snapshot.RunID, err)
 		}
 		return retentionRecord{}, false
 	}
-	if err := validRetentionRecord(record, name, m.root, m.nodeID, m.retention, m.now().UTC()); err != nil {
+	if err := validRetentionRecord(record, filepath.Base(path), m.root, m.nodeID, m.retention, m.now().UTC()); err != nil {
 		m.log("agent: skip run %s this sweep: its retention record is no longer trustworthy: %v", snapshot.RunID, err)
 		return retentionRecord{}, false
 	}
@@ -957,8 +1046,12 @@ type handoffEntry struct {
 // opened directory, which is the granularity the per-run bound trims at.
 //
 // Sizes are logical bytes of regular files. A hard-linked file is charged once
-// per link, because part 1 does not track inode identity across a run; a
-// symlink is never followed and contributes nothing.
+// per link, because this is the unit the per-run bound trims in: dropping one
+// name recovers nothing if another still holds the inode, and a bound that
+// assumed otherwise would stop trimming while the run was still over. Cross-run
+// inode identity is the node pass's (handoff_accounting.go), which is the only
+// place that sees a whole root at once. A symlink is never followed and
+// contributes nothing.
 func handoffEntries(run *os.Root) ([]handoffEntry, int64, error) {
 	directory, err := run.Open(".")
 	if err != nil {
@@ -994,25 +1087,19 @@ func handoffEntries(run *os.Root) ([]handoffEntry, int64, error) {
 
 // measureEntry sums the logical length of the regular files under one entry,
 // reached only through the run's own directory handle.
+//
+// It used to recurse into subdirectories, which made how deep it went the
+// workload's decision. It now walks with an explicit stack (walkHandoffTree),
+// and passes no file identity: the per-run bound trims names and charges a
+// hard-linked file once per link, which is what part 1 states its unit to be.
+// Cross-run identity belongs to the node pass, which sees a whole root.
 func measureEntry(run *os.Root, name string, info os.FileInfo) (int64, error) {
-	switch {
-	case info.Mode().IsRegular():
-		return info.Size(), nil
-	case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
-		// Symlinks, sockets and devices contribute nothing, and a symlink is
-		// never followed: a link into the node is not this run's storage.
-		return 0, nil
-	}
-	child, err := openHandoffDirectory(run, name)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	defer child.Close()
-	_, total, err := handoffEntries(child)
-	return total, err
+	// No context and no budget: this runs inside one attempt's own
+	// finalization, on the one directory that attempt prepared, and stopping
+	// early would mean trimming against a figure the bound knows is short.
+	// The node pass is the one with a budget, because it walks every run.
+	tally, err := walkHandoffTree(context.Background(), nil, run, name, info, nil)
+	return tally.logical, err
 }
 
 func handoffOwnerRunID(spec contract.JobSpec) string {

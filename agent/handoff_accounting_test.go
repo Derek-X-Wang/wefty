@@ -1,0 +1,1344 @@
+//go:build darwin || linux
+
+package agent
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// account runs one collection and returns what its accounting pass found,
+// through the same hook the agent wires to its status projection.
+func (h *retentionHarness) account() RetainedResultsStatus {
+	h.t.Helper()
+	var status RetainedResultsStatus
+	h.manager.observeAccounting = func(pass RetainedResultsStatus) { status = pass }
+	if err := h.manager.collect(); err != nil {
+		h.t.Fatal(err)
+	}
+	// Measuring is its own pass, off the finalization path: collect() expires
+	// and nothing else, so a test that wants figures asks for them.
+	if err := h.manager.accountNode(h.t.Context()); err != nil {
+		h.t.Fatal(err)
+	}
+	h.manager.observeAccounting = nil
+	return status
+}
+
+func (h *retentionHarness) record(runID string) retentionRecord {
+	h.t.Helper()
+	for _, record := range h.manager.loadRecords() {
+		if record.RunID == runID {
+			return record
+		}
+	}
+	h.t.Fatalf("no retention record for run %s", runID)
+	return retentionRecord{}
+}
+
+// TestTwoRunsHardLinkingOneFileAreChargedItsBytesOnce is the cross-run identity
+// the node figure is built on. Part 1 measured one run at a time, so a file two
+// runs share was counted once per run and a node that held one 4 MiB artifact
+// reported eight.
+func TestTwoRunsHardLinkingOneFileAreChargedItsBytesOnce(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	const payload = 4 << 20
+	first := harness.retain("run_first", true, true, map[string]int{"result.json": 16, "big.bin": payload})
+	second := harness.retain("run_second", true, true, map[string]int{"result.json": 16})
+	if err := os.Link(filepath.Join(first, "big.bin"), filepath.Join(second, "big.bin")); err != nil {
+		t.Fatalf("link one file into two runs: %v", err)
+	}
+
+	status := harness.account()
+	if status.Runs != 2 {
+		t.Fatalf("accounted %d runs, want 2", status.Runs)
+	}
+	if status.LogicalBytes < payload {
+		t.Fatalf("the shared file's %d bytes are not counted at all: %d", payload, status.LogicalBytes)
+	}
+	if status.LogicalBytes >= 2*payload {
+		t.Fatalf("the shared file is charged once per link: %d logical bytes for %d bytes of storage",
+			status.LogicalBytes, payload)
+	}
+	if status.ChargedBytes >= 2*payload {
+		t.Fatalf("the charged figure double-counts the shared file: %d", status.ChargedBytes)
+	}
+	// The second name costs the entry floor and nothing more: the data is
+	// charged once, the directory slot holding it is charged every time.
+	if status.ChargedBytes < status.LogicalBytes {
+		t.Fatalf("charged %d bytes for %d logical bytes", status.ChargedBytes, status.LogicalBytes)
+	}
+	// Two runs, each with a directory, a marker, a result.json and the shared
+	// file.
+	if status.Entries != 8 {
+		t.Fatalf("reached %d entries, want 8", status.Entries)
+	}
+
+	// The per-run bound's unit is unchanged: it trims names, so each run still
+	// sees the whole file it can drop.
+	for _, path := range []string{first, second} {
+		run, err := harness.manager.openRun(filepath.Base(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, size, err := handoffEntries(run)
+		run.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if size < payload {
+			t.Fatalf("the per-run bound for %q stopped seeing the file it can trim: %d bytes", path, size)
+		}
+	}
+}
+
+// TestASwarmOfEmptyFilesIsChargedItsEntryFloor is the case logical bytes cannot
+// see: a tree that holds almost nothing and costs the node an inode, a
+// directory slot and a block per file.
+func TestASwarmOfEmptyFilesIsChargedItsEntryFloor(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	const swarm = 3000
+	path := harness.retain("run_swarm", true, true, map[string]int{"result.json": 16})
+	for index := range swarm {
+		name := filepath.Join(path, fmt.Sprintf("tiny-%05d", index))
+		if err := os.WriteFile(name, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	status := harness.account()
+	if status.LogicalBytes > 4<<10 {
+		t.Fatalf("a swarm of empty files reported %d logical bytes; the point is that it reports almost none",
+			status.LogicalBytes)
+	}
+	// 4 KiB is written out rather than taken from the constant: the number the
+	// node is charged is the assertion, and a test that reads it back from the
+	// code it is checking would pass whatever that code said.
+	if want := int64(swarm) * 4096; status.ChargedBytes < want {
+		t.Fatalf("charged %d bytes for %d entries, want at least %d", status.ChargedBytes, swarm, want)
+	}
+	// The directory, its marker, its result.json and the swarm.
+	if want := int64(swarm + 3); status.Entries != want {
+		t.Fatalf("reached %d entries, want %d", status.Entries, want)
+	}
+}
+
+// TestACrashedRunsDirectoryIsAdoptedWithItsMarkersDeadline covers the residue a
+// record written only at finish could never account for: the agent died between
+// preparation and finish, so the directory is on the node and nothing names it.
+func TestACrashedRunsDirectoryIsAdoptedWithItsMarkersDeadline(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	deadline := harness.now.Add(40 * time.Minute).UTC()
+	crashed := harness.plantDirectory("run_crashed", &handoffMarker{
+		RunID: "run_crashed", NodeID: "node-1", RetainUntil: deadline,
+	})
+	// A directory with no marker at all, and one whose marker names another
+	// node. Neither is this agent's to claim.
+	harness.plantDirectory("run_foreign", nil)
+	harness.plantDirectory("run_elsewhere", &handoffMarker{
+		RunID: "run_elsewhere", NodeID: "node-2", RetainUntil: deadline,
+	})
+
+	if err := harness.manager.adoptResidue(); err != nil {
+		t.Fatal(err)
+	}
+	records := harness.manager.loadRecords()
+	if len(records) != 1 {
+		t.Fatalf("adoption wrote %d records, want only the marked one: %#v", len(records), records)
+	}
+	adopted := records[0]
+	if adopted.RunID != "run_crashed" {
+		t.Fatalf("adopted run %q", adopted.RunID)
+	}
+	if !adopted.RetainUntil.Equal(deadline) {
+		t.Fatalf("adopted with deadline %s, want the marker's %s", adopted.RetainUntil, deadline)
+	}
+	if !adopted.Adopted {
+		t.Fatal("the adopted record does not say the agent derived its window")
+	}
+
+	// The two it did not claim are still there, untouched, and counted.
+	status := harness.account()
+	if status.Unrecorded != 2 {
+		t.Fatalf("reported %d unrecorded entries, want 2", status.Unrecorded)
+	}
+	for _, name := range []string{"run_foreign", "run_elsewhere"} {
+		if _, err := os.Stat(filepath.Join(harness.root, name)); err != nil {
+			t.Fatalf("a directory the agent does not claim was removed: %v", err)
+		}
+	}
+
+	// Adoption put the run back inside the sweep: it expires on the marker's
+	// deadline rather than sitting on the node for as long as it runs.
+	harness.now = deadline.Add(time.Minute)
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(crashed); !os.IsNotExist(err) {
+		t.Fatalf("the adopted run did not expire: %v", err)
+	}
+}
+
+// TestAnAdoptedDeadlineCannotOutrunTheRetentionWindow: the marker is a file the
+// workload can write, so adopting its deadline has to be safe against one it
+// chose. The worst a forged marker may do is shorten its own run's retention.
+func TestAnAdoptedDeadlineCannotOutrunTheRetentionWindow(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	harness.plantDirectory("run_greedy", &handoffMarker{
+		RunID: "run_greedy", NodeID: "node-1", RetainUntil: harness.now.Add(400 * time.Hour).UTC(),
+	})
+	if err := harness.manager.adoptResidue(); err != nil {
+		t.Fatal(err)
+	}
+	adopted := harness.record("run_greedy")
+	if want := harness.now.Add(time.Hour).UTC(); !adopted.RetainUntil.Equal(want) {
+		t.Fatalf("a forged marker bought %s of retention; the window is %s", adopted.RetainUntil, want)
+	}
+}
+
+// TestARecordIsWrittenAtPreparationAndCompletedAtFinish is the state change the
+// whole slice rests on: an in-flight run is accounted for, and finishing
+// updates that record rather than replacing it with a different one.
+func TestARecordIsWrittenAtPreparationAndCompletedAtFinish(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path := filepath.Join(harness.root, "run_live")
+	spec := handoffClaim("run_live", path, nil).Job.Spec
+	owner := prepareHandoffForTest(t, harness.manager, spec)
+	admitted := harness.now.UTC()
+
+	prepared := harness.record("run_live")
+	if !prepared.AdmittedAt.Equal(admitted) {
+		t.Fatalf("preparation recorded admission at %s, want %s", prepared.AdmittedAt, admitted)
+	}
+	if !prepared.RetainUntil.IsZero() || !prepared.RetainedAt.IsZero() {
+		t.Fatalf("a run that has not finished carries a retention window: %#v", prepared)
+	}
+
+	// While it is running its bytes are the node's, and the pass says so.
+	if err := os.WriteFile(filepath.Join(path, "working.bin"), make([]byte, 8<<10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status := harness.account()
+	if status.Runs != 1 || status.InFlight != 1 {
+		t.Fatalf("accounted %d runs, %d in flight; want 1 and 1", status.Runs, status.InFlight)
+	}
+	if status.LogicalBytes < 8<<10 {
+		t.Fatalf("an in-flight run's %d logical bytes are invisible to accounting", status.LogicalBytes)
+	}
+
+	harness.now = harness.now.Add(10 * time.Minute)
+	if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+		t.Fatal(err)
+	}
+	finished := harness.record("run_live")
+	if !finished.AdmittedAt.Equal(admitted) {
+		t.Fatalf("finishing rewrote the run's admission to %s, want %s", finished.AdmittedAt, admitted)
+	}
+	if !finished.RetainedAt.Equal(harness.now.UTC()) ||
+		!finished.RetainUntil.Equal(harness.now.Add(time.Hour).UTC()) {
+		t.Fatalf("finishing did not write the terminal window: %#v", finished)
+	}
+	if !finished.Succeeded || !finished.Published || finished.Adopted {
+		t.Fatalf("finishing did not write the terminal facts: %#v", finished)
+	}
+
+	// S1's revalidation still holds over the new earlier state: a sweep still
+	// carrying the preparation record has the older copy and does not get to
+	// write it back over the run's terminal facts.
+	stale := prepared
+	stale.Quarantine = handoffExpiryNameNotADirectory
+	if harness.manager.rewriteRecord(prepared, stale) {
+		t.Fatal("a sweep holding the preparation record rewrote the finished one")
+	}
+	if again := harness.record("run_live"); again.Quarantine != "" || !again.RetainUntil.Equal(finished.RetainUntil) {
+		t.Fatalf("the stale rewrite landed anyway: %#v", again)
+	}
+}
+
+// walkFrames measures one walk and returns the peak number of directory
+// handles it held. The walker reports its own peak through a seam rather than
+// the test sampling /dev/fd: a sample can miss the peak entirely, which made
+// the previous assertion able to pass a walk that held thousands.
+func walkFrames(t *testing.T, run *os.Root, name string) (int64, int) {
+	t.Helper()
+	peak := -1
+	handoffWalkFramesObserved = func(open, observed int) {
+		if open != 0 {
+			t.Errorf("walk retained %d frame handle(s) after cleanup", open)
+		}
+		peak = observed
+	}
+	t.Cleanup(func() { handoffWalkFramesObserved = nil })
+	info, err := run.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, err := measureEntry(run, name, info)
+	if err != nil {
+		t.Fatalf("measure %q: %v", name, err)
+	}
+	if peak < 0 {
+		t.Fatal("the walk reported no peak frame count")
+	}
+	return size, peak
+}
+
+// countedOpens measures one tree with an opens budget large enough not to bite
+// and reports how much of it the walk spent, which is the cost the re-opening
+// strategy is asserted on.
+func countedOpens(t *testing.T, run *os.Root, name string) (handoffTally, int64) {
+	t.Helper()
+	info, err := run.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := int64(maxWalkOpens)
+	tally, err := walkHandoffTree(t.Context(), &budget, run, name, info, nil)
+	if err != nil {
+		t.Fatalf("measure %q: %v", name, err)
+	}
+	return tally, int64(maxWalkOpens) - budget
+}
+
+// TestMeasureEntryWalksADeepChainWithOneHandle: how deep a retained tree goes is
+// the workload's decision, and the measurement used to recurse once per level
+// and hold that level's directory open until the whole subtree returned. Node
+// accounting walks every run on the node, so an adversarial tree stopped being
+// one run's problem.
+//
+// A chain is the easy half: every level's last subdirectory is also its only
+// one, so the parent is released as the child is opened and the whole descent
+// costs one handle.
+func TestMeasureEntryWalksADeepChainWithOneHandle(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	depth := deepTreeDepth()
+	const payload = 4096
+	path := harness.plantDirectory("run_deep", nil)
+	run, err := harness.manager.openRun("run_deep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	buildDeepChain(t, path, depth, payload)
+
+	size, peak := walkFrames(t, run, "deep")
+	if size != payload {
+		t.Fatalf("a %d-deep chain measured %d bytes, want %d", depth, size, payload)
+	}
+	if peak != 1 {
+		t.Fatalf("a %d-deep chain held %d directory handles at once, want 1", depth, peak)
+	}
+}
+
+// TestMeasureEntryWalksACombWithinItsFrameBound is the shape the chain
+// optimization alone does not survive. Give every level one child that
+// continues downward and one empty sibling visited after it, and every ancestor
+// stays open with a pending child for the whole descent: 2N directories pinned
+// N descriptors, and a node out of descriptors stops measuring and stops
+// serving.
+func TestMeasureEntryWalksACombWithinItsFrameBound(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// Written out rather than derived from maxOpenWalkFrames: the bound is what
+	// is being asserted, and a fixture and an assertion that both move with the
+	// constant would pass whatever the constant said. 256 teeth are well past
+	// the bound of 64, and 96 handles is a ceiling a walk holding one per level
+	// cannot slip under.
+	const teeth = 256
+	const frameCeiling = 96
+	const payload = 2048
+	path := harness.plantDirectory("run_comb", nil)
+	run, err := harness.manager.openRun("run_comb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	buildComb(t, openRootAt(t, path), teeth, payload)
+
+	size, peak := walkFrames(t, run, "comb")
+	// One file per tooth and one inside each postponed sibling.
+	if want := int64(teeth * payload * 2); size != want {
+		t.Fatalf("a comb of %d teeth measured %d bytes, want %d", teeth, size, want)
+	}
+	if peak > frameCeiling {
+		t.Fatalf("a comb of %d teeth held %d directory handles at once, past the ceiling of %d",
+			teeth, peak, frameCeiling)
+	}
+}
+
+// TestACombSubtreeReplacedMidWalkIsCountedRatherThanMeasured: a released
+// ancestor is re-opened by name, and a workload owns these directories. The
+// walk accepts the re-open only if it is the same inode, and what it gives up
+// is reported rather than quietly left out of the node's figures.
+func TestACombSubtreeReplacedMidWalkIsCountedRatherThanMeasured(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	const teeth = 192
+	const releasedBelow = 96
+	path := harness.plantDirectory("run_swapped", nil)
+	run, err := harness.manager.openRun("run_swapped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	buildComb(t, openRootAt(t, path), teeth, 0)
+
+	// Replace the shallowest released ancestor with a different directory
+	// while the walk is below it. The walk is deterministic, so the swap is
+	// staged from the seam at the moment the frame bound has released it.
+	combRoot := filepath.Join(path, "comb")
+	swapped := false
+	handoffWalkDescended = func(depth int) {
+		if swapped || depth <= releasedBelow {
+			return
+		}
+		swapped = true
+		// The walk has released this ancestor's handle by now and can only
+		// reach it again by name. Move the real one aside and leave a
+		// different directory at the name it will re-open.
+		victim := filepath.Join(combRoot, "down")
+		if err := os.Rename(victim, filepath.Join(path, "elsewhere")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Mkdir(victim, 0o700); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { handoffWalkDescended = nil })
+	openAfterWalk, peak := -1, -1
+	handoffWalkFramesObserved = func(open, observed int) {
+		openAfterWalk, peak = open, observed
+	}
+	t.Cleanup(func() { handoffWalkFramesObserved = nil })
+	info, err := run.Lstat("comb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tally, err := walkHandoffTree(t.Context(), nil, run, "comb", info, nil)
+	if err != nil {
+		t.Fatalf("walk a comb whose ancestor was replaced: %v", err)
+	}
+	if !swapped {
+		t.Fatal("the fixture never got deep enough to release an ancestor")
+	}
+	if tally.replaced == 0 {
+		t.Fatalf("the walk re-opened a name that leads somewhere else and measured through it: %#v", tally)
+	}
+	// One renamed directory is one loss, however many frames beneath it then
+	// fail on the same component as the walk unwinds.
+	if tally.replaced != 1 {
+		t.Fatalf("one replaced ancestor was counted %d times: %#v", tally.replaced, tally)
+	}
+	if tally.reopenFailures < 3 {
+		t.Fatalf("the fixture drove only %d failed re-open retry/retries, want at least 3", tally.reopenFailures)
+	}
+	if peak > maxOpenWalkFrames {
+		t.Fatalf("failed re-open retries held %d frame handles at once, past the bound of %d", peak, maxOpenWalkFrames)
+	}
+	if openAfterWalk != 0 {
+		t.Fatalf("walk retained %d frame handle(s) after failed re-open retries", openAfterWalk)
+	}
+}
+
+// deepTreeDepth is how deep the chain fixture goes, and it is not the same
+// number on both platforms.
+//
+// On Linux each directory costs a constant handful of syscalls, so the depth is
+// the one worth asserting: far past any per-level frame. On macOS the kernel
+// does work proportional to a path's depth on every operation at that depth, so
+// building and removing the fixture is superlinear -- ten thousand levels is
+// minutes of system time, and a unit lane that takes minutes is a unit lane
+// people stop running. The frame bound is asserted on the walker's own count,
+// which is exact at either depth.
+func deepTreeDepth() int {
+	if runtime.GOOS == "linux" {
+		return 12_000
+	}
+	return 600
+}
+
+// plantDirectory creates one directory under the handoff root the way residue
+// exists on a node: as files, with no agent record behind them. A nil marker
+// plants none, which is a directory the agent must never claim.
+func (h *retentionHarness) plantDirectory(runID string, marker *handoffMarker) string {
+	h.t.Helper()
+	path := filepath.Join(h.root, runID)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "result.json"), make([]byte, 32), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	if marker == nil {
+		return path
+	}
+	run, err := h.manager.openRun(runID)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer run.Close()
+	if err := writeHandoffMarker(run, *marker); err != nil {
+		h.t.Fatal(err)
+	}
+	return path
+}
+
+// buildDeepChain builds a chain of directories too deep to reach by pathname,
+// descending through one handle at a time so building the fixture costs no more
+// descriptors than measuring it should.
+func buildDeepChain(t *testing.T, path string, depth, payload int) {
+	t.Helper()
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { root.Close() }()
+	if err := root.Mkdir("deep", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current, err := root.OpenRoot("deep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range depth {
+		if err := current.Mkdir("d", 0o700); err != nil {
+			current.Close()
+			t.Fatal(err)
+		}
+		next, err := current.OpenRoot("d")
+		current.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		current = next
+	}
+	file, err := current.Create("leaf.bin")
+	if err != nil {
+		current.Close()
+		t.Fatal(err)
+	}
+	_, err = file.Write(make([]byte, payload))
+	file.Close()
+	current.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// buildComb builds the shape a chain optimization alone does not survive: every
+// level holds the directory that continues downward and, visited after it, an
+// empty sibling that keeps the level pending for the whole descent. Each level
+// also holds one file, so the measurement has something to be right about.
+func buildComb(t *testing.T, root *os.Root, teeth, payload int) {
+	t.Helper()
+	defer root.Close()
+	if err := root.Mkdir("comb", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current, err := root.OpenRoot("comb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range teeth {
+		// "down" sorts before "sibling", so the descent happens first and the
+		// sibling stays pending behind it -- which is the whole attack.
+		if err := current.Mkdir("down", 0o700); err != nil {
+			current.Close()
+			t.Fatal(err)
+		}
+		if err := current.Mkdir("sibling", 0o700); err != nil {
+			current.Close()
+			t.Fatal(err)
+		}
+		if payload > 0 {
+			writeCombPayload(t, current, "tooth.bin", payload)
+			// A file inside the postponed sibling too: the sibling is only
+			// reached after the descent comes back up, through an ancestor the
+			// walk released, so these bytes are exactly what a broken re-open
+			// loses.
+			sibling, err := current.OpenRoot("sibling")
+			if err != nil {
+				current.Close()
+				t.Fatal(err)
+			}
+			writeCombPayload(t, sibling, "sibling.bin", payload)
+			sibling.Close()
+		}
+		next, err := current.OpenRoot("down")
+		current.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		current = next
+	}
+	current.Close()
+}
+
+// admitAndAbandon leaves the node in the state a crash leaves it in: an
+// admission record written at preparation, its lease released, and nothing that
+// ever finished the run.
+func (h *retentionHarness) admitAndAbandon(runID string) string {
+	h.t.Helper()
+	path := filepath.Join(h.root, runID)
+	spec := handoffClaim(runID, path, nil).Job.Spec
+	owner := prepareHandoffForTest(h.t, h.manager, spec)
+	if err := os.WriteFile(filepath.Join(path, "working.bin"), make([]byte, 2048), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	owner.lease.release()
+	return path
+}
+
+// TestAnAdmissionWhoseDirectoryIsGoneLosesItsRecord: reconciling directory
+// entries rather than records left this state permanently "in flight" -- no
+// entry to walk, so nothing to reconcile, and the sweep skips a record with no
+// deadline. The record then outlived everything it described.
+func TestAnAdmissionWhoseDirectoryIsGoneLosesItsRecord(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path := harness.admitAndAbandon("run_vanished")
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := harness.manager.adoptResidue(); err != nil {
+		t.Fatal(err)
+	}
+	if records := harness.manager.loadRecords(); len(records) != 0 {
+		t.Fatalf("the record of a run whose directory is gone survived: %#v", records)
+	}
+	if !harness.logged("is gone; its record is removed") {
+		t.Fatalf("the removal was silent: %v", harness.logs)
+	}
+}
+
+// TestAnAdmissionWhoseNameIsASymlinkIsQuarantinedAndRecovers: the other state
+// startup used to skip. A workload that replaces its own handoff name with a
+// symlink before the node restarts used to buy its record permanent residence,
+// because a record with no deadline is invisible to the sweep. It now gets the
+// deadline it was admitted for and enters S1's reversible quarantine.
+func TestAnAdmissionWhoseNameIsASymlinkIsQuarantinedAndRecovers(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	admitted := harness.now.UTC()
+	path := harness.admitAndAbandon("run_swapped_name")
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, "not-ours"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := harness.manager.adoptResidue(); err != nil {
+		t.Fatal(err)
+	}
+	record := harness.record("run_swapped_name")
+	if want := admitted.Add(time.Hour); !record.RetainUntil.Equal(want) {
+		t.Fatalf("the quarantined admission expires at %s, want the window it was admitted for (%s)",
+			record.RetainUntil, want)
+	}
+	if record.Quarantine != handoffExpiryNameNotADirectory {
+		t.Fatalf("the admission did not reach the structural quarantine: %#v", record)
+	}
+
+	// Past the deadline, the sweep still refuses to follow the link, and what
+	// it points at is untouched.
+	harness.now = record.RetainUntil.Add(time.Minute)
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("the sweep removed a name it refuses to follow: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, "not-ours")); err != nil {
+		t.Fatalf("the sweep followed the link into the node: %v", err)
+	}
+
+	// A directory back at the name lifts the quarantine by itself, with no
+	// restart and no operator, and the run expires normally.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("the recovered run did not expire: %v", err)
+	}
+	if records := harness.manager.loadRecords(); len(records) != 0 {
+		t.Fatalf("the expired record survived: %#v", records)
+	}
+}
+
+// TestAnAdmissionWhoseDirectoryRemainsGetsItsAdmittedDeadline is the third
+// crash state, and the one that already worked. It is asserted beside the other
+// two so the three are read together.
+func TestAnAdmissionWhoseDirectoryRemainsGetsItsAdmittedDeadline(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	admitted := harness.now.UTC()
+	harness.admitAndAbandon("run_interrupted")
+
+	harness.now = harness.now.Add(20 * time.Minute)
+	if err := harness.manager.adoptResidue(); err != nil {
+		t.Fatal(err)
+	}
+	record := harness.record("run_interrupted")
+	if want := admitted.Add(time.Hour); !record.RetainUntil.Equal(want) {
+		t.Fatalf("the interrupted run expires at %s, want the window it was admitted for (%s)",
+			record.RetainUntil, want)
+	}
+	if !record.AdmittedAt.Equal(admitted) || !record.Adopted {
+		t.Fatalf("reconciliation did not keep the run's admission or mark the window derived: %#v", record)
+	}
+	if record.Quarantine != "" {
+		t.Fatalf("a directory that is still there was quarantined: %#v", record)
+	}
+}
+
+// TestTwoRunNamesThatOnceSharedARecordFileNoLongerDo: "run.live" and "run_live"
+// are both valid run IDs, and the old mapping folded both onto run_live.json.
+// One run's record standing in for another's is one run holding another's
+// expiry.
+func TestTwoRunNamesThatOnceSharedARecordFileNoLongerDo(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	harness.retain("run.live", true, true, map[string]int{"result.json": 16})
+	harness.retain("run_live", true, true, map[string]int{"result.json": 16})
+
+	if first, second := recordComponent("run.live"), recordComponent("run_live"); first == second {
+		t.Fatalf("both runs are still filed as %q", first)
+	}
+	records := harness.manager.loadRecords()
+	if len(records) != 2 {
+		t.Fatalf("two runs produced %d records: %#v", len(records), records)
+	}
+	for _, record := range records {
+		if record.Directory != filepath.Join(harness.root, record.RunID) {
+			t.Fatalf("record for run %q names %q", record.RunID, record.Directory)
+		}
+	}
+}
+
+// TestTwoRunNamesSharingTheirFirstBytesNoLongerShareARecordFile: the old
+// mapping cut at 96 bytes, and a run ID may be 128.
+func TestTwoRunNamesSharingTheirFirstBytesNoLongerShareARecordFile(t *testing.T) {
+	prefix := strings.Repeat("a", 120)
+	first, second := prefix+"-one", prefix+"-two"
+	if !validRunMailboxSegment(first) || !validRunMailboxSegment(second) {
+		t.Fatalf("the fixture run IDs are not valid run names")
+	}
+	if legacyRecordComponent(first) != legacyRecordComponent(second) {
+		t.Fatal("the fixture does not reproduce the collision it is here for")
+	}
+	if recordComponent(first) == recordComponent(second) {
+		t.Fatalf("two runs sharing their first 96 bytes are still filed as %q", recordComponent(first))
+	}
+	if length := len(recordComponent(first)); length > maxRecordComponentBytes+len(".json") {
+		t.Fatalf("the record name is %d bytes, past the bound", length)
+	}
+}
+
+// TestAdoptionNeverWritesOverARecordItDoesNotOwn: adoption is the one path that
+// writes a record for a directory it did not prepare, on evidence a workload
+// can write. It creates; it never replaces.
+func TestAdoptionNeverWritesOverARecordItDoesNotOwn(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		planted  string
+		expected string
+	}{
+		{
+			name:     "a record that names another run",
+			planted:  `{"run_id":"run_other","node_id":"node-1","directory":"/elsewhere/run_other","retained_at":"2026-09-17T11:00:00Z","retain_until":"2026-09-17T12:30:00Z"}`,
+			expected: "already holds run",
+		},
+		{
+			name:     "a record that cannot be read",
+			planted:  "{not json",
+			expected: "could not be read",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newRetentionHarness(t, time.Hour)
+			path := harness.plantDirectory("run_planted", &handoffMarker{
+				RunID: "run_planted", NodeID: "node-1", RetainUntil: harness.now.Add(time.Hour).UTC(),
+			})
+			file := harness.manager.recordPath("run_planted")
+			if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(testCase.planted), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := harness.manager.adoptResidue(); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(payload) != testCase.planted {
+				t.Fatalf("adoption replaced a record it does not own: %s", payload)
+			}
+			if !harness.logged(testCase.expected) {
+				t.Fatalf("the refusal was silent: %v", harness.logs)
+			}
+			// The directory itself is untouched, and the pass reports it.
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("a directory adoption refused was removed: %v", err)
+			}
+			if status := harness.account(); status.Unrecorded == 0 {
+				t.Fatalf("a directory adoption refused is not reported as unrecorded: %#v", status)
+			}
+		})
+	}
+}
+
+// TestTheAccountingPassReachesTheStatusTheNodeDoctorReads: the measurement
+// existed and the only place it reached was the agent log. This is the seam
+// between the collector and Agent.RetainedResults, which is what the node
+// doctor asks for.
+func TestTheAccountingPassReachesTheStatusTheNodeDoctorReads(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	observer := newLifecycleObserver(systemClock{})
+	if _, measured := observer.retainedResultsSnapshot(); measured {
+		t.Fatal("a node that has not measured reported a measurement")
+	}
+	harness.manager.observeAccounting = observer.recordRetainedResults
+	harness.retain("run_reported", true, true, map[string]int{"result.json": 16, "payload.bin": 64 << 10})
+	harness.plantDirectory("run_not_ours", nil)
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	status, measured := observer.retainedResultsSnapshot()
+	if !measured {
+		t.Fatal("a completed accounting pass did not reach the status the doctor reads")
+	}
+	if status.Runs != 1 || status.LogicalBytes < 64<<10 || status.ChargedBytes < status.LogicalBytes {
+		t.Fatalf("the status lost the pass's figures: %#v", status)
+	}
+	if status.Unrecorded != 1 {
+		t.Fatalf("the directory this agent does not own is not reported: %#v", status)
+	}
+	if status.MeasuredAt.IsZero() {
+		t.Fatalf("the status does not say when it was measured: %#v", status)
+	}
+	// Status() carries the same figures, so a reader of either surface sees one
+	// answer rather than two.
+	projected := observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).RetainedResults
+	if projected == nil || !reflect.DeepEqual(*projected, status) {
+		t.Fatalf("the lifecycle projection and the doctor accessor disagree: %#v vs %#v", projected, status)
+	}
+	// The per-run rows are what an eviction order will choose between, so they
+	// have to name the run and carry its own share rather than the node total.
+	if len(status.PerRun) != 1 || status.PerRun[0].RunID != "run_reported" ||
+		status.PerRun[0].LogicalBytes != status.LogicalBytes {
+		t.Fatalf("the pass did not keep the run's own figures: %#v", status.PerRun)
+	}
+}
+
+// TestAHashedRecordNameCannotBeSpelledByALiteralRunID is the counterexample a
+// readable prefix plus a short digest could not survive, and it needs no hash
+// collision: 97 "a"s hash to D, and the run ID "79 a's, a dash, the first 16 of
+// D" is itself a valid, short-enough run ID that spells the first run's file
+// name exactly. Preparation and the upload record write at these names without
+// passing adoption's guard, so that is one run overwriting another's record.
+func TestAHashedRecordNameCannotBeSpelledByALiteralRunID(t *testing.T) {
+	hashed := strings.Repeat("a", 97)
+	digest := sha256.Sum256([]byte(hashed))
+	literal := strings.Repeat("a", 79) + "-" + hex.EncodeToString(digest[:])[:16]
+	for _, runID := range []string{hashed, literal} {
+		if !validRunMailboxSegment(runID) {
+			t.Fatalf("the fixture run ID %q is not a valid run name", runID)
+		}
+	}
+	if recordComponent(hashed) == recordComponent(literal) {
+		t.Fatalf("a literal run ID still spells a hashed one's file name: %q", recordComponent(hashed))
+	}
+	if !strings.HasPrefix(recordComponent(hashed), hashedRecordPrefix) {
+		t.Fatalf("the long run ID is not filed in the hashed namespace: %q", recordComponent(hashed))
+	}
+	if strings.HasPrefix(recordComponent(literal), hashedRecordPrefix) {
+		t.Fatalf("a short run ID reached the hashed namespace: %q", recordComponent(literal))
+	}
+
+	// The separator is a byte a literal name escapes, so a run ID carrying it
+	// cannot reach the hashed namespace either.
+	carrier := hashedRecordPrefix + hex.EncodeToString(digest[:])
+	component := recordComponent(carrier)
+	if strings.HasPrefix(component, hashedRecordPrefix) {
+		t.Fatalf("a run ID beginning with %q reached the hashed namespace: %q", hashedRecordPrefix, component)
+	}
+	if component == recordComponent(hashed) {
+		t.Fatalf("a run ID spelling a digest collided with the run that hashes to it: %q", component)
+	}
+}
+
+// TestAChainPrefixedCombIsMeasuredWhole: the walk drops a directory from its
+// stack the moment it descends into that directory's last child, so for
+// chain/comb/... the stack holds the comb and nothing remembers the chain.
+// Rebuilding a released frame from the stack opened base/comb, which does not
+// exist, and an unchanged tree reported its postponed siblings as lost.
+func TestAChainPrefixedCombIsMeasuredWhole(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// Deeper than the frame bound, so ancestors really are released and really
+	// have to be re-opened by name.
+	const chain = 8
+	const teeth = 192
+	// Past the 4 KiB entry floor, so the logical and charged figures are
+	// different numbers and the assertion below checks both rather than one
+	// twice.
+	const payload = 8192
+	path := harness.plantDirectory("run_prefixed", nil)
+	root := buildChainPrefix(t, path, chain)
+	buildComb(t, openRootAt(t, root), teeth, payload)
+
+	run, err := harness.manager.openRun("run_prefixed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	info, err := run.Lstat("chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tally, err := walkHandoffTree(t.Context(), nil, run, "chain", info, nil)
+	if err != nil {
+		t.Fatalf("walk a chain-prefixed comb: %v", err)
+	}
+	if tally.replaced != 0 || tally.vanished != 0 || tally.truncated != 0 {
+		t.Fatalf("an unchanged tree reported lost subtrees: %#v", tally)
+	}
+	// Every tooth's file plus every sibling's file: buildComb writes one file
+	// per level, and buildCombSiblingPayload one inside each postponed sibling.
+	if want := int64(teeth * payload * 2); tally.logical != want {
+		t.Fatalf("measured %d logical bytes, want %d", tally.logical, want)
+	}
+	// Per tooth: the tooth directory, its file, its sibling, the sibling's
+	// file. Plus the chain's directories and the comb root.
+	if want := int64(teeth*4 + chain + 1); tally.entries != want {
+		t.Fatalf("reached %d entries, want %d", tally.entries, want)
+	}
+	// The files carry their own bytes; every directory entry carries the floor.
+	if want := int64(teeth)*2*payload + int64(teeth*2+chain+1)*4096; tally.charged != want {
+		t.Fatalf("charged %d bytes, want %d", tally.charged, want)
+	}
+}
+
+func writeCombPayload(t *testing.T, root *os.Root, name string, payload int) {
+	t.Helper()
+	file, err := root.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.Write(make([]byte, payload))
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// buildChainPrefix builds a run of single-child directories and returns the
+// deepest one, so a branching fixture can be planted under an ancestry the walk
+// keeps no frames for.
+func buildChainPrefix(t *testing.T, path string, depth int) string {
+	t.Helper()
+	current := filepath.Join(path, "chain")
+	if err := os.Mkdir(current, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for range depth - 1 {
+		current = filepath.Join(current, "link")
+		if err := os.Mkdir(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return current
+}
+
+// TestReopeningAChainOverACombStaysFarBelowRewalkingIt: a released ancestor is
+// reached again by name, and the naive way to do that is to walk the whole
+// ancestry from the walk's base every time. Over a branching tree that is the
+// prefix once per branch -- for this fixture, forty thousand directory opens
+// inside the collector -- so the walk keeps the frames it re-opens and the
+// steps above them.
+//
+// The assertion is on directories opened re-establishing an ancestry, through
+// the walker's own count. How many handles it holds says nothing about how much
+// work it repeated to hold them, which is the cost this is about.
+func TestReopeningAChainOverACombStaysFarBelowRewalkingIt(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	const teeth = 160
+	const chain = 260
+	path := harness.plantDirectory("run_costed", nil)
+	buildComb(t, buildNamedChain(t, path, "long", chain), teeth, 0)
+
+	run, err := harness.manager.openRun("run_costed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	tally, total := countedOpens(t, run, "long")
+	if want := int64(teeth*2 + chain + 1); tally.entries != want {
+		t.Fatalf("the fixture is not the shape this test is about: %d entries, want %d", tally.entries, want)
+	}
+	// Written out rather than derived from the fixture: walking the ancestry
+	// per branch costs teeth x chain = 41600 opens, and a bound that moved
+	// with the code it checks would pass whatever that code did. Four thousand
+	// is an order of magnitude under the naive cost and an order of magnitude
+	// over what the current walk spends.
+	const allowance = 4000
+	t.Logf("%d directories opened, %d of them re-establishing an ancestry", total, tally.reopenOpens)
+	if tally.reopenOpens > allowance {
+		t.Fatalf("re-opening a %d-deep ancestry over %d branches cost %d opens, past the allowance of %d",
+			chain, teeth, tally.reopenOpens, allowance)
+	}
+}
+
+// TestAWalkThatSpendsItsBudgetStopsAndSaysSo: how much work a retained tree is
+// worth is the workload's choice, and this pass runs where a shutdown waits on
+// it. A pass that stops early reports the run by name; one that never finishes
+// reports nothing at all.
+func TestAWalkThatSpendsItsBudgetStopsAndSaysSo(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path := harness.plantDirectory("run_endless", nil)
+	buildComb(t, openRootAt(t, path), 64, 0)
+	run, err := harness.manager.openRun("run_endless")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	info, err := run.Lstat("comb")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	budget := int64(8)
+	tally, err := walkHandoffTree(t.Context(), &budget, run, "comb", info, nil)
+	if !errors.Is(err, errHandoffWalkTruncated) {
+		t.Fatalf("a walk past its budget returned %v", err)
+	}
+	if tally.truncated != 1 {
+		t.Fatalf("a truncated walk did not say so: %#v", tally)
+	}
+	if tally.entries == 0 {
+		t.Fatalf("a truncated walk threw away what it had counted: %#v", tally)
+	}
+	if budget > 0 {
+		t.Fatalf("the walk stopped with %d opens left rather than at the budget", budget)
+	}
+}
+
+// TestAWalkStopsWhenTheAgentIsShuttingDown: the collector is joined before the
+// node lock is released, so a pass that ignores cancellation is a node holding
+// its lock for as long as a workload's tree takes to walk.
+func TestAWalkStopsWhenTheAgentIsShuttingDown(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path := harness.plantDirectory("run_shutdown", nil)
+	buildComb(t, openRootAt(t, path), 64, 0)
+	run, err := harness.manager.openRun("run_shutdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	info, err := run.Lstat("comb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	// Cancel once the walk is under way, so the fixture proves the walk
+	// notices rather than that it never started.
+	handoffWalkDescended = func(depth int) {
+		if depth >= 4 {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { handoffWalkDescended = nil; cancel() })
+
+	budget := int64(maxWalkOpens)
+	tally, err := walkHandoffTree(ctx, &budget, run, "comb", info, nil)
+	if !errors.Is(err, errHandoffWalkTruncated) {
+		t.Fatalf("a walk during shutdown returned %v", err)
+	}
+	if tally.truncated != 1 {
+		t.Fatalf("a cancelled walk did not report itself truncated: %#v", tally)
+	}
+}
+
+// TestFinishingAnAttemptDoesNotWalkOtherRunsTrees is the stall this pass was
+// moved off: every attempt's finalization calls collect() synchronously, so
+// measuring there put one workload's directory tree in front of every other
+// run finishing.
+func TestFinishingAnAttemptDoesNotWalkOtherRunsTrees(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	harness.retain("run_neighbour", true, true, map[string]int{"result.json": 16})
+	neighbour := filepath.Join(harness.root, "run_neighbour")
+	buildComb(t, openRootAt(t, neighbour), 32, 0)
+
+	walked := 0
+	handoffWalkDescended = func(int) { walked++ }
+	t.Cleanup(func() { handoffWalkDescended = nil })
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if walked != 0 {
+		t.Fatalf("collection descended into %d directories; it expires and nothing else", walked)
+	}
+
+	// The pass still measures it, on its own call.
+	walked = 0
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if walked == 0 {
+		t.Fatal("the accounting pass measured nothing")
+	}
+}
+
+// buildNamedChain builds one chain of single-child directories under path and
+// returns an open handle on its deepest directory. It descends through handles
+// rather than by pathname, because a chain long enough to make the re-opening
+// cost visible is longer than a path may be.
+func buildNamedChain(t *testing.T, path, name string, depth int) *os.Root {
+	t.Helper()
+	current := openRootAt(t, path)
+	for step := range depth {
+		component := "link"
+		if step == 0 {
+			component = name
+		}
+		if err := current.Mkdir(component, 0o700); err != nil {
+			current.Close()
+			t.Fatal(err)
+		}
+		next, err := current.OpenRoot(component)
+		current.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		current = next
+	}
+	return current
+}
+
+func openRootAt(t *testing.T, path string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// TestAnAdmissionRecordedAfterItsFinishIsNotCarriedForward: the clock can step
+// back between preparation and finish, and a record admitted after it finished
+// is one the validator refuses outright -- which would leave the run with no
+// record the sweep will act on at all.
+func TestAnAdmissionRecordedAfterItsFinishIsNotCarriedForward(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path := filepath.Join(harness.root, "run_stepped")
+	spec := handoffClaim("run_stepped", path, nil).Job.Spec
+	owner := prepareHandoffForTest(t, harness.manager, spec)
+
+	// The node's clock steps backwards between preparation and finish.
+	harness.now = harness.now.Add(-30 * time.Minute)
+	if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+		t.Fatal(err)
+	}
+	record := harness.record("run_stepped")
+	if record.AdmittedAt.After(record.RetainedAt) {
+		t.Fatalf("the record claims it was admitted after it finished: %#v", record)
+	}
+	if err := validRetentionRecord(record, recordComponent("run_stepped"), harness.root,
+		"node-1", time.Hour, harness.now.UTC()); err != nil {
+		t.Fatalf("the finished record is not one the sweep will act on: %v", err)
+	}
+}
+
+// TestNoWriterOverwritesAnotherRunsRecord: the record name is injective now, so
+// reaching a file that names another run means an older agent's shared mapping
+// or something nobody should have been able to produce. Either way that file is
+// deletion authority over another run's directory.
+func TestNoWriterOverwritesAnotherRunsRecord(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	file := harness.manager.recordPath("run_mine")
+	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	planted := `{"run_id":"run_theirs","node_id":"node-1","directory":"/elsewhere/run_theirs","retained_at":"2026-09-17T11:00:00Z","retain_until":"2026-09-17T12:30:00Z"}`
+	if err := os.WriteFile(file, []byte(planted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := harness.manager.writeRecord(retentionRecord{
+		RunID: "run_mine", NodeID: "node-1", Directory: filepath.Join(harness.root, "run_mine"),
+		AdmittedAt: harness.now.UTC(),
+	})
+	if !errors.Is(err, errRecordBelongsToAnotherRun) {
+		t.Fatalf("writing over another run's record returned %v", err)
+	}
+	payload, readErr := os.ReadFile(file)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(payload) != planted {
+		t.Fatalf("another run's record was replaced: %s", payload)
+	}
+	if !harness.logged("already belongs to run") {
+		t.Fatalf("the refusal was silent: %v", harness.logs)
+	}
+}
+
+// TestAReplacedPrefixIsCaughtOnEveryReopen: a re-open resolves every component
+// by name, every time, and that is the only thing that makes the identity
+// checks below it mean anything.
+//
+// Caching the prefix broke exactly this. Once the steps above a branch were
+// held open, renaming the prefix away and leaving a different directory at its
+// name kept the walk measuring the detached original: every check below the
+// cache passed, because they were checks on the original's own descendants, and
+// nothing was reported. The fixture stages that precisely -- the replacement
+// mirrors the prefix down to the first frame, so the walk reaches a real
+// identity check rather than failing on a missing path.
+func TestAReplacedPrefixIsCaughtOnEveryReopen(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// Deeper than the frame bound so ancestors really are released and really
+	// have to be reached again by name.
+	const teeth = 160
+	const chain = 6
+	// The replacement's own payload. Nothing measured may come from it, and
+	// the original's teeth carry no bytes, so any logical byte at all is the
+	// walk having wandered into the replacement.
+	const decoy = 7777
+	path := harness.plantDirectory("run_detached", nil)
+	buildComb(t, buildNamedChain(t, path, "chain", chain), teeth, 0)
+
+	// The swap happens between two re-opens, not during the descent: a walk
+	// that resolves the prefix on its first re-open would catch a swap staged
+	// before that, whatever it does afterwards. This is the interleaving a
+	// cached prefix walks straight past.
+	swapped := false
+	handoffWalkReopened = func(int) {
+		if swapped {
+			return
+		}
+		swapped = true
+		// Move the whole prefix aside and put one that looks just like it,
+		// down to the name of the first frame, at the name the walk will
+		// re-open.
+		if err := os.Rename(filepath.Join(path, "chain"), filepath.Join(path, "detached")); err != nil {
+			t.Error(err)
+			return
+		}
+		replacement := buildNamedChain(t, path, "chain", chain)
+		if err := replacement.Mkdir("comb", 0o700); err != nil {
+			replacement.Close()
+			t.Error(err)
+			return
+		}
+		imposter, err := replacement.OpenRoot("comb")
+		replacement.Close()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		writeCombPayload(t, imposter, "decoy.bin", decoy)
+		imposter.Close()
+	}
+	t.Cleanup(func() { handoffWalkReopened = nil })
+
+	run, err := harness.manager.openRun("run_detached")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	info, err := run.Lstat("chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tally, err := walkHandoffTree(t.Context(), nil, run, "chain", info, nil)
+	if err != nil {
+		t.Fatalf("walk a tree whose prefix was replaced: %v", err)
+	}
+	if !swapped {
+		t.Fatal("the fixture never drove a re-open, so nothing was staged")
+	}
+	if tally.replaced == 0 {
+		t.Fatalf("a prefix replaced between two re-opens was not noticed: %#v", tally)
+	}
+	// Nothing from the replacement, and nothing further from the original the
+	// rename detached: the walk stopped at the identity check rather than
+	// measuring through either.
+	if tally.logical != 0 {
+		t.Fatalf("the walk measured %d bytes it could only have found in the replacement: %#v",
+			tally.logical, tally)
+	}
+	// The prefix, the comb root, and the teeth it had already reached before
+	// the swap -- each tooth being its own directory plus an empty sibling.
+	if tally.entries > int64(chain+1+2*teeth) {
+		t.Fatalf("the walk counted %d entries, more than the original tree holds: %#v",
+			tally.entries, tally)
+	}
+}
+
+// TestARunFiledUnderTwoNamesIsCountedOnce: migrating a record to its current
+// name publishes that file and then removes the older one, and those are two
+// steps. The accounting pass holds no lock -- deliberately, so it never sits in
+// front of an attempt finishing -- so it can read the pair, and counting both
+// would report a node holding twice what it does.
+func TestARunFiledUnderTwoNamesIsCountedOnce(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// A run ID the two mappings disagree about, so it really has two names.
+	const runID = "run.migrating"
+	path := harness.retain(runID, true, true, map[string]int{"result.json": 4096})
+	current := recordComponent(runID)
+	legacy := legacyRecordComponent(runID)
+	if current == legacy {
+		t.Fatalf("the fixture run ID has one name (%q), so it cannot stage the race", current)
+	}
+	// Stage the window: both files present, both valid, for the same run.
+	payload, err := os.ReadFile(filepath.Join(harness.manager.recordRoot(), current))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(harness.manager.recordRoot(), legacy), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if records := harness.manager.loadRecords(); len(records) != 1 {
+		t.Fatalf("one run under two names loaded %d records: %#v", len(records), records)
+	}
+	status := harness.account()
+	if status.Runs != 1 {
+		t.Fatalf("one run under two names was accounted as %d runs: %#v", status.Runs, status)
+	}
+	if len(status.PerRun) != 1 || status.PerRun[0].RunID != runID {
+		t.Fatalf("one run under two names produced %d rows: %#v", len(status.PerRun), status.PerRun)
+	}
+	// The directory itself, its marker and its one result.json -- once.
+	if status.Entries != 3 {
+		t.Fatalf("one run's entries were counted %d times over: %d entries", status.Entries/3, status.Entries)
+	}
+	if status.LogicalBytes < 4096 || status.LogicalBytes >= 8192 {
+		t.Fatalf("one run's bytes were counted twice: %d", status.LogicalBytes)
+	}
+	if !harness.logged("is filed under two names") {
+		t.Fatalf("the duplicate was not reported: %v", harness.logs)
+	}
+	_ = path
+}

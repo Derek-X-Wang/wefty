@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -430,11 +431,28 @@ func TestARecordNamingAPathComponentItIsNotIsRefused(t *testing.T) {
 			want: "belongs to node",
 		},
 		{
-			name: "no retention window",
+			// A record may legitimately carry an admission and no window --
+			// that is a run still executing -- but one carrying neither says
+			// nothing at all about the directory it names.
+			name: "neither an admission nor a retention window",
 			record: retentionRecord{
 				RunID: "run_ok", NodeID: "node-1", Directory: "",
 			},
-			want: "carries no retention window",
+			want: "carries neither an admission nor a retention window",
+		},
+		{
+			name: "half a retention window",
+			record: retentionRecord{
+				RunID: "run_ok", NodeID: "node-1", Directory: "",
+			},
+			want: "carries half a retention window",
+		},
+		{
+			name: "admitted in the future",
+			record: retentionRecord{
+				RunID: "run_ok", NodeID: "node-1", Directory: "",
+			},
+			want: "admitted in the future",
 		},
 		{
 			name: "a window longer than the contract allows",
@@ -459,7 +477,12 @@ func TestARecordNamingAPathComponentItIsNotIsRefused(t *testing.T) {
 				record.Directory = filepath.Join(root, record.RunID)
 			}
 			switch testCase.want {
-			case "carries no retention window":
+			case "carries neither an admission nor a retention window":
+			case "carries half a retention window":
+				record.AdmittedAt = now
+				record.RetainedAt = now
+			case "admitted in the future":
+				record.AdmittedAt = now.Add(time.Hour)
 			case "past the retention window":
 				record.RetainedAt = now
 				record.RetainUntil = now.Add(48 * time.Hour)
@@ -515,7 +538,7 @@ func TestTheResultCollectorStopsWhenTheAgentDoes(t *testing.T) {
 		clock:    systemClock{},
 		handoffs: newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil),
 	}
-	a.startResultCollector()
+	a.startResultCollector(t.Context())
 	if a.collectorDone == nil {
 		t.Fatal("the collector did not start")
 	}
@@ -938,5 +961,56 @@ func TestASweepActsOnTheRecordAsItIsUnderTheLease(t *testing.T) {
 	}
 	if !harness.logged("the sweep acts on the newer record") {
 		t.Fatalf("the sweep did not say it was re-reading: %v", harness.logs)
+	}
+}
+
+// TestCancellingTheAgentInterruptsAStartupAccountingPass: the first pass runs
+// inside Run, before anything else is serving, and it walks every retained run
+// on the node. A pass that cannot hear Run's cancellation makes shutdown wait
+// for a workload's directory tree before the node lock is released -- the same
+// stall as the timer pass, arriving earlier.
+func TestCancellingTheAgentInterruptsAStartupAccountingPass(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "handoffs")
+	a := &Agent{
+		clock:    systemClock{},
+		handoffs: newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	a.startResultCollector(ctx)
+	t.Cleanup(a.stopResultCollector)
+	if a.collectorContext == nil {
+		t.Fatal("the collector published no context for the startup pass")
+	}
+
+	// A retained run with a tree deep enough that a pass over it is
+	// interruptible rather than instantaneous.
+	harness := &retentionHarness{t: t, root: root, now: time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)}
+	harness.manager = a.handoffs
+	harness.manager.now = func() time.Time { return harness.now }
+	harness.manager.logf = func(format string, args ...any) {
+		harness.logs = append(harness.logs, fmt.Sprintf(format, args...))
+	}
+	harness.retain("run_deep_startup", true, true, map[string]int{"result.json": 16})
+	buildComb(t, openRootAt(t, filepath.Join(root, "run_deep_startup")), 64, 0)
+
+	var status RetainedResultsStatus
+	harness.manager.observeAccounting = func(pass RetainedResultsStatus) { status = pass }
+	// Cancel once the pass is under way, so this proves the walk hears the
+	// cancellation rather than that it never started.
+	handoffWalkDescended = func(depth int) {
+		if depth >= 4 {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { handoffWalkDescended = nil })
+
+	if err := a.handoffs.accountNode(a.collectorContext); err != nil {
+		t.Fatalf("a cancelled startup pass returned an error rather than stopping: %v", err)
+	}
+	if a.collectorContext.Err() == nil {
+		t.Fatal("cancelling the agent did not reach the accounting pass's context")
+	}
+	if status.Truncated == 0 {
+		t.Fatalf("a startup pass cancelled partway did not report itself truncated: %#v", status)
 	}
 }
