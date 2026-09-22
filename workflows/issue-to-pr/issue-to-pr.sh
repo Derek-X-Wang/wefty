@@ -800,6 +800,21 @@ git -C "$TREE_DIR" config user.name "wefty issue-to-pr" >/dev/null 2>&1 || true
 git -C "$TREE_DIR" config user.email "issue-to-pr@wefty.invalid" >/dev/null 2>&1 || true
 HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
 
+# PLAN.md is this run's own scratch, not part of the change: excluding it here
+# means every `git add -A` this script runs -- the phase markers and the
+# implement-phase safety net alike -- can never sweep it into a commit, so it
+# never ships in the pull request and the plan marker commit stays empty, as
+# the README promises. The exclude lives in the shared git-common-dir, which
+# only this run's own clone uses, so it cannot leak to anything else.
+GIT_COMMON_DIR=$(git -C "$TREE_DIR" rev-parse --git-common-dir 2>/dev/null) || GIT_COMMON_DIR=.git
+case $GIT_COMMON_DIR in
+/*) : ;;
+*) GIT_COMMON_DIR=$TREE_DIR/$GIT_COMMON_DIR ;;
+esac
+mkdir -p "$GIT_COMMON_DIR/info" 2>/dev/null || true
+printf '/PLAN.md\n' >>"$GIT_COMMON_DIR/info/exclude" 2>/dev/null ||
+	log "WARNING: could not exclude PLAN.md from $BRANCH"
+
 # --------------------------------------------------------------------------
 # read-issue
 # --------------------------------------------------------------------------
@@ -931,7 +946,12 @@ phase_start gates "running the repository gates"
 		gate_log=$WORK_DIR/gate-$gate.log
 		log "gate $gate: $command_line"
 		append_step "$gate" started "gate $gate" || log "WARNING: $REPORT_ERROR"
-		(cd "$TREE_DIR" && sh -c "$command_line") >"$gate_log" 2>&1
+		# The repository gates must not inherit this run's execution context:
+		# the repo's own tests assert WEFTY_L1_ENDPOINT is unset, and the
+		# attempt bridge exports it into every one-shot job environment.
+		(cd "$TREE_DIR" && unset WEFTY_RUN_ID WEFTY_RUN_DIR WEFTY_HANDOFF_DIR \
+			WEFTY_L1_ENDPOINT WEFTY_L3_ENDPOINT WEFTY_ATTEMPT_TOKEN WEFTY_RUN_TOKEN &&
+			sh -c "$command_line") >"$gate_log" 2>&1
 		exit_code=$?
 		# gofmt reports unformatted files on stdout and still exits 0.
 		if [ "$gate" = gofmt ] && [ "$exit_code" -eq 0 ] && [ -s "$gate_log" ]; then
@@ -1029,16 +1049,23 @@ phase_start open-pr "opening a draft pull request"
 		[ -n "$PR_URL" ] ||
 			fail_workflow open-pr "gh printed no pull request URL" "$(tail -n 20 "$WORK_DIR/pr.log")"
 	fi
-	HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
-	printf '{"url":"%s","head_sha":"%s","branch":"%s","issue":"%s","repo":"%s"}\n' \
-		"$(json_escape "$PR_URL")" "$(json_escape "$HEAD_SHA")" "$(json_escape "$BRANCH")" \
-		"$(json_escape "$ISSUE")" "$(json_escape "$REPO")" >"$PR_FILE" 2>/dev/null ||
-		log "WARNING: could not write $PR_FILE"
-	chmod 0600 "$PR_FILE" 2>/dev/null || true
-	[ -s "$PR_FILE" ] || fail_workflow open-pr "cannot write $PR_FILE"
 	log "pull request $PR_URL"
 }
 phase_complete open-pr
+
+# pr.json is written only now, after this phase's own marker commit has been
+# committed and pushed: that push is the branch's actual final state, and
+# GitHub resolves the pull request's head against the branch, not against
+# whatever HEAD was before this phase's marker. Writing it earlier recorded a
+# commit that was already one behind the pull request by the time anyone read
+# it, and disagreed with result.json, which is written after every phase.
+HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
+printf '{"url":"%s","head_sha":"%s","branch":"%s","issue":"%s","repo":"%s"}\n' \
+	"$(json_escape "$PR_URL")" "$(json_escape "$HEAD_SHA")" "$(json_escape "$BRANCH")" \
+	"$(json_escape "$ISSUE")" "$(json_escape "$REPO")" >"$PR_FILE" 2>/dev/null ||
+	log "WARNING: could not write $PR_FILE"
+chmod 0600 "$PR_FILE" 2>/dev/null || true
+[ -s "$PR_FILE" ] || fail_workflow open-pr "cannot write $PR_FILE"
 
 # --------------------------------------------------------------------------
 # Verdict

@@ -72,6 +72,10 @@ one a run is in and `wefty inspect` shows how long each took:
 | `push` | the branch is on the remote, matching local HEAD |
 | `open-pr` | `gh pr create --draft`, and `pr.json` + `summary.md` |
 
+`PLAN.md` is excluded from the worktree's git, so it is never part of the
+change: it exists for the `implement` phase and the pull request body to read,
+and does not reach a commit or the diff a reviewer sees.
+
 Each phase ends by recording an empty marker commit and **pushing** it. The
 subject is prose; the part that counts is the trailers:
 
@@ -144,7 +148,7 @@ stay on the branch, so the next run can resume from where it stopped.
 
 | File | Where | What |
 |---|---|---|
-| `pr.json` | handoff dir | `{url, head_sha, branch, issue, repo}` |
+| `pr.json` | handoff dir | `{url, head_sha, branch, issue, repo}` — `head_sha` is the branch's HEAD after this phase's own marker push, the same commit `result.json` names |
 | `summary.md` | handoff dir | the pull request body, as submitted |
 | `result.json` | handoff dir + ledger | the verdict; read it with `wefty results` |
 | `failures.txt` | handoff dir | gate output, when a gate failed |
