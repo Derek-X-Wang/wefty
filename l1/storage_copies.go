@@ -720,6 +720,10 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 				receipt.FailureCode != "insufficient_disk" && receipt.FailureCode != "cancelled" {
 				return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt lacks positive staging absence")
 			}
+			// The capacity fact belongs to the capacity refusal alone.
+			if receipt.FailureCode != "insufficient_disk" && receipt.ObservedAvailableBytes != 0 {
+				return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt carries capacity facts for a non-capacity failure")
+			}
 		case "clone":
 			// Clone's only typed failure is the capacity refusal. Anything
 			// else leaves the copy's integrity in doubt and stays on the
@@ -827,9 +831,10 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 // latchComputerCloneCapacityFailure gives a refused clone the terminal
 // capacity latch a refused grow already has. The receipt's own requested and
 // observed bytes become the Job's typed `insufficient_disk` failure, the
-// never-written destination generation is retired, and the destination leaves
-// `cloning`, so nothing redispatches the operation and an operator can read
-// why it stopped. The source Computer and its Backup are untouched.
+// never-published destination generation is retired, and the destination
+// leaves `cloning` latched failed, so nothing redispatches the operation, no
+// later start can format an empty disk under its identity, and an operator can
+// read why it stopped. The source Computer and its Backup are untouched.
 func latchComputerCloneCapacityFailure(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
 	request ComputerStorageCopyAcknowledgementRequest, receiptJSON []byte, bodyHash string, now time.Time) error {
 	if row.Operation != "clone" {
@@ -866,9 +871,12 @@ func latchComputerCloneCapacityFailure(ctx context.Context, tx *sql.Tx, row comp
 	if err := requireSingleStorageGenerationMutation(retired, "retire refused Computer clone generation"); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped', current_attempt_id=NULL, updated_ns=?
-		WHERE job_id=?`, now.UnixNano(), row.JobID); err != nil {
-		return internalError(err, "keep refused Computer clone stopped")
+	// The destination is latched failed rather than stopped: it owns no
+	// Storage generation, so it is not a Computer that merely happens to be
+	// off, and nothing may start it into a freshly formatted empty disk.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, current_attempt_id=NULL, updated_ns=?
+		WHERE job_id=?`, contract.JobFailed, now.UnixNano(), row.JobID); err != nil {
+		return internalError(err, "latch refused Computer clone failed")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state='stopped', published_attempt_id=NULL,
 		healthy_since_ns=NULL, next_restart_at=NULL, last_failure=? WHERE job_id=?`, latchedFailure, row.JobID); err != nil {

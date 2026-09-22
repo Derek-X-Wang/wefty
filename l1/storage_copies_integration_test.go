@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -206,6 +207,17 @@ func successfulOldGenerationBackupReceipt(directive ComputerStorageCopyDirective
 		Encryption:    BackupEncryptionNone}
 }
 
+// execAll applies each statement on its own so a silently skipped mutation
+// cannot make an assertion pass for the wrong reason.
+func execAll(t *testing.T, h *integrationHarness, statements [][]any) {
+	t.Helper()
+	for _, statement := range statements {
+		if _, err := h.store.db.Exec(statement[0].(string), statement[1:]...); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func refusedStorageCopyReceipt(directive ComputerStorageCopyDirective, failureCode string, observedAvailableBytes int64) ComputerStorageCopyReceipt {
 	return ComputerStorageCopyReceipt{Kind: "computer_storage_copy_failed_absent",
 		ReceiptID: "refused-" + directive.DestinationComputerID, Operation: directive.Operation,
@@ -252,7 +264,7 @@ func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t
 			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
 	if err != nil || refused.ReconfigurationPhase != ComputerReconfigurationStable || refused.ReconfigurationRevision != nil ||
 		refused.AppliedRevision != 1 || refused.DesiredState != contract.ServiceDesiredStopped ||
-		refused.CurrentJob.State != contract.JobStopped {
+		refused.CurrentJob.State != contract.JobFailed {
 		t.Fatalf("refused clone = %#v err=%v", refused, err)
 	}
 	var failure contract.SpawnFailure
@@ -295,6 +307,89 @@ func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t
 	if err != nil || unchanged.StorageID != sourceComputer.StorageID || unchanged.StorageGeneration != sourceComputer.StorageGeneration ||
 		unchanged.IntentRevision != sourceComputer.IntentRevision || unchanged.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("refused clone changed source Computer = %#v err=%v", unchanged, err)
+	}
+}
+
+// Capacity coming back must not turn a refused clone into a freshly formatted
+// empty disk wearing the clone's identity: the destination names a generation
+// that was never published, so it can be removed and nothing else.
+func TestRefusedComputerCloneCannotStartAnEmptyReplacementDisk(t *testing.T) {
+	h, node, sourceComputer, sourceBackup, _ := publishedBackupForStorageCopy(t, 2)
+	clone, _, err := h.store.BeginComputerClone(context.Background(), ComputerCloneRequest{BackupID: sourceBackup.BackupID,
+		ComputerMutationPrecondition: computerPrecondition(sourceComputer, "operator"), Name: "unstartable-clone",
+		DiskBytes: sourceBackup.AllocatedSize + (64 << 20), IdempotencyKey: "unstartable", Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("unstartable clone directive = %#v err=%v", directives, err)
+	}
+	receipt := refusedStorageCopyReceipt(directives[0], "insufficient_disk", 25112510464)
+	refused, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Capacity has come back; nothing about it makes this destination startable.
+	_, startErr := h.store.SetComputerDesiredState(context.Background(), refused.ComputerID,
+		ComputerDesiredStateRequest{ComputerMutationPrecondition: computerPrecondition(refused, "operator"),
+			DesiredState: contract.ServiceDesiredRunning})
+	var startRefusal *Error
+	if !errors.As(startErr, &startRefusal) || startRefusal.Code != contract.ErrorConflict ||
+		startRefusal.Details["reason"] != ComputerStorageGenerationRetiredReason ||
+		startRefusal.Details["required_operation"] != "remove" {
+		t.Fatalf("start of a refused clone = %v (%#v)", startErr, startRefusal)
+	}
+	_, _, restartErr := h.store.RestartComputer(context.Background(), refused.ComputerID,
+		ComputerRestartRequest{ComputerMutationPrecondition: computerPrecondition(refused, "operator"),
+			IdempotencyKey: "restart-refused-clone"})
+	var restartRefusal *Error
+	if !errors.As(restartErr, &restartRefusal) || restartRefusal.Code != contract.ErrorConflict ||
+		restartRefusal.Details["reason"] != ComputerStorageGenerationRetiredReason {
+		t.Fatalf("restart of a refused clone = %v (%#v)", restartErr, restartRefusal)
+	}
+	// Even a corrupted desired state cannot hand the destination to a helper.
+	execAll(t, h, [][]any{
+		{`UPDATE computers SET desired_state='running' WHERE computer_id=?`, refused.ComputerID},
+		{`UPDATE jobs SET state='queued' WHERE job_id=?`, refused.CurrentJobID},
+		{`UPDATE service_jobs SET desired_state='running' WHERE job_id=?`, refused.CurrentJobID},
+	})
+	var queued string
+	if err := h.store.db.QueryRow(`SELECT state FROM jobs WHERE job_id=?`, refused.CurrentJobID).Scan(&queued); err != nil || queued != "queued" {
+		t.Fatalf("corrupted clone Job state = %q err=%v", queued, err)
+	}
+	claim, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID,
+		contract.JobClassService)
+	if err != nil || claim != nil {
+		t.Fatalf("claim of a refused clone = %#v err=%v", claim, err)
+	}
+	// Control: the retired generation is what withheld that claim, not some
+	// other admission condition.
+	execAll(t, h, [][]any{
+		{`UPDATE computer_storage_generations SET phase='current', retired_ns=NULL WHERE computer_id=? AND storage_generation=1`, refused.ComputerID},
+	})
+	control, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID,
+		contract.JobClassService)
+	if err != nil || control == nil || control.Job.JobID != refused.CurrentJobID {
+		t.Fatalf("control claim with published Storage = %#v err=%v", control, err)
+	}
+	execAll(t, h, [][]any{
+		{`UPDATE computer_storage_generations SET phase='retired' WHERE computer_id=? AND storage_generation=1`, refused.ComputerID},
+		{`UPDATE computers SET desired_state='stopped' WHERE computer_id=?`, refused.ComputerID},
+		{`UPDATE service_jobs SET desired_state='stopped' WHERE job_id=?`, refused.CurrentJobID},
+		{`UPDATE attempts SET state='lost' WHERE job_id=?`, refused.CurrentJobID},
+		{`UPDATE jobs SET state='failed', current_attempt_id=NULL WHERE job_id=?`, refused.CurrentJobID},
+	})
+	current, err := h.store.GetComputer(context.Background(), refused.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := h.store.RemoveComputer(context.Background(), current.ComputerID,
+		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator-remove")})
+	if err != nil || removed.DesiredState != contract.ServiceDesiredRemoved {
+		t.Fatalf("remove of a refused clone = %#v err=%v", removed, err)
 	}
 }
 

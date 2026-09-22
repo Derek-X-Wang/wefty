@@ -316,14 +316,25 @@ filesystem cannot hold is a capacity refusal, not a doubtful copy: the helper
 proves the destination staging absent and returns the same typed
 `insufficient_disk` evidence a grow refusal returns, with the requested bytes
 and the available bytes observed at the refusal. L1 records the clone operation
-`failed` with that code, retires the never-written destination generation,
+`failed` with that code, retires the never-published destination generation,
 latches the receipt-derived requested and observed bytes on the destination
 Job's `last_failure` with `next_restart_at` null, and returns the destination
-to `stable`, so the operation is terminal, the operator reads why it stopped on
-the ordinary capacity surface, and nothing redispatches it. The source
-Computer, its Storage, and its Backup are untouched. Quarantine stays reserved
-for a copy whose integrity is in doubt and is never how a clone reports that
-the disk was too small. Immutable Storage provenance records
+to `stable` and latched failed, so the operation is terminal, the operator
+reads why it stopped on the ordinary capacity surface, and nothing redispatches
+it. The source Computer, its Storage, and its Backup are untouched. Quarantine
+stays reserved for a copy whose integrity is in doubt and is never how a clone
+reports that the disk was too small.
+
+A Computer whose current Storage generation was never published owns no bytes
+to start from, so it is neither startable nor restartable: start, restart, and
+claim admission all refuse it with the typed reason
+`storage_generation_retired` until an authorized recovery operation
+establishes valid current Storage. Recovered capacity is not such an
+operation. Without that rule a refused clone would look like an ordinary
+stopped Computer, and the helper's first-allocation path would format a fresh
+empty disk under the clone's durable identity, silently replacing the copy the
+operator asked for with nothing. Removal is always available and is the
+ordinary exit. Immutable Storage provenance records
 the source Backup and destination as a custody fork. If one
 managed branch is removed while another secret-bearing branch survives, the
 Computer outcome is `removed_reduced`; after coordinated positive removal of

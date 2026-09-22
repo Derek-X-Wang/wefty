@@ -31,6 +31,10 @@ const (
 	computerStorageCopyExpanded        computerStorageCopyPhase = "expanded"
 	computerStorageCopyManifestWritten computerStorageCopyPhase = "manifest_written"
 	computerStorageCopyPublished       computerStorageCopyPhase = "published"
+	// computerStorageCopyRefusalCleanup is not a durable phase: it marks the
+	// owned interval in which a typed failure proves and removes the
+	// destination, so a test can observe that ownership is still held there.
+	computerStorageCopyRefusalCleanup computerStorageCopyPhase = "refusal_cleanup"
 )
 
 type computerStorageCopyFacts struct {
@@ -322,6 +326,38 @@ func (engine *ContainerdEngine) finalizeComputerStorageCopy(ctx context.Context,
 	return rekeyFacts, err
 }
 
+// computerStorageDestinationFullError is raised only where this call writes to
+// the Node's own Computer-disk filesystem. ENOSPC anywhere else -- inside the
+// copied image while its filesystem is mounted, for example -- is not host
+// destination capacity and never becomes a capacity refusal.
+type computerStorageDestinationFullError struct {
+	ObservedAvailableBytes int64
+	Err                    error
+}
+
+func (e *computerStorageDestinationFullError) Error() string {
+	return fmt.Sprintf("Computer Storage destination filesystem is full with %d available bytes: %v",
+		e.ObservedAvailableBytes, e.Err)
+}
+
+func (e *computerStorageDestinationFullError) Unwrap() error { return e.Err }
+
+// destinationCapacityError converts ENOSPC from one exact destination
+// allocation or write into the typed capacity refusal, recording the Node
+// filesystem's available bytes while this call still owns the generation. Any
+// other error, and any failure to read that capacity fact, is returned
+// unchanged.
+func (engine *ContainerdEngine) destinationCapacityError(err error) error {
+	if err == nil || !errors.Is(err, unix.ENOSPC) {
+		return err
+	}
+	available, availableErr := filesystemAvailableBytes(filepath.Join(engine.config.RuntimeRoot, "computer-disks"))
+	if availableErr != nil {
+		return errors.Join(err, availableErr)
+	}
+	return &computerStorageDestinationFullError{ObservedAvailableBytes: available, Err: err}
+}
+
 // storageCopyDestinationPublished reports whether the destination generation
 // already owns published bytes. A failure after publication is never rewritten
 // into an absence receipt, because that receipt authorizes deletion.
@@ -342,18 +378,38 @@ func storageCopyDestinationPublished(runtimeRoot string, request CopyComputerSto
 // storageCopyFailureReceipt proves the destination generation holds no bytes
 // and names the typed reason. `observedAvailableBytes` is the capacity fact
 // behind an `insufficient_disk` refusal and is zero for every other code.
-func storageCopyFailureReceipt(runtimeRoot string, request CopyComputerStorageRequest, code string,
+func (engine *ContainerdEngine) storageCopyFailureReceipt(request CopyComputerStorageRequest, code string,
 	observedAvailableBytes int64) (CopyComputerStorageResponse, error) {
 	destinationName, err := deterministicComputerDiskName(request.Destination)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
+	runtimeRoot := engine.config.RuntimeRoot
 	destinationRoot := filepath.Join(runtimeRoot, "computer-disks", destinationName)
+	// Unlinking a pathname is not absence: a still-mounted filesystem or a
+	// live loop device keeps the copied bytes reachable. Prove both are gone
+	// before any receipt claims the destination holds nothing.
+	mountPath := filepath.Join(runtimeRoot, "computer-copy-mounts", destinationName)
+	if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
+		return CopyComputerStorageResponse{}, err
+	} else if mounted {
+		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination remains mounted after failure")
+	}
+	loops, err := engine.computerDiskSystem().loopsForRoot(destinationRoot)
+	if err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	if len(loops) != 0 {
+		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination remains loop-attached after failure")
+	}
 	if err := os.RemoveAll(destinationRoot); err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
 	if _, err := os.Lstat(destinationRoot); !errors.Is(err, os.ErrNotExist) {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy staging remains after failure cleanup")
+	}
+	if err := os.Remove(mountPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return CopyComputerStorageResponse{}, err
 	}
 	receiptID, err := randomCapability()
 	if err != nil {
@@ -376,57 +432,36 @@ func storageCopyFailureReceipt(runtimeRoot string, request CopyComputerStorageRe
 }
 
 // storageCopyFailureCode is the closed typed vocabulary each verb may report
-// instead of an opaque engine failure. Clone reports only the capacity
-// refusal: every other clone failure leaves the destination in doubt and stays
-// on the integrity path.
-func storageCopyFailureCode(operation string, err error) string {
-	insufficientDisk := errors.Is(err, unix.ENOSPC) ||
-		strings.Contains(strings.ToLower(err.Error()), "no space left on device")
-	if operation == "clone" {
-		if insufficientDisk {
-			return "insufficient_disk"
+// instead of an opaque engine failure. The capacity refusal is recognized only
+// as the exact typed error raised at a destination write site, never from an
+// error chain or from tool output text, and never from a joined error that
+// also carries a second failure: a copy whose cleanup or detach also failed is
+// still an engine failure. Clone has that one code and nothing else; every
+// other clone failure leaves the destination in doubt and stays on the
+// integrity path.
+func storageCopyFailureCode(operation string, err error) (string, int64) {
+	if full, exact := err.(*computerStorageDestinationFullError); exact {
+		if operation == "clone" || operation == "import" {
+			return "insufficient_disk", full.ObservedAvailableBytes
 		}
-		return ""
+		return "", 0
 	}
 	if operation != "import" {
-		return ""
+		return "", 0
 	}
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return "cancelled"
-	case insufficientDisk:
-		return "insufficient_disk"
+		return "cancelled", 0
 	case strings.Contains(err.Error(), "digest"):
-		return "digest_mismatch"
+		return "digest_mismatch", 0
 	case strings.Contains(err.Error(), "Custody import manifest"),
 		strings.Contains(err.Error(), "Custody import disk size"):
-		return "manifest_invalid"
+		return "manifest_invalid", 0
 	}
-	return ""
+	return "", 0
 }
 
 func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request CopyComputerStorageRequest) (response CopyComputerStorageResponse, returnedErr error) {
-	defer func() {
-		if returnedErr == nil {
-			return
-		}
-		code := storageCopyFailureCode(request.Operation, returnedErr)
-		if code == "" {
-			return
-		}
-		published, err := storageCopyDestinationPublished(engine.config.RuntimeRoot, request)
-		if err != nil || published {
-			return
-		}
-		observedAvailableBytes := int64(0)
-		if code == "insufficient_disk" {
-			observedAvailableBytes, err = filesystemAvailableBytes(filepath.Join(engine.config.RuntimeRoot, "computer-disks"))
-			if err != nil {
-				return
-			}
-		}
-		response, returnedErr = storageCopyFailureReceipt(engine.config.RuntimeRoot, request, code, observedAvailableBytes)
-	}()
 	engine.computerBackupMu.Lock()
 	defer engine.computerBackupMu.Unlock()
 	engine.storageCopyMu.Lock()
@@ -473,6 +508,33 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		return CopyComputerStorageResponse{}, err
 	}
 	defer closeComputerDiskLock(lock)
+	// Registered after the generation lock and inside both copy mutexes, so
+	// it runs before any of them is released: the publication check, the
+	// mount/loop absence proof and the deletion are one owned interval that no
+	// concurrent copy can interleave with.
+	defer func() {
+		if returnedErr == nil {
+			return
+		}
+		code, observedAvailableBytes := storageCopyFailureCode(request.Operation, returnedErr)
+		if code == "" {
+			return
+		}
+		if err := engine.storageCopyCheckpoint(computerStorageCopyRefusalCleanup); err != nil {
+			returnedErr = errors.Join(returnedErr, err)
+			return
+		}
+		published, err := storageCopyDestinationPublished(engine.config.RuntimeRoot, request)
+		if err != nil || published {
+			return
+		}
+		converted, receiptErr := engine.storageCopyFailureReceipt(request, code, observedAvailableBytes)
+		if receiptErr != nil {
+			returnedErr = errors.Join(returnedErr, receiptErr)
+			return
+		}
+		response, returnedErr = converted, nil
+	}()
 	manifestPath := filepath.Join(destinationRoot, "storage-copy.json")
 	manifest, present, err := readComputerStorageCopyManifest(manifestPath)
 	if err != nil {
@@ -515,7 +577,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		}
 		if err := engine.allocateComputerBackup(stagingPath, request.SourceSize); err != nil {
 			_ = file.Close()
-			return CopyComputerStorageResponse{}, err
+			return CopyComputerStorageResponse{}, engine.destinationCapacityError(err)
 		}
 		if err := file.Close(); err != nil {
 			return CopyComputerStorageResponse{}, err
@@ -543,8 +605,14 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		if copyErr == nil {
 			copyErr = destination.Sync()
 		}
-		if err := errors.Join(copyErr, source.Close(), destination.Close()); err != nil {
-			return CopyComputerStorageResponse{}, err
+		// The destination write is classified alone: a close that also failed
+		// joins the error and keeps the whole outcome an engine failure.
+		closeErr := errors.Join(source.Close(), destination.Close())
+		if closeErr != nil {
+			return CopyComputerStorageResponse{}, errors.Join(copyErr, closeErr)
+		}
+		if copyErr != nil {
+			return CopyComputerStorageResponse{}, engine.destinationCapacityError(copyErr)
 		}
 		manifest.Phase = computerStorageCopyCopied
 		if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
@@ -582,7 +650,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	if manifest.Phase == computerStorageCopySourceVerified {
 		if request.Destination.DiskBytes > request.SourceSize {
 			if err := engine.allocateComputerBackup(stagingPath, request.Destination.DiskBytes); err != nil {
-				return CopyComputerStorageResponse{}, err
+				return CopyComputerStorageResponse{}, engine.destinationCapacityError(err)
 			}
 		}
 		expanded := request.Destination.DiskBytes > request.SourceSize

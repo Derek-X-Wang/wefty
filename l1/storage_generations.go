@@ -21,7 +21,16 @@ const (
 	ComputerStorageGenerationCurrent ComputerStorageGenerationPhase = "current"
 	ComputerStorageGenerationStaging ComputerStorageGenerationPhase = "staging"
 	ComputerStorageGenerationRetired ComputerStorageGenerationPhase = "retired"
+	// computerStorageGenerationAbsent is not a stored phase: it names a
+	// Computer whose current generation row is gone entirely.
+	computerStorageGenerationAbsent ComputerStorageGenerationPhase = "absent"
 )
+
+// ComputerStorageGenerationRetiredReason is the typed refusal reason for a
+// Computer that names a Storage generation which was never published, so it
+// can be neither started nor restarted until an authorized recovery
+// operation establishes valid current Storage.
+const ComputerStorageGenerationRetiredReason = "storage_generation_retired"
 
 type ComputerStorageGeneration struct {
 	StorageID         string                         `json:"storage_id"`

@@ -1227,15 +1227,32 @@ capacity fact, not an integrity doubt, and is reported as one.
 `computer_storage_copy_failed_absent` with `failure_code=insufficient_disk`
 carries `observed_available_bytes`: the Node filesystem's available bytes read
 at the moment of the refusal, the same fact a `GrowComputerStorage` refusal
-returns, so one capacity failure reads identically whichever verb met it. The
-receipt is issued only after the helper has removed the destination staging
-root and observed its absence, and never when the destination already owns
-published bytes; a failure after publication stays an error, because an
-absence receipt authorizes deletion. Clone has exactly this one typed failure
-code. Every other clone failure leaves the copy's integrity in doubt and keeps
-the existing path: an engine failure, a deferred resume, or a quarantined
-generation, which is reserved for a copy whose bytes cannot be trusted.
-`observed_available_bytes` is absent from every other Storage copy receipt.
+returns, so one capacity failure reads identically whichever verb met it.
+`observed_available_bytes` belongs to that refusal alone and is absent from
+every other Storage copy receipt, failed or verified.
+
+The capacity refusal is recognized only where this call writes to the Node's
+own Computer-disk filesystem: the destination allocation, the staging copy, and
+the expansion allocation each raise it directly. ENOSPC reached any other way
+is not host destination capacity -- the full filesystem may be the one inside
+the copied image -- and neither an error chain nor tool output text can create
+the fact. An error that also carries a second failure, such as a copy whose
+close or whose detach failed, stays an engine failure, because that second
+failure must not disappear behind an absence receipt.
+
+Absence is proved, not asserted. The helper issues the receipt only while it
+still owns the destination generation -- the publication check, the absence
+proof, and the deletion are one interval no concurrent copy can interleave with
+-- and only after the destination is neither mounted nor loop-attached, since
+an unlinked pathname leaves the copied bytes reachable through a live mount or
+loop device. It is never issued when the destination already owns published
+bytes; a failure after publication stays an error, because an absence receipt
+authorizes deletion.
+
+Clone has exactly this one typed failure code. Every other clone failure leaves
+the copy's integrity in doubt and keeps the existing path: an engine failure, a
+deferred resume, or a quarantined generation, which is reserved for a copy
+whose bytes cannot be trusted.
 
 For a Custody import, typed helper runtime loss during `CopyComputerStorage`
 becomes an exact-generation `computer_storage_preparation_interrupted`
