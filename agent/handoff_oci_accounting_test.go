@@ -43,7 +43,7 @@ func TestTheAccountingPassReportsTheOCIHelpersHandoffRootToo(t *testing.T) {
 		Volumes: []workloadrunner.RetainedHandoffVolume{
 			{Name: known, TerminalKnown: true, LogicalBytes: 4096, DedupedBytes: 4096, Entries: 2},
 			{Name: "wefty-handoff-volume-deadbeefdeadbeefdeadbeefdeadbeef", LogicalBytes: 64, DedupedBytes: 64, Entries: 1,
-				Anomaly: "no helper-owned retention receipt"},
+				Anomalies: []string{string(ocihelper.HandoffAnomalyNoReceipt)}},
 		},
 		Exhausted: true,
 	}}
@@ -71,7 +71,7 @@ func TestTheAccountingPassReportsTheOCIHelpersHandoffRootToo(t *testing.T) {
 	if !harness.logged("retained results in this node's OCI handoff root") {
 		t.Fatalf("the pass did not report the OCI root: %v", harness.logs)
 	}
-	if !harness.logged("no helper-owned retention receipt") {
+	if !harness.logged(string(ocihelper.HandoffAnomalyNoReceipt)) {
 		t.Fatalf("a per-volume anomaly went unreported: %v", harness.logs)
 	}
 

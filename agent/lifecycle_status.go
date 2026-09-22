@@ -140,6 +140,9 @@ type RetainedOCIResultsStatus struct {
 	// unreadable receipt, a measurement that hit its bound. They are still
 	// counted in every figure above.
 	Anomalies int `json:"anomalies"`
+	// Truncated counts the volumes whose byte and entry figures the helper
+	// measured incompletely, so those volumes' figures are a floor.
+	Truncated int `json:"truncated"`
 	// Exhausted says the helper holds more volumes than one read carries, so
 	// the figures above are a floor.
 	Exhausted bool `json:"exhausted,omitempty"`

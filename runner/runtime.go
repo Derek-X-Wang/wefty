@@ -610,8 +610,13 @@ type RetainedHandoffVolume struct {
 	Entries       int64
 	// Live says an attempt is still writing here.
 	Live bool
-	// Anomaly is a per-volume observation that must not fail the whole read.
-	Anomaly string
+	// Truncated says the byte and entry figures are a floor: the runtime
+	// stopped measuring early. The terminal time is never a floor.
+	Truncated bool
+	// Anomalies are per-volume observations that must not fail the whole
+	// read. They are a closed token vocabulary, so what a node reports cannot
+	// grow with what a workload wrote.
+	Anomalies []string
 }
 
 // ManagedVolumeFinalizer deletes durable runtime-managed state only after the

@@ -117,7 +117,11 @@ type ContainerdEngine struct {
 	ports                       map[uint16]string
 	nextPort                    uint16
 	serviceVolumeMu             sync.Mutex
-	handoffRetentionMu          sync.Mutex // serializes writes to handoffs-state/; never held across containerd work
+	handoffRetentionMu          sync.Mutex           // serializes receipt publication only; never held across measurement or containerd work
+	handoffMeasureEntered       func(string)         // a test observes when one volume's measurement begins
+	handoffMeasureDescend       func(string, string) // a test replaces a child between its stat and its open
+	handoffMeasureEntryBudget   int64                // a test proves the entry bound without planting a million files
+	handoffMeasureOpenBudget    int64                // a test proves the open bound without planting a million directories
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -1813,7 +1817,7 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 					// verified attempt. The volume keeps its files and reports
 					// terminal_known=false until the next sweep stamps it,
 					// which is exactly the fallback that case exists for.
-					if receiptErr := engine.writeHandoffRetentionReceipt(resources.HandoffVolumeDirectory, engine.handoffNow()); receiptErr != nil && !errors.Is(receiptErr, os.ErrNotExist) {
+					if receiptErr := engine.writeHandoffRetentionReceipt(cleanupCtx, resources.HandoffVolumeDirectory, engine.handoffNow()); receiptErr != nil && !errors.Is(receiptErr, os.ErrNotExist) {
 						log.Printf("stamp the terminal time on handoff volume %s: %v", resources.HandoffVolumeDirectory, receiptErr)
 					}
 					return DeleteResponse{Deleted: true}, nil
@@ -2524,19 +2528,6 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	// Residue first, then expiry. A handoff volume an older helper left, or one
-	// whose attempt never reached finalization, has no helper-owned terminal
-	// time and therefore cannot be expired at all; stamping it here starts its
-	// window from a timestamp no workload could have written, which is what
-	// turns it from something the node keeps forever into something the node
-	// can give back.
-	sweepNow := engine.handoffNow()
-	if err := engine.stampMissingHandoffRetentionReceipts(sweepNow); err != nil {
-		return SweepResponse{}, err
-	}
-	if err := engine.cleanupExpiredHandoffs(sweepNow); err != nil {
-		return SweepResponse{}, err
-	}
 	if err := engine.sweepImageSpools(); err != nil {
 		return SweepResponse{}, err
 	}
@@ -2634,49 +2625,15 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
 		return SweepResponse{}, err
 	}
+	// Last, and only here. Every surviving task and container has been reaped
+	// above, and the ownership records of attempts this node has proved
+	// quiescent have just been removed -- so what remains in that root is
+	// exactly the set of runs nothing here may call finished. Stamping a
+	// terminal time before that proof is how a helper that restarted over a
+	// still-running workload would have declared its results final while it
+	// was still writing them.
+	engine.reconcileHandoffRetention(ctx, engine.handoffNow(), remaining)
 	return response, nil
-}
-
-// cleanupExpiredHandoffs removes the handoff volumes whose retention window has
-// run out, and it runs from the helper-owned receipt rather than the directory
-// mtime.
-//
-// A volume with no bound receipt is never expired here: its mtime is a figure
-// the workload owns, and expiring on it is how a run's results could be swept
-// while it was still writing them (or kept forever). The sweep stamps a
-// receipt for such a volume first, so its window starts from a helper-owned
-// timestamp instead.
-func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time) error {
-	names, err := engine.handoffVolumeNames()
-	if err != nil {
-		return err
-	}
-	live := engine.liveHandoffVolumes()
-	for _, name := range names {
-		if _, writing := live[name]; writing {
-			continue
-		}
-		expired, err := engine.handoffVolumeExpired(name, now)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return err
-		}
-		if !expired {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		// The receipt is retained exactly while its volume is. Removing them
-		// together is what keeps "observed = residue union retained" true over
-		// the new durable class.
-		if err := engine.removeHandoffRetentionReceipt(name); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (engine *ContainerdEngine) sweepImageSpools() error {
@@ -3394,6 +3351,16 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			return nil, nil, nil, err
 		}
 		if volume.Kind == ManagedVolumeHandoff {
+			// Reuse supersedes the previous attempt's terminal time. Leaving
+			// it authoritative meant a rerun inherited a deadline it had
+			// nothing to do with: when that deadline passed mid-run, the new
+			// attempt's own Delete verified the volume as residue and retried
+			// until its cleanup deadline instead of recording the completion.
+			// A live run has no terminal time, which is exactly what no
+			// receipt means.
+			if err := engine.supersedeHandoffRetentionReceipt(name); err != nil {
+				return nil, nil, nil, err
+			}
 			// The mtime no longer decides anything: retention runs from the
 			// helper-owned receipt. It is stamped here so that a volume
 			// prepared and never finalized reports its preparation time as
@@ -4972,10 +4939,18 @@ func removeCgroupTree(path string) error {
 }
 
 func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInventory, now time.Time) (ResourceInventory, []DurableRetention, error) {
+	liveHandoffs, err := engine.liveHandoffVolumes()
+	if err != nil {
+		return ResourceInventory{}, nil, err
+	}
 	projected, err := projectRuntimeAbsenceInventory(inventory, engine.retainedServiceDataBinding, func(name string) (bool, error) {
-		// The same predicate the sweep removes by, so a volume this projection
-		// calls retained is exactly one the sweep will not take.
-		expired, err := engine.handoffVolumeExpired(name, now)
+		// The same predicate the sweep removes by, live-attempt guard
+		// included, so a volume this projection calls retained is exactly one
+		// the sweep will not take. They disagreed once: cleanup skipped a live
+		// volume and this did not, so a rerun of a stable owner key whose
+		// prior receipt had expired was classified as residue and its own
+		// Delete could never reach Absent.
+		expired, err := engine.handoffVolumeExpired(name, now, liveHandoffs)
 		if errors.Is(err, os.ErrNotExist) {
 			// A concurrently removed inventory entry cannot be retained evidence;
 			// keeping it in the projection makes the next verification retry prove

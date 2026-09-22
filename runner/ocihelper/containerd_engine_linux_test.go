@@ -1318,12 +1318,8 @@ func TestHandoffRetentionRefreshesAndExpiresStableOwnerVolumes(t *testing.T) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.writeHandoffRetentionReceipt(name, now.Add(-30*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.cleanupExpiredHandoffs(now); err != nil {
-		t.Fatal(err)
-	}
+	stamp(t, engine, name, now.Add(-30*time.Minute))
+	expire(t, engine, now)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("retry-window handoff was removed: %v", err)
 	}
@@ -1332,20 +1328,14 @@ func TestHandoffRetentionRefreshesAndExpiresStableOwnerVolumes(t *testing.T) {
 	if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.cleanupExpiredHandoffs(now); err != nil {
-		t.Fatal(err)
-	}
+	expire(t, engine, now)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("a workload-written mtime expired a handoff volume inside its window: %v", err)
 	}
 
 	// The helper's own terminal time running out is what removes it.
-	if err := engine.writeHandoffRetentionReceipt(name, now.Add(-2*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.cleanupExpiredHandoffs(now); err != nil {
-		t.Fatal(err)
-	}
+	stamp(t, engine, name, now.Add(-2*time.Hour))
+	expire(t, engine, now)
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expired handoff remained: %v", err)
 	}

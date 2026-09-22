@@ -654,19 +654,27 @@ it can enforce correctly and leaves the node budget to #494. A node's retained
 results are therefore bounded by how many runs it executes within the window and
 by 64 MiB each, not by a single figure.
 
-**Part 1's per-run bound covers the process handoff directory only.** An OCI
-run's results live in a helper-owned volume the agent cannot measure, so those
-are bounded by the window alone. Per-volume byte accounting inside the helper is
-#494.
+**The per-run bound covers the process handoff directory only.** An OCI run's
+results live in a helper-owned volume the agent cannot measure — on a Mac node
+the helper runs inside a Lima VM, so the agent cannot even stat that filesystem
+— and no per-run byte bound is enforced there. The helper does measure it: it
+reports every retained handoff volume's logical bytes, bytes deduplicated by
+inode across its whole root, and entry count over the protocol
+(`oci-helper-protocol.md`, `InventoryHandoffVolumes`), and the node agent reads
+those figures beside its own root's and reports both. Nothing acts on them yet;
+the node budget that will is #494's last slice.
 
-**The OCI window runs from the volume's current directory mtime**, which
-preparation stamps and which ordinary entry creation inside the directory also
-changes — not from the run finishing. A job that creates its files early and
-then runs for a long time can therefore see its results expire sooner than seven
-days after it finished, and a uid-0 workload can move the timestamp directly, by
-the same ownership limit the mailbox records (`oci-helper-protocol.md`, "Run
-mailbox confinement"). A helper-owned terminal timestamp, recorded after
-quiescence and validated, is #494.
+**The OCI window runs from a helper-owned terminal receipt**, written after the
+attempt's task is reaped and its absence verified, in a durable root the
+container is never given a path to. The directory's mtime decides nothing: a
+uid-0 workload owns its own handoff directory and can move that timestamp
+directly, by the same ownership limit the mailbox records
+(`oci-helper-protocol.md`, "Run mailbox confinement"), and ordinary entry
+creation moves it too. A volume with no such receipt — one an older helper
+left, or one whose attempt never reached finalization — is **never expired**:
+its age is reported with the mtime labelled as a workload-writable fallback,
+and the next boot sweep, once it has proved the previous workloads stopped,
+gives it a helper-owned terminal time so its window can start at all.
 
 Collection expires and evicts nothing; measuring what is left is a separate
 pass on the collector's own timer. Collection runs at agent startup, after

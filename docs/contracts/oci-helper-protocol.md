@@ -1067,10 +1067,11 @@ narrow
 `service_data`. It derives exactly one helper-owned identity, removes only that
 volume (and, for service data, its paired owner record), and returns success
 only after separate absence checks. The agent calls the handoff arm after a
-volume's retention window has expired or the node's budget has evicted it, and
-the service-data arm during Job removal; neither arm grants general path
-deletion authority. Deleting a handoff volume removes its retention receipt
-with it.
+volume's retention window has expired, and the service-data arm during Job
+removal; neither arm grants general path deletion authority. Deleting a handoff
+volume removes its retention receipt with it. Agent-driven eviction to fit a
+node budget is not implemented: the agent reads the retained-handoff inventory
+and acts on none of it, and the budget that will is a later slice of #494.
 
 Handoff retention receipts are their own inventory class,
 `handoff_retention_records`, for the same reason service-data owner records

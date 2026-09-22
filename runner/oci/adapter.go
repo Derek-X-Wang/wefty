@@ -2491,10 +2491,15 @@ func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workload
 		Exhausted: response.Exhausted,
 	}
 	for _, volume := range response.Volumes {
+		anomalies := make([]string, 0, len(volume.Anomalies))
+		for _, anomaly := range volume.Anomalies {
+			anomalies = append(anomalies, string(anomaly))
+		}
 		report.Volumes = append(report.Volumes, workloadrunner.RetainedHandoffVolume{
 			Name: volume.Name, TerminalAt: volume.TerminalAt, TerminalKnown: volume.TerminalKnown,
 			LogicalBytes: volume.LogicalBytes, DedupedBytes: volume.DedupedBytes,
-			Entries: volume.Entries, Live: volume.Live, Anomaly: volume.Anomaly,
+			Entries: volume.Entries, Live: volume.Live, Truncated: volume.Truncated,
+			Anomalies: anomalies,
 		})
 	}
 	return report, nil

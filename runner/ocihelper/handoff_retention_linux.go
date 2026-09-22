@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -39,13 +42,23 @@ import (
 const (
 	handoffRetentionStateDirectory = "handoffs-state"
 	handoffRetentionReceiptVersion = 1
-	// maxHandoffMeasureEntries bounds one volume's measurement. A workload
-	// that plants a tree deeper or wider than this gets a per-volume anomaly
-	// and a floor for its figures; it does not get to stall a node-wide call.
+	// maxHandoffMeasureEntries and maxHandoffMeasureOpens bound one pass. The
+	// tree being walked is a workload's, so its shape is chosen by the thing
+	// being measured; a pass that spends its budget reports a floor and says
+	// so rather than running until somebody's deadline expires.
 	maxHandoffMeasureEntries = 1 << 20
-	// maxHandoffMeasureDepth bounds how deep one volume is walked, for the
-	// same reason.
+	maxHandoffMeasureOpens   = 1 << 16
+	// maxHandoffMeasureDepth bounds how deep one volume is walked. One open
+	// descriptor is held per level and never released while its children are
+	// being measured, so this is also the bound on descriptors in flight.
 	maxHandoffMeasureDepth = 64
+	// handoffReadChunk is how many names one directory read returns. Reading a
+	// whole directory at once would let a workload choose the helper's
+	// allocation, which is the same mistake as an unbounded walk.
+	handoffReadChunk = 256
+	// maxHandoffVolumeAnomalies bounds one volume's observations so a response
+	// cannot grow with a workload's tree.
+	maxHandoffVolumeAnomalies = 4
 )
 
 // handoffRetentionReceipt is the helper-owned terminal fact for one handoff
@@ -60,6 +73,12 @@ type handoffRetentionReceipt struct {
 	LogicalBytes int64     `json:"logical_bytes"`
 	DedupedBytes int64     `json:"deduped_bytes"`
 	Entries      int64     `json:"entries"`
+	// Truncated says the measurement above stopped early, so those figures are
+	// a floor. The terminal time is not a floor: it is exact, and it is the
+	// field retention runs from. A measurement that could not finish must
+	// still leave a terminal time, or a workload could keep its results
+	// forever by making its own tree too expensive to measure.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type handoffInodeIdentity struct {
@@ -68,10 +87,39 @@ type handoffInodeIdentity struct {
 }
 
 type handoffVolumeMeasurement struct {
-	logical int64
-	deduped int64
+	logical   int64
+	deduped   int64
+	entries   int64
+	truncated bool
+	anomalies []HandoffVolumeAnomaly
+}
+
+func (measurement *handoffVolumeMeasurement) note(anomaly HandoffVolumeAnomaly) {
+	if slices.Contains(measurement.anomalies, anomaly) || len(measurement.anomalies) >= maxHandoffVolumeAnomalies {
+		return
+	}
+	measurement.anomalies = append(measurement.anomalies, anomaly)
+}
+
+// handoffMeasureBudget is one pass's remaining work. It is shared across every
+// volume of a node-wide pass, so the whole call is bounded, not each volume.
+type handoffMeasureBudget struct {
 	entries int64
-	anomaly string
+	opens   int64
+}
+
+// newHandoffMeasureBudget is a method so a test can prove the bound without
+// planting a million files, the way the agent's per-run bound is a field
+// rather than a direct constant read.
+func (engine *ContainerdEngine) newHandoffMeasureBudget() *handoffMeasureBudget {
+	budget := &handoffMeasureBudget{entries: maxHandoffMeasureEntries, opens: maxHandoffMeasureOpens}
+	if engine.handoffMeasureEntryBudget > 0 {
+		budget.entries = engine.handoffMeasureEntryBudget
+	}
+	if engine.handoffMeasureOpenBudget > 0 {
+		budget.opens = engine.handoffMeasureOpenBudget
+	}
+	return budget
 }
 
 // handoffRetentionFact is one volume's retention state as the helper reads it
@@ -81,7 +129,7 @@ type handoffRetentionFact struct {
 	terminalAt    time.Time
 	terminalKnown bool
 	receipt       handoffRetentionReceipt
-	anomaly       string
+	anomaly       HandoffVolumeAnomaly
 }
 
 func (engine *ContainerdEngine) handoffVolumeRoot() string {
@@ -124,51 +172,6 @@ func (engine *ContainerdEngine) openHandoffVolume(name string) (*os.File, handof
 	return file, handoffInodeIdentity{device: uint64(stat.Dev), inode: stat.Ino}, nil
 }
 
-// readHandoffRetentionFact answers what this volume's retention runs from.
-//
-// An unreadable, invalid, or mismatched receipt is never an error that fails a
-// node-wide call: it comes back as terminalKnown=false plus an anomaly string,
-// the ComputerDiskAnomalies precedent. The caller then knows the volume is
-// evictable under a budget and is not expirable on a timestamp a workload
-// could have written.
-func (engine *ContainerdEngine) readHandoffRetentionFact(name string) (handoffRetentionFact, error) {
-	fact := handoffRetentionFact{}
-	info, identity, err := engine.openHandoffVolumeIdentity(name)
-	if err != nil {
-		return fact, err
-	}
-	fact.terminalAt = info.ModTime()
-	payload, err := os.ReadFile(engine.handoffRetentionPath(name))
-	if errors.Is(err, os.ErrNotExist) {
-		fact.anomaly = "no helper-owned retention receipt; the directory mtime is a workload-writable fallback"
-		return fact, nil
-	}
-	if err != nil {
-		fact.anomaly = "retention receipt could not be read: " + err.Error()
-		return fact, nil
-	}
-	var receipt handoffRetentionReceipt
-	if err := json.Unmarshal(payload, &receipt); err != nil || receipt.Version != handoffRetentionReceiptVersion {
-		fact.anomaly = "retention receipt is not a version-1 helper receipt"
-		return fact, nil
-	}
-	if receipt.Device != identity.device || receipt.Inode != identity.inode {
-		// The record is evidence and the descriptor is authority. A receipt
-		// naming a directory that is no longer the one standing at this name
-		// says nothing about the bytes that are there now.
-		fact.anomaly = "retention receipt names a different directory than the one standing at this volume's name"
-		return fact, nil
-	}
-	if receipt.TerminalAt.IsZero() {
-		fact.anomaly = "retention receipt carries no terminal time"
-		return fact, nil
-	}
-	fact.receipt = receipt
-	fact.terminalAt = receipt.TerminalAt
-	fact.terminalKnown = true
-	return fact, nil
-}
-
 // openHandoffVolumeIdentity is openHandoffVolume without keeping the handle:
 // the descriptor exists only to take an identity nothing could have swapped
 // underneath it.
@@ -185,6 +188,51 @@ func (engine *ContainerdEngine) openHandoffVolumeIdentity(name string) (os.FileI
 	return info, identity, nil
 }
 
+// readHandoffRetentionFact answers what this volume's retention runs from.
+//
+// An unreadable, invalid, or mismatched receipt is never an error that fails a
+// node-wide call: it comes back as terminalKnown=false plus an anomaly token,
+// the ComputerDiskAnomalies precedent. The caller then knows the volume is
+// evictable under a budget and is not expirable on a timestamp a workload
+// could have written.
+func (engine *ContainerdEngine) readHandoffRetentionFact(name string) (handoffRetentionFact, error) {
+	fact := handoffRetentionFact{}
+	info, identity, err := engine.openHandoffVolumeIdentity(name)
+	if err != nil {
+		return fact, err
+	}
+	fact.terminalAt = info.ModTime()
+	payload, err := os.ReadFile(engine.handoffRetentionPath(name))
+	if errors.Is(err, os.ErrNotExist) {
+		fact.anomaly = HandoffAnomalyNoReceipt
+		return fact, nil
+	}
+	if err != nil {
+		fact.anomaly = HandoffAnomalyReceiptUnreadable
+		return fact, nil
+	}
+	var receipt handoffRetentionReceipt
+	if err := json.Unmarshal(payload, &receipt); err != nil || receipt.Version != handoffRetentionReceiptVersion {
+		fact.anomaly = HandoffAnomalyReceiptInvalid
+		return fact, nil
+	}
+	if receipt.Device != identity.device || receipt.Inode != identity.inode {
+		// The record is evidence and the descriptor is authority. A receipt
+		// naming a directory that is no longer the one standing at this name
+		// says nothing about the bytes that are there now.
+		fact.anomaly = HandoffAnomalyReceiptMismatched
+		return fact, nil
+	}
+	if receipt.TerminalAt.IsZero() {
+		fact.anomaly = HandoffAnomalyReceiptInvalid
+		return fact, nil
+	}
+	fact.receipt = receipt
+	fact.terminalAt = receipt.TerminalAt
+	fact.terminalKnown = true
+	return fact, nil
+}
+
 func (engine *ContainerdEngine) handoffRetentionPath(volume string) string {
 	return filepath.Join(engine.handoffRetentionRoot(), HandoffRetentionRecordName(volume))
 }
@@ -193,23 +241,40 @@ func (engine *ContainerdEngine) handoffRetentionPath(volume string) string {
 //
 // It is called from Delete after the attempt's task has been reaped and its
 // absence independently verified -- the namespace is quiescent and no workload
-// can still be writing here -- and from the sweep for a volume that has no
-// receipt at all. Writing it is versioned, fsynced and write-then-rename, so a
-// crash leaves either the old receipt or the new one.
-func (engine *ContainerdEngine) writeHandoffRetentionReceipt(name string, terminalAt time.Time) error {
+// can still be writing here -- and from the sweep for a volume that has none.
+//
+// Measuring happens *outside* handoffRetentionMu, under the caller's context
+// and a bounded budget. The tree being measured is a workload's, so its cost
+// is a workload's choice; holding a node-wide lock across it let one run's
+// directory sit in front of every other attempt's Delete, and Delete's own
+// ten-second cleanup context did not bound it. The mutex now covers the
+// publish alone -- a few syscalls -- and the volume's identity is re-taken
+// under it, so figures measured against a directory that has since been
+// replaced are never published as that directory's.
+func (engine *ContainerdEngine) writeHandoffRetentionReceipt(ctx context.Context, name string, terminalAt time.Time) error {
 	if name == "" {
 		return nil
 	}
-	engine.handoffRetentionMu.Lock()
-	defer engine.handoffRetentionMu.Unlock()
 	file, identity, err := engine.openHandoffVolume(name)
 	if err != nil {
 		return err
 	}
-	measurement := measureHandoffVolume(file, nil)
-	closeErr := file.Close()
-	if closeErr != nil {
-		return closeErr
+	measurement := engine.measureHandoffVolume(ctx, name, file, nil, engine.newHandoffMeasureBudget())
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return engine.publishHandoffRetentionReceipt(name, identity, terminalAt, measurement)
+}
+
+func (engine *ContainerdEngine) publishHandoffRetentionReceipt(name string, measured handoffInodeIdentity, terminalAt time.Time, measurement handoffVolumeMeasurement) error {
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	_, identity, err := engine.openHandoffVolumeIdentity(name)
+	if err != nil {
+		return err
+	}
+	if identity != measured {
+		return fmt.Errorf("handoff volume %s was replaced while its terminal figures were measured", name)
 	}
 	root := engine.handoffRetentionRoot()
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -219,6 +284,7 @@ func (engine *ContainerdEngine) writeHandoffRetentionReceipt(name string, termin
 		Version: handoffRetentionReceiptVersion, Device: identity.device, Inode: identity.inode,
 		TerminalAt: terminalAt.UTC(), LogicalBytes: measurement.logical,
 		DedupedBytes: measurement.deduped, Entries: measurement.entries,
+		Truncated: measurement.truncated,
 	})
 }
 
@@ -231,20 +297,51 @@ func (engine *ContainerdEngine) removeHandoffRetentionReceipt(name string) error
 	return nil
 }
 
-// liveHandoffVolumes is the set of handoff volumes a live attempt of this
-// session is still writing into. Nothing stamps a terminal time on one of
-// these, and the inventory reports them as live so no budget ever treats an
-// unfinished run's bytes as an eviction candidate.
-func (engine *ContainerdEngine) liveHandoffVolumes() map[string]struct{} {
+// supersedeHandoffRetentionReceipt drops the prior terminal time when a volume
+// is prepared for reuse.
+//
+// Without this, a rerun of a stable owner key inherits the previous attempt's
+// receipt, which can expire while the new attempt is still running. The next
+// `Delete` then calls `Verify` first, which classified the volume and its
+// receipt as runtime residue, so `Absent` was never reached and the attempt
+// retried until its cleanup deadline instead of recording its own completion.
+//
+// A volume under a live attempt is deliberately left with no terminal time at
+// all: "this run has not finished" is exactly what no receipt means, and the
+// live-attempt guard keeps it out of expiry until its own Delete writes one.
+func (engine *ContainerdEngine) supersedeHandoffRetentionReceipt(name string) error {
+	return engine.removeHandoffRetentionReceipt(name)
+}
+
+// liveHandoffVolumes is the set of handoff volumes whose attempt this node has
+// not proved stopped.
+//
+// It is deliberately two sources. The in-memory attempts map is empty in a
+// freshly constructed engine, so a helper that restarted over a still-running
+// workload would have called every one of its volumes idle and stamped a
+// terminal time on a directory that was still being written. The durable
+// attempt-ownership records are what survive that restart, and they carry the
+// owner-key-derived handoff volume name precisely because the boot sweep
+// cannot re-derive it.
+func (engine *ContainerdEngine) liveHandoffVolumes() (map[string]struct{}, error) {
 	live := make(map[string]struct{})
 	engine.mu.Lock()
-	defer engine.mu.Unlock()
 	for _, attempt := range engine.attempts {
 		if name := attempt.resources.HandoffVolumeDirectory; name != "" {
 			live[name] = struct{}{}
 		}
 	}
-	return live
+	engine.mu.Unlock()
+	records, _, err := engine.loadAttemptOwnershipSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		if name := record.Resources.HandoffVolumeDirectory; name != "" {
+			live[name] = struct{}{}
+		}
+	}
+	return live, nil
 }
 
 func (engine *ContainerdEngine) handoffVolumeNames() ([]string, error) {
@@ -262,6 +359,43 @@ func (engine *ContainerdEngine) handoffVolumeNames() ([]string, error) {
 	return names, nil
 }
 
+// reconcileHandoffRetention is the sweep's whole handoff pass, and it runs
+// only once the node has proved its previous workloads stopped.
+//
+// Order matters and is the point. Reaping surviving tasks is mandatory and
+// happens first, in Sweep; this runs afterwards, against the post-reap
+// inventory, because a terminal time taken while a workload is still writing
+// is a lie the node then acts on for seven days. If anything of the runtime
+// survived the reap, nothing here runs at all.
+//
+// Everything here is best-effort per volume. A node upgraded with receiptless
+// volumes on a full filesystem used to fail on the first temporary receipt and
+// abort the whole pass -- before freeing the already-expired volumes that
+// would have made room -- and then do it again on the next boot. One volume's
+// failure now costs that volume its receipt until the next sweep, and nothing
+// else.
+func (engine *ContainerdEngine) reconcileHandoffRetention(ctx context.Context, now time.Time, remaining ResourceInventory) {
+	if surviving := len(remaining.Tasks) + len(remaining.Containers) + len(remaining.Shims); surviving != 0 {
+		log.Printf("handoff retention: %d runtime resource(s) survived the sweep, so no handoff volume is stamped or expired this pass", surviving)
+		return
+	}
+	names, err := engine.handoffVolumeNames()
+	if err != nil {
+		log.Printf("handoff retention: read the handoff root: %v", err)
+		return
+	}
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		log.Printf("handoff retention: read durable attempt ownership: %v", err)
+		return
+	}
+	engine.stampMissingHandoffRetentionReceipts(ctx, now, names, live)
+	engine.cleanupExpiredHandoffs(now, names, live)
+	if err := engine.removeOrphanHandoffRetentionReceipts(names); err != nil {
+		log.Printf("handoff retention: remove receipts whose volume is gone: %v", err)
+	}
+}
+
 // stampMissingHandoffRetentionReceipts converts crash residue into accounted,
 // expirable state.
 //
@@ -270,35 +404,43 @@ func (engine *ContainerdEngine) handoffVolumeNames() ([]string, error) {
 // workload's to write -- so without this it would sit on the node forever.
 // Stamping it at sweep time starts its retention window from a helper-owned
 // timestamp, which is the whole point: residue becomes something the node can
-// give back.
-func (engine *ContainerdEngine) stampMissingHandoffRetentionReceipts(now time.Time) error {
-	names, err := engine.handoffVolumeNames()
-	if err != nil {
-		return err
-	}
-	live := engine.liveHandoffVolumes()
+// give back. It runs on every sweep, so a volume a previous pass could not
+// stamp is repaired by the next one.
+func (engine *ContainerdEngine) stampMissingHandoffRetentionReceipts(ctx context.Context, now time.Time, names []string, live map[string]struct{}) {
+	budget := engine.newHandoffMeasureBudget()
 	for _, name := range names {
 		if _, writing := live[name]; writing {
 			continue
 		}
 		fact, err := engine.readHandoffRetentionFact(name)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
 		if err != nil {
-			// A volume whose descriptor cannot be taken is not one to stamp a
-			// terminal time on. It stays visible in the inventory with its
-			// anomaly.
+			if !errors.Is(err, os.ErrNotExist) {
+				log.Printf("handoff retention: read %s's terminal time: %v", name, err)
+			}
 			continue
 		}
 		if fact.terminalKnown {
 			continue
 		}
-		if err := engine.writeHandoffRetentionReceipt(name, now); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		if err := engine.stampOneHandoffRetentionReceipt(ctx, name, now, budget); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("handoff retention: stamp a terminal time on %s: %v (it keeps its files and the next sweep tries again)", name, err)
 		}
 	}
-	return engine.removeOrphanHandoffRetentionReceipts(names)
+}
+
+// stampOneHandoffRetentionReceipt measures and publishes one volume against a
+// budget the whole pass shares, so a node-wide migration is bounded rather
+// than each volume being bounded on its own.
+func (engine *ContainerdEngine) stampOneHandoffRetentionReceipt(ctx context.Context, name string, now time.Time, budget *handoffMeasureBudget) error {
+	file, identity, err := engine.openHandoffVolume(name)
+	if err != nil {
+		return err
+	}
+	measurement := engine.measureHandoffVolume(ctx, name, file, nil, budget)
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return engine.publishHandoffRetentionReceipt(name, identity, now, measurement)
 }
 
 // removeOrphanHandoffRetentionReceipts keeps the durable class honest: a
@@ -314,6 +456,7 @@ func (engine *ContainerdEngine) removeOrphanHandoffRetentionReceipts(volumes []s
 	for _, name := range volumes {
 		present[HandoffRetentionRecordName(name)] = struct{}{}
 	}
+	var failures []error
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, handoffVolumeNamePrefix) || !strings.HasSuffix(name, handoffRetentionRecordSuffix) {
@@ -326,17 +469,20 @@ func (engine *ContainerdEngine) removeOrphanHandoffRetentionReceipts(volumes []s
 		err := os.Remove(filepath.Join(engine.handoffRetentionRoot(), name))
 		engine.handoffRetentionMu.Unlock()
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			failures = append(failures, err)
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // handoffVolumeExpired is the single predicate for "this volume's retention
 // window has run out", and it is deliberately the same one the runtime-absence
-// projection reads. A volume the projection calls retained is exactly one this
-// will not remove.
-func (engine *ContainerdEngine) handoffVolumeExpired(name string, now time.Time) (bool, error) {
+// projection reads, live-attempt guard included. A volume the projection calls
+// retained is exactly one the sweep will not remove.
+func (engine *ContainerdEngine) handoffVolumeExpired(name string, now time.Time, live map[string]struct{}) (bool, error) {
+	if _, writing := live[name]; writing {
+		return false, nil
+	}
 	fact, err := engine.readHandoffRetentionFact(name)
 	if errors.Is(err, os.ErrNotExist) {
 		// A concurrently removed entry cannot be retained evidence.
@@ -354,6 +500,38 @@ func (engine *ContainerdEngine) handoffVolumeExpired(name string, now time.Time)
 	return now.Sub(fact.terminalAt) >= engine.handoffRetention(), nil
 }
 
+// cleanupExpiredHandoffs removes the handoff volumes whose retention window has
+// run out, and it runs from the helper-owned receipt rather than the directory
+// mtime.
+//
+// One volume it cannot read is one volume it does not remove. It used to
+// abort, which meant a single directory replaced by a symlink stopped a node
+// expiring anything at all.
+func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time, names []string, live map[string]struct{}) {
+	for _, name := range names {
+		expired, err := engine.handoffVolumeExpired(name, now, live)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				log.Printf("handoff retention: decide whether %s has expired: %v (it keeps its files)", name, err)
+			}
+			continue
+		}
+		if !expired {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("handoff retention: remove expired %s: %v", name, err)
+			continue
+		}
+		// The receipt is retained exactly while its volume is. Removing them
+		// together is what keeps "observed = residue union retained" true over
+		// the new durable class.
+		if err := engine.removeHandoffRetentionReceipt(name); err != nil {
+			log.Printf("handoff retention: remove %s's receipt after its volume: %v", name, err)
+		}
+	}
+}
+
 // InventoryHandoffVolumes reports every handoff volume this node still holds.
 //
 // One pass, one (device, inode) map: a file two volumes hard-link is charged
@@ -364,6 +542,12 @@ func (engine *ContainerdEngine) handoffVolumeExpired(name string, now time.Time)
 // No owner key crosses this boundary in either direction. The agent derives
 // every name it knows from its own runs, so a name here it cannot map back is
 // the crash-residue signal, and no identity the helper holds leaves it.
+//
+// The response is bounded in *encoded bytes*, not in rows. A frame over
+// MaxFrameBytes is not a shorter answer: the transport refuses it, the server
+// discards the write error and closes the connection, and the client reads
+// that as a lost session -- so a node with enough retained results would have
+// lost its runtime every time it tried to count them.
 func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
 	names, err := engine.handoffVolumeNames()
 	if err != nil {
@@ -374,132 +558,198 @@ func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ I
 		names = names[:MaxInventoriedHandoffVolumes]
 		response.Exhausted = true
 	}
-	live := engine.liveHandoffVolumes()
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		return InventoryHandoffVolumesResponse{}, err
+	}
 	seen := make(map[handoffInodeIdentity]struct{})
+	budget := engine.newHandoffMeasureBudget()
+	encoded := len(`{"volumes":[],"exhausted":false}`)
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
 			response.Exhausted = true
 			return response, nil
 		}
-		volume := RetainedHandoffVolume{Name: name}
-		if _, writing := live[name]; writing {
-			volume.Live = true
-		}
-		fact, err := engine.readHandoffRetentionFact(name)
-		if errors.Is(err, os.ErrNotExist) {
-			// Removed between the listing and the read. It is not on the node
-			// any more, so it is not in the node's figures.
+		volume, present := engine.retainedHandoffVolume(ctx, name, live, seen, budget)
+		if !present {
 			continue
 		}
+		size, err := json.Marshal(volume)
 		if err != nil {
-			volume.Anomaly = "handoff volume could not be opened as a helper-owned directory: " + err.Error()
-			response.Volumes = append(response.Volumes, volume)
-			continue
+			return InventoryHandoffVolumesResponse{}, err
 		}
-		volume.TerminalAt, volume.TerminalKnown, volume.Anomaly = fact.terminalAt.UTC(), fact.terminalKnown, fact.anomaly
-		file, _, err := engine.openHandoffVolume(name)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				volume.Anomaly = joinHandoffAnomaly(volume.Anomaly, "handoff volume could not be measured: "+err.Error())
-				response.Volumes = append(response.Volumes, volume)
-			}
-			continue
+		if encoded+len(size)+1 > MaxFrameBytes-handoffInventoryFrameHeadroom {
+			response.Exhausted = true
+			break
 		}
-		measurement := measureHandoffVolume(file, seen)
-		if err := file.Close(); err != nil {
-			measurement.anomaly = joinHandoffAnomaly(measurement.anomaly, "handoff volume descriptor could not be closed: "+err.Error())
-		}
-		volume.LogicalBytes, volume.DedupedBytes, volume.Entries = measurement.logical, measurement.deduped, measurement.entries
-		volume.Anomaly = joinHandoffAnomaly(volume.Anomaly, measurement.anomaly)
+		encoded += len(size) + 1
 		response.Volumes = append(response.Volumes, volume)
 	}
 	return response, nil
 }
 
-func joinHandoffAnomaly(left, right string) string {
-	switch {
-	case left == "":
-		return right
-	case right == "":
-		return left
-	default:
-		return left + "; " + right
+// retainedHandoffVolume reads and measures one volume. A volume that went away
+// between the listing and the read is not on the node any more, so it is not
+// in the node's figures at all, which `present` says.
+func (engine *ContainerdEngine) retainedHandoffVolume(ctx context.Context, name string, live map[string]struct{}, seen map[handoffInodeIdentity]struct{}, budget *handoffMeasureBudget) (RetainedHandoffVolume, bool) {
+	volume := RetainedHandoffVolume{Name: name}
+	if _, writing := live[name]; writing {
+		volume.Live = true
 	}
+	fact, err := engine.readHandoffRetentionFact(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return RetainedHandoffVolume{}, false
+	}
+	measurement := handoffVolumeMeasurement{}
+	if err != nil {
+		measurement.note(HandoffAnomalyVolumeUnreadable)
+		volume.Anomalies = measurement.anomalies
+		return volume, true
+	}
+	volume.TerminalAt, volume.TerminalKnown = fact.terminalAt.UTC(), fact.terminalKnown
+	if fact.anomaly != "" {
+		measurement.note(fact.anomaly)
+	}
+	file, _, err := engine.openHandoffVolume(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return RetainedHandoffVolume{}, false
+		}
+		measurement.note(HandoffAnomalyVolumeUnreadable)
+		volume.Anomalies = measurement.anomalies
+		return volume, true
+	}
+	walked := engine.measureHandoffVolume(ctx, name, file, seen, budget)
+	if err := file.Close(); err != nil {
+		walked.note(HandoffAnomalyVolumeUnreadable)
+	}
+	for _, anomaly := range walked.anomalies {
+		measurement.note(anomaly)
+	}
+	volume.LogicalBytes, volume.DedupedBytes, volume.Entries = walked.logical, walked.deduped, walked.entries
+	volume.Truncated, volume.Anomalies = walked.truncated, measurement.anomalies
+	return volume, true
 }
 
 // measureHandoffVolume walks one volume through a descriptor that is already
-// open, breadth-first, holding exactly one directory handle at a time.
+// open.
 //
-// Symlinks are never followed and never descended into, so a workload cannot
-// point the measurement at the rest of the node. `seen`, when it is supplied,
-// spans a whole pass over the handoff root, which is what makes the deduped
-// figure a node figure rather than a per-volume one; a nil map measures this
-// volume alone, which is what a receipt records.
-func measureHandoffVolume(volume *os.File, seen map[handoffInodeIdentity]struct{}) handoffVolumeMeasurement {
+// Every fact about an entry is taken relative to the still-open descriptor of
+// the directory it was listed in -- `Fstatat` with AT_SYMLINK_NOFOLLOW, never
+// a pathname -- and every subdirectory is entered with `openat` from that same
+// descriptor, no-follow, with its identity re-checked against what was just
+// observed. An earlier draft read names, closed the directory, and then called
+// `DirEntry.Info()`, which resolves by pathname: a workload that replaced an
+// enumerated ancestor with a symlink in that window would have had the helper
+// stat outside the tree it had pinned.
+//
+// One descriptor is held per level and none is released while its children are
+// being measured, so a queued ancestor can never be re-opened into something
+// else. Depth is bounded, so this costs at most maxHandoffMeasureDepth open
+// descriptors.
+//
+// `seen`, when it is supplied, spans a whole pass over the handoff root, which
+// is what makes the deduped figure a node figure rather than a per-volume one;
+// a nil map measures this volume alone, which is what a receipt records.
+func (engine *ContainerdEngine) measureHandoffVolume(ctx context.Context, name string, volume *os.File, seen map[handoffInodeIdentity]struct{}, budget *handoffMeasureBudget) handoffVolumeMeasurement {
 	measurement := handoffVolumeMeasurement{}
-	type frame struct {
-		path  string
-		depth int
+	if engine.handoffMeasureEntered != nil {
+		engine.handoffMeasureEntered(name)
 	}
-	pending := []frame{{path: ".", depth: 0}}
-	for len(pending) > 0 {
-		current := pending[0]
-		pending = pending[1:]
-		directory, err := openHandoffSubdirectory(volume, current.path)
-		if err != nil {
-			measurement.anomaly = joinHandoffAnomaly(measurement.anomaly, "a directory under this volume could not be read: "+err.Error())
-			continue
-		}
-		children, readErr := directory.ReadDir(-1)
-		closeErr := directory.Close()
-		if readErr != nil {
-			measurement.anomaly = joinHandoffAnomaly(measurement.anomaly, "a directory under this volume could not be read: "+readErr.Error())
-		}
-		if closeErr != nil {
-			measurement.anomaly = joinHandoffAnomaly(measurement.anomaly, "a directory handle under this volume could not be closed: "+closeErr.Error())
-		}
-		for _, child := range children {
-			if measurement.entries >= maxHandoffMeasureEntries {
-				measurement.anomaly = joinHandoffAnomaly(measurement.anomaly, "measurement stopped at its entry bound; these figures are a floor")
-				return measurement
-			}
-			measurement.entries++
-			info, err := child.Info()
-			if err != nil {
-				// An entry that went away between the listing and the stat is
-				// not on the node any more.
-				continue
-			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				continue
-			}
-			if info.IsDir() {
-				if current.depth+1 >= maxHandoffMeasureDepth {
-					measurement.anomaly = joinHandoffAnomaly(measurement.anomaly, "measurement stopped at its depth bound; these figures are a floor")
-					continue
-				}
-				pending = append(pending, frame{path: filepath.Join(current.path, child.Name()), depth: current.depth + 1})
-				continue
-			}
-			if !info.Mode().IsRegular() {
-				continue
-			}
-			measurement.logical += info.Size()
-			if !chargeHandoffInode(info, seen) {
-				continue
-			}
-			measurement.deduped += info.Size()
-		}
+	duplicate, err := unix.Dup(int(volume.Fd()))
+	if err != nil {
+		measurement.note(HandoffAnomalyVolumeUnreadable)
+		return measurement
+	}
+	directory := os.NewFile(uintptr(duplicate), volume.Name())
+	engine.walkHandoffDirectory(ctx, name, directory, 0, seen, budget, &measurement)
+	if err := directory.Close(); err != nil {
+		measurement.note(HandoffAnomalyVolumeUnreadable)
+	}
+	if measurement.truncated {
+		measurement.note(HandoffAnomalyMeasurementTruncated)
 	}
 	return measurement
+}
+
+func (engine *ContainerdEngine) walkHandoffDirectory(ctx context.Context, volume string, directory *os.File, depth int, seen map[handoffInodeIdentity]struct{}, budget *handoffMeasureBudget, measurement *handoffVolumeMeasurement) {
+	descriptor := int(directory.Fd())
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			measurement.truncated = true
+			return
+		}
+		names, err := directory.Readdirnames(handoffReadChunk)
+		if err != nil && !errors.Is(err, io.EOF) {
+			measurement.note(HandoffAnomalyVolumeUnreadable)
+			return
+		}
+		for _, entry := range names {
+			if budget.entries <= 0 {
+				measurement.truncated = true
+				return
+			}
+			budget.entries--
+			measurement.entries++
+			var stat unix.Stat_t
+			if unix.Fstatat(descriptor, entry, &stat, unix.AT_SYMLINK_NOFOLLOW) != nil {
+				// Gone between the listing and the stat, or unreadable. Either
+				// way there is nothing here to count.
+				continue
+			}
+			switch stat.Mode & unix.S_IFMT {
+			case unix.S_IFDIR:
+				engine.descendHandoffDirectory(ctx, volume, descriptor, entry, stat, depth, seen, budget, measurement)
+			case unix.S_IFREG:
+				measurement.logical += stat.Size
+				if chargeHandoffInode(stat, seen) {
+					measurement.deduped += stat.Size
+				}
+			}
+		}
+		if errors.Is(err, io.EOF) || len(names) == 0 {
+			return
+		}
+	}
+}
+
+func (engine *ContainerdEngine) descendHandoffDirectory(ctx context.Context, volume string, parent int, entry string, observed unix.Stat_t, depth int, seen map[handoffInodeIdentity]struct{}, budget *handoffMeasureBudget, measurement *handoffVolumeMeasurement) {
+	if depth+1 >= maxHandoffMeasureDepth || budget.opens <= 0 {
+		measurement.truncated = true
+		return
+	}
+	budget.opens--
+	if engine.handoffMeasureDescend != nil {
+		engine.handoffMeasureDescend(volume, entry)
+	}
+	child, err := unix.Openat(parent, entry, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		// It was a directory a moment ago and is not one now, or cannot be
+		// entered. It is counted as an entry and measured as nothing.
+		measurement.note(HandoffAnomalySubtreeReplaced)
+		return
+	}
+	var actual unix.Stat_t
+	if unix.Fstat(child, &actual) != nil || actual.Dev != observed.Dev || actual.Ino != observed.Ino {
+		// A different directory now stands where this pass was about to
+		// measure. Measuring it would attribute another tree's bytes to this
+		// volume, so it is reported and not measured.
+		unix.Close(child)
+		measurement.note(HandoffAnomalySubtreeReplaced)
+		return
+	}
+	file := os.NewFile(uintptr(child), entry)
+	engine.walkHandoffDirectory(ctx, volume, file, depth+1, seen, budget, measurement)
+	if err := file.Close(); err != nil {
+		measurement.note(HandoffAnomalyVolumeUnreadable)
+	}
 }
 
 // chargeHandoffInode reports whether this file's bytes belong in the deduped
 // figure. A file with one link is always its own; a file with several is
 // charged to whichever entry of the pass reached it first.
-func chargeHandoffInode(info os.FileInfo, seen map[handoffInodeIdentity]struct{}) bool {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Nlink <= 1 || seen == nil {
+func chargeHandoffInode(stat unix.Stat_t, seen map[handoffInodeIdentity]struct{}) bool {
+	if stat.Nlink <= 1 || seen == nil {
 		return true
 	}
 	identity := handoffInodeIdentity{device: uint64(stat.Dev), inode: stat.Ino}
@@ -508,40 +758,6 @@ func chargeHandoffInode(info os.FileInfo, seen map[handoffInodeIdentity]struct{}
 	}
 	seen[identity] = struct{}{}
 	return true
-}
-
-// openHandoffSubdirectory descends by descriptor from the volume's own handle,
-// one component at a time, refusing a symlink at every component. The volume
-// is workload-writable, so a path resolved by name would be a path the
-// workload chooses.
-func openHandoffSubdirectory(volume *os.File, path string) (*os.File, error) {
-	if path == "." {
-		duplicate, err := unix.Dup(int(volume.Fd()))
-		if err != nil {
-			return nil, err
-		}
-		return os.NewFile(uintptr(duplicate), volume.Name()), nil
-	}
-	current := int(volume.Fd())
-	opened := -1
-	defer func() {
-		if opened >= 0 {
-			unix.Close(opened)
-		}
-	}()
-	for _, component := range strings.Split(path, string(filepath.Separator)) {
-		next, err := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return nil, err
-		}
-		if opened >= 0 {
-			unix.Close(opened)
-		}
-		opened, current = next, next
-	}
-	file := os.NewFile(uintptr(opened), filepath.Join(volume.Name(), path))
-	opened = -1
-	return file, nil
 }
 
 // writeAtomicDurableJSONRecord is writeAtomicDurableOwnerRecord's shape for a

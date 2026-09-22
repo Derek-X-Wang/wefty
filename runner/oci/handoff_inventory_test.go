@@ -2,6 +2,7 @@ package oci
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestRetainedHandoffInventoryCrossesTheRuntimeSeamIntact(t *testing.T) {
 	engine := &handoffInventoryEngine{response: ocihelper.InventoryHandoffVolumesResponse{
 		Volumes: []ocihelper.RetainedHandoffVolume{
 			{Name: name, TerminalAt: terminal, TerminalKnown: true, LogicalBytes: 4096, DedupedBytes: 4096, Entries: 3},
-			{Name: "wefty-handoff-volume-deadbeefdeadbeefdeadbeefdeadbeef", Live: true, Anomaly: "no helper-owned retention receipt"},
+			{Name: "wefty-handoff-volume-deadbeefdeadbeefdeadbeefdeadbeef", Live: true, Anomalies: []ocihelper.HandoffVolumeAnomaly{ocihelper.HandoffAnomalyNoReceipt}},
 		},
 		Exhausted: true,
 	}}
@@ -50,11 +51,11 @@ func TestRetainedHandoffInventoryCrossesTheRuntimeSeamIntact(t *testing.T) {
 	}
 	first := report.Volumes[0]
 	if first.Name != name || !first.TerminalKnown || !first.TerminalAt.Equal(terminal) ||
-		first.LogicalBytes != 4096 || first.DedupedBytes != 4096 || first.Entries != 3 || first.Live || first.Anomaly != "" {
+		first.LogicalBytes != 4096 || first.DedupedBytes != 4096 || first.Entries != 3 || first.Live || len(first.Anomalies) != 0 {
 		t.Fatalf("the retained volume lost facts crossing the seam: %+v", first)
 	}
 	second := report.Volumes[1]
-	if !second.Live || second.TerminalKnown || second.Anomaly == "" {
+	if !second.Live || second.TerminalKnown || !slices.Equal(second.Anomalies, []string{string(ocihelper.HandoffAnomalyNoReceipt)}) {
 		t.Fatalf("the live, receiptless volume lost facts crossing the seam: %+v", second)
 	}
 }

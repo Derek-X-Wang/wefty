@@ -5774,3 +5774,74 @@ func TestRetainedHandoffInventoryFailureDoesNotInvalidateSession(t *testing.T) {
 		t.Fatalf("a failed accounting read marked the live helper session lost: %v", err)
 	}
 }
+
+// A response the transport refuses is not a smaller answer. The server
+// discards the write error and closes the connection, and the client reads
+// that as a lost session -- so a node with enough retained results would have
+// lost its runtime every time it tried to count them. The engine bounds the
+// response in encoded bytes; this proves that a response at that bound still
+// crosses the wire and leaves the session usable.
+func TestAMaximumSizedRetainedHandoffInventoryKeepsTheSessionUsable(t *testing.T) {
+	budget := MaxFrameBytes - handoffInventoryFrameHeadroom
+	response := InventoryHandoffVolumesResponse{Exhausted: true}
+	encoded := len(`{"volumes":[],"exhausted":false}`)
+	for index := 0; ; index++ {
+		volume := RetainedHandoffVolume{
+			Name:         fmt.Sprintf("%s%064x", handoffVolumeNamePrefix, index),
+			TerminalAt:   testStartedAt(),
+			LogicalBytes: 1 << 40, DedupedBytes: 1 << 40, Entries: 1 << 20,
+			Anomalies: []HandoffVolumeAnomaly{
+				HandoffAnomalyNoReceipt, HandoffAnomalyMeasurementTruncated,
+				HandoffAnomalySubtreeReplaced, HandoffAnomalyVolumeUnreadable,
+			},
+		}
+		row, err := json.Marshal(volume)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if encoded+len(row)+1 > budget {
+			break
+		}
+		encoded += len(row) + 1
+		response.Volumes = append(response.Volumes, volume)
+	}
+	if len(response.Volumes) == 0 {
+		t.Fatal("the fixture built no response at all")
+	}
+
+	engine := newFakeEngine()
+	engine.handoffInventory = response
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	received, err := session.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatalf("a maximum-sized retained handoff inventory did not cross the wire: %v", err)
+	}
+	if len(received.Volumes) != len(response.Volumes) || !received.Exhausted {
+		t.Fatalf("received %d volumes (exhausted=%v), sent %d", len(received.Volumes), received.Exhausted, len(response.Volumes))
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("a maximum-sized accounting response cost the node its session: %v", err)
+	}
+	// The same response one row larger is what the engine's budget exists to
+	// prevent: it is refused by the transport, not truncated.
+	oversize := response
+	oversize.Volumes = append(slices.Clone(response.Volumes), response.Volumes[0])
+	for len(oversize.Volumes) < 2*len(response.Volumes) {
+		oversize.Volumes = append(oversize.Volumes, response.Volumes[0])
+	}
+	body, err := json.Marshal(oversize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= MaxFrameBytes {
+		t.Fatalf("the oversize fixture is %d bytes, which the transport would still accept", len(body))
+	}
+}

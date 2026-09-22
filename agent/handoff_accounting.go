@@ -782,9 +782,9 @@ func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
 		status.Runs, status.InFlight, status.LogicalBytes, status.ChargedBytes, status.Entries,
 		status.QuarantinedRecords, status.Truncated, status.Replaced, status.Unrecorded, m.root)
 	if status.OCI != nil {
-		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live), %d logical bytes, %d deduped bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d carrying a name no run of this node derives%s",
+		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live), %d logical bytes, %d deduped bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d measured incompletely, whose figures are a floor; %d carrying a name no run of this node derives%s",
 			status.OCI.Volumes, status.OCI.Live, status.OCI.LogicalBytes, status.OCI.DedupedBytes, status.OCI.Entries,
-			status.OCI.TerminalUnknown, status.OCI.Anomalies, status.OCI.Unattributable,
+			status.OCI.TerminalUnknown, status.OCI.Anomalies, status.OCI.Truncated, status.OCI.Unattributable,
 			map[bool]string{true: "; the helper holds more than it reported, so these are a floor"}[status.OCI.Exhausted])
 	}
 	if m.observeAccounting != nil {
@@ -1112,9 +1112,12 @@ func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIRes
 		if !volume.TerminalKnown {
 			status.TerminalUnknown++
 		}
-		if volume.Anomaly != "" {
+		if volume.Truncated {
+			status.Truncated++
+		}
+		if len(volume.Anomalies) != 0 {
 			status.Anomalies++
-			m.log("agent: the OCI helper's handoff volume %s: %s", volume.Name, volume.Anomaly)
+			m.log("agent: the OCI helper's handoff volume %s: %s", volume.Name, strings.Join(volume.Anomalies, ", "))
 		}
 		if _, placed := known[volume.Name]; !placed {
 			status.Unattributable++

@@ -1813,12 +1813,51 @@ type RetainedHandoffVolume struct {
 	// Live says a live attempt of this session is still writing here. Its
 	// results are not retained yet and it is nobody's eviction candidate.
 	Live bool `json:"live"`
-	// Anomaly is the per-volume observation that must not fail a node-wide
-	// call: an unreadable or mismatched receipt, or a measurement that spent
-	// its budget. Empty means the volume was read whole, the
-	// ComputerDiskAnomalies precedent.
-	Anomaly string `json:"anomaly,omitempty"`
+	// Truncated says the measurement stopped early -- budget, depth or
+	// cancellation -- so the byte and entry figures are a floor rather than a
+	// measurement. The terminal time above is never a floor.
+	Truncated bool `json:"truncated,omitempty"`
+	// Anomalies are the per-volume observations that must not fail a
+	// node-wide call, the ComputerDiskAnomalies precedent. They are a closed
+	// token vocabulary, deduplicated and capped, rather than free text,
+	// because a response's size must not be a function of what a workload
+	// wrote: a frame over MaxFrameBytes costs the node its session, not its
+	// accounting. Empty means the volume was read whole.
+	Anomalies []HandoffVolumeAnomaly `json:"anomalies,omitempty"`
 }
+
+// HandoffVolumeAnomaly is the closed vocabulary of per-volume observations.
+//
+// It is a fixed token set rather than free text for two reasons: a reader and
+// a later consumer should name the same condition, and a response's size must
+// not be a function of what a workload wrote. An earlier draft carried the
+// walker's own error strings, repeated per failure, which made a node-wide
+// read's frame unbounded.
+type HandoffVolumeAnomaly string
+
+const (
+	// HandoffAnomalyNoReceipt: no helper-owned terminal time exists, so the
+	// reported one is the directory's mtime, which the workload owns.
+	HandoffAnomalyNoReceipt HandoffVolumeAnomaly = "no_receipt"
+	// HandoffAnomalyReceiptUnreadable: the receipt is there and could not be
+	// read.
+	HandoffAnomalyReceiptUnreadable HandoffVolumeAnomaly = "receipt_unreadable"
+	// HandoffAnomalyReceiptInvalid: the receipt is not a version-1 helper
+	// receipt, or carries no terminal time.
+	HandoffAnomalyReceiptInvalid HandoffVolumeAnomaly = "receipt_invalid"
+	// HandoffAnomalyReceiptMismatched: the receipt names a different directory
+	// than the one standing at this volume's name.
+	HandoffAnomalyReceiptMismatched HandoffVolumeAnomaly = "receipt_identity_mismatch"
+	// HandoffAnomalyVolumeUnreadable: the volume itself could not be opened or
+	// enumerated as a helper-owned directory.
+	HandoffAnomalyVolumeUnreadable HandoffVolumeAnomaly = "volume_unreadable"
+	// HandoffAnomalyMeasurementTruncated: the pass stopped early -- budget,
+	// depth, or cancellation -- so the figures are a floor.
+	HandoffAnomalyMeasurementTruncated HandoffVolumeAnomaly = "measurement_truncated"
+	// HandoffAnomalySubtreeReplaced: a directory stopped being the one this
+	// pass had just observed, so it was counted rather than measured.
+	HandoffAnomalySubtreeReplaced HandoffVolumeAnomaly = "subtree_replaced"
+)
 
 // InventoryHandoffVolumesRequest carries nothing beyond the session envelope.
 // Attempt authority is not merely unnecessary here, it is unrepresentable: a
@@ -1837,6 +1876,16 @@ type InventoryHandoffVolumesResponse struct {
 // told that it holds more than it was shown, and never handed an unbounded
 // frame.
 const MaxInventoriedHandoffVolumes = 4096
+
+// handoffInventoryFrameHeadroom is what one InventoryHandoffVolumes response
+// leaves below MaxFrameBytes for the reply envelope and framing.
+//
+// A frame the transport refuses is not a smaller answer: the server discards
+// the write error and closes the connection, and the client reads that as a
+// lost session. A row cap alone did not bound this -- 4096 receiptless volumes
+// encode past MaxFrameBytes on their own -- so the budget is in encoded bytes.
+// Accounting must never cost a node its runtime.
+const handoffInventoryFrameHeadroom = 64 << 10
 
 // HandoffRetentionRecordName maps one handoff volume directory to the
 // helper-owned receipt that carries its terminal time. Both sides spell it
