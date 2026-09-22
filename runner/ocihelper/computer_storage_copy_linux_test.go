@@ -509,6 +509,121 @@ func TestDelayedAttachmentRechecksRefusalAfterAcquiringGeneration(t *testing.T) 
 	}
 }
 
+// The disk sweep quarantines a generation by renaming diskRoot into
+// computer-disk-quarantine while holding that same root's own flock -- the
+// same door #512 already closed for the clone-refusal tombstone. Losing that
+// race against a concurrent quarantine must fail exactly the same way: the
+// fresh, empty diskRoot MkdirAll recreates on a new inode must never be
+// mistaken for the durable first-allocation checkpoint the sweep just
+// displaced, or attach would format an empty disk under a quarantined
+// identity -- the outcome #512 exists to prevent, through the quarantine
+// door instead of the refusal door.
+func TestDelayedAttachmentRechecksQuarantineAfterAcquiringGeneration(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	storage := testComputerStorage()
+	name, err := deterministicComputerDiskName(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(root, "computer-disks", name)
+
+	// Leave behind the durable first-allocation checkpoint: an authority
+	// manifest with no image and no attachment history at all.
+	seed := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerDiskHook: func(checkpoint computerDiskCheckpoint) error {
+			if checkpoint == computerDiskManifestBeforeImage {
+				return errors.New("injected: stop before the image is written")
+			}
+			return nil
+		}}
+	if _, err := seed.attachComputerDisk(t.Context(), storage, testComputerAuthority("seed", "seed-fence", "boot-a")); err == nil {
+		t.Fatal("seed attach did not stop before the image")
+	}
+	if _, err := os.Lstat(filepath.Join(diskRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seed left a disk image behind: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	checked := make(chan struct{})
+	resume := make(chan struct{})
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerDiskHook: func(checkpoint computerDiskCheckpoint) error {
+			if checkpoint == computerDiskPreLockChecked {
+				close(checked)
+				select {
+				case <-resume:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}}
+	attached := make(chan error, 1)
+	go func() {
+		attachment, err := engine.attachComputerDisk(ctx, storage, testComputerAuthority("attempt-a", "fence-a", "boot-a"))
+		if attachment != nil {
+			_ = engine.detachComputerDisk(attachment, computerDiskReapReceipt, "")
+		}
+		attached <- err
+	}()
+
+	select {
+	case <-checked:
+	case <-ctx.Done():
+		t.Fatal("attach never reached its pre-lock checkpoint", ctx.Err())
+	}
+
+	// Quarantine diskRoot exactly as the sweep does: take its own flock, then
+	// rename it away while still holding that flock.
+	sweepLock, err := openComputerDiskLock(diskRoot)
+	if err != nil {
+		t.Fatalf("sweep could not take diskRoot's flock: %v", err)
+	}
+	sweeper := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if err := sweeper.quarantineComputerDiskAnomaly(diskRoot, name, storage, "test_injected"); err != nil {
+		t.Fatalf("sweep quarantine: %v", err)
+	}
+	closeComputerDiskLock(sweepLock)
+
+	// The attachment has passed its pre-lock checks. Only now let it acquire
+	// the flock on the fresh, empty root the sweep's rename left behind.
+	close(resume)
+
+	var quarantined *ComputerStorageQuarantinedError
+	select {
+	case err := <-attached:
+		if !errors.As(err, &quarantined) {
+			t.Fatalf("delayed attachment raced the quarantine sweep: %v, want a typed quarantine refusal", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("delayed attachment did not complete", ctx.Err())
+	}
+
+	if _, err := os.Lstat(filepath.Join(diskRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attach formatted a fresh disk under the quarantined identity: %v", err)
+	}
+	quarantineRoot := filepath.Join(root, "computer-disk-quarantine")
+	entries, err := os.ReadDir(quarantineRoot)
+	if err != nil {
+		t.Fatalf("read quarantine directory: %v", err)
+	}
+	found := false
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), name+"-anomaly-") {
+			continue
+		}
+		found = true
+		if _, err := os.Lstat(filepath.Join(quarantineRoot, entry.Name(), "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the quarantined root gained a disk image after quarantine: %v", err)
+		}
+	}
+	if !found {
+		t.Fatal("quarantine directory does not hold the renamed root")
+	}
+}
+
 // Unlinking a pathname is not absence. While the copied filesystem is still
 // mounted or loop-attached, its bytes remain reachable, so no receipt may
 // certify that the destination holds nothing.

@@ -31,6 +31,7 @@ type computerDiskCheckpoint string
 
 const (
 	computerDiskRefusalChecked      computerDiskCheckpoint = "refusal_checked"
+	computerDiskPreLockChecked      computerDiskCheckpoint = "pre_lock_checked"
 	computerDiskRootRemoved         computerDiskCheckpoint = "root_removed"
 	computerDiskRemovalAbsent       computerDiskCheckpoint = "removal_absent"
 	computerDiskManifestBeforeImage computerDiskCheckpoint = "manifest_before_image"
@@ -169,6 +170,20 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if err = engine.computerDiskCheckpoint(computerDiskRefusalChecked); err != nil {
 		return nil, err
 	}
+	// The disk sweep quarantines a generation by renaming diskRoot into
+	// computer-disk-quarantine while holding this same flock. Record which
+	// directory the checks above just inspected so it can be compared, once
+	// the flock is held, against whatever directory MkdirAll leaves in place:
+	// if the sweep wins the race, MkdirAll recreates an empty diskRoot with a
+	// fresh inode, and every check above was answered by bytes that are no
+	// longer there.
+	preLockRootInfo, statErr := os.Lstat(diskRoot)
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat Computer disk root before its attachment lock: %w", statErr)
+	}
+	if err = engine.computerDiskCheckpoint(computerDiskPreLockChecked); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create Computer disk root: %w", err)
 	}
@@ -186,6 +201,22 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, errComputerStorageAttachmentOwned
 	}
+	// The generation flock is now held. Every optimistic check taken before
+	// it -- quarantine, pending-resume, and refusal -- can have been answered
+	// by a diskRoot the sweep has since quarantined out from under this call,
+	// so each is re-read against the directory this call now owns before any
+	// of it is trusted. A missing manifest/image here must never become
+	// permission to allocate a fresh disk under a quarantined identity.
+	if quarantined, err := computerDiskQuarantined(engine.config.RuntimeRoot, storage); err != nil {
+		return nil, err
+	} else if quarantined {
+		return nil, &ComputerStorageQuarantinedError{Storage: storage}
+	}
+	if pending, pendingErr := engine.computerStorageResumePending(diskRoot, name); pendingErr != nil {
+		return nil, pendingErr
+	} else if pending {
+		return nil, &ComputerStorageResumeDeferredError{Storage: storage}
+	}
 	// Refusal may finish between the optimistic check and flock acquisition.
 	// Re-read while owning the generation before interpreting a missing image
 	// as permission to allocate a fresh disk.
@@ -193,6 +224,25 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		return nil, refusalErr
 	} else if absent {
 		return nil, errors.New("Computer Storage generation was refused and holds no bytes")
+	}
+	// A quarantine or pending-resume record can itself lag the rename that
+	// produced it. The directory this call is about to operate on must
+	// therefore be proven the same directory the pre-lock checks inspected,
+	// by inode, not merely absent from those record scans.
+	postLockRoot, openErr := os.Open(diskRoot)
+	if openErr != nil {
+		return nil, fmt.Errorf("open Computer disk root under its attachment lock: %w", openErr)
+	}
+	postLockRootInfo, fstatErr := postLockRoot.Stat()
+	closeErr := postLockRoot.Close()
+	if fstatErr != nil {
+		return nil, fmt.Errorf("stat Computer disk root under its attachment lock: %w", fstatErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close Computer disk root under its attachment lock: %w", closeErr)
+	}
+	if preLockRootInfo != nil && !os.SameFile(preLockRootInfo, postLockRootInfo) {
+		return nil, errors.New("Computer disk root was replaced while its attachment lock was being acquired")
 	}
 	// The node-wide mutex only orders manifest/flock admission against
 	// preflight. The generation flock now owns this disk, so formatting and
