@@ -297,6 +297,13 @@ const (
 // what a later attempt decides about the path.
 const CustodyExportWriteStarted = "external_write_started"
 
+// CustodyExportWriteCompleted is the typed refusal for an export whose
+// helper already wrote and verified the external bytes in an earlier
+// invocation whose acknowledgement never reached L1. Like
+// CustodyExportWriteStarted it is never an untouched refusal; it says more,
+// namely that the operator's storage holds a complete verified copy.
+const CustodyExportWriteCompleted = "external_write_completed"
+
 // CustodyExportLeftDestinationUntouched reports whether a durable Custody
 // export ended without the helper creating, writing, or replacing anything at
 // the operator destination. Only such an export leaves the source Storage

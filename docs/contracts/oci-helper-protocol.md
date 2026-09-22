@@ -1367,22 +1367,37 @@ storage that never reaches the host. All four refusals carry the node-facing
 roots in the receipt and are raised before any directory is created, any
 manifest is written, and any Backup byte is read.
 
-The descriptors admission opened stay open. Every later step — creating the
-missing directories, reading and publishing `custody.json` through a
+The configured root is acquired the same way: one `O_NOFOLLOW` directory
+open per component from the filesystem root, the only anchor nothing can
+substitute, each component proved to be the non-symlink directory the helper
+had just looked at. Checking a path's components and then opening the whole
+path by name would leave a window in which an ancestor becomes a symlink.
+The descriptors admission opened then stay open. Every later step — creating
+the missing directories, reading and publishing `custody.json` through a
 temporary file and a rename, opening, truncating, writing, syncing and
 re-hashing `storage.ext4`, and fsyncing the directory — is performed relative
-to those descriptors, never by re-resolving a pathname, so an ancestor
-replaced after admission cannot redirect a privileged write. The opened root
-is verified to still be the directory its configured path named.
+to those descriptors, never by re-resolving a pathname. Each directory
+preparation creates or finds, including one that already exists, faces the
+admission checks again — non-symlink directory, same shared filesystem, not
+the managed root — before any chmod, chown or write reaches it, because a
+component missing at admission can appear as a mount of something else
+before preparation opens it. The shared mount's own device is likewise read
+from descriptors, not from a path.
 
-Before the first byte the helper places on operator storage, a directory
-included, it durably records a write-started marker in its own managed state,
-keyed to the Computer and export identity. While that marker exists, no
+Before the first byte of the Storage the helper places on operator storage —
+the manifest and the disk; an empty operator-owned directory is not one — it
+durably records a write-started record in its own managed state, keyed to the
+Computer and export identity, published with the same create-write-fsync-
+rename-fsync discipline as any other durable record and with the managed root
+fsynced the first time that directory appears. While a record exists, no
 invocation of that export may return a refusal that claims the destination
-was never touched: the typed answer becomes `external_write_started`, which
-L1 treats as tainting. The marker is removed only when the external bytes and
-manifest have both been digest-verified, so a crash, a restart or an upgrade
-between attempts preserves the uncertainty rather than losing it.
+was never touched: the typed answer is `external_write_started`, or
+`external_write_completed` once the bytes and manifest have been verified.
+L1 treats both as tainting. The helper never deletes a record — a verified
+export rewrites it in place, so an acknowledgement lost between the receipt
+and L1 still leaves durable evidence that the bytes exist. The records for a
+Computer are removed only when its last Storage generation leaves the node,
+by the removal path, and nothing outside that directory is touched.
 
 `CopyComputerStorage(import)` admits its external source through the same
 decision and likewise keeps the verified disk descriptor open for the copy

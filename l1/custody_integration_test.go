@@ -395,23 +395,61 @@ func TestCustodyExportRefusedBeforeAnyExternalByteLeavesTheSourceUntainted(t *te
 	}
 }
 
-func TestCustodyExportWriteStartedTaintsTheSource(t *testing.T) {
-	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
-	_, directive := beginCustodyExport(t, h, node, computer, backup, "write-started")
-	refusal := successfulCustodyExportReceipt(directive)
-	refusal.Kind, refusal.ManifestDigest = "computer_custody_export_failed", ""
-	refusal.FailureCode = contract.CustodyExportWriteStarted
-	refusal.ExternalOwnerUID, refusal.ExternalOwnerGID = 0, 0
-	refusal.OwnershipApplied, refusal.PrivateModeApplied = false, false
-	refused, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
-		computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: refusal.ReceiptID, Receipt: refusal})
-	if err != nil || refused.Status != "failed" || refused.FailureCode != contract.CustodyExportWriteStarted {
-		t.Fatalf("write-started Custody export = %#v err=%v", refused, err)
-	}
-	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
-	if err != nil || !provenance.CustodyTainted {
-		t.Fatalf("an export that began writing left the source untainted = %#v err=%v", provenance, err)
+func TestCustodyExportThatTouchedTheDestinationTaintsAndReducesRemoval(t *testing.T) {
+	for _, code := range []string{contract.CustodyExportWriteStarted, contract.CustodyExportWriteCompleted} {
+		t.Run(code, func(t *testing.T) {
+			h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+			_, directive := beginCustodyExport(t, h, node, computer, backup, "touched-"+code)
+			refusal := successfulCustodyExportReceipt(directive)
+			refusal.Kind, refusal.ManifestDigest, refusal.FailureCode = "computer_custody_export_failed", "", code
+			refusal.ExternalOwnerUID, refusal.ExternalOwnerGID = 0, 0
+			refusal.OwnershipApplied, refusal.PrivateModeApplied = false, false
+			refused, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
+				computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
+					BootSessionID: node.BootSessionID, IdempotencyKey: refusal.ReceiptID, Receipt: refusal})
+			if err != nil || refused.Status != "failed" || refused.FailureCode != code {
+				t.Fatalf("Custody export refused %s = %#v err=%v", code, refused, err)
+			}
+			provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+			if err != nil || !provenance.CustodyTainted {
+				t.Fatalf("an export that touched the destination left the source untainted = %#v err=%v", provenance, err)
+			}
+			// A lost acknowledgement must not become a clean removal.
+			current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			removed, err := h.store.RemoveComputer(context.Background(), current.ComputerID,
+				ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator-remove")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			directives, err := h.store.ListNodeRemovalDirectives(context.Background(),
+				"fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("removal directives = %#v err=%v", directives, err)
+			}
+			for _, copy := range directives[0].ComputerBackupCopies.Copies {
+				if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+					ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+						IdempotencyKey: "removed-" + copy.CopyID, Receipt: backupRemovalReceipt(copy)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+				directives[0].JobID, RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					RemovalGeneration: directives[0].RemovalGeneration, CleanupFence: directives[0].CleanupFence,
+					RootInstanceID: directives[0].RootInstanceID, IdempotencyKey: "touched-removed"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, changed, err := h.store.FinalizeServiceRemoval(context.Background(), directives[0].JobID); err != nil || !changed {
+				t.Fatalf("finalize removal changed=%t err=%v", changed, err)
+			}
+			removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+			if err != nil || removed.RemovalOutcome != "removed_reduced" {
+				t.Fatalf("an export that touched the destination allowed %q = %#v err=%v", removed.RemovalOutcome, removed, err)
+			}
+		})
 	}
 }
 

@@ -310,8 +310,11 @@ operator mount root, or lay under a root the helper could not prove is the
 filesystem the node shares with it — is recorded as evidence and taints
 nothing, because no byte of that Storage ever left managed custody. That
 proof is durable, not per-attempt: the helper records a write-started marker
-before its first external byte and answers every later attempt on that export
-`external_write_started`, which taints. Missing or late helper completion, a
+before its first external byte, rewrites it in place when the export
+verifies, never deletes it before the Computer's own removal, and answers
+every later attempt on that export `external_write_started` or
+`external_write_completed`, both of which taint. An acknowledgement lost
+between a verified receipt and L1 therefore cannot become a clean removal. Missing or late helper completion, a
 partial write, and a digest mismatch all still taint: taint follows the
 possibility of external bytes, not the operator's intent. A refusal that
 names the node's operator mount roots must name canonical absolute

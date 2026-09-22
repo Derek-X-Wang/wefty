@@ -80,6 +80,12 @@ type custodyExternalDestination struct {
 	existingAncestor string
 	missing          []string
 	dir              *os.File
+	// anchorDevice and managedInfo travel with the destination so the
+	// components created during preparation face the same two questions the
+	// admitted ones did: are they on the filesystem the node shares, and are
+	// they the helper's own managed root.
+	anchorDevice *uint64
+	managedInfo  os.FileInfo
 }
 
 func (destination *custodyExternalDestination) close() error {
@@ -178,6 +184,76 @@ func pathWithin(root, candidate string) bool {
 	return relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
+// acquireCustodyDirectory opens an absolute directory path one component at
+// a time, each with O_NOFOLLOW|O_DIRECTORY, verifying as it goes that the
+// component it opened is the non-symlink directory it just looked at. The
+// filesystem root is the trusted anchor. It also returns the descriptor of
+// the parent directory, which is how the mount anchor's device comparison is
+// taken from descriptors rather than from a path.
+func (engine *ContainerdEngine) acquireCustodyDirectory(path string) (_ *os.File, _ *os.File, resultErr error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
+		return nil, nil, errors.New("directory path must be clean, absolute, and not the filesystem root")
+	}
+	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	current := os.NewFile(uintptr(fd), string(filepath.Separator))
+	var parent *os.File
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		if parent != nil {
+			_ = parent.Close()
+		}
+		if current != nil {
+			_ = current.Close()
+		}
+	}()
+	components := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	walked := string(filepath.Separator)
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return nil, nil, errors.New("directory path contains an invalid component")
+		}
+		if engine.computerCustodyAcquireHook != nil {
+			if err := engine.computerCustodyAcquireHook(filepath.Join(walked, component)); err != nil {
+				return nil, nil, err
+			}
+		}
+		before, err := custodyComponentInfo(current, component)
+		if err != nil {
+			return nil, nil, err
+		}
+		if before.Mode()&os.ModeSymlink != 0 {
+			return nil, nil, fmt.Errorf("path component %q is a symlink", component)
+		}
+		if !before.IsDir() {
+			return nil, nil, fmt.Errorf("path component %q is not a directory", component)
+		}
+		next, err := openCustodyDirectoryAt(current, component)
+		if err != nil {
+			return nil, nil, err
+		}
+		opened, err := next.Stat()
+		if err != nil {
+			_ = next.Close()
+			return nil, nil, err
+		}
+		if !sameCustodyInode(before, opened) {
+			_ = next.Close()
+			return nil, nil, fmt.Errorf("path component %q changed while opening", component)
+		}
+		if parent != nil {
+			_ = parent.Close()
+		}
+		parent, current = current, next
+		walked = filepath.Join(walked, component)
+	}
+	return current, parent, nil
+}
+
 // walkCustodyExternalRoot opens the operator mount root, proves the opened
 // inode is still the directory that path names, and walks towards the
 // destination through descriptor-relative lookups that refuse a symlinked
@@ -192,14 +268,16 @@ func pathWithin(root, candidate string) bool {
 // guest tmpfs below the root, or a nested guest bind under a live host
 // mount, is a different filesystem that never reaches the host.
 func (engine *ContainerdEngine) walkCustodyExternalRoot(allowedRoot, destination, managedRoot string) (_ *custodyExternalDestination, resultErr error) {
-	if err := rejectSymlinkComponents(allowedRoot); err != nil {
-		return nil, fmt.Errorf("operator mount root is not stable: %w", err)
-	}
 	managedInfo, err := os.Stat(managedRoot)
 	if err != nil {
 		return nil, err
 	}
-	dir, err := openCustodyDirectory(allowedRoot)
+	// The configured root is acquired the same way the rest of the path is:
+	// one no-follow open per component from the filesystem root, which is
+	// the only anchor nothing can substitute. Checking the components and
+	// then opening the whole path would leave a window in which an ancestor
+	// becomes a symlink.
+	dir, _, err := engine.acquireCustodyDirectory(allowedRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -211,15 +289,6 @@ func (engine *ContainerdEngine) walkCustodyExternalRoot(allowedRoot, destination
 	opened, err := dir.Stat()
 	if err != nil {
 		return nil, err
-	}
-	current, err := os.Lstat(allowedRoot)
-	if err != nil {
-		return nil, err
-	}
-	// Post-open identity: the descriptor the helper will keep must be the
-	// directory the configured root named when it was checked.
-	if !current.IsDir() || !sameCustodyInode(current, opened) {
-		return nil, errors.New("operator mount root changed while opening")
 	}
 	if sameCustodyInode(opened, managedInfo) {
 		return nil, custodyMechanicsError(contract.CustodyExportManagedRootPath,
@@ -242,7 +311,8 @@ func (engine *ContainerdEngine) walkCustodyExternalRoot(allowedRoot, destination
 		before, err := custodyComponentInfo(dir, component)
 		if errors.Is(err, os.ErrNotExist) {
 			return &custodyExternalDestination{root: destination, allowedRoot: allowedRoot,
-				existingAncestor: existing, missing: components[index:], dir: dir}, nil
+				existingAncestor: existing, missing: components[index:], dir: dir,
+				anchorDevice: anchor, managedInfo: managedInfo}, nil
 		}
 		if err != nil {
 			return nil, err
@@ -288,7 +358,7 @@ func (engine *ContainerdEngine) walkCustodyExternalRoot(allowedRoot, destination
 		existing = filepath.Join(existing, component)
 	}
 	return &custodyExternalDestination{root: destination, allowedRoot: allowedRoot,
-		existingAncestor: existing, dir: dir}, nil
+		existingAncestor: existing, dir: dir, anchorDevice: anchor, managedInfo: managedInfo}, nil
 }
 
 // custodyMountAnchor returns the device every admitted component must live
@@ -301,20 +371,31 @@ func (engine *ContainerdEngine) custodyMountAnchor(allowedRoot string, allowedRo
 		return nil, nil
 	}
 	anchorPath := filepath.Clean(engine.config.GuestMountRoot)
-	if err := rejectSymlinkComponents(anchorPath); err != nil {
-		return nil, custodyMechanicsError(contract.CustodyExportRootUnmounted,
-			fmt.Errorf("shared mount root is not stable: %w", err))
-	}
-	anchorInfo, err := os.Stat(anchorPath)
+	// The shared root and its parent are read from descriptors acquired the
+	// same no-follow way, so the device comparison cannot be aimed at a
+	// different directory than the one the helper would write through.
+	anchorDir, anchorParent, err := engine.acquireCustodyDirectory(anchorPath)
 	if err != nil {
 		return nil, custodyMechanicsError(contract.CustodyExportRootUnmounted,
-			fmt.Errorf("shared mount root %q is unreadable: %w", anchorPath, err))
+			fmt.Errorf("shared mount root %q is unreachable: %w", anchorPath, err))
+	}
+	defer anchorDir.Close()
+	if anchorParent != nil {
+		defer anchorParent.Close()
+	}
+	anchorInfo, err := anchorDir.Stat()
+	if err != nil {
+		return nil, err
 	}
 	anchorDevice, err := engine.custodyPathDevice(anchorPath, anchorInfo)
 	if err != nil {
 		return nil, err
 	}
-	parentInfo, err := os.Stat(filepath.Dir(anchorPath))
+	if anchorParent == nil {
+		return nil, custodyMechanicsError(contract.CustodyExportRootUnmounted,
+			fmt.Errorf("shared mount root %q has no parent to compare against", anchorPath))
+	}
+	parentInfo, err := anchorParent.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -453,10 +534,11 @@ func readCustodyExternalOwner(dir *os.File) (custodyExternalOwner, error) {
 // the descriptor of the export directory itself. Nothing here re-resolves a
 // pathname, so an ancestor swapped for a symlink after admission changes
 // nothing about where these bytes go.
-func prepareCustodyExternalRoot(destination *custodyExternalDestination, owner custodyExternalOwner,
-	chown func(*os.File, int, int) error) (*os.File, error) {
+func prepareCustodyExternalRoot(engine *ContainerdEngine, destination *custodyExternalDestination,
+	owner custodyExternalOwner, chown func(*os.File, int, int) error) (*os.File, error) {
 	current := destination.dir
 	owned := false
+	walked := destination.existingAncestor
 	closeCurrent := func() {
 		if owned {
 			_ = current.Close()
@@ -471,10 +553,34 @@ func prepareCustodyExternalRoot(destination *custodyExternalDestination, owner c
 			closeCurrent()
 			return nil, err
 		}
-		next, err := openCustodyDirectoryAt(current, component)
+		// EEXIST means something else got there first, and even a directory
+		// the helper just created can be replaced before it is opened. Both
+		// cases face the admission checks again, before any chmod, chown or
+		// write reaches the inode.
+		next, info, err := openVerifiedCustodyComponent(current, component)
 		if err != nil {
 			closeCurrent()
-			return nil, custodyMechanicsError("destination_substituted", fmt.Errorf("open created Custody directory: %w", err))
+			return nil, err
+		}
+		if destination.managedInfo != nil && sameCustodyInode(info, destination.managedInfo) {
+			_ = next.Close()
+			closeCurrent()
+			return nil, custodyMechanicsError(contract.CustodyExportManagedRootPath,
+				errors.New("Custody path component is the helper-managed root"))
+		}
+		if destination.anchorDevice != nil {
+			device, deviceErr := engine.custodyPathDevice(filepath.Join(walked, component), info)
+			if deviceErr != nil {
+				_ = next.Close()
+				closeCurrent()
+				return nil, deviceErr
+			}
+			if device != *destination.anchorDevice {
+				_ = next.Close()
+				closeCurrent()
+				return nil, custodyMechanicsError(contract.CustodyExportPathCrossesMount,
+					fmt.Errorf("Custody path component %q leaves the filesystem the node shares with the helper", component))
+			}
 		}
 		if err := next.Chmod(0o700); err != nil {
 			_ = next.Close()
@@ -488,6 +594,7 @@ func prepareCustodyExternalRoot(destination *custodyExternalDestination, owner c
 		}
 		closeCurrent()
 		current, owned = next, true
+		walked = filepath.Join(walked, component)
 	}
 	if !owned {
 		// The export directory already existed: hand back a descriptor the
@@ -499,6 +606,39 @@ func prepareCustodyExternalRoot(destination *custodyExternalDestination, owner c
 		return duplicated, nil
 	}
 	return current, nil
+}
+
+// openVerifiedCustodyComponent opens one name inside an open directory and
+// proves it is the non-symlink directory the helper just looked at.
+func openVerifiedCustodyComponent(dir *os.File, component string) (*os.File, os.FileInfo, error) {
+	before, err := custodyComponentInfo(dir, component)
+	if err != nil {
+		return nil, nil, custodyMechanicsError(contract.CustodyExportPathUnconfined,
+			fmt.Errorf("inspect Custody directory %q: %w", component, err))
+	}
+	if before.Mode()&os.ModeSymlink != 0 {
+		return nil, nil, custodyMechanicsError(contract.CustodyExportPathUnconfined,
+			fmt.Errorf("Custody path component %q is a symlink", component))
+	}
+	if !before.IsDir() {
+		return nil, nil, custodyMechanicsError(contract.CustodyExportPathUnconfined,
+			fmt.Errorf("Custody path component %q is not a directory", component))
+	}
+	opened, err := openCustodyDirectoryAt(dir, component)
+	if err != nil {
+		return nil, nil, custodyMechanicsError("destination_substituted", fmt.Errorf("open created Custody directory: %w", err))
+	}
+	info, err := opened.Stat()
+	if err != nil {
+		_ = opened.Close()
+		return nil, nil, err
+	}
+	if !sameCustodyInode(before, info) {
+		_ = opened.Close()
+		return nil, nil, custodyMechanicsError("destination_substituted",
+			fmt.Errorf("Custody path component %q changed while opening", component))
+	}
+	return opened, info, nil
 }
 
 // openCustodyDestination opens the export's disk inside the descriptor
@@ -713,10 +853,11 @@ func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputer
 	return diskFile, nil
 }
 
-// custodyWriteMarkerRoot holds one small file per export authority that has
-// reached the point of touching operator storage. It is the helper's durable
-// answer to "could this export already have written bytes?", and it outlives
-// crashes, restarts and upgrades.
+// custodyWriteMarkerRoot holds one small record per export authority that has
+// reached the point of placing bytes on operator storage. It is the helper's
+// durable answer to "could this export already have written?", it outlives
+// crashes, restarts and upgrades, and no export path ever deletes it: only
+// the removal of the Computer it belongs to does.
 func custodyWriteMarkerRoot(runtimeRoot string) string {
 	return filepath.Join(runtimeRoot, "computer-custody-writes")
 }
@@ -726,14 +867,23 @@ func custodyWriteMarkerName(computerID, exportID string) string {
 	return hex.EncodeToString(digest[:]) + ".json"
 }
 
+const (
+	custodyWritePhaseStarted   = "started"
+	custodyWritePhaseCompleted = "completed"
+)
+
 type custodyWriteMarker struct {
 	Version           int    `json:"version"`
+	Phase             string `json:"phase"`
 	ComputerID        string `json:"computer_id"`
 	ExportID          string `json:"export_id"`
 	StorageID         string `json:"storage_id"`
 	StorageGeneration int64  `json:"storage_generation"`
 	ExternalPath      string `json:"external_path"`
+	ContentDigest     string `json:"content_digest,omitempty"`
+	ManifestDigest    string `json:"manifest_digest,omitempty"`
 	StartedNS         int64  `json:"started_ns"`
+	CompletedNS       int64  `json:"completed_ns,omitempty"`
 }
 
 func custodyClock(clock Clock) Clock {
@@ -743,54 +893,137 @@ func custodyClock(clock Clock) Clock {
 	return clock
 }
 
-func (engine *ContainerdEngine) custodyWriteStarted(request ExportComputerCustodyRequest) (bool, error) {
-	path := filepath.Join(custodyWriteMarkerRoot(engine.config.RuntimeRoot),
-		custodyWriteMarkerName(request.Storage.ComputerID, request.ExportID))
-	_, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+// custodyWriteRefusalCode is the typed answer a refusal must carry once this
+// export has touched operator storage. A completed record is a stronger
+// statement than a started one, and neither leaves the source untainted.
+func custodyWriteRefusalCode(phase string) string {
+	if phase == custodyWritePhaseCompleted {
+		return contract.CustodyExportWriteCompleted
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return contract.CustodyExportWriteStarted
 }
 
-// recordCustodyWriteStarted must be durable before the first external
-// mutation. Once it exists, no later invocation of this export may claim the
-// destination was never touched, however the earlier attempt ended.
-func (engine *ContainerdEngine) recordCustodyWriteStarted(request ExportComputerCustodyRequest) error {
+// custodyWritePhase reads the durable record for this export authority. An
+// unreadable or malformed record is treated as "started": the helper never
+// converts a damaged answer into a claim that nothing was written.
+func (engine *ContainerdEngine) custodyWritePhase(request ExportComputerCustodyRequest) (string, bool, error) {
+	path := filepath.Join(custodyWriteMarkerRoot(engine.config.RuntimeRoot),
+		custodyWriteMarkerName(request.Storage.ComputerID, request.ExportID))
+	payload, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return custodyWritePhaseStarted, true, nil
+	}
+	var marker custodyWriteMarker
+	if err := json.Unmarshal(payload, &marker); err != nil || marker.Phase != custodyWritePhaseCompleted {
+		return custodyWritePhaseStarted, true, nil
+	}
+	return custodyWritePhaseCompleted, true, nil
+}
+
+// publishCustodyWriteMarker durably establishes the record before the first
+// byte and, on success, atomically replaces it in place. The directory entry
+// is fsynced into the managed root the first time the directory appears, or a
+// crash could leave external bytes with no reachable record of them.
+func (engine *ContainerdEngine) publishCustodyWriteMarker(request ExportComputerCustodyRequest, marker custodyWriteMarker) error {
 	root := custodyWriteMarkerRoot(engine.config.RuntimeRoot)
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	created := false
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		makeErr := os.Mkdir(root, 0o700)
+		if makeErr != nil && !errors.Is(makeErr, os.ErrExist) {
+			return makeErr
+		}
+		created = makeErr == nil
+	} else if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(custodyWriteMarker{Version: 1, ComputerID: request.Storage.ComputerID,
-		ExportID: request.ExportID, StorageID: request.Storage.StorageID,
-		StorageGeneration: request.Storage.StorageGeneration, ExternalPath: request.ExternalPath,
-		StartedNS: custodyClock(engine.config.Clock).Now().UnixNano()})
+	// The directory entry itself must be durable in the managed root, or a
+	// crash could leave external bytes with no record that reaches them.
+	if created {
+		if err := syncDirectory(engine.config.RuntimeRoot); err != nil {
+			return err
+		}
+	}
+	payload, err := json.Marshal(marker)
 	if err != nil {
 		return err
 	}
-	name := custodyWriteMarkerName(request.Storage.ComputerID, request.ExportID)
-	temporary := filepath.Join(root, "."+name+".tmp")
-	if err := os.WriteFile(temporary, payload, 0o600); err != nil {
+	file, err := os.CreateTemp(root, ".custody-write.tmp-")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, filepath.Join(root, name)); err != nil {
-		_ = os.Remove(temporary)
+	name := file.Name()
+	defer os.Remove(name)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	writeErr := error(nil)
+	if _, writeErr = file.Write(payload); writeErr == nil {
+		writeErr = file.Sync()
+	}
+	if writeErr = errors.Join(writeErr, file.Close()); writeErr != nil {
+		return writeErr
+	}
+	if err := os.Rename(name, filepath.Join(root, custodyWriteMarkerName(request.Storage.ComputerID, request.ExportID))); err != nil {
 		return err
 	}
 	return syncDirectory(root)
 }
 
-// clearCustodyWriteStarted runs only after the external bytes and manifest
-// have been digest-verified: that is the one outcome in which the export no
-// longer holds any unresolved question about operator storage.
-func (engine *ContainerdEngine) clearCustodyWriteStarted(request ExportComputerCustodyRequest) error {
+// recordCustodyWriteStarted must be durable before the first byte the helper
+// places on operator storage. Once it exists, no later invocation of this
+// export may claim the destination was never touched.
+func (engine *ContainerdEngine) recordCustodyWriteStarted(request ExportComputerCustodyRequest) error {
+	return engine.publishCustodyWriteMarker(request, custodyWriteMarker{Version: 1,
+		Phase: custodyWritePhaseStarted, ComputerID: request.Storage.ComputerID, ExportID: request.ExportID,
+		StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+		ExternalPath: request.ExternalPath, StartedNS: custodyClock(engine.config.Clock).Now().UnixNano()})
+}
+
+// recordCustodyWriteCompleted replaces the started record with the verified
+// outcome. It does not delete anything: an acknowledgement lost between this
+// receipt and L1 must not let a later attempt call the destination untouched.
+func (engine *ContainerdEngine) recordCustodyWriteCompleted(request ExportComputerCustodyRequest, manifestDigest string) error {
+	now := custodyClock(engine.config.Clock).Now().UnixNano()
+	return engine.publishCustodyWriteMarker(request, custodyWriteMarker{Version: 1,
+		Phase: custodyWritePhaseCompleted, ComputerID: request.Storage.ComputerID, ExportID: request.ExportID,
+		StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+		ExternalPath: request.ExternalPath, ContentDigest: request.SourceDigest, ManifestDigest: manifestDigest,
+		StartedNS: now, CompletedNS: now})
+}
+
+// removeCustodyWriteMarkersForComputer is the only deletion path. It runs
+// when a Computer's last Storage generation leaves this node, and it touches
+// nothing outside the marker directory.
+func (engine *ContainerdEngine) removeCustodyWriteMarkersForComputer(computerID string) error {
 	root := custodyWriteMarkerRoot(engine.config.RuntimeRoot)
-	path := filepath.Join(root, custodyWriteMarkerName(request.Storage.ComputerID, request.ExportID))
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	entries, err := readDirectoryIfPresent(root)
+	if err != nil || len(entries) == 0 {
 		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		payload, readErr := os.ReadFile(filepath.Join(root, entry.Name()))
+		if readErr != nil {
+			continue
+		}
+		var marker custodyWriteMarker
+		if json.Unmarshal(payload, &marker) != nil || marker.ComputerID != computerID {
+			continue
+		}
+		if err := os.Remove(filepath.Join(root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removed = true
+	}
+	if !removed {
+		return nil
 	}
 	return syncDirectoryIfPresent(root)
 }
@@ -825,7 +1058,9 @@ func custodyExportFailure(request ExportComputerCustodyRequest, code string, roo
 }
 
 func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, request ExportComputerCustodyRequest) (response ExportComputerCustodyResponse, returnedErr error) {
-	writeStarted := false
+	// writeRefusal is the typed answer this export owes while durable
+	// evidence says it has already touched operator storage.
+	writeRefusal := ""
 	defer func() {
 		if returnedErr == nil {
 			return
@@ -845,10 +1080,10 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		}
 		// A refusal only means "nothing was touched" when this export never
 		// reached operator storage in any earlier invocation. Once the
-		// durable marker exists, the honest answer is that bytes may be out
+		// durable record exists, the honest answer is that bytes may be out
 		// there, whatever this attempt decided.
-		if writeStarted && contract.CustodyExportLeftDestinationUntouched("failed", code) {
-			code, roots = contract.CustodyExportWriteStarted, nil
+		if writeRefusal != "" && contract.CustodyExportLeftDestinationUntouched("failed", code) {
+			code, roots = writeRefusal, nil
 		}
 		if code != "" {
 			response, returnedErr = custodyExportFailure(request, code, roots...)
@@ -867,9 +1102,12 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	}
 	// Read the durable write history before anything else can decide this
 	// export never touched the destination.
-	writeStarted, err := engine.custodyWriteStarted(request)
+	phase, recorded, err := engine.custodyWritePhase(request)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
+	}
+	if recorded {
+		writeRefusal = custodyWriteRefusalCode(phase)
 	}
 	// Admission first: nothing on the operator's filesystem is created, and no
 	// Backup byte is read, until the destination is proven to be inside a
@@ -920,17 +1158,22 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}
-	// The durable marker precedes the first byte the helper places on
-	// operator storage, directory included, and outlives any crash after it.
-	if err := engine.recordCustodyWriteStarted(request); err != nil {
-		return ExportComputerCustodyResponse{}, err
-	}
-	writeStarted = true
-	externalDirectory, err := prepareCustodyExternalRoot(admitted, externalOwner, chown)
+	// Preparation still carries admission's questions to every directory it
+	// creates or finds, so a component that appears on another filesystem
+	// between admission and here is refused for what it is.
+	externalDirectory, err := prepareCustodyExternalRoot(engine, admitted, externalOwner, chown)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}
 	defer externalDirectory.Close()
+	// The durable record precedes the first byte of this Storage that the
+	// helper places on operator storage — the manifest and the disk. An
+	// empty operator-owned directory holds no Storage byte, which is why
+	// preparation may still answer with its own typed refusal.
+	if err := engine.recordCustodyWriteStarted(request); err != nil {
+		return ExportComputerCustodyResponse{}, err
+	}
+	writeRefusal = contract.CustodyExportWriteStarted
 	manifest, _, exists, err := readCustodyManifest(externalDirectory)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
@@ -1030,9 +1273,10 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		ExternalPath: request.ExternalPath, AllocatedSize: request.SourceSize, ContentDigest: request.SourceDigest,
 		ManifestDigest: custodyManifestDigest(payload), ExternalOwnerUID: uint32(externalOwner.uid),
 		ExternalOwnerGID: uint32(externalOwner.gid), OwnershipApplied: true, PrivateModeApplied: true}
-	// Verified bytes and a verified manifest are the one outcome that closes
-	// the question the marker holds open.
-	if err := engine.clearCustodyWriteStarted(request); err != nil {
+	// The record is replaced, never removed: an acknowledgement lost between
+	// this receipt and L1 must still find durable evidence that these bytes
+	// exist. Only the Computer's removal takes the record away.
+	if err := engine.recordCustodyWriteCompleted(request, receipt.ManifestDigest); err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}
 	return ExportComputerCustodyResponse{Receipt: receipt}, nil

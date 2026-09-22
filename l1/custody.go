@@ -354,7 +354,7 @@ func validCustodyExportFailureCode(code string) bool {
 	case "insufficient_disk", "destination_not_empty", "destination_substituted", "ownership_failed", "cancelled",
 		contract.CustodyExportManagedRootPath, contract.CustodyExportPathUnconfined,
 		contract.CustodyExportRootUnmounted, contract.CustodyExportPathCrossesMount,
-		contract.CustodyExportWriteStarted:
+		contract.CustodyExportWriteStarted, contract.CustodyExportWriteCompleted:
 		return true
 	default:
 		return false

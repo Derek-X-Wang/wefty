@@ -133,6 +133,7 @@ type ContainerdEngine struct {
 	computerCustodyChown        func(*os.File, int, int) error
 	computerCustodyOwner        func(string) (custodyExternalOwner, error)
 	computerCustodyDevice       func(string, os.FileInfo) (uint64, error) // a test states which filesystem a path is on; production reads st_dev
+	computerCustodyAcquireHook  func(string) error                        // a test substitutes a component while the helper is acquiring the root
 	storageCopyHook             func(computerStorageCopyPhase) error
 	storageCopyFinalize         func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error)
 	computerDiskHook            func(computerDiskCheckpoint) error

@@ -781,8 +781,149 @@ func TestComputerCustodyExportAfterAPartialWriteNeverClaimsTheDestinationUntouch
 	if err != nil || completed.Receipt.Kind != "computer_custody_export_verified" {
 		t.Fatalf("resumed Custody export = %+v err=%v", completed, err)
 	}
-	started, err := engine.custodyWriteStarted(request)
-	if err != nil || started {
-		t.Fatalf("verified export left the durable write marker started=%t err=%v", started, err)
+	phase, recorded, err := engine.custodyWritePhase(request)
+	if err != nil || !recorded || phase != custodyWritePhaseCompleted {
+		t.Fatalf("verified export left phase=%q recorded=%t err=%v, want a durable completed record", phase, recorded, err)
+	}
+}
+
+func TestComputerCustodyExportKeepsDurableEvidenceOfAVerifiedExport(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
+	request := custodyExportTestRequest(source, externalRoot)
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
+	exported, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || exported.Receipt.Kind != "computer_custody_export_verified" {
+		t.Fatalf("Custody export = %+v err=%v", exported, err)
+	}
+	phase, recorded, err := engine.custodyWritePhase(request)
+	if err != nil || !recorded || phase != custodyWritePhaseCompleted {
+		t.Fatalf("verified export left phase=%q recorded=%t err=%v, want a durable completed record", phase, recorded, err)
+	}
+	// The acknowledgement never reached L1 and the node restarted; the
+	// destination is no longer admissible. The refusal must still say these
+	// bytes exist.
+	restarted := &ContainerdEngine{config: custodyEngineConfig(root, t.TempDir()), diskSystem: system}
+	response, err := restarted.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+		response.Receipt.FailureCode != contract.CustodyExportWriteCompleted {
+		t.Fatalf("refusal after a lost acknowledgement = %+v err=%v", response, err)
+	}
+	if contract.CustodyExportLeftDestinationUntouched("failed", response.Receipt.FailureCode) {
+		t.Fatal("a refusal after a verified export was treated as leaving the destination untouched")
+	}
+	// Only the Computer's removal takes the record away, and only once no
+	// Storage generation of that Computer is left on the node.
+	remaining, err := engine.computerHasRemainingStorage(request.Storage.ComputerID)
+	if err != nil || !remaining {
+		t.Fatalf("a Computer with a published disk reported remaining=%t err=%v", remaining, err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "computer-disks")); err != nil {
+		t.Fatal(err)
+	}
+	if remaining, err = engine.computerHasRemainingStorage(request.Storage.ComputerID); err != nil || remaining {
+		t.Fatalf("a Computer with no disk reported remaining=%t err=%v", remaining, err)
+	}
+	if err := engine.removeCustodyWriteMarkersForComputer("a-different-computer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, recorded, err = engine.custodyWritePhase(request); err != nil || !recorded {
+		t.Fatalf("another Computer's removal took this record: recorded=%t err=%v", recorded, err)
+	}
+	if err := engine.removeCustodyWriteMarkersForComputer(request.Storage.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, recorded, err = engine.custodyWritePhase(request); err != nil || recorded {
+		t.Fatalf("Computer removal left the record: recorded=%t err=%v", recorded, err)
+	}
+}
+
+func TestComputerCustodyExportRefusesAnAncestorSubstitutedDuringRootAcquisition(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	base := t.TempDir()
+	level := filepath.Join(base, "level")
+	mountRoot := filepath.Join(level, "operator-root")
+	if err := os.MkdirAll(mountRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The decoy carries the same last component, so a helper that opened the
+	// configured root by pathname would land here and agree with itself.
+	decoy := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(decoy, "operator-root"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	request := custodyExportTestRequest(source, filepath.Join(mountRoot, "custody"))
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
+	// The swap replaces an intermediate ancestor of the configured root
+	// while the helper is walking to it: O_NOFOLLOW on the last component
+	// would not see this one.
+	engine.computerCustodyAcquireHook = func(path string) error {
+		if path != level {
+			return nil
+		}
+		if err := os.RemoveAll(level); err != nil {
+			return err
+		}
+		return os.Symlink(decoy, level)
+	}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+		response.Receipt.FailureCode != contract.CustodyExportPathUnconfined {
+		t.Fatalf("root acquisition substitution = %+v err=%v", response, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(decoy, "operator-root"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("root acquisition followed the substituted ancestor: %v err=%v", entries, err)
+	}
+}
+
+func TestComputerCustodyExportChecksComponentsThatAppearAfterAdmission(t *testing.T) {
+	hostRoot := "/operator/mounts"
+	rows := []struct {
+		name    string
+		device  uint64
+		code    string
+		written bool
+	}{
+		{name: "a guest-local mount appears where the helper was about to create", device: 9,
+			code: contract.CustodyExportPathCrossesMount},
+		{name: "a same-device subdirectory of the share is still accepted", device: 7, written: true},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			guestRoot := t.TempDir()
+			destination := filepath.Join(guestRoot, "custody")
+			request := custodyExportTestRequest(source, filepath.Join(hostRoot, "custody"))
+			engine := translatedCustodyEngine(root, hostRoot, guestRoot, system, map[string]uint64{
+				filepath.Dir(guestRoot): 1, guestRoot: 7, destination: row.device, "*": 7})
+			// Admission finds nothing at the destination; the directory only
+			// appears afterwards, which is exactly the race this closes.
+			engine.computerCustodyHook = func(phase string) error {
+				if phase != "before_external_write" {
+					return nil
+				}
+				return os.MkdirAll(destination, 0o700)
+			}
+			response, err := engine.ExportComputerCustody(t.Context(), request)
+			if row.written {
+				if err != nil || response.Receipt.Kind != "computer_custody_export_verified" {
+					t.Fatalf("same-device destination = %+v err=%v", response, err)
+				}
+				digest, err := digestFile(t.Context(), filepath.Join(destination, "storage.ext4"))
+				if err != nil || digest != request.SourceDigest {
+					t.Fatalf("Custody bytes at the shared destination = %s err=%v", digest, err)
+				}
+				return
+			}
+			if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+				response.Receipt.FailureCode != row.code {
+				t.Fatalf("component that appeared after admission = %+v err=%v, want %s", response, err, row.code)
+			}
+			entries, readErr := os.ReadDir(destination)
+			if readErr != nil || len(entries) != 0 {
+				t.Fatalf("refused export wrote into the appeared component: %v err=%v", entries, readErr)
+			}
+		})
 	}
 }
