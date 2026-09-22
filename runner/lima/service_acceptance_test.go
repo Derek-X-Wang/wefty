@@ -22,10 +22,18 @@ import (
 )
 
 type attendedArtifact struct {
-	SessionID string                    `json:"session_id"`
-	Commit    string                    `json:"commit"`
-	Versions  map[string]string         `json:"versions"`
-	Rows      map[string]attendedResult `json:"rows"`
+	SessionID string `json:"session_id"`
+	Commit    string `json:"commit"`
+	// RecordedAt is when the receipt builder finished assembling this
+	// artifact -- a fixed value baked into the file, not the wall clock the
+	// gate happens to run under. The retention proof on oci_oneshot_run and
+	// oci_oneshot_rerun_identity compares each row's results_retained_until
+	// against this timestamp rather than time.Now(), so the gate's verdict
+	// on a given receipt is the same today and a month from now (#509
+	// review: comparing to live wall-clock made the gate non-reproducible).
+	RecordedAt string                    `json:"recorded_at"`
+	Versions   map[string]string         `json:"versions"`
+	Rows       map[string]attendedResult `json:"rows"`
 }
 
 type attendedResult struct {
@@ -71,7 +79,30 @@ type attendedResult struct {
 	StdoutMarkers      []string            `json:"stdout_markers"`
 	StderrMarkers      []string            `json:"stderr_markers"`
 	HandoffMarkerBytes []string            `json:"handoff_marker_bytes"`
-	HandoffAbsent      bool                `json:"handoff_absent_after_completion"`
+	// HandoffAbsent is the pre-#493 claim that a successful run's handoff
+	// volume/directory was deleted on completion. #493 made deletion-on-
+	// success false by design: the handoff is now retained through the
+	// retention window (docs/contracts/run-execution-context.md, "Results
+	// and their retention"). Retired (#509 review): a row asserting true is
+	// refused unconditionally and by name, with no deprecation window --
+	// scripts/check-oci-acceptance-matrix.sh already rejects every false
+	// assertion, so the deprecated spelling (accepted with value false)
+	// could never actually reach a receipt's `assertions` anyway.
+	HandoffAbsent bool `json:"handoff_absent_after_completion,omitempty"`
+	// HandoffRetainedAfterCompletion, ResultsRetainedUntil and ResultsExpired
+	// are the #509 retention-proof facts that replace HandoffAbsent: the
+	// helper-owned volume (or process handoff directory) is present in the
+	// helper's runtime root after success, and `wefty --json inspect`'s
+	// results block carries retained_until in the future with expired=false.
+	// A row's inventories entry may carry these nested as a results_block
+	// object instead of promoting them onto the row -- validateHandoffRetention
+	// accepts either. HandoffRetainedAfterCompletion is a pointer so a
+	// missing fact (nil) and an explicit false are both failures, exactly
+	// like an explicit true is required to pass -- there is no bool default
+	// that reads as proof.
+	HandoffRetainedAfterCompletion *bool  `json:"handoff_retained_after_completion,omitempty"`
+	ResultsRetainedUntil           string `json:"results_retained_until,omitempty"`
+	ResultsExpired                 *bool  `json:"results_expired,omitempty"`
 	// QuiescenceFaultInjected, QuiescenceLatched and ServiceJobState carry the
 	// service_failed_quiescence outcome. The row keeps its intent -- an
 	// unprovable stop must not be reported as stopped -- while recording what
@@ -299,6 +330,10 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if artifact.SessionID == "" || len(artifact.Versions) == 0 {
 		t.Fatal("attended artifact omitted session or tool versions")
 	}
+	sessionEnd, err := time.Parse(time.RFC3339, artifact.RecordedAt)
+	if err != nil {
+		t.Fatalf("attended artifact recorded_at %q does not parse as RFC3339: %v", artifact.RecordedAt, err)
+	}
 	if missing := missingRequiredAttendedRow(artifact.Rows); missing != "" {
 		t.Fatalf("attended artifact omitted required row %q", missing)
 	}
@@ -322,8 +357,11 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 		!sameNonEmptyStrings(oneshot.TopLevelDigests) || !sameNonEmptyStrings(oneshot.PlatformDigests) ||
 		!containsString(oneshot.StdoutMarkers, "wefty-echo-once-stdout") ||
 		!containsString(oneshot.StderrMarkers, "wefty-echo-once-stderr") ||
-		!containsString(oneshot.HandoffMarkerBytes, "wefty echo one-shot handoff\n") || !oneshot.HandoffAbsent {
+		!containsString(oneshot.HandoffMarkerBytes, "wefty echo one-shot handoff\n") {
 		t.Fatalf("ordinary OCI one-shot row lacks bridge/digest/single-execution evidence: %+v", oneshot)
+	}
+	if err := validateHandoffRetention(oneshot, sessionEnd); err != nil {
+		t.Fatalf("ordinary OCI one-shot row %v: %+v", err, oneshot)
 	}
 	prestarted := artifact.Rows["oci_oneshot_prestarted_loss"]
 	if !prestarted.RoundTrip || prestarted.PayloadExecutions != 1 || len(prestarted.AttemptIDs) != 2 ||
@@ -340,8 +378,11 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if !rerun.RoundTrip || rerun.PayloadExecutions != 2 || len(rerun.AttemptIDs) != 2 ||
 		rerun.AttemptIDs[0] == rerun.AttemptIDs[1] ||
 		!sameNonEmptyStrings(rerun.TopLevelDigests) || !sameNonEmptyStrings(rerun.PlatformDigests) ||
-		!containsString(rerun.HandoffMarkerBytes, "wefty echo one-shot handoff\n") || !rerun.HandoffAbsent {
+		!containsString(rerun.HandoffMarkerBytes, "wefty echo one-shot handoff\n") {
 		t.Fatalf("OCI rerun row lacks frozen identity and distinct execution evidence: %+v", rerun)
+	}
+	if err := validateHandoffRetention(rerun, sessionEnd); err != nil {
+		t.Fatalf("OCI rerun row %v: %+v", err, rerun)
 	}
 	dynamic := artifact.Rows["dynamic_forwarding_disabled"].DynamicListeners
 	if dynamic["127.0.0.1"] || dynamic["0.0.0.0"] || len(dynamic) != 2 {
@@ -466,6 +507,288 @@ func TestServiceAcceptanceAttendedArtifactRejectsMissingServiceRows(t *testing.T
 				t.Fatalf("missing row = %q, want %q", missing, name)
 			}
 			rows[name] = attendedResult{}
+		})
+	}
+}
+
+// resultsBlockFacts is the shape docs/contracts/run-execution-context.md
+// calls the results block, as it actually appears today: nested inside a
+// row's free-form inventories entry rather than promoted onto the row
+// itself (see runner/lima/service_acceptance_test.go's other inventories
+// consumers, e.g. removal.ResourceManifests). validateHandoffRetention reads
+// it as a fallback when the row does not carry ResultsRetainedUntil /
+// ResultsExpired directly.
+type resultsBlockFacts struct {
+	ResultsBlock *struct {
+		RetainedUntil string `json:"retained_until"`
+		Expired       *bool  `json:"expired"`
+	} `json:"results_block"`
+}
+
+// resultsBlockFromInventories scans a row's inventories entries for a nested
+// results_block and returns the first one that names a non-empty
+// retained_until. Entries that are not JSON objects, or that omit
+// results_block, are skipped rather than treated as errors: inventories is a
+// free-form evidence bag and most rows use it for unrelated facts.
+func resultsBlockFromInventories(inventories []json.RawMessage) (retainedUntil string, expired *bool, ok bool) {
+	for _, raw := range inventories {
+		var facts resultsBlockFacts
+		if err := json.Unmarshal(raw, &facts); err != nil {
+			continue
+		}
+		if facts.ResultsBlock == nil || facts.ResultsBlock.RetainedUntil == "" {
+			continue
+		}
+		return facts.ResultsBlock.RetainedUntil, facts.ResultsBlock.Expired, true
+	}
+	return "", nil, false
+}
+
+// validateHandoffRetention holds a row to the retention proof #493 requires
+// in place of the pre-#493 absence requirement. Before #493, a successful run
+// deleted its own handoff volume/directory, so oci_oneshot_run and
+// oci_oneshot_rerun_identity recorded handoff_absent_after_completion=true.
+// #493 made deletion-on-success false by design (agent/attempt_lifecycle.go's
+// runtimeManagedVolumesForSuccessfulCompletion returns nil unconditionally):
+// the handoff now survives through the retention window, so the row must
+// instead show it explicitly retained (handoff_retained_after_completion=
+// true -- a missing or false fact fails, it is never inferred) with a results
+// block whose retained_until parses and is after the receipt's own recorded
+// session end (sessionEnd, from the artifact's recorded_at -- never the
+// wall clock the gate happens to run under, so the same receipt verdicts the
+// same way today and a month from now) and whose expired=false.
+//
+// handoff_absent_after_completion is retired, not deprecated (#509 review):
+// a row asserting it true is refused unconditionally and by name, even
+// alongside handoff_retained_after_completion=true -- the two facts
+// contradict, and the contradiction itself is what gets named. Every
+// rejection here names the fact the row is missing or contradicts, rather
+// than folding into the generic bridge/digest evidence message.
+func validateHandoffRetention(row attendedResult, sessionEnd time.Time) error {
+	if row.HandoffAbsent {
+		if row.HandoffRetainedAfterCompletion != nil && *row.HandoffRetainedAfterCompletion {
+			return errors.New("row asserts both handoff_absent_after_completion=true and handoff_retained_after_completion=true, which contradict; handoff_absent_after_completion is retired (#509) and must not be true")
+		}
+		return errors.New("row claims handoff_absent_after_completion=true; that fact is retired (#509) -- #493 retains the handoff on success, so this row needs handoff_retained_after_completion=true")
+	}
+	if row.HandoffRetainedAfterCompletion == nil || !*row.HandoffRetainedAfterCompletion {
+		return errors.New("row lacks handoff_retained_after_completion=true")
+	}
+
+	retainedUntil := row.ResultsRetainedUntil
+	expired := row.ResultsExpired
+	if retainedUntil == "" || expired == nil {
+		if invUntil, invExpired, ok := resultsBlockFromInventories(row.Inventories); ok {
+			if retainedUntil == "" {
+				retainedUntil = invUntil
+			}
+			if expired == nil {
+				expired = invExpired
+			}
+		}
+	}
+	if retainedUntil == "" {
+		return errors.New("row lacks results_retained_until (checked the row and its inventories' results_block)")
+	}
+	until, err := time.Parse(time.RFC3339, retainedUntil)
+	if err != nil {
+		return fmt.Errorf("row's results_retained_until %q does not parse as RFC3339: %w", retainedUntil, err)
+	}
+	if !until.After(sessionEnd) {
+		return fmt.Errorf("row's results_retained_until %s is not after the session's recorded end %s",
+			until.Format(time.RFC3339), sessionEnd.Format(time.RFC3339))
+	}
+	if expired == nil {
+		return errors.New("row lacks results_expired (checked the row and its inventories' results_block)")
+	}
+	if *expired {
+		return errors.New("row's results_expired=true; retention proof requires expired=false")
+	}
+	return nil
+}
+
+func TestServiceAcceptanceHandoffRetentionRowOutcomes(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	// sessionEnd stands in for the artifact's recorded_at: a fixed value
+	// baked into the receipt, never the wall clock the test happens to run
+	// under.
+	sessionEnd := time.Date(2026, 9, 22, 4, 20, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name        string
+		row         attendedResult
+		sessionEnd  time.Time
+		accept      bool
+		wantMissing string // substring the rejection must name, when accept is false
+	}{
+		{
+			name: "retained=true, results_retained_until after session end, expired=false",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2026-09-29T04:24:49Z",
+				ResultsExpired:                 boolPtr(false),
+			},
+			sessionEnd: sessionEnd,
+			accept:     true,
+		},
+		{
+			name: "explicit retained=true with nested results_block (run-7 shape)",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				Inventories: []json.RawMessage{
+					json.RawMessage(`{"results_block":{"retained_until":"2026-09-29T04:24:49.223447Z","expired":false}}`),
+				},
+			},
+			sessionEnd: sessionEnd,
+			accept:     true,
+		},
+		{
+			name: "retained_until exactly equal to session end is rejected (not strictly after)",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2026-09-22T04:20:00Z",
+				ResultsExpired:                 boolPtr(false),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "is not after the session's recorded end",
+		},
+		{
+			name: "retained_until before session end is rejected",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2026-09-20T00:00:00Z",
+				ResultsExpired:                 boolPtr(false),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "is not after the session's recorded end",
+		},
+		{
+			name: "replay long after real-world expiry still passes: verdict depends only on the artifact's own recorded end, never live wall-clock",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2020-01-08T00:00:00Z",
+				ResultsExpired:                 boolPtr(false),
+			},
+			// Both sessionEnd and retainedUntil are years in the past
+			// relative to any real clock this test could run under; the
+			// gate must still accept it, because retainedUntil is after
+			// this receipt's own recorded sessionEnd and nothing here
+			// reads time.Now().
+			sessionEnd: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+			accept:     true,
+		},
+		{
+			name:        "pre-#493 absence=true is rejected and named",
+			row:         attendedResult{HandoffAbsent: true},
+			sessionEnd:  sessionEnd,
+			wantMissing: "handoff_absent_after_completion=true",
+		},
+		{
+			name: "absence=true still rejected even with a retained results block",
+			row: attendedResult{
+				HandoffAbsent: true, ResultsRetainedUntil: "2026-09-29T04:24:49Z", ResultsExpired: boolPtr(false),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "handoff_absent_after_completion=true",
+		},
+		{
+			name: "absence=true and retained=true is a named contradiction, not a pass",
+			row: attendedResult{
+				HandoffAbsent: true, HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil: "2026-09-29T04:24:49Z", ResultsExpired: boolPtr(false),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "contradict",
+		},
+		{
+			name:        "retained fact missing (nil) fails, even though the Go zero value is false either way",
+			row:         attendedResult{},
+			sessionEnd:  sessionEnd,
+			wantMissing: "handoff_retained_after_completion=true",
+		},
+		{
+			name:        "retained fact explicitly false fails",
+			row:         attendedResult{HandoffRetainedAfterCompletion: boolPtr(false)},
+			sessionEnd:  sessionEnd,
+			wantMissing: "handoff_retained_after_completion=true",
+		},
+		{
+			name: "retained=true but no results block anywhere",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "results_retained_until",
+		},
+		{
+			name: "retained_until present but unparseable",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "not-a-timestamp",
+				ResultsExpired:                 boolPtr(false),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "does not parse as RFC3339",
+		},
+		{
+			name: "retained_until present but expired missing",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2026-09-29T04:24:49Z",
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "results_expired",
+		},
+		{
+			name: "results_expired=true is rejected",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2026-09-29T04:24:49Z",
+				ResultsExpired:                 boolPtr(true),
+			},
+			sessionEnd:  sessionEnd,
+			wantMissing: "results_expired=true",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateHandoffRetention(testCase.row, testCase.sessionEnd)
+			if testCase.accept != (err == nil) {
+				t.Fatalf("validateHandoffRetention(%+v) = %v, accept=%t", testCase.row, err, testCase.accept)
+			}
+			if !testCase.accept && !strings.Contains(err.Error(), testCase.wantMissing) {
+				t.Fatalf("validateHandoffRetention(%+v) error %q does not name %q", testCase.row, err.Error(), testCase.wantMissing)
+			}
+		})
+	}
+}
+
+// TestServiceAcceptanceHandoffRetainedFactDecoding pins the JSON decoding
+// behavior validateHandoffRetention's presence check depends on: a missing
+// handoff_retained_after_completion key must decode to a nil pointer (never
+// a silent false that happens to read the same as "absent"), and an explicit
+// key decodes to a non-nil pointer holding the value written (#509 review).
+func TestServiceAcceptanceHandoffRetainedFactDecoding(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		json string
+		want *bool
+	}{
+		{name: "key omitted", json: `{}`, want: nil},
+		{name: "explicit false", json: `{"handoff_retained_after_completion":false}`, want: new(bool)},
+		{name: "explicit true", json: `{"handoff_retained_after_completion":true}`, want: func() *bool { b := true; return &b }()},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var row attendedResult
+			if err := json.Unmarshal([]byte(testCase.json), &row); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case testCase.want == nil && row.HandoffRetainedAfterCompletion != nil:
+				t.Fatalf("HandoffRetainedAfterCompletion = %v, want nil (key was absent)", *row.HandoffRetainedAfterCompletion)
+			case testCase.want != nil && row.HandoffRetainedAfterCompletion == nil:
+				t.Fatal("HandoffRetainedAfterCompletion = nil, want a present pointer (key was explicit)")
+			case testCase.want != nil && *testCase.want != *row.HandoffRetainedAfterCompletion:
+				t.Fatalf("HandoffRetainedAfterCompletion = %v, want %v", *row.HandoffRetainedAfterCompletion, *testCase.want)
+			}
 		})
 	}
 }

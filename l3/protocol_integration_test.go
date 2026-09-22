@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -337,6 +338,136 @@ func TestLineageQueryChainProvenanceAndTerminalReconciliation(t *testing.T) {
 				t.Fatalf("reconciled parent = status %q finished %v, want %q", parentRecord.Status, parentRecord.FinishedAt, tc.wantParent)
 			}
 		})
+	}
+}
+
+// TestLineageQueryAncestorsIncludeRerunSource guards the #509 fix to
+// GetLineage's ancestors walk: CreateRerun stores the new run with
+// parent_run_id NULL (a rerun is not a workflow-dispatched child) and
+// records its source separately via run_triggers (source='rerun',
+// source_run_id). Before the fix, the ancestors query only climbed
+// parent_run_id, so a rerun's own lineage.ancestors came back empty even
+// though its trigger names type:rerun and the source run ID.
+func TestLineageQueryAncestorsIncludeRerunSource(t *testing.T) {
+	h := newIntegrationHarness(t)
+	request := inlineRunRequest("#!/bin/sh\nexit 0\n")
+	request.Tags = append(request.Tags, contract.StableNodeTagPrefix+"node-1")
+	source := h.submit(request, "rerun-lineage-source")
+
+	jobs := &recordingJobClient{}
+	reconciler, err := NewReconciler(h.l3Store, jobs, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil,
+		http.Header{"Idempotency-Key": []string{"rerun-lineage-rerun"}})
+	if status != http.StatusCreated {
+		t.Fatalf("rerun status = %d body=%s", status, body)
+	}
+	var rerun RunAccepted
+	if err := json.Unmarshal(body, &rerun); err != nil {
+		t.Fatal(err)
+	}
+
+	rerunRecord, err := h.l3Store.GetRun(context.Background(), rerun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rerunRecord.ParentRunID != "" || rerunRecord.Trigger.Type != "rerun" || rerunRecord.Trigger.SourceRunID != source.RunID {
+		t.Fatalf("rerun provenance = parent %q trigger %#v, want empty parent, type rerun, source %q",
+			rerunRecord.ParentRunID, rerunRecord.Trigger, source.RunID)
+	}
+
+	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+rerun.RunID+"/lineage", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("lineage query = %d body=%s", status, body)
+	}
+	var lineage RunLineage
+	if err := json.Unmarshal(body, &lineage); err != nil {
+		t.Fatal(err)
+	}
+	if len(lineage.Ancestors) != 1 || lineage.Ancestors[0].RunID != source.RunID || lineage.Ancestors[0].Depth != 1 {
+		t.Fatalf("rerun lineage.ancestors = %#v, want one entry for source run %q at depth 1", lineage.Ancestors, source.RunID)
+	}
+
+	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+source.RunID+"/lineage", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("source lineage query = %d body=%s", status, body)
+	}
+	var sourceLineage RunLineage
+	if err := json.Unmarshal(body, &sourceLineage); err != nil {
+		t.Fatal(err)
+	}
+	if len(sourceLineage.Ancestors) != 0 {
+		t.Fatalf("source lineage.ancestors = %#v, want none", sourceLineage.Ancestors)
+	}
+}
+
+// TestLineageQueryBoundsUnboundedCycleRecursion guards the #509 review's
+// depth-cap fix: neither of GetLineage's two recursive CTEs deduped visited
+// run IDs, so corrupt or adversarial cyclic provenance (a parent_run_id chain
+// that loops back on itself -- never producible through the ordinary
+// dispatch/rerun API, but not something the query itself refused) would
+// recurse without bound. This writes a raw 3-cycle directly into the runs
+// table -- a -> b -> c -> a -- bypassing the API entirely, and requires
+// GetLineage to terminate at exactly maxLineageTraversalDepth ancestors
+// rather than hang or grow without bound.
+func TestLineageQueryBoundsUnboundedCycleRecursion(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "lineage-cycle.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.db.Close()
+
+	now := time.Now().UnixNano()
+	for _, id := range []string{"run_cycle_a", "run_cycle_b", "run_cycle_c"} {
+		if _, err := store.db.Exec(`
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, idempotency_key, request_hash, status, params_json, tags_json, required_envelope, dispatch_authority, created_ns, updated_ns)
+VALUES(?, NULL, ?, ?, 'hash', 'pending', '{}', '[]', 0, 0, ?, ?)`,
+			id, "dispatch:"+id, "idem:"+id, now, now); err != nil {
+			t.Fatalf("insert run %q: %v", id, err)
+		}
+	}
+	// parent_run_id is an immediate foreign key, so the cycle can only be
+	// closed with UPDATEs once all three rows already exist.
+	closeEdge := func(from, to string) {
+		t.Helper()
+		if _, err := store.db.Exec(`UPDATE runs SET parent_run_id=? WHERE run_id=?`, to, from); err != nil {
+			t.Fatalf("close cycle edge %s -> %s: %v", from, to, err)
+		}
+	}
+	closeEdge("run_cycle_a", "run_cycle_b")
+	closeEdge("run_cycle_b", "run_cycle_c")
+	closeEdge("run_cycle_c", "run_cycle_a")
+
+	type result struct {
+		lineage RunLineage
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		lineage, err := store.GetLineage(context.Background(), "run_cycle_a")
+		done <- result{lineage, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if len(r.lineage.Ancestors) != maxLineageTraversalDepth {
+			t.Fatalf("cyclic ancestors = %d entries, want the traversal bound %d", len(r.lineage.Ancestors), maxLineageTraversalDepth)
+		}
+		for _, entry := range r.lineage.Ancestors {
+			if entry.Depth < 1 || entry.Depth > maxLineageTraversalDepth {
+				t.Fatalf("cyclic ancestor depth %d out of bound [1,%d]", entry.Depth, maxLineageTraversalDepth)
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("GetLineage did not terminate on cyclic provenance within 10s; the recursion bound is missing or broken")
 	}
 }
 
