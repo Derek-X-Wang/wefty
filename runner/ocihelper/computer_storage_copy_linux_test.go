@@ -448,6 +448,67 @@ func TestCloneIntegrityFailureKeepsTheDestinationAndItsQuarantine(t *testing.T) 
 	}
 }
 
+func TestDelayedAttachmentRechecksRefusalAfterAcquiringGeneration(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	checked := make(chan struct{})
+	resume := make(chan struct{})
+	attached := make(chan error, 1)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupAllocate: func(string, int64) error { return unix.ENOSPC },
+		computerDiskHook: func(checkpoint computerDiskCheckpoint) error {
+			if checkpoint == computerDiskRefusalChecked {
+				close(checked)
+				select {
+				case <-resume:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}}
+	engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+		if phase != computerStorageCopyRefusalCleanup {
+			return nil
+		}
+		go func() {
+			attachment, err := engine.attachComputerDisk(ctx, request.Destination,
+				testComputerAuthority("delayed-creator", "delayed-fence", "boot"))
+			if attachment != nil {
+				_ = engine.detachComputerDisk(attachment, computerDiskReapReceipt, "")
+			}
+			attached <- err
+		}()
+		select {
+		case <-checked:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	response, err := engine.CopyComputerStorage(ctx, request)
+	// The attachment has passed its first refusal check. Only now let it
+	// acquire the flock that the completed refusal just released.
+	close(resume)
+	if err != nil || !response.Receipt.DestinationAbsent {
+		t.Fatalf("clone refusal = %+v err=%v", response, err)
+	}
+	select {
+	case err := <-attached:
+		if err == nil || !strings.Contains(err.Error(), "refused and holds no bytes") {
+			t.Fatalf("delayed attachment bypassed refusal: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("delayed attachment did not complete", ctx.Err())
+	}
+	name, _ := deterministicComputerDiskName(request.Destination)
+	if _, err := os.Lstat(filepath.Join(root, "computer-disks", name, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("delayed attachment created a disk after refusal: %v", err)
+	}
+}
+
 // Unlinking a pathname is not absence. While the copied filesystem is still
 // mounted or loop-attached, its bytes remain reachable, so no receipt may
 // certify that the destination holds nothing.

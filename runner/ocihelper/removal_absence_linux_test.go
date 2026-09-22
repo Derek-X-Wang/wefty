@@ -8,7 +8,125 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
+
+func TestRefusedCloneTombstoneInventoryAndRemoval(t *testing.T) {
+	for _, residue := range []string{"", "disk.ext4", "unexpected-payload"} {
+		t.Run("residue="+residue, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+				computerBackupAllocate: func(string, int64) error { return unix.ENOSPC }}
+			response, err := engine.CopyComputerStorage(t.Context(), request)
+			if err != nil || !response.Receipt.DestinationAbsent {
+				t.Fatalf("clone refusal = %+v err=%v", response, err)
+			}
+			storage := request.Destination
+			name, _ := deterministicComputerDiskName(storage)
+			diskRoot := filepath.Join(root, "computer-disks", name)
+			removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: "removal-boot",
+				JobID: request.Authority.JobID, PriorJobID: request.Authority.JobID, RemovalGeneration: 2, CleanupFence: "remove-refused-clone"}
+			inventoryRequest := InventoryRemovalRequest{Removal: removal, RootInstanceID: request.Authority.RootInstanceID, ComputerStorage: &storage}
+			inventory, err := engine.InventoryRemoval(t.Context(), inventoryRequest)
+			if err != nil || len(inventory.Attempts) != 1 || !inventory.Attempts[0].StorageAbsent || !inventory.Attempts[0].StorageOnly {
+				t.Fatalf("tombstone removal inventory = %+v err=%v", inventory, err)
+			}
+			if inventory.Attempts[0].Authority.JobID != removal.JobID || inventory.Attempts[0].Authority.FencingToken != removal.CleanupFence {
+				t.Fatalf("inventory lost removal authority: %+v", inventory)
+			}
+			if residue == "" {
+				for _, field := range []string{"node", "root", "job"} {
+					wrong := inventoryRequest
+					switch field {
+					case "node":
+						wrong.Removal.NodeID = "other-node"
+					case "root":
+						wrong.RootInstanceID = "other-root"
+					case "job":
+						wrong.Removal.JobID = "other-job"
+					}
+					if _, err := engine.InventoryRemoval(t.Context(), wrong); err == nil {
+						t.Errorf("tombstone inventory accepted conflicting %s authority", field)
+					}
+				}
+			}
+			if residue != "" {
+				if err := os.WriteFile(filepath.Join(diskRoot, residue), []byte("must survive"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := engine.InventoryRemoval(t.Context(), inventoryRequest); err == nil {
+					t.Fatal("tombstone with payload was inventoried as absent")
+				}
+			}
+			deleted, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+				Kind: ManagedVolumeComputerDisk, ComputerStorage: &storage, Removal: &removal,
+				StorageAbsent: inventory.Attempts[0].StorageAbsent, QuarantineOnFailure: true, FailureAttempts: 3})
+			if residue != "" {
+				if err == nil || deleted.Deleted || deleted.Quarantine != nil {
+					t.Fatalf("frozen tombstone absence deleted reappeared bytes: %+v err=%v", deleted, err)
+				}
+				if payload, err := os.ReadFile(filepath.Join(diskRoot, residue)); err != nil || string(payload) != "must survive" {
+					t.Fatalf("reappeared payload changed: %q err=%v", payload, err)
+				}
+				return
+			}
+			if err != nil || !deleted.Deleted || deleted.Quarantine != nil {
+				t.Fatalf("tombstone removal = %+v err=%v", deleted, err)
+			}
+			if _, err := os.Lstat(diskRoot); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("tombstoned root remains after removal: %v", err)
+			}
+		})
+	}
+}
+
+func TestTombstoneRemovalRetainsCreatorAdmissionThroughAbsence(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupAllocate: func(string, int64) error { return unix.ENOSPC }}
+	response, err := engine.CopyComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.DestinationAbsent {
+		t.Fatalf("clone refusal = %+v err=%v", response, err)
+	}
+	name, _ := deterministicComputerDiskName(request.Destination)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	checked := 0
+	engine.computerDiskHook = func(checkpoint computerDiskCheckpoint) error {
+		if checkpoint != computerDiskRootRemoved && checkpoint != computerDiskRemovalAbsent {
+			return nil
+		}
+		checked++
+		if engine.computerReimageMu.TryLock() {
+			engine.computerReimageMu.Unlock()
+			t.Errorf("%s released attachment admission", checkpoint)
+		}
+		if engine.computerStorageRootMu.TryLock() {
+			engine.computerStorageRootMu.Unlock()
+			t.Errorf("%s released root admission", checkpoint)
+		}
+		// A delayed copy reaches real destination admission after unlinking
+		// the old flock. Cancellation makes exclusion deterministic: an
+		// unlocked admission mutex would create a replacement root/lock.
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := engine.CopyComputerStorage(ctx, request); !errors.Is(err, context.Canceled) {
+			t.Errorf("%s admitted a delayed copy: %v", checkpoint, err)
+		}
+		if _, err := os.Lstat(diskRoot); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s let the delayed copy recreate its lock: %v", checkpoint, err)
+		}
+		return nil
+	}
+	if err := engine.deleteComputerDisk(request.Destination, ManagedVolumeRemovalAuthority{}); err != nil {
+		t.Fatal(err)
+	}
+	if checked != 2 {
+		t.Fatalf("observed %d deletion boundaries, want 2", checked)
+	}
+}
 
 // Freeze absence, publish a creator's complete prepared destination and release
 // its flock, then replay deletion using that frozen removal inventory.

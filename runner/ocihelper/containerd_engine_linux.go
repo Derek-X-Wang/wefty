@@ -120,7 +120,7 @@ type ContainerdEngine struct {
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
-	computerStorageRootMu       sync.Mutex // root creation through flock admission; never held for copy/format
+	computerStorageRootMu       sync.Mutex // root admission and deletion through absence proof; never held for copy/format
 	storageCopyMu               sync.Mutex
 	diskSystem                  computerDiskSystem
 	storageResetHook            func(computerStorageResetPhase) error
@@ -2093,6 +2093,23 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 		_ = lock.Close()
 	}()
+	// A refused generation has no payload or attachment history to inventory.
+	// Bind its durable refusal to this Computer's removal, then carry frozen
+	// absence through the ordinary Storage-only finalization path.
+	if refusal, absent, refusalErr := refusedComputerStorageAbsent(root, name); refusalErr != nil {
+		return InventoryRemovalResponse{}, refusalErr
+	} else if absent {
+		if !sameComputerStorageIdentity(refusal.Storage, storage) ||
+			refusal.Receipt.NodeID != request.Removal.NodeID || refusal.Receipt.RootInstanceID != request.RootInstanceID ||
+			refusal.Receipt.JobID != request.Removal.JobID {
+			return InventoryRemovalResponse{}, errors.New("Computer refusal does not match removal authority")
+		}
+		attempt, err := absentComputerStorageRemovalAttempt(request, storage)
+		if err != nil {
+			return InventoryRemovalResponse{}, err
+		}
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	}
 	manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 	if manifestErr != nil || !present {
 		return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))

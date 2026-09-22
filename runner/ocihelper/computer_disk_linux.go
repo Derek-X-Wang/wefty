@@ -30,6 +30,9 @@ const (
 type computerDiskCheckpoint string
 
 const (
+	computerDiskRefusalChecked      computerDiskCheckpoint = "refusal_checked"
+	computerDiskRootRemoved         computerDiskCheckpoint = "root_removed"
+	computerDiskRemovalAbsent       computerDiskCheckpoint = "removal_absent"
 	computerDiskManifestBeforeImage computerDiskCheckpoint = "manifest_before_image"
 	computerDiskImageBeforePhase    computerDiskCheckpoint = "image_before_phase"
 	computerDiskPendingBeforeAttach computerDiskCheckpoint = "pending_before_attach"
@@ -163,6 +166,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		return nil, errors.New("Computer Storage generation was refused and holds no bytes")
 	}
 	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
+	if err = engine.computerDiskCheckpoint(computerDiskRefusalChecked); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create Computer disk root: %w", err)
 	}
@@ -179,6 +185,14 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	}()
 	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, errComputerStorageAttachmentOwned
+	}
+	// Refusal may finish between the optimistic check and flock acquisition.
+	// Re-read while owning the generation before interpreting a missing image
+	// as permission to allocate a fresh disk.
+	if _, absent, refusalErr := refusedComputerStorageAbsent(diskRoot, name); refusalErr != nil {
+		return nil, refusalErr
+	} else if absent {
+		return nil, errors.New("Computer Storage generation was refused and holds no bytes")
 	}
 	// The node-wide mutex only orders manifest/flock admission against
 	// preflight. The generation flock now owns this disk, so formatting and
@@ -450,12 +464,7 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 
 func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority, storageAbsent bool) error {
 	engine.computerReimageMu.Lock()
-	reimageLocked := true
-	defer func() {
-		if reimageLocked {
-			engine.computerReimageMu.Unlock()
-		}
-	}()
+	defer engine.computerReimageMu.Unlock()
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return err
@@ -465,12 +474,11 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 			strings.HasPrefix(entry, "."+name+"-") && strings.HasSuffix(entry, computerDiskQuarantineGCFailureSuffix)
 	}
 	engine.computerStorageRootMu.Lock()
-	rootLocked := true
-	defer func() {
-		if rootLocked {
-			engine.computerStorageRootMu.Unlock()
-		}
-	}()
+	defer engine.computerStorageRootMu.Unlock()
+	// Keep the established reimage -> root-admission order through deletion
+	// and the final absence proof. The flock lives inside the deleted root;
+	// its descriptor cannot exclude a creator opening a replacement inode.
+	// Reimage admission excludes attachments, root admission copy/reset.
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	var lock *os.File
 	defer func() {
@@ -490,17 +498,12 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	if lock != nil {
-		if storageAbsent {
-			return errors.New("Computer disk deletion observed a reappeared generation after frozen Storage absence")
+	if lock != nil && storageAbsent {
+		// Frozen absence permits only no payload. A refusal's retained lock
+		// and tombstone satisfy that precondition; any reappeared bytes do not.
+		if _, absent, refusalErr := refusedComputerStorageAbsent(diskRoot, name); refusalErr != nil || !absent {
+			return errors.Join(refusalErr, errors.New("Computer disk deletion observed a reappeared generation after frozen Storage absence"))
 		}
-		// The generation flock excludes creators and attachment. If the root
-		// was absent, retain admission until cleanup finishes: there is no flock
-		// inode yet to exclude copy/reset root creation.
-		engine.computerStorageRootMu.Unlock()
-		rootLocked = false
-		engine.computerReimageMu.Unlock()
-		reimageLocked = false
 	}
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil {
@@ -548,6 +551,9 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 	if err := os.RemoveAll(diskRoot); err != nil {
 		return err
 	}
+	if err := engine.computerDiskCheckpoint(computerDiskRootRemoved); err != nil {
+		return err
+	}
 	if err := os.Remove(mountPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -590,7 +596,7 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 			return errors.New("Computer disk removal left quarantine residue")
 		}
 	}
-	return nil
+	return engine.computerDiskCheckpoint(computerDiskRemovalAbsent)
 }
 
 func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttachment, kind, sweepEpoch string) error {

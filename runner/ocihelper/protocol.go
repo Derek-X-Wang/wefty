@@ -1151,7 +1151,8 @@ type DeleteResponse struct {
 // DeleteManagedVolumeRequest names durable helper-owned state independently
 // from an attempt. OwnerKey is an opaque stable handoff-owner identity.
 type DeleteManagedVolumeRequest struct {
-	// StorageAbsent preserves frozen absence as a deletion precondition.
+	// StorageAbsent preserves frozen payload absence as a deletion precondition:
+	// only an absent root or its exact refusal tombstone and lock may remain.
 	StorageAbsent       bool                           `json:"storage_absent,omitempty"`
 	Kind                ManagedVolumeKind              `json:"kind"`
 	OwnerKey            string                         `json:"owner_key"`
