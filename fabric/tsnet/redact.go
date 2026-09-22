@@ -3,8 +3,11 @@ package tsnet
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
+	"unicode"
 )
 
 // enrollmentRequiredMessage is the wefty-owned line printed in place of the
@@ -30,16 +33,6 @@ var (
 	// authkey=... / key=... are the query parameters an enrollment or
 	// coordination URL carries the same secret in.
 	authKeyQueryPattern = regexp.MustCompile(`(?i)\b(authkey|key)=[^&\s"'<>]+`)
-	// A URL's userinfo (user[:password]@) component. A control URL can
-	// carry basic-auth credentials this way, and the pinned dependency
-	// logs the configured control URL verbatim with no gating of its own
-	// ("control server key from <serverURL>",
-	// control/controlclient/direct.go:714). This is stripped
-	// unconditionally, before enrollment detection even runs: there is no
-	// opt-in for a login/password, only for the enrollment token, so it
-	// applies regardless of the print opt-in and regardless of whether the
-	// URL turns out to be enrollment-shaped.
-	urlUserinfoPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]+@`)
 	// nodekey:<hex> is a node's long-form public key (types/key/node.go's
 	// NodePublic.String). It is a public identifier, not a secret, but it
 	// still names a specific tailnet member and stays behind the seam.
@@ -63,37 +56,14 @@ var (
 	// is not covered here -- there is no generic pattern for a suffix an
 	// operator chose, and this package does not attempt one.
 	magicDNSPattern = regexp.MustCompile(`(?i)\b[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.ts\.net\b`)
-	// enrollmentURLPattern recognizes the two enrollment URL shapes wefty
-	// knows how to gate: the tailscale.com SaaS controller's
-	// login.<host>/a/<token> path (control/controlclient/direct.go's
-	// "AuthURL is %v" log and ipn/ipnlocal/local.go's "Received auth URL"
-	// log both forward resp.AuthURL verbatim) and an alternate control
-	// server's <control-host>/register/<key> path. Both carry a one-time
-	// login token in the URL itself, which is why they get the
-	// notice/opt-in treatment below instead of ordinary conservative URL
-	// redaction.
-	enrollmentURLPattern = regexp.MustCompile(`(?i)\bhttps?://(?:login\.[a-zA-Z0-9.-]+/a/[A-Za-z0-9_-]+|[a-zA-Z0-9.-]+/register/[A-Za-z0-9_-]+)\S*`)
-	// Any other http(s) URL a forwarded line carries is unrecognized: it
-	// might be an ordinary error message (a dial failure, a bad control
-	// URL) rather than an enrollment prompt. processFabricLine keeps the
-	// line but blanks the URL with this pattern unless the print opt-in is
-	// on, rather than swallowing the whole line.
-	urlPattern = regexp.MustCompile(`https?://\S+`)
 )
 
-// redactFabricLog strips anything that looks like URL userinfo, a
-// tailscale auth key or key= query parameter, a node/disco public key, a
-// tailnet address, or a MagicDNS-style tailnet hostname out of a line the
-// pinned tsnet dependency produced. It is applied to every line this
-// package forwards, whether or not that line was recognised as an
-// enrollment or other URL, as defense in depth against a future tsnet
-// release folding a credential into some other status line. It is NOT
-// applied to a recognised enrollment URL's own host and path when the print
-// opt-in is on -- see enrollmentURLPattern and
-// redactFabricLogPreservingEnrollmentURL for that policy, which is what
-// makes the opt-in actually usable.
+// redactFabricLog strips anything that looks like a tailscale auth key or
+// key= query parameter, a node/disco public key, a tailnet address, or a
+// MagicDNS-style tailnet hostname out of text the pinned tsnet dependency
+// produced. URL userinfo is handled structurally by processFabricLine before
+// this pure text redactor runs.
 func redactFabricLog(line string) string {
-	line = urlUserinfoPattern.ReplaceAllString(line, "${1}[REDACTED]@")
 	line = authKeyQueryPattern.ReplaceAllString(line, "$1=[REDACTED]")
 	line = authKeyPattern.ReplaceAllString(line, "[REDACTED]")
 	line = nodeKeyPattern.ReplaceAllString(line, "nodekey:[REDACTED]")
@@ -105,34 +75,51 @@ func redactFabricLog(line string) string {
 	return line
 }
 
-// redactFabricLogPreservingEnrollmentURL is used only when the enrollment
-// URL print opt-in is on and the line contains a recognised enrollment URL
-// (enrollmentURLPattern). Text outside the matched URL still gets the full
-// redactFabricLog treatment; the URL span itself keeps its host and path
-// byte-for-byte, with only its authkey=/key= query values and tskey- tokens
-// stripped. Running the identifier patterns (tailnet address, MagicDNS,
-// nodekey) over the URL itself would otherwise mangle a CGNAT- or
-// MagicDNS-hosted control server's enrollment link exactly when an operator
-// asked to see it (wefty #498 finding 1, round 2). Userinfo is not handled
-// here: processFabricLine already stripped it from the whole line,
-// including inside this span, before the enrollment shape was even
-// matched.
-func redactFabricLogPreservingEnrollmentURL(line string) string {
-	loc := enrollmentURLPattern.FindStringIndex(line)
-	if loc == nil {
-		// Defensive fallback; callers only reach here after a match.
-		return redactFabricLog(line)
-	}
-	before := redactFabricLog(line[:loc[0]])
-	enrollmentURL := line[loc[0]:loc[1]]
-	enrollmentURL = authKeyQueryPattern.ReplaceAllString(enrollmentURL, "$1=[REDACTED]")
-	enrollmentURL = authKeyPattern.ReplaceAllString(enrollmentURL, "[REDACTED]")
-	after := redactFabricLog(line[loc[1]:])
-	return before + enrollmentURL + after
-}
-
 func fabricPrintEnrollmentURLEnabled() bool {
 	return os.Getenv(printEnrollmentURLEnv) == "1"
+}
+
+// nextHTTPURLStart finds the next candidate URL without deciding where it
+// ends. URL boundaries are determined by scanHTTPURLToken, not a regexp, so
+// punctuation-delimited structured fields cannot join one URL to the next.
+func nextHTTPURLStart(line string) int {
+	httpStart := strings.Index(line, "http://")
+	httpsStart := strings.Index(line, "https://")
+	if httpStart < 0 {
+		return httpsStart
+	}
+	if httpsStart < 0 || httpStart < httpsStart {
+		return httpStart
+	}
+	return httpsStart
+}
+
+// scanHTTPURLToken returns the length of the candidate URL at the start of
+// line. Whitespace and punctuation used to delimit log fields end the token;
+// a sentence-ending period is left outside it.
+func scanHTTPURLToken(line string) int {
+	end := len(line)
+	for i, r := range line {
+		if unicode.IsSpace(r) || strings.ContainsRune("\"'<>,;)]", r) {
+			end = i
+			break
+		}
+	}
+	for end > 0 && line[end-1] == '.' {
+		end--
+	}
+	return end
+}
+
+func isEnrollmentURL(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	return strings.HasPrefix(host, "login.") && strings.HasPrefix(u.Path, "/a/") ||
+		strings.HasPrefix(u.Path, "/register/")
+}
+
+func redactEnrollmentURL(rawURL string) string {
+	rawURL = authKeyQueryPattern.ReplaceAllString(rawURL, "$1=[REDACTED]")
+	return authKeyPattern.ReplaceAllString(rawURL, "[REDACTED]")
 }
 
 // processFabricLine applies wefty's enrollment disclosure policy to a line
@@ -140,31 +127,53 @@ func fabricPrintEnrollmentURLEnabled() bool {
 // single place that policy is decided, so the user-facing and backend logs
 // can never disagree about what an operator is allowed to see:
 //
-//   - URL userinfo (user[:password]@) is stripped from the whole line
-//     first, unconditionally -- there is no opt-in for a login/password
-//     (finding 2, round 2).
-//   - A recognised enrollment URL (enrollmentURLPattern) becomes the
+//   - Candidate URLs end at whitespace or log-field punctuation, are parsed,
+//     and have userinfo stripped unconditionally.
+//   - A recognised enrollment URL becomes the
 //     wefty-owned notice, unless the operator opted in, in which case the
 //     real URL is kept intact -- only its credential-bearing query
-//     parameters are stripped, by redactFabricLogPreservingEnrollmentURL,
-//     not the identifier patterns that would otherwise mangle a
-//     CGNAT/MagicDNS-hosted control server's URL (finding 1, round 2).
+//     parameters are stripped, not the identifier patterns that would
+//     otherwise mangle a CGNAT/MagicDNS-hosted control server's URL.
 //   - Any other http(s) URL is conservatively blanked unless that same
 //     opt-in is set, so an ordinary error message keeps its text instead of
 //     being swallowed.
-//   - Every other line is just redacted for stray identifiers.
+//   - Text outside an opted-in enrollment URL is redacted normally.
 func processFabricLine(line string) string {
-	line = urlUserinfoPattern.ReplaceAllString(line, "${1}[REDACTED]@")
-	switch {
-	case enrollmentURLPattern.MatchString(line):
-		if !fabricPrintEnrollmentURLEnabled() {
-			return enrollmentRequiredMessage
+	optedIn := fabricPrintEnrollmentURLEnabled()
+	var out strings.Builder
+	for {
+		start := nextHTTPURLStart(line)
+		if start < 0 {
+			out.WriteString(redactFabricLog(line))
+			return out.String()
 		}
-		return redactFabricLogPreservingEnrollmentURL(line)
-	case urlPattern.MatchString(line) && !fabricPrintEnrollmentURLEnabled():
-		return redactFabricLog(urlPattern.ReplaceAllString(line, "[REDACTED-URL]"))
-	default:
-		return redactFabricLog(line)
+
+		out.WriteString(redactFabricLog(line[:start]))
+		tokenLen := scanHTTPURLToken(line[start:])
+		rawURL := line[start : start+tokenLen]
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			out.WriteString("[REDACTED-URL]")
+			line = line[start+tokenLen:]
+			continue
+		}
+
+		// A control URL can carry basic-auth credentials. There is no opt-in
+		// for these, so remove parsed userinfo before classifying or emitting
+		// any URL.
+		u.User = nil
+		safeURL := u.String()
+		if isEnrollmentURL(u) {
+			if !optedIn {
+				return enrollmentRequiredMessage
+			}
+			out.WriteString(redactEnrollmentURL(safeURL))
+		} else if optedIn {
+			out.WriteString(redactFabricLog(safeURL))
+		} else {
+			out.WriteString("[REDACTED-URL]")
+		}
+		line = line[start+tokenLen:]
 	}
 }
 

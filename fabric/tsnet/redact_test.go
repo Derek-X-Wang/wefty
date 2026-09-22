@@ -151,6 +151,56 @@ func TestWrapUserLogfPreservesEnrollmentURLHostUnderIdentifierRedaction(t *testi
 	}
 }
 
+func TestWrapUserLogfBoundsEnrollmentURLBeforeAdjacentPeerURL(t *testing.T) {
+	t.Setenv(printEnrollmentURLEnv, "1")
+
+	const line = `AuthURL is "https://login.example.test/a/token",peer="http://100.101.102.103"`
+	const want = `AuthURL is "https://login.example.test/a/token",peer="http://[REDACTED-TAILNET-ADDR]"`
+	var got []string
+	userLogf := wrapUserLogf(func(format string, args ...any) {
+		got = append(got, fmt.Sprintf(format, args...))
+	})
+
+	userLogf("%s", line)
+
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("opted-in adjacent URLs = %q, want %q", got, want)
+	}
+}
+
+func TestWrapUserLogfDoesNotTreatQueryAtSignAsUserinfo(t *testing.T) {
+	t.Setenv(printEnrollmentURLEnv, "1")
+
+	const line = `https://control.example.test?contact=ops@example.test`
+	var got []string
+	userLogf := wrapUserLogf(func(format string, args ...any) {
+		got = append(got, fmt.Sprintf(format, args...))
+	})
+
+	userLogf("%s", line)
+
+	if len(got) != 1 || got[0] != line {
+		t.Fatalf("URL with query @ = %q, want host and query preserved as %q", got, line)
+	}
+}
+
+func TestWrapUserLogfRedactsMalformedURLToken(t *testing.T) {
+	t.Setenv(printEnrollmentURLEnv, "1")
+
+	const line = `request failed for https://%zz.`
+	const want = `request failed for [REDACTED-URL].`
+	var got []string
+	userLogf := wrapUserLogf(func(format string, args ...any) {
+		got = append(got, fmt.Sprintf(format, args...))
+	})
+
+	userLogf("%s", line)
+
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("malformed URL line = %q, want %q", got, want)
+	}
+}
+
 func TestWrapUserLogfDetectsAlternateControlRegisterShape(t *testing.T) {
 	t.Setenv(printEnrollmentURLEnv, "")
 
@@ -301,8 +351,10 @@ func TestWrapBackendLogfAppliesTheSameEnrollmentPolicyAsUserLogf(t *testing.T) {
 func TestURLUserinfoIsAlwaysRedacted(t *testing.T) {
 	for _, optedIn := range []string{"", "1"} {
 		name := "opted out"
+		want := `control server key from [REDACTED-URL]`
 		if optedIn == "1" {
 			name = "opted in"
+			want = `control server key from https://control.example.test`
 		}
 		t.Run("UserLogf/"+name, func(t *testing.T) {
 			t.Setenv(printEnrollmentURLEnv, optedIn)
@@ -315,8 +367,8 @@ func TestURLUserinfoIsAlwaysRedacted(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("sink called %d times, want 1: %v", len(got), got)
 			}
-			if strings.Contains(got[0], syntheticControlURLUserinfo) {
-				t.Fatalf("UserLogf (%s) leaked URL userinfo: %q", name, got[0])
+			if got[0] != want || strings.Contains(got[0], syntheticControlURLUserinfo) {
+				t.Fatalf("UserLogf (%s) = %q, want %q with no URL userinfo", name, got[0], want)
 			}
 		})
 		t.Run("BackendLogf/"+name, func(t *testing.T) {
@@ -330,8 +382,8 @@ func TestURLUserinfoIsAlwaysRedacted(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("sink called %d times, want 1: %v", len(got), got)
 			}
-			if strings.Contains(got[0], syntheticControlURLUserinfo) {
-				t.Fatalf("BackendLogf (%s) leaked URL userinfo: %q", name, got[0])
+			if got[0] != want || strings.Contains(got[0], syntheticControlURLUserinfo) {
+				t.Fatalf("BackendLogf (%s) = %q, want %q with no URL userinfo", name, got[0], want)
 			}
 		})
 	}
