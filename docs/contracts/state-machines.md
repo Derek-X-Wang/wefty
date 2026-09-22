@@ -326,15 +326,17 @@ stays reserved for a copy whose integrity is in doubt and is never how a clone
 reports that the disk was too small.
 
 A Computer whose current Storage generation was never published owns no bytes
-to start from, so it is neither startable nor restartable: start, restart, and
-claim admission all refuse it with the typed reason
-`storage_generation_retired` until an authorized recovery operation
-establishes valid current Storage. Recovered capacity is not such an
-operation. Without that rule a refused clone would look like an ordinary
-stopped Computer, and the helper's first-allocation path would format a fresh
-empty disk under the clone's durable identity, silently replacing the copy the
-operator asked for with nothing. Removal is always available and is the
-ordinary exit. Immutable Storage provenance records
+to start from or to change. Start, restart, and claim admission refuse it with
+the typed reason `storage_generation_retired`, and so do reimage, projection
+replacement, resize, and reset, each before reserving a revision or entering a
+phase: those operations would otherwise commit a reconfiguration whose
+directive no helper can ever complete, which is the same wedge in a different
+verb. The refusal stands until an authorized recovery operation establishes
+valid current Storage; recovered capacity is not such an operation. Without
+that rule a refused clone would look like an ordinary stopped Computer, and the
+helper's first-allocation path would format a fresh empty disk under the
+clone's durable identity, silently replacing the copy the operator asked for
+with nothing. Removal is always available and is the ordinary exit. Immutable Storage provenance records
 the source Backup and destination as a custody fork. If one
 managed branch is removed while another secret-bearing branch survives, the
 Computer outcome is `removed_reduced`; after coordinated positive removal of

@@ -1707,6 +1707,12 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
+	// Refused before any revision is reserved: a projection or reimage of a
+	// Computer with no published Storage commits a phase whose directive no
+	// helper can ever complete.
+	if err := requireCurrentComputerStorage(ctx, tx, computer, string(operation)); err != nil {
+		return Computer{}, err
+	}
 	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}

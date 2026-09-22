@@ -154,6 +154,14 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	} else if pending {
 		return nil, &ComputerStorageResumeDeferredError{Storage: storage}
 	}
+	// A refused copy's generation is terminal. Preparing it would format a
+	// fresh empty disk under the identity whose copy was refused, which is
+	// exactly the outcome the refusal exists to prevent.
+	if _, absent, refusalErr := refusedComputerStorageAbsent(diskRoot, name); refusalErr != nil {
+		return nil, refusalErr
+	} else if absent {
+		return nil, errors.New("Computer Storage generation was refused and holds no bytes")
+	}
 	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create Computer disk root: %w", err)
@@ -512,7 +520,12 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 			return errors.New("Computer disk deletion lacks detachment or staging authority")
 		}
 	} else if _, statErr := os.Lstat(diskRoot); statErr == nil {
-		return errors.New("Computer disk deletion found bytes without an authority manifest")
+		// A refused copy's own lock and tombstone are not bytes: that
+		// generation never published anything, and authorized removal deletes
+		// the retained root whole.
+		if _, absent, refusalErr := refusedComputerStorageAbsent(diskRoot, name); refusalErr != nil || !absent {
+			return errors.Join(refusalErr, errors.New("Computer disk deletion found bytes without an authority manifest"))
+		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
@@ -779,14 +792,23 @@ func (linuxComputerDiskSystem) allocateAndFormat(ctx context.Context, path strin
 }
 
 func fullyAllocateComputerDisk(path string, bytes int64) error {
+	allocationErr, closeErr := allocateComputerDiskSeparately(path, bytes)
+	return errors.Join(allocationErr, closeErr)
+}
+
+// allocateComputerDiskSeparately returns the allocation failure and the close
+// failure as two values. A caller that must decide whether ENOSPC is a
+// capacity fact may look only at the first: an allocation error combined with
+// a failed close is never a clean capacity refusal.
+func allocateComputerDiskSeparately(path string, bytes int64) (allocationErr error, closeErr error) {
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return err
+		return err, nil
 	}
-	if err = unix.Fallocate(int(file.Fd()), 0, 0, bytes); err == nil {
-		err = file.Sync()
+	if allocationErr = unix.Fallocate(int(file.Fd()), 0, 0, bytes); allocationErr == nil {
+		allocationErr = file.Sync()
 	}
-	return errors.Join(err, file.Close())
+	return allocationErr, file.Close()
 }
 
 func findRootTool(name string) (string, error) {
@@ -1429,6 +1451,19 @@ diskLoop:
 		if quarantineResumed {
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
 				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: "quarantine_recovered",
+			})
+			closeComputerDiskLock(recoveryLock)
+			continue
+		}
+		// A refused copy leaves its own lock and tombstone and nothing else.
+		// That generation holds no bytes: it is absent, not an anomaly, and
+		// quarantining it would turn an already-terminal operation into an
+		// operator problem. A tombstone that does not stand alone falls
+		// through to the ordinary classification below.
+		if _, absent, refusalErr := refusedComputerStorageAbsent(root, entry.Name()); refusalErr == nil && absent {
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerDiskImage, ID: entry.Name(), Action: SweepActionRetained,
+				Method: "computer_storage_copy_refused",
 			})
 			closeComputerDiskLock(recoveryLock)
 			continue

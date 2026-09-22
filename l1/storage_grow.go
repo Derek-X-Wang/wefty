@@ -195,6 +195,12 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 		return Computer{}, false, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
+	// A grow mutates the current generation's image. With no published
+	// generation there is nothing to grow, and the helper would refuse the
+	// absent disk on every poll.
+	if err := requireCurrentComputerStorage(ctx, tx, computer, "resize"); err != nil {
+		return Computer{}, false, err
+	}
 	if request.DiskBytes <= computer.DesiredDiskBytes {
 		return Computer{}, false, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
 			"computer_id": computerID, "current_disk_bytes": computer.DesiredDiskBytes,

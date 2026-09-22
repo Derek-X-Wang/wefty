@@ -309,7 +309,7 @@ func TestComputerRestoreRejectsDigestMismatchAndTruncationBeforeDestinationPubli
 // A clone that cannot fit its destination is a capacity fact with its own
 // typed receipt; every other clone failure keeps the destination and stays on
 // the integrity path, and a quarantined generation stays quarantined.
-func TestCloneCapacityRefusalIsTypedAndLeavesIntegrityFailuresQuarantinable(t *testing.T) {
+func TestCloneCapacityRefusalIsTypedAndOwnsItsGenerationThroughCleanup(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
 	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize+(1<<20))
 	destinationName, err := deterministicComputerDiskName(request.Destination)
@@ -320,6 +320,7 @@ func TestCloneCapacityRefusalIsTypedAndLeavesIntegrityFailuresQuarantinable(t *t
 	stagingPath := filepath.Join(destinationRoot, "disk.ext4.staging")
 	var ownershipErr error
 	cleanupObserved := false
+	creator := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
 	exhausted := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
 		computerBackupAllocate: func(path string, size int64) error {
 			if size > request.SourceSize {
@@ -327,22 +328,31 @@ func TestCloneCapacityRefusalIsTypedAndLeavesIntegrityFailuresQuarantinable(t *t
 			}
 			return fullyAllocateComputerDisk(path, size)
 		}, storageCopyFinalize: fakeCloneFinalize(t),
-		// The refusal's publication check, absence proof and deletion must
-		// happen while this call still owns the generation, or a concurrent
-		// retry could publish into the root it is about to delete.
+		// Observed at the one instant a creator could race the refusal: the
+		// payload is gone and the tombstone is not written yet. The
+		// generation lock inode must still be the one this call holds, so no
+		// attachment admission can take the destination and create a disk in
+		// the root the refusal is finishing.
 		storageCopyHook: func(phase computerStorageCopyPhase) error {
 			if phase != computerStorageCopyRefusalCleanup {
 				return nil
 			}
 			cleanupObserved = true
+			if _, err := os.Lstat(stagingPath); !errors.Is(err, os.ErrNotExist) {
+				ownershipErr = errors.Join(ownershipErr, fmt.Errorf("payload survived refusal cleanup: %v", err))
+			}
 			if lock, err := openComputerDiskLock(destinationRoot); !errors.Is(err, errComputerStorageAttachmentOwned) {
 				closeComputerDiskLock(lock)
 				ownershipErr = errors.Join(ownershipErr,
 					fmt.Errorf("destination generation was not owned during refusal cleanup: %v", err))
 			}
-			if _, err := os.Lstat(stagingPath); err != nil {
+			if _, err := creator.attachComputerDisk(t.Context(), request.Destination,
+				testComputerAuthority("racing-creator", "racing-fence", "racing-boot")); !errors.Is(err, errComputerStorageAttachmentOwned) {
 				ownershipErr = errors.Join(ownershipErr,
-					fmt.Errorf("refusal cleanup ran after the staging was already gone: %v", err))
+					fmt.Errorf("a creator was admitted during refusal cleanup: %v", err))
+			}
+			if _, err := os.Lstat(filepath.Join(destinationRoot, "disk.ext4")); !errors.Is(err, os.ErrNotExist) {
+				ownershipErr = errors.Join(ownershipErr, fmt.Errorf("a disk appeared during refusal cleanup: %v", err))
 			}
 			return nil
 		}}
@@ -361,10 +371,57 @@ func TestCloneCapacityRefusalIsTypedAndLeavesIntegrityFailuresQuarantinable(t *t
 		receipt.DestinationPrepared || receipt.HelperGeneration != request.Authority.HelperGeneration {
 		t.Fatalf("over-capacity clone receipt = %+v", receipt)
 	}
-	if _, err := os.Lstat(destinationRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("refused clone staging remains: %v", err)
+	// The root survives with its lock and tombstone and nothing else.
+	entries, err := os.ReadDir(destinationRoot)
+	if err != nil {
+		t.Fatal(err)
 	}
+	remaining := []string{}
+	for _, entry := range entries {
+		remaining = append(remaining, entry.Name())
+	}
+	slices.Sort(remaining)
+	if !slices.Equal(remaining, []string{"attachment.lock", "copy-refused.json"}) {
+		t.Fatalf("refused destination root = %v", remaining)
+	}
+	// Every later reader treats that root as an absent generation.
+	if _, err := creator.attachComputerDisk(t.Context(), request.Destination,
+		testComputerAuthority("late-creator", "late-fence", "late-boot")); err == nil ||
+		!strings.Contains(err.Error(), "refused and holds no bytes") {
+		t.Fatalf("preparing a refused generation = %v", err)
+	}
+	replay, err := exhausted.CopyComputerStorage(t.Context(), request)
+	if err != nil || replay.Receipt.ReceiptID != receipt.ReceiptID || replay.Receipt.FailureCode != "insufficient_disk" {
+		t.Fatalf("refused clone replay = %+v err=%v", replay.Receipt, err)
+	}
+	sweeper := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if err := sweeper.sweepComputerDisks(t.Context(), "refusal-sweep"); err != nil {
+		t.Fatalf("sweep with a refused generation = %v", err)
+	}
+	for _, evidence := range sweeper.computerDiskSweepEvidence {
+		if evidence.ID == destinationName && evidence.Action == SweepActionQuarantined {
+			t.Fatalf("sweep quarantined a refused generation: %+v", evidence)
+		}
+	}
+	if quarantined, err := computerDiskQuarantined(root, request.Destination); err != nil || quarantined {
+		t.Fatalf("refused generation quarantined=%t err=%v", quarantined, err)
+	}
+	if _, err := os.Lstat(filepath.Join(destinationRoot, "copy-refused.json")); err != nil {
+		t.Fatalf("sweep removed the refusal tombstone: %v", err)
+	}
+}
 
+// A clone whose bytes are in doubt keeps its destination and its ordinary
+// integrity path: it is never converted into proven absence, and a generation
+// already quarantined stays quarantined.
+func TestCloneIntegrityFailureKeepsTheDestinationAndItsQuarantine(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize+(1<<20))
+	destinationName, err := deterministicComputerDiskName(request.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationRoot := filepath.Join(root, "computer-disks", destinationName)
 	stalled := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
 		computerBackupCopyN: func(io.Writer, io.Reader, int64) (int64, error) {
 			return 0, errors.New("Computer Storage copy stalled mid-flight")
@@ -375,10 +432,16 @@ func TestCloneCapacityRefusalIsTypedAndLeavesIntegrityFailuresQuarantinable(t *t
 	if _, err := os.Lstat(destinationRoot); err != nil {
 		t.Fatalf("integrity failure discarded the destination in doubt: %v", err)
 	}
-
 	if err := stalled.quarantineComputerDiskAnomaly(destinationRoot, destinationName, request.Destination, "identity_mismatch"); err != nil {
 		t.Fatal(err)
 	}
+	exhausted := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupAllocate: func(path string, size int64) error {
+			if size > request.SourceSize {
+				return unix.ENOSPC
+			}
+			return fullyAllocateComputerDisk(path, size)
+		}, storageCopyFinalize: fakeCloneFinalize(t)}
 	var quarantined *ComputerStorageQuarantinedError
 	if response, err := exhausted.CopyComputerStorage(t.Context(), request); !errors.As(err, &quarantined) || response.Receipt.Kind != "" {
 		t.Fatalf("quarantined over-capacity clone = %+v err=%v, want the quarantine result", response.Receipt, err)
@@ -449,6 +512,109 @@ func TestCloneENOSPCOutsideDestinationWritesIsNeverACapacityRefusal(t *testing.T
 			response, err := engine.CopyComputerStorage(t.Context(), request)
 			if err == nil || response.Receipt.Kind != "" {
 				t.Fatalf("%s produced %+v err=%v, want an engine failure", arm.name, response.Receipt, err)
+			}
+			if _, err := os.Lstat(filepath.Join(root, "computer-disks", destinationName)); err != nil {
+				t.Fatalf("%s discarded the destination in doubt: %v", arm.name, err)
+			}
+		})
+	}
+}
+
+// A recognized source-validation failure is terminal for the reserved
+// destination, so it must carry the same proven-absence receipt the agent
+// acknowledges. An engine error would leave the reserved import with nothing
+// to close.
+func TestCustodyImportSourceValidationFailuresStillProveAbsence(t *testing.T) {
+	for _, arm := range []struct {
+		name     string
+		wantCode string
+		tamper   func(t *testing.T, externalRoot string, request *CopyComputerStorageRequest)
+	}{
+		{"missing manifest", "manifest_invalid", func(t *testing.T, externalRoot string, _ *CopyComputerStorageRequest) {
+			if err := os.Remove(filepath.Join(externalRoot, "custody.json")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"conflicting manifest", "manifest_invalid", func(_ *testing.T, _ string, request *CopyComputerStorageRequest) {
+			request.ManifestDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		}},
+		{"disk digest mismatch", "digest_mismatch", func(t *testing.T, externalRoot string, _ *CopyComputerStorageRequest) {
+			disk, err := os.OpenFile(filepath.Join(externalRoot, "storage.ext4"), os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := disk.WriteAt([]byte("tenant-bytes-changed"), 8192); err != nil {
+				t.Fatal(err)
+			}
+			if err := errors.Join(disk.Sync(), disk.Close()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+			exportRequest := custodyExportTestRequest(source, externalRoot)
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+				storageCopyFinalize: importFinalize}
+			exported, err := engine.ExportComputerCustody(t.Context(), exportRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := storageCopyTestRequest(source, "import", source.Receipt.AllocatedSize)
+			request.Destination.ComputerID = "import-computer"
+			request.Destination.StorageID = "import-storage"
+			request.Destination.StorageGeneration = 1
+			request.ExportID = exportRequest.ExportID
+			request.ExternalPath = externalRoot
+			request.ManifestDigest = exported.Receipt.ManifestDigest
+			request.Authority.JobID = "import-job"
+			arm.tamper(t, externalRoot, &request)
+			response, err := engine.CopyComputerStorage(t.Context(), request)
+			if err != nil || response.Receipt.Kind != "computer_storage_copy_failed_absent" ||
+				response.Receipt.FailureCode != arm.wantCode || !response.Receipt.DestinationAbsent ||
+				response.Receipt.ObservedAvailableBytes != 0 {
+				t.Fatalf("%s = %+v err=%v", arm.name, response.Receipt, err)
+			}
+			destinationName, err := deterministicComputerDiskName(request.Destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := requireRefusedComputerStorageAbsence(filepath.Join(root, "computer-disks", destinationName)); err != nil {
+				t.Fatalf("%s left a destination holding bytes: %v", arm.name, err)
+			}
+		})
+	}
+}
+
+// An allocation ENOSPC that arrives joined with a failed close is not a clean
+// capacity fact: the second failure must not disappear behind a receipt.
+func TestAllocationENOSPCJoinedWithACloseFailureStaysAnEngineFailure(t *testing.T) {
+	for _, arm := range []struct {
+		name      string
+		expansion bool
+	}{{"initial allocation", false}, {"expansion allocation", true}} {
+		t.Run(arm.name, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			destinationSize := source.Receipt.AllocatedSize
+			if arm.expansion {
+				destinationSize += 1 << 20
+			}
+			request := storageCopyTestRequest(source, "clone", destinationSize)
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+				computerBackupAllocate: func(path string, size int64) error {
+					if arm.expansion != (size > request.SourceSize) {
+						return fullyAllocateComputerDisk(path, size)
+					}
+					return errors.Join(unix.ENOSPC, unix.EIO)
+				}, storageCopyFinalize: fakeCloneFinalize(t)}
+			response, err := engine.CopyComputerStorage(t.Context(), request)
+			if err == nil || response.Receipt.Kind != "" || !errors.Is(err, unix.EIO) {
+				t.Fatalf("%s = %+v err=%v, want an engine failure carrying the close failure", arm.name, response.Receipt, err)
+			}
+			destinationName, err := deterministicComputerDiskName(request.Destination)
+			if err != nil {
+				t.Fatal(err)
 			}
 			if _, err := os.Lstat(filepath.Join(root, "computer-disks", destinationName)); err != nil {
 				t.Fatalf("%s discarded the destination in doubt: %v", arm.name, err)

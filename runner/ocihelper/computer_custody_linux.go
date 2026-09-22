@@ -281,7 +281,7 @@ func validateImportCustodySource(runtimeRoot string, request CopyComputerStorage
 		if err == nil {
 			err = errors.New("Custody import manifest is missing")
 		}
-		return "", err
+		return "", &computerStorageCopySourceError{Code: "manifest_invalid", Err: err}
 	}
 	if manifest.Phase != "complete" || custodyManifestDigest(payload) != request.ManifestDigest ||
 		manifest.ExportID != request.ExportID || manifest.BackupID != request.BackupID || manifest.CopyID != request.CopyID ||
@@ -289,24 +289,28 @@ func validateImportCustodySource(runtimeRoot string, request CopyComputerStorage
 		manifest.StorageID != request.SourceStorageID || manifest.StorageGeneration != request.SourceGeneration ||
 		manifest.AllocatedSize != request.SourceSize || manifest.ContentDigest != request.SourceDigest ||
 		request.Authority.NodeID == "" || request.Authority.RootInstanceID == "" {
-		return "", errors.New("Custody import manifest conflicts with recorded export evidence")
+		return "", &computerStorageCopySourceError{Code: "manifest_invalid",
+			Err: errors.New("Custody import manifest conflicts with recorded export evidence")}
 	}
 	disk := filepath.Join(root, manifest.DiskFile)
 	fd, err := unix.Open(disk, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return "", errors.New("Custody import disk size conflicts with its manifest")
+		return "", &computerStorageCopySourceError{Code: "manifest_invalid",
+			Err: errors.New("Custody import disk size conflicts with its manifest")}
 	}
 	diskFile := os.NewFile(uintptr(fd), disk)
 	defer diskFile.Close()
 	info, err := diskFile.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != request.SourceSize {
-		return "", errors.New("Custody import disk size conflicts with its manifest")
+		return "", &computerStorageCopySourceError{Code: "manifest_invalid",
+			Err: errors.New("Custody import disk size conflicts with its manifest")}
 	}
 	// This re-verification is load-bearing: import trusts neither a path-derived
 	// owner nor prior export time once the portable bytes are operator-owned.
 	digest, err := digestCustodyFile(diskFile)
 	if err != nil || digest != request.SourceDigest {
-		return "", errors.New("Custody import disk digest conflicts with its manifest")
+		return "", &computerStorageCopySourceError{Code: "digest_mismatch",
+			Err: errors.New("Custody import disk digest conflicts with its manifest")}
 	}
 	return disk, nil
 }

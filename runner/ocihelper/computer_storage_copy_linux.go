@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -32,8 +33,9 @@ const (
 	computerStorageCopyManifestWritten computerStorageCopyPhase = "manifest_written"
 	computerStorageCopyPublished       computerStorageCopyPhase = "published"
 	// computerStorageCopyRefusalCleanup is not a durable phase: it marks the
-	// owned interval in which a typed failure proves and removes the
-	// destination, so a test can observe that ownership is still held there.
+	// instant a refusal has removed the payload and has not yet written its
+	// tombstone, so a test can observe that the generation lock is still held
+	// and no creator can take the destination.
 	computerStorageCopyRefusalCleanup computerStorageCopyPhase = "refusal_cleanup"
 )
 
@@ -348,7 +350,7 @@ func (e *computerStorageDestinationFullError) Unwrap() error { return e.Err }
 // other error, and any failure to read that capacity fact, is returned
 // unchanged.
 func (engine *ContainerdEngine) destinationCapacityError(err error) error {
-	if err == nil || !errors.Is(err, unix.ENOSPC) {
+	if err == nil || soleCause(err) != unix.ENOSPC {
 		return err
 	}
 	available, availableErr := filesystemAvailableBytes(filepath.Join(engine.config.RuntimeRoot, "computer-disks"))
@@ -356,6 +358,36 @@ func (engine *ContainerdEngine) destinationCapacityError(err error) error {
 		return errors.Join(err, availableErr)
 	}
 	return &computerStorageDestinationFullError{ObservedAvailableBytes: available, Err: err}
+}
+
+// computerStorageCopySourceError names a recognized source-validation failure
+// at the site that detects it, so the verb's typed outcome never depends on
+// matching an error's text.
+type computerStorageCopySourceError struct {
+	Code string
+	Err  error
+}
+
+func (e *computerStorageCopySourceError) Error() string { return e.Err.Error() }
+
+func (e *computerStorageCopySourceError) Unwrap() error { return e.Err }
+
+// soleCause unwraps a single-cause error chain to the error underneath. An
+// error that joins several failures has no sole cause: it returns nil, so a
+// second failure travelling beside ENOSPC can never be read as a clean
+// capacity fact.
+func soleCause(err error) error {
+	for err != nil {
+		if _, joined := err.(interface{ Unwrap() []error }); joined {
+			return nil
+		}
+		next := errors.Unwrap(err)
+		if next == nil {
+			return err
+		}
+		err = next
+	}
+	return nil
 }
 
 // storageCopyDestinationPublished reports whether the destination generation
@@ -378,6 +410,111 @@ func storageCopyDestinationPublished(runtimeRoot string, request CopyComputerSto
 // storageCopyFailureReceipt proves the destination generation holds no bytes
 // and names the typed reason. `observedAvailableBytes` is the capacity fact
 // behind an `insufficient_disk` refusal and is zero for every other code.
+// A refused copy never deletes the destination root itself. `attachment.lock`
+// lives inside that root, so unlinking it would drop the generation ownership
+// this refusal is holding and let a concurrent creator take a replacement
+// inode mid-cleanup. The payload is removed through the retained root instead,
+// and a durable refusal tombstone is left beside the lock. A root holding
+// nothing but the lock and that tombstone is an absent generation: it is not
+// quarantined, it is not prepared, and it is deleted whole by ordinary
+// authorized removal.
+const (
+	computerDiskAttachmentLockFile   = "attachment.lock"
+	computerStorageCopyRefusalRecord = "copy-refused.json"
+)
+
+type computerStorageCopyRefusal struct {
+	Version   int                        `json:"version"`
+	DiskName  string                     `json:"disk_name"`
+	Storage   ComputerStorageReference   `json:"storage"`
+	Receipt   ComputerStorageCopyReceipt `json:"receipt"`
+	RefusedAt time.Time                  `json:"refused_at"`
+}
+
+func writeComputerStorageCopyRefusal(root, name string, storage ComputerStorageReference,
+	receipt ComputerStorageCopyReceipt) error {
+	payload, err := json.Marshal(computerStorageCopyRefusal{Version: 1, DiskName: name,
+		Storage: storage, Receipt: receipt, RefusedAt: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	return writeDurableFile(root, ".copy-refused.json.tmp-", computerStorageCopyRefusalRecord, payload, 0o600)
+}
+
+// readComputerStorageCopyRefusal returns the tombstone only when it is exactly
+// the refusal this generation's own root may carry. Anything else is not
+// absence evidence and leaves the ordinary recovery paths in charge.
+func readComputerStorageCopyRefusal(root, name string) (computerStorageCopyRefusal, bool, error) {
+	payload, present, err := readComputerRecoveryRecord(filepath.Join(root, computerStorageCopyRefusalRecord))
+	if err != nil || !present {
+		return computerStorageCopyRefusal{}, false, err
+	}
+	var refusal computerStorageCopyRefusal
+	if err := json.Unmarshal(payload, &refusal); err != nil {
+		return computerStorageCopyRefusal{}, false, err
+	}
+	expected, err := deterministicComputerDiskName(refusal.Storage)
+	if err != nil {
+		return computerStorageCopyRefusal{}, false, err
+	}
+	if refusal.Version != 1 || refusal.DiskName != name || expected != name ||
+		refusal.Receipt.Kind != "computer_storage_copy_failed_absent" || !refusal.Receipt.DestinationAbsent ||
+		refusal.Receipt.FailureCode == "" || refusal.RefusedAt.IsZero() {
+		return computerStorageCopyRefusal{}, false, errors.New("Computer Storage copy refusal record lacks exact generation authority")
+	}
+	return refusal, true, nil
+}
+
+// refusedComputerStorageAbsent reports the one shape a refused generation may
+// have: its own lock, its own tombstone, and no payload at all.
+func refusedComputerStorageAbsent(root, name string) (computerStorageCopyRefusal, bool, error) {
+	refusal, present, err := readComputerStorageCopyRefusal(root, name)
+	if err != nil || !present {
+		return computerStorageCopyRefusal{}, false, err
+	}
+	if err := requireRefusedComputerStorageAbsence(root); err != nil {
+		return computerStorageCopyRefusal{}, false, err
+	}
+	return refusal, true, nil
+}
+
+func removeComputerStorageCopyPayload(root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == computerDiskAttachmentLockFile || entry.Name() == computerStorageCopyRefusalRecord {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return syncDirectory(root)
+}
+
+func requireRefusedComputerStorageAbsence(root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	tombstone := false
+	for _, entry := range entries {
+		switch entry.Name() {
+		case computerDiskAttachmentLockFile:
+		case computerStorageCopyRefusalRecord:
+			tombstone = true
+		default:
+			return errors.New("Computer Storage copy payload remains after failure cleanup")
+		}
+	}
+	if !tombstone {
+		return errors.New("Computer Storage copy refusal left no durable tombstone")
+	}
+	return nil
+}
+
 func (engine *ContainerdEngine) storageCopyFailureReceipt(request CopyComputerStorageRequest, code string,
 	observedAvailableBytes int64) (CopyComputerStorageResponse, error) {
 	destinationName, err := deterministicComputerDiskName(request.Destination)
@@ -402,11 +539,14 @@ func (engine *ContainerdEngine) storageCopyFailureReceipt(request CopyComputerSt
 	if len(loops) != 0 {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination remains loop-attached after failure")
 	}
-	if err := os.RemoveAll(destinationRoot); err != nil {
+	if err := removeComputerStorageCopyPayload(destinationRoot); err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
-	if _, err := os.Lstat(destinationRoot); !errors.Is(err, os.ErrNotExist) {
-		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy staging remains after failure cleanup")
+	// The payload is gone and the tombstone is not written yet: this is the
+	// one instant a creator could race the refusal, and the generation lock
+	// inode it must take is still the one this call holds.
+	if err := engine.storageCopyCheckpoint(computerStorageCopyRefusalCleanup); err != nil {
+		return CopyComputerStorageResponse{}, err
 	}
 	if err := os.Remove(mountPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return CopyComputerStorageResponse{}, err
@@ -415,7 +555,7 @@ func (engine *ContainerdEngine) storageCopyFailureReceipt(request CopyComputerSt
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
-	return CopyComputerStorageResponse{Receipt: ComputerStorageCopyReceipt{
+	receipt := ComputerStorageCopyReceipt{
 		Kind: "computer_storage_copy_failed_absent", ReceiptID: receiptID, Operation: request.Operation,
 		BackupID: request.BackupID, CopyID: request.CopyID, ExportID: request.ExportID,
 		ExternalPath: request.ExternalPath, ManifestDigest: request.ManifestDigest,
@@ -428,7 +568,14 @@ func (engine *ContainerdEngine) storageCopyFailureReceipt(request CopyComputerSt
 		SourceSize: request.SourceSize, DestinationSize: request.Destination.DiskBytes,
 		SourceDigest: request.SourceDigest, FailureCode: code, DestinationAbsent: true,
 		ObservedAvailableBytes: observedAvailableBytes,
-	}}, nil
+	}
+	if err := writeComputerStorageCopyRefusal(destinationRoot, destinationName, request.Destination, receipt); err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	if err := requireRefusedComputerStorageAbsence(destinationRoot); err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	return CopyComputerStorageResponse{Receipt: receipt}, nil
 }
 
 // storageCopyFailureCode is the closed typed vocabulary each verb may report
@@ -448,6 +595,9 @@ func storageCopyFailureCode(operation string, err error) (string, int64) {
 	}
 	if operation != "import" {
 		return "", 0
+	}
+	if source, exact := err.(*computerStorageCopySourceError); exact {
+		return source.Code, 0
 	}
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -483,21 +633,6 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	} else if quarantined {
 		return CopyComputerStorageResponse{}, &ComputerStorageQuarantinedError{Storage: request.Destination}
 	}
-	var sourcePath string
-	var err error
-	if importSource {
-		sourcePath, err = validateImportCustodySource(engine.config.RuntimeRoot, request)
-	} else {
-		var copyName string
-		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
-		if err == nil {
-			sourceRoot := filepath.Join(engine.config.RuntimeRoot, "computer-backups", copyName)
-			sourcePath, err = validateStorageCopySource(ctx, sourceRoot, request)
-		}
-	}
-	if err != nil {
-		return CopyComputerStorageResponse{}, err
-	}
 	destinationName, err := deterministicComputerDiskName(request.Destination)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
@@ -520,10 +655,6 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		if code == "" {
 			return
 		}
-		if err := engine.storageCopyCheckpoint(computerStorageCopyRefusalCleanup); err != nil {
-			returnedErr = errors.Join(returnedErr, err)
-			return
-		}
 		published, err := storageCopyDestinationPublished(engine.config.RuntimeRoot, request)
 		if err != nil || published {
 			return
@@ -535,6 +666,36 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		}
 		response, returnedErr = converted, nil
 	}()
+	// A generation already refused stays refused: its tombstone replays the
+	// exact receipt instead of starting the copy again under an identity that
+	// L1 has already closed.
+	if refusal, absent, refusalErr := refusedComputerStorageAbsent(destinationRoot, destinationName); refusalErr != nil {
+		return CopyComputerStorageResponse{}, refusalErr
+	} else if absent {
+		if !sameComputerStorageIdentity(refusal.Storage, request.Destination) ||
+			refusal.Receipt.OperationRevision != request.Authority.OperationRevision {
+			return CopyComputerStorageResponse{}, errors.New("Computer Storage copy destination was refused under different durable authority")
+		}
+		return CopyComputerStorageResponse{Receipt: refusal.Receipt}, nil
+	}
+	// Source validation runs inside the owned destination interval: its typed
+	// failures must reach the same proven-absence receipt, or a rejected
+	// portable manifest would leave the reserved import with nothing to
+	// acknowledge.
+	var sourcePath string
+	if importSource {
+		sourcePath, err = validateImportCustodySource(engine.config.RuntimeRoot, request)
+	} else {
+		var copyName string
+		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
+		if err == nil {
+			sourceRoot := filepath.Join(engine.config.RuntimeRoot, "computer-backups", copyName)
+			sourcePath, err = validateStorageCopySource(ctx, sourceRoot, request)
+		}
+	}
+	if err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
 	manifestPath := filepath.Join(destinationRoot, "storage-copy.json")
 	manifest, present, err := readComputerStorageCopyManifest(manifestPath)
 	if err != nil {
@@ -575,12 +736,16 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		if err != nil {
 			return CopyComputerStorageResponse{}, err
 		}
-		if err := engine.allocateComputerBackup(stagingPath, request.SourceSize); err != nil {
-			_ = file.Close()
-			return CopyComputerStorageResponse{}, engine.destinationCapacityError(err)
+		// Only the allocation itself can be a capacity fact. Either close
+		// failure joins the outcome and keeps it an engine failure, and
+		// neither is ever discarded.
+		allocationErr, allocationCloseErr := engine.allocateComputerDestination(stagingPath, request.SourceSize)
+		outerCloseErr := file.Close()
+		if allocationCloseErr != nil || outerCloseErr != nil {
+			return CopyComputerStorageResponse{}, errors.Join(allocationErr, allocationCloseErr, outerCloseErr)
 		}
-		if err := file.Close(); err != nil {
-			return CopyComputerStorageResponse{}, err
+		if allocationErr != nil {
+			return CopyComputerStorageResponse{}, engine.destinationCapacityError(allocationErr)
 		}
 		manifest.Phase = computerStorageCopyAllocated
 		if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
@@ -649,8 +814,12 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	facts := computerStorageCopyFacts{}
 	if manifest.Phase == computerStorageCopySourceVerified {
 		if request.Destination.DiskBytes > request.SourceSize {
-			if err := engine.allocateComputerBackup(stagingPath, request.Destination.DiskBytes); err != nil {
-				return CopyComputerStorageResponse{}, engine.destinationCapacityError(err)
+			expansionErr, expansionCloseErr := engine.allocateComputerDestination(stagingPath, request.Destination.DiskBytes)
+			if expansionCloseErr != nil {
+				return CopyComputerStorageResponse{}, errors.Join(expansionErr, expansionCloseErr)
+			}
+			if expansionErr != nil {
+				return CopyComputerStorageResponse{}, engine.destinationCapacityError(expansionErr)
 			}
 		}
 		expanded := request.Destination.DiskBytes > request.SourceSize

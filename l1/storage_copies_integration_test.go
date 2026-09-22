@@ -386,6 +386,43 @@ func TestRefusedComputerCloneCannotStartAnEmptyReplacementDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Every operation that would commit a phase no helper can complete is
+	// refused at admission, with the same typed reason and no revision spent.
+	for _, operation := range []struct {
+		name  string
+		apply func() error
+	}{
+		{"reimage", func() error {
+			_, err := h.store.ReimageComputer(context.Background(), current.ComputerID, ComputerReimageRequest{
+				ComputerMutationPrecondition: computerPrecondition(current, "operator"), Image: reimageTarget('7'),
+				IdempotencyKey: "reimage-refused-clone"})
+			return err
+		}},
+		{"resize", func() error {
+			_, _, err := h.store.BeginComputerGrow(context.Background(), current.ComputerID, ComputerGrowRequest{
+				ComputerMutationPrecondition: computerPrecondition(current, "operator"),
+				DiskBytes:                    current.DesiredDiskBytes + (1 << 20), IdempotencyKey: "grow-refused-clone"})
+			return err
+		}},
+		{"reset", func() error {
+			_, _, err := h.store.BeginComputerStorageReset(context.Background(), current.ComputerID,
+				ComputerStorageResetRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator"),
+					IdempotencyKey: "reset-refused-clone"})
+			return err
+		}},
+	} {
+		var refusal *Error
+		if err := operation.apply(); !errors.As(err, &refusal) || refusal.Code != contract.ErrorConflict ||
+			refusal.Details["reason"] != ComputerStorageGenerationRetiredReason ||
+			refusal.Details["required_operation"] != "remove" {
+			t.Fatalf("%s of a refused clone = %v (%#v)", operation.name, err, refusal)
+		}
+		unchanged, err := h.store.GetComputer(context.Background(), current.ComputerID)
+		if err != nil || unchanged.IntentRevision != current.IntentRevision ||
+			unchanged.ReconfigurationPhase != ComputerReconfigurationStable {
+			t.Fatalf("%s spent a revision on a refused clone = %#v err=%v", operation.name, unchanged, err)
+		}
+	}
 	removed, err := h.store.RemoveComputer(context.Background(), current.ComputerID,
 		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator-remove")})
 	if err != nil || removed.DesiredState != contract.ServiceDesiredRemoved {

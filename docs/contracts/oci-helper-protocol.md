@@ -1233,21 +1233,32 @@ every other Storage copy receipt, failed or verified.
 
 The capacity refusal is recognized only where this call writes to the Node's
 own Computer-disk filesystem: the destination allocation, the staging copy, and
-the expansion allocation each raise it directly. ENOSPC reached any other way
-is not host destination capacity -- the full filesystem may be the one inside
-the copied image -- and neither an error chain nor tool output text can create
-the fact. An error that also carries a second failure, such as a copy whose
-close or whose detach failed, stays an engine failure, because that second
-failure must not disappear behind an absence receipt.
+the expansion allocation each raise it directly, as an exact typed value.
+ENOSPC reached any other way is not host destination capacity -- the full
+filesystem may be the one inside the copied image -- and neither an error chain
+nor tool output text can create the fact. An error that also carries a second
+failure stays an engine failure, because that second failure must not disappear
+behind an absence receipt: the allocation error and the close error are kept
+apart for exactly this reason, and no close error is ever discarded. A Custody
+import's recognized source-validation failures are typed the same way, at the
+site that detects them.
 
-Absence is proved, not asserted. The helper issues the receipt only while it
-still owns the destination generation -- the publication check, the absence
-proof, and the deletion are one interval no concurrent copy can interleave with
--- and only after the destination is neither mounted nor loop-attached, since
+Absence is proved, not asserted, and it is proved without ever giving up the
+generation. The refusal runs while this call still owns the generation, and it
+never deletes the generation root, because the flock that carries that
+ownership lives inside it: unlinking the root would let a creator take a
+replacement inode mid-cleanup. The refusal removes the payload through the
+retained root, writes a durable refusal tombstone beside the lock, and only
+then issues the receipt. A root holding nothing but its lock and that tombstone
+is an absent generation: the startup sweep leaves it alone instead of
+quarantining it, preparation refuses it rather than formatting a fresh disk
+under an identity whose copy was refused, a repeated call replays the recorded
+receipt, and ordinary authorized removal deletes the root whole. The receipt is
+issued only after the destination is neither mounted nor loop-attached, since
 an unlinked pathname leaves the copied bytes reachable through a live mount or
-loop device. It is never issued when the destination already owns published
-bytes; a failure after publication stays an error, because an absence receipt
-authorizes deletion.
+loop device, and never when the destination already owns published bytes; a
+failure after publication stays an error, because an absence receipt authorizes
+deletion.
 
 Clone has exactly this one typed failure code. Every other clone failure leaves
 the copy's integrity in doubt and keeps the existing path: an engine failure, a
