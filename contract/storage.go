@@ -200,6 +200,12 @@ type ComputerStorageCopyReceipt struct {
 	FilesystemExpanded    bool   `json:"filesystem_expanded"`
 	FailureCode           string `json:"failure_code,omitempty"`
 	DestinationAbsent     bool   `json:"destination_absent,omitempty"`
+	// ObservedAvailableBytes is the capacity fact behind an
+	// `insufficient_disk` refusal, measured on the Node at the moment the
+	// copy was refused. It is the same evidence a grow refusal carries, so a
+	// capacity failure reads identically whichever verb met it, and it is
+	// absent from every other outcome.
+	ObservedAvailableBytes int64 `json:"observed_available_bytes,omitempty"`
 }
 
 // ComputerCustodyManifest is the portable, self-contained authority record

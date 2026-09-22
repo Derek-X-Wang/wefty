@@ -322,7 +322,28 @@ func (engine *ContainerdEngine) finalizeComputerStorageCopy(ctx context.Context,
 	return rekeyFacts, err
 }
 
-func custodyImportFailureReceipt(runtimeRoot string, request CopyComputerStorageRequest, code string) (CopyComputerStorageResponse, error) {
+// storageCopyDestinationPublished reports whether the destination generation
+// already owns published bytes. A failure after publication is never rewritten
+// into an absence receipt, because that receipt authorizes deletion.
+func storageCopyDestinationPublished(runtimeRoot string, request CopyComputerStorageRequest) (bool, error) {
+	destinationName, err := deterministicComputerDiskName(request.Destination)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Lstat(filepath.Join(runtimeRoot, "computer-disks", destinationName, "disk.ext4")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// storageCopyFailureReceipt proves the destination generation holds no bytes
+// and names the typed reason. `observedAvailableBytes` is the capacity fact
+// behind an `insufficient_disk` refusal and is zero for every other code.
+func storageCopyFailureReceipt(runtimeRoot string, request CopyComputerStorageRequest, code string,
+	observedAvailableBytes int64) (CopyComputerStorageResponse, error) {
 	destinationName, err := deterministicComputerDiskName(request.Destination)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
@@ -332,14 +353,14 @@ func custodyImportFailureReceipt(runtimeRoot string, request CopyComputerStorage
 		return CopyComputerStorageResponse{}, err
 	}
 	if _, err := os.Lstat(destinationRoot); !errors.Is(err, os.ErrNotExist) {
-		return CopyComputerStorageResponse{}, errors.New("Custody import staging remains after failure cleanup")
+		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy staging remains after failure cleanup")
 	}
 	receiptID, err := randomCapability()
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
 	return CopyComputerStorageResponse{Receipt: ComputerStorageCopyReceipt{
-		Kind: "computer_storage_copy_failed_absent", ReceiptID: receiptID, Operation: "import",
+		Kind: "computer_storage_copy_failed_absent", ReceiptID: receiptID, Operation: request.Operation,
 		BackupID: request.BackupID, CopyID: request.CopyID, ExportID: request.ExportID,
 		ExternalPath: request.ExternalPath, ManifestDigest: request.ManifestDigest,
 		SourceComputerID: request.SourceComputerID, SourceStorageID: request.SourceStorageID,
@@ -350,29 +371,61 @@ func custodyImportFailureReceipt(runtimeRoot string, request CopyComputerStorage
 		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
 		SourceSize: request.SourceSize, DestinationSize: request.Destination.DiskBytes,
 		SourceDigest: request.SourceDigest, FailureCode: code, DestinationAbsent: true,
+		ObservedAvailableBytes: observedAvailableBytes,
 	}}, nil
+}
+
+// storageCopyFailureCode is the closed typed vocabulary each verb may report
+// instead of an opaque engine failure. Clone reports only the capacity
+// refusal: every other clone failure leaves the destination in doubt and stays
+// on the integrity path.
+func storageCopyFailureCode(operation string, err error) string {
+	insufficientDisk := errors.Is(err, unix.ENOSPC) ||
+		strings.Contains(strings.ToLower(err.Error()), "no space left on device")
+	if operation == "clone" {
+		if insufficientDisk {
+			return "insufficient_disk"
+		}
+		return ""
+	}
+	if operation != "import" {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "cancelled"
+	case insufficientDisk:
+		return "insufficient_disk"
+	case strings.Contains(err.Error(), "digest"):
+		return "digest_mismatch"
+	case strings.Contains(err.Error(), "Custody import manifest"),
+		strings.Contains(err.Error(), "Custody import disk size"):
+		return "manifest_invalid"
+	}
+	return ""
 }
 
 func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request CopyComputerStorageRequest) (response CopyComputerStorageResponse, returnedErr error) {
 	defer func() {
-		if request.Operation != "import" || returnedErr == nil {
+		if returnedErr == nil {
 			return
 		}
-		code := ""
-		switch {
-		case errors.Is(returnedErr, context.Canceled), errors.Is(returnedErr, context.DeadlineExceeded):
-			code = "cancelled"
-		case errors.Is(returnedErr, unix.ENOSPC):
-			code = "insufficient_disk"
-		case strings.Contains(returnedErr.Error(), "digest"):
-			code = "digest_mismatch"
-		case strings.Contains(returnedErr.Error(), "Custody import manifest"),
-			strings.Contains(returnedErr.Error(), "Custody import disk size"):
-			code = "manifest_invalid"
+		code := storageCopyFailureCode(request.Operation, returnedErr)
+		if code == "" {
+			return
 		}
-		if code != "" {
-			response, returnedErr = custodyImportFailureReceipt(engine.config.RuntimeRoot, request, code)
+		published, err := storageCopyDestinationPublished(engine.config.RuntimeRoot, request)
+		if err != nil || published {
+			return
 		}
+		observedAvailableBytes := int64(0)
+		if code == "insufficient_disk" {
+			observedAvailableBytes, err = filesystemAvailableBytes(filepath.Join(engine.config.RuntimeRoot, "computer-disks"))
+			if err != nil {
+				return
+			}
+		}
+		response, returnedErr = storageCopyFailureReceipt(engine.config.RuntimeRoot, request, code, observedAvailableBytes)
 	}()
 	engine.computerBackupMu.Lock()
 	defer engine.computerBackupMu.Unlock()

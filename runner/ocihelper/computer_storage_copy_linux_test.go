@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func publishedStorageCopySource(t *testing.T) (string, *fakeComputerDiskSystem, CreateComputerBackupResponse) {
@@ -300,5 +302,59 @@ func TestComputerRestoreRejectsDigestMismatchAndTruncationBeforeDestinationPubli
 				t.Fatalf("corrupt source published destination: %v", err)
 			}
 		})
+	}
+}
+
+// A clone that cannot fit its destination is a capacity fact with its own
+// typed receipt; every other clone failure keeps the destination and stays on
+// the integrity path, and a quarantined generation stays quarantined.
+func TestCloneCapacityRefusalIsTypedAndLeavesIntegrityFailuresQuarantinable(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize+(1<<20))
+	destinationName, err := deterministicComputerDiskName(request.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationRoot := filepath.Join(root, "computer-disks", destinationName)
+	exhausted := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupAllocate: func(path string, size int64) error {
+			if size > request.SourceSize {
+				return unix.ENOSPC
+			}
+			return fullyAllocateComputerDisk(path, size)
+		}, storageCopyFinalize: fakeCloneFinalize(t)}
+	response, err := exhausted.CopyComputerStorage(t.Context(), request)
+	if err != nil {
+		t.Fatalf("over-capacity clone error = %v, want a typed receipt", err)
+	}
+	receipt := response.Receipt
+	if receipt.Kind != "computer_storage_copy_failed_absent" || receipt.Operation != "clone" ||
+		receipt.FailureCode != "insufficient_disk" || !receipt.DestinationAbsent ||
+		receipt.ObservedAvailableBytes <= 0 || receipt.DestinationSize != request.Destination.DiskBytes ||
+		receipt.DestinationDigest != "" || receipt.OSIdentityRekeyed || receipt.FilesystemExpanded ||
+		receipt.DestinationPrepared || receipt.HelperGeneration != request.Authority.HelperGeneration {
+		t.Fatalf("over-capacity clone receipt = %+v", receipt)
+	}
+	if _, err := os.Lstat(destinationRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused clone staging remains: %v", err)
+	}
+
+	stalled := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupCopyN: func(io.Writer, io.Reader, int64) (int64, error) {
+			return 0, errors.New("Computer Storage copy stalled mid-flight")
+		}, storageCopyFinalize: fakeCloneFinalize(t)}
+	if response, err := stalled.CopyComputerStorage(t.Context(), request); err == nil || response.Receipt.Kind != "" {
+		t.Fatalf("integrity failure = %+v err=%v, want an untyped error", response.Receipt, err)
+	}
+	if _, err := os.Lstat(destinationRoot); err != nil {
+		t.Fatalf("integrity failure discarded the destination in doubt: %v", err)
+	}
+
+	if err := stalled.quarantineComputerDiskAnomaly(destinationRoot, destinationName, request.Destination, "identity_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	var quarantined *ComputerStorageQuarantinedError
+	if response, err := exhausted.CopyComputerStorage(t.Context(), request); !errors.As(err, &quarantined) || response.Receipt.Kind != "" {
+		t.Fatalf("quarantined over-capacity clone = %+v err=%v, want the quarantine result", response.Receipt, err)
 	}
 }

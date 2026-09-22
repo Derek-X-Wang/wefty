@@ -206,6 +206,98 @@ func successfulOldGenerationBackupReceipt(directive ComputerStorageCopyDirective
 		Encryption:    BackupEncryptionNone}
 }
 
+func refusedStorageCopyReceipt(directive ComputerStorageCopyDirective, failureCode string, observedAvailableBytes int64) ComputerStorageCopyReceipt {
+	return ComputerStorageCopyReceipt{Kind: "computer_storage_copy_failed_absent",
+		ReceiptID: "refused-" + directive.DestinationComputerID, Operation: directive.Operation,
+		BackupID: directive.BackupID, CopyID: directive.CopyID, ExportID: directive.ExportID,
+		ExternalPath: directive.ExternalPath, ManifestDigest: directive.ManifestDigest,
+		SourceComputerID: directive.SourceComputerID, SourceStorageID: directive.SourceStorageID,
+		SourceGeneration: directive.SourceGeneration, DestinationComputerID: directive.DestinationComputerID,
+		DestinationStorageID: directive.DestinationStorageID, DestinationGeneration: directive.DestinationGeneration,
+		NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 9,
+		SourceSize: directive.SourceSize, DestinationSize: directive.DestinationSize,
+		SourceDigest: directive.SourceDigest, FailureCode: failureCode, DestinationAbsent: true,
+		ObservedAvailableBytes: observedAvailableBytes}
+}
+
+func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t *testing.T) {
+	h, node, sourceComputer, sourceBackup, _ := publishedBackupForStorageCopy(t, 2)
+	requestedBytes := sourceBackup.AllocatedSize + (64 << 20)
+	clone, _, err := h.store.BeginComputerClone(context.Background(), ComputerCloneRequest{BackupID: sourceBackup.BackupID,
+		ComputerMutationPrecondition: computerPrecondition(sourceComputer, "operator"), Name: "over-capacity-clone",
+		DiskBytes: requestedBytes, IdempotencyKey: "over-capacity", Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 || directives[0].DestinationSize != requestedBytes {
+		t.Fatalf("over-capacity clone directive = %#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	const observedAvailableBytes = int64(25112510464)
+	// A copy whose integrity is in doubt never claims proven absence: only
+	// the capacity refusal may take the terminal clone failure path.
+	for _, code := range []string{"digest_mismatch", "manifest_invalid", "cancelled", ""} {
+		receipt := refusedStorageCopyReceipt(directive, code, observedAvailableBytes)
+		if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+			ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "integrity-" + code, Receipt: receipt}); errorCode(err) != contract.ErrorInvalidRequest {
+			t.Fatalf("clone failure code %q error = %v, want invalid_request", code, err)
+		}
+	}
+	receipt := refusedStorageCopyReceipt(directive, "insufficient_disk", observedAvailableBytes)
+	refused, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+	if err != nil || refused.ReconfigurationPhase != ComputerReconfigurationStable || refused.ReconfigurationRevision != nil ||
+		refused.AppliedRevision != 1 || refused.DesiredState != contract.ServiceDesiredStopped ||
+		refused.CurrentJob.State != contract.JobStopped {
+		t.Fatalf("refused clone = %#v err=%v", refused, err)
+	}
+	var failure contract.SpawnFailure
+	if refused.CurrentJob.ServiceJob == nil || json.Unmarshal(refused.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureInsufficientDisk || failure.NodeID != node.NodeID ||
+		failure.RequestedBytes != requestedBytes || failure.ObservedAvailableBytes != observedAvailableBytes ||
+		refused.CurrentJob.NextRestartAt != nil {
+		t.Fatalf("refused clone latch = %s failure=%#v next_restart=%v", refused.CurrentJob.LastFailure, failure, refused.CurrentJob.NextRestartAt)
+	}
+	var status, failureCode string
+	if err := h.store.db.QueryRow(`SELECT status, failure_code FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND operation_revision=1`, clone.ComputerID).Scan(&status, &failureCode); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || failureCode != "insufficient_disk" {
+		t.Fatalf("refused clone operation = %q/%q", status, failureCode)
+	}
+	generations, err := h.store.ListComputerStorageGenerations(context.Background(), clone.ComputerID)
+	if err != nil || len(generations.Generations) != 1 || generations.Generations[0].Phase != "retired" {
+		t.Fatalf("refused clone generations = %#v err=%v", generations.Generations, err)
+	}
+	// The refusal is terminal: the node is never handed the same clone again,
+	// so it can never report the destination quarantined instead.
+	directives, err = h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 0 {
+		t.Fatalf("redispatched refused clone = %#v err=%v", directives, err)
+	}
+	replayed, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+	if err != nil || replayed.AppliedRevision != 1 || replayed.ReconfigurationPhase != ComputerReconfigurationStable {
+		t.Fatalf("refused clone replay = %#v err=%v", replayed, err)
+	}
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: "late-success", Receipt: successfulStorageCopyReceipt(directive)}); err == nil {
+		t.Fatal("late verified receipt was accepted after a terminal clone refusal")
+	}
+	unchanged, err := h.store.GetComputer(context.Background(), sourceComputer.ComputerID)
+	if err != nil || unchanged.StorageID != sourceComputer.StorageID || unchanged.StorageGeneration != sourceComputer.StorageGeneration ||
+		unchanged.IntentRevision != sourceComputer.IntentRevision || unchanged.ReconfigurationPhase != ComputerReconfigurationStable {
+		t.Fatalf("refused clone changed source Computer = %#v err=%v", unchanged, err)
+	}
+}
+
 func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *testing.T) {
 	h, node, computer, source, oldClaim := publishedBackupForStorageCopy(t, 3)
 	request := ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),

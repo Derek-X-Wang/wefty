@@ -462,9 +462,29 @@ func executeComputerClone(ctx context.Context, clients *apiClients, jsonOutput b
 		var observation storageWaitObservation
 		observed, observation, waitErr = waitForComputerRevision(ctx, clients, computer.ComputerID, computer.IntentRevision, wait)
 		output.Computer, output.Observation = &observed, &observation
+		if waitErr == nil {
+			waitErr = awaitedComputerCloneFailure(observed)
+		}
 	}
 	waitErr = attachStorageProvenance(ctx, clients, computer.ComputerID, &output, waitErr)
 	return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
+}
+
+// awaitedComputerCloneFailure reports the destination's terminal capacity
+// latch as the same typed refusal a refused grow returns. A clone that reached
+// `stable` without copying a byte is a failure, not a completed revision.
+func awaitedComputerCloneFailure(computer l1.Computer) error {
+	var failure contract.SpawnFailure
+	if len(computer.CurrentJob.LastFailure) == 0 ||
+		json.Unmarshal(computer.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureInsufficientDisk {
+		return nil
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: contract.ErrorCapacityExhausted, Message: "Computer clone failed: insufficient_disk", Retryable: false,
+		Details: map[string]any{"computer_id": computer.ComputerID, "failure_code": string(failure.Code),
+			"requested_bytes": failure.RequestedBytes, "observed_available_bytes": failure.ObservedAvailableBytes},
+	}}
 }
 
 func executeComputerCustody(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {

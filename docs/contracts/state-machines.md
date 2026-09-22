@@ -311,7 +311,19 @@ Clone uses the same cold-copy primitive but creates a new `computer_id`,
 `storage_id`, required name, dispatch authority, and generation one with no
 grants. A smaller destination is refused; a larger one is fully allocated and
 its filesystem expanded. The helper narrowly regenerates `/etc/machine-id`
-and does not alter browser profile data. Immutable Storage provenance records
+and does not alter browser profile data. A destination the bound Node's
+filesystem cannot hold is a capacity refusal, not a doubtful copy: the helper
+proves the destination staging absent and returns the same typed
+`insufficient_disk` evidence a grow refusal returns, with the requested bytes
+and the available bytes observed at the refusal. L1 records the clone operation
+`failed` with that code, retires the never-written destination generation,
+latches the receipt-derived requested and observed bytes on the destination
+Job's `last_failure` with `next_restart_at` null, and returns the destination
+to `stable`, so the operation is terminal, the operator reads why it stopped on
+the ordinary capacity surface, and nothing redispatches it. The source
+Computer, its Storage, and its Backup are untouched. Quarantine stays reserved
+for a copy whose integrity is in doubt and is never how a clone reports that
+the disk was too small. Immutable Storage provenance records
 the source Backup and destination as a custody fork. If one
 managed branch is removed while another secret-bearing branch survives, the
 Computer outcome is `removed_reduced`; after coordinated positive removal of
