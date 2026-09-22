@@ -1361,11 +1361,17 @@ guest — admission is additionally bound to that shared filesystem's identity.
 The configured guest mount root must itself be a mount, or the refusal is
 `external_root_unmounted`; every admitted component must then be on that same
 device, and any step onto another filesystem is `external_path_crosses_mount`.
-A device boundary on its own proves nothing: a guest-only filesystem below an
-unmounted root, or a nested guest bind under a live host mount, is still
-storage that never reaches the host. All four refusals carry the node-facing
-roots in the receipt and are raised before any directory is created, any
-manifest is written, and any Backup byte is read.
+That binding reaches the leaf: the disk file is opened through the admitted
+directory and its own device is read from that descriptor before anything is
+changed or written through it, because a file bind-mounted from a guest
+filesystem is a regular operator-owned file that still never reaches host
+storage. A device boundary on its own proves nothing either: a guest-only
+filesystem below an unmounted root, or a nested guest bind under a live host
+mount, is storage that never reaches the host. All four refusals carry the
+node-facing roots in the receipt, and none of them writes a manifest, a disk
+byte, or reads a Backup byte. Such a refusal may leave empty operator-owned
+directories under a configured root — the place the export was allowed to go
+— and that is why it still leaves the source Storage untainted.
 
 The configured root is acquired the same way: one `O_NOFOLLOW` directory
 open per component from the filesystem root, the only anchor nothing can

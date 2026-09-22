@@ -97,6 +97,18 @@ func (destination *custodyExternalDestination) close() error {
 	return err
 }
 
+// nameCustodyRoots gives a refusal raised after admission the same
+// node-facing roots an admission refusal carries, so every refusal about
+// where an export may go answers that question.
+func (engine *ContainerdEngine) nameCustodyRoots(err error) error {
+	var mechanics *custodyExportMechanicsError
+	if !errors.As(err, &mechanics) || len(mechanics.roots) > 0 ||
+		!contract.CustodyExportRefusalNamesRoots(mechanics.code) {
+		return err
+	}
+	return custodyConfinementError(mechanics.code, engine.custodyExternalRoots(), mechanics.err)
+}
+
 // custodyExternalRoots names the operator mount roots as the node names them:
 // the same list `node oci doctor` publishes, so a refusal and the doctor fact
 // cannot disagree.
@@ -277,9 +289,14 @@ func (engine *ContainerdEngine) walkCustodyExternalRoot(allowedRoot, destination
 	// the only anchor nothing can substitute. Checking the components and
 	// then opening the whole path would leave a window in which an ancestor
 	// becomes a symlink.
-	dir, _, err := engine.acquireCustodyDirectory(allowedRoot)
+	dir, parent, err := engine.acquireCustodyDirectory(allowedRoot)
 	if err != nil {
 		return nil, err
+	}
+	// The parent descriptor exists only to prove the root; nothing below
+	// uses it, and it must not outlive this call.
+	if parent != nil {
+		defer parent.Close()
 	}
 	defer func() {
 		if resultErr != nil {
@@ -440,14 +457,6 @@ func custodyPathDevice(info os.FileInfo) (uint64, error) {
 		return 0, errors.New("Custody path device is unavailable")
 	}
 	return uint64(stat.Dev), nil
-}
-
-func openCustodyDirectory(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), path), nil
 }
 
 func openCustodyDirectoryAt(dir *os.File, component string) (*os.File, error) {
@@ -642,8 +651,12 @@ func openVerifiedCustodyComponent(dir *os.File, component string) (*os.File, os.
 }
 
 // openCustodyDestination opens the export's disk inside the descriptor
-// admission proved, never by pathname, and refuses a substituted inode.
-func openCustodyDestination(dir *os.File, name string, owner custodyExternalOwner, chown func(*os.File, int, int) error) (*os.File, error) {
+// admission proved, never by pathname, and refuses a substituted inode. The
+// leaf carries the same filesystem question as every directory above it: a
+// file bind-mounted from a guest filesystem is a regular operator-owned file
+// and still never reaches host storage.
+func (engine *ContainerdEngine) openCustodyDestination(destination *custodyExternalDestination, dir *os.File, name string,
+	owner custodyExternalOwner, chown func(*os.File, int, int) error) (*os.File, error) {
 	flags := unix.O_RDWR | unix.O_CREAT | unix.O_EXCL | unix.O_NOFOLLOW | unix.O_CLOEXEC
 	fd, err := unix.Openat(int(dir.Fd()), name, flags, 0o600)
 	created := err == nil
@@ -670,6 +683,11 @@ func openCustodyDestination(dir *os.File, name string, owner custodyExternalOwne
 	if !ok || !info.Mode().IsRegular() || (!created && (int(stat.Uid) != owner.uid || int(stat.Gid) != owner.gid)) {
 		return closeOnError(custodyMechanicsError("destination_substituted", errors.New("Custody destination is not the expected operator-owned regular inode")))
 	}
+	// The device is read from the opened descriptor, before anything is
+	// changed or written through it.
+	if err := engine.verifyCustodyLeafDevice(destination, file.Name(), info); err != nil {
+		return closeOnError(err)
+	}
 	if err := file.Chmod(0o600); err != nil {
 		return closeOnError(custodyMechanicsError("ownership_failed", fmt.Errorf("protect Custody destination: %w", err)))
 	}
@@ -683,6 +701,52 @@ func openCustodyDestination(dir *os.File, name string, owner custodyExternalOwne
 		return closeOnError(err)
 	}
 	return file, nil
+}
+
+// verifyExistingCustodyLeaf asks the filesystem question of a disk file that
+// is already sitting in the prepared directory, before this export writes a
+// manifest byte. A file bound there from another filesystem is refused for
+// what it is, while the same check inside the disk open remains the
+// authoritative one for a file that appears later.
+func (engine *ContainerdEngine) verifyExistingCustodyLeaf(destination *custodyExternalDestination, dir *os.File, name string) error {
+	if destination == nil || destination.anchorDevice == nil {
+		return nil
+	}
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return custodyMechanicsError("destination_substituted",
+				errors.New("Custody destination is not the expected operator-owned regular inode"))
+		}
+		return err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	return engine.verifyCustodyLeafDevice(destination, file.Name(), info)
+}
+
+// verifyCustodyLeafDevice holds an external file to the filesystem the node
+// shares with the helper, the same binding every admitted directory carries.
+func (engine *ContainerdEngine) verifyCustodyLeafDevice(destination *custodyExternalDestination, path string, info os.FileInfo) error {
+	if destination == nil || destination.anchorDevice == nil {
+		return nil
+	}
+	device, err := engine.custodyPathDevice(path, info)
+	if err != nil {
+		return err
+	}
+	if device != *destination.anchorDevice {
+		return custodyConfinementError(contract.CustodyExportPathCrossesMount, engine.custodyExternalRoots(),
+			fmt.Errorf("Custody file %q is on another filesystem than the one the node shares with the helper", path))
+	}
+	return nil
 }
 
 // custodyDirectoryEmpty reads the export directory through a fresh
@@ -844,6 +908,9 @@ func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputer
 	if err != nil || !info.Mode().IsRegular() || info.Size() != request.SourceSize {
 		return nil, errors.New("Custody import disk size conflicts with its manifest")
 	}
+	if err := engine.verifyCustodyLeafDevice(destination, diskFile.Name(), info); err != nil {
+		return nil, err
+	}
 	// This re-verification is load-bearing: import trusts neither a path-derived
 	// owner nor prior export time once the portable bytes are operator-owned.
 	digest, err := digestCustodyFile(diskFile)
@@ -886,6 +953,15 @@ type custodyWriteMarker struct {
 	CompletedNS       int64  `json:"completed_ns,omitempty"`
 }
 
+// custodySyncDirectory is the one place a Custody directory is made durable,
+// so a test can observe which directories the helper syncs.
+func (engine *ContainerdEngine) custodySyncDirectory(path string) error {
+	if engine.computerCustodySync != nil {
+		return engine.computerCustodySync(path)
+	}
+	return syncDirectory(path)
+}
+
 func custodyClock(clock Clock) Clock {
 	if clock == nil {
 		return systemClock{}
@@ -924,27 +1000,22 @@ func (engine *ContainerdEngine) custodyWritePhase(request ExportComputerCustodyR
 }
 
 // publishCustodyWriteMarker durably establishes the record before the first
-// byte and, on success, atomically replaces it in place. The directory entry
-// is fsynced into the managed root the first time the directory appears, or a
-// crash could leave external bytes with no reachable record of them.
+// byte and, on success, atomically replaces it in place.
 func (engine *ContainerdEngine) publishCustodyWriteMarker(request ExportComputerCustodyRequest, marker custodyWriteMarker) error {
 	root := custodyWriteMarkerRoot(engine.config.RuntimeRoot)
-	created := false
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		makeErr := os.Mkdir(root, 0o700)
-		if makeErr != nil && !errors.Is(makeErr, os.ErrExist) {
+		if makeErr := os.Mkdir(root, 0o700); makeErr != nil && !errors.Is(makeErr, os.ErrExist) {
 			return makeErr
 		}
-		created = makeErr == nil
 	} else if err != nil {
 		return err
 	}
-	// The directory entry itself must be durable in the managed root, or a
-	// crash could leave external bytes with no record that reaches them.
-	if created {
-		if err := syncDirectory(engine.config.RuntimeRoot); err != nil {
-			return err
-		}
+	// The directory entry is fsynced into the managed root on every
+	// publication, not only when this invocation created it: an earlier
+	// attempt interrupted between its mkdir and its sync would otherwise
+	// leave external bytes with no record that reaches them.
+	if err := engine.custodySyncDirectory(engine.config.RuntimeRoot); err != nil {
+		return err
 	}
 	payload, err := json.Marshal(marker)
 	if err != nil {
@@ -970,7 +1041,7 @@ func (engine *ContainerdEngine) publishCustodyWriteMarker(request ExportComputer
 	if err := os.Rename(name, filepath.Join(root, custodyWriteMarkerName(request.Storage.ComputerID, request.ExportID))); err != nil {
 		return err
 	}
-	return syncDirectory(root)
+	return engine.custodySyncDirectory(root)
 }
 
 // recordCustodyWriteStarted must be durable before the first byte the helper
@@ -1163,9 +1234,14 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	// between admission and here is refused for what it is.
 	externalDirectory, err := prepareCustodyExternalRoot(engine, admitted, externalOwner, chown)
 	if err != nil {
-		return ExportComputerCustodyResponse{}, err
+		return ExportComputerCustodyResponse{}, engine.nameCustodyRoots(err)
 	}
 	defer externalDirectory.Close()
+	// A disk file already sitting in the prepared directory faces the
+	// filesystem question before this export writes anything of its own.
+	if err := engine.verifyExistingCustodyLeaf(admitted, externalDirectory, "storage.ext4"); err != nil {
+		return ExportComputerCustodyResponse{}, engine.nameCustodyRoots(err)
+	}
 	// The durable record precedes the first byte of this Storage that the
 	// helper places on operator storage — the manifest and the disk. An
 	// empty operator-owned directory holds no Storage byte, which is why
@@ -1208,7 +1284,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	if manifest.DiskFile != "storage.ext4" {
 		return ExportComputerCustodyResponse{}, errors.New("Custody manifest names an unexpected disk file")
 	}
-	destination, err := openCustodyDestination(externalDirectory, manifest.DiskFile, externalOwner, chown)
+	destination, err := engine.openCustodyDestination(admitted, externalDirectory, manifest.DiskFile, externalOwner, chown)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}

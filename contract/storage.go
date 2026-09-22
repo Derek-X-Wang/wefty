@@ -305,9 +305,11 @@ const CustodyExportWriteStarted = "external_write_started"
 const CustodyExportWriteCompleted = "external_write_completed"
 
 // CustodyExportLeftDestinationUntouched reports whether a durable Custody
-// export ended without the helper creating, writing, or replacing anything at
-// the operator destination. Only such an export leaves the source Storage
-// free of custody taint: every other outcome, including a missing or late
+// export ended without placing any byte of that Storage on operator storage.
+// Such a refusal may have created empty operator-owned directories under a
+// configured operator mount root — that is where the export was allowed to
+// go — but it wrote no manifest and no disk, so the source Storage stays
+// free of custody taint. Every other outcome, including a missing or late
 // receipt, means bytes may exist outside managed custody.
 func CustodyExportLeftDestinationUntouched(status, failureCode string) bool {
 	if status != "failed" {
