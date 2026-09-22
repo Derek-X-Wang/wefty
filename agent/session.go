@@ -1459,6 +1459,15 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID, k
 // live attempt for the job, and a still-refused re-ask returns its own
 // refusal so the removal's refusal accounting sees this attempt, not the
 // stale one.
+//
+// A receipt it earns replaces the recorded failure before it is returned.
+// Asking is not free of consequence: the adapter's tracking entry and its
+// single-use sweep evidence are spent by the answer, so a repeated Delete for
+// the same authority comes back `unauthorized_attempt` with no tracked
+// fallback left. If the removal's own durable write of that receipt then
+// failed -- one transient spool error -- the next retry would re-ask against
+// evidence that no longer exists and wedge exactly as before, having already
+// proven the very thing it needed.
 func (session *agentSession) reaskRuntimeReap(
 	ctx context.Context,
 	jobID, kind, nodeID, bootSessionID string,
@@ -1486,7 +1495,13 @@ func (session *agentSession) reaskRuntimeReap(
 			refusals = append(refusals, err)
 			continue
 		}
-		return verifiedRuntimeReap(jobID, runtimeReapOutcome{receipt: receipt})
+		verified, verifyErr := verifiedRuntimeReap(jobID, runtimeReapOutcome{receipt: receipt})
+		if verifyErr != nil {
+			refusals = append(refusals, verifyErr)
+			continue
+		}
+		session.retainRemovalReap(jobID, verified)
+		return verified, nil
 	}
 	if len(refusals) != 0 {
 		return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q runtime reap: %w", jobID, errors.Join(refusals...))
@@ -1530,6 +1545,27 @@ func (session *agentSession) recordRuntimeReap(jobID string, receipt workloadrun
 		}
 		session.serviceReaps[jobID] = outcome
 	}
+}
+
+// retainRemovalReap keeps a receipt the removal path earned by asking the
+// runtime again. recordRuntimeReap cannot: it stores only for a job with a
+// live resident attempt, and this path runs precisely when there is none.
+//
+// It takes the same lock claims and residency take, and refuses to write for a
+// job that has since been admitted again. A receipt speaks for the attempt it
+// reaped; a later attempt of the same job has its own runtime to prove absent,
+// and executeResident drops this entry when that attempt starts for the same
+// reason.
+func (session *agentSession) retainRemovalReap(jobID string, receipt workloadrunner.ReapReceipt) {
+	session.claimMu.Lock()
+	defer session.claimMu.Unlock()
+	if _, admitted := session.residentJobID[jobID]; admitted {
+		return
+	}
+	if session.serviceReaps == nil {
+		session.serviceReaps = make(map[string]runtimeReapOutcome)
+	}
+	session.serviceReaps[jobID] = runtimeReapOutcome{receipt: receipt}
 }
 
 func (session *agentSession) clearRuntimeReap(jobID string) {

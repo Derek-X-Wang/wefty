@@ -785,16 +785,31 @@ that cannot name every resource, or that finds one present, fails the reap
 rather than granting absence. A `Verify` that never completed is not evidence
 either way: it stays a recoverable runtime loss the caller retries.
 
-The agent keeps one reap *receipt* per job for the rest of the boot, because
-quiescence once proven stays proven. A reap that failed proved nothing, so it
-is never kept as that job's answer: a removal retrying on its own cadence asks
-the runtime again under the frozen attempt authority it already holds, and
-carries back whatever that attempt refused rather than an older moment's
-failure. The adapter keeps that call answerable for exactly this reason -- a
-typed runtime loss leaves the attempt's tracking entry in place -- and every
-proof behind the receipt stays the adapter's. Without it a removal whose
-helper was lost while its cleanup was refused could never finish on the node
-still running it, however long the refusal had since been cleared.
+The agent keeps one reap *receipt* per job, because quiescence once proven
+stays proven. It keeps it until the boot ends, the removal that consumed it
+completes, or a new attempt of that job starts -- a receipt speaks for the
+attempt it reaped, and a later attempt has its own runtime to prove absent, so
+admitting the job again drops it.
+
+A reap that failed proved nothing, so it is never kept as that job's answer: a
+removal retrying on its own cadence asks the runtime again under the frozen
+attempt authority it already holds, and carries back whatever that attempt
+refused rather than an older moment's failure. The adapter keeps that call
+answerable for exactly this reason -- a typed runtime loss leaves the attempt's
+tracking entry in place -- and every proof behind the receipt stays the
+adapter's. Without it a removal whose helper was lost while its cleanup was
+refused could never finish on the node still running it, however long the
+refusal had since been cleared. Where the frozen manifest carries no authority
+this node can ask again -- Storage-only rows, or rows belonging to another job,
+node or boot -- the recorded failure remains the only answer there is.
+
+A receipt earned that way is retained before it is returned, under the lock
+claims and residency take and only while the job is still unadmitted. Asking
+spends the adapter's tracking entry and its single-use sweep evidence for that
+authority, so a repeated Delete comes back `unauthorized_attempt` with no
+tracked fallback left: a receipt earned and then dropped -- one transient
+failure to write it durably -- would wedge the next retry for the rest of the
+boot, having already proven the thing it needed.
 
 ## Authority clock
 

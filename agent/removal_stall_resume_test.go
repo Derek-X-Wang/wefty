@@ -356,6 +356,55 @@ func TestARestartMidCadenceDoesNotAcknowledgeTwice(t *testing.T) {
 	}
 }
 
+// singleUseReapRuntime is the helper's real answer shape. A reap that
+// succeeds spends the adapter's tracking entry and its single-use sweep
+// evidence, so asking again for the same attempt authority comes back
+// `unauthorized_attempt` with no tracked fallback left. A refusal spends
+// nothing.
+type singleUseReapRuntime struct {
+	asked    int
+	refusing bool
+	consumed map[workloadrunner.AttemptAuthority]struct{}
+}
+
+func newSingleUseReapRuntime(refusing bool) *singleUseReapRuntime {
+	return &singleUseReapRuntime{refusing: refusing, consumed: make(map[workloadrunner.AttemptAuthority]struct{})}
+}
+
+func (runtime *singleUseReapRuntime) reap(_ context.Context, kind string, authority workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, error) {
+	runtime.asked++
+	if kind != contract.JobKindOCI {
+		return workloadrunner.ReapReceipt{}, fmt.Errorf("unexpected reap kind %q", kind)
+	}
+	if _, spent := runtime.consumed[authority]; spent {
+		return workloadrunner.ReapReceipt{}, &ocihelper.RPCError{
+			Code: ocihelper.CodeUnauthorizedAttempt, Message: "attempt authority does not match a live attempt",
+		}
+	}
+	if runtime.refusing {
+		return workloadrunner.ReapReceipt{}, &ocihelper.RPCError{Code: ocihelper.CodeEngineFailure, Message: "still refused"}
+	}
+	runtime.consumed[authority] = struct{}{}
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+		BootSessionID: authority.BootSessionID}, nil
+}
+
+// latchedFailureRemoval seeds what the attempt lifecycle recorded while the
+// helper was lost, plus the frozen attempt authority the removal carries.
+func latchedFailureRemoval(t *testing.T, session *agentSession, jobID string) []workloadrunner.RuntimeResourceManifest {
+	t.Helper()
+	manifest := testRuntimeResourceManifest(jobID, "attempt")
+	manifest.NodeID = session.registration.NodeID
+	manifest.BootSessionID = session.registration.BootSessionID
+	session.claimMu.Lock()
+	session.serviceReaps[jobID] = runtimeReapOutcome{
+		err: errors.New("workload runtime lost during operation: OCI boot barrier has not completed"),
+	}
+	session.serviceBoots[jobID] = session.registration.BootSessionID
+	session.claimMu.Unlock()
+	return []workloadrunner.RuntimeResourceManifest{manifest}
+}
+
 // TestRemovalReapAsksTheRuntimeAgainAfterALatchedFailure is the root cause of
 // #514 at the seam it lives on. The session latches the one reap outcome an
 // attempt produced and replays it for the rest of the boot. That is right for
@@ -367,33 +416,9 @@ func TestRemovalReapAsksTheRuntimeAgainAfterALatchedFailure(t *testing.T) {
 	node := newStalledRemovalNode(t, "reask-reap-node", true)
 	session := node.agent.session
 	jobID := node.removal.jobID
-	attempts := []workloadrunner.RuntimeResourceManifest{func() workloadrunner.RuntimeResourceManifest {
-		manifest := testRuntimeResourceManifest(jobID, "attempt")
-		manifest.NodeID = session.registration.NodeID
-		manifest.BootSessionID = session.registration.BootSessionID
-		return manifest
-	}()}
-
-	// What the attempt lifecycle recorded while the helper was lost.
-	latched := errors.New("workload runtime lost during operation: OCI boot barrier has not completed")
-	session.claimMu.Lock()
-	session.serviceReaps[jobID] = runtimeReapOutcome{err: latched}
-	session.serviceBoots[jobID] = session.registration.BootSessionID
-	session.claimMu.Unlock()
-
-	asked := 0
-	refusing := true
-	session.reapRemovalAttempt = func(_ context.Context, kind string, authority workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, error) {
-		asked++
-		if kind != contract.JobKindOCI || authority.JobID != jobID || authority.AttemptID != "attempt" ||
-			authority.NodeID != session.registration.NodeID || authority.BootSessionID != session.registration.BootSessionID {
-			return workloadrunner.ReapReceipt{}, fmt.Errorf("unexpected reap authority %+v for kind %q", authority, kind)
-		}
-		if refusing {
-			return workloadrunner.ReapReceipt{}, &ocihelper.RPCError{Code: ocihelper.CodeEngineFailure, Message: "still refused"}
-		}
-		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
-	}
+	attempts := latchedFailureRemoval(t, session, jobID)
+	runtime := newSingleUseReapRuntime(true)
+	session.reapRemovalAttempt = runtime.reap
 
 	_, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts)
 	if err == nil || !strings.Contains(err.Error(), "still refused") {
@@ -402,25 +427,90 @@ func TestRemovalReapAsksTheRuntimeAgainAfterALatchedFailure(t *testing.T) {
 	if strings.Contains(fmt.Sprint(err), "boot barrier") {
 		t.Fatalf("reap replayed the latched failure instead of asking again: %v", err)
 	}
-	refusing = false
+	runtime.refusing = false
 	receipt, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts)
 	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceAttempt {
 		t.Fatalf("reap after the fault cleared = %+v err %v, want a positive receipt on the running node", receipt, err)
 	}
-	if asked != 2 {
-		t.Fatalf("runtime reap asked %d times, want one per removal attempt", asked)
+	if runtime.asked != 2 {
+		t.Fatalf("runtime reap asked %d times, want one per removal attempt", runtime.asked)
 	}
 
-	// A latched receipt is still the answer: proven quiescence is not re-asked.
-	session.claimMu.Lock()
-	session.serviceReaps[jobID] = runtimeReapOutcome{receipt: workloadrunner.ReapReceipt{
-		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime}}
-	session.claimMu.Unlock()
-	if _, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts); err != nil {
+	// The receipt it earned is the job's answer now: proven quiescence is
+	// replayed, never re-asked. The runtime would refuse a second consumption
+	// of the same authority, exactly as the helper does.
+	replayed, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts)
+	if err != nil || replayed != receipt {
+		t.Fatalf("second reap = %+v err %v, want the earned receipt replayed", replayed, err)
+	}
+	if runtime.asked != 2 {
+		t.Fatalf("runtime reap asked %d times, want a proven receipt replayed without asking", runtime.asked)
+	}
+}
+
+// TestAnEarnedReapReceiptSurvivesAFailedQuiescenceWrite is the narrow window
+// the re-ask opens and must close. Asking spends the adapter's evidence for
+// that authority, so a receipt earned and then lost -- one transient spool
+// error between the answer and its durable write -- would leave the next
+// retry asking against evidence that no longer exists, wedged for the rest of
+// the boot having already proven the thing it needed.
+func TestAnEarnedReapReceiptSurvivesAFailedQuiescenceWrite(t *testing.T) {
+	node := newStalledRemovalNode(t, "retained-receipt-node", true)
+	session := node.agent.session
+	jobID := node.removal.jobID
+	attempts := latchedFailureRemoval(t, session, jobID)
+	runtime := newSingleUseReapRuntime(false)
+	session.reapRemovalAttempt = runtime.reap
+
+	// The retry that finally earns a receipt, whose durable write then fails.
+	earned, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts)
+	if err != nil {
+		t.Fatalf("the retry that cleared the fault = %v, want a positive receipt", err)
+	}
+	persistErr := errors.New("record runtime quiescence: disk I/O error")
+
+	// The next cadence tick, after the transient write failure.
+	retried, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts)
+	if err != nil {
+		t.Fatalf("the tick after %v = %v, want the proof this node already earned", persistErr, err)
+	}
+	if retried != earned {
+		t.Fatalf("retried receipt = %+v, want the earned one %+v", retried, earned)
+	}
+	if runtime.asked != 1 {
+		t.Fatalf("runtime reap asked %d times, want the earned proof reused rather than re-consumed", runtime.asked)
+	}
+}
+
+// TestAnEarnedReapReceiptIsNotKeptForALaterAttempt keeps the retained receipt
+// inside the attempt it speaks for. A new attempt of the same job has its own
+// runtime to prove absent.
+func TestAnEarnedReapReceiptIsNotKeptForALaterAttempt(t *testing.T) {
+	node := newStalledRemovalNode(t, "readmitted-job-node", true)
+	session := node.agent.session
+	jobID := node.removal.jobID
+	attempts := latchedFailureRemoval(t, session, jobID)
+	runtime := newSingleUseReapRuntime(false)
+	session.reapRemovalAttempt = runtime.reap
+
+	earned, err := session.reapServiceForRemoval(t.Context(), jobID, contract.JobKindOCI, attempts)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if asked != 2 {
-		t.Fatalf("runtime reap asked %d times, want a proven receipt replayed without asking", asked)
+
+	// The narrow race the guard closes: the job is claimed again between the
+	// answer and its retention. executeResident drops the entry when that
+	// attempt starts, and a retention arriving afterwards must not put it back.
+	session.claimMu.Lock()
+	session.residentJobID[jobID] = struct{}{}
+	delete(session.serviceReaps, jobID)
+	session.claimMu.Unlock()
+	session.retainRemovalReap(jobID, earned)
+	session.claimMu.Lock()
+	_, kept := session.serviceReaps[jobID]
+	session.claimMu.Unlock()
+	if kept {
+		t.Fatal("a receipt from an earlier attempt was retained for a job this node has admitted again")
 	}
 }
 
