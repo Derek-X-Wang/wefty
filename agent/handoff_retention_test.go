@@ -674,3 +674,70 @@ func TestABoundThatCannotReachItsDirectoryRecordsWhy(t *testing.T) {
 		}
 	})
 }
+
+// TestAnUnremovableExpiredRunIsQuarantinedRatherThanRetriedForever: a symlink
+// planted at an expired run's name is refused by every sweep, so before this
+// the same refusal was logged hourly for as long as the node ran and nothing
+// ever decided. The retry is bounded; then the record is quarantined with a
+// typed reason a node doctor can show, and the directory is still neither
+// followed nor deleted.
+func TestAnUnremovableExpiredRunIsQuarantinedRatherThanRetriedForever(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, "not-ours"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := harness.retain("run_stuck", true, true, map[string]int{"result.json": 16})
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Fatal(err)
+	}
+	harness.now = harness.now.Add(2 * time.Hour)
+
+	for attempt := 1; attempt < maxExpiryAttempts; attempt++ {
+		if err := harness.manager.collect(); err != nil {
+			t.Fatal(err)
+		}
+		record := requireRetentionRecord(t, harness.manager, "run_stuck")
+		if record.ExpiryFailures != attempt {
+			t.Fatalf("after %d sweeps the record counts %d failures", attempt, record.ExpiryFailures)
+		}
+		if record.Quarantine != "" {
+			t.Fatalf("the record was quarantined after %d of %d attempts", attempt, maxExpiryAttempts)
+		}
+	}
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	record := requireRetentionRecord(t, harness.manager, "run_stuck")
+	if record.Quarantine != handoffExpiryDirectoryUnremovable {
+		t.Fatalf("quarantine = %q, want %q", record.Quarantine, handoffExpiryDirectoryUnremovable)
+	}
+	if record.QuarantinedAt.IsZero() || !strings.Contains(record.QuarantineDetail, "not a directory") {
+		t.Fatalf("quarantine carries no usable cause: %+v", record)
+	}
+	if !harness.logged("is left exactly as it is") {
+		t.Fatalf("the quarantine was silent: %v", harness.logs)
+	}
+
+	// The retry stops: a further sweep says nothing more about this run.
+	before := len(harness.logs)
+	for range 3 {
+		if err := harness.manager.collect(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, line := range harness.logs[before:] {
+		if strings.Contains(line, "run_stuck") {
+			t.Fatalf("a quarantined record was retried: %q", line)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, "not-ours")); err != nil {
+		t.Fatalf("quarantine followed the symlink it refused: %v", err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the planted name was removed: %v, %v", info, err)
+	}
+}

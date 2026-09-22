@@ -36,6 +36,17 @@ const (
 	// retentionClockSkew is how far ahead of the agent's own clock a record's
 	// timestamps may sit before they are treated as untrustworthy.
 	retentionClockSkew = 5 * time.Minute
+	// maxExpiryAttempts bounds how often the collector retries one record whose
+	// directory it cannot remove. A name a workload replaced with a symlink is
+	// refused at every attempt, and an unbounded retry means the same refusal
+	// is logged hourly for as long as the node runs, with nothing ever
+	// deciding. After this many consecutive failures the record is quarantined
+	// and the collector stops asking.
+	maxExpiryAttempts = 4
+	// maxQuarantineDetailBytes bounds the free-form cause kept beside the typed
+	// quarantine reason, so one long OS error cannot push a record past
+	// maxRetentionRecordBytes and make it unreadable.
+	maxQuarantineDetailBytes = 256
 )
 
 // handoffRecordAnomaly is a typed reason the agent could not do to a run's
@@ -56,6 +67,10 @@ const (
 	// it would bound one run's results by deleting another's, so nothing is
 	// trimmed there.
 	handoffBoundDirectoryForeign handoffRecordAnomaly = "bound_directory_not_this_runs"
+	// handoffExpiryDirectoryUnremovable: expiry failed maxExpiryAttempts times
+	// in a row. The directory is left exactly as it is -- never followed, never
+	// deleted -- and the record stops driving retries.
+	handoffExpiryDirectoryUnremovable handoffRecordAnomaly = "expiry_directory_unremovable"
 )
 
 // retentionRecord is the agent's own answer to "what is retained, since when,
@@ -75,6 +90,19 @@ type retentionRecord struct {
 	// whose bound silently did nothing is exactly the state this field exists
 	// to stop being invisible.
 	BoundAnomaly handoffRecordAnomaly `json:"bound_anomaly,omitempty"`
+	// ExpiryFailures counts consecutive collector attempts that could not
+	// remove this run's directory. It is persisted rather than kept in memory
+	// so an agent restart does not reset a retry that is never going to
+	// succeed.
+	ExpiryFailures int `json:"expiry_failures,omitempty"`
+	// Quarantine, once set, stops the collector acting on this record at all.
+	// The directory it names is left untouched: quarantine is the agent saying
+	// it will not keep trying, not permission to try harder.
+	Quarantine handoffRecordAnomaly `json:"quarantine,omitempty"`
+	// QuarantineDetail is the last failure's own words, bounded. The typed
+	// reason above is what anything branches on; this is what a person reads.
+	QuarantineDetail string    `json:"quarantine_detail,omitempty"`
+	QuarantinedAt    time.Time `json:"quarantined_at,omitempty"`
 }
 
 // uploadRecord is this node's own account of what happened to a run's result

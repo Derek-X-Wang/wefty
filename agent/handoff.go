@@ -604,6 +604,10 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 //
 // It acts only on directories the agent has a record for. A directory under
 // the root with no record is someone else's and is never measured or removed.
+//
+// A record whose directory it cannot remove is retried a bounded number of
+// times and then quarantined (noteExpiryFailure). Quarantine stops the retries;
+// it never widens what the sweep is willing to delete.
 func (m *handoffManager) collect() error {
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
@@ -614,12 +618,17 @@ func (m *handoffManager) collect() error {
 	defer root.Close()
 	now := m.now().UTC()
 	for _, record := range m.loadRecords() {
+		if record.Quarantine != "" {
+			// Already decided. Retrying it would be the hourly loop this
+			// quarantine exists to end.
+			continue
+		}
 		if record.RetainUntil.IsZero() || now.Before(record.RetainUntil) {
 			continue
 		}
 		removed, err := m.removeExpiredRun(root, record)
 		if err != nil {
-			m.log("agent: remove expired results for run %s: %v", record.RunID, err)
+			m.noteExpiryFailure(record, err)
 			continue
 		}
 		if removed {
@@ -627,6 +636,47 @@ func (m *handoffManager) collect() error {
 		}
 	}
 	return nil
+}
+
+// noteExpiryFailure bounds how often one record can send the collector at a
+// directory it cannot remove.
+//
+// A workload that replaces its own expired run name with a symlink used to buy
+// itself an unbounded retry: the sweep refuses to follow the link, logs the
+// refusal, and comes back an hour later to refuse it again, every hour, for as
+// long as the node runs. Nothing ever decided, and the same line filled the log
+// forever. After maxExpiryAttempts consecutive failures the record is
+// quarantined with a typed reason. That stops the retries and nothing else --
+// the directory is still never followed and never deleted, and the record stays
+// on disk so the node doctor and this log can both name what is sitting there.
+func (m *handoffManager) noteExpiryFailure(record retentionRecord, cause error) {
+	record.ExpiryFailures++
+	if record.ExpiryFailures >= maxExpiryAttempts {
+		record.Quarantine = handoffExpiryDirectoryUnremovable
+		record.QuarantineDetail = boundedQuarantineDetail(cause)
+		record.QuarantinedAt = m.now().UTC()
+		m.log("agent: remove expired results for run %s: %v; %d consecutive attempts failed, so the record is quarantined as %s and the directory at %q is left exactly as it is",
+			record.RunID, cause, record.ExpiryFailures, record.Quarantine, record.Directory)
+	} else {
+		m.log("agent: remove expired results for run %s: %v (attempt %d of %d before the record is quarantined)",
+			record.RunID, cause, record.ExpiryFailures, maxExpiryAttempts)
+	}
+	if err := m.writeRecord(record); err != nil {
+		m.log("agent: record the failed expiry of run %s: %v", record.RunID, err)
+	}
+}
+
+// boundedQuarantineDetail keeps one OS error's own words without letting them
+// push a record past the size at which it stops being readable at all.
+func boundedQuarantineDetail(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	detail := cause.Error()
+	if len(detail) > maxQuarantineDetailBytes {
+		return detail[:maxQuarantineDetailBytes]
+	}
+	return detail
 }
 
 // tryCollectLease reserves only idle paths. It acquires a normal path-lock
