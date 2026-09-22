@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -698,19 +699,42 @@ func TestRecoveryFinalizesAStalledComputerRemovalExactlyOnce(t *testing.T) {
 		computer.CurrentJobID, completion); err != nil {
 		t.Fatalf("late completion acknowledgement: %v", err)
 	}
+	// The harness's own background reconcile ticker (l1/server.go ~168,181;
+	// l1/recovery.go ~185-209) can race this explicit call on a loaded runner
+	// and finalize the same agent_cleaned+acknowledged removal first, so
+	// first.FinalizedRemovals==0 does not mean finalization never happened --
+	// it means the ticker's own pass already made the idempotent transition.
+	// Either way this call is guaranteed to return with the removal
+	// finalized: it either did the work itself (FinalizedRemovals==1), or the
+	// removed_ns exclusion (recovery.go's already-finalized guard) shows the
+	// ticker already did. The property this test holds is that finalization
+	// happens exactly once total, not that this particular call is the one
+	// that performs it, so assert the outcome reached rather than the winner.
 	first, err := h.store.Reconcile(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.FinalizedRemovals != 1 {
-		t.Fatalf("first reconcile finalized %d removals, want 1", first.FinalizedRemovals)
-	}
-	var firstRemovedNS int64
+	var firstRemovedNS sql.NullInt64
 	if err := h.store.db.QueryRow(`SELECT removed_ns FROM service_removals WHERE job_id=?`,
 		computer.CurrentJobID).Scan(&firstRemovedNS); err != nil {
 		t.Fatal(err)
 	}
+	switch first.FinalizedRemovals {
+	case 1:
+		if !firstRemovedNS.Valid {
+			t.Fatalf("first reconcile reported finalizing the removal but removed_ns is still NULL")
+		}
+	case 0:
+		if !firstRemovedNS.Valid {
+			t.Fatalf("first reconcile finalized 0 removals and the removal is still unfinalized: neither this call nor the background reconcile pass finalized it")
+		}
+	default:
+		t.Fatalf("first reconcile finalized %d removals, want 0 or 1", first.FinalizedRemovals)
+	}
 	h.clock.Advance(time.Minute)
+	// Whichever pass finalized it, no later pass may do so again: the second
+	// explicit reconcile must find nothing left to finalize, and the
+	// removal's finalized fields must be unchanged.
 	second, err := h.store.Reconcile(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -723,8 +747,8 @@ func TestRecoveryFinalizesAStalledComputerRemovalExactlyOnce(t *testing.T) {
 		computer.CurrentJobID).Scan(&secondRemovedNS); err != nil {
 		t.Fatal(err)
 	}
-	if secondRemovedNS != firstRemovedNS {
-		t.Fatalf("removal time was rewritten by a later pass: %d then %d", firstRemovedNS, secondRemovedNS)
+	if secondRemovedNS != firstRemovedNS.Int64 {
+		t.Fatalf("removal time was rewritten by a later pass: %d then %d", firstRemovedNS.Int64, secondRemovedNS)
 	}
 	// The terminal label a declaration produced is never upgraded by the late
 	// cleanup that followed it.
