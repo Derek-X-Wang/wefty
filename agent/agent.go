@@ -384,6 +384,16 @@ func New(config Config) (*Agent, error) {
 			}
 		}
 	}
+	// The removal's own retry needs the live runtime, not the outcome the
+	// attempt lifecycle recorded once. The adapter validates the authority and
+	// owns every proof; this only lets a still-running node ask again (#514).
+	session.reapRemovalAttempt = func(ctx context.Context, kind string, authority workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, error) {
+		adapter, found := runtimes.selectKind(kind)
+		if !found {
+			return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: no workload runtime for kind %q", kind)
+		}
+		return adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: authority})
+	}
 	session.removals = newRemovalController(
 		client, outbox, managedResource, session,
 		config.NodeID, config.BootSessionID, logf,
