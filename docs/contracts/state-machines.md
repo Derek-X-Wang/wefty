@@ -210,6 +210,18 @@ image preflight records a typed failure, retires the refused staging
 projection, and leaves the prior projection stopped and operable; it never
 publishes unverified image authority.
 
+The new image's platform is compared with the bound Node's advertised runtime
+platform -- the platform its OCI helper proved in the functional probe that
+earns `kind:oci`, published as the `runtime_platform:<os>/<architecture>`
+capability fact and withdrawn with the rest of that probe's facts. The Node's
+registered host platform is never the comparison: a Mac Node's host is
+darwin/arm64 while every image it can run is linux/arm64. A Node that
+advertises no runtime platform, or more than one, has nothing to compare and
+refuses the receipt. A verified receipt L1 refuses for either reason is counted,
+and the third consecutive refusal of the same operation latches the typed
+failure through the ordinary refused-preflight path. No Computer is left in
+`reimaging` behind a refusal that repeats on every poll with no failure to read.
+
 A grow intent is strictly larger than `desired_disk_bytes`. It preserves the
 current immutable Job, attempt, Computer identity, Storage identity, and
 generation. The bound helper makes one locked newcomer-pays capacity decision,

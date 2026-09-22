@@ -525,6 +525,7 @@ CREATE TABLE IF NOT EXISTS computer_reimage_operations (
   preflight_receipt_hash TEXT,
   acknowledgement_key TEXT,
   acknowledgement_hash TEXT,
+  preflight_refusals INTEGER NOT NULL DEFAULT 0 CHECK(preflight_refusals >= 0),
   requested_ns INTEGER NOT NULL,
   verified_ns INTEGER,
   completed_ns INTEGER,
@@ -1116,6 +1117,10 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		if err := s.ensureColumn(ctx, "computers", column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	if err := s.ensureColumn(ctx, "computer_reimage_operations", "preflight_refusals",
+		"INTEGER NOT NULL DEFAULT 0 CHECK(preflight_refusals >= 0)"); err != nil {
+		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO computer_storage_generations(
 		computer_id, storage_id, storage_generation, disk_bytes, phase, created_ns

@@ -25,8 +25,10 @@ import (
 )
 
 type capabilityProbeAdapterStub struct {
-	err   error
-	calls *int
+	err        error
+	calls      *int
+	platform   ocihelper.OCIPlatform
+	noPlatform bool
 }
 
 func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.T) {
@@ -144,11 +146,61 @@ func (stub *atomicCapabilityProbeAdapterStub) Probe(context.Context, string, str
 	return nil
 }
 
+func (stub *atomicCapabilityProbeAdapterStub) ProbedRuntimePlatform() (ocihelper.OCIPlatform, bool) {
+	return ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}, true
+}
+
 func (stub capabilityProbeAdapterStub) Probe(context.Context, string, string, string, string, time.Duration) error {
 	if stub.calls != nil {
 		*stub.calls++
 	}
 	return stub.err
+}
+
+// ProbedRuntimePlatform answers with the ordinary Linux Node platform unless a
+// row asks for a different one, or for a probe that recorded none at all.
+func (stub capabilityProbeAdapterStub) ProbedRuntimePlatform() (ocihelper.OCIPlatform, bool) {
+	if stub.noPlatform {
+		return ocihelper.OCIPlatform{}, false
+	}
+	if stub.platform.OS == "" {
+		return ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}, true
+	}
+	return stub.platform, true
+}
+
+func TestOCIProbePublishesTheHelpersRuntimePlatformNotTheHosts(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		adapter    capabilityProbeAdapterStub
+		want       string
+		wantFailed bool
+	}{
+		{name: "mac node runs linux in its guest",
+			adapter: capabilityProbeAdapterStub{platform: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}},
+			want:    "runtime_platform:linux/arm64"},
+		{name: "linux node", want: "runtime_platform:linux/amd64"},
+		{name: "probe recorded no platform", adapter: capabilityProbeAdapterStub{noPlatform: true}, wantFailed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := ociCapabilityProbe{adapter: test.adapter}.Probe(t.Context())
+			if test.wantFailed {
+				if err == nil || result.ReasonCode != contract.CapabilityReasonProbeFailed ||
+					len(result.MissingCapabilities) != 1 || result.MissingCapabilities[0] != "kind:oci" {
+					t.Fatalf("platformless probe = %+v err=%v", result, err)
+				}
+				return
+			}
+			if err != nil || !result.Capabilities[test.want] {
+				t.Fatalf("probe = %+v err=%v, want %q", result, err, test.want)
+			}
+			for capability := range result.Capabilities {
+				if strings.HasPrefix(capability, "runtime_platform:") && capability != test.want {
+					t.Fatalf("probe advertised a second runtime platform %q", capability)
+				}
+			}
+		})
+	}
 }
 
 func TestOCIProbePublishesComputerOnlyAfterExactHelperProbe(t *testing.T) {

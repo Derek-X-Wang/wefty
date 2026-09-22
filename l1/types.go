@@ -277,6 +277,15 @@ const MaximumServiceRemovalStallDetail = 1024
 // agent that produces it.
 const MinimumServiceRemovalStallAttempts = 3
 
+// MaximumComputerReimagePreflightRefusals is how many consecutive authority
+// refusals of the same reimage preflight acknowledgement L1 admits before the
+// refusal is a durable fact about the operation rather than one bad try. It
+// reuses the removal stall bar deliberately: the same three-in-a-row evidence
+// that turns an unfinished removal into a declared stall turns a repeatedly
+// refused reimage into a latched typed failure, so no Computer sits in
+// `reimaging` behind a refusal that will never stop repeating.
+const MaximumComputerReimagePreflightRefusals = MinimumServiceRemovalStallAttempts
+
 type ComputerStorageCleanupQuarantine struct {
 	Kind              string                          `json:"kind"`
 	Operation         ComputerStorageCleanupOperation `json:"operation"`
