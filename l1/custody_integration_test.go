@@ -91,9 +91,9 @@ func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *test
 		removalDirectives[0].JobID, removalReceipt); err != nil {
 		t.Fatal(err)
 	}
-	if _, changed, err := h.store.FinalizeServiceRemoval(context.Background(), removalDirectives[0].JobID); err != nil || !changed {
-		t.Fatalf("finalize Custody removal changed=%t err=%v", changed, err)
-	}
+	finalizeOrObserveRemoval(t, h.store, removalDirectives[0].JobID, func(job Job) bool {
+		return job.State == contract.JobRemovedVerified
+	})
 	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("pre-byte Custody event removal = %#v err=%v", removed, err)
@@ -386,9 +386,9 @@ func TestCustodyExportRefusedBeforeAnyExternalByteLeavesTheSourceUntainted(t *te
 			RootInstanceID: removalDirectives[0].RootInstanceID, IdempotencyKey: "untainted-removed"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, changed, err := h.store.FinalizeServiceRemoval(context.Background(), removalDirectives[0].JobID); err != nil || !changed {
-		t.Fatalf("finalize removal changed=%t err=%v", changed, err)
-	}
+	finalizeOrObserveRemoval(t, h.store, removalDirectives[0].JobID, func(job Job) bool {
+		return job.State == contract.JobRemovedVerified
+	})
 	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_verified" {
 		t.Fatalf("refused export reduced the removal outcome = %#v err=%v", removed, err)
@@ -442,9 +442,9 @@ func TestCustodyExportThatTouchedTheDestinationTaintsAndReducesRemoval(t *testin
 					RootInstanceID: directives[0].RootInstanceID, IdempotencyKey: "touched-removed"}); err != nil {
 				t.Fatal(err)
 			}
-			if _, changed, err := h.store.FinalizeServiceRemoval(context.Background(), directives[0].JobID); err != nil || !changed {
-				t.Fatalf("finalize removal changed=%t err=%v", changed, err)
-			}
+			finalizeOrObserveRemoval(t, h.store, directives[0].JobID, func(job Job) bool {
+				return job.State == contract.JobRemovedVerified
+			})
 			removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
 			if err != nil || removed.RemovalOutcome != "removed_reduced" {
 				t.Fatalf("an export that touched the destination allowed %q = %#v err=%v", removed.RemovalOutcome, removed, err)

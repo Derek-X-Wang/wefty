@@ -31,9 +31,9 @@ func TestLegacyFinalizedRemovalAcceptsBareAcknowledgementAfterMigration(t *testi
 	if _, err := harness.h.store.AcknowledgeServiceRemoval(t.Context(), "fabric-agent", harness.job.JobID, ack); err != nil {
 		t.Fatal(err)
 	}
-	if _, finalized, err := harness.h.store.FinalizeServiceRemoval(t.Context(), harness.job.JobID); err != nil || !finalized {
-		t.Fatalf("finalize legacy fixture: finalized=%t err=%v", finalized, err)
-	}
+	finalizeOrObserveRemoval(t, harness.h.store, harness.job.JobID, func(job Job) bool {
+		return job.State == contract.JobRemovedVerified
+	})
 	var sequence int
 	var name, databasePath string
 	if err := harness.h.store.db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &name, &databasePath); err != nil {
@@ -703,6 +703,30 @@ func TestForceForgottenAcknowledgementPrecedesTombstoneFinalization(t *testing.T
 	assertRemovedServiceRows(t, h, job.JobID)
 }
 
+// finalizeOrObserveRemoval finalizes a service removal's cleanup phase and
+// returns the resulting Job, accepting either winner of the race between this
+// call and the harness server's own background reconcile pass: the
+// immediate recovery pass in Serve and its 1s ticker (l1/server.go ~168,181)
+// finalize any agent_cleaned+acknowledged removal on their own
+// (l1/recovery.go ~185-209), so on a loaded runner they can land between a
+// fixture's acknowledgement and its own FinalizeServiceRemoval call. When
+// that happens FinalizeServiceRemoval reports changed=false, but it still
+// returns the removal's current Job -- finalization is idempotent, so that
+// Job carries the same outcome this call would have produced. want is
+// evaluated against that Job regardless of which call actually finalized it,
+// so the assertion is about the outcome reached, never about who won.
+func finalizeOrObserveRemoval(t *testing.T, store *Store, jobID string, want func(Job) bool) Job {
+	t.Helper()
+	job, changed, err := store.FinalizeServiceRemoval(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("finalize removal %s: err=%v", jobID, err)
+	}
+	if !want(job) {
+		t.Fatalf("finalize removal %s changed=%t did not reach the expected outcome: %#v", jobID, changed, job)
+	}
+	return job
+}
+
 // TestLateCleanupNeverUpgradesAWaivedRemoval holds the waiver terminal for
 // both service kinds. An operator who force-forgets accepts an outcome nobody
 // proved; when a returning node finally acknowledges cleanup, that
@@ -791,10 +815,9 @@ func finalizeWaivedComputerRemoval(t *testing.T) Job {
 	if acknowledged.State != contract.JobForgottenCleanupUnverified {
 		t.Fatalf("acknowledgement state = %q, want the waiver to stand", acknowledged.State)
 	}
-	finalized, changed, err := h.store.FinalizeServiceRemoval(context.Background(), computer.CurrentJobID)
-	if err != nil || !changed {
-		t.Fatalf("finalize waived Computer removal = %#v changed=%v err=%v", finalized, changed, err)
-	}
+	finalized := finalizeOrObserveRemoval(t, h.store, computer.CurrentJobID, func(job Job) bool {
+		return job.State == contract.JobForgottenCleanupUnverified && job.Removal != nil
+	})
 	// The durable row, not just the projection, must still say unverified.
 	var status contract.JobState
 	if err := h.store.db.QueryRow(`SELECT status FROM service_removals WHERE job_id=?`,
@@ -884,10 +907,9 @@ func finalizeWaivedOrdinaryRemoval(t *testing.T) Job {
 	if acknowledged.State != contract.JobForgottenCleanupUnverified {
 		t.Fatalf("acknowledgement state = %q, want the waiver to stand", acknowledged.State)
 	}
-	finalized, changed, err := harness.h.store.FinalizeServiceRemoval(context.Background(), harness.job.JobID)
-	if err != nil || !changed {
-		t.Fatalf("finalize waived service removal = %#v changed=%v err=%v", finalized, changed, err)
-	}
+	finalized := finalizeOrObserveRemoval(t, harness.h.store, harness.job.JobID, func(job Job) bool {
+		return job.State == contract.JobForgottenCleanupUnverified && job.Removal != nil
+	})
 	var outcome string
 	if err := harness.h.store.db.QueryRow(`SELECT outcome FROM service_tombstones WHERE job_id=?`,
 		harness.job.JobID).Scan(&outcome); err != nil {
