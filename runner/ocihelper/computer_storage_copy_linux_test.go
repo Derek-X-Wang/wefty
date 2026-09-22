@@ -729,13 +729,16 @@ func TestCustodyImportSourceValidationFailuresStillProveAbsence(t *testing.T) {
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			root, system, source := publishedStorageCopySource(t)
-			externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+			// The export the import verifies must itself be admitted: an
+			// unconfined destination is refused, and a refused export leaves
+			// no manifest for these arms to tamper with.
+			mountRoot, externalRoot := custodyOperatorMountRoot(t)
 			exportRequest := custodyExportTestRequest(source, externalRoot)
-			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+			engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
 				storageCopyFinalize: importFinalize}
 			exported, err := engine.ExportComputerCustody(t.Context(), exportRequest)
-			if err != nil {
-				t.Fatal(err)
+			if err != nil || exported.Receipt.Kind != "computer_custody_export_verified" {
+				t.Fatalf("Custody export fixture = %+v err=%v", exported.Receipt, err)
 			}
 			request := storageCopyTestRequest(source, "import", source.Receipt.AllocatedSize)
 			request.Destination.ComputerID = "import-computer"

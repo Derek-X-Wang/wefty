@@ -138,6 +138,33 @@ func validateStorageCopySource(ctx context.Context, root string, request CopyCom
 	return path, nil
 }
 
+// openStorageCopySource reads through the retained descriptor when one
+// exists — an import must never re-resolve the operator's pathname — and
+// otherwise opens the helper-managed source by path.
+func openStorageCopySource(path string, handle *os.File) (io.Reader, func() error, error) {
+	if handle != nil {
+		if _, err := handle.Seek(0, io.SeekStart); err != nil {
+			return nil, nil, err
+		}
+		return handle, func() error { return nil }, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return file, file.Close, nil
+}
+
+func digestStorageCopySource(ctx context.Context, path string, handle *os.File) (string, error) {
+	if handle == nil {
+		return digestFile(ctx, path)
+	}
+	if _, err := handle.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return digestReader(ctx, handle)
+}
+
 func digestFilePrefix(ctx context.Context, path string, size int64) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -683,8 +710,16 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	// portable manifest would leave the reserved import with nothing to
 	// acknowledge.
 	var sourcePath string
+	// An import holds the descriptor admission verified; the copy and both
+	// digests read that inode instead of re-resolving the operator's path.
+	var sourceHandle *os.File
+	defer func() {
+		if sourceHandle != nil {
+			_ = sourceHandle.Close()
+		}
+	}()
 	if importSource {
-		sourcePath, err = validateImportCustodySource(engine.config.RuntimeRoot, request)
+		sourceHandle, err = engine.validateImportCustodySource(request)
 	} else {
 		var copyName string
 		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
@@ -754,13 +789,13 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		if err := engine.storageCopyCheckpoint(computerStorageCopyAllocated); err != nil {
 			return CopyComputerStorageResponse{}, err
 		}
-		source, err := os.Open(sourcePath)
+		source, closeSource, err := openStorageCopySource(sourcePath, sourceHandle)
 		if err != nil {
 			return CopyComputerStorageResponse{}, err
 		}
 		destination, err := os.OpenFile(stagingPath, os.O_WRONLY, 0)
 		if err != nil {
-			_ = source.Close()
+			_ = closeSource()
 			return CopyComputerStorageResponse{}, err
 		}
 		copied, copyErr := engine.copyComputerBackup(destination, custodyContextReader{ctx: ctx, r: source}, request.SourceSize)
@@ -772,7 +807,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		}
 		// The destination write is classified alone: a close that also failed
 		// joins the error and keeps the whole outcome an engine failure.
-		closeErr := errors.Join(source.Close(), destination.Close())
+		closeErr := errors.Join(closeSource(), destination.Close())
 		if closeErr != nil {
 			return CopyComputerStorageResponse{}, errors.Join(copyErr, closeErr)
 		}
@@ -787,7 +822,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 			return CopyComputerStorageResponse{}, err
 		}
 	}
-	sourceDigest, err := digestFile(ctx, sourcePath)
+	sourceDigest, err := digestStorageCopySource(ctx, sourcePath, sourceHandle)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
@@ -879,7 +914,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	if request.Operation == "restore" && request.Destination.DiskBytes == request.SourceSize && destinationDigest != sourceDigest {
 		return CopyComputerStorageResponse{}, errors.New("Computer restore destination digest mismatch")
 	}
-	postMutationSourceDigest, err := digestFile(ctx, sourcePath)
+	postMutationSourceDigest, err := digestStorageCopySource(ctx, sourcePath, sourceHandle)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}

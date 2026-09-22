@@ -985,7 +985,7 @@ func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID 
 	if err := tx.QueryRowContext(ctx, computerCustodyGraph+`
 		SELECT COUNT(*) FROM (
 			SELECT e.export_id AS custody_id FROM computer_custody_exports e
-			JOIN custody ON custody.storage_id=e.source_storage_id
+			JOIN custody ON custody.storage_id=e.source_storage_id WHERE `+custodyExportTaintingPredicate+`
 			UNION ALL
 			SELECT p.provenance_id FROM storage_provenance p
 			JOIN custody ON custody.storage_id=p.destination_storage_id WHERE p.kind='import'
