@@ -98,6 +98,20 @@ into the same streak: a refusal there is a typed helper refusal like any
 other, so it extends the same consecutive count, is weighed against the same
 bound, and declares the same outcome. There is one bound and one outcome for
 a removal, never a second accounting for one of its steps.
+A copy whose removal L1 has already acknowledged does not ordinarily become
+one of those refusals. The bound node keeps its own durable record of the
+copies L1 accepted as absent, matched on copy and Backup identity, Storage
+identity and generation, bound node, root instance, operation revision and
+cleanup fence, and skips them when a directive list built before the
+acknowledgement names them again, so no second deletion call and no second
+receipt are made. That suppression is bounded, not absolute: the record keeps
+a fixed number of recent copies, and a crash between the accepted
+acknowledgement and the record's own write leaves nothing to skip on, so a
+repeat deletion after eviction or such a crash is possible. It is not a
+wedge, because L1 accepts the renewed positive-absence evidence that repeat
+produces. A typed helper refusal on that repeat is still a refusal of this
+removal's cleanup and still counts into the streak, exactly as a first
+deletion's refusal does.
 The bound agent freezes the exact declaration durably before it first sends it
 and replays those bytes until L1 accepts them, under an idempotency key that
 does not vary with the boot session, so a lost response cannot turn an accepted
@@ -288,6 +302,23 @@ intent CAS. Zero or an already-reached positive cap rejects creation without
 mutation. Capacity never auto-deletes: pruning is explicit, retains the immutable logical record as
 `pruned`, and moves its one physical copy through
 `published → removal_pending → removed` only after a positive absence receipt.
+A copy that is already `removed` answers a further positive absence receipt
+with the already-removed outcome it is: every identity and authority field is
+still checked against the planned copy, so a receipt that passes proves
+exactly the absence L1 recorded, and it is accepted without mutation while the
+first accepted receipt stays the record. A planned prune returns the pruned
+Backup; a superseded create's planned copy and a restore predecessor kept as a
+Backup have no Backup to return and answer with the same empty acknowledgement
+they answer an ordinary replay with. The helper mints a fresh receipt identity
+on every deletion call, so a differing receipt identity is renewed evidence,
+not conflicting authority. Such a renewal writes nothing -- no receipt, no
+key, no hash, no completion time -- and therefore binds no idempotency key of
+its own, which is the exception noted in the lease, fencing and dispatch
+contract: exactly one key is bound per copy, the one the writing receipt
+carried, and only reusing that key with a different body is refused, as
+`idempotency_conflict`. A receipt that disagrees about Backup, copy, Computer,
+Storage identity or generation, bound node, root instance, operation revision
+or cleanup fence is still `conflict`.
 ENOSPC and digest mismatch publish no Backup and require positive copy absence.
 
 Restore is stopped-only. For a Computer with a current attempt, an accepted

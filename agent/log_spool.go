@@ -42,6 +42,12 @@ const (
 	legacyUnclassifiedKind                = "unclassified"
 	maxSuppressedCompletionPayloadsPerJob = 16
 	maxCompletionInspectionReceipts       = 1024
+	// maxBackupCopyRemovalAcknowledgements bounds the node's record of Backup
+	// copies L1 has already acknowledged as absent. One row per physical copy
+	// this node ever deleted is tiny next to a Backup, and the row is only
+	// ever consulted by a directive that names that copy again, so the oldest
+	// rows fall out rather than growing without limit.
+	maxBackupCopyRemovalAcknowledgements = 1024
 )
 
 type durableSpoolEvent struct {
@@ -266,6 +272,18 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	  stall_declaration_json BLOB,
 	  stall_declaration_key TEXT,
 	  stall_declared_ns INTEGER
+	);
+	CREATE TABLE IF NOT EXISTS backup_copy_removal_acknowledgements (
+	  copy_id TEXT PRIMARY KEY,
+	  backup_id TEXT NOT NULL,
+	  computer_id TEXT NOT NULL,
+	  storage_id TEXT NOT NULL,
+	  storage_generation INTEGER NOT NULL,
+	  bound_node_id TEXT NOT NULL,
+	  root_instance_id TEXT NOT NULL,
+	  operation_revision INTEGER NOT NULL,
+	  cleanup_fence TEXT NOT NULL,
+	  acknowledged_ns INTEGER NOT NULL
 	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
@@ -632,6 +650,82 @@ WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id
 		return fmt.Errorf("agent: commit completed service removal release: %w", err)
 	}
 	return nil
+}
+
+// backupCopyRemovalAcknowledged answers whether L1 has already accepted this
+// node's positive-absence receipt for exactly this Backup copy under exactly
+// this removal authority. A fresh heartbeat never names an acknowledged copy,
+// so the question only ever arises when a directive list built before that
+// acknowledgement is replayed. Deleting the copy again would mint a second
+// receipt for an absence L1 already recorded, and L1 would refuse the
+// different receipt -- a refusal that, since #465, counts into the removal's
+// stall streak (#501).
+//
+// The authority is compared in full rather than on the copy alone: a row that
+// disagrees about Backup, Computer, Storage identity or generation, bound
+// node, root instance, operation revision or cleanup fence is not evidence
+// about the copy this directive names, so the deletion proceeds.
+func (spool *logSpool) backupCopyRemovalAcknowledged(ctx context.Context, directive l1.ComputerBackupPruneDirective) (bool, error) {
+	if strings.TrimSpace(directive.CopyID) == "" {
+		return false, nil
+	}
+	var stored l1.ComputerBackupPruneDirective
+	if err := spool.db.QueryRowContext(ctx, `SELECT backup_id, computer_id, storage_id, storage_generation,
+bound_node_id, root_instance_id, operation_revision, cleanup_fence
+FROM backup_copy_removal_acknowledgements WHERE copy_id=?`, directive.CopyID).Scan(&stored.BackupID,
+		&stored.ComputerID, &stored.StorageID, &stored.StorageGeneration, &stored.BoundNodeID,
+		&stored.RootInstanceID, &stored.OperationRevision, &stored.CleanupFence); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("agent: read acknowledged Backup copy removal: %w", err)
+	}
+	stored.CopyID = directive.CopyID
+	return sameBackupCopyRemovalAuthority(stored, directive), nil
+}
+
+// recordBackupCopyRemovalAcknowledged makes the acknowledgement durable. It is
+// written only after L1 answered positively, so the record never claims an
+// absence L1 has not accepted.
+func (spool *logSpool) recordBackupCopyRemovalAcknowledged(ctx context.Context, directive l1.ComputerBackupPruneDirective, observedAt time.Time) error {
+	if strings.TrimSpace(directive.CopyID) == "" {
+		return errors.New("agent: acknowledged Backup copy removal requires a copy identity")
+	}
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin acknowledged Backup copy removal: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO backup_copy_removal_acknowledgements(
+copy_id, backup_id, computer_id, storage_id, storage_generation, bound_node_id, root_instance_id,
+operation_revision, cleanup_fence, acknowledged_ns
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(copy_id) DO UPDATE SET backup_id=excluded.backup_id, computer_id=excluded.computer_id,
+storage_id=excluded.storage_id, storage_generation=excluded.storage_generation,
+bound_node_id=excluded.bound_node_id, root_instance_id=excluded.root_instance_id,
+operation_revision=excluded.operation_revision, cleanup_fence=excluded.cleanup_fence,
+acknowledged_ns=excluded.acknowledged_ns`, directive.CopyID, directive.BackupID, directive.ComputerID,
+		directive.StorageID, directive.StorageGeneration, directive.BoundNodeID, directive.RootInstanceID,
+		directive.OperationRevision, directive.CleanupFence, observedAt.UTC().Round(0).UnixNano()); err != nil {
+		return fmt.Errorf("agent: persist acknowledged Backup copy removal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM backup_copy_removal_acknowledgements WHERE copy_id IN (
+SELECT copy_id FROM backup_copy_removal_acknowledgements ORDER BY acknowledged_ns DESC LIMIT -1 OFFSET ?)`,
+		maxBackupCopyRemovalAcknowledgements); err != nil {
+		return fmt.Errorf("agent: bound acknowledged Backup copy removals: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit acknowledged Backup copy removal: %w", err)
+	}
+	return nil
+}
+
+func sameBackupCopyRemovalAuthority(left, right l1.ComputerBackupPruneDirective) bool {
+	return left.BackupID == right.BackupID && left.CopyID == right.CopyID &&
+		left.ComputerID == right.ComputerID && left.StorageID == right.StorageID &&
+		left.StorageGeneration == right.StorageGeneration && left.BoundNodeID == right.BoundNodeID &&
+		left.RootInstanceID == right.RootInstanceID && left.OperationRevision == right.OperationRevision &&
+		left.CleanupFence == right.CleanupFence
 }
 
 func (spool *logSpool) ensureAttempt(ctx context.Context, claim l1.Claim) error {

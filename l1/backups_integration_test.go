@@ -2,6 +2,10 @@ package l1
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -511,4 +515,256 @@ func TestComputerBackupAcknowledgementsRequireBoundNodeAndCurrentRoot(t *testing
 			IdempotencyKey: "recreated-prune-root", Receipt: pruneReceipt}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("recreated prune root acknowledgement = %v, want %q", err, contract.ErrorConflict)
 	}
+}
+
+// backupAbsenceRows is a byte-exact snapshot of every durable row a Backup-copy
+// absence acknowledgement can write: the planned prune, the superseded create
+// operation, the restore-predecessor storage-copy operation, the physical copy
+// and the logical Backup. quote() renders NULL, BLOB and integer values
+// literally, so a request that wrote nothing produces an identical snapshot
+// even after the clock has moved.
+func backupAbsenceRows(t *testing.T, store *Store, computerID, backupID, copyID string) string {
+	t.Helper()
+	var snapshot strings.Builder
+	read := func(name, query string, args ...any) {
+		var row string
+		err := store.db.QueryRow(query, args...).Scan(&row)
+		if errors.Is(err, sql.ErrNoRows) {
+			row = "<absent>"
+		} else if err != nil {
+			t.Fatalf("snapshot %s: %v", name, err)
+		}
+		fmt.Fprintf(&snapshot, "%s=%s\n", name, row)
+	}
+	read("prune", `SELECT quote(status)||quote(receipt_json)||quote(acknowledgement_key)||
+		quote(acknowledgement_hash)||quote(completed_ns) FROM computer_backup_prunes
+		WHERE computer_id=? AND copy_id=?`, computerID, copyID)
+	read("operation", `SELECT quote(status)||quote(receipt_json)||quote(receipt_hash)||
+		quote(acknowledgement_key)||quote(acknowledgement_hash)||quote(completed_ns)
+		FROM computer_backup_operations WHERE computer_id=? AND copy_id=?`, computerID, copyID)
+	read("restore", `SELECT quote(status)||quote(old_backup_absence_receipt_json)||
+		quote(old_backup_absence_acknowledgement_key)||quote(old_backup_absence_acknowledgement_hash)||
+		quote(completed_ns) FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND old_copy_id=?`, computerID, copyID)
+	read("copy", `SELECT quote(phase)||quote(removed_ns)||quote(cleanup_fence)
+		FROM backup_copies WHERE copy_id=?`, copyID)
+	read("backup", `SELECT quote(status)||quote(pruned_ns) FROM backups WHERE backup_id=?`, backupID)
+	return snapshot.String()
+}
+
+// assertRenewedBackupAbsenceWritesNothing is the shared #501 rule at one of the
+// three rows that can hold an accepted Backup-copy absence. A renewed receipt
+// under a second key is accepted; because that acceptance writes nothing, the
+// second key is never a stored idempotency identity, so reusing it with a
+// different body is accepted again rather than refused. Exactly one key stays
+// bound: the one the receipt that actually wrote the absence carried.
+func assertRenewedBackupAbsenceWritesNothing(t *testing.T, h *integrationHarness, node Node,
+	computerID, backupID, copyID, acceptedKey string, accepted ComputerBackupCopyRemovalReceipt,
+	wantShape func(*testing.T, Backup)) {
+	t.Helper()
+	before := backupAbsenceRows(t, h.store, computerID, backupID, copyID)
+	acknowledge := func(key string, receipt ComputerBackupCopyRemovalReceipt) (Backup, error) {
+		// Any write would stamp the moved clock into a completion timestamp.
+		h.clock.Advance(time.Minute)
+		return h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computerID,
+			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: key, Receipt: receipt})
+	}
+
+	renewed := accepted
+	renewed.ReceiptID = "renewed-" + copyID
+	replayed, err := acknowledge(renewed.ReceiptID, renewed)
+	if err != nil {
+		t.Fatalf("renewed absence for an already-removed copy: %v", err)
+	}
+	wantShape(t, replayed)
+	if after := backupAbsenceRows(t, h.store, computerID, backupID, copyID); after != before {
+		t.Fatalf("renewed absence wrote to the store:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+
+	// The renewed key bound nothing, so reusing it with a different body is the
+	// same accepted renewal, not an idempotency conflict.
+	reusedRenewal := renewed
+	reusedRenewal.HelperGeneration = renewed.HelperGeneration + 1
+	replayed, err = acknowledge(renewed.ReceiptID, reusedRenewal)
+	if err != nil {
+		t.Fatalf("reused renewal key with a different receipt: %v", err)
+	}
+	wantShape(t, replayed)
+	if after := backupAbsenceRows(t, h.store, computerID, backupID, copyID); after != before {
+		t.Fatalf("reused renewal key wrote to the store:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+
+	// The one bound key is still bound.
+	reusedAccepted := accepted
+	reusedAccepted.HelperGeneration = accepted.HelperGeneration + 1
+	if _, err := acknowledge(acceptedKey, reusedAccepted); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("reused accepted key with a different receipt = %v, want %q", err, contract.ErrorIdempotencyConflict)
+	}
+	if after := backupAbsenceRows(t, h.store, computerID, backupID, copyID); after != before {
+		t.Fatalf("refused idempotency conflict wrote to the store:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func wantPrunedBackupShape(t *testing.T, backup Backup) {
+	t.Helper()
+	if backup.Status != "pruned" || len(backup.Copies) != 1 || backup.Copies[0].Phase != "removed" {
+		t.Fatalf("already-removed prune answer = %#v, want the pruned Backup", backup)
+	}
+}
+
+func wantEmptyAcknowledgementShape(t *testing.T, backup Backup) {
+	t.Helper()
+	if backup.BackupID != "" {
+		t.Fatalf("already-removed operation answer = %#v, want the empty acknowledgement", backup)
+	}
+}
+
+// TestAlreadyRemovedBackupCopyAcceptsRenewedAbsenceEvidence is the L1 half of
+// #501, at all three rows that can hold an accepted Backup-copy absence. The
+// helper mints a fresh receipt identity on every deletion call, so a replayed
+// directive list produces a different receipt for a copy L1 has already
+// recorded as absent. Refusing that as conflicting authority made an
+// already-removed copy a permanent `conflict` -- and since #465 that refusal
+// counts into the removal's stall streak. Every identity and authority field is
+// still checked against the planned copy, so what arrives here proves exactly
+// the absence L1 recorded: it is accepted, and it writes nothing at all.
+func TestAlreadyRemovedBackupCopyAcceptsRenewedAbsenceEvidence(t *testing.T) {
+	t.Run("planned prune", func(t *testing.T) {
+		h, node, computer := backupHarness(t, 1, nil)
+		computer, claim := startBackupComputer(t, h, node, computer)
+		if _, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+				IdempotencyKey: "backup-renewed-absence", AllowPowerOff: true}); err != nil {
+			t.Fatal(err)
+		}
+		finishBackupQuiescence(t, h, claim, "backup-renewed-absence-quiescence")
+		creates, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(creates) != 1 {
+			t.Fatalf("Backup create directive = %#v err=%v", creates, err)
+		}
+		backup, completed := acknowledgeBackup(t, h, node, creates[0], successfulBackupReceipt(creates[0]))
+		if _, _, err := h.store.BeginComputerBackupPrune(context.Background(), completed.ComputerID,
+			ComputerBackupPruneRequest{ComputerMutationPrecondition: computerPrecondition(completed, "operator"),
+				BackupID: backup.BackupID, IdempotencyKey: "prune-renewed-absence"}); err != nil {
+			t.Fatal(err)
+		}
+		prunes, err := h.store.ListNodeComputerBackupPruneDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(prunes) != 1 {
+			t.Fatalf("Backup prune directive = %#v err=%v", prunes, err)
+		}
+		accepted := backupRemovalReceipt(prunes[0])
+		pruned, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", completed.ComputerID,
+			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: accepted.ReceiptID, Receipt: accepted})
+		if err != nil {
+			t.Fatalf("first accepted absence: %v", err)
+		}
+		wantPrunedBackupShape(t, pruned)
+		assertRenewedBackupAbsenceWritesNothing(t, h, node, completed.ComputerID, backup.BackupID,
+			accepted.CopyID, accepted.ReceiptID, accepted, wantPrunedBackupShape)
+
+		// Conflicting authority remains a conflict however fresh the receipt is.
+		for name, mutate := range map[string]func(*ComputerBackupCopyRemovalReceipt){
+			"fence":     func(r *ComputerBackupCopyRemovalReceipt) { r.CleanupFence = "other" },
+			"operation": func(r *ComputerBackupCopyRemovalReceipt) { r.OperationRevision++ },
+			"root":      func(r *ComputerBackupCopyRemovalReceipt) { r.RootInstanceID = "other" },
+		} {
+			t.Run("still refuses "+name, func(t *testing.T) {
+				foreign := accepted
+				foreign.ReceiptID = "forged-" + name
+				mutate(&foreign)
+				if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", completed.ComputerID,
+					ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+						IdempotencyKey: foreign.ReceiptID, Receipt: foreign}); errorCode(err) != contract.ErrorConflict {
+					t.Fatalf("mutated %s on an already-removed prune = %v, want %q", name, err, contract.ErrorConflict)
+				}
+			})
+		}
+	})
+
+	t.Run("superseded create", func(t *testing.T) {
+		h, node, computer := backupHarness(t, 2, nil)
+		computer, claim := startBackupComputer(t, h, node, computer)
+		reserved, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+				IdempotencyKey: "backup-superseded-renewal", AllowPowerOff: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		finishBackupQuiescence(t, h, claim, "backup-superseded-renewal-quiescence")
+		if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID,
+			ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(reserved, "operator-remove")}); err != nil {
+			t.Fatal(err)
+		}
+		removals, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(removals) != 1 || removals[0].ComputerBackupCopies == nil ||
+			len(removals[0].ComputerBackupCopies.Copies) != 1 {
+			t.Fatalf("composite removal directive = %#v err=%v", removals, err)
+		}
+		copyDirective := removals[0].ComputerBackupCopies.Copies[0]
+		accepted := backupRemovalReceipt(copyDirective)
+		answered, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "superseded-copy-removed", Receipt: accepted})
+		if err != nil {
+			t.Fatalf("first accepted superseded absence: %v", err)
+		}
+		wantEmptyAcknowledgementShape(t, answered)
+		assertRenewedBackupAbsenceWritesNothing(t, h, node, computer.ComputerID, copyDirective.BackupID,
+			copyDirective.CopyID, "superseded-copy-removed", accepted, wantEmptyAcknowledgementShape)
+	})
+
+	t.Run("restore predecessor", func(t *testing.T) {
+		h, node, computer, source, _ := publishedBackupForStorageCopy(t, 3)
+		reserved, _, err := h.store.BeginComputerRestore(context.Background(), computer.ComputerID,
+			ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+				BackupID: source.BackupID, KeepOldBackup: true, IdempotencyKey: "restore-renewed-absence"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.store.RecordComputerRestoreAuthorityRevoked(context.Background(), computer.ComputerID,
+			reserved.IntentRevision, testRestoreRevocationEvidence(computer.ComputerID, reserved.IntentRevision)); err != nil {
+			t.Fatal(err)
+		}
+		storageCopies, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(),
+			"fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(storageCopies) != 1 || storageCopies[0].OldCopyID == "" {
+			t.Fatalf("reserved restore precommit = %#v err=%v", storageCopies, err)
+		}
+		// The helper's copy evidence was durably accepted before L1 published,
+		// so the predecessor copy is known to exist when removal supersedes it.
+		if _, err := h.store.db.Exec(`UPDATE computer_storage_copy_operations SET status='prepared',
+			acknowledgement_key='verified-copy', acknowledgement_hash='verified-hash'
+			WHERE destination_computer_id=? AND operation_revision=?`, computer.ComputerID, reserved.IntentRevision); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID,
+			ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(reserved, "operator-remove")}); err != nil {
+			t.Fatal(err)
+		}
+		removals, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(removals) != 1 || removals[0].ComputerBackupCopies == nil {
+			t.Fatalf("restore composite removal = %#v err=%v", removals, err)
+		}
+		var precommit ComputerBackupPruneDirective
+		for _, copy := range removals[0].ComputerBackupCopies.Copies {
+			if copy.CopyID == storageCopies[0].OldCopyID {
+				precommit = copy
+			}
+		}
+		if precommit.CopyID == "" {
+			t.Fatalf("composite removal omitted the precommitted restore Backup: %#v", removals[0].ComputerBackupCopies.Copies)
+		}
+		accepted := backupRemovalReceipt(precommit)
+		answered, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "precommit-copy-removed", Receipt: accepted})
+		if err != nil {
+			t.Fatalf("first accepted restore predecessor absence: %v", err)
+		}
+		wantEmptyAcknowledgementShape(t, answered)
+		assertRenewedBackupAbsenceWritesNothing(t, h, node, computer.ComputerID, precommit.BackupID,
+			precommit.CopyID, "precommit-copy-removed", accepted, wantEmptyAcknowledgementShape)
+	})
 }

@@ -41,18 +41,29 @@ type stalledRemovalFixture struct {
 	jobID      string
 	root       string
 	accepted   *atomic.Int64
+	computerID string
+	backupID   string
+	copyID     string
 	close      func()
 }
 
 func newStalledRemovalFixture(t *testing.T) stalledRemovalFixture {
-	return newStalledRemovalFixtureForKind(t, false)
+	return newStalledRemovalFixtureForKind(t, false, false)
 }
 
 func newStalledComputerRemovalFixture(t *testing.T) stalledRemovalFixture {
-	return newStalledRemovalFixtureForKind(t, true)
+	return newStalledRemovalFixtureForKind(t, true, false)
 }
 
-func newStalledRemovalFixtureForKind(t *testing.T, computerKind bool) stalledRemovalFixture {
+// newStalledComputerRemovalFixtureWithBackup publishes one real cold Backup
+// through L1's own flow before the Computer is removed, so the standing
+// removal directive carries the Backup-copy claim L1 built rather than one the
+// test hand-wrote (#501).
+func newStalledComputerRemovalFixtureWithBackup(t *testing.T) stalledRemovalFixture {
+	return newStalledRemovalFixtureForKind(t, true, true)
+}
+
+func newStalledRemovalFixtureForKind(t *testing.T, computerKind, withBackup bool) stalledRemovalFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	network := plain.NewNetwork()
@@ -61,7 +72,8 @@ func newStalledRemovalFixtureForKind(t *testing.T, computerKind bool) stalledRem
 	// rather than asserting the agent's word for how long it waited.
 	var l1Offset atomic.Int64
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{
-		Clock: l1.ClockFunc(func() time.Time { return time.Now().Add(time.Duration(l1Offset.Load())) }),
+		Clock:             l1.ClockFunc(func() time.Time { return time.Now().Add(time.Duration(l1Offset.Load())) }),
+		ComputerBackupCap: 1,
 	})
 	if err != nil {
 		cancel()
@@ -189,6 +201,14 @@ func newStalledRemovalFixtureForKind(t *testing.T, computerKind bool) stalledRem
 	if err := outbox.spool.storeRuntimeResourceManifest(ctx, manifest, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	backupID, copyID := "", ""
+	if withBackup {
+		backupID, copyID = publishStallFixtureBackup(t, ctx, store, agentClient, computer, claim)
+		computer, err = store.GetComputer(ctx, computer.ComputerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if computerKind {
 		if _, err := store.RemoveComputer(ctx, computer.ComputerID, l1.ComputerRemoveRequest{
 			ComputerMutationPrecondition: l1.ComputerMutationPrecondition{IntentRevision: computer.IntentRevision,
@@ -219,6 +239,7 @@ func newStalledRemovalFixtureForKind(t *testing.T, computerKind bool) stalledRem
 	return stalledRemovalFixture{
 		ctx: ctx, store: store, client: agentClient, controller: controller, directive: directives[0],
 		jobID: jobID, root: root, accepted: &accepted,
+		computerID: computer.ComputerID, backupID: backupID, copyID: copyID,
 		close: func() {
 			cancel()
 			_ = httpServer.Close()
@@ -675,5 +696,173 @@ func TestWedgedBackupCopyDeletionDeclaresTheSameStall(t *testing.T) {
 	}
 	if nodes[0].ServiceOccupancy != 0 {
 		t.Fatalf("service occupancy after a wedged Backup-copy removal = %d, want 0", nodes[0].ServiceOccupancy)
+	}
+}
+
+// publishStallFixtureBackup drives L1's own cold-Backup flow: reserve the
+// operation, quiesce the Computer's current attempt, take the create directive
+// L1 dispatches, and acknowledge it with a positive copy receipt. The Backup
+// and its one physical copy are then L1's own rows, which is what makes the
+// removal directive that follows carry a real Backup-copy claim.
+func publishStallFixtureBackup(t *testing.T, ctx context.Context, store *l1.Store, client *Client,
+	computer l1.Computer, claim *l1.Claim) (string, string) {
+	t.Helper()
+	// The Backup's source is a running Computer, so its current attempt first
+	// reaches `running` the way a real one does.
+	if _, err := store.ObserveAttemptImage(ctx, "fabric-agent", claim.Job.JobID, claim.Lease.AttemptID,
+		l1.ImageObservationRequest{FencingToken: claim.Lease.FencingToken,
+			SubmittedReference:     "ghcr.io/example/tool:latest",
+			TopLevelDigest:         "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+			TopLevelMediaType:      "application/vnd.oci.image.index.v1+json",
+			PlatformManifestDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			Platform:               l1.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v8"},
+			RuntimeHandler:         "io.containerd.runc.v2", Snapshotter: "overlayfs"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartAttempt(ctx, "fabric-agent", claim.Job.JobID, claim.Lease.AttemptID,
+		l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.BeginComputerBackup(ctx, computer.ComputerID, l1.ComputerBackupCreateRequest{
+		ComputerMutationPrecondition: l1.ComputerMutationPrecondition{IntentRevision: computer.IntentRevision,
+			StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration, Actor: "operator"},
+		IdempotencyKey: "stall-backup", AllowPowerOff: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteAttempt(ctx, "fabric-agent", claim.Job.JobID, claim.Lease.AttemptID,
+		l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "stall-backup-quiescence",
+			Result:                    l1.ProcessResult{OutputError: "quiesced for cold Backup"},
+			RuntimeQuiescenceEvidence: l1.RuntimeQuiescenceAttempt}); err != nil {
+		t.Fatal(err)
+	}
+	creates, err := store.ListNodeComputerBackupDirectives(ctx, "fabric-agent", "stall-node", "stall-boot")
+	if err != nil || len(creates) != 1 {
+		t.Fatalf("Backup create directives = %#v err=%v", creates, err)
+	}
+	directive := creates[0]
+	receipt := l1.ComputerBackupCopyReceipt{Kind: "computer_backup_copy_verified",
+		ReceiptID: "stall-backup-receipt", BackupID: directive.BackupID, CopyID: directive.CopyID,
+		ComputerID: directive.ComputerID, StorageID: directive.StorageID,
+		StorageGeneration: directive.StorageGeneration, NodeID: directive.BoundNodeID,
+		RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence,
+		HelperGeneration: 7, AllocatedSize: directive.AllocatedSize,
+		ContentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Encryption:    l1.BackupEncryptionNone}
+	if _, err := client.AcknowledgeComputerBackup(ctx, directive.ComputerID, l1.ComputerBackupAcknowledgementRequest{
+		NodeID: "stall-node", BootSessionID: "stall-boot", IdempotencyKey: receipt.ReceiptID,
+		Receipt: receipt}); err != nil {
+		t.Fatal(err)
+	}
+	return directive.BackupID, directive.CopyID
+}
+
+// TestARealBackupCopyStallsAndTheReturningNodeDeletesItExactlyOnce closes the
+// coverage gap the #465 review named: that test hand-built the Backup-copy
+// claims, so nothing proved L1 actually puts a real Backup copy on the standing
+// removal directive, nor what happens to it across a declared stall. Here the
+// Backup is created through L1's own cold-Backup flow, retained while the
+// removal is refused past the bound, and finally deleted by the returning node
+// -- once, from a directive list that still names it (#501).
+func TestARealBackupCopyStallsAndTheReturningNodeDeletesItExactlyOnce(t *testing.T) {
+	fixture := newStalledComputerRemovalFixtureWithBackup(t)
+	defer fixture.close()
+	claims := fixture.directive.ComputerBackupCopies
+	if claims == nil || len(claims.Copies) != 1 || claims.Copies[0].CopyID != fixture.copyID ||
+		claims.Copies[0].BackupID != fixture.backupID {
+		t.Fatalf("standing directive Backup-copy claims = %#v, want L1's own copy %q", claims, fixture.copyID)
+	}
+
+	helper := &stubBackupCopyRuntime{refuse: map[string]bool{fixture.copyID: true}}
+	backups := &backupController{client: fixture.client, backupper: helper, nodeID: "stall-node",
+		bootSessionID: "stall-boot", rootInstanceID: fixture.directive.RootInstanceID, logf: t.Logf,
+		inflight: make(map[string]struct{})}
+	backups.copyRemovalAcknowledged = fixture.controller.outbox.backupCopyRemovalAcknowledged
+	backups.recordCopyRemovalAcknowledged = fixture.controller.outbox.recordBackupCopyRemovalAcknowledged
+	fixture.controller.removeBackupCopies = func(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {
+		for _, directive := range directives {
+			if err := backups.processPrune(ctx, directive); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	fixture.declareStall(t)
+
+	stalled, err := fixture.store.GetJob(fixture.ctx, fixture.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled.State != contract.JobStalledCleanupUnverified || stalled.Removal == nil ||
+		stalled.Removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupStalled ||
+		stalled.Removal.CleanupStatus != l1.ServiceRemovalCleanupPending {
+		t.Fatalf("refused real Backup-copy removal projection = %#v", stalled)
+	}
+	if stalled.Removal.Stall == nil ||
+		stalled.Removal.Stall.LastRefusalCode != string(ocihelper.CodeEngineFailure) ||
+		stalled.Removal.Stall.Attempts < l1.MinimumServiceRemovalStallAttempts {
+		t.Fatalf("declared evidence does not name the Backup-copy refusal: %#v", stalled.Removal.Stall)
+	}
+	// The declaration asserts no deletion, so the Backup copy is still retained
+	// and the standing directive still names it.
+	retained, err := fixture.store.ListComputerBackups(fixture.ctx, fixture.computerID)
+	if err != nil || len(retained.Backups) != 1 || retained.Backups[0].Status != "pruning" ||
+		len(retained.Backups[0].Copies) != 1 || retained.Backups[0].Copies[0].Phase != "removal_pending" {
+		t.Fatalf("Backup retained across the declared stall = %#v err=%v", retained, err)
+	}
+	refusals := helper.deletionsOf(fixture.copyID)
+	if refusals < l1.MinimumServiceRemovalStallAttempts {
+		t.Fatalf("Backup copy deletion attempted %d times; the streak never formed", refusals)
+	}
+
+	// The node returns and the copy can finally be deleted. Everything past it
+	// succeeds too, so the standing directive is carried through to a positive
+	// cleanup acknowledgement.
+	helper.refuse = nil
+	fixture.completeManagedRootRemoval(t)
+	controller := fixture.controller
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
+			BootSessionID: controller.bootSessionID}, nil
+	}
+	controller.finalizeVolumes = func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	if err := controller.reconcile(fixture.ctx, fixture.directive); err != nil {
+		t.Fatalf("the returning node did not finish the stalled Computer removal: %v", err)
+	}
+
+	pruned, err := fixture.store.ListComputerBackups(fixture.ctx, fixture.computerID)
+	if err != nil || len(pruned.Backups) != 1 || pruned.Backups[0].Status != "pruned" ||
+		len(pruned.Backups[0].Copies) != 1 || pruned.Backups[0].Copies[0].Phase != "removed" {
+		t.Fatalf("Backup after the returning node's cleanup = %#v err=%v", pruned, err)
+	}
+	finalized, err := fixture.store.GetJob(fixture.ctx, fixture.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Late cleanup records the acknowledgement; the unverified outcome stands.
+	if finalized.State != contract.JobStalledCleanupUnverified || finalized.Removal == nil ||
+		finalized.Removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupStalled ||
+		finalized.Removal.CleanupStatus != l1.ServiceRemovalCleanupAcknowledged {
+		t.Fatalf("finalized stalled Computer removal = %#v", finalized.Removal)
+	}
+	if deleted := helper.deletionsOf(fixture.copyID); deleted != refusals+1 {
+		t.Fatalf("Backup copy deleted %d times, want the %d refusals plus one success", deleted, refusals+1)
+	}
+
+	// The node's durable record now carries L1's acceptance, so the list L1
+	// built before that acknowledgement is answered without touching the helper
+	// again: a second deletion would mint a second receipt against a prune that
+	// is already removed.
+	acknowledged, err := backups.copyRemovalAcknowledged(fixture.ctx, claims.Copies[0])
+	if err != nil || !acknowledged {
+		t.Fatalf("durable acknowledged Backup copy record = %t err=%v", acknowledged, err)
+	}
+	before := len(helper.deletions)
+	if err := backups.processPrune(fixture.ctx, claims.Copies[0]); err != nil {
+		t.Fatalf("replaying the stale Backup-copy claim failed: %v", err)
+	}
+	if len(helper.deletions) != before {
+		t.Fatalf("stale replay deleted the acknowledged Backup copy again: %v", helper.deletions)
 	}
 }

@@ -16,18 +16,27 @@ type backupController struct {
 	bootSessionID  string
 	rootInstanceID string
 	logf           func(string, ...any)
+	// copyRemovalAcknowledged and recordCopyRemovalAcknowledged are the node's
+	// durable memory of which Backup copies L1 has already accepted as absent.
+	copyRemovalAcknowledged       func(context.Context, l1.ComputerBackupPruneDirective) (bool, error)
+	recordCopyRemovalAcknowledged func(context.Context, l1.ComputerBackupPruneDirective) error
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
 	wg       sync.WaitGroup
 }
 
-func newBackupController(client *Client, backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID, rootInstanceID string, logf func(string, ...any)) *backupController {
+func newBackupController(client *Client, outbox *evidenceOutbox, backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID, rootInstanceID string, logf func(string, ...any)) *backupController {
 	if backupper == nil {
 		return nil
 	}
-	return &backupController{client: client, backupper: backupper, nodeID: nodeID,
+	controller := &backupController{client: client, backupper: backupper, nodeID: nodeID,
 		bootSessionID: bootSessionID, rootInstanceID: rootInstanceID, logf: logf, inflight: make(map[string]struct{})}
+	if outbox != nil {
+		controller.copyRemovalAcknowledged = outbox.backupCopyRemovalAcknowledged
+		controller.recordCopyRemovalAcknowledged = outbox.recordBackupCopyRemovalAcknowledged
+	}
+	return controller
 }
 
 func (controller *backupController) processCreate(ctx context.Context, directive l1.ComputerBackupDirective) error {
@@ -62,6 +71,21 @@ func (controller *backupController) processPrune(ctx context.Context, directive 
 	if directive.RootInstanceID != controller.rootInstanceID || controller.rootInstanceID == "" {
 		return fmt.Errorf("Backup prune belongs to managed-root instance %q, not %q", directive.RootInstanceID, controller.rootInstanceID)
 	}
+	// A directive list built before this copy's acknowledgement still names it.
+	// Deleting it again would ask the helper to prove an absence it already
+	// proved and mint a second receipt for it, which L1 refuses -- and that
+	// refusal now counts into the removal's stall streak (#501). The
+	// acknowledgement is the answer the directive is asking for, so replay it
+	// from the node's own durable record instead.
+	if controller.copyRemovalAcknowledged != nil {
+		acknowledged, err := controller.copyRemovalAcknowledged(ctx, directive)
+		if err != nil {
+			return err
+		}
+		if acknowledged {
+			return nil
+		}
+	}
 	receipt, err := controller.backupper.DeleteComputerBackupCopy(ctx, workloadrunner.ComputerBackupCopyRemovalRequest{
 		BackupID: directive.BackupID, CopyID: directive.CopyID,
 		Storage: workloadrunner.ComputerStorage{ComputerID: directive.ComputerID, StorageID: directive.StorageID,
@@ -74,10 +98,15 @@ func (controller *backupController) processPrune(ctx context.Context, directive 
 	if err != nil {
 		return err
 	}
-	_, err = controller.client.AcknowledgeComputerBackupPrune(ctx, directive.ComputerID,
+	if _, err := controller.client.AcknowledgeComputerBackupPrune(ctx, directive.ComputerID,
 		l1.ComputerBackupPruneAcknowledgementRequest{NodeID: controller.nodeID,
-			BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
-	return err
+			BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt}); err != nil {
+		return err
+	}
+	if controller.recordCopyRemovalAcknowledged != nil {
+		return controller.recordCopyRemovalAcknowledged(ctx, directive)
+	}
+	return nil
 }
 
 func (controller *backupController) enqueue(ctx context.Context, key string, run func(context.Context) error, failures chan<- destinationError) {

@@ -352,6 +352,16 @@ visible with claims disabled.
 | Same idempotency identity and same body is replayed | original success | none | n/a | Return the original result; do not duplicate logs or completion. |
 | Same idempotency identity has a different body | 409 | `idempotency_conflict` | false | No mutation. |
 
+A request that mutates nothing carries no idempotency binding. The
+same-body/different-body rows above govern stored idempotency identities, and
+an identity is stored only by the request that performed the write. An accepted
+request that writes nothing -- the renewed positive-absence receipt for an
+already-removed Backup copy is the one such case today -- binds no key, so
+repeating that key with a different body is answered the same way again rather
+than as `idempotency_conflict`. Exactly one key remains bound per outcome: the
+one carried by the request that wrote it, and reusing that key with a different
+body is still `idempotency_conflict`.
+
 Expiry never creates another attempt. A desired-running service job becomes
 eligible for its bound node again, while the ordinary atomic claim transaction
 is the only operation that can mint the fresh attempt ID and incremented fence.
