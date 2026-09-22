@@ -47,8 +47,13 @@ func run() error {
 		return fmt.Errorf("--reconcile-interval must be positive")
 	}
 
+	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
+	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
+	// #498). The resolved boolean, not just the true case, always wins.
 	if *printEnrollmentURL {
 		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+	} else {
+		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:          *fabricMode,

@@ -284,8 +284,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	resolveFabricEnvironment(&options)
+	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
+	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
+	// #498). The resolved boolean, not just the true case, always wins.
 	if options.printEnrollmentURL {
 		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+	} else {
+		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,

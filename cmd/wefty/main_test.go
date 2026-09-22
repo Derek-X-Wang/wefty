@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -641,5 +642,33 @@ func TestInspectResultsBlockSeparatesUploadedFromRetained(t *testing.T) {
 		if !strings.Contains(out, "files: retained until") || !strings.Contains(out, "node node-1") {
 			t.Errorf("%s output lost the retention line:\n%s", name, out)
 		}
+	}
+}
+
+// TestExplicitFabricPrintEnrollmentURLFalseOverridesInheritedEnv covers
+// wefty #498 finding 6: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
+// (set by a parent process, or a previous wefty invocation in the same
+// shell) must not survive an explicit --fabric-print-enrollment-url=false
+// on this invocation. flag.Bool's default read the inherited env var, so
+// the explicit false must still win by the time the fabric is opened.
+func TestExplicitFabricPrintEnrollmentURLFalseOverridesInheritedEnv(t *testing.T) {
+	t.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+
+	var stderr bytes.Buffer
+	options, _, err := parseGlobalOptions([]string{"--fabric-print-enrollment-url=false", "status"}, &stderr)
+	if err != nil {
+		t.Fatalf("parseGlobalOptions: %v", err)
+	}
+	if options.printEnrollmentURL {
+		t.Fatal("explicit --fabric-print-enrollment-url=false was overridden by the inherited env var in the parsed options")
+	}
+
+	// run() re-seeds the environment from the resolved flag value right
+	// before opening the fabric; the command itself is expected to fail
+	// (no real fabric is set up here), but the env write happens first.
+	_ = run(context.Background(), []string{"--fabric-print-enrollment-url=false", "status"}, io.Discard, io.Discard)
+
+	if got := os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL"); got != "0" {
+		t.Fatalf("WEFTY_FABRIC_PRINT_ENROLLMENT_URL = %q after run(), want %q", got, "0")
 	}
 }
