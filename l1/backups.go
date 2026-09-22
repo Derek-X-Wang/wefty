@@ -763,12 +763,18 @@ func (s *Store) ListNodeComputerBackupPruneDirectives(ctx context.Context, ident
 // replaying a directive list built before the acknowledgement produces one;
 // refusing it as conflicting authority turned an already-removed copy into a
 // permanent `l1_conflict` that, since #465, counts into the removal's stall
-// streak (#501). Renewed positive-absence evidence is accepted without
-// mutation instead, and the first accepted receipt stays the record.
+// streak (#501). Renewed positive-absence evidence is accepted instead.
 //
-// Reusing one idempotency key for two different bodies remains the ordinary
-// idempotency violation, and a receipt that disagrees about authority is still
-// refused as a conflict before this point.
+// Exactly one idempotency key is ever bound for a copy's absence: the one
+// carried by the receipt that performed the write. An accepted renewal writes
+// nothing -- no receipt, no key, no hash, no completion timestamp -- so it
+// binds no key and its caller must return before any mutation. That is why
+// renewing under a second key and then reusing that second key with a
+// different body is accepted again rather than refused: the second key was
+// never a stored idempotency identity, and the general same-key/different-body
+// rule governs stored identities. Reusing the one bound key with a different
+// body is still the ordinary idempotency violation, and a receipt that
+// disagrees about authority is still refused as a conflict before this point.
 func refuseReusedBackupAbsenceKey(acknowledgementKey, acknowledgementHash sql.NullString, requestKey, bodyHash, subject string) error {
 	if acknowledgementKey.Valid && acknowledgementKey.String == requestKey &&
 		(!acknowledgementHash.Valid || acknowledgementHash.String != bodyHash) {
@@ -861,6 +867,8 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 					bodyHash, "restore predecessor Backup removal"); err != nil {
 					return Backup{}, err
 				}
+				// Nothing is written and the transaction is never committed, so
+				// this renewal binds no idempotency key of its own.
 				return Backup{}, nil
 			}
 			receiptJSON, marshalErr := json.Marshal(request.Receipt)
@@ -897,6 +905,8 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 				request.IdempotencyKey, bodyHash, "superseded Computer Backup copy removal"); err != nil {
 				return Backup{}, err
 			}
+			// Nothing is written and the transaction is never committed, so
+			// this renewal binds no idempotency key of its own.
 			return Backup{}, nil
 		}
 		receiptJSON, marshalErr := json.Marshal(request.Receipt)
@@ -933,6 +943,10 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 			request.IdempotencyKey, bodyHash, "Computer Backup prune"); err != nil {
 			return Backup{}, err
 		}
+		// The pruned Backup is read back and returned -- this is the one site
+		// whose acknowledgement shape carries a body -- but nothing is written
+		// and the transaction is never committed, so this renewal binds no
+		// idempotency key of its own.
 		backup, err := readBackup(ctx, tx, stored.BackupID)
 		if err != nil {
 			return Backup{}, internalError(err, "read replayed Computer Backup prune")
