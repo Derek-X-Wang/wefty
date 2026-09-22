@@ -38,6 +38,26 @@ const (
 	retentionClockSkew = 5 * time.Minute
 )
 
+// handoffRecordAnomaly is a typed reason the agent could not do to a run's
+// directory what its record asked. It is typed rather than a free-form string
+// because the node doctor and the log both have to name the same condition:
+// "this run's files are still on the node, and here is the one reason nothing
+// is being done about them".
+type handoffRecordAnomaly string
+
+const (
+	// handoffBoundDirectoryUnreachable: at finish the run's name no longer led
+	// to the directory preparation pinned, and the directory standing there now
+	// could not be opened on the same no-follow, identity-checked path
+	// preparation uses. The bound was enforced on the pinned handle only.
+	handoffBoundDirectoryUnreachable handoffRecordAnomaly = "bound_directory_unreachable"
+	// handoffBoundDirectoryForeign: the directory standing at the run's name
+	// carries an ownership marker naming another run or another node. Trimming
+	// it would bound one run's results by deleting another's, so nothing is
+	// trimmed there.
+	handoffBoundDirectoryForeign handoffRecordAnomaly = "bound_directory_not_this_runs"
+)
+
 // retentionRecord is the agent's own answer to "what is retained, since when,
 // and what may be given up first".
 type retentionRecord struct {
@@ -48,6 +68,13 @@ type retentionRecord struct {
 	RetainUntil time.Time `json:"retain_until"`
 	Published   bool      `json:"published,omitempty"`
 	Succeeded   bool      `json:"succeeded,omitempty"`
+	// BoundAnomaly names why the per-run bound could not be enforced on the
+	// directory that actually stood at this run's name when the attempt
+	// finished. It is recorded rather than returned because a workload that
+	// destroys its own handoff directory has not failed its run -- but a node
+	// whose bound silently did nothing is exactly the state this field exists
+	// to stop being invisible.
+	BoundAnomaly handoffRecordAnomaly `json:"bound_anomaly,omitempty"`
 }
 
 // uploadRecord is this node's own account of what happened to a run's result

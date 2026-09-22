@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -530,4 +531,146 @@ func TestTheResultCollectorStopsWhenTheAgentDoes(t *testing.T) {
 	}
 	// Idempotent: Close may run after an explicit stop.
 	a.stopResultCollector()
+}
+
+// TestThePerRunBoundMeasuresTheDirectoryThatIsActuallyThere is the recreated-
+// directory no-op. A workload that does `rm -rf $handoff && mkdir $handoff`
+// leaves the handle preparation pinned pointing at an unlinked inode, so finish
+// trimmed nothing, reported nothing, and left every oversized byte on the node
+// while the node believed the run fit its bound.
+//
+// The test proves the old behaviour rather than asserting it from memory: it
+// trims through the pinned handle first, exactly as the old finish did, and
+// shows the recreated files survive that untouched.
+func TestThePerRunBoundMeasuresTheDirectoryThatIsActuallyThere(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	harness.manager.runBytes = 1024
+	path := filepath.Join(harness.root, "run_recreated")
+	spec := handoffClaim("run_recreated", path, nil).Job.Spec
+	owner := prepareHandoffForTest(t, harness.manager, spec)
+
+	// The workload's own rm -rf and mkdir, between preparation and finish.
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, size := range map[string]int{"result.json": 32, "oversize.bin": 8192} {
+		if err := os.WriteFile(filepath.Join(path, name), make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The negative, run first: trimming through the pinned handle -- which is
+	// all the old finish did -- removes nothing, and says nothing is wrong.
+	if err := harness.manager.enforceRunBound(owner.run, "run_recreated"); err != nil {
+		t.Fatalf("trimming the pinned handle reported an error: %v", err)
+	}
+	if info, err := os.Lstat(filepath.Join(path, "oversize.bin")); err != nil || info.Size() != 8192 {
+		t.Fatalf("the pinned handle is not the unlinked inode this test needs: %v, %v", info, err)
+	}
+
+	if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(path, "oversize.bin")); !os.IsNotExist(err) {
+		t.Fatalf("the per-run bound skipped the recreated directory: %v", err)
+	}
+	if size := measureRun(t, harness.manager, "run_recreated"); size > harness.manager.runBytes {
+		t.Fatalf("the recreated directory retains %d bytes, past the %d byte bound", size, harness.manager.runBytes)
+	}
+	if _, err := os.Stat(filepath.Join(path, "result.json")); err != nil {
+		t.Fatalf("the recreated run's result document was not kept: %v", err)
+	}
+	if !harness.logged("no longer the directory preparation pinned") {
+		t.Fatalf("the identity mismatch was silent: %v", harness.logs)
+	}
+	if !harness.logged("run run_recreated:") {
+		t.Fatalf("the mismatch did not name the run: %v", harness.logs)
+	}
+	// Nothing went wrong that the record has to carry: the bound reached the
+	// directory that is really there.
+	if anomaly := requireRetentionRecord(t, harness.manager, "run_recreated").BoundAnomaly; anomaly != "" {
+		t.Fatalf("bound anomaly = %q, want none", anomaly)
+	}
+}
+
+// TestABoundThatCannotReachItsDirectoryRecordsWhy covers the two ways
+// re-acquisition refuses. In both the directory standing at the run's name is
+// left exactly as it is -- a symlink is never followed and another run's files
+// are never trimmed to bound this one -- and the refusal is on the record
+// instead of nowhere.
+func TestABoundThatCannotReachItsDirectoryRecordsWhy(t *testing.T) {
+	t.Run("a symlink planted at the run's name", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		harness.manager.runBytes = 1024
+		elsewhere := t.TempDir()
+		if err := os.WriteFile(filepath.Join(elsewhere, "not-ours.bin"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(harness.root, "run_linked")
+		spec := handoffClaim("run_linked", path, nil).Job.Spec
+		owner := prepareHandoffForTest(t, harness.manager, spec)
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(elsewhere, path); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(elsewhere, "not-ours.bin")); err != nil {
+			t.Fatalf("the bound followed a symlink out of the handoff root: %v", err)
+		}
+		record := requireRetentionRecord(t, harness.manager, "run_linked")
+		if record.BoundAnomaly != handoffBoundDirectoryUnreachable {
+			t.Fatalf("bound anomaly = %q, want %q", record.BoundAnomaly, handoffBoundDirectoryUnreachable)
+		}
+		if !harness.logged("cannot be bounded") {
+			t.Fatalf("the refusal was silent: %v", harness.logs)
+		}
+	})
+
+	t.Run("another run's directory at this run's name", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		harness.manager.runBytes = 1024
+		path := filepath.Join(harness.root, "run_displaced")
+		spec := handoffClaim("run_displaced", path, nil).Job.Spec
+		owner := prepareHandoffForTest(t, harness.manager, spec)
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(handoffMarker{
+			RunID: "run_somebody_else", NodeID: "node-1", RetainUntil: harness.now.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, handoffMarkerName), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "theirs.bin"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Lstat(filepath.Join(path, "theirs.bin")); err != nil || info.Size() != 8192 {
+			t.Fatalf("another run's files were trimmed to bound this one: %v, %v", info, err)
+		}
+		record := requireRetentionRecord(t, harness.manager, "run_displaced")
+		if record.BoundAnomaly != handoffBoundDirectoryForeign {
+			t.Fatalf("bound anomaly = %q, want %q", record.BoundAnomaly, handoffBoundDirectoryForeign)
+		}
+		if !harness.logged("not this run's to trim") {
+			t.Fatalf("the refusal was silent: %v", harness.logs)
+		}
+	})
 }

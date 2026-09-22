@@ -357,14 +357,103 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 			path, owner.runID, owner.nodeID, runID, nodeID)
 	}
 	now := m.now().UTC()
-	if err := m.writeRecord(retentionRecord{
+	record := retentionRecord{
 		RunID: runID, NodeID: nodeID, Directory: path,
 		RetainedAt: now, RetainUntil: now.Add(m.retention),
 		Published: published, Succeeded: succeeded,
-	}); err != nil {
+	}
+	// The record is written before the bound runs, so a run whose trimming
+	// fails is still an accounted directory that expires on schedule rather
+	// than residue nothing sweeps.
+	if err := m.writeRecord(record); err != nil {
 		return err
 	}
-	return m.enforceRunBound(owner.run, runID)
+	if err := m.enforceRunBound(owner.run, runID); err != nil {
+		return err
+	}
+	anomaly := m.boundCurrentDirectory(owner, runID, nodeID, path)
+	if anomaly == "" {
+		return nil
+	}
+	record.BoundAnomaly = anomaly
+	return m.writeRecord(record)
+}
+
+// boundCurrentDirectory enforces the per-run bound on whatever directory now
+// stands at the run's name, when that is no longer the directory preparation
+// pinned.
+//
+// The bound used to be a silent no-op against the one workload most likely to
+// blow through it. A job that does `rm -rf $handoff && mkdir $handoff` leaves
+// the pinned handle pointing at an unlinked inode: finish trimmed an inode with
+// no links, removed nothing, reported no error, and the files that should have
+// been bounded stayed on the node while the node believed they fit. Every byte
+// of that run is then mischarged for as long as it is retained.
+//
+// The pinned handle is still trimmed first, by finish above, because a
+// directory merely renamed away is still this run's storage and the contract
+// says so. This is the second half: check that the name still leads to it, and
+// if it does not, bound the directory that is really there.
+//
+// Re-acquisition goes through exactly the path preparation uses -- no-follow,
+// directory-only, identity re-checked after the open -- and then reads the
+// ownership marker. A marker naming another run or another node means the name
+// now leads to someone else's results, and one run's bound is never enforced by
+// deleting another run's files. Nothing here follows a symlink and nothing here
+// removes the name itself.
+//
+// It never fails the attempt. A workload that destroyed its own handoff
+// directory has not failed its run. What it must never do is return quietly:
+// every outcome below is either logged with the run named or recorded on the
+// retention record, and usually both.
+func (m *handoffManager) boundCurrentDirectory(owner *handoffOwnership, runID, nodeID, path string) handoffRecordAnomaly {
+	root, err := openPrivateHandoffDirectory(m.root)
+	if err != nil {
+		m.log("agent: run %s: open the handoff root to re-check %q after trimming: %v", runID, path, err)
+		return handoffBoundDirectoryUnreachable
+	}
+	defer root.Close()
+	pinned, err := owner.run.Stat(".")
+	if err != nil {
+		m.log("agent: run %s: stat the prepared handoff directory for %q: %v", runID, path, err)
+		return handoffBoundDirectoryUnreachable
+	}
+	current, err := root.Lstat(runID)
+	if err == nil && os.SameFile(pinned, current) {
+		return ""
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		m.log("agent: run %s no longer has a handoff directory at %q: the name preparation created is gone, so the per-run bound reached only the directory it pinned",
+			runID, path)
+		return handoffBoundDirectoryUnreachable
+	}
+	if err != nil {
+		m.log("agent: run %s: inspect %q after trimming: %v", runID, path, err)
+		return handoffBoundDirectoryUnreachable
+	}
+	m.log("agent: run %s: %q is no longer the directory preparation pinned (it is now %s); the per-run bound is being re-applied to the directory that is actually there",
+		runID, path, current.Mode())
+	replaced, err := openHandoffDirectory(root, runID)
+	if err != nil {
+		m.log("agent: run %s: the directory now at %q cannot be bounded: %v", runID, path, err)
+		return handoffBoundDirectoryUnreachable
+	}
+	defer replaced.Close()
+	marker, exists, err := readHandoffMarker(replaced)
+	if err != nil {
+		m.log("agent: run %s: the directory now at %q carries an unusable ownership marker and was not trimmed: %v", runID, path, err)
+		return handoffBoundDirectoryUnreachable
+	}
+	if exists && (marker.RunID != runID || marker.NodeID != nodeID) {
+		m.log("agent: run %s: the directory now at %q belongs to run %q on node %q; its files are not this run's to trim",
+			runID, path, marker.RunID, marker.NodeID)
+		return handoffBoundDirectoryForeign
+	}
+	if err := m.enforceRunBound(replaced, runID); err != nil {
+		m.log("agent: run %s: bound the recreated handoff directory at %q: %v", runID, path, err)
+		return handoffBoundDirectoryUnreachable
+	}
+	return ""
 }
 
 // readResult reads this run's result document through the same receipt that
@@ -459,7 +548,7 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 	// protection exists to avoid: the alias survives as a result while trimming
 	// deletes whatever it pointed at, so what an operator finds is a dangling
 	// link named like a verdict.
-	for index, entry := range entries {
+	for _, entry := range entries {
 		if entry.name != handoffResultName || entry.regular {
 			continue
 		}
@@ -468,11 +557,12 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 		}
 		m.log("agent: run %s had a %s that is not a regular file (%s); it is not a result and was removed",
 			runID, handoffResultName, entry.mode)
-		entries = slices.Delete(entries, index, index+1)
+		// Remeasured, not adjusted: the removal changed the directory, and a
+		// non-regular result.json may have been a whole subtree.
+		if entries, size, err = handoffEntries(run); err != nil {
+			return err
+		}
 		break
-	}
-	if entries, size, err = handoffEntries(run); err != nil {
-		return err
 	}
 	if size <= m.runBytes {
 		return nil
@@ -718,6 +808,14 @@ func handoffHasFiles(run *os.Root) (bool, error) {
 	return false, nil
 }
 
+// handoffMarkerOpenRace is a test seam. It runs in the window between the
+// marker's Lstat and the open that must not trust it, so the non-blocking open
+// and the post-open identity check can be proved by a swap that really happens
+// there rather than by one planted before the Lstat -- which the mode check
+// alone already refuses, and which therefore proves nothing about either guard.
+// Nothing outside a test ever sets it.
+var handoffMarkerOpenRace func()
+
 // readHandoffMarker is bounded, refuses anything that is not a regular file,
 // and never follows a link. It runs only at preparation.
 func readHandoffMarker(run *os.Root) (handoffMarker, bool, error) {
@@ -730,6 +828,9 @@ func readHandoffMarker(run *os.Root) (handoffMarker, bool, error) {
 	}
 	if !info.Mode().IsRegular() {
 		return handoffMarker{}, false, fmt.Errorf("handoff marker is not a regular file")
+	}
+	if handoffMarkerOpenRace != nil {
+		handoffMarkerOpenRace()
 	}
 	file, err := openHandoffFile(run, handoffMarkerName, os.O_RDONLY|noFollowOpenFlag|runMailboxNonBlockingOpen, 0)
 	if err != nil {

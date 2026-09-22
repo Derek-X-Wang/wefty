@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -254,36 +255,97 @@ func TestHandoffAttemptArrivingDuringExpiryAcquiresAfterDeletion(t *testing.T) {
 	waitHandoffReferences(t, harness.manager, path, 0)
 }
 
+// TestHandoffFIFOMarkerDoesNotBlockPreparation covers both halves of the marker
+// read, and the second half is the one that matters.
+//
+// A FIFO planted before the Lstat is refused by the mode check, so a test that
+// plants it there passes whether or not the non-blocking open and the post-open
+// identity check exist at all -- it proves nothing about either. The guards
+// those two exist for are only reached when the name is a regular file at the
+// check and a FIFO by the time it is opened, which is exactly the swap a
+// same-UID workload can perform, so that is what the second case does.
 func TestHandoffFIFOMarkerDoesNotBlockPreparation(t *testing.T) {
-	harness := newRetentionHarness(t, time.Hour)
-	path := filepath.Join(harness.root, "run_fifo")
-	if err := os.MkdirAll(path, 0700); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(path, handoffMarkerName)
-	if err := syscall.Mkfifo(marker, 0600); err != nil {
-		t.Fatal(err)
-	}
-	spec := handoffClaim("run_fifo", path, nil).Job.Spec
+	t.Run("a FIFO already in place is refused by the mode check", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(harness.root, "run_fifo")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(path, handoffMarkerName)
+		if err := syscall.Mkfifo(marker, 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := prepareWithoutBlocking(t, harness, "run_fifo", path, marker)
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("preparation error = %v, want one naming the mode check", err)
+		}
+	})
+
+	t.Run("a regular marker swapped for a FIFO after its check is refused", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(harness.root, "run_fifo_swapped")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(path, handoffMarkerName)
+		// Regular, valid, and this run's own: the mode check has no reason to
+		// refuse it, so everything below is the later guards' work.
+		payload, err := json.Marshal(handoffMarker{
+			RunID: "run_fifo_swapped", NodeID: "node-1", RetainUntil: harness.now.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, payload, 0600); err != nil {
+			t.Fatal(err)
+		}
+		// The swap happens in the window the seam names: after the Lstat that
+		// found a regular file, before the open. No writer is attached, so a
+		// regressed blocking open hangs here and the deadline below reports it.
+		var once sync.Once
+		handoffMarkerOpenRace = func() {
+			once.Do(func() {
+				if err := os.Remove(marker); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := syscall.Mkfifo(marker, 0600); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		t.Cleanup(func() { handoffMarkerOpenRace = nil })
+
+		err = prepareWithoutBlocking(t, harness, "run_fifo_swapped", path, marker)
+		if err == nil || !strings.Contains(err.Error(), "changed identity while opening") {
+			t.Fatalf("preparation error = %v, want the post-open identity refusal", err)
+		}
+	})
+}
+
+// prepareWithoutBlocking runs preparation with a deadline and unblocks a
+// regressed blocking open on the marker before reporting the failure, so one
+// hung open cannot wedge the whole package's test binary.
+func prepareWithoutBlocking(t *testing.T, harness *retentionHarness, runID, path, marker string) error {
+	t.Helper()
+	spec := handoffClaim(runID, path, nil).Job.Spec
 	lease, err := harness.manager.lock(t.Context(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.release()
+	t.Cleanup(lease.release)
 	done := make(chan error, 1)
 	go func() { _, err := harness.manager.prepare(lease, spec, "node-1"); done <- err }()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("FIFO marker accepted")
-		}
-	case <-time.After(time.Second):
-		// Unblock a regressed blocking open before reporting the failure.
+		return err
+	case <-time.After(5 * time.Second):
 		file, _ := os.OpenFile(marker, os.O_RDWR|syscall.O_NONBLOCK, 0)
 		if file != nil {
 			file.Close()
 		}
-		t.Fatal("FIFO marker blocked preparation")
+		t.Fatal("the marker read blocked preparation")
+		return nil
 	}
 }
 
