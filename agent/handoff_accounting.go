@@ -131,18 +131,25 @@ type handoffWalk struct {
 	// unchanged tree reported its postponed siblings as unaccounted.
 	path      []string
 	firstOpen int
-	// peak is the most frames ever open at once, which is what a test asserts
-	// instead of watching the process's descriptor table and hoping to sample
-	// at the right moment.
-	peak int
+	// openFrames is the number of handles owned by frames. Every frame handle
+	// has exactly one owner, and every ownership change goes through own and
+	// release so reopened handles participate in the bound as well.
+	openFrames int
+	// liveHandles counts every directory handle opened by this walk until its
+	// one close, including transient handles and candidates not yet owned by a
+	// frame. It makes an overwritten owner visible at cleanup.
+	liveHandles int
+	// peakOpenFrames is the most frame handles ever owned at once, which is
+	// what a test asserts instead of watching the process's descriptor table
+	// and hoping to sample at the right moment.
+	peakOpenFrames int
 }
 
 // handoffWalkFramesObserved is a test seam. It reports the peak number of
-// directory handles one walk held, so the bound above is asserted on the
-// walker's own count rather than on a sampled /dev/fd -- a sample can miss the
-// peak entirely and pass a walk that held thousands. Nothing outside a test
-// ever sets it.
-var handoffWalkFramesObserved func(peak int)
+// frame-owned handles and every directory handle still live after cleanup, so
+// the bound and exact release are asserted on the walker's own accounting
+// rather than on a sampled /dev/fd. Nothing outside a test ever sets it.
+var handoffWalkFramesObserved func(open, peak int)
 
 // handoffWalkDescended is a test seam. It runs each time the walk pushes a
 // level, so a test can replace a directory the walk has already released and
@@ -164,25 +171,24 @@ var handoffWalkDescended func(depth int)
 // trims names, and part 1 states its unit as logical bytes per link.
 func walkHandoffTree(parent *os.Root, name string, info os.FileInfo, seen map[handoffInode]struct{}) (handoffTally, error) {
 	walk := &handoffWalk{base: parent, seen: seen}
+	defer walk.report()
 	defer walk.closeAll()
 	walk.tally.add(handoffLogicalBytes(info, seen))
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		walk.report()
 		return walk.tally, nil
 	}
 	err := walk.descend(name)
-	walk.report()
 	return walk.tally, err
 }
 
 func (walk *handoffWalk) report() {
 	if handoffWalkFramesObserved != nil {
-		handoffWalkFramesObserved(walk.peak)
+		handoffWalkFramesObserved(walk.liveHandles, walk.peakOpenFrames)
 	}
 }
 
 func (walk *handoffWalk) descend(name string) error {
-	top, err := openHandoffDirectory(walk.base, name)
+	top, err := walk.openDirectory(walk.base, name)
 	if err != nil {
 		if handoffWalkSkips(err) {
 			return nil
@@ -214,7 +220,7 @@ func (walk *handoffWalk) descend(name string) error {
 			continue
 		}
 		depth := frame.depth + 1
-		next, err := openHandoffDirectory(run, child)
+		next, err := walk.openDirectory(run, child)
 		if len(frame.directories) == 0 {
 			// Nothing here needs this handle again. Dropping it now, rather
 			// than when the subtree returns, is what keeps a chain of
@@ -243,7 +249,7 @@ func (walk *handoffWalk) descend(name string) error {
 func (walk *handoffWalk) push(depth int, name string, run *os.Root) error {
 	identity, err := run.Stat(".")
 	if err != nil {
-		run.Close()
+		walk.closeHandle(run)
 		if handoffWalkSkips(err) {
 			return nil
 		}
@@ -251,20 +257,20 @@ func (walk *handoffWalk) push(depth int, name string, run *os.Root) error {
 	}
 	directories, err := tallyHandoffChildren(run, &walk.tally, walk.seen)
 	if err != nil {
-		run.Close()
+		walk.closeHandle(run)
 		return err
 	}
 	if len(directories) == 0 {
-		return run.Close()
+		return walk.closeHandle(run)
 	}
 	// Truncate rather than append: a child opened after an earlier sibling's
 	// subtree finished belongs at its parent's depth plus one, not after
 	// whatever that subtree left behind.
 	walk.path = append(walk.path[:depth], name)
-	walk.stack = append(walk.stack, &handoffWalkFrame{
-		depth: depth, run: run, identity: identity, directories: directories,
-	})
+	frame := &handoffWalkFrame{depth: depth, identity: identity, directories: directories}
+	walk.stack = append(walk.stack, frame)
 	walk.trim(len(walk.stack) - 1)
+	walk.own(frame, run)
 	if handoffWalkDescended != nil {
 		handoffWalkDescended(len(walk.path))
 	}
@@ -276,10 +282,7 @@ func (walk *handoffWalk) push(depth int, name string, run *os.Root) error {
 // is reached through its name.
 func (walk *handoffWalk) discard() {
 	last := len(walk.stack) - 1
-	if walk.stack[last].run != nil {
-		walk.stack[last].run.Close()
-		walk.stack[last].run = nil
-	}
+	walk.release(walk.stack[last])
 	walk.stack = walk.stack[:last]
 	if walk.firstOpen > last {
 		walk.firstOpen = last
@@ -318,18 +321,30 @@ func (walk *handoffWalk) topRoot() (*os.Root, error) {
 	}
 	current := walk.base
 	var transient *os.Root
+	firstOpen := walk.firstOpen
+	var openedFrames []*handoffWalkFrame
+	complete := false
 	defer func() {
 		if transient != nil {
-			transient.Close()
+			walk.closeHandle(transient)
+		}
+		if !complete {
+			// A failed re-open owns none of the frame handles it acquired.
+			// Restoring both ownership and the window marker makes every retry
+			// start with the same handle count.
+			for _, frame := range openedFrames {
+				walk.release(frame)
+			}
+			walk.firstOpen = firstOpen
 		}
 	}()
 	cursor := 0
 	for depth := 0; depth <= frame.depth; depth++ {
-		child, err := openHandoffDirectory(current, walk.path[depth])
+		child, err := walk.openDirectory(current, walk.path[depth])
 		if transient != nil {
 			// The step that led here is no longer needed now that its child is
 			// open, so it never counts against the descriptor bound.
-			transient.Close()
+			walk.closeHandle(transient)
 			transient = nil
 		}
 		if err != nil {
@@ -343,43 +358,85 @@ func (walk *handoffWalk) topRoot() (*os.Root, error) {
 			continue
 		}
 		target := walk.stack[cursor]
-		opened, statErr := child.Stat(".")
-		if statErr != nil || !os.SameFile(target.identity, opened) {
-			child.Close()
+		actual, statErr := child.Stat(".")
+		if statErr != nil || !os.SameFile(target.identity, actual) {
+			walk.closeHandle(child)
 			return nil, errHandoffWalkMoved
 		}
-		target.run = child
+		if target.run != nil {
+			// The frame already owns the original directory. The name still
+			// reaches that identity, so keep the existing owner and discard the
+			// duplicate handle used to prove it.
+			walk.closeHandle(child)
+			current = target.run
+			continue
+		}
 		if cursor < walk.firstOpen {
 			walk.firstOpen = cursor
 		}
+		walk.trim(cursor)
+		walk.own(target, child)
+		openedFrames = append(openedFrames, target)
 		current = child
 		// Keep the window behind this frame inside the bound. The frame in
 		// hand is never one of the released ones: the bound is far larger than
 		// the one handle this loop is holding.
-		walk.trim(cursor)
 	}
+	complete = true
 	return frame.run, nil
+}
+
+// openDirectory records every handle this walk opens. A handle leaves this
+// count only through closeHandle, whether it becomes frame-owned or remains a
+// transient reconstruction step.
+func (walk *handoffWalk) openDirectory(parent *os.Root, name string) (*os.Root, error) {
+	run, err := openHandoffDirectory(parent, name)
+	if err == nil {
+		walk.liveHandles++
+	}
+	return run, err
+}
+
+func (walk *handoffWalk) closeHandle(run *os.Root) error {
+	err := run.Close()
+	walk.liveHandles--
+	return err
+}
+
+// own gives one open handle to a frame. A frame is its handle's sole owner.
+func (walk *handoffWalk) own(frame *handoffWalkFrame, run *os.Root) {
+	if frame.run != nil {
+		panic("handoff walk frame already owns a handle")
+	}
+	frame.run = run
+	walk.openFrames++
+	if walk.openFrames > walk.peakOpenFrames {
+		walk.peakOpenFrames = walk.openFrames
+	}
+}
+
+// release closes the handle owned by frame exactly once.
+func (walk *handoffWalk) release(frame *handoffWalkFrame) {
+	if frame.run == nil {
+		return
+	}
+	walk.closeHandle(frame.run)
+	frame.run = nil
+	walk.openFrames--
 }
 
 // trim releases the oldest open frames until at most maxOpenWalkFrames handles
 // are alive behind position, and records the peak.
 func (walk *handoffWalk) trim(position int) {
 	for position-walk.firstOpen >= maxOpenWalkFrames {
-		walk.stack[walk.firstOpen].run.Close()
-		walk.stack[walk.firstOpen].run = nil
+		walk.release(walk.stack[walk.firstOpen])
 		walk.firstOpen++
-	}
-	if open := position + 1 - walk.firstOpen; open > walk.peak {
-		walk.peak = open
 	}
 }
 
 func (walk *handoffWalk) closeAll() {
-	for position := walk.firstOpen; position < len(walk.stack); position++ {
-		if walk.stack[position].run != nil {
-			walk.stack[position].run.Close()
-			walk.stack[position].run = nil
-		}
+	for _, frame := range walk.stack {
+		walk.release(frame)
 	}
 }
 

@@ -264,7 +264,12 @@ func TestARecordIsWrittenAtPreparationAndCompletedAtFinish(t *testing.T) {
 func walkFrames(t *testing.T, run *os.Root, name string) (int64, int) {
 	t.Helper()
 	peak := -1
-	handoffWalkFramesObserved = func(observed int) { peak = observed }
+	handoffWalkFramesObserved = func(open, observed int) {
+		if open != 0 {
+			t.Errorf("walk retained %d frame handle(s) after cleanup", open)
+		}
+		peak = observed
+	}
 	t.Cleanup(func() { handoffWalkFramesObserved = nil })
 	info, err := run.Lstat(name)
 	if err != nil {
@@ -384,6 +389,11 @@ func TestACombSubtreeReplacedMidWalkIsCountedRatherThanMeasured(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { handoffWalkDescended = nil })
+	openAfterWalk, peak := -1, -1
+	handoffWalkFramesObserved = func(open, observed int) {
+		openAfterWalk, peak = open, observed
+	}
+	t.Cleanup(func() { handoffWalkFramesObserved = nil })
 	info, err := run.Lstat("comb")
 	if err != nil {
 		t.Fatal(err)
@@ -400,6 +410,15 @@ func TestACombSubtreeReplacedMidWalkIsCountedRatherThanMeasured(t *testing.T) {
 	}
 	if tally.unaccounted < tally.replaced {
 		t.Fatalf("a replaced subtree was not counted as unaccounted: %#v", tally)
+	}
+	if tally.replaced < 3 {
+		t.Fatalf("the fixture drove only %d failed re-open retry/retries, want at least 3", tally.replaced)
+	}
+	if peak > maxOpenWalkFrames {
+		t.Fatalf("failed re-open retries held %d frame handles at once, past the bound of %d", peak, maxOpenWalkFrames)
+	}
+	if openAfterWalk != 0 {
+		t.Fatalf("walk retained %d frame handle(s) after failed re-open retries", openAfterWalk)
 	}
 }
 
