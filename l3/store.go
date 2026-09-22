@@ -1337,6 +1337,13 @@ params_json, created_ns FROM run_triggers WHERE run_id=?`, runID).
 	return provenance, nil
 }
 
+// maxLineageTraversalDepth bounds both recursive walks in GetLineage. Neither
+// arm dedupes visited run IDs, so corrupt or adversarial cyclic provenance
+// (a parent_run_id or rerun source_run_id chain that loops back on itself)
+// would otherwise make the recursive CTE recurse without bound rather than
+// fail closed (#509 review).
+const maxLineageTraversalDepth = 64
+
 func (s *Store) GetLineage(ctx context.Context, runID string) (RunLineage, error) {
 	var exists int
 	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE run_id=?`, runID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
@@ -1362,9 +1369,10 @@ WITH RECURSIVE ancestors(run_id, parent_run_id, status, depth) AS (
     a.parent_run_id,
     (SELECT source_run_id FROM run_triggers WHERE run_id=a.run_id AND source='rerun')
   )
+  WHERE a.depth < ?
 )
 SELECT run_id, COALESCE(parent_run_id, ''), status, depth
-FROM ancestors WHERE depth > 0 ORDER BY depth DESC, run_id`, runID)
+FROM ancestors WHERE depth > 0 ORDER BY depth DESC, run_id`, runID, maxLineageTraversalDepth)
 	if err != nil {
 		return RunLineage{}, internalError(err, "list run ancestors")
 	}
@@ -1388,9 +1396,10 @@ WITH RECURSIVE descendants(run_id, parent_run_id, status, depth) AS (
   UNION ALL
   SELECT r.run_id, r.parent_run_id, r.status, d.depth + 1
   FROM runs r JOIN descendants d ON r.parent_run_id=d.run_id
+  WHERE d.depth < ?
 )
 SELECT run_id, COALESCE(parent_run_id, ''), status, depth
-FROM descendants WHERE depth > 0 ORDER BY depth, run_id`, runID)
+FROM descendants WHERE depth > 0 ORDER BY depth, run_id`, runID, maxLineageTraversalDepth)
 	if err != nil {
 		return RunLineage{}, internalError(err, "list run descendants")
 	}

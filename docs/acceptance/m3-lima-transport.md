@@ -539,10 +539,12 @@ Record four rows:
    `wefty echo one-shot handoff\n` marker bytes before finalization, then prove
    retention, not absence: after L1 accepts success, the handoff volume is
    still present in the helper's runtime root, `wefty --json inspect` shows
-   the run's results block with `retained_until` in the future and
-   `expired=false`, and `wefty results RUN_ID` returns the document if the
-   workload wrote one (#493 — a successful run's handoff is retained through
-   the retention window, not deleted).
+   the run's results block with `retained_until` after the receipt's own
+   recorded session end (never the operator's live wall-clock — the receipt
+   must stand on its own when re-read later) and `expired=false`, and
+   `wefty results RUN_ID` returns the document when the workload wrote one
+   within the upload bound (#493 — a successful run's handoff is retained
+   through the retention window, not deleted).
 2. `oci_oneshot_prestarted_loss`: stop the VM or helper after image evidence
    but before authoritative `Started`. Require the old attempt to terminalize,
    the job to requeue with its original absolute deadline and digest, a fresh
@@ -564,12 +566,20 @@ reserved-name presence (never values), helper generation, attempts, digest
 arrays, payload-execution count, logs, exact handoff marker bytes, the
 retention proof (`handoff_retained_after_completion=true`,
 `results_retained_until`, `results_expired=false`), and final residue
-inventory. `handoff_absent_after_completion` is deprecated (#509): it is still
-accepted for one release, with value `false` — the old, inverted way of making
-the same retention claim — but a row that still asserts `true`, the pre-#493
-absence requirement, fails the gate. A Mac/Lima row is `NOT-RUN` unless this
-attended owner-hardware procedure actually executes it; hosted macOS does not
-satisfy the row.
+inventory. The receipt must also carry `recorded_at`: the fixed instant the
+receipt builder finished assembling the artifact, which the gate compares
+`results_retained_until` against instead of the wall clock it happens to run
+under, so the same receipt reads the same way today and a month from now.
+
+`handoff_absent_after_completion` is retired, not deprecated: the gate
+refuses it unconditionally the moment a row asserts it `true`, with no
+transition window, and names the row that still carries it. `retained` and
+`absent` asserted together is a contradiction, refused the same way. Only an
+explicit `handoff_retained_after_completion=true` counts as the retention
+proof; a row that omits the fact fails exactly like one that sets it `false`
+— there is no default that reads as proof. A Mac/Lima row is `NOT-RUN` unless
+this attended owner-hardware procedure actually executes it; hosted macOS
+does not satisfy the row.
 
 ## Loss and recovery order
 
