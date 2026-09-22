@@ -336,12 +336,24 @@ func TestComputerCustodyImportRejectsTamperThenResumesMidImport(t *testing.T) {
 	if err := os.WriteFile(manifestPath, tampered, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := engine.CopyComputerStorage(t.Context(), importRequest); err == nil {
-		t.Fatal("Custody import accepted a tampered manifest")
+	// A rejected portable manifest is a terminal import with proven staging
+	// absence, so the reserved destination identity has something to
+	// acknowledge. It is a destination of its own: the refusal is durable.
+	tamperRequest := importRequest
+	tamperRequest.Destination.ComputerID = "tampered-import-computer"
+	tamperRequest.Destination.StorageID = "tampered-import-storage"
+	refused, err := engine.CopyComputerStorage(t.Context(), tamperRequest)
+	if err != nil || refused.Receipt.Kind != "computer_storage_copy_failed_absent" ||
+		refused.Receipt.FailureCode != "manifest_invalid" || !refused.Receipt.DestinationAbsent {
+		t.Fatalf("tampered import = %+v err=%v", refused.Receipt, err)
+	}
+	tamperedName, _ := deterministicComputerDiskName(tamperRequest.Destination)
+	if err := requireRefusedComputerStorageAbsence(filepath.Join(root, "computer-disks", tamperedName)); err != nil {
+		t.Fatalf("tampered import left a destination holding bytes: %v", err)
 	}
 	name, _ := deterministicComputerDiskName(importRequest.Destination)
 	if _, err := os.Lstat(filepath.Join(root, "computer-disks", name)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("tampered import created managed destination: %v", err)
+		t.Fatalf("tampered import created the untouched destination: %v", err)
 	}
 	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
 		t.Fatal(err)

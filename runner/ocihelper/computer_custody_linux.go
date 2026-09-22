@@ -881,7 +881,7 @@ func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputer
 		if err == nil {
 			err = errors.New("Custody import manifest is missing")
 		}
-		return nil, err
+		return nil, &computerStorageCopySourceError{Code: "manifest_invalid", Err: err}
 	}
 	if manifest.Phase != "complete" || custodyManifestDigest(payload) != request.ManifestDigest ||
 		manifest.ExportID != request.ExportID || manifest.BackupID != request.BackupID || manifest.CopyID != request.CopyID ||
@@ -889,14 +889,16 @@ func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputer
 		manifest.StorageID != request.SourceStorageID || manifest.StorageGeneration != request.SourceGeneration ||
 		manifest.AllocatedSize != request.SourceSize || manifest.ContentDigest != request.SourceDigest ||
 		request.Authority.NodeID == "" || request.Authority.RootInstanceID == "" {
-		return nil, errors.New("Custody import manifest conflicts with recorded export evidence")
+		return nil, &computerStorageCopySourceError{Code: "manifest_invalid",
+			Err: errors.New("Custody import manifest conflicts with recorded export evidence")}
 	}
 	if manifest.DiskFile != "storage.ext4" {
 		return nil, errors.New("Custody import manifest names an unexpected disk file")
 	}
 	fd, err := unix.Openat(int(destination.dir.Fd()), manifest.DiskFile, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, errors.New("Custody import disk size conflicts with its manifest")
+		return nil, &computerStorageCopySourceError{Code: "manifest_invalid",
+			Err: errors.New("Custody import disk size conflicts with its manifest")}
 	}
 	diskFile := os.NewFile(uintptr(fd), filepath.Join(destination.root, manifest.DiskFile))
 	defer func() {
@@ -906,7 +908,8 @@ func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputer
 	}()
 	info, err := diskFile.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != request.SourceSize {
-		return nil, errors.New("Custody import disk size conflicts with its manifest")
+		return nil, &computerStorageCopySourceError{Code: "manifest_invalid",
+			Err: errors.New("Custody import disk size conflicts with its manifest")}
 	}
 	if err := engine.verifyCustodyLeafDevice(destination, diskFile.Name(), info); err != nil {
 		return nil, err
@@ -915,7 +918,8 @@ func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputer
 	// owner nor prior export time once the portable bytes are operator-owned.
 	digest, err := digestCustodyFile(diskFile)
 	if err != nil || digest != request.SourceDigest {
-		return nil, errors.New("Custody import disk digest conflicts with its manifest")
+		return nil, &computerStorageCopySourceError{Code: "digest_mismatch",
+			Err: errors.New("Custody import disk digest conflicts with its manifest")}
 	}
 	return diskFile, nil
 }

@@ -708,17 +708,36 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 		return protocolError(contract.ErrorStorageReferenceConflict, "Custody import receipt does not bind its portable manifest")
 	}
 	if receipt.Kind == "computer_storage_copy_failed_absent" {
-		if row.Operation != "import" || !receipt.DestinationAbsent || receipt.DestinationDigest != "" ||
+		if !receipt.DestinationAbsent || receipt.DestinationDigest != "" ||
 			receipt.OSIdentityRekeyed || receipt.MachineIDBeforeDigest != "" || receipt.MachineIDAfterDigest != "" ||
 			receipt.MachineIDRepaired || receipt.SourceUnchanged || receipt.DestinationPrepared ||
-			receipt.PreparationReceipt || receipt.DestinationChown || receipt.FilesystemExpanded ||
-			(receipt.FailureCode != "manifest_invalid" && receipt.FailureCode != "digest_mismatch" &&
-				receipt.FailureCode != "insufficient_disk" && receipt.FailureCode != "cancelled") {
-			return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt lacks positive staging absence")
+			receipt.PreparationReceipt || receipt.DestinationChown || receipt.FilesystemExpanded {
+			return protocolError(contract.ErrorInvalidRequest, "Computer Storage copy failure receipt lacks positive staging absence")
+		}
+		switch row.Operation {
+		case "import":
+			if receipt.FailureCode != "manifest_invalid" && receipt.FailureCode != "digest_mismatch" &&
+				receipt.FailureCode != "insufficient_disk" && receipt.FailureCode != "cancelled" {
+				return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt lacks positive staging absence")
+			}
+			// The capacity fact belongs to the capacity refusal alone.
+			if receipt.FailureCode != "insufficient_disk" && receipt.ObservedAvailableBytes != 0 {
+				return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt carries capacity facts for a non-capacity failure")
+			}
+		case "clone":
+			// Clone's only typed failure is the capacity refusal. Anything
+			// else leaves the copy's integrity in doubt and stays on the
+			// quarantine path instead of claiming proven absence.
+			if receipt.FailureCode != "insufficient_disk" || receipt.ObservedAvailableBytes < 0 {
+				return protocolError(contract.ErrorInvalidRequest, "Computer clone failure receipt lacks receipt-derived capacity facts")
+			}
+		default:
+			return protocolError(contract.ErrorInvalidRequest, "Computer %s has no typed staging-absence failure", row.Operation)
 		}
 		return nil
 	}
 	if receipt.Kind != computerStorageCopyReceiptKind || receipt.FailureCode != "" || receipt.DestinationAbsent ||
+		receipt.ObservedAvailableBytes != 0 ||
 		!backupDigestPattern.MatchString(receipt.DestinationDigest) || !receipt.SourceUnchanged ||
 		!receipt.DestinationPrepared || receipt.PreparationReceipt || receipt.DestinationChown {
 		return protocolError(contract.ErrorStorageReferenceConflict, "Computer Storage copy receipt outcome is invalid")
@@ -809,6 +828,70 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 	return requireComputerCAS(result, row.DestinationComputerID, row.OperationRevision)
 }
 
+// latchComputerCloneCapacityFailure gives a refused clone the terminal
+// capacity latch a refused grow already has. The receipt's own requested and
+// observed bytes become the Job's typed `insufficient_disk` failure, the
+// never-published destination generation is retired, and the destination
+// leaves `cloning` latched failed, so nothing redispatches the operation, no
+// later start can format an empty disk under its identity, and an operator can
+// read why it stopped. The source Computer and its Backup are untouched.
+func latchComputerCloneCapacityFailure(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	request ComputerStorageCopyAcknowledgementRequest, receiptJSON []byte, bodyHash string, now time.Time) error {
+	if row.Operation != "clone" {
+		return protocolError(contract.ErrorInvalidRequest, "only a Computer clone latches a typed Storage copy refusal")
+	}
+	computer, err := readComputerAuthority(ctx, tx, row.DestinationComputerID, now)
+	if err != nil {
+		return internalError(err, "read refused Computer clone target")
+	}
+	if computer.IntentRevision != row.OperationRevision || computer.ReconfigurationPhase != ComputerReconfigurationCloning ||
+		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != row.OperationRevision {
+		return protocolError(contract.ErrorStaleIntentRevision, "Computer clone no longer owns its refusal")
+	}
+	latchedFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk,
+		Message: "Computer clone disk capacity was refused", NodeID: row.BoundNodeID,
+		RequestedBytes: row.DestinationSize, ObservedAvailableBytes: request.Receipt.ObservedAvailableBytes})
+	if err != nil {
+		return internalError(err, "encode Computer clone capacity failure")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+		failure_code=?, verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?,
+		acknowledgement_hash=?, verified_ns=?, completed_ns=?
+		WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
+		request.Receipt.FailureCode, receiptJSON, bodyHash, request.IdempotencyKey, bodyHash,
+		now.UnixNano(), now.UnixNano(), row.DestinationComputerID, row.OperationRevision); err != nil {
+		return internalError(err, "record refused Computer clone")
+	}
+	retired, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
+		WHERE computer_id=? AND storage_generation=? AND phase='staging' AND reset_revision=?`, now.UnixNano(),
+		row.DestinationComputerID, row.DestinationGeneration, row.OperationRevision)
+	if err != nil {
+		return internalError(err, "retire refused Computer clone generation")
+	}
+	if err := requireSingleStorageGenerationMutation(retired, "retire refused Computer clone generation"); err != nil {
+		return err
+	}
+	// The destination is latched failed rather than stopped: it owns no
+	// Storage generation, so it is not a Computer that merely happens to be
+	// off, and nothing may start it into a freshly formatted empty disk.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, current_attempt_id=NULL, updated_ns=?
+		WHERE job_id=?`, contract.JobFailed, now.UnixNano(), row.JobID); err != nil {
+		return internalError(err, "latch refused Computer clone failed")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state='stopped', published_attempt_id=NULL,
+		healthy_since_ns=NULL, next_restart_at=NULL, last_failure=? WHERE job_id=?`, latchedFailure, row.JobID); err != nil {
+		return internalError(err, "latch Computer clone capacity failure")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',
+		reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=?
+		AND reconfiguration_phase='cloning'`, row.OperationRevision, now.UnixNano(),
+		row.DestinationComputerID, row.OperationRevision)
+	if err != nil {
+		return internalError(err, "close refused Computer clone")
+	}
+	return requireComputerCAS(result, row.DestinationComputerID, row.OperationRevision)
+}
+
 func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
 	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Computer Storage copy acknowledgement fields are required")
@@ -884,6 +967,20 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 	receiptJSON, err := json.Marshal(request.Receipt)
 	if err != nil {
 		return Computer{}, internalError(err, "encode Computer Storage copy receipt")
+	}
+	if request.Receipt.Kind == "computer_storage_copy_failed_absent" {
+		if err := latchComputerCloneCapacityFailure(ctx, tx, row, request, receiptJSON, bodyHash, now); err != nil {
+			return Computer{}, err
+		}
+		computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
+		if err != nil {
+			return Computer{}, internalError(err, "read refused Computer clone authority")
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, internalError(err, "commit refused Computer clone")
+		}
+		s.notifyComputerPolicyChanged()
+		return computer, nil
 	}
 	var oldReceiptJSON any
 	if request.OldBackupReceipt != nil {

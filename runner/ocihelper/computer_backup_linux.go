@@ -60,10 +60,18 @@ func (engine *ContainerdEngine) computerBackupCheckpoint(checkpoint computerBack
 }
 
 func (engine *ContainerdEngine) allocateComputerBackup(path string, size int64) error {
+	allocationErr, closeErr := engine.allocateComputerDestination(path, size)
+	return errors.Join(allocationErr, closeErr)
+}
+
+// allocateComputerDestination keeps the allocation failure separate from the
+// close failure, so only the allocation itself can become a typed capacity
+// refusal. The injected test allocator is the allocation.
+func (engine *ContainerdEngine) allocateComputerDestination(path string, size int64) (allocationErr error, closeErr error) {
 	if engine.computerBackupAllocate != nil {
-		return engine.computerBackupAllocate(path, size)
+		return engine.computerBackupAllocate(path, size), nil
 	}
-	return fullyAllocateComputerDisk(path, size)
+	return allocateComputerDiskSeparately(path, size)
 }
 
 func (engine *ContainerdEngine) copyComputerBackup(destination io.Writer, source io.Reader, size int64) (int64, error) {

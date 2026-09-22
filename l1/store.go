@@ -2456,6 +2456,16 @@ WHERE job_id=(
 		      AND candidate_computer.desired_state=@desired_running
 		      AND candidate_computer.reconfiguration_phase='stable'
 		      AND candidate_computer.placement_node_id=@node_id
+		      -- A Computer may be claimed only while it names Storage that
+		      -- was actually published. A generation retired by an
+		      -- unsuccessful copy must never reach a helper, which would
+		      -- format a fresh empty disk under that Computer identity.
+		      AND EXISTS (
+		        SELECT 1 FROM computer_storage_generations published_storage
+		        WHERE published_storage.computer_id=candidate_computer.computer_id
+		          AND published_storage.storage_generation=candidate_computer.storage_generation
+		          AND published_storage.phase='current'
+		      )
 		    ))
 	    AND (
 	      (

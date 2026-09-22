@@ -972,6 +972,34 @@ func markComputerIntentApplied(ctx context.Context, tx *sql.Tx, computerID strin
 	return nil
 }
 
+// requireCurrentComputerStorage refuses any operation that would start a
+// Computer whose current Storage generation is not `current`. An unsuccessful
+// clone, import, or abort retires the generation it reserved and never
+// publishes one, so the Computer names Storage that holds no bytes: starting it
+// would let the helper take its first-allocation path and format a fresh empty
+// disk under a durable Computer identity, silently replacing the copy the
+// operator asked for. Recovery is an authorized operation that establishes
+// valid current Storage; removal remains available and is not gated here.
+func requireCurrentComputerStorage(ctx context.Context, q queryer, computer Computer, action string) error {
+	var phase ComputerStorageGenerationPhase
+	err := q.QueryRowContext(ctx, `SELECT phase FROM computer_storage_generations
+		WHERE computer_id=? AND storage_generation=?`, computer.ComputerID, computer.StorageGeneration).Scan(&phase)
+	if errors.Is(err, sql.ErrNoRows) {
+		phase = computerStorageGenerationAbsent
+	} else if err != nil {
+		return internalError(err, "read Computer current Storage generation")
+	}
+	if phase == ComputerStorageGenerationCurrent {
+		return nil
+	}
+	return protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
+		"computer_id": computer.ComputerID, "storage_id": computer.StorageID,
+		"storage_generation": computer.StorageGeneration, "storage_generation_phase": string(phase),
+		"reason": ComputerStorageGenerationRetiredReason, "required_operation": "remove",
+	}, "Computer %q cannot %s: its Storage generation %d was never published",
+		computer.ComputerID, action, computer.StorageGeneration)
+}
+
 func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, request ComputerDesiredStateRequest) (Computer, error) {
 	if request.DesiredState != contract.ServiceDesiredRunning && request.DesiredState != contract.ServiceDesiredStopped {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest,
@@ -1001,6 +1029,11 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable && !backupStopWins {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	}
+	if request.DesiredState == contract.ServiceDesiredRunning {
+		if err := requireCurrentComputerStorage(ctx, tx, computer, "start"); err != nil {
+			return Computer{}, err
+		}
 	}
 	if request.DesiredState == contract.ServiceDesiredRunning && computer.CurrentJob.State == contract.JobFailed {
 		return Computer{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
@@ -1181,6 +1214,9 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return Computer{}, false, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	}
+	if err := requireCurrentComputerStorage(ctx, tx, computer, "restart"); err != nil {
+		return Computer{}, false, err
 	}
 	var latchedFailure contract.SpawnFailure
 	activeResourceRestart := (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning) &&
@@ -1670,6 +1706,12 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	}
+	// Refused before any revision is reserved: a projection or reimage of a
+	// Computer with no published Storage commits a phase whose directive no
+	// helper can ever complete.
+	if err := requireCurrentComputerStorage(ctx, tx, computer, string(operation)); err != nil {
+		return Computer{}, err
 	}
 	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err

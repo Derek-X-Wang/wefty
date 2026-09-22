@@ -467,10 +467,10 @@ heartbeats.
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only, except that one tombstoned attempt whose helper deadman completed a successful guardian reap may authorize exactly one later `Delete` with full seven-field attempt-authority equality and the current node/boot-session gate. That exception still calls engine `Delete`, repeats independent absence verification, and releases image pins, capacity, ports, and retained runtime state before returning positive deletion; it never treats the earlier reap alone as the response. The helper consumes the guardian evidence when that call completes, so a second exact call, stale fence, foreign attempt, different removal generation or boot session, and every failed guardian reap remain refused. In every path, a positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
-| `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. The server snapshots the live-attempt registry, releases its mutex for the engine scan, then rechecks the registry before returning; heartbeat and Run dispatch stay live throughout the scan, and a new matching attempt fails the inventory closed. Computer reimage serialization is context-bounded. A Job-scoped scan returns runtime authorities once. Each per-generation scan returns only Storage proof and never repeats runtime authorities: a prepared disk backed by a durable copy/reset receipt and no attachment lineage, loop, mount, pending attachment, or retirement, a distinct typed already-absent disk-root authority, or `no_storage_evidence` with empty typed evidence. The Job-scoped runtime scan is the sole runtime authority; reconstruction refuses only when neither scan proves authority. Per-generation calls perform filesystem inventory without containerd lease, snapshot, or container scans. The helper never creates a missing root while proving absence. Every result is bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity. |
+| `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. The server snapshots the live-attempt registry, releases its mutex for the engine scan, then rechecks the registry before returning; heartbeat and Run dispatch stay live throughout the scan, and a new matching attempt fails the inventory closed. Computer reimage serialization is context-bounded. A Job-scoped scan returns runtime authorities once. Each per-generation scan returns only Storage proof and never repeats runtime authorities: a prepared disk backed by a durable copy/reset receipt and no attachment lineage, loop, mount, pending attachment, or retirement, a distinct typed absent-Storage authority (a missing root or exact refusal tombstone with no payload), or `no_storage_evidence` with empty typed evidence. The Job-scoped runtime scan is the sole runtime authority; reconstruction refuses only when neither scan proves authority. Per-generation calls perform filesystem inventory without containerd lease, snapshot, or container scans. The helper never creates a missing root while proving absence. Every result is bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. A prepared-removal Storage-only authority requires its helper-originated never-attached witness; reset/restore predecessor and failed-import cleanup use separate typed operation authorities and cannot claim that witness. After separate durable-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
-| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
+| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. A destination the Node cannot hold returns a typed `insufficient_disk` failure receipt carrying the available bytes observed at the refusal and proven staging absence, not an opaque engine failure. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path that is outside the managed root and a strict descendant of one of the helper's configured operator mount roots. L1 has already committed the custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A missing manifest cannot be reconstructed as empty lineage when an immutable copy receipt or durable reset-preparation record proves prior storage preparation; that contradiction returns typed `computer_storage_grow_uncertain` before reserving capacity or mutating bytes. A failure after ext4 may have expanded returns the same typed uncertainty, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
@@ -1243,6 +1243,49 @@ followed by normal removal authority for N. The affected Computer therefore stay
 fail-closed while the helper continues serving the rest of the Node. Startup's
 namespace-absence promise remains exact for every non-quarantined generation.
 
+A `CopyComputerStorage` clone or import that cannot fit its destination is a
+capacity fact, not an integrity doubt, and is reported as one.
+`computer_storage_copy_failed_absent` with `failure_code=insufficient_disk`
+carries `observed_available_bytes`: the Node filesystem's available bytes read
+at the moment of the refusal, the same fact a `GrowComputerStorage` refusal
+returns, so one capacity failure reads identically whichever verb met it.
+`observed_available_bytes` belongs to that refusal alone and is absent from
+every other Storage copy receipt, failed or verified.
+
+The capacity refusal is recognized only where this call writes to the Node's
+own Computer-disk filesystem: the destination allocation, the staging copy, and
+the expansion allocation each raise it directly, as an exact typed value.
+ENOSPC reached any other way is not host destination capacity -- the full
+filesystem may be the one inside the copied image -- and neither an error chain
+nor tool output text can create the fact. An error that also carries a second
+failure stays an engine failure, because that second failure must not disappear
+behind an absence receipt: the allocation error and the close error are kept
+apart for exactly this reason, and no close error is ever discarded. A Custody
+import's recognized source-validation failures are typed the same way, at the
+site that detects them.
+
+Absence is proved, not asserted, and it is proved without ever giving up the
+generation. The refusal runs while this call still owns the generation, and it
+never deletes the generation root, because the flock that carries that
+ownership lives inside it: unlinking the root would let a creator take a
+replacement inode mid-cleanup. The refusal removes the payload through the
+retained root, writes a durable refusal tombstone beside the lock, and only
+then issues the receipt. A root holding nothing but its lock and that tombstone
+is an absent generation: the startup sweep leaves it alone instead of
+quarantining it, preparation refuses it rather than formatting a fresh disk
+under an identity whose copy was refused, a repeated call replays the recorded
+receipt, and ordinary authorized removal deletes the root whole. The receipt is
+issued only after the destination is neither mounted nor loop-attached, since
+an unlinked pathname leaves the copied bytes reachable through a live mount or
+loop device, and never when the destination already owns published bytes; a
+failure after publication stays an error, because an absence receipt authorizes
+deletion.
+
+Clone has exactly this one typed failure code. Every other clone failure leaves
+the copy's integrity in doubt and keeps the existing path: an engine failure, a
+deferred resume, or a quarantined generation, which is reserved for a copy
+whose bytes cannot be trusted.
+
 For a Custody import, typed helper runtime loss during `CopyComputerStorage`
 becomes an exact-generation `computer_storage_preparation_interrupted`
 observation; startup recovery also carries exact-generation
@@ -1459,8 +1502,11 @@ one Job-scoped scan. Each subsequent Computer-generation request returns only
 that generation's deterministic Storage rows, so the adapter cannot duplicate
 runtime authority across generations. Its no-runtime results are either an
 exact prepared disk with no attached, pending, previously detached, or retired
-authority, or an exact typed absent-disk-root authority. The latter is absence
-evidence, not preparation evidence, and does not create filesystem state.
+authority, or an exact typed absent-Storage authority. The latter covers a
+missing root or a refused generation containing only its lock and durable
+refusal tombstone, with no payload. The refusal must match the requested
+Computer/Storage generation, Node, root instance, and Job. It is absence
+evidence, not preparation evidence, and does not create a missing root.
 Every result remains bound to the authenticated current helper session and
 durable removal fence. Malformed, anomalous, or identity-mismatched disks still
 fail closed; historical attachment cannot become preparation evidence. A detached
@@ -1470,13 +1516,16 @@ authority, and reconstruction refuses only when neither scan proves authority.
 
 Frozen `storage_absent` evidence is carried as a restrictive precondition through
 Computer disk finalization to `DeleteManagedVolume`. Deletion revalidates it under
-the generation flock: a reappeared root is refused and never converted to cleanup
-quarantine, even after retries. Copy/import and reset root creation share short
-root admission with absence inventory and deletion. Creators release admission
-once they own the generation flock, before copying or formatting. Deletion of a
-missing root retains admission through cleanup because no flock inode exists yet;
-existing-root deletion releases admission after acquiring the flock. Prepared,
-Attached, Pending, detachment, mount, and loop checks remain in force.
+the generation flock: only a missing root or the exact lock-and-tombstone shape
+may remain. Reappeared payload is refused and never converted to cleanup
+quarantine, even after retries. Copy/import and reset root creation share root
+admission with absence inventory and deletion. Creators release admission once
+they own the generation flock, before copying or formatting. Deletion retains
+root admission and attachment admission through cleanup and the final absence
+proof, in the existing reimage-then-root lock order, because unlinking the root
+also unlinks its flock. Attachment rechecks refusal after acquiring the flock
+before interpreting any missing manifest or image. Prepared, Attached, Pending,
+detachment, mount, and loop checks remain in force.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows. Ordinary services

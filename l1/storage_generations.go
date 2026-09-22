@@ -21,7 +21,16 @@ const (
 	ComputerStorageGenerationCurrent ComputerStorageGenerationPhase = "current"
 	ComputerStorageGenerationStaging ComputerStorageGenerationPhase = "staging"
 	ComputerStorageGenerationRetired ComputerStorageGenerationPhase = "retired"
+	// computerStorageGenerationAbsent is not a stored phase: it names a
+	// Computer whose current generation row is gone entirely.
+	computerStorageGenerationAbsent ComputerStorageGenerationPhase = "absent"
 )
+
+// ComputerStorageGenerationRetiredReason is the typed refusal reason for a
+// Computer that names a Storage generation which was never published, so it
+// can be neither started nor restarted until an authorized recovery
+// operation establishes valid current Storage.
+const ComputerStorageGenerationRetiredReason = "storage_generation_retired"
 
 type ComputerStorageGeneration struct {
 	StorageID         string                         `json:"storage_id"`
@@ -212,6 +221,13 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	}
 	if computer.StorageGeneration == math.MaxInt64 {
 		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q exhausted Storage generation space", computerID)
+	}
+	// Reset publishes a successor by retiring a `current` predecessor. A
+	// Computer whose generation was never published has no predecessor to
+	// retire, so admitting one would reserve a successor that can never be
+	// published.
+	if err := requireCurrentComputerStorage(ctx, tx, computer, "reset"); err != nil {
+		return Computer{}, false, err
 	}
 	nextRevision := computer.IntentRevision + 1
 	var nextGeneration int64

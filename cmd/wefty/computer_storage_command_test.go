@@ -1148,3 +1148,73 @@ func writeStorageCLICustodyManifest(t *testing.T, h *storageCLIHarness) (contrac
 	}
 	return manifest, manifestPath, manifestDigest
 }
+
+// A clone that never copied a byte is a failure, not a completed revision:
+// `--wait` must report the capacity refusal the destination latched.
+func TestComputerCloneWaitReportsTheCapacityRefusal(t *testing.T) {
+	h := newStorageCLIHarness(t)
+	runStorageCLI(t, h.ctx, h.clients, true, "services", "backup", "set-cap", h.computer.ComputerID,
+		"--cap", "1", "--expect-current")
+	runStorageCLI(t, h.ctx, h.clients, true, "services", "backup", "create", h.computer.ComputerID,
+		"--expect-current", "--idempotency-key", "refused-clone-source", "--allow-power-off")
+	h.completeBackupHelper(t)
+	backups, err := h.store.ListComputerBackups(h.ctx, h.computer.ComputerID)
+	if err != nil || len(backups.Backups) != 1 {
+		t.Fatalf("refused clone source = %#v err=%v", backups, err)
+	}
+	const requestedBytes = int64(64) << 30
+	const observedAvailableBytes = int64(25112510464)
+	done := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			directives, err := h.store.ListNodeComputerStorageCopyDirectives(h.ctx, "fabric-storage-node", h.node.NodeID, h.node.BootSessionID)
+			if err != nil {
+				done <- err
+				return
+			}
+			for _, directive := range directives {
+				if directive.Operation != "clone" {
+					continue
+				}
+				receipt := l1.ComputerStorageCopyReceipt{Kind: "computer_storage_copy_failed_absent",
+					ReceiptID: "refused-" + directive.DestinationComputerID, Operation: directive.Operation,
+					BackupID: directive.BackupID, CopyID: directive.CopyID,
+					SourceComputerID: directive.SourceComputerID, SourceStorageID: directive.SourceStorageID,
+					SourceGeneration: directive.SourceGeneration, DestinationComputerID: directive.DestinationComputerID,
+					DestinationStorageID: directive.DestinationStorageID, DestinationGeneration: directive.DestinationGeneration,
+					NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+					OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 9,
+					SourceSize: directive.SourceSize, DestinationSize: directive.DestinationSize,
+					SourceDigest: directive.SourceDigest, FailureCode: "insufficient_disk", DestinationAbsent: true,
+					ObservedAvailableBytes: observedAvailableBytes}
+				_, err := h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
+					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
+						IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+				done <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		done <- errors.New("no clone directive appeared before the deadline")
+	}()
+	var stdout, stderr bytes.Buffer
+	cloneErr := execute(h.ctx, h.clients, true, []string{"services", "clone", h.computer.ComputerID,
+		backups.Backups[0].BackupID, "--name", "refused-clone", "--disk-bytes", fmt.Sprint(requestedBytes),
+		"--expect-current", "--idempotency-key", "refused-clone", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	if helperErr := <-done; helperErr != nil {
+		t.Fatal(helperErr)
+	}
+	var refusal *apiResponseError
+	if !errors.As(cloneErr, &refusal) || refusal.APIError.Code != contract.ErrorCapacityExhausted ||
+		refusal.APIError.Details["failure_code"] != string(contract.SpawnFailureInsufficientDisk) ||
+		fmt.Sprint(refusal.APIError.Details["requested_bytes"]) != fmt.Sprint(requestedBytes) ||
+		fmt.Sprint(refusal.APIError.Details["observed_available_bytes"]) != fmt.Sprint(observedAvailableBytes) {
+		t.Fatalf("refused clone wait error = %v (%#v) stdout=%s", cloneErr, refusal, stdout.String())
+	}
+	var output storageMutationOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || output.Computer == nil ||
+		output.Computer.ReconfigurationPhase != l1.ComputerReconfigurationStable {
+		t.Fatalf("refused clone output = %s err=%v", stdout.String(), err)
+	}
+}
