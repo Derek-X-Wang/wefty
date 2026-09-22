@@ -288,9 +288,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
 	// #498). The resolved boolean, not just the true case, always wins.
 	if options.printEnrollmentURL {
-		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
 	} else {
-		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
+		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
@@ -478,6 +478,8 @@ Global flags:
   --plain-device-id DEVICE_ID
   --json
   --node-config PATH
+  --fabric-print-enrollment-url
+                             Print the raw Fabric enrollment URL on first login instead of the wefty notice
 `
 
 type usageError string
