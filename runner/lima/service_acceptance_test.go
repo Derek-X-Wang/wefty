@@ -126,15 +126,20 @@ type attendedResult struct {
 	OwnerRecordAbsent       bool              `json:"service_data_owner_record_absent,omitempty"`
 	// DeleteAttestRestart records a real agent process restart interposed
 	// between the helper's Delete and the attestation. It is an optional
-	// observation, never a required fact (#521): the attended removal's
-	// completion pass is in-process and sub-second -- 24.9 ms on owner
-	// hardware in run 7 -- so no operator can interpose a restart there, and
-	// the runbook never asks them to. The invariant it was reaching for is
-	// owned by TestRemovalControllerCrashBetweenHelperDeleteAndAttestation-
-	// NeverAcknowledgesEarly in agent/removal_test.go, where the boundary can
-	// be driven directly. The gate requiring it true only ever passed on a
-	// receipt that overstated what the row saw; it sat unreached behind the
-	// retired absence check until #509 removed that fatal.
+	// observation, never a required fact (#521): the gate dropped an
+	// unfulfilled native-restart requirement, because the attended runbook's
+	// step 10 stages no such restart -- the completion pass runs in-process
+	// and took 24.9 ms on owner hardware in run 7 -- so ordinary execution
+	// cannot reliably satisfy it. An instrumented restart at that boundary is
+	// not claimed to be impossible, only unstaged. What remains covered is the
+	// controller's error/retry sequencing, in TestRemovalControllerCrash-
+	// BetweenHelperDeleteAndAttestationNeverAcknowledgesEarly (agent/
+	// removal_test.go): one controller over a mocked record, no process
+	// restart and no durable-state reload, so coverage of an actual boundary
+	// restart is unverified. The row's ordering evidence is the timestamps it
+	// already reads -- attested_at/completed_at before the L1 job's
+	// cleanup_acknowledged_at -- not the record's later disappearance, which
+	// is separate local cleanup after the acknowledgement.
 	DeleteAttestRestart  bool               `json:"delete_attest_restart_observed,omitempty"`
 	BindSourcesUntouched bool               `json:"bind_sources_untouched,omitempty"`
 	ImageCacheRetained   bool               `json:"image_cache_retained,omitempty"`

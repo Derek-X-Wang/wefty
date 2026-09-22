@@ -550,14 +550,18 @@ Record four rows:
    the job to requeue with its original absolute deadline and digest, a fresh
    attempt/fence after recovery, and exactly one payload execution across the
    two attempts. Record `round_trip=true` for that one execution, as row 1
-   does. The recovered attempt's exit zero is itself the bridge proof: `--once`
-   makes its authenticated run-scoped request before it writes either marker
-   and returns a non-zero exit on any failure or non-2xx response
-   (`cmd/wefty-echo-service/main.go`, `runOnce`), which is the same reading
-   `serviceacceptance/attended_helper_loss.go` already makes of those markers.
-   A row that recovered into a clean exit zero and both markers therefore
-   carries the round trip; leaving the fact `false` understates what the row
-   observed.
+   does. The recovered attempt's exit zero carries the bridge request: `--once`
+   writes its handoff file, then makes the authenticated run-scoped request,
+   and returns a non-zero exit if that request fails to send or answers outside
+   2xx — before it writes either marker
+   (`cmd/wefty-echo-service/main.go`, `runOnce`). It ignores response
+   body-read and close errors, so exit zero proves the request was sent and
+   accepted, not that the response body was fully drained. That is the same
+   reading `serviceacceptance/attended_helper_loss.go` makes of those markers;
+   where the row can also watch the host-side origin serve the request (as row
+   1's entrypoint does), record that stronger observation instead. Leaving the
+   fact `false` on a recovered attempt that exited zero with both markers
+   understates what the row observed.
 3. `oci_oneshot_poststarted_loss`: stop the VM or helper after `Started`.
    Require one terminal `runtime_failure`, no automatic requeue, one attempt,
    and exactly one payload execution.
@@ -804,20 +808,31 @@ The same read carries them: a record whose `absence_attestation` is present
 proves the post-delete attestation, and its `assertions` array is the row's
 `removal_assertions`.
 `delete_attest_restart_observed` is an optional observation, not a fact this
-row is required to carry, because this procedure cannot produce one. The
-completion pass runs in-process and finishes inside a sub-second window (24.9
-ms on owner hardware, run 7), so no operator can interpose a real agent process
-restart between the helper `Delete` and the attestation, and nothing above asks
-them to. What the attended row proves instead is the ordering it can actually
-observe: the completed record carries the absence attestation, the guest-native
-service-data bytes and the owner record are gone, and only then does the job
-reach `removed_verified` — the record leaves the read surface at the L1
-acknowledgement, so an early acknowledgement would have taken it away before
-the capture ever held it at `phase=complete`. The invariant the restart was
-reaching for — a crash between the helper delete and the attestation never
-acknowledges L1 early, and resume redoes both — is owned by
+row is required to carry: nothing above stages the native agent process restart
+it names. The completion pass runs in-process and finished in 24.9 ms on owner
+hardware (run 7), and the prescribed procedure gives the operator no mechanism
+to interpose a restart between the helper `Delete` and the attestation — an
+instrumented restart at that boundary may still be possible, but this runbook
+does not describe one, so ordinary execution cannot reliably satisfy the fact.
+Record instead the two timestamps that do carry the ordering, from the same
+reads this row already takes: the completed record's `attested_at` /
+`completed_at`, and the L1 job's `cleanup_acknowledged_at`. The first must
+precede the second. Run 7 read `.973392Z` against `.975621Z`
+(`evidence/removal-complete-record.json`, `evidence/removal-postverify.txt`).
+Do not read the record's later disappearance as ordering evidence: the agent
+acknowledges L1 and then deletes the record in a separate transaction
+(`agent/removal.go`, `ackRemoval` before `finishRemoval`), so a completed
+record can outlive its acknowledgement and its removal is ordinary local
+cleanup.
+
+Unit coverage retains the controller's error/retry sequencing across that
+boundary — a successful delete, an injected attestation error, no
+acknowledgement, then a second pass requiring both calls again before
+acknowledging — in
 `TestRemovalControllerCrashBetweenHelperDeleteAndAttestationNeverAcknowledgesEarly`
-in `agent/removal_test.go`, which is where it is provable. Set
+(`agent/removal_test.go`). That test drives one controller over a mocked
+record; it restarts no process and reloads no durable state, so coverage of an
+actual boundary restart is **unverified**. Set
 `delete_attest_restart_observed=true` only after observing a real agent process
 restart at that boundary without an early L1 acknowledgement; injected callback
 errors may be recorded separately but do not prove a restart, and hosted lanes
