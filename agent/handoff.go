@@ -64,6 +64,13 @@ type handoffOwnership struct {
 	runID  string
 	nodeID string
 	run    *os.Root
+	// prepared is the identity of the directory this receipt was issued for,
+	// taken while it was certainly still linked. finish compares the run name
+	// against this rather than re-stating the handle, because a workload that
+	// unlinked the directory leaves a handle whose own "." no longer resolves
+	// on Linux -- os.Root reaches it through /proc/self/fd/N -- so asking the
+	// handle what it is would fail exactly in the case worth detecting.
+	prepared os.FileInfo
 }
 
 type handoffLease struct {
@@ -177,6 +184,14 @@ func (m *handoffManager) releasePathReference(path string, pathLock *handoffPath
 // directory the agent had never taken responsibility for. A node that cannot
 // manage the directory a run was given says so.
 var errUnmanagedHandoffDirectory = errors.New("handoff directory is not one this node manages")
+
+// errHandoffNameNotADirectory marks the one refusal repeating cannot resolve:
+// the name a run's directory should be at holds something else -- a symlink, a
+// FIFO, a regular file. Every other failure the sweep meets can clear on its
+// own, so this is the only class it is allowed to stop retrying (see
+// noteExpiryFailure), and it is a sentinel rather than a string match because
+// "stop sweeping this run" is too consequential a decision to key off wording.
+var errHandoffNameNotADirectory = errors.New("handoff name is not a directory")
 
 // ownsHandoff reports that this job carries the run identity everything the
 // agent does with a handoff directory is keyed by: the retention record, the
@@ -325,7 +340,11 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 	}); err != nil {
 		return nil, err
 	}
-	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, run: run}
+	prepared, err := run.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, run: run, prepared: prepared}
 	m.mu.Lock()
 	lease.ownership = owner
 	m.mu.Unlock()
@@ -368,92 +387,82 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 	if err := m.writeRecord(record); err != nil {
 		return err
 	}
-	if err := m.enforceRunBound(owner.run, runID); err != nil {
-		return err
-	}
-	anomaly := m.boundCurrentDirectory(owner, runID, nodeID, path)
-	if anomaly == "" {
+	// Identity first, and only then the trim. Trimming before the check means
+	// reading a directory the workload may have unlinked, which on Linux fails
+	// outright -- os.Root reaches the handle through /proc/self/fd/N and that
+	// path stops resolving the moment the directory is gone -- so the one case
+	// worth detecting would turn into an attempt failure.
+	if anomaly := m.pinnedDirectoryDrift(owner, runID, path); anomaly != "" {
+		record.BoundAnomaly = anomaly
+		// Best effort, and deliberately so: the anomaly is diagnosis, and a
+		// node that cannot write its own diagnosis has not changed what the run
+		// did. Failing the attempt here would turn "this node could not write
+		// its state directory" into "this run failed", which is a worse lie
+		// than the one this whole function exists to stop telling.
+		if err := m.writeRecord(record); err != nil {
+			m.log("agent: run %s: record that the per-run bound did not reach %q: %v", runID, path, err)
+		}
 		return nil
 	}
-	record.BoundAnomaly = anomaly
-	return m.writeRecord(record)
+	return m.enforceRunBound(owner.run, runID)
 }
 
-// boundCurrentDirectory enforces the per-run bound on whatever directory now
-// stands at the run's name, when that is no longer the directory preparation
-// pinned.
+// pinnedDirectoryDrift reports that the run's name no longer leads to the
+// directory preparation pinned, which is the one condition under which the
+// per-run bound must not trim anything at all.
 //
-// The bound used to be a silent no-op against the one workload most likely to
-// blow through it. A job that does `rm -rf $handoff && mkdir $handoff` leaves
-// the pinned handle pointing at an unlinked inode: finish trimmed an inode with
-// no links, removed nothing, reported no error, and the files that should have
-// been bounded stayed on the node while the node believed they fit. Every byte
-// of that run is then mischarged for as long as it is retained.
+// The bound used to be a silent no-op against the workload most likely to blow
+// through it. A job that does `rm -rf $handoff && mkdir $handoff` leaves the
+// handle preparation pinned pointing at an unlinked inode: finish trimmed an
+// inode with no links, removed nothing, reported no error, and the files that
+// should have been bounded stayed on the node while the node believed they fit.
+// Every byte of that run is then mischarged for as long as it is retained,
+// which is exactly the number #494's node budget is about to be built on.
 //
-// The pinned handle is still trimmed first, by finish above, because a
-// directory merely renamed away is still this run's storage and the contract
-// says so. This is the second half: check that the name still leads to it, and
-// if it does not, bound the directory that is really there.
+// Neither directory is trimmed on a mismatch. Not the replacement: the only
+// thing that could prove a directory that appeared after preparation is this
+// run's own is the ownership marker, and the marker is a file inside a
+// directory that shares this agent's OS identity, so a workload can write any
+// marker it likes, including a copy of another run's. Not the pinned handle
+// either: once the name has moved on, that handle is either an unlinked inode
+// -- where reading it fails on Linux and achieves nothing anywhere -- or a
+// directory sitting somewhere this run's path lease says nothing about. So the
+// conservative half is what lands: the drift is named in the log and recorded
+// on the retention record, and nothing is deleted. The bound is no longer
+// silently skipped; it is openly not met.
 //
-// Re-acquisition goes through exactly the path preparation uses -- no-follow,
-// directory-only, identity re-checked after the open -- and then reads the
-// ownership marker. A marker naming another run or another node means the name
-// now leads to someone else's results, and one run's bound is never enforced by
-// deleting another run's files. Nothing here follows a symlink and nothing here
-// removes the name itself.
+// The ownership marker is therefore still read exactly once, at preparation, as
+// docs/contracts/run-execution-context.md says.
 //
 // It never fails the attempt. A workload that destroyed its own handoff
-// directory has not failed its run. What it must never do is return quietly:
-// every outcome below is either logged with the run named or recorded on the
-// retention record, and usually both.
-func (m *handoffManager) boundCurrentDirectory(owner *handoffOwnership, runID, nodeID, path string) handoffRecordAnomaly {
+// directory has not failed its run.
+func (m *handoffManager) pinnedDirectoryDrift(owner *handoffOwnership, runID, path string) handoffRecordAnomaly {
+	if owner.prepared == nil {
+		m.log("agent: run %s: %q was prepared without a recorded identity; the per-run bound is not applied", runID, path)
+		return handoffBoundDirectoryUnverifiable
+	}
 	root, err := openPrivateHandoffDirectory(m.root)
 	if err != nil {
-		m.log("agent: run %s: open the handoff root to re-check %q after trimming: %v", runID, path, err)
-		return handoffBoundDirectoryUnreachable
+		m.log("agent: run %s: open the handoff root to check %q before trimming: %v", runID, path, err)
+		return handoffBoundDirectoryUnverifiable
 	}
 	defer root.Close()
-	pinned, err := owner.run.Stat(".")
-	if err != nil {
-		m.log("agent: run %s: stat the prepared handoff directory for %q: %v", runID, path, err)
-		return handoffBoundDirectoryUnreachable
-	}
 	current, err := root.Lstat(runID)
-	if err == nil && os.SameFile(pinned, current) {
+	if errors.Is(err, fs.ErrNotExist) {
+		m.log("agent: run %s: %q no longer exists; the per-run bound trimmed nothing, and whatever the workload removed is not accounted for",
+			runID, path)
+		return handoffBoundDirectoryReplaced
+	}
+	if err != nil {
+		m.log("agent: run %s: inspect %q before trimming: %v", runID, path, err)
+		return handoffBoundDirectoryUnverifiable
+	}
+	if os.SameFile(owner.prepared, current) {
 		return ""
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		m.log("agent: run %s no longer has a handoff directory at %q: the name preparation created is gone, so the per-run bound reached only the directory it pinned",
-			runID, path)
-		return handoffBoundDirectoryUnreachable
-	}
-	if err != nil {
-		m.log("agent: run %s: inspect %q after trimming: %v", runID, path, err)
-		return handoffBoundDirectoryUnreachable
-	}
-	m.log("agent: run %s: %q is no longer the directory preparation pinned (it is now %s); the per-run bound is being re-applied to the directory that is actually there",
+	m.log("agent: run %s: %q is no longer the directory preparation pinned (it is now %s); the per-run bound trimmed nothing and both directories are left untouched",
 		runID, path, current.Mode())
-	replaced, err := openHandoffDirectory(root, runID)
-	if err != nil {
-		m.log("agent: run %s: the directory now at %q cannot be bounded: %v", runID, path, err)
-		return handoffBoundDirectoryUnreachable
-	}
-	defer replaced.Close()
-	marker, exists, err := readHandoffMarker(replaced)
-	if err != nil {
-		m.log("agent: run %s: the directory now at %q carries an unusable ownership marker and was not trimmed: %v", runID, path, err)
-		return handoffBoundDirectoryUnreachable
-	}
-	if exists && (marker.RunID != runID || marker.NodeID != nodeID) {
-		m.log("agent: run %s: the directory now at %q belongs to run %q on node %q; its files are not this run's to trim",
-			runID, path, marker.RunID, marker.NodeID)
-		return handoffBoundDirectoryForeign
-	}
-	if err := m.enforceRunBound(replaced, runID); err != nil {
-		m.log("agent: run %s: bound the recreated handoff directory at %q: %v", runID, path, err)
-		return handoffBoundDirectoryUnreachable
-	}
-	return ""
+	return handoffBoundDirectoryReplaced
 }
 
 // readResult reads this run's result document through the same receipt that
@@ -605,9 +614,12 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 // It acts only on directories the agent has a record for. A directory under
 // the root with no record is someone else's and is never measured or removed.
 //
-// A record whose directory it cannot remove is retried a bounded number of
-// times and then quarantined (noteExpiryFailure). Quarantine stops the retries;
-// it never widens what the sweep is willing to delete.
+// A record whose directory it cannot remove is retried for as long as the
+// failure can clear on its own. The one class that cannot -- the run's name
+// holds something that is not a directory -- pauses after a few identical
+// refusals (noteExpiryFailure) and resumes by itself the moment a directory is
+// back there (liftQuarantine). Neither ever widens what the sweep is willing to
+// delete.
 func (m *handoffManager) collect() error {
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
@@ -618,52 +630,226 @@ func (m *handoffManager) collect() error {
 	defer root.Close()
 	now := m.now().UTC()
 	for _, record := range m.loadRecords() {
-		if record.Quarantine != "" {
-			// Already decided. Retrying it would be the hourly loop this
-			// quarantine exists to end.
+		if record.Quarantine == "" && (record.RetainUntil.IsZero() || now.Before(record.RetainUntil)) {
 			continue
 		}
-		if record.RetainUntil.IsZero() || now.Before(record.RetainUntil) {
-			continue
-		}
-		removed, err := m.removeExpiredRun(root, record)
-		if err != nil {
-			m.noteExpiryFailure(record, err)
-			continue
-		}
-		if removed {
-			m.log("agent: retained results for run %s expired and were removed", record.RunID)
-		}
+		m.expireRun(root, record, now)
 	}
 	return nil
 }
 
-// noteExpiryFailure bounds how often one record can send the collector at a
-// directory it cannot remove.
+// expireRun decides everything this sweep will decide about one record while
+// holding that record's path lease, and writes nothing about it once the lease
+// is gone.
+//
+// Splitting those two used to lose a rerun's results. The sweep released the
+// lease and *then* persisted its failure, so a retry that acquired the lease in
+// between, ran, and wrote a fresh deadline and verdict had them overwritten by
+// the sweep's expired snapshot -- and the next sweep would delete files a run
+// had just retained. collectMu does not help: an attempt's finalization writes
+// its record before it enters collection at all.
+//
+// Holding the lease closes the window on one side. The record can still have
+// moved on between loadRecords and the lease, so every write below also
+// re-reads the record and refuses if it is no longer the one this sweep loaded
+// (rewriteRecord).
+func (m *handoffManager) expireRun(root *os.Root, record retentionRecord, now time.Time) {
+	lease := m.tryCollectLease(record.Directory)
+	if lease == nil {
+		// An attempt holds this path. It is not the sweep's to touch, and it is
+		// not a failure either.
+		return
+	}
+	defer lease.release()
+	if handoffSweepRace != nil {
+		handoffSweepRace(handoffSweepLeaseAcquired, record)
+	}
+	// The snapshot was loaded before the lease, so an attempt could have
+	// finished in that window and written the run's real terminal facts. Every
+	// decision below -- expired or not, quarantined or not, delete or not --
+	// runs on what is on disk now, under the lease, not on that snapshot. The
+	// sweep deleting results a rerun retained seconds ago is the same bug as
+	// the sweep overwriting them.
+	current, ok := m.currentRecord(record)
+	if !ok {
+		return
+	}
+	record = current
+	if record.Quarantine != "" {
+		lifted, ok := m.liftQuarantine(root, record)
+		if !ok {
+			return
+		}
+		record = lifted
+	}
+	if record.RetainUntil.IsZero() || now.Before(record.RetainUntil) {
+		return
+	}
+	removed, err := m.removeExpiredRun(root, record, lease)
+	if err != nil {
+		m.noteExpiryFailure(record, err)
+		return
+	}
+	if removed {
+		m.log("agent: retained results for run %s expired and were removed", record.RunID)
+	}
+}
+
+// liftQuarantine re-checks, once per sweep and with one Lstat, whether the
+// condition that paused this record still holds.
+//
+// Quarantine has to be reversible without a person. The only thing it is ever
+// set on is a run name that is structurally not a directory, and that is a
+// condition a workload can undo as easily as it created it -- so the sweep
+// looks, and the moment a directory is back at the name (or the name is gone
+// entirely) the pause lifts and this sweep goes on to expire it normally.
+//
+// It reports whether the caller should continue with this record.
+func (m *handoffManager) liftQuarantine(root *os.Root, record retentionRecord) (retentionRecord, bool) {
+	info, err := root.Lstat(record.RunID)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Nothing is there any more. Expiry below removes the record.
+	case err != nil:
+		return record, false
+	case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
+		// Still the shape the sweep cannot remove. Say nothing: repeating the
+		// refusal every hour is what the quarantine exists to stop.
+		return record, false
+	}
+	lifted := record
+	lifted.Quarantine = ""
+	lifted.QuarantineDetail = ""
+	lifted.QuarantinedAt = time.Time{}
+	lifted.ExpiryFailures = 0
+	lifted.StructuralRefusals = 0
+	m.log("agent: run %s is a directory again at %q; its expiry quarantine is lifted and the sweep resumes",
+		record.RunID, record.Directory)
+	if !m.rewriteRecord(record, lifted) {
+		return record, false
+	}
+	return lifted, true
+}
+
+// noteExpiryFailure records that this sweep could not remove one run, and
+// bounds the retry only for the class of failure that repeating cannot fix.
 //
 // A workload that replaces its own expired run name with a symlink used to buy
 // itself an unbounded retry: the sweep refuses to follow the link, logs the
 // refusal, and comes back an hour later to refuse it again, every hour, for as
 // long as the node runs. Nothing ever decided, and the same line filled the log
-// forever. After maxExpiryAttempts consecutive failures the record is
-// quarantined with a typed reason. That stops the retries and nothing else --
-// the directory is still never followed and never deleted, and the record stays
-// on disk so the node doctor and this log can both name what is sitting there.
+// forever. That refusal is structural -- it is byte-for-byte identical on every
+// sweep -- so after maxStructuralRefusals of them the record is quarantined,
+// reversibly (liftQuarantine).
+//
+// Everything else is transient and is retried for as long as it keeps failing,
+// exactly as it was before quarantine existed. A busy filesystem, an unreadable
+// directory, a permission the node regains: four unlucky sweeps -- which an
+// attempt's own finalization can trigger back to back, in minutes -- must not
+// end the seven-day sweep for that run. The count is still persisted, so being
+// stuck is visible even while the sweep keeps trying.
 func (m *handoffManager) noteExpiryFailure(record retentionRecord, cause error) {
-	record.ExpiryFailures++
-	if record.ExpiryFailures >= maxExpiryAttempts {
-		record.Quarantine = handoffExpiryDirectoryUnremovable
-		record.QuarantineDetail = boundedQuarantineDetail(cause)
-		record.QuarantinedAt = m.now().UTC()
-		m.log("agent: remove expired results for run %s: %v; %d consecutive attempts failed, so the record is quarantined as %s and the directory at %q is left exactly as it is",
-			record.RunID, cause, record.ExpiryFailures, record.Quarantine, record.Directory)
-	} else {
-		m.log("agent: remove expired results for run %s: %v (attempt %d of %d before the record is quarantined)",
-			record.RunID, cause, record.ExpiryFailures, maxExpiryAttempts)
+	if handoffSweepRace != nil {
+		handoffSweepRace(handoffSweepFailureRecorded, record)
 	}
-	if err := m.writeRecord(record); err != nil {
-		m.log("agent: record the failed expiry of run %s: %v", record.RunID, err)
+	updated := record
+	updated.ExpiryFailures++
+	structural := errors.Is(cause, errHandoffNameNotADirectory)
+	if structural {
+		updated.StructuralRefusals++
 	}
+	switch {
+	case structural && updated.StructuralRefusals >= maxStructuralRefusals:
+		updated.Quarantine = handoffExpiryNameNotADirectory
+		updated.QuarantineDetail = boundedQuarantineDetail(cause)
+		updated.QuarantinedAt = m.now().UTC()
+		m.log("agent: remove expired results for run %s: %v; %d sweeps have found the same shape at %q, so the sweep pauses on it and the name is left exactly as it is until a directory is back there",
+			record.RunID, cause, updated.StructuralRefusals, record.Directory)
+	case structural:
+		m.log("agent: remove expired results for run %s: %v (%d of %d before the sweep pauses on it)",
+			record.RunID, cause, updated.StructuralRefusals, maxStructuralRefusals)
+	default:
+		m.log("agent: remove expired results for run %s: %v (%d consecutive failures; the sweep will try again)",
+			record.RunID, cause, updated.ExpiryFailures)
+	}
+	m.rewriteRecord(record, updated)
+}
+
+// rewriteRecord persists a sweep's change to one record only if the record on
+// disk is still the one this sweep loaded.
+//
+// The record it holds is a snapshot taken before the lease, and an attempt that
+// finished in between has already written the run's real terminal facts. Those
+// facts decide when the directory may be deleted, so writing a stale copy over
+// them is how a sweep deletes results a run retained seconds ago. Identity and
+// terminal facts are compared; the fields the sweep itself owns are not.
+func (m *handoffManager) rewriteRecord(snapshot, updated retentionRecord) bool {
+	if strings.TrimSpace(m.stateRoot) == "" {
+		return true
+	}
+	current, err := m.readRecord(filepath.Join(m.recordRoot(), recordComponent(snapshot.RunID)))
+	if err != nil {
+		m.log("agent: leave run %s's retention record alone: re-reading it failed: %v", snapshot.RunID, err)
+		return false
+	}
+	if !sameRetainedRun(current, snapshot) {
+		m.log("agent: leave run %s's retention record alone: it was rewritten while this sweep ran, and the sweep's copy is the older one",
+			snapshot.RunID)
+		return false
+	}
+	if err := m.writeRecord(updated); err != nil {
+		m.log("agent: update run %s's retention record: %v", snapshot.RunID, err)
+		return false
+	}
+	return true
+}
+
+// sameRetainedRun compares the facts an attempt writes and a sweep must never
+// invent: who the record is for, and the terminal verdict and window it carries.
+func sameRetainedRun(left, right retentionRecord) bool {
+	return left.RunID == right.RunID && left.NodeID == right.NodeID &&
+		left.Directory == right.Directory &&
+		left.RetainedAt.Equal(right.RetainedAt) &&
+		left.RetainUntil.Equal(right.RetainUntil) &&
+		left.Published == right.Published && left.Succeeded == right.Succeeded
+}
+
+// handoffSweepRace is a test seam. It runs at the two points in one record's
+// sweep where a concurrent attempt used to be able to slip past -- just after
+// the path lease is taken, and inside the failure handling -- so those
+// interleavings can be staged deterministically instead of raced for. Nothing
+// outside a test ever sets it.
+var handoffSweepRace func(stage string, record retentionRecord)
+
+const (
+	handoffSweepLeaseAcquired   = "lease-acquired"
+	handoffSweepFailureRecorded = "failure-recorded"
+)
+
+// currentRecord re-reads one record under the path lease and refuses to act on
+// anything it cannot read and validate. A record the agent cannot trust is not
+// authority to delete a directory, which is the same rule loadRecords applies.
+func (m *handoffManager) currentRecord(snapshot retentionRecord) (retentionRecord, bool) {
+	if strings.TrimSpace(m.stateRoot) == "" {
+		return snapshot, true
+	}
+	name := recordComponent(snapshot.RunID)
+	record, err := m.readRecord(filepath.Join(m.recordRoot(), name))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.log("agent: skip run %s this sweep: re-reading its retention record failed: %v", snapshot.RunID, err)
+		}
+		return retentionRecord{}, false
+	}
+	if err := validRetentionRecord(record, name, m.root, m.nodeID, m.retention, m.now().UTC()); err != nil {
+		m.log("agent: skip run %s this sweep: its retention record is no longer trustworthy: %v", snapshot.RunID, err)
+		return retentionRecord{}, false
+	}
+	if !sameRetainedRun(record, snapshot) {
+		m.log("agent: run %s was retained again while this sweep ran; the sweep acts on the newer record",
+			snapshot.RunID)
+	}
+	return record, true
 }
 
 // boundedQuarantineDetail keeps one OS error's own words without letting them
@@ -696,16 +882,12 @@ func (m *handoffManager) tryCollectLease(path string) *handoffLease {
 	return lease
 }
 
-// removeExpiredRun deletes one expired run under the path-ownership lock, and
-// re-checks that no attempt holds it while that lock is held. Selecting
+// removeExpiredRun deletes one expired run. Its caller holds the record's path
+// lease for the whole call and for the failure accounting afterwards, and it
+// re-checks that no attempt holds the path while that lease is held. Selecting
 // candidates and then deleting them without it would let an attempt claim the
 // path in between and lose its directory to a sweep that decided earlier.
-func (m *handoffManager) removeExpiredRun(root *os.Root, record retentionRecord) (bool, error) {
-	lease := m.tryCollectLease(record.Directory)
-	if lease == nil {
-		return false, nil
-	}
-	defer lease.release()
+func (m *handoffManager) removeExpiredRun(root *os.Root, record retentionRecord, lease *handoffLease) (bool, error) {
 	run, err := openHandoffDirectory(root, record.RunID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, m.removeRecord(record.RunID)

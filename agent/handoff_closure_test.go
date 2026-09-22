@@ -290,13 +290,7 @@ func TestHandoffFIFOMarkerDoesNotBlockPreparation(t *testing.T) {
 		marker := filepath.Join(path, handoffMarkerName)
 		// Regular, valid, and this run's own: the mode check has no reason to
 		// refuse it, so everything below is the later guards' work.
-		payload, err := json.Marshal(handoffMarker{
-			RunID: "run_fifo_swapped", NodeID: "node-1", RetainUntil: harness.now.Add(time.Hour),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(marker, payload, 0600); err != nil {
+		if err := os.WriteFile(marker, markerPayload(t, "run_fifo_swapped", "node-1", harness.now), 0600); err != nil {
 			t.Fatal(err)
 		}
 		// The swap happens in the window the seam names: after the Lstat that
@@ -316,11 +310,69 @@ func TestHandoffFIFOMarkerDoesNotBlockPreparation(t *testing.T) {
 		}
 		t.Cleanup(func() { handoffMarkerOpenRace = nil })
 
-		err = prepareWithoutBlocking(t, harness, "run_fifo_swapped", path, marker)
+		err := prepareWithoutBlocking(t, harness, "run_fifo_swapped", path, marker)
 		if err == nil || !strings.Contains(err.Error(), "changed identity while opening") {
 			t.Fatalf("preparation error = %v, want the post-open identity refusal", err)
 		}
 	})
+
+	t.Run("a regular marker swapped for a different regular file is refused", func(t *testing.T) {
+		// The swapped-FIFO case above reaches the post-open check with a
+		// non-regular mode, so the mode half of it fires and SameFile is never
+		// consulted. This case swaps in another *regular* file, so the mode
+		// half passes and only SameFile can refuse. The original inode is kept
+		// alive by an open descriptor for the whole swap, so the replacement
+		// cannot land on a recycled inode number and pass by accident.
+		harness := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(harness.root, "run_marker_swapped")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(path, handoffMarkerName)
+		if err := os.WriteFile(marker, markerPayload(t, "run_marker_swapped", "node-1", harness.now), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// A marker naming another node: if SameFile is gone, this one is read
+		// and preparation fails on the node mismatch instead, which is a
+		// different error and a failing assertion below.
+		replacement := markerPayload(t, "run_marker_swapped", "some-other-node", harness.now)
+		var once sync.Once
+		handoffMarkerOpenRace = func() {
+			once.Do(func() {
+				original, err := os.Open(marker)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				t.Cleanup(func() { original.Close() })
+				if err := os.Remove(marker); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := os.WriteFile(marker, replacement, 0600); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		t.Cleanup(func() { handoffMarkerOpenRace = nil })
+
+		err := prepareWithoutBlocking(t, harness, "run_marker_swapped", path, marker)
+		if err == nil || !strings.Contains(err.Error(), "changed identity while opening") {
+			t.Fatalf("preparation error = %v, want the post-open SameFile refusal", err)
+		}
+	})
+}
+
+// markerPayload encodes one ownership marker exactly as the agent writes it.
+func markerPayload(t *testing.T, runID, nodeID string, now time.Time) []byte {
+	t.Helper()
+	payload, err := json.Marshal(handoffMarker{
+		RunID: runID, NodeID: nodeID, RetainUntil: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 // prepareWithoutBlocking runs preparation with a deadline and unblocks a
@@ -376,7 +428,12 @@ func TestHandoffNonemptyResultDirectoryIsRemovedBeforeBounding(t *testing.T) {
 	}
 }
 
-func TestHandoffFinalizationUsesPreparedDirectoryAfterPathReplacement(t *testing.T) {
+// TestHandoffFinalizationTrimsNothingWhenTheRunNameWasReplaced: the run's name
+// is a symlink to another run by the time the attempt finishes. Nothing is
+// trimmed -- not through the link, and not through the prepared handle either,
+// which the name no longer leads to -- and the fact that the bound did not run
+// is on the record instead of nowhere.
+func TestHandoffFinalizationTrimsNothingWhenTheRunNameWasReplaced(t *testing.T) {
 	harness := newRetentionHarness(t, time.Hour)
 	harness.manager.runBytes = 1024
 	path := filepath.Join(harness.root, "run_original")
@@ -407,10 +464,13 @@ func TestHandoffFinalizationUsesPreparedDirectoryAfterPathReplacement(t *testing
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(victim, "keep.bin")); err != nil {
-		t.Fatalf("trim redirected to another run: %v", err)
+		t.Fatalf("trim followed the link into another run: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(moved, "large.bin")); !os.IsNotExist(err) {
-		t.Fatalf("prepared handle was not trimmed: %v", err)
+	if info, err := os.Stat(filepath.Join(moved, "large.bin")); err != nil || info.Size() != 4096 {
+		t.Fatalf("a directory the run's name no longer leads to was trimmed: %v, %v", info, err)
+	}
+	if !harness.logged("no longer the directory preparation pinned") {
+		t.Fatalf("the drift was silent: %v", harness.logs)
 	}
 }
 

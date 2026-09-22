@@ -36,13 +36,18 @@ const (
 	// retentionClockSkew is how far ahead of the agent's own clock a record's
 	// timestamps may sit before they are treated as untrustworthy.
 	retentionClockSkew = 5 * time.Minute
-	// maxExpiryAttempts bounds how often the collector retries one record whose
-	// directory it cannot remove. A name a workload replaced with a symlink is
-	// refused at every attempt, and an unbounded retry means the same refusal
-	// is logged hourly for as long as the node runs, with nothing ever
-	// deciding. After this many consecutive failures the record is quarantined
-	// and the collector stops asking.
-	maxExpiryAttempts = 4
+	// maxStructuralRefusals bounds how often the collector retries a record
+	// whose run name is structurally not a directory it can sweep -- a symlink,
+	// a FIFO, a regular file. That refusal is deterministic: it is identical on
+	// every sweep, so repeating it hourly for as long as the node runs decides
+	// nothing and fills the log. After this many the record is quarantined.
+	//
+	// It bounds *only* that class. A removal that failed because the
+	// filesystem was busy, unreadable or unwritable is retried for as long as
+	// it keeps failing, exactly as it was before quarantine existed, because
+	// that fault can clear and the seven-day sweep has to still be there when
+	// it does.
+	maxStructuralRefusals = 4
 	// maxQuarantineDetailBytes bounds the free-form cause kept beside the typed
 	// quarantine reason, so one long OS error cannot push a record past
 	// maxRetentionRecordBytes and make it unreadable.
@@ -50,27 +55,32 @@ const (
 )
 
 // handoffRecordAnomaly is a typed reason the agent could not do to a run's
-// directory what its record asked. It is typed rather than a free-form string
-// because the node doctor and the log both have to name the same condition:
-// "this run's files are still on the node, and here is the one reason nothing
-// is being done about them".
+// directory what its record asked: "this run's files are still on the node,
+// and here is the one reason nothing is being done about them".
+//
+// It is typed rather than a free-form string so that a reader and a future
+// consumer name the same condition. Today the only consumers are the agent log
+// and the retention record's own JSON under the agent state root; nothing in
+// `wefty inspect`, the node doctor or the agent status surfaces reads it yet.
+// Reporting it is #494's later slices, and this type is what they will read.
 type handoffRecordAnomaly string
 
 const (
-	// handoffBoundDirectoryUnreachable: at finish the run's name no longer led
-	// to the directory preparation pinned, and the directory standing there now
-	// could not be opened on the same no-follow, identity-checked path
-	// preparation uses. The bound was enforced on the pinned handle only.
-	handoffBoundDirectoryUnreachable handoffRecordAnomaly = "bound_directory_unreachable"
-	// handoffBoundDirectoryForeign: the directory standing at the run's name
-	// carries an ownership marker naming another run or another node. Trimming
-	// it would bound one run's results by deleting another's, so nothing is
-	// trimmed there.
-	handoffBoundDirectoryForeign handoffRecordAnomaly = "bound_directory_not_this_runs"
-	// handoffExpiryDirectoryUnremovable: expiry failed maxExpiryAttempts times
-	// in a row. The directory is left exactly as it is -- never followed, never
-	// deleted -- and the record stops driving retries.
-	handoffExpiryDirectoryUnremovable handoffRecordAnomaly = "expiry_directory_unremovable"
+	// handoffBoundDirectoryReplaced: at finish the run's name no longer led to
+	// the directory preparation pinned. The per-run bound reached the pinned
+	// directory and nothing else, so what stands at the name now is unbounded
+	// and unaccounted, and is deliberately left untouched.
+	handoffBoundDirectoryReplaced handoffRecordAnomaly = "bound_directory_replaced"
+	// handoffBoundDirectoryUnverifiable: the agent could not establish either
+	// way whether the name still led to the pinned directory. The bound reached
+	// the pinned directory; whether that was the whole story is unknown.
+	handoffBoundDirectoryUnverifiable handoffRecordAnomaly = "bound_directory_unverifiable"
+	// handoffExpiryNameNotADirectory: the run's name is structurally not
+	// something the sweep can remove -- a symlink, a FIFO, a regular file -- and
+	// has been for maxStructuralRefusals sweeps. The directory is left exactly
+	// as it is: never followed, never deleted. The quarantine lifts by itself
+	// the moment the name is a directory again.
+	handoffExpiryNameNotADirectory handoffRecordAnomaly = "expiry_name_is_not_a_directory"
 )
 
 // retentionRecord is the agent's own answer to "what is retained, since when,
@@ -83,21 +93,36 @@ type retentionRecord struct {
 	RetainUntil time.Time `json:"retain_until"`
 	Published   bool      `json:"published,omitempty"`
 	Succeeded   bool      `json:"succeeded,omitempty"`
-	// BoundAnomaly names why the per-run bound could not be enforced on the
-	// directory that actually stood at this run's name when the attempt
-	// finished. It is recorded rather than returned because a workload that
-	// destroys its own handoff directory has not failed its run -- but a node
-	// whose bound silently did nothing is exactly the state this field exists
-	// to stop being invisible.
+	// BoundAnomaly names why the per-run bound did not reach the directory that
+	// actually stood at this run's name when the attempt finished. It is
+	// recorded rather than returned because a workload that destroys its own
+	// handoff directory has not failed its run -- but a node whose bound
+	// silently did nothing is exactly the state this field exists to stop being
+	// invisible. It reaches a person through the agent log and this record's
+	// own JSON; no status or doctor surface reads it yet.
 	BoundAnomaly handoffRecordAnomaly `json:"bound_anomaly,omitempty"`
-	// ExpiryFailures counts consecutive collector attempts that could not
-	// remove this run's directory. It is persisted rather than kept in memory
-	// so an agent restart does not reset a retry that is never going to
-	// succeed.
+	// ExpiryFailures counts every consecutive sweep that could not remove this
+	// run's directory, whatever the cause. It drives nothing; it exists so a
+	// person reading the record can see that a run has been stuck and for how
+	// long.
 	ExpiryFailures int `json:"expiry_failures,omitempty"`
-	// Quarantine, once set, stops the collector acting on this record at all.
-	// The directory it names is left untouched: quarantine is the agent saying
-	// it will not keep trying, not permission to try harder.
+	// StructuralRefusals counts only the subset of those failures the sweep
+	// will never resolve by waiting -- the run's name is not a directory. It is
+	// what quarantine is bounded by, kept separate so a run that hit four
+	// transient errors is not treated as a run whose name is a symlink.
+	//
+	// Both are persisted rather than held in memory so restarting the agent
+	// does not reset a count that is never going to change.
+	StructuralRefusals int `json:"structural_refusals,omitempty"`
+	// Quarantine, once set, stops the sweep retrying this record while the
+	// condition that set it still holds. Each sweep re-checks the run's name
+	// cheaply and lifts it as soon as a directory is back, so this is a pause,
+	// never a permanent retirement, and it needs no operator to clear.
+	//
+	// It means "unsafe to delete", and only that. It is deliberately not a
+	// statement about accounting: these bytes are still on the node, and #494's
+	// node budget must keep charging them, or quarantine becomes a way to hide
+	// storage from the budget.
 	Quarantine handoffRecordAnomaly `json:"quarantine,omitempty"`
 	// QuarantineDetail is the last failure's own words, bounded. The typed
 	// reason above is what anything branches on; this is what a person reads.
