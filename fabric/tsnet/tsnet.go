@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/internal/naming"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/envknob"
 	tailscaletsnet "tailscale.com/tsnet"
 )
 
@@ -52,6 +53,25 @@ func New(config Config) (*Fabric, error) {
 	if !logical {
 		return nil, fmt.Errorf("tsnet fabric: Name %q is not a wefty logical name", config.Name)
 	}
+	// Wefty owns its logs: the embedded node must never upload its log to
+	// the pinned tsnet dependency's log service. This must run before the
+	// tailscaletsnet.Server below is constructed, and in particular before
+	// its first Start (triggered lazily by Listen, Dial, or WhoIs): that is
+	// when tsnet.Server.startLogger (tsnet/tsnet.go:1053) builds the log
+	// upload transport via logpolicy.NewLogtailTransport ->
+	// TransportOptions.New and wires it into s.logtail through
+	// logtail.Config.HTTPC (tsnet/tsnet.go:1085,1088). TransportOptions.New
+	// checks envknob.NoLogsNoSupport() at call time and substitutes a no-op
+	// transport when it is set (tailscale.com@v1.102.3
+	// logpolicy/logpolicy.go:891-894). envknob.SetNoLogsNoSupport()
+	// (envknob/envknob.go:477-479) sets TS_NO_LOGS_NO_SUPPORT=true through
+	// the dependency's own Setenv, and envknob.NoLogsNoSupport() re-reads
+	// os.Getenv on every call rather than a once-cached value
+	// (envknob/envknob.go:270,280-293, Bool -> boolOr), so there is no
+	// earlier-cached read to race against as long as this runs before
+	// Start. Calling the dependency's own setter (rather than os.Setenv
+	// with the variable's name) keeps that name inside the fabric seam.
+	envknob.SetNoLogsNoSupport()
 	return &Fabric{
 		localName:      name,
 		coordinatorURL: config.CoordinatorURL,

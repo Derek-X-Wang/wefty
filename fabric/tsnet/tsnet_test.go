@@ -8,6 +8,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 )
 
@@ -17,6 +18,25 @@ func TestNewRequiresWeftyName(t *testing.T) {
 	}
 	if _, err := New(Config{Name: "wefty://node/runner-1"}); err != nil {
 		t.Fatalf("New() rejected a wefty name: %v", err)
+	}
+}
+
+// TestNewOptsOutOfLogUpload asserts that New sets the pinned tsnet
+// dependency's own no-logs-no-support knob before returning, so the
+// embedded node's tsnet.Server.startLogger path (tsnet/tsnet.go:1053)
+// never builds a real log-upload transport (logpolicy/logpolicy.go:891-894
+// substitutes a no-op transport once envknob.NoLogsNoSupport() is true).
+// Wefty owns its logs; nothing should reach the dependency's log service.
+func TestNewOptsOutOfLogUpload(t *testing.T) {
+	t.Setenv("TS_NO_LOGS_NO_SUPPORT", "")
+	if envknob.NoLogsNoSupport() {
+		t.Fatal("precondition failed: TS_NO_LOGS_NO_SUPPORT already set")
+	}
+	if _, err := New(Config{Name: "wefty://node/runner-1"}); err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !envknob.NoLogsNoSupport() {
+		t.Fatal("New() did not opt the embedded node out of log upload")
 	}
 }
 
