@@ -983,6 +983,15 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteVolume {
 			return false
 		}
+		// Backup-copy deletion is the same shape: one durable copy, separately
+		// authorized, and the caller accepts only an independently verified
+		// positive-absence receipt. Reading its refusal as node-wide loss made
+		// an immutable Backup copy invalidate the exclusive session on every
+		// retry, so the node dropped kind:oci and nothing could be placed while
+		// the stalled removal's Slot was free (#513).
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteBackup {
+			return false
+		}
 		// Delete is independently bounded and followed by attempt-scoped
 		// verification. Cancellation or deadline expiry here is failed cleanup
 		// for this attempt, not proof that the helper session or namespace

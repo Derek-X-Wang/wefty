@@ -107,7 +107,27 @@ a Computer, still earns the separate Storage-custody outcome, but it never
 upgrades the removal's own unverified terminal outcome. A stalled removal also
 retains its node-local binding image pin, which the standing directive still
 needs, and any Backup copies it never deleted, which the standing directive
-still names, until that positive cleanup releases them. The node doctor's
+still names, until that positive cleanup releases them.
+A declared stall is L1's own record that this cleanup is not proven and the
+Slot is released, so the node must not answer it by withdrawing the capability
+that released Slot exists to make usable. Registration and every OCI recovery
+therefore suppress the duplicate Backup-prune reconciliation for a removal
+whose stall L1 has accepted -- exactly the copies its standing directive names,
+matched on copy and Backup identity, Storage identity and generation, bound
+node, root instance, cleanup fence and operation revision -- leaving that
+removal's own retries as the only cadence that touches them. Every other
+directive in the same response is reconciled and still gates, so a node whose
+sole outstanding cleanup is a stalled one publishes `kind:oci` again. This
+exempts nothing from the helper's namespace sweep and verification: runtime
+residue belonging to a stalled Computer is still refused by that proof, and its
+durable-retention rules are unchanged. The suppression is derived on every pass
+from the node's own durable removal record, which carries the accepted
+declaration, joined with the standing directive, and only when the two agree on
+job, removal generation, cleanup fence, root instance and bound node; any
+disagreement reconciles normally. Nothing is latched, so releasing the record
+restores ordinary reconciliation. There is still one bound and one outcome for
+a removal, never a second accounting for one of its steps. The
+node doctor's
 `oci_removal_stalled` finding names this outcome as the way a pinned slot is
 released.
 Retries after declaration, except a complete record's one returning-boot

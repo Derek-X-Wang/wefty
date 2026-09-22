@@ -235,11 +235,20 @@ The client boundary exposes runtime loss as a typed error only for an active
 session's transport disappearance, `session_stale`, an explicit image
 `engine_loss` fact, or an `engine_failure` that is none of the following: an
 `attempt_scoped` `Run` refusal, a bounded `Delete` cancellation or deadline, or
-any `DeleteManagedVolume` failure. The `attempt_scoped` claim is written and
+any `DeleteManagedVolume` or `DeleteComputerBackupCopy` failure. The
+`attempt_scoped` claim is written and
 read only for `Run`; the client ignores it on every other operation. A typed
 `Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
 failure. Every `DeleteManagedVolume` failure is scoped to its independently
-authorized durable resource and removal operation. An `operation_failed`
+authorized durable resource and removal operation, and
+`DeleteComputerBackupCopy` carries the same scope for one Backup copy: it is
+separately authorized, deletes only that copy, and the caller accepts it only
+against an independently verified positive-absence receipt, so refusing it
+proves nothing about namespace authority. Reading that refusal as node-wide
+loss let one Backup copy the node could not delete invalidate the exclusive
+session on every retry, so the node withdrew `kind:oci` and could place nothing
+while the stalled removal holding that copy had already released its Slot.
+An `operation_failed`
 Computer-disk deletion is retried at most three times with 100 ms between
 attempts. If the third attempt still fails, the helper durably writes an
 authority-bound `managed_volume_cleanup_quarantined` receipt, fences future
@@ -313,6 +322,18 @@ that session. Sweep readiness is never inherited from an earlier session, even
 when node and boot-session IDs are textually identical. A failed or negative
 verification keeps every engine operation other than `Sweep` and namespace
 `Verify` behind `sweep_required`.
+
+A removal L1 has declared `stalled_cleanup_unverified` changes nothing about
+that proof. Runtime residue belonging to a stalled Computer is refused here
+exactly as any other residue is, and the durable-retention rules that decide
+what counts as residue are unchanged; this protocol has no stalled-resource
+exemption. What changes is above the proof, in the agent: registration and
+every OCI recovery suppress the duplicate Backup-prune reconciliation they
+would otherwise run for such a removal -- exactly the copies its standing
+directive names, matched on their full removal authority -- so the declared
+removal's own durable retries are the only cadence that touches those copies,
+and a node is not held back from advertising OCI by work it has already
+reported to L1 that it cannot finish. `state-machines.md` owns that rule.
 
 The client-side boot barrier waits for an incumbent session's monotonic
 heartbeat deadline and reap rather than preempting it, then acquires exclusive
