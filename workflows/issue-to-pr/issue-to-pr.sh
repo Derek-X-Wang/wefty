@@ -648,14 +648,44 @@ phase_done() {
 			'$1 == want && $2 != "" && $3 == who { found = 1 } END { exit found ? 0 : 1 }'
 }
 
+# marker_commit prints the SHA of the newest marker commit for phase $1 on
+# ORIGIN_SNAPSHOT that satisfies the exact trust check phase_done() applies --
+# the same trailer, run and author match -- so recovering content out of a
+# commit that could not have skipped the phase is never possible either.
+marker_commit() {
+	[ -n "$ORIGIN_SNAPSHOT" ] || return 1
+	git -C "$TREE_DIR" log \
+		--format='%H%x09%(trailers:key=Issue-To-PR-Marker,valueonly,separator=%x2C)%x09%(trailers:key=Issue-To-PR-Run,valueonly,separator=%x2C)%x09%ae' \
+		"$ORIGIN_SNAPSHOT" 2>/dev/null |
+		awk -F'\t' -v want="$ISSUE/$1" -v who="$MARKER_EMAIL" \
+			'$2 == want && $3 != "" && $4 == who { print $1; exit }'
+}
+
+# recovered_plan_text prints the plan marker commit $1's own middle paragraph
+# -- the plan text phase_complete embeds there (see below) -- with this
+# workflow's own trailing trailer paragraph stripped back off. A branch whose
+# plan marker predates that (no embedded plan) prints nothing, which is the
+# caller's signal to fall back to a retired legacy PLAN.md, if there was one.
+recovered_plan_text() {
+	git -C "$TREE_DIR" log -1 --format=%b "$1" 2>/dev/null |
+		sed -e '/^Issue-To-PR-Marker: /,$d'
+}
+
 # phase_complete records the phase and publishes it. The commit is empty when
 # the phase produced no files of its own, which is the point: the marker is a
-# fact about the run reaching here, not about what it wrote.
+# fact about the run reaching here, not about what it wrote. An optional
+# second argument is a body paragraph -- used only by the plan phase, to carry
+# the plan text itself, since PLAN.md is excluded from this worktree's git and
+# a resumed run's scratch directory starts empty. git drops an empty `-m`
+# cleanly, so the commit is byte-identical to the two-paragraph form when
+# there is no body.
 phase_complete() {
 	complete_phase=$1
+	complete_body=${2:-}
 	git -C "$TREE_DIR" add -A >/dev/null 2>&1 || true
 	if ! git -C "$TREE_DIR" commit --allow-empty --quiet \
 		-m "$(marker_subject "$complete_phase")" \
+		-m "$complete_body" \
 		-m "$(printf 'Issue-To-PR-Marker: %s/%s\nIssue-To-PR-Run: %s' "$ISSUE" "$complete_phase" "$RUN_ID")" \
 		>"$WORK_DIR/commit.log" 2>&1; then
 		fail_workflow "$complete_phase" "cannot record the phase marker commit" \
@@ -800,6 +830,41 @@ git -C "$TREE_DIR" config user.name "wefty issue-to-pr" >/dev/null 2>&1 || true
 git -C "$TREE_DIR" config user.email "issue-to-pr@wefty.invalid" >/dev/null 2>&1 || true
 HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
 
+# A branch from before PLAN.md was excluded from this worktree's git (below)
+# may still track it. Retiring it here -- before any phase runs -- makes the
+# "no PLAN.md in the diff" guarantee hold for every branch this workflow
+# resumes onto, not only ones created after this fix. Its content becomes this
+# run's fallback recovered plan, for a plan marker that predates embedding the
+# plan text in the marker commit's own message (below).
+LEGACY_PLAN_FILE=$WORK_DIR/legacy-plan.txt
+if git -C "$TREE_DIR" ls-files --error-unmatch PLAN.md >/dev/null 2>&1; then
+	git -C "$TREE_DIR" show HEAD:PLAN.md >"$LEGACY_PLAN_FILE" 2>/dev/null || : >"$LEGACY_PLAN_FILE"
+	if ! git -C "$TREE_DIR" rm --quiet -- PLAN.md >"$WORK_DIR/commit.log" 2>&1; then
+		fail_workflow checkout "cannot retire the tracked PLAN.md on $BRANCH" "$(tail -n 20 "$WORK_DIR/commit.log")"
+	fi
+	if ! git -C "$TREE_DIR" commit --quiet -m "issue-to-pr: retire tracked PLAN.md" \
+		>"$WORK_DIR/commit.log" 2>&1; then
+		fail_workflow checkout "cannot commit the PLAN.md retirement on $BRANCH" "$(tail -n 20 "$WORK_DIR/commit.log")"
+	fi
+	log "retired the tracked PLAN.md on $BRANCH"
+fi
+
+# PLAN.md is this run's own scratch, not part of the change: excluding it here
+# means every `git add -A` this script runs -- the phase markers and the
+# implement-phase safety net alike -- can never sweep it into a commit, so it
+# never ships in the pull request and the plan marker commit stays empty, as
+# the README promises. The exclude lives in the shared git-common-dir, which
+# only this run's own clone uses, so it cannot leak to anything else.
+GIT_COMMON_DIR=$(git -C "$TREE_DIR" rev-parse --git-common-dir 2>/dev/null) || GIT_COMMON_DIR=.git
+case $GIT_COMMON_DIR in
+/*) : ;;
+*) GIT_COMMON_DIR=$TREE_DIR/$GIT_COMMON_DIR ;;
+esac
+mkdir -p "$GIT_COMMON_DIR/info" 2>/dev/null || true
+if ! printf '/PLAN.md\n' >>"$GIT_COMMON_DIR/info/exclude" 2>/dev/null; then
+	fail_workflow checkout "cannot exclude PLAN.md from $BRANCH's git"
+fi
+
 # --------------------------------------------------------------------------
 # read-issue
 # --------------------------------------------------------------------------
@@ -844,6 +909,22 @@ fi
 
 if phase_done plan; then
 	phase_skipped plan
+	# PLAN.md itself never survives to a resumed run: it is excluded from this
+	# worktree's git, and scratch -- where a resumed run would otherwise have
+	# looked -- starts empty every run. The plan marker's own commit message is
+	# where the plan text actually lives (phase_complete embeds it below), so
+	# recovering it means reading that commit, not the working tree.
+	plan_marker_sha=$(marker_commit plan) || plan_marker_sha=
+	plan_text=
+	[ -z "$plan_marker_sha" ] || plan_text=$(recovered_plan_text "$plan_marker_sha")
+	if [ -z "$plan_text" ] && [ -s "$LEGACY_PLAN_FILE" ]; then
+		# This branch's plan marker predates embedding the plan in the commit
+		# message; fall back to the content retired from its tracked PLAN.md.
+		plan_text=$(cat "$LEGACY_PLAN_FILE" 2>/dev/null) || plan_text=
+	fi
+	[ -z "$plan_text" ] || printf '%s\n' "$plan_text" >"$PLAN_FILE"
+	[ -s "$PLAN_FILE" ] ||
+		fail_workflow plan "resuming skipped the plan phase but its plan text could not be recovered from $CONTINUE_FROM"
 else
 	phase_start plan "asking $AGENT for a plan"
 	{
@@ -857,7 +938,10 @@ else
 	[ -s "$PLAN_FILE" ] ||
 		fail_workflow plan "the $AGENT agent wrote no PLAN.md" "$(tail -c "$FAILURE_BYTE_LIMIT" "$WORK_DIR/agent-plan.log" 2>/dev/null)"
 	log "plan written ($(wc -c <"$PLAN_FILE" | tr -d ' ') bytes)"
-	phase_complete plan
+	# The plan text rides in the marker commit's own message: PLAN.md itself
+	# never reaches this branch, so this is the only place a resumed run (or a
+	# reviewer reading the marker) can recover it from.
+	phase_complete plan "$(cat "$PLAN_FILE" 2>/dev/null)"
 fi
 
 # --------------------------------------------------------------------------
@@ -931,7 +1015,12 @@ phase_start gates "running the repository gates"
 		gate_log=$WORK_DIR/gate-$gate.log
 		log "gate $gate: $command_line"
 		append_step "$gate" started "gate $gate" || log "WARNING: $REPORT_ERROR"
-		(cd "$TREE_DIR" && sh -c "$command_line") >"$gate_log" 2>&1
+		# The repository gates must not inherit this run's execution context:
+		# the repo's own tests assert WEFTY_L1_ENDPOINT is unset, and the
+		# attempt bridge exports it into every one-shot job environment.
+		(cd "$TREE_DIR" && unset WEFTY_RUN_ID WEFTY_RUN_DIR WEFTY_HANDOFF_DIR \
+			WEFTY_L1_ENDPOINT WEFTY_L3_ENDPOINT WEFTY_ATTEMPT_TOKEN WEFTY_RUN_TOKEN &&
+			sh -c "$command_line") >"$gate_log" 2>&1
 		exit_code=$?
 		# gofmt reports unformatted files on stdout and still exits 0.
 		if [ "$gate" = gofmt ] && [ "$exit_code" -eq 0 ] && [ -s "$gate_log" ]; then
@@ -1029,16 +1118,27 @@ phase_start open-pr "opening a draft pull request"
 		[ -n "$PR_URL" ] ||
 			fail_workflow open-pr "gh printed no pull request URL" "$(tail -n 20 "$WORK_DIR/pr.log")"
 	fi
-	HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
-	printf '{"url":"%s","head_sha":"%s","branch":"%s","issue":"%s","repo":"%s"}\n' \
-		"$(json_escape "$PR_URL")" "$(json_escape "$HEAD_SHA")" "$(json_escape "$BRANCH")" \
-		"$(json_escape "$ISSUE")" "$(json_escape "$REPO")" >"$PR_FILE" 2>/dev/null ||
-		log "WARNING: could not write $PR_FILE"
-	chmod 0600 "$PR_FILE" 2>/dev/null || true
-	[ -s "$PR_FILE" ] || fail_workflow open-pr "cannot write $PR_FILE"
 	log "pull request $PR_URL"
 }
 phase_complete open-pr
+
+# pr.json is written only now, after this phase's own marker commit has been
+# committed and pushed: that push is the branch's actual final state, and
+# GitHub resolves the pull request's head against the branch, not against
+# whatever HEAD was before this phase's marker. Writing it earlier recorded a
+# commit that was already one behind the pull request by the time anyone read
+# it, and disagreed with result.json, which is written after every phase.
+HEAD_SHA=$(git -C "$TREE_DIR" rev-parse HEAD 2>/dev/null) || HEAD_SHA=
+# pr.json is a prerequisite for success, not a best-effort flourish (see
+# "Verdict" below), so a write failure fails the workflow here rather than
+# only being logged and caught later.
+if ! printf '{"url":"%s","head_sha":"%s","branch":"%s","issue":"%s","repo":"%s"}\n' \
+	"$(json_escape "$PR_URL")" "$(json_escape "$HEAD_SHA")" "$(json_escape "$BRANCH")" \
+	"$(json_escape "$ISSUE")" "$(json_escape "$REPO")" >"$PR_FILE" 2>/dev/null; then
+	fail_workflow open-pr "cannot write $PR_FILE"
+fi
+chmod 0600 "$PR_FILE" 2>/dev/null || true
+[ -s "$PR_FILE" ] || fail_workflow open-pr "cannot write $PR_FILE"
 
 # --------------------------------------------------------------------------
 # Verdict

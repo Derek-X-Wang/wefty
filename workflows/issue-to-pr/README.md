@@ -72,8 +72,32 @@ one a run is in and `wefty inspect` shows how long each took:
 | `push` | the branch is on the remote, matching local HEAD |
 | `open-pr` | `gh pr create --draft`, and `pr.json` + `summary.md` |
 
-Each phase ends by recording an empty marker commit and **pushing** it. The
-subject is prose; the part that counts is the trailers:
+`PLAN.md` is excluded from the worktree's git, so it is never part of the
+change: it exists on disk for the `implement` phase and the pull request body
+to read, and does not reach a commit or the diff a reviewer sees. Its content
+still has to survive a resume, whose scratch directory starts empty every run,
+so the `plan` phase's own marker commit carries it as a paragraph in the
+commit message. Its tree diff is still empty; only `plan`'s message is not:
+
+```
+issue-to-pr: phase plan complete
+
+<the plan, verbatim>
+
+Issue-To-PR-Marker: <issue>/plan
+Issue-To-PR-Run: <run id>
+```
+
+Resuming past `plan` recovers the text from that message, not from `PLAN.md`
+on disk. A branch from before this existed may still track `PLAN.md` itself;
+resuming onto one retires it with its own commit,
+`issue-to-pr: retire tracked PLAN.md`, before any phase runs, and that
+tracked copy becomes the recovered plan if the branch's own `plan` marker
+predates carrying the text in its message.
+
+Every other phase's marker commit carries no such paragraph. Each phase ends
+by recording an empty-diff marker commit and **pushing** it. The subject is
+prose; the part that counts is the trailers:
 
 ```
 issue-to-pr: phase <name> complete
@@ -144,7 +168,7 @@ stay on the branch, so the next run can resume from where it stopped.
 
 | File | Where | What |
 |---|---|---|
-| `pr.json` | handoff dir | `{url, head_sha, branch, issue, repo}` |
+| `pr.json` | handoff dir | `{url, head_sha, branch, issue, repo}` — `head_sha` is the branch's HEAD after this phase's own marker push, the same commit `result.json` names |
 | `summary.md` | handoff dir | the pull request body, as submitted |
 | `result.json` | handoff dir + ledger | the verdict; read it with `wefty results` |
 | `failures.txt` | handoff dir | gate output, when a gate failed |
