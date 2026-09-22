@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
 func reimageTarget(digit byte) contract.OCIImageSpec {
@@ -111,19 +112,17 @@ func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
 		{"detachment receipt", func(r *ComputerReimagePreflightReceipt) { r.DetachmentReceiptID = "" }},
 		{"detachment attempt", func(r *ComputerReimagePreflightReceipt) { r.DetachmentAttemptID = "" }},
 		{"detachment fence", func(r *ComputerReimagePreflightReceipt) { r.DetachmentFencingToken = "" }},
-		{"platform os", func(r *ComputerReimagePreflightReceipt) { r.PlatformOS = "other" }},
-		{"platform architecture", func(r *ComputerReimagePreflightReceipt) { r.PlatformArchitecture = "other" }},
 		{"uid", func(r *ComputerReimagePreflightReceipt) { r.ImageUID++ }},
 		{"gid", func(r *ComputerReimagePreflightReceipt) { r.ImageGID++ }},
 	}
-	if len(mutations) != 20 {
+	if len(mutations) != 18 {
 		t.Fatalf("negative row count = %d", len(mutations))
 	}
 	for _, test := range mutations {
 		t.Run(test.name, func(t *testing.T) {
 			receipt := valid
 			test.mutate(&receipt)
-			if err := validateComputerReimagePreflight(row, receipt, "linux", "amd64"); err == nil {
+			if err := validateComputerReimagePreflight(row, receipt); err == nil {
 				t.Fatal("mutated reimage preflight receipt passed")
 			}
 		})
@@ -134,7 +133,7 @@ func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
 	resetPreparation.DetachmentAttemptID = ""
 	resetPreparation.DetachmentFencingToken = ""
 	resetPreparation.ResetPreparationReceiptID = "reset-preparation"
-	if err := validateComputerReimagePreflight(row, resetPreparation, "linux", "amd64"); err != nil {
+	if err := validateComputerReimagePreflight(row, resetPreparation); err != nil {
 		t.Fatalf("explicit reset-preparation evidence was rejected: %v", err)
 	}
 	for _, test := range []struct {
@@ -153,7 +152,7 @@ func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
 		failed.DetachmentReceiptID = ""
 		failed.DetachmentAttemptID = ""
 		failed.DetachmentFencingToken = ""
-		if err := validateComputerReimagePreflight(row, failed, "linux", "amd64"); err == nil {
+		if err := validateComputerReimagePreflight(row, failed); err == nil {
 			t.Fatalf("%s failure without storage evidence passed", test.code)
 		}
 	}
@@ -164,7 +163,7 @@ func TestRestartedResourceLatchCanEnterReimageWithoutSecondRestart(t *testing.T)
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "restart-then-reimage", Spec: computerCapabilityJobSpec("computer:restart-then-reimage"), Actor: "operator",
@@ -210,7 +209,7 @@ func TestComputerReimageMissingGenerationBudgetFailsClosed(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "missing-reimage-budget", Spec: computerCapabilityJobSpec("computer:missing-reimage-budget"), Actor: "operator",
@@ -272,7 +271,7 @@ func TestComputerReimageAcknowledgementCapacityRefusalIsTypedOutcome(t *testing.
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "ack-capacity-refusal", Spec: computerCapabilityJobSpec("computer:ack-capacity-refusal"), Actor: "operator",
@@ -325,7 +324,7 @@ func TestComputerReimagePreservesIdentityStorageAndIntent(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "reimage-stopped", Spec: computerCapabilityJobSpec("computer:reimage:v1"), Actor: "operator",
@@ -403,7 +402,7 @@ func TestComputerReimageFailedDigestKeepsPriorProjectionOperable(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "reimage-failed-digest", Spec: computerCapabilityJobSpec("computer:reimage-failed:v1"), Actor: "operator",
@@ -521,7 +520,7 @@ func TestRunningComputerReimageUsesInternalQuiescence(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
 		Name: "reimage-running", Spec: computerCapabilityJobSpec("computer:running-reimage:v1"), Actor: "operator"})
@@ -599,7 +598,7 @@ func TestComputerGrowPreservesJobAttemptAndStorageGeneration(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "grow-running", Spec: computerCapabilityJobSpec("computer:grow"), Actor: "operator"})
@@ -733,7 +732,7 @@ func TestComputerGrowInsufficientDiskLatchesUntilExplicitRestart(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "grow-refused", Spec: computerCapabilityJobSpec("computer:grow-refused"), Actor: "operator"})
@@ -797,7 +796,7 @@ func TestReconfigurationAbortRequiresDeadBoundNodeAndLeavesExplicitRestart(t *te
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "abort-reimage", Spec: computerCapabilityJobSpec("computer:abort"), Actor: "operator"})
@@ -869,7 +868,7 @@ func TestRemovalAcceptsAbortedComputerWithStoppedProjection(t *testing.T) {
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-		"kind:oci": true, "cgroup_v2": true, "computer": true,
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 		Name: "remove-aborted", Spec: computerCapabilityJobSpec("computer:remove-aborted"), Actor: "operator"})
@@ -935,7 +934,7 @@ func TestResetAndGrowAbortRemainRetryableAndFenceLateAcknowledgement(t *testing.
 				"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 			})
 			node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-				"kind:oci": true, "cgroup_v2": true, "computer": true,
+				"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 			}, []string{contract.StableNodeTagPrefix + "computer-node"})
 			computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 				Name: "abort-" + operation, Spec: computerCapabilityJobSpec("computer:abort:" + operation), Actor: "operator"})
@@ -1021,7 +1020,7 @@ func TestAbortCrashBoundariesRollbackAtomically(t *testing.T) {
 					return nil
 				}}, map[string]NodePolicy{"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 1}})
 			node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-				"kind:oci": true, "cgroup_v2": true, "computer": true,
+				"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 			}, []string{contract.StableNodeTagPrefix + "computer-node"})
 			computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 				Name: "abort-crash-" + checkpoint, Spec: computerCapabilityJobSpec("computer:" + checkpoint), Actor: "operator"})
@@ -1067,7 +1066,7 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 				return nil
 			}}, map[string]NodePolicy{"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 1}})
 			registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-				"kind:oci": true, "cgroup_v2": true, "computer": true,
+				"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 			}, []string{contract.StableNodeTagPrefix + "computer-node"})
 			computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 				Name: "projection-crash-" + checkpoint, Spec: computerCapabilityJobSpec("computer:" + checkpoint), Actor: "operator"})
@@ -1108,7 +1107,7 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 			return nil
 		}}, map[string]NodePolicy{"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 1}})
 		node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
-			"kind:oci": true, "cgroup_v2": true, "computer": true,
+			"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 		}, []string{contract.StableNodeTagPrefix + "computer-node"})
 		computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
 			Name: "projection-finalize-crash", Spec: computerCapabilityJobSpec("computer:finalize-crash"), Actor: "operator"})
@@ -1143,4 +1142,232 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 			t.Fatalf("resumed finalize = %#v err=%v", completed, err)
 		}
 	})
+}
+
+// registerRuntimePlatformNode registers a Node whose host platform and OCI
+// runtime platform differ, which is the shape of every Mac Node: the host is
+// darwin and the helper runs containers on linux inside the Lima guest.
+func registerRuntimePlatformNode(t *testing.T, h *integrationHarness, nodeID, hostOS, hostArchitecture string,
+	capabilities map[string]bool, tags []string,
+) Node {
+	t.Helper()
+	node, err := h.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-" + nodeID}, contract.NodeRegistration{
+		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
+		OS: hostOS, Architecture: hostArchitecture, AgentVersion: "test", Capabilities: capabilities,
+		CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
+	}, NodePolicy{Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return node
+}
+
+// stagedReimageOnRuntimePlatformNode builds the one fixture every runtime
+// platform row needs: a stopped Computer bound to a Node with the given host
+// and advertised runtime facts, with a reimage already staged and waiting for
+// its preflight acknowledgement.
+func stagedReimageOnRuntimePlatformNode(t *testing.T, name, hostOS, hostArchitecture string,
+	capabilities map[string]bool, target byte,
+) (*integrationHarness, Node, Computer) {
+	t.Helper()
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	})
+	node := registerRuntimePlatformNode(t, h, "computer-node", hostOS, hostArchitecture, capabilities,
+		[]string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: name, Spec: computerCapabilityJobSpec("computer:" + name), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.SetComputerDesiredState(t.Context(), computer.ComputerID,
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "stop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, ComputerReimageRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), Image: reimageTarget(target),
+		IdempotencyKey: "reimage-" + name,
+	})
+	if err != nil || staged.ReconfigurationPhase != ComputerReconfigurationReimaging {
+		t.Fatalf("staged reimage = %#v err=%v", staged, err)
+	}
+	return h, node, staged
+}
+
+func TestComputerReimageAdmitsTheNodesRuntimePlatformNotItsHostPlatform(t *testing.T) {
+	h, node, staged := stagedReimageOnRuntimePlatformNode(t, "mac-reimage", "darwin", "arm64", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/arm64": true,
+	}, '1')
+	directive, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
+	request.Receipt.PlatformOS, request.Receipt.PlatformArchitecture = "linux", "arm64"
+	completed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		staged.ComputerID, request)
+	if err != nil || completed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		completed.CurrentJobID != directive.StagingJobID {
+		t.Fatalf("linux/arm64 reimage on a darwin host = %#v err=%v", completed, err)
+	}
+}
+
+func TestComputerReimageRefusesAnImageTheNodesRuntimeCannotRunAndLatchesTheTypedFailure(t *testing.T) {
+	for _, test := range []struct {
+		name                      string
+		imageOS, imageArchiteture string
+		target                    byte
+	}{
+		// The darwin image matches the Node's host platform exactly and is
+		// still the one image this Node can never run.
+		{name: "foreign os", imageOS: "darwin", imageArchiteture: "arm64", target: '2'},
+		// Same operating system, wrong machine: refused on the architecture
+		// alone, which the operating-system comparison cannot catch.
+		{name: "foreign architecture", imageOS: "linux", imageArchiteture: "amd64", target: '7'},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h, node, staged := stagedReimageOnRuntimePlatformNode(t, "mac-wrong-image", "darwin", "arm64", map[string]bool{
+				"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/arm64": true,
+			}, test.target)
+			_, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
+			request.Receipt.PlatformOS = test.imageOS
+			request.Receipt.PlatformArchitecture = test.imageArchiteture
+			wantRefusal := "image platform " + test.imageOS + "/" + test.imageArchiteture +
+				" is not the bound Node's advertised runtime platform linux/arm64"
+			for refusal := int64(1); refusal < MaximumComputerReimagePreflightRefusals; refusal++ {
+				_, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+					staged.ComputerID, request)
+				if errorCode(err) != contract.ErrorConflict || !strings.Contains(err.Error(), wantRefusal) {
+					t.Fatalf("refusal %d = %v", refusal, err)
+				}
+				held, err := h.store.GetComputer(t.Context(), staged.ComputerID)
+				if err != nil || held.ReconfigurationPhase != ComputerReconfigurationReimaging {
+					t.Fatalf("Computer after refusal %d = %#v err=%v", refusal, held, err)
+				}
+			}
+			latched, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+				staged.ComputerID, request)
+			var failure contract.SpawnFailure
+			if err != nil || latched.ReconfigurationPhase != ComputerReconfigurationStable ||
+				latched.AppliedRevision != staged.IntentRevision ||
+				json.Unmarshal(latched.CurrentJob.LastFailure, &failure) != nil ||
+				failure.Code != contract.SpawnFailureImagePlatformUnsupported ||
+				!strings.Contains(failure.Message, "refused 3 times in a row") ||
+				!strings.Contains(failure.Message, wantRefusal) {
+				t.Fatalf("latched platform refusal = %#v failure=%#v err=%v", latched, failure, err)
+			}
+			replayed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+				staged.ComputerID, request)
+			if err != nil || replayed.CurrentJobID != latched.CurrentJobID {
+				t.Fatalf("latched refusal replay = %#v err=%v", replayed, err)
+			}
+			// Not wedged: the released reconfiguration authority accepts a
+			// fresh operator intent without a removal.
+			aborted, _, err := h.store.AbortComputerReconfiguration(t.Context(), latched.ComputerID,
+				ComputerReconfigurationAbortRequest{ComputerMutationPrecondition: computerPrecondition(latched, "operator"),
+					IdempotencyKey: "abort-after-latch"})
+			if errorCode(err) == "" {
+				t.Fatalf("abort after the latch = %#v err=%v", aborted, err)
+			}
+			restaged, err := h.store.ReimageComputer(t.Context(), latched.ComputerID, ComputerReimageRequest{
+				ComputerMutationPrecondition: computerPrecondition(latched, "operator"), Image: reimageTarget('3'),
+				IdempotencyKey: "reimage-after-latch"})
+			if err != nil || restaged.ReconfigurationPhase != ComputerReconfigurationReimaging {
+				t.Fatalf("reimage after the latch = %#v err=%v", restaged, err)
+			}
+		})
+	}
+}
+
+// A helper-reported failure receipt is already a typed outcome on its way to
+// being latched. Comparing its platform would refuse the very receipt that says
+// the image cannot be used, which recreates the wedge one level down, so the
+// comparison is deliberately scoped to verified receipts.
+func TestComputerReimageFailureReceiptIsLatchedWithoutAPlatformComparison(t *testing.T) {
+	h, node, staged := stagedReimageOnRuntimePlatformNode(t, "failure-receipt-exempt", "darwin", "arm64", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/arm64": true,
+	}, '8')
+	_, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
+	request.Receipt.Kind = computerReimagePreflightFailedReceiptKind
+	request.Receipt.FailureCode = string(contract.SpawnFailureImagePlatformUnsupported)
+	request.Receipt.FailureStage = "image_identity"
+	request.Receipt.FailureReason = "image_platform_unsupported"
+	// The helper could not resolve a usable platform, so the receipt names one
+	// this Node's runtime does not run. A verified receipt spelled this way is
+	// refused; this one must be latched exactly as the helper reported it.
+	request.Receipt.PlatformOS, request.Receipt.PlatformArchitecture = "windows", "amd64"
+	failed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		staged.ComputerID, request)
+	var failure contract.SpawnFailure
+	if err != nil || failed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		failed.AppliedRevision != staged.IntentRevision ||
+		json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureImagePlatformUnsupported ||
+		!strings.Contains(failure.Message, "image_identity") ||
+		strings.Contains(failure.Message, "advertised runtime platform") {
+		t.Fatalf("mismatched-platform failure receipt = %#v failure=%#v err=%v", failed, failure, err)
+	}
+	var refusals int64
+	if err := h.store.db.QueryRow(`SELECT preflight_refusals FROM computer_reimage_operations
+		WHERE computer_id=? AND operation_revision=?`, staged.ComputerID, staged.IntentRevision).Scan(&refusals); err != nil ||
+		refusals != 0 {
+		t.Fatalf("failure receipt counted %d platform refusals err=%v", refusals, err)
+	}
+}
+
+func TestComputerReimageFailsClosedWhenTheNodeAdvertisesNoRuntimePlatform(t *testing.T) {
+	h, node, staged := stagedReimageOnRuntimePlatformNode(t, "no-runtime-platform", "linux", "amd64", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, '4')
+	_, request := reimagePreflightAcknowledgement(t, h, node, staged.ComputerID, "", "")
+	// The receipt names exactly the host platform, which is what the old
+	// comparison read; with no advertised runtime platform there is nothing to
+	// compare it against.
+	request.Receipt.PlatformOS, request.Receipt.PlatformArchitecture = "linux", "amd64"
+	for refusal := int64(1); refusal < MaximumComputerReimagePreflightRefusals; refusal++ {
+		if _, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+			staged.ComputerID, request); errorCode(err) != contract.ErrorConflict ||
+			!strings.Contains(err.Error(), "advertises no OCI runtime platform") {
+			t.Fatalf("fail-closed refusal %d = %v", refusal, err)
+		}
+	}
+	latched, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		staged.ComputerID, request)
+	var failure contract.SpawnFailure
+	if err != nil || latched.ReconfigurationPhase != ComputerReconfigurationStable ||
+		json.Unmarshal(latched.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureReimagePreflight ||
+		!strings.Contains(failure.Message, "advertises no OCI runtime platform") {
+		t.Fatalf("latched fail-closed refusal = %#v failure=%#v err=%v", latched, failure, err)
+	}
+}
+
+func TestNodeRuntimePlatformReadsOneAdvertisedFactOrNone(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		capabilities map[string]bool
+		want         nodeRuntimePlatform
+	}{
+		{"advertised", map[string]bool{"kind:oci": true, "runtime_platform:linux/arm64": true},
+			nodeRuntimePlatform{OS: "linux", Architecture: "arm64", Advertised: true}},
+		{"absent", map[string]bool{"kind:oci": true}, nodeRuntimePlatform{}},
+		{"withdrawn", map[string]bool{"runtime_platform:linux/arm64": false}, nodeRuntimePlatform{}},
+		{"ambiguous", map[string]bool{"runtime_platform:linux/arm64": true, "runtime_platform:linux/amd64": true},
+			nodeRuntimePlatform{}},
+		{"malformed", map[string]bool{"runtime_platform:linux": true}, nodeRuntimePlatform{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := json.Marshal(test.capabilities)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readNodeRuntimePlatform(encoded); got != test.want {
+				t.Fatalf("readNodeRuntimePlatform() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+	if got := RuntimePlatformCapability(" Linux ", "ARM64"); got != "runtime_platform:linux/arm64" {
+		t.Fatalf("RuntimePlatformCapability() = %q", got)
+	}
+	if got := RuntimePlatformCapability("linux", ""); got != "" {
+		t.Fatalf("RuntimePlatformCapability() with no architecture = %q", got)
+	}
 }

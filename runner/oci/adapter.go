@@ -836,6 +836,22 @@ func (adapter *Adapter) SetComputerSubmission(ctx context.Context, authority wor
 	return session.SetComputerToken(ctx, ocihelper.SetComputerTokenRequest{Authority: HelperAuthority(authority), Token: token, L3Endpoint: endpoint})
 }
 
+// ProbedRuntimePlatform reports the platform the currently pinned helper proved
+// it runs containers on in its last functional probe. It is the same recorded
+// fact every claim compares its image against, and it is the only truthful
+// answer to "what can this Node run": on a Mac the host is darwin while this is
+// the Lima guest's linux.
+func (adapter *Adapter) ProbedRuntimePlatform() (ocihelper.OCIPlatform, bool) {
+	if adapter == nil || adapter.sessions == nil {
+		return ocihelper.OCIPlatform{}, false
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return ocihelper.OCIPlatform{}, false
+	}
+	return adapter.probePlatform(session)
+}
+
 func (adapter *Adapter) probePlatform(session *ocihelper.Session) (ocihelper.OCIPlatform, bool) {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()

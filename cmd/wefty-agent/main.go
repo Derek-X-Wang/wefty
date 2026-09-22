@@ -953,6 +953,7 @@ type ociCapabilityProbe struct {
 
 type ociCapabilityAdapter interface {
 	Probe(context.Context, string, string, string, string, time.Duration) error
+	ProbedRuntimePlatform() (ocihelper.OCIPlatform, bool)
 }
 
 func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProbeResult, error) {
@@ -972,8 +973,22 @@ func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProb
 			MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed,
 		}, err
 	}
+	// The runtime platform is published with the rest of the probe-earned OCI
+	// facts because it is the only platform an image can be compared against.
+	// A Mac Node's registered host platform is darwin/arm64 and every image it
+	// can run is linux/arm64, so publishing nothing here would leave L1 with
+	// only the host platform to compare and it would refuse work the Node can
+	// do. A probe that proved nothing about the platform proves nothing at all.
+	runtimePlatform, recorded := probe.adapter.ProbedRuntimePlatform()
+	platformCapability := l1.RuntimePlatformCapability(runtimePlatform.OS, runtimePlatform.Architecture)
+	if !recorded || platformCapability == "" {
+		return agent.CapabilityProbeResult{
+			MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed,
+		}, errors.New("OCI functional probe recorded no runtime platform")
+	}
 	capabilities := map[string]bool{
 		"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true, "cgroup_v2": true,
+		platformCapability: true,
 	}
 	// OpenSession admits only the exact helper wire major. A successful OCI
 	// functional probe therefore proves the complete protocol-v2 Computer

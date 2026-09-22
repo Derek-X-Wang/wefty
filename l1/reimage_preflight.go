@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +36,7 @@ type computerReimageOperation struct {
 	ComputerID, OldJobID, StagingJobID, StorageID, BoundNodeID, RootInstanceID string
 	OperationFence, TargetReference, TargetDigest, IdempotencyKey, RequestHash string
 	Status                                                                     string
-	OperationRevision, StorageGeneration                                       int64
+	OperationRevision, StorageGeneration, PreflightRefusals                    int64
 	Chown                                                                      bool
 	AcknowledgementKey, AcknowledgementHash                                    sql.NullString
 }
@@ -45,12 +46,12 @@ func readComputerReimageOperation(ctx context.Context, q queryer, computerID str
 	err := q.QueryRowContext(ctx, `SELECT computer_id, operation_revision, old_job_id, staging_job_id,
 		storage_id, storage_generation, bound_node_id, root_instance_id, operation_fence,
 		target_reference, target_digest, chown, idempotency_key, request_hash, status,
-		acknowledgement_key, acknowledgement_hash FROM computer_reimage_operations
+		acknowledgement_key, acknowledgement_hash, preflight_refusals FROM computer_reimage_operations
 		WHERE computer_id=? AND operation_revision=?`, computerID, revision).Scan(&row.ComputerID,
 		&row.OperationRevision, &row.OldJobID, &row.StagingJobID, &row.StorageID,
 		&row.StorageGeneration, &row.BoundNodeID, &row.RootInstanceID, &row.OperationFence,
 		&row.TargetReference, &row.TargetDigest, &row.Chown, &row.IdempotencyKey, &row.RequestHash,
-		&row.Status, &row.AcknowledgementKey, &row.AcknowledgementHash)
+		&row.Status, &row.AcknowledgementKey, &row.AcknowledgementHash, &row.PreflightRefusals)
 	return row, err
 }
 
@@ -100,9 +101,50 @@ func reimagePreflightAcknowledgementHash(request ComputerReimagePreflightAcknowl
 	return hex.EncodeToString(sum[:]), body, nil
 }
 
-func validateComputerReimagePreflight(row computerReimageOperation, receipt ComputerReimagePreflightReceipt,
-	nodeOS, nodeArchitecture string,
-) error {
+// nodeRuntimePlatform is the platform a bound Node's OCI runtime proved it runs,
+// read from the Node's advertised capability facts. Advertised is false when the
+// Node names no runtime platform at all, which is never treated as a match.
+type nodeRuntimePlatform struct {
+	OS, Architecture string
+	Advertised       bool
+}
+
+func readNodeRuntimePlatform(capabilitiesJSON []byte) nodeRuntimePlatform {
+	platformOS, platformArchitecture, advertised := advertisedRuntimePlatform(capabilitiesJSON)
+	return nodeRuntimePlatform{OS: platformOS, Architecture: platformArchitecture, Advertised: advertised}
+}
+
+func (platform nodeRuntimePlatform) String() string {
+	if !platform.Advertised {
+		return "none"
+	}
+	return platform.OS + "/" + platform.Architecture
+}
+
+// computerReimageRuntimePlatformRefusal names why a verified preflight receipt's
+// image platform cannot be admitted on its bound Node, or an empty code when it
+// can. The comparison is against the Node's advertised RUNTIME platform, the
+// same helper-reported fact the OCI claim path already trusts, and never against
+// the host platform in `nodes`: a Mac Node's host is darwin/arm64 while every
+// image it can run is linux/arm64, so the host comparison refused every reimage
+// a Mac Node could actually perform. A Node that advertises no runtime platform
+// has nothing to compare and fails closed.
+func computerReimageRuntimePlatformRefusal(receipt ComputerReimagePreflightReceipt,
+	platform nodeRuntimePlatform,
+) (contract.SpawnFailureCode, string) {
+	if !platform.Advertised {
+		return contract.SpawnFailureReimagePreflight,
+			"bound Node advertises no OCI runtime platform for Computer reimage"
+	}
+	if receipt.PlatformOS != platform.OS || receipt.PlatformArchitecture != platform.Architecture {
+		return contract.SpawnFailureImagePlatformUnsupported,
+			"Computer reimage image platform " + receipt.PlatformOS + "/" + receipt.PlatformArchitecture +
+				" is not the bound Node's advertised runtime platform " + platform.String()
+	}
+	return "", ""
+}
+
+func validateComputerReimagePreflight(row computerReimageOperation, receipt ComputerReimagePreflightReceipt) error {
 	if (receipt.Kind != computerReimagePreflightReceiptKind && receipt.Kind != computerReimagePreflightFailedReceiptKind) ||
 		receipt.ReceiptID == "" ||
 		receipt.HelperGeneration == 0 || receipt.ComputerID != row.ComputerID ||
@@ -112,9 +154,6 @@ func validateComputerReimagePreflight(row computerReimageOperation, receipt Comp
 		receipt.OperationRevision != row.OperationRevision || receipt.OperationFence != row.OperationFence ||
 		receipt.TargetDigest != row.TargetDigest {
 		return protocolError(contract.ErrorConflict, "Computer reimage preflight receipt does not match current authority")
-	}
-	if receipt.PlatformOS != nodeOS || receipt.PlatformArchitecture != nodeArchitecture {
-		return protocolError(contract.ErrorConflict, "Computer reimage image platform does not match its bound Node")
 	}
 	if receipt.Kind == computerReimagePreflightFailedReceiptKind {
 		if !computerReimagePreflightStages[receipt.FailureStage] ||
@@ -215,6 +254,44 @@ func failComputerReimagePreflightTx(
 	return updated, nil
 }
 
+// refuseComputerReimagePreflightTx counts one authority refusal of an otherwise
+// well-formed preflight receipt and, at MaximumComputerReimagePreflightRefusals
+// consecutive refusals, latches the typed failure. Counting is the whole point:
+// a refusal the agent will retry every poll forever left the Computer in
+// `reimaging` with no failure to read and no escape but removal, so the bounded
+// count converts a repeating refusal into the same durable typed outcome a
+// helper-reported preflight failure already produces.
+func (s *Store) refuseComputerReimagePreflightTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	computer Computer,
+	row computerReimageOperation,
+	request ComputerReimagePreflightAcknowledgementRequest,
+	body []byte,
+	bodyHash string,
+	failureCode contract.SpawnFailureCode,
+	reason string,
+	now time.Time,
+) (Computer, bool, error) {
+	refusals := row.PreflightRefusals + 1
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_reimage_operations SET preflight_refusals=?
+		WHERE computer_id=? AND operation_revision=?`, refusals, computer.ComputerID, row.OperationRevision); err != nil {
+		return Computer{}, false, internalError(err, "count refused Computer reimage preflight")
+	}
+	if refusals < MaximumComputerReimagePreflightRefusals {
+		return Computer{}, false, nil
+	}
+	updated, err := failComputerReimagePreflightTx(ctx, tx, computer, row, request, body, bodyHash,
+		contract.SpawnFailure{Code: failureCode,
+			Message: "Computer reimage preflight was refused " + strconv.FormatInt(refusals, 10) +
+				" times in a row: " + reason,
+			NodeID: row.BoundNodeID}, now)
+	if err != nil {
+		return Computer{}, false, err
+	}
+	return updated, true, nil
+}
+
 func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identityNodeID, computerID string,
 	request ComputerReimagePreflightAcknowledgementRequest,
 ) (Computer, error) {
@@ -243,18 +320,20 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer reimage preflight authority")
 	}
-	var nodeOS, nodeArchitecture, rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT os, architecture, root_instance_id FROM nodes WHERE node_id=?`,
-		row.BoundNodeID).Scan(&nodeOS, &nodeArchitecture, &rootInstanceID); err != nil {
+	var nodeCapabilitiesJSON []byte
+	var rootInstanceID string
+	if err := tx.QueryRowContext(ctx, `SELECT capabilities_json, root_instance_id FROM nodes WHERE node_id=?`,
+		row.BoundNodeID).Scan(&nodeCapabilitiesJSON, &rootInstanceID); err != nil {
 		return Computer{}, internalError(err, "read Computer reimage node facts")
 	}
+	runtimePlatform := readNodeRuntimePlatform(nodeCapabilitiesJSON)
 	if rootInstanceID != row.RootInstanceID {
 		return Computer{}, protocolError(contract.ErrorStaleFence, "Computer reimage managed-root authority changed")
 	}
 	if request.NodeID != row.BoundNodeID {
 		return Computer{}, protocolError(contract.ErrorAttemptNotOwned, "authenticated Node does not own Computer reimage")
 	}
-	if err := validateComputerReimagePreflight(row, request.Receipt, nodeOS, nodeArchitecture); err != nil {
+	if err := validateComputerReimagePreflight(row, request.Receipt); err != nil {
 		return Computer{}, err
 	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
@@ -275,6 +354,23 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 		computer.CurrentJobID != row.OldJobID || computer.CurrentJob.State != contract.JobStopped {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision,
 			"Computer reimage preflight no longer owns current authority")
+	}
+	if request.Receipt.Kind == computerReimagePreflightReceiptKind {
+		if refusalCode, reason := computerReimageRuntimePlatformRefusal(request.Receipt, runtimePlatform); refusalCode != "" {
+			updated, refused, err := s.refuseComputerReimagePreflightTx(ctx, tx, computer, row, request, body,
+				bodyHash, refusalCode, reason, now)
+			if err != nil {
+				return Computer{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return Computer{}, internalError(err, "commit refused Computer reimage preflight")
+			}
+			if !refused {
+				return Computer{}, protocolError(contract.ErrorConflict, "%s", reason)
+			}
+			s.notifyComputerPolicyChanged()
+			return updated, nil
+		}
 	}
 	if request.Receipt.Kind == computerReimagePreflightFailedReceiptKind {
 		failureCode := contract.SpawnFailureCode(request.Receipt.FailureCode)

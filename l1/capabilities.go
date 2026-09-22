@@ -13,13 +13,14 @@ import (
 )
 
 const (
-	capabilityKindPrefix           = "kind:"
-	capabilityRuntimeHandlerPrefix = "runtime_handler:"
-	capabilityCgroupV2             = "cgroup_v2"
-	capabilityComputer             = "computer"
-	maxNodeCapabilities            = 128
-	maxMissingCapabilities         = 128
-	maxCapabilityNameBytes         = 128
+	capabilityKindPrefix            = "kind:"
+	capabilityRuntimeHandlerPrefix  = "runtime_handler:"
+	capabilityRuntimePlatformPrefix = "runtime_platform:"
+	capabilityCgroupV2              = "cgroup_v2"
+	capabilityComputer              = "computer"
+	maxNodeCapabilities             = 128
+	maxMissingCapabilities          = 128
+	maxCapabilityNameBytes          = 128
 )
 
 type storedCapabilityObservation struct {
@@ -153,7 +154,50 @@ func isOCIProbeCapability(capability string) bool {
 	capability = strings.ToLower(strings.TrimSpace(capability))
 	return capability == "kind:oci" || capability == "cgroup_v2" || capability == "apparmor" ||
 		capability == capabilityComputer ||
-		strings.HasPrefix(capability, capabilityRuntimeHandlerPrefix)
+		strings.HasPrefix(capability, capabilityRuntimeHandlerPrefix) ||
+		strings.HasPrefix(capability, capabilityRuntimePlatformPrefix)
+}
+
+// RuntimePlatformCapability spells the one Node-advertised fact that says which
+// platform a Node actually runs containers on. It is deliberately not the host
+// platform recorded at registration: a Mac Node's host is darwin/arm64 while its
+// OCI helper runs linux/arm64 inside the Lima guest, so only the runtime
+// platform can be compared with an image. It is earned by the same functional
+// probe that earns kind:oci, and withdrawn with it.
+func RuntimePlatformCapability(os, architecture string) string {
+	os = strings.ToLower(strings.TrimSpace(os))
+	architecture = strings.ToLower(strings.TrimSpace(architecture))
+	if os == "" || architecture == "" || strings.ContainsRune(os, '/') || strings.ContainsRune(architecture, '/') {
+		return ""
+	}
+	return capabilityRuntimePlatformPrefix + os + "/" + architecture
+}
+
+// advertisedRuntimePlatform reads the single runtime platform a Node currently
+// advertises. None and more than one are both "no runtime platform": a caller
+// that must compare an image against the Node fails closed rather than guess
+// which of two advertised platforms an image was built for.
+func advertisedRuntimePlatform(capabilitiesJSON []byte) (string, string, bool) {
+	var capabilities map[string]bool
+	if err := json.Unmarshal(capabilitiesJSON, &capabilities); err != nil {
+		return "", "", false
+	}
+	platformOS, platformArchitecture := "", ""
+	for capability, enabled := range capabilities {
+		if !enabled || !strings.HasPrefix(capability, capabilityRuntimePlatformPrefix) {
+			continue
+		}
+		value := strings.TrimPrefix(capability, capabilityRuntimePlatformPrefix)
+		name, architecture, found := strings.Cut(value, "/")
+		if !found || name == "" || architecture == "" || strings.ContainsRune(architecture, '/') {
+			return "", "", false
+		}
+		if platformOS != "" {
+			return "", "", false
+		}
+		platformOS, platformArchitecture = name, architecture
+	}
+	return platformOS, platformArchitecture, platformOS != ""
 }
 
 // RequiredCapabilities derives the normalized execution eligibility set for
