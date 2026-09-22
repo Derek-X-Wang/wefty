@@ -98,6 +98,7 @@ func run() error {
 		authKey                  = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
 		controlURL               = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
 		ephemeral                = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
+		printEnrollmentURL       = flag.Bool("fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 		readyFile                = flag.String("ready-file", "", "write listener metadata after the server is ready")
 		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
 		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
@@ -141,6 +142,9 @@ func run() error {
 		return json.NewEncoder(os.Stdout).Encode(challenge)
 	}
 
+	if *printEnrollmentURL {
+		os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           *fabricMode,
 		PlainFabricID:  *plainFabricID,

@@ -61,7 +61,14 @@ func New(config Config) (*Fabric, error) {
 			AuthKey:    config.Credential.Value,
 			Ephemeral:  config.Ephemeral,
 			ControlURL: config.CoordinatorURL,
-			Logf:       config.Logf,
+			// Both loggers are always wefty-owned functions, never the
+			// caller's config.Logf (or nil) directly: the pinned tsnet
+			// dependency defaults an unset UserLogf to raw stderr, which
+			// can print an enrollment URL during first login (wefty
+			// #498). wrapUserLogf redacts and gates that; wrapBackendLogf
+			// silences the separately verbose backend log by default.
+			Logf:     wrapBackendLogf(config.Logf),
+			UserLogf: wrapUserLogf(config.Logf),
 		},
 	}, nil
 }
