@@ -305,12 +305,18 @@ A Custody export first CAS-records immutable source Backup, Storage, Node,
 managed-root, path, and fence evidence and moves the Computer through
 `exporting`. The event is permanent, and every outcome taints the branch
 except one: a typed helper refusal that proves the destination was never
-touched — the path was inside the managed root, outside every configured
-operator mount root, or under an operator mount root the helper cannot prove
-is really mounted — is recorded as evidence and taints nothing, because no
-byte of that Storage ever left managed custody. Missing or late helper
-completion, a partial write, and a digest mismatch all still taint: taint
-follows the possibility of external bytes, not the operator's intent.
+touched — the path reached the managed root, lay outside every configured
+operator mount root, or lay under a root the helper could not prove is the
+filesystem the node shares with it — is recorded as evidence and taints
+nothing, because no byte of that Storage ever left managed custody. That
+proof is durable, not per-attempt: the helper records a write-started marker
+before its first external byte and answers every later attempt on that export
+`external_write_started`, which taints. Missing or late helper completion, a
+partial write, and a digest mismatch all still taint: taint follows the
+possibility of external bytes, not the operator's intent. A refusal that
+names the node's operator mount roots must name canonical absolute
+directories consistent with the recorded external path, or L1 refuses the
+acknowledgement rather than recording an untainting outcome it cannot check.
 Removal supersedes a still-planned export and closes its directive fence; the
 already-committed event remains permanent taint. A verified helper receipt advances the durable export from `planned` to
 `available`, meaning the complete external disk and `custody.json` manifest

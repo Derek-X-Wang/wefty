@@ -337,23 +337,89 @@ func validateCustodyExportReceipt(export ComputerCustodyExportDirective, receipt
 		}
 	case "computer_custody_export_failed":
 		if receipt.ManifestDigest != "" || receipt.OwnershipApplied || receipt.PrivateModeApplied ||
-			receipt.ExternalOwnerUID != 0 || receipt.ExternalOwnerGID != 0 || (receipt.FailureCode != "insufficient_disk" &&
-			receipt.FailureCode != "destination_not_empty" && receipt.FailureCode != contract.CustodyExportManagedRootPath &&
-			receipt.FailureCode != contract.CustodyExportPathUnconfined && receipt.FailureCode != contract.CustodyExportRootUnmounted &&
-			receipt.FailureCode != "destination_substituted" && receipt.FailureCode != "ownership_failed" &&
-			receipt.FailureCode != "cancelled") {
+			receipt.ExternalOwnerUID != 0 || receipt.ExternalOwnerGID != 0 || !validCustodyExportFailureCode(receipt.FailureCode) {
 			return protocolError(contract.ErrorInvalidRequest, "failed Custody export receipt is incomplete")
 		}
-		// Only a refusal that proves the destination untouched may name the
-		// node's operator mount roots, because only that refusal is about
-		// where the export was allowed to go.
-		if len(receipt.ExternalRoots) > 0 && !contract.CustodyExportLeftDestinationUntouched("failed", receipt.FailureCode) {
-			return protocolError(contract.ErrorInvalidRequest, "failed Custody export receipt is incomplete")
+		if err := validateCustodyExportRoots(export, receipt); err != nil {
+			return err
 		}
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "Custody export receipt kind is invalid")
 	}
 	return nil
+}
+
+func validCustodyExportFailureCode(code string) bool {
+	switch code {
+	case "insufficient_disk", "destination_not_empty", "destination_substituted", "ownership_failed", "cancelled",
+		contract.CustodyExportManagedRootPath, contract.CustodyExportPathUnconfined,
+		contract.CustodyExportRootUnmounted, contract.CustodyExportPathCrossesMount,
+		contract.CustodyExportWriteStarted:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateCustodyExportRoots holds a refused receipt to what it claims. Only
+// a refusal about where the export was allowed to go may name roots, it must
+// name them, and the roots must be canonical node-facing directories that
+// agree with the path this durable export recorded: an unconfined path is by
+// definition under none of them, and an unreachable root is by definition an
+// ancestor of the path. L1 holds no copy of a node's configured roots, so
+// the recorded path is the authority available here.
+func validateCustodyExportRoots(export ComputerCustodyExportDirective, receipt ComputerCustodyExportReceipt) error {
+	invalid := func() error {
+		return protocolError(contract.ErrorInvalidRequest, "Custody export refusal does not name the node's operator mount roots")
+	}
+	if !contract.CustodyExportRefusalNamesRoots(receipt.FailureCode) {
+		if len(receipt.ExternalRoots) > 0 {
+			return invalid()
+		}
+		return nil
+	}
+	// A node with no configured operator mount root has none to name; a node
+	// with roots must name them truthfully and briefly.
+	if len(receipt.ExternalRoots) > 16 {
+		return invalid()
+	}
+	seen := make(map[string]struct{}, len(receipt.ExternalRoots))
+	covered := false
+	for _, root := range receipt.ExternalRoots {
+		if root == "" || len(root) > 1024 || strings.ContainsAny(root, "\x00\r\n") ||
+			!filepath.IsAbs(root) || filepath.Clean(root) != root || root == string(filepath.Separator) {
+			return invalid()
+		}
+		if _, duplicate := seen[root]; duplicate {
+			return invalid()
+		}
+		seen[root] = struct{}{}
+		if pathUnderRoot(root, export.ExternalPath) {
+			covered = true
+		}
+	}
+	// A root the helper could not reach must be one that covers the recorded
+	// path: that is the claim those two refusals make. An unconfined path
+	// carries no such invariant — it may be outside every root, or under one
+	// through a component the walk refused.
+	switch receipt.FailureCode {
+	case contract.CustodyExportRootUnmounted, contract.CustodyExportPathCrossesMount:
+		if len(receipt.ExternalRoots) > 0 && !covered {
+			return invalid()
+		}
+	}
+	return nil
+}
+
+func pathUnderRoot(root, candidate string) bool {
+	if !filepath.IsAbs(candidate) {
+		return false
+	}
+	relative, err := filepath.Rel(root, filepath.Clean(candidate))
+	if err != nil {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && relative != "."
 }
 
 func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNodeID, computerID string, request ComputerCustodyExportAcknowledgementRequest) (ComputerCustodyExport, error) {

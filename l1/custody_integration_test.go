@@ -2,6 +2,8 @@ package l1
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -390,6 +392,67 @@ func TestCustodyExportRefusedBeforeAnyExternalByteLeavesTheSourceUntainted(t *te
 	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_verified" {
 		t.Fatalf("refused export reduced the removal outcome = %#v err=%v", removed, err)
+	}
+}
+
+func TestCustodyExportWriteStartedTaintsTheSource(t *testing.T) {
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+	_, directive := beginCustodyExport(t, h, node, computer, backup, "write-started")
+	refusal := successfulCustodyExportReceipt(directive)
+	refusal.Kind, refusal.ManifestDigest = "computer_custody_export_failed", ""
+	refusal.FailureCode = contract.CustodyExportWriteStarted
+	refusal.ExternalOwnerUID, refusal.ExternalOwnerGID = 0, 0
+	refusal.OwnershipApplied, refusal.PrivateModeApplied = false, false
+	refused, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
+		computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: refusal.ReceiptID, Receipt: refusal})
+	if err != nil || refused.Status != "failed" || refused.FailureCode != contract.CustodyExportWriteStarted {
+		t.Fatalf("write-started Custody export = %#v err=%v", refused, err)
+	}
+	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	if err != nil || !provenance.CustodyTainted {
+		t.Fatalf("an export that began writing left the source untainted = %#v err=%v", provenance, err)
+	}
+}
+
+func TestCustodyExportRefusalRootsMustBeCanonicalAndConsistentWithTheRecordedPath(t *testing.T) {
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+	_, directive := beginCustodyExport(t, h, node, computer, backup, "roots")
+	parent := filepath.Dir(directive.ExternalPath)
+	rows := []struct {
+		name     string
+		code     string
+		roots    []string
+		accepted bool
+	}{
+		{name: "unconfined names the node's roots", code: contract.CustodyExportPathUnconfined,
+			roots: []string{"/srv/wefty"}, accepted: true},
+		{name: "a node with no configured root names none", code: contract.CustodyExportPathUnconfined, accepted: true},
+		{name: "relative root", code: contract.CustodyExportPathUnconfined, roots: []string{"srv/wefty"}},
+		{name: "uncanonical root", code: contract.CustodyExportPathUnconfined, roots: []string{"/srv/wefty/"}},
+		{name: "filesystem root", code: contract.CustodyExportPathUnconfined, roots: []string{"/"}},
+		{name: "duplicate roots", code: contract.CustodyExportPathUnconfined, roots: []string{"/srv/wefty", "/srv/wefty"}},
+		{name: "unmounted root covers the recorded path", code: contract.CustodyExportRootUnmounted,
+			roots: []string{parent}, accepted: true},
+		{name: "unmounted root unrelated to the recorded path", code: contract.CustodyExportRootUnmounted,
+			roots: []string{"/srv/elsewhere"}},
+		{name: "a verified receipt names no roots", code: "", roots: []string{"/srv/wefty"}},
+	}
+	for index, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			receipt := successfulCustodyExportReceipt(directive)
+			receipt.ReceiptID = fmt.Sprintf("receipt-roots-%d", index)
+			if row.code != "" {
+				receipt.Kind, receipt.ManifestDigest, receipt.FailureCode = "computer_custody_export_failed", "", row.code
+				receipt.ExternalOwnerUID, receipt.ExternalOwnerGID = 0, 0
+				receipt.OwnershipApplied, receipt.PrivateModeApplied = false, false
+			}
+			receipt.ExternalRoots = row.roots
+			err := validateCustodyExportReceipt(directive, receipt)
+			if row.accepted != (err == nil) {
+				t.Fatalf("receipt roots %v with code %q: err=%v", row.roots, row.code, err)
+			}
+		})
 	}
 }
 

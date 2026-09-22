@@ -283,7 +283,19 @@ const (
 	// a translated view of the node's paths, an absent mount would silently
 	// take the export into the helper's own rootfs.
 	CustodyExportRootUnmounted = "external_root_unmounted"
+	// CustodyExportPathCrossesMount is an operator path that leaves the
+	// filesystem the node shares with its helper. A device boundary below the
+	// shared root is another filesystem inside the helper, not the
+	// operator's storage.
+	CustodyExportPathCrossesMount = "external_path_crosses_mount"
 )
+
+// CustodyExportWriteStarted is the typed refusal for an export whose helper
+// has already begun placing bytes on operator storage in some earlier
+// invocation. It is never an untouched refusal: the durable evidence says
+// external bytes may exist, so the source Storage stays tainted no matter
+// what a later attempt decides about the path.
+const CustodyExportWriteStarted = "external_write_started"
 
 // CustodyExportLeftDestinationUntouched reports whether a durable Custody
 // export ended without the helper creating, writing, or replacing anything at
@@ -295,7 +307,8 @@ func CustodyExportLeftDestinationUntouched(status, failureCode string) bool {
 		return false
 	}
 	switch failureCode {
-	case CustodyExportManagedRootPath, CustodyExportPathUnconfined, CustodyExportRootUnmounted:
+	case CustodyExportManagedRootPath, CustodyExportPathUnconfined, CustodyExportRootUnmounted,
+		CustodyExportPathCrossesMount:
 		return true
 	default:
 		return false
@@ -306,5 +319,13 @@ func CustodyExportLeftDestinationUntouched(status, failureCode string) bool {
 // CustodyExportLeftDestinationUntouched accepts, for callers that must express
 // the same predicate in a query.
 func CustodyExportUntouchedRefusalCodes() []string {
-	return []string{CustodyExportManagedRootPath, CustodyExportPathUnconfined, CustodyExportRootUnmounted}
+	return []string{CustodyExportManagedRootPath, CustodyExportPathUnconfined, CustodyExportRootUnmounted,
+		CustodyExportPathCrossesMount}
+}
+
+// CustodyExportRefusalNamesRoots reports whether a failure code is one whose
+// receipt must name the node's operator mount roots, so a refused operator
+// learns where an export may go without reading node facts.
+func CustodyExportRefusalNamesRoots(failureCode string) bool {
+	return CustodyExportLeftDestinationUntouched("failed", failureCode)
 }

@@ -1343,24 +1343,50 @@ root and returns `computer_backup_copy_removed` only after positive absence.
 The helper does not choose retention, auto-delete, restore, clone, export,
 encryption, or replica policy. `ExportComputerCustody` accepts only an
 already-recorded event bound to one published Backup copy. It admits the
-operator's path before it creates anything: the node path is translated into
-the helper's own filesystem view exactly as an operator mount source is, and
-must then be a strict descendant of one of the helper's configured operator
-mount roots (`--oci-allowed-mount-root`, the list `node oci doctor`
-publishes). A path inside the managed root is `managed_root_path`; a path
-under no configured root, reached through a symlinked component, or through a
-component that is not a directory, is `external_path_unconfined`. Where the
-helper reads a translated view of the node's paths — a Lima Node, whose
-operator mount root is the host directory bind-mounted into the guest — the
-admitted root must also prove to be a real mount, by comparing devices across
-the descriptors the helper itself opened from that root downward; otherwise
-the refusal is `external_root_unmounted`, because an absent host mount would
-silently take the export into the helper's own rootfs under a path that
-mimics the node's. Those three refusals carry the node-facing roots in the
-receipt and are raised before any directory is created, any manifest is
-written, and any Backup byte is read, so the helper never creates a directory
-outside a configured root. `CopyComputerStorage(import)` admits its external
-source through the same decision. It writes the external manifest before the disk,
+operator's path before it creates anything and before any pathname is
+canonicalized: the node path is translated into the helper's own filesystem
+view exactly as an operator mount source is, is judged lexically against the
+managed root and against the helper's configured operator mount roots
+(`--oci-allowed-mount-root`, the list `node oci doctor` publishes), and is
+only then walked component by component through descriptors the helper opens
+itself. A path that reaches the managed root is `managed_root_path`; a path
+under no configured root, or one whose component is a symlink, is not a
+directory, or changes identity while being opened, is
+`external_path_unconfined`. Resolving symlinks before the walk is forbidden:
+it would let an in-root symlink evade that rejection.
+
+Where the helper reads a translated view of the node's paths — a Lima Node,
+whose operator mount root is the host directory the bootstrap shares into the
+guest — admission is additionally bound to that shared filesystem's identity.
+The configured guest mount root must itself be a mount, or the refusal is
+`external_root_unmounted`; every admitted component must then be on that same
+device, and any step onto another filesystem is `external_path_crosses_mount`.
+A device boundary on its own proves nothing: a guest-only filesystem below an
+unmounted root, or a nested guest bind under a live host mount, is still
+storage that never reaches the host. All four refusals carry the node-facing
+roots in the receipt and are raised before any directory is created, any
+manifest is written, and any Backup byte is read.
+
+The descriptors admission opened stay open. Every later step — creating the
+missing directories, reading and publishing `custody.json` through a
+temporary file and a rename, opening, truncating, writing, syncing and
+re-hashing `storage.ext4`, and fsyncing the directory — is performed relative
+to those descriptors, never by re-resolving a pathname, so an ancestor
+replaced after admission cannot redirect a privileged write. The opened root
+is verified to still be the directory its configured path named.
+
+Before the first byte the helper places on operator storage, a directory
+included, it durably records a write-started marker in its own managed state,
+keyed to the Computer and export identity. While that marker exists, no
+invocation of that export may return a refusal that claims the destination
+was never touched: the typed answer becomes `external_write_started`, which
+L1 treats as tainting. The marker is removed only when the external bytes and
+manifest have both been digest-verified, so a crash, a restart or an upgrade
+between attempts preserves the uncertainty rather than losing it.
+
+`CopyComputerStorage(import)` admits its external source through the same
+decision and likewise keeps the verified disk descriptor open for the copy
+and both digests. It writes the external manifest before the disk,
 retains partial bytes after interruption, and returns a receipt only after
 size, content digest, and manifest digest are observed. Files remain mode
 `0600` but inherit the owner and group of the nearest existing ancestor of the
