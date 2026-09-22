@@ -147,16 +147,34 @@ func lockComputerReimageMutex(ctx context.Context, mutex *sync.Mutex) bool {
 	}
 }
 
+// computerStorageAdmissionWait bounds how long the helper waits for one
+// Node-wide Computer disk admission mutex, independently of the caller's own
+// deadline. The client keeps its deadline locally and closes the connection
+// when it expires, so a refusal produced only at that moment would be written
+// to a socket nobody is reading any more. A shorter helper-side bound is what
+// lets the typed contention refusal reach the caller over a connection that is
+// still open. Preflight's ten-second generation-lock ceiling is deliberately
+// longer: it answers with a typed receipt on its own stream rather than a
+// refusal. It is a variable only so tests can shorten the wait.
+var computerStorageAdmissionWait = 5 * time.Second
+
 // admitComputerStorage waits for one Node-wide Computer disk admission mutex
-// under the caller's own deadline. Expiry is a typed contention refusal rather
-// than an untyped engine failure, because the caller never reached the
-// generation: nothing was created, mutated, or deleted, and the same authority
-// is replayable.
+// under whichever expires first: the caller's own deadline or the helper's
+// bound. Expiry is a typed contention refusal rather than an untyped engine
+// failure, and the same authority is replayable.
 func admitComputerStorage(ctx context.Context, mutex *sync.Mutex, admission string) error {
-	if lockComputerReimageMutex(ctx, mutex) {
+	waitCtx, cancel := context.WithTimeout(ctx, computerStorageAdmissionWait)
+	defer cancel()
+	if lockComputerReimageMutex(waitCtx, mutex) {
 		return nil
 	}
-	return &computerStorageAdmissionContendedError{Admission: admission, cause: context.Cause(ctx)}
+	// The caller's own cause wins when it has one, so a cancelled request
+	// still reads as cancelled rather than as the helper's bound.
+	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = context.Cause(waitCtx)
+	}
+	return &computerStorageAdmissionContendedError{Admission: admission, cause: cause}
 }
 
 func openExistingComputerDiskLock(ctx context.Context, root string) (*os.File, error) {

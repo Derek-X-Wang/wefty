@@ -252,6 +252,25 @@ func (engine *ContainerdEngine) acquireComputerGrowLock(diskRoot string, storage
 	return nil, release, nil
 }
 
+// acquireComputerGrowRoot creates the generation root and takes its lock under
+// root admission, the discipline every other root creator follows. Grow is a
+// root creator like the rest: without admission its MkdirAll can put a
+// replacement root and lock inode back inside the interval a deletion has
+// already proved absent, and grow then refuses the missing image but leaves
+// that root behind for the deletion's own proof to trip over. Admission is
+// released once the generation is owned, before any allocation.
+func (engine *ContainerdEngine) acquireComputerGrowRoot(ctx context.Context, diskRoot string,
+	storage ComputerStorageReference) (*computerDiskAttachment, func(), error) {
+	if err := admitComputerStorage(ctx, &engine.computerStorageRootMu, "Storage root"); err != nil {
+		return nil, nil, err
+	}
+	defer engine.computerStorageRootMu.Unlock()
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		return nil, nil, err
+	}
+	return engine.acquireComputerGrowLock(diskRoot, storage)
+}
+
 func readExt4FilesystemBytes(ctx context.Context, target string) (int64, error) {
 	dumpe2fs, err := findRootTool("dumpe2fs")
 	if err != nil {
@@ -425,10 +444,7 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	imagePath := filepath.Join(diskRoot, "disk.ext4")
-	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
-		return GrowComputerStorageResponse{}, err
-	}
-	attachment, release, err := engine.acquireComputerGrowLock(diskRoot, request.Storage)
+	attachment, release, err := engine.acquireComputerGrowRoot(ctx, diskRoot, request.Storage)
 	if err != nil {
 		return GrowComputerStorageResponse{}, err
 	}

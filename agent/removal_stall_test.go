@@ -542,6 +542,45 @@ func TestAnUntypedRemovalFailureNeverBecomesAStall(t *testing.T) {
 	}
 }
 
+// Node-wide Computer disk admission contention says nothing about the resource
+// this removal asks about -- only that another Computer's operation held the
+// Node while this one waited. Counting it would let unrelated traffic declare
+// a healthy removal stalled, so it ends the streak like an untyped failure.
+func TestAdmissionContentionNeverBecomesARemovalStall(t *testing.T) {
+	controller := &removalController{nodeID: "node", stallBound: l1.DefaultRemovalStallBound}
+	controller.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+	counted := 0
+	reset := 0
+	controller.recordRemovalFailure = func(context.Context, localRemoval, string, string) error {
+		counted++
+		return nil
+	}
+	controller.recordUntypedFailure = func(context.Context, localRemoval) error {
+		reset++
+		return nil
+	}
+	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
+		t.Fatal("admission contention declared a stall")
+		return nil
+	}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{failedAttempts: 99, lastRefusalCode: "unauthorized_attempt"}, true, nil
+	}
+	busy := &ocihelper.RPCError{Code: ocihelper.CodeComputerStorageBusy,
+		Message: "Computer Storage root admission is contended: context deadline exceeded"}
+	for range l1.MinimumServiceRemovalStallAttempts {
+		declared, err := controller.noteRemovalFailure(t.Context(),
+			l1.RemovalDirective{JobID: "job", BoundNodeID: "node"},
+			fmt.Errorf("delete Computer disk resource: %w", busy))
+		if err != nil || declared {
+			t.Fatalf("admission contention reported the removal as declared stalled: declared=%t err=%v", declared, err)
+		}
+	}
+	if counted != 0 || reset != l1.MinimumServiceRemovalStallAttempts {
+		t.Fatalf("admission contention counted=%d reset=%d, want 0/%d", counted, reset, l1.MinimumServiceRemovalStallAttempts)
+	}
+}
+
 // TestARemovalRefusalStreakResetsWhenTheRefusalChanges separates a removal
 // that cannot proceed from one still working through distinct causes.
 func TestARemovalRefusalStreakResetsWhenTheRefusalChanges(t *testing.T) {

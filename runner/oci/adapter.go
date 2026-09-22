@@ -493,6 +493,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 	response, err := session.InventoryRemoval(ctx, ocihelper.InventoryRemovalRequest{
 		Removal: ocihelper.ManagedVolumeRemovalAuthority{
 			NodeID: request.NodeID, BootSessionID: request.BootSessionID, JobID: request.JobID,
+			PriorJobID:        request.PriorJobID,
 			RemovalGeneration: request.RemovalGeneration, CleanupFence: request.CleanupFence,
 		},
 		ComputerStorage: computerStorage, RootInstanceID: request.RootInstanceID,

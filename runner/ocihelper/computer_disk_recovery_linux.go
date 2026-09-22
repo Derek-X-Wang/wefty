@@ -1295,9 +1295,16 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 			continue
 		}
 		root := filepath.Join(quarantineRoot, entry.Name())
-		lock, lockErr := openComputerDiskLock(root)
+		lock, present, lockErr := openComputerDiskLockWithoutCreatingRoot(root)
 		if lockErr != nil {
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantineGCFailed, Method: "generation_lock"})
+			continue
+		}
+		if !present {
+			// The listing this loop walks predates the open. A quarantine root
+			// that has since gone was collected by an authorized removal, and
+			// recreating it to take a lock would resurrect residue that
+			// removal has already proved absent.
 			continue
 		}
 		receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(root, "quarantine.json"))

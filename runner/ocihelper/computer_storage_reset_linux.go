@@ -71,6 +71,39 @@ func openComputerDiskLock(root string) (*os.File, error) {
 	return lock, nil
 }
 
+// openComputerDiskLockWithoutCreatingRoot takes the same exclusive flock as
+// openComputerDiskLock but never creates the directory the lock lives in.
+// Quarantine collection acts on a listing it took earlier, so MkdirAll there
+// would put a quarantine root back after an authorized removal's final listing
+// had already proved it gone -- and that separate inode is not covered by the
+// generation flock the removal holds. A root that is no longer there was
+// collected by someone else, which is reported as absent rather than as a
+// failure.
+func openComputerDiskLockWithoutCreatingRoot(root string) (*os.File, bool, error) {
+	directory, err := os.OpenFile(root, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if err := directory.Close(); err != nil {
+		return nil, false, err
+	}
+	lock, err := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lock.Close()
+		return nil, false, errComputerStorageAttachmentOwned
+	}
+	return lock, true, nil
+}
+
 func closeComputerDiskLock(lock *os.File) {
 	if lock == nil {
 		return

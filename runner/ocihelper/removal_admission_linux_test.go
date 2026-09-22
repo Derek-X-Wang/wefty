@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -329,5 +330,189 @@ func TestTombstonedRootDoesNotDeferTheCustodyWriteRecordSweep(t *testing.T) {
 	}
 	if _, recorded, err := engine.custodyWritePhase(exportRequest); err != nil || recorded {
 		t.Fatalf("a retained refusal tombstone deferred the custody sweep: recorded=%t err=%v", recorded, err)
+	}
+}
+
+// GrowComputerStorage creates the generation root too, so it must reach that
+// creation only through root admission: a grow admitted inside a deletion's
+// unlink-to-proof interval would put a replacement root and lock inode back
+// under the proof, and then refuse the missing image and leave them there.
+func TestGrowWaitingOnRootAdmissionRefusesTypedAndCreatesNoRoot(t *testing.T) {
+	root, fake, storage, _ := prepareDetachedBackupSource(t)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: fake}
+	grow := growTestRequest(32 << 20)
+	grow.Storage.ComputerID = "grow-computer"
+	grow.Storage.StorageID = "grow-storage"
+	growName, _ := deterministicComputerDiskName(grow.Storage)
+	growRoot := filepath.Join(root, "computer-disks", growName)
+	checked := map[computerDiskCheckpoint]bool{}
+	engine.computerDiskHook = func(checkpoint computerDiskCheckpoint) error {
+		if checkpoint != computerDiskRootRemoved && checkpoint != computerDiskRemovalAbsent {
+			return nil
+		}
+		checked[checkpoint] = true
+		_, err := engine.GrowComputerStorage(expiredContext(t), grow)
+		var contended *computerStorageAdmissionContendedError
+		if !errors.As(err, &contended) {
+			t.Errorf("%s admitted a grow: %v", checkpoint, err)
+		}
+		if _, err := os.Lstat(growRoot); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s let a grow create a generation root: %v", checkpoint, err)
+		}
+		return nil
+	}
+	if err := engine.deleteComputerDisk(storage, detachedRemovalAuthority()); err != nil {
+		t.Fatal(err)
+	}
+	if len(checked) != 2 {
+		t.Fatalf("observed %d deletion boundaries, want 2", len(checked))
+	}
+}
+
+// Quarantine collection acts on a listing it took earlier. Its lock open must
+// never create the directory back: an authorized removal can have collected
+// that quarantine root in between, and the removal's generation flock does not
+// cover this separate inode.
+func TestQuarantineCollectionNeverRecreatesACollectedRoot(t *testing.T) {
+	root := t.TempDir()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.quarantineComputerDiskAnomaly(diskRoot, name, storage, "allocation_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	quarantineRoot := filepath.Join(root, "computer-disk-quarantine")
+	entries, err := os.ReadDir(quarantineRoot)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine entries=%d err=%v", len(entries), err)
+	}
+	collected := filepath.Join(quarantineRoot, entries[0].Name())
+	raced := false
+	engine.computerReadDir = func(path string) ([]os.DirEntry, error) {
+		listed, readErr := os.ReadDir(path)
+		if readErr != nil || path != quarantineRoot || raced {
+			return listed, readErr
+		}
+		// An authorized removal collects this quarantine root between the
+		// listing and the lock open that follows it.
+		raced = true
+		if err := os.RemoveAll(collected); err != nil {
+			t.Fatal(err)
+		}
+		return listed, nil
+	}
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !raced {
+		t.Fatal("collection never listed the quarantine root")
+	}
+	if _, err := os.Lstat(collected); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("collection recreated a quarantine root that removal had taken: %v", err)
+	}
+}
+
+// The typed contention refusal has to arrive over a connection that is still
+// open. The client keeps its own deadline locally and closes the socket when
+// it expires, so the helper bounds its own admission wait.
+type admissionContendedEngine struct {
+	*fakeEngine
+	held sync.Mutex
+}
+
+func (engine *admissionContendedEngine) DeleteManagedVolume(ctx context.Context, _ DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
+	return DeleteManagedVolumeResponse{}, admitComputerStorage(ctx, &engine.held, "Storage root")
+}
+
+func TestAdmissionContentionReachesTheCallerOverALiveConnection(t *testing.T) {
+	previous := computerStorageAdmissionWait
+	computerStorageAdmissionWait = 50 * time.Millisecond
+	t.Cleanup(func() { computerStorageAdmissionWait = previous })
+	engine := &admissionContendedEngine{fakeEngine: newFakeEngine()}
+	engine.held.Lock()
+	defer engine.held.Unlock()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	// The caller's context never expires: only the helper's own bound does.
+	_, err = session.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+		Kind: ManagedVolumeHandoff, OwnerKey: "contended-volume"})
+	assertRPCCode(t, err, CodeComputerStorageBusy)
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("admission contention marked the live helper session lost: %v", err)
+	}
+}
+
+// Contention at the finalization acquisition follows payload removal, so the
+// refusal claims replayable contention and nothing about unchanged storage.
+// What it does promise is that no absence proof was produced and that the same
+// authority finishes the work.
+func TestAdmissionContentionAfterPayloadRemovalIsReplayable(t *testing.T) {
+	previous := computerStorageAdmissionWait
+	computerStorageAdmissionWait = 20 * time.Millisecond
+	t.Cleanup(func() { computerStorageAdmissionWait = previous })
+	root, fake, storage, _ := prepareDetachedBackupSource(t)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: fake}
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	held, proved := false, false
+	engine.computerDiskHook = func(checkpoint computerDiskCheckpoint) error {
+		switch checkpoint {
+		case computerDiskPayloadRemoved:
+			if !held {
+				// Held past this hook's return, so deletion's finalization
+				// acquisition is the one that expires.
+				held = true
+				engine.computerReimageMu.Lock()
+			}
+		case computerDiskRemovalAbsent:
+			proved = true
+		}
+		return nil
+	}
+	err := engine.deleteComputerDisk(storage, detachedRemovalAuthority())
+	engine.computerReimageMu.Unlock()
+	var contended *computerStorageAdmissionContendedError
+	if !errors.As(err, &contended) {
+		t.Fatalf("finalization admission = %v, want a typed contention refusal", err)
+	}
+	if proved {
+		t.Fatal("a contended removal claimed an absence proof")
+	}
+	remaining, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatalf("contended removal did not leave its retained root: %v", err)
+	}
+	names := make([]string, 0, len(remaining))
+	for _, entry := range remaining {
+		names = append(names, entry.Name())
+	}
+	if !slices.Equal(names, []string{"attachment.lock"}) {
+		t.Fatalf("contended removal left %v, want only the retained lock", names)
+	}
+	// The same authority, replayed, finishes the removal.
+	engine.computerDiskHook = func(checkpoint computerDiskCheckpoint) error {
+		if checkpoint == computerDiskRemovalAbsent {
+			proved = true
+		}
+		return nil
+	}
+	if err := engine.deleteComputerDisk(storage, detachedRemovalAuthority()); err != nil {
+		t.Fatalf("replayed removal: %v", err)
+	}
+	if !proved {
+		t.Fatal("replayed removal returned without proving absence")
+	}
+	if _, err := os.Lstat(diskRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replayed removal left the root: %v", err)
 	}
 }

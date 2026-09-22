@@ -359,6 +359,7 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 			}
 			proofRequest := workloadrunner.RuntimeRemovalProofRequest{
 				NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
+				PriorJobID:        removal.jobID,
 				RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
 				Attempts: attempts,
 			}
@@ -420,6 +421,10 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 	for index, computerStorage := range requests {
 		request := workloadrunner.RuntimeRemovalProofRequest{
 			NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
+			// The Job that wrote a refusal tombstone is the Job this removal
+			// names as prior once `current_job_id` has rotated; the helper
+			// accepts either, and it cannot accept what it is never sent.
+			PriorJobID:        removal.jobID,
 			RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
 			ComputerStorage: computerStorage,
 		}
@@ -1085,9 +1090,18 @@ func (controller *removalController) removalIsStalled(ctx context.Context, recor
 // streak is counted against. The raw message cannot be used: it carries job
 // and attempt identifiers, so every retry would look like a different refusal
 // and no streak would ever form.
+//
+// A qualifying code has to say something about the resource this removal is
+// asking about. `computer_storage_busy` raised by Node-wide disk admission
+// says only that another Computer's operation held the Node while this one
+// waited, so counting it would let unrelated traffic declare a healthy removal
+// stalled. It ends the streak instead, exactly like an untyped failure.
 func removalRefusalCode(cause error) (string, string) {
 	var rpcErr *ocihelper.RPCError
 	if errors.As(cause, &rpcErr) && strings.TrimSpace(string(rpcErr.Code)) != "" {
+		if rpcErr.Code == ocihelper.CodeComputerStorageBusy {
+			return "", ""
+		}
 		return string(rpcErr.Code), rpcErr.Message
 	}
 	var reasoned interface{ ControlFailureReason() string }
