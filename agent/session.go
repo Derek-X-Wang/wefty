@@ -245,14 +245,7 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	}
 	// ADR-0002 removal recovery is independent of OCI readiness and always runs
 	// once registration authority and its restrictive N+1 are published.
-	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives),
-		session.processStorageResetDirectives(ctx, registrationHeartbeat.StorageResetDirectives),
-		session.processStorageGrowDirectives(ctx, registrationHeartbeat.StorageGrowDirectives),
-		session.processReimageDirectives(ctx, registrationHeartbeat.ReimageDirectives),
-		session.processBackupDirectives(ctx, registrationHeartbeat.BackupDirectives),
-		session.processBackupPruneDirectives(ctx, registrationHeartbeat.BackupPruneDirectives),
-		session.processStorageCopyDirectives(ctx, registrationHeartbeat.StorageCopyDirectives),
-		session.processCustodyExportDirectives(ctx, registrationHeartbeat.CustodyExportDirectives))
+	removalErr := session.processStandingDirectives(ctx, registrationHeartbeat)
 	pinsErr := error(nil)
 	if barrierErr == nil && removalErr == nil {
 		pinsErr = session.reconcileOCIImagePins(ctx)
@@ -306,6 +299,33 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 		return session.publishCapabilityHeartbeat(ctx, nil)
 	}
 	return session.publishCapabilityHeartbeat(ctx, &generation)
+}
+
+// processStandingDirectives reconciles every standing node-scoped directive
+// carried by one boot-sequence response. Registration and OCI recovery run the
+// identical set, and its joined error is what keeps `kind:oci` withdrawn until
+// the node has finished the work L1 is still asking for.
+//
+// That gate used to include the Backup copies of a removal L1 had already
+// declared stalled. A Backup-copy deletion the helper refuses -- an immutable
+// copy on a Mac Node, in the run that found this -- was redelivered on every
+// heartbeat, failed identically every time, and so withdrew the node's whole
+// OCI capability while the stalled removal's own Slot was free: the operator
+// was told a fresh Computer could place, and nothing could (#513). A removal
+// that L1 has declared stalled is a standing chore with its own durable
+// backoff, not an unfinished boot step, so its retained resources are excluded
+// here and the rest of the namespace is still proven absent as before.
+func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
+	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
+	return errors.Join(session.resumePendingRemovals(ctx),
+		session.processRemovalDirectives(ctx, response.RemovalDirectives),
+		session.processStorageResetDirectives(ctx, response.StorageResetDirectives),
+		session.processStorageGrowDirectives(ctx, response.StorageGrowDirectives),
+		session.processReimageDirectives(ctx, response.ReimageDirectives),
+		session.processBackupDirectives(ctx, response.BackupDirectives),
+		session.processBackupPruneDirectives(ctx, retention.excludeBackupPrunes(response.BackupPruneDirectives)),
+		session.processStorageCopyDirectives(ctx, response.StorageCopyDirectives),
+		session.processCustodyExportDirectives(ctx, response.CustodyExportDirectives))
 }
 
 func (session *agentSession) processRemovalDirectives(ctx context.Context, directives []l1.RemovalDirective) error {
@@ -544,15 +564,7 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 	if barrierErr != nil && !intentDisabled {
 		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
 	}
-	removalErr := errors.Join(session.resumePendingRemovals(ctx),
-		session.processRemovalDirectives(ctx, restrictiveResponse.RemovalDirectives),
-		session.processStorageResetDirectives(ctx, restrictiveResponse.StorageResetDirectives),
-		session.processStorageGrowDirectives(ctx, restrictiveResponse.StorageGrowDirectives),
-		session.processReimageDirectives(ctx, restrictiveResponse.ReimageDirectives),
-		session.processBackupDirectives(ctx, restrictiveResponse.BackupDirectives),
-		session.processBackupPruneDirectives(ctx, restrictiveResponse.BackupPruneDirectives),
-		session.processStorageCopyDirectives(ctx, restrictiveResponse.StorageCopyDirectives),
-		session.processCustodyExportDirectives(ctx, restrictiveResponse.CustodyExportDirectives))
+	removalErr := session.processStandingDirectives(ctx, restrictiveResponse)
 	if barrierErr != nil {
 		return ocihelper.HelperSession{}, barrierErr
 	}
@@ -1258,6 +1270,10 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 			}
 			session.observeGrantedCapacity(response.Node)
+			// The same exclusion the boot sequence makes: a stalled removal's
+			// retained resources belong to its own durable backoff, and the
+			// ordinary directive lists must not reconcile them a second time.
+			retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 			if session.removals != nil {
 				for _, directive := range response.RemovalDirectives {
 					session.removals.enqueue(ctx, directive, failures)
@@ -1284,7 +1300,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 					session.backups.enqueue(ctx, "create\x00"+directive.CopyID,
 						func(runContext context.Context) error { return session.backups.processCreate(runContext, directive) }, failures)
 				}
-				for _, directive := range response.BackupPruneDirectives {
+				for _, directive := range retention.excludeBackupPrunes(response.BackupPruneDirectives) {
 					directive := directive
 					session.backups.enqueue(ctx, "prune\x00"+directive.CopyID,
 						func(runContext context.Context) error { return session.backups.processPrune(runContext, directive) }, failures)

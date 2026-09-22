@@ -821,6 +821,89 @@ func backupCopyDirectives(claims *l1.ComputerBackupCopyClaims) []l1.ComputerBack
 	return claims.Copies
 }
 
+// stalledRemovalRetention names the resources still held by removals L1 has
+// already declared stalled: the Computer whose deletion was refused and the
+// Backup copies its standing directive still names. Those resources are the
+// declaration's own subject -- L1 recorded that nothing about their deletion
+// is proven -- so they are outside every absence proof the node's OCI boot
+// sequence makes, and a node holding only them earns `kind:oci` again (#513).
+//
+// A stalled removal keeps exactly one cadence: the durable backoff its own
+// standing directive runs on. Reconciling the same physical Backup copy a
+// second time through the ordinary prune list would be a second accounting
+// for one step of one removal, which the removal contract forbids.
+type stalledRemovalRetention struct {
+	computers map[string]struct{}
+	copies    map[string]struct{}
+}
+
+func (retention stalledRemovalRetention) empty() bool {
+	return len(retention.computers) == 0 && len(retention.copies) == 0
+}
+
+func (retention stalledRemovalRetention) retains(directive l1.ComputerBackupPruneDirective) bool {
+	if _, held := retention.copies[directive.CopyID]; held && directive.CopyID != "" {
+		return true
+	}
+	_, held := retention.computers[directive.ComputerID]
+	return held && directive.ComputerID != ""
+}
+
+// excludeBackupPrunes drops the prunes a stalled removal already owns. It
+// returns the input untouched when nothing is stalled, so the ordinary node
+// carries no per-directive bookkeeping at all.
+func (retention stalledRemovalRetention) excludeBackupPrunes(directives []l1.ComputerBackupPruneDirective) []l1.ComputerBackupPruneDirective {
+	if retention.empty() || len(directives) == 0 {
+		return directives
+	}
+	kept := make([]l1.ComputerBackupPruneDirective, 0, len(directives))
+	for _, directive := range directives {
+		if retention.retains(directive) {
+			continue
+		}
+		kept = append(kept, directive)
+	}
+	return kept
+}
+
+// declaredStalledRetention reads the stalled set without any new L1 field. The
+// durable runtime removal record is the authority for "L1 declared this
+// stalled" -- `stall_declared_ns` is written only after L1 accepted the
+// declaration -- and the standing removal directive L1 already redispatches
+// for that same job names the resources it retains. A record this agent cannot
+// validate is never treated as stalled, so a broken row narrows nothing.
+func (controller *removalController) declaredStalledRetention(ctx context.Context, directives []l1.RemovalDirective) stalledRemovalRetention {
+	retention := stalledRemovalRetention{}
+	if controller == nil || controller.loadRuntimeRemoval == nil {
+		return retention
+	}
+	for _, directive := range directives {
+		if directive.BoundNodeID != controller.nodeID {
+			continue
+		}
+		record, found, err := controller.loadRuntimeRemoval(ctx, directive.JobID)
+		if err != nil || !found || record.invalidReason != "" || record.stallDeclaredAt == nil {
+			continue
+		}
+		if directive.ComputerStorage != nil && directive.ComputerStorage.ComputerID != "" {
+			if retention.computers == nil {
+				retention.computers = make(map[string]struct{})
+			}
+			retention.computers[directive.ComputerStorage.ComputerID] = struct{}{}
+		}
+		for _, copy := range backupCopyDirectives(directive.ComputerBackupCopies) {
+			if copy.CopyID == "" {
+				continue
+			}
+			if retention.copies == nil {
+				retention.copies = make(map[string]struct{})
+			}
+			retention.copies[copy.CopyID] = struct{}{}
+		}
+	}
+	return retention
+}
+
 func storageGenerationClaims(claims *l1.ComputerStorageGenerationClaims) []l1.ComputerStorageGenerationClaim {
 	if claims == nil {
 		return nil
