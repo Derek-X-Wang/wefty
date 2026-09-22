@@ -549,7 +549,15 @@ Record four rows:
    but before authoritative `Started`. Require the old attempt to terminalize,
    the job to requeue with its original absolute deadline and digest, a fresh
    attempt/fence after recovery, and exactly one payload execution across the
-   two attempts.
+   two attempts. Record `round_trip=true` for that one execution, as row 1
+   does. The recovered attempt's exit zero is itself the bridge proof: `--once`
+   makes its authenticated run-scoped request before it writes either marker
+   and returns a non-zero exit on any failure or non-2xx response
+   (`cmd/wefty-echo-service/main.go`, `runOnce`), which is the same reading
+   `serviceacceptance/attended_helper_loss.go` already makes of those markers.
+   A row that recovered into a clean exit zero and both markers therefore
+   carries the round trip; leaving the fact `false` understates what the row
+   observed.
 3. `oci_oneshot_poststarted_loss`: stop the VM or helper after `Started`.
    Require one terminal `runtime_failure`, no automatic requeue, one attempt,
    and exactly one payload execution.
@@ -795,13 +803,28 @@ one `absent=true` assertion for every class/identity in `resource_manifests`.
 The same read carries them: a record whose `absence_attestation` is present
 proves the post-delete attestation, and its `assertions` array is the row's
 `removal_assertions`.
-The attended receipt must set `delete_attest_restart_observed=true` only after
-observing a real agent process restart at the helper-delete/attestation boundary
-without an early L1 acknowledgement. Injected callback errors may be recorded
-separately but do not prove a restart; hosted lanes record the restart row as
-`NOT-RUN`. The same receipt also carries bind-source byte/digest equality and
-the retained image-cache observation. A row that was skipped or could not be
-inventoried is a failure, never a synthesized PASS.
+`delete_attest_restart_observed` is an optional observation, not a fact this
+row is required to carry, because this procedure cannot produce one. The
+completion pass runs in-process and finishes inside a sub-second window (24.9
+ms on owner hardware, run 7), so no operator can interpose a real agent process
+restart between the helper `Delete` and the attestation, and nothing above asks
+them to. What the attended row proves instead is the ordering it can actually
+observe: the completed record carries the absence attestation, the guest-native
+service-data bytes and the owner record are gone, and only then does the job
+reach `removed_verified` — the record leaves the read surface at the L1
+acknowledgement, so an early acknowledgement would have taken it away before
+the capture ever held it at `phase=complete`. The invariant the restart was
+reaching for — a crash between the helper delete and the attestation never
+acknowledges L1 early, and resume redoes both — is owned by
+`TestRemovalControllerCrashBetweenHelperDeleteAndAttestationNeverAcknowledgesEarly`
+in `agent/removal_test.go`, which is where it is provable. Set
+`delete_attest_restart_observed=true` only after observing a real agent process
+restart at that boundary without an early L1 acknowledgement; injected callback
+errors may be recorded separately but do not prove a restart, and hosted lanes
+record the restart observation as `NOT-RUN`. The same receipt also carries
+bind-source byte/digest equality and the retained image-cache observation. A
+row that was skipped or could not be inventoried is a failure, never a
+synthesized PASS.
 
 Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,

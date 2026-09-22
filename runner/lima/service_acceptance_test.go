@@ -108,26 +108,37 @@ type attendedResult struct {
 	// unprovable stop must not be reported as stopped -- while recording what
 	// the injected fault actually produced. A latch and an honest survival are
 	// both real observations; a row whose fault was never injected is neither.
-	QuiescenceFaultInjected bool               `json:"quiescence_fault_injected,omitempty"`
-	QuiescenceLatched       bool               `json:"quiescence_latched,omitempty"`
-	ServiceJobState         string             `json:"service_job_state,omitempty"`
-	ServiceOwners           []string           `json:"service_owners,omitempty"`
-	ServiceAttemptCounts    []int              `json:"service_attempt_counts,omitempty"`
-	GuestNativeData         bool               `json:"guest_native_data,omitempty"`
-	VirtioFSData            *bool              `json:"virtiofs_data,omitempty"`
-	RootfsDiscarded         bool               `json:"rootfs_discarded,omitempty"`
-	RemovalPhase            string             `json:"removal_phase,omitempty"`
-	RemovalPendingObserved  bool               `json:"removal_pending_observed,omitempty"`
-	RemovalCompleted        bool               `json:"removal_completed,omitempty"`
-	RuntimeQuiesced         bool               `json:"runtime_quiesced,omitempty"`
-	ResourceManifests       []json.RawMessage  `json:"resource_manifests,omitempty"`
-	PostDeleteAttestation   bool               `json:"post_delete_attestation,omitempty"`
-	ServiceDataBytesAbsent  bool               `json:"service_data_bytes_absent,omitempty"`
-	OwnerRecordAbsent       bool               `json:"service_data_owner_record_absent,omitempty"`
-	DeleteAttestRestart     bool               `json:"delete_attest_restart_observed,omitempty"`
-	BindSourcesUntouched    bool               `json:"bind_sources_untouched,omitempty"`
-	ImageCacheRetained      bool               `json:"image_cache_retained,omitempty"`
-	RemovalAssertions       []removalAssertion `json:"removal_assertions,omitempty"`
+	QuiescenceFaultInjected bool              `json:"quiescence_fault_injected,omitempty"`
+	QuiescenceLatched       bool              `json:"quiescence_latched,omitempty"`
+	ServiceJobState         string            `json:"service_job_state,omitempty"`
+	ServiceOwners           []string          `json:"service_owners,omitempty"`
+	ServiceAttemptCounts    []int             `json:"service_attempt_counts,omitempty"`
+	GuestNativeData         bool              `json:"guest_native_data,omitempty"`
+	VirtioFSData            *bool             `json:"virtiofs_data,omitempty"`
+	RootfsDiscarded         bool              `json:"rootfs_discarded,omitempty"`
+	RemovalPhase            string            `json:"removal_phase,omitempty"`
+	RemovalPendingObserved  bool              `json:"removal_pending_observed,omitempty"`
+	RemovalCompleted        bool              `json:"removal_completed,omitempty"`
+	RuntimeQuiesced         bool              `json:"runtime_quiesced,omitempty"`
+	ResourceManifests       []json.RawMessage `json:"resource_manifests,omitempty"`
+	PostDeleteAttestation   bool              `json:"post_delete_attestation,omitempty"`
+	ServiceDataBytesAbsent  bool              `json:"service_data_bytes_absent,omitempty"`
+	OwnerRecordAbsent       bool              `json:"service_data_owner_record_absent,omitempty"`
+	// DeleteAttestRestart records a real agent process restart interposed
+	// between the helper's Delete and the attestation. It is an optional
+	// observation, never a required fact (#521): the attended removal's
+	// completion pass is in-process and sub-second -- 24.9 ms on owner
+	// hardware in run 7 -- so no operator can interpose a restart there, and
+	// the runbook never asks them to. The invariant it was reaching for is
+	// owned by TestRemovalControllerCrashBetweenHelperDeleteAndAttestation-
+	// NeverAcknowledgesEarly in agent/removal_test.go, where the boundary can
+	// be driven directly. The gate requiring it true only ever passed on a
+	// receipt that overstated what the row saw; it sat unreached behind the
+	// retired absence check until #509 removed that fatal.
+	DeleteAttestRestart  bool               `json:"delete_attest_restart_observed,omitempty"`
+	BindSourcesUntouched bool               `json:"bind_sources_untouched,omitempty"`
+	ImageCacheRetained   bool               `json:"image_cache_retained,omitempty"`
+	RemovalAssertions    []removalAssertion `json:"removal_assertions,omitempty"`
 }
 
 type removalAssertion struct {
@@ -409,7 +420,7 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	}
 	removal := artifact.Rows["service_removal_manifest_offline"]
 	if removal.RemovalPhase != "complete" || !removal.RemovalPendingObserved || !removal.RemovalCompleted || !removal.RuntimeQuiesced || len(removal.ResourceManifests) == 0 ||
-		!removal.PostDeleteAttestation || !removal.ServiceDataBytesAbsent || !removal.OwnerRecordAbsent || !removal.DeleteAttestRestart ||
+		!removal.PostDeleteAttestation || !removal.ServiceDataBytesAbsent || !removal.OwnerRecordAbsent ||
 		!removal.BindSourcesUntouched || !removal.ImageCacheRetained {
 		t.Fatalf("offline removal row lacks pending manifest/quiescence evidence: %+v", removal)
 	}
