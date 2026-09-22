@@ -31,6 +31,13 @@ const (
 	syntheticTailnetIPv6      = `fd7a:115c:a1e0:1234:5678:9abc:def0:1111`
 	syntheticEnrollmentURL    = `https://login.example-control.test/a/0123456789abcdefEXAMPLE`
 	syntheticRegisterURL      = `https://control.example-headscale.test/register/0123456789abcdef0123456789abcdef`
+	// Round-2 review samples: an enrollment URL whose host happens to be a
+	// tailnet address or MagicDNS name, and a control URL carrying
+	// basic-auth userinfo.
+	syntheticTailnetHostRegisterURL  = `http://100.101.102.103/register/0123456789abcdef`
+	syntheticMagicDNSHostAuthURL     = `https://login.example-tailnet.ts.net/a/0123456789abcdefEXAMPLE`
+	sampleControlURLWithUserinfoLine = `control server key from https://operator:example-password@control.example.test`
+	syntheticControlURLUserinfo      = `operator:example-password@`
 )
 
 func TestRedactFabricLogStripsSensitiveContent(t *testing.T) {
@@ -107,6 +114,40 @@ func TestWrapUserLogfPrintsRealURLIntactWhenOptedIn(t *testing.T) {
 	}
 	if strings.Contains(got[0], syntheticAuthKeyValue) {
 		t.Fatalf("opted-in enrollment line %q still leaked the auth key", got[0])
+	}
+}
+
+// TestWrapUserLogfPreservesEnrollmentURLHostUnderIdentifierRedaction covers
+// wefty #498 finding 1, round 2: when opted in, the enrollment URL's host
+// must survive intact even when that host itself looks like a tailnet
+// address or a MagicDNS name -- the identifier-redaction patterns must not
+// run over the matched enrollment URL span.
+func TestWrapUserLogfPreservesEnrollmentURLHostUnderIdentifierRedaction(t *testing.T) {
+	t.Setenv(printEnrollmentURLEnv, "1")
+
+	tests := []struct {
+		name string
+		line string
+		want string
+	}{
+		{"CGNAT-host register URL", "AuthURL is " + syntheticTailnetHostRegisterURL, syntheticTailnetHostRegisterURL},
+		{"MagicDNS-host login/a URL", "AuthURL is " + syntheticMagicDNSHostAuthURL, syntheticMagicDNSHostAuthURL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			sink := func(format string, args ...any) { got = append(got, fmt.Sprintf(format, args...)) }
+			userLogf := wrapUserLogf(sink)
+
+			userLogf("%s", tt.line)
+
+			if len(got) != 1 {
+				t.Fatalf("sink called %d times, want 1: %v", len(got), got)
+			}
+			if got[0] != "AuthURL is "+tt.want {
+				t.Fatalf("opted-in enrollment line = %q, want the URL exactly intact as %q", got[0], "AuthURL is "+tt.want)
+			}
+		})
 	}
 }
 
@@ -249,6 +290,51 @@ func TestWrapBackendLogfAppliesTheSameEnrollmentPolicyAsUserLogf(t *testing.T) {
 			t.Fatalf("opted-in backend enrollment line %q still leaked the auth key", got2[0])
 		}
 	})
+}
+
+// TestURLUserinfoIsAlwaysRedacted covers wefty #498 finding 2, round 2: the
+// pinned dependency logs the configured control URL verbatim
+// (control/controlclient/direct.go:714, "control server key from
+// <serverURL>"), and that URL can carry basic-auth userinfo. Unlike the
+// enrollment URL, there is no opt-in for a login/password: it must be
+// stripped through both hooks, in both opt-in states.
+func TestURLUserinfoIsAlwaysRedacted(t *testing.T) {
+	for _, optedIn := range []string{"", "1"} {
+		name := "opted out"
+		if optedIn == "1" {
+			name = "opted in"
+		}
+		t.Run("UserLogf/"+name, func(t *testing.T) {
+			t.Setenv(printEnrollmentURLEnv, optedIn)
+			var got []string
+			sink := func(format string, args ...any) { got = append(got, fmt.Sprintf(format, args...)) }
+			userLogf := wrapUserLogf(sink)
+
+			userLogf("%s", sampleControlURLWithUserinfoLine)
+
+			if len(got) != 1 {
+				t.Fatalf("sink called %d times, want 1: %v", len(got), got)
+			}
+			if strings.Contains(got[0], syntheticControlURLUserinfo) {
+				t.Fatalf("UserLogf (%s) leaked URL userinfo: %q", name, got[0])
+			}
+		})
+		t.Run("BackendLogf/"+name, func(t *testing.T) {
+			t.Setenv(printEnrollmentURLEnv, optedIn)
+			var got []string
+			sink := func(format string, args ...any) { got = append(got, fmt.Sprintf(format, args...)) }
+			backendLogf := wrapBackendLogf(sink)
+
+			backendLogf("%s", sampleControlURLWithUserinfoLine)
+
+			if len(got) != 1 {
+				t.Fatalf("sink called %d times, want 1: %v", len(got), got)
+			}
+			if strings.Contains(got[0], syntheticControlURLUserinfo) {
+				t.Fatalf("BackendLogf (%s) leaked URL userinfo: %q", name, got[0])
+			}
+		})
+	}
 }
 
 func TestNewSetsWeftyOwnedLoggersByDefault(t *testing.T) {
