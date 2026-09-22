@@ -549,7 +549,19 @@ Record four rows:
    but before authoritative `Started`. Require the old attempt to terminalize,
    the job to requeue with its original absolute deadline and digest, a fresh
    attempt/fence after recovery, and exactly one payload execution across the
-   two attempts.
+   two attempts. Record `round_trip=true` for that one execution, as row 1
+   does. The recovered attempt's exit zero carries the bridge request: `--once`
+   writes its handoff file, then makes the authenticated run-scoped request,
+   and returns a non-zero exit if that request fails to send or answers outside
+   2xx — before it writes either marker
+   (`cmd/wefty-echo-service/main.go`, `runOnce`). It ignores response
+   body-read and close errors, so exit zero proves the request was sent and
+   accepted, not that the response body was fully drained. That is the same
+   reading `serviceacceptance/attended_helper_loss.go` makes of those markers;
+   where the row can also watch the host-side origin serve the request (as row
+   1's entrypoint does), record that stronger observation instead. Leaving the
+   fact `false` on a recovered attempt that exited zero with both markers
+   understates what the row observed.
 3. `oci_oneshot_poststarted_loss`: stop the VM or helper after `Started`.
    Require one terminal `runtime_failure`, no automatic requeue, one attempt,
    and exactly one payload execution.
@@ -795,13 +807,39 @@ one `absent=true` assertion for every class/identity in `resource_manifests`.
 The same read carries them: a record whose `absence_attestation` is present
 proves the post-delete attestation, and its `assertions` array is the row's
 `removal_assertions`.
-The attended receipt must set `delete_attest_restart_observed=true` only after
-observing a real agent process restart at the helper-delete/attestation boundary
-without an early L1 acknowledgement. Injected callback errors may be recorded
-separately but do not prove a restart; hosted lanes record the restart row as
-`NOT-RUN`. The same receipt also carries bind-source byte/digest equality and
-the retained image-cache observation. A row that was skipped or could not be
-inventoried is a failure, never a synthesized PASS.
+`delete_attest_restart_observed` is an optional observation, not a fact this
+row is required to carry: nothing above stages the native agent process restart
+it names. The completion pass runs in-process and finished in 24.9 ms on owner
+hardware (run 7), and the prescribed procedure gives the operator no mechanism
+to interpose a restart between the helper `Delete` and the attestation — an
+instrumented restart at that boundary may still be possible, but this runbook
+does not describe one, so ordinary execution cannot reliably satisfy the fact.
+Record instead the two timestamps that do carry the ordering, from the same
+reads this row already takes: the completed record's `attested_at` /
+`completed_at`, and the L1 job's `cleanup_acknowledged_at`. The first must
+precede the second. Run 7 read `.973392Z` against `.975621Z`
+(`evidence/removal-complete-record.json`, `evidence/removal-postverify.txt`).
+Do not read the record's later disappearance as ordering evidence: the agent
+acknowledges L1 and then deletes the record in a separate transaction
+(`agent/removal.go`, `ackRemoval` before `finishRemoval`), so a completed
+record can outlive its acknowledgement and its removal is ordinary local
+cleanup.
+
+Unit coverage retains the controller's error/retry sequencing across that
+boundary — a successful delete, an injected attestation error, no
+acknowledgement, then a second pass requiring both calls again before
+acknowledging — in
+`TestRemovalControllerCrashBetweenHelperDeleteAndAttestationNeverAcknowledgesEarly`
+(`agent/removal_test.go`). That test drives one controller over a mocked
+record; it restarts no process and reloads no durable state, so coverage of an
+actual boundary restart is **unverified**. Set
+`delete_attest_restart_observed=true` only after observing a real agent process
+restart at that boundary without an early L1 acknowledgement; injected callback
+errors may be recorded separately but do not prove a restart, and hosted lanes
+record the restart observation as `NOT-RUN`. The same receipt also carries
+bind-source byte/digest equality and the retained image-cache observation. A
+row that was skipped or could not be inventoried is a failure, never a
+synthesized PASS.
 
 Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,
