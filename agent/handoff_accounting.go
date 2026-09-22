@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,18 +29,40 @@ type handoffTally struct {
 	logical int64
 	charged int64
 	entries int64
-	// unaccounted counts the subtrees this walk gave up on because it could no
-	// longer reach the directory it had been measuring. Their bytes are on the
-	// node and are not in the figures above, which is exactly what the pass
-	// has to say rather than quietly report a smaller node.
-	unaccounted int
-	// replaced counts the subset of those where the name was reachable and led
+	// vanished counts the subtrees this walk gave up on because the directory
+	// it had been measuring stopped being reachable at all. Their bytes may
+	// still be on the node and are not in the figures above, which is what the
+	// pass has to say rather than quietly report a smaller node.
+	vanished int
+	// replaced counts the subtrees where the name was reachable and led
 	// somewhere else: a different directory now stands where the walk had been
 	// measuring. That is a different fact from a subtree that simply went
 	// away, and it is the one worth naming -- a workload owns these
 	// directories, and swapping one mid-pass is how a tree would otherwise be
 	// measured as somewhere it is not.
+	//
+	// Each is counted once per loss. Every frame beneath a replaced ancestor
+	// fails on the same component as the walk unwinds, and counting those
+	// would report a hundred losses where a workload renamed one directory.
 	replaced int
+	// truncated marks this run's tree as measured incompletely, because the
+	// pass spent its opens budget or the agent is shutting down.
+	truncated int
+	// closeFailures counts directories the walk finished with and could not
+	// close. It costs that entry's handle, not the pass.
+	closeFailures int
+	// reopenOpens counts the directories opened re-establishing an ancestry
+	// the walk had released, as opposed to visiting the tree. It is what the
+	// prefix cache exists to keep down, and a test asserts on it because
+	// "how many handles were held" says nothing about how much work was
+	// repeated to hold them.
+	reopenOpens int
+	// reopenFailures counts every re-open that did not complete, which is more
+	// than the losses above: one replaced ancestor refuses once for every
+	// frame beneath it as the walk unwinds. Nothing outside this walk reports
+	// it -- the node is told how many subtrees it lost, not how many times the
+	// walk noticed -- and a test uses it to know the retry path really ran.
+	reopenFailures int
 }
 
 // add records one directory entry.
@@ -81,11 +104,51 @@ func (tally *handoffTally) add(logical int64) {
 // nothing.
 const maxOpenWalkFrames = 64
 
+// maxWalkAnchors bounds the re-opened ancestry one walk keeps warm.
+//
+// Re-opening a released frame used to start at the walk's base every time, so a
+// deep branching tree paid its whole prefix per re-open. The components above
+// the branching are the same every time -- a chain over a comb re-walks the
+// chain for every tooth -- so the last re-open's steps are kept and the next
+// one starts from the deepest one that is still valid. Handles are what this
+// costs, so it is bounded like everything else here: a walk holds at most
+// maxOpenWalkFrames frames plus this many anchors.
+//
+// It shortens the prefix; it is not what bounds the adversarial case. That is
+// maxWalkOpens, because no cache makes an arbitrarily branching tree cheap.
+const maxWalkAnchors = 64
+
+// maxWalkOpens is how many directories one accounting pass may open before it
+// stops and says so.
+//
+// Accounting is a background pass over a workload's own directories, and how
+// much work they are worth is that workload's choice. Without a budget an
+// adversarial tree is an unbounded amount of syscalls inside the collector --
+// which the agent joins before releasing the node lock, so a shutdown waits on
+// it. A pass that stops early reports a truncated run by name; a pass that
+// never finishes reports nothing at all, which is the worse of the two.
+//
+// Low millions: far past any real retained-results tree, and seconds rather
+// than hours at a few microseconds an open.
+const maxWalkOpens = 4_000_000
+
 // errHandoffWalkMoved marks a directory that is no longer the one this walk
 // measured part of. It is not a failure of the pass: the workload owns these
 // files and may replace them mid-walk. What it costs is the rest of that
-// subtree, which is reported as unaccounted rather than guessed at.
+// subtree, which is reported as replaced rather than guessed at.
 var errHandoffWalkMoved = errors.New("a directory changed identity while the pass was walking it")
+
+// errHandoffWalkTruncated marks a walk that stopped before it finished, either
+// because the pass ran out of its opens budget or because the agent is shutting
+// down. What it has counted is real and incomplete, and saying which run was
+// cut short is the whole point of having the error.
+var errHandoffWalkTruncated = errors.New("the accounting pass stopped before it finished this run")
+
+// errHandoffWalkOwnership marks the one internal inconsistency this walk can
+// notice about itself: a frame being handed a second handle. It stops the walk
+// rather than the process. A background pass that panics takes the collector
+// goroutine, and with it the agent, over an accounting figure.
+var errHandoffWalkOwnership = errors.New("a walk frame was handed a second handle")
 
 // handoffWalkFrame is one directory the walk has read and still has
 // subdirectories to descend into.
@@ -129,8 +192,23 @@ type handoffWalk struct {
 	// above it is a component nothing remembers. Rebuilding a released frame
 	// from the stack then opened base/comb, which does not exist, and an
 	// unchanged tree reported its postponed siblings as unaccounted.
-	path      []string
-	firstOpen int
+	path []string
+	// anchors[d] is an open handle for path[:d+1] kept from the last re-open,
+	// so the next one starts below the prefix instead of at the base. An entry
+	// is dropped the moment its own component changes.
+	anchors     []*os.Root
+	anchorCount int
+	firstOpen   int
+	// opens is what is left of the pass's budget, shared by every run the pass
+	// measures. It is a pointer because the budget bounds the pass, not one
+	// tree: a node with a hundred adversarial runs is the same problem as one.
+	opens *int64
+	// ctx ends the walk when the agent is shutting down.
+	ctx context.Context
+	// lostDepth is the depth a re-open last failed at, so one replaced
+	// ancestor is counted once rather than once for every frame beneath it
+	// that then fails on the same component.
+	lostDepth int
 	// openFrames is the number of handles owned by frames. Every frame handle
 	// has exactly one owner, and every ownership change goes through own and
 	// release so reopened handles participate in the bound as well.
@@ -169,8 +247,8 @@ var handoffWalkDescended func(depth int)
 // seen, when non-nil, is the pass's cross-run file identity (handoffInodeOf).
 // Passing nil counts every name, which is what the per-run bound wants: it
 // trims names, and part 1 states its unit as logical bytes per link.
-func walkHandoffTree(parent *os.Root, name string, info os.FileInfo, seen map[handoffInode]struct{}) (handoffTally, error) {
-	walk := &handoffWalk{base: parent, seen: seen}
+func walkHandoffTree(ctx context.Context, budget *int64, parent *os.Root, name string, info os.FileInfo, seen map[handoffInode]struct{}) (handoffTally, error) {
+	walk := &handoffWalk{base: parent, seen: seen, opens: budget, ctx: ctx, lostDepth: -1}
 	defer walk.report()
 	defer walk.closeAll()
 	walk.tally.add(handoffLogicalBytes(info, seen))
@@ -178,6 +256,9 @@ func walkHandoffTree(parent *os.Root, name string, info os.FileInfo, seen map[ha
 		return walk.tally, nil
 	}
 	err := walk.descend(name)
+	if errors.Is(err, errHandoffWalkTruncated) || errors.Is(err, errHandoffWalkOwnership) {
+		walk.tally.truncated++
+	}
 	return walk.tally, err
 }
 
@@ -206,19 +287,33 @@ func (walk *handoffWalk) descend(name string) error {
 		}
 		child := frame.directories[0]
 		frame.directories = frame.directories[1:]
-		run, err := walk.topRoot()
+		run, depthLost, err := walk.topRoot()
 		if err != nil {
+			if errors.Is(err, errHandoffWalkTruncated) || errors.Is(err, errHandoffWalkOwnership) {
+				return err
+			}
 			// The walk can no longer reach the directory this frame stands
 			// for. What was counted stays counted; what is left of it is named
-			// as unaccounted rather than measured through a directory the walk
-			// cannot prove is the same one.
-			walk.tally.unaccounted++
-			if errors.Is(err, errHandoffWalkMoved) {
-				walk.tally.replaced++
+			// rather than measured through a directory the walk cannot prove
+			// is the one it was measuring.
+			//
+			// One replaced ancestor is one loss. Every frame beneath it fails
+			// on the same component as the walk unwinds, and counting each of
+			// those would report a hundred lost subtrees where a workload
+			// renamed one directory.
+			walk.tally.reopenFailures++
+			if depthLost != walk.lostDepth {
+				walk.lostDepth = depthLost
+				if errors.Is(err, errHandoffWalkMoved) {
+					walk.tally.replaced++
+				} else {
+					walk.tally.vanished++
+				}
 			}
 			walk.complete()
 			continue
 		}
+		walk.lostDepth = -1
 		depth := frame.depth + 1
 		next, err := walk.openDirectory(run, child)
 		if len(frame.directories) == 0 {
@@ -261,16 +356,26 @@ func (walk *handoffWalk) push(depth int, name string, run *os.Root) error {
 		return err
 	}
 	if len(directories) == 0 {
-		return walk.closeHandle(run)
+		if err := walk.closeHandle(run); err != nil {
+			// Closing a directory the walk is finished with cannot change what
+			// it counted, and it is not a reason to abandon every other run's
+			// tree. The entry it belongs to is already tallied; the failure is
+			// one entry's, not the pass's.
+			walk.tally.closeFailures++
+		}
+		return nil
 	}
 	// Truncate rather than append: a child opened after an earlier sibling's
 	// subtree finished belongs at its parent's depth plus one, not after
 	// whatever that subtree left behind.
+	walk.dropAnchors(depth)
 	walk.path = append(walk.path[:depth], name)
 	frame := &handoffWalkFrame{depth: depth, identity: identity, directories: directories}
 	walk.stack = append(walk.stack, frame)
 	walk.trim(len(walk.stack) - 1)
-	walk.own(frame, run)
+	if err := walk.own(frame, run); err != nil {
+		return err
+	}
 	if handoffWalkDescended != nil {
 		handoffWalkDescended(len(walk.path))
 	}
@@ -295,8 +400,63 @@ func (walk *handoffWalk) complete() {
 	depth := walk.stack[len(walk.stack)-1].depth
 	walk.discard()
 	if depth < len(walk.path) {
+		walk.dropAnchors(depth)
 		walk.path = walk.path[:depth]
 	}
+	if walk.lostDepth >= depth {
+		// The walk has unwound past whatever it lost, so the next failure is a
+		// new one rather than the same component refusing again.
+		walk.lostDepth = -1
+	}
+}
+
+// dropAnchors closes every cached step at or below depth. An anchor stands for
+// one exact prefix of path, so the moment that prefix changes the handle is a
+// directory this walk is no longer inside.
+func (walk *handoffWalk) dropAnchors(depth int) {
+	for position := depth; position < len(walk.anchors); position++ {
+		if walk.anchors[position] != nil {
+			walk.closeHandle(walk.anchors[position])
+			walk.anchors[position] = nil
+			walk.anchorCount--
+		}
+	}
+	if depth < len(walk.anchors) {
+		walk.anchors = walk.anchors[:depth]
+	}
+}
+
+// anchor keeps one re-opened step for the next re-open, or closes it when the
+// cache is full. The deepest steps are the ones an unwinding walk asks for
+// next, so a full cache gives up its shallowest entry rather than refusing.
+func (walk *handoffWalk) anchor(depth int, run *os.Root) {
+	for len(walk.anchors) <= depth {
+		walk.anchors = append(walk.anchors, nil)
+	}
+	if walk.anchors[depth] != nil {
+		walk.closeHandle(walk.anchors[depth])
+		walk.anchors[depth] = nil
+		walk.anchorCount--
+	}
+	for walk.anchorCount >= maxWalkAnchors {
+		shallowest := -1
+		for position, cached := range walk.anchors {
+			if cached != nil {
+				shallowest = position
+				break
+			}
+		}
+		if shallowest < 0 || shallowest >= depth {
+			// Nothing shallower to give up. This step is the one that goes.
+			walk.closeHandle(run)
+			return
+		}
+		walk.closeHandle(walk.anchors[shallowest])
+		walk.anchors[shallowest] = nil
+		walk.anchorCount--
+	}
+	walk.anchors[depth] = run
+	walk.anchorCount++
 }
 
 // topRoot hands back the deepest frame's handle, re-opening what was released
@@ -313,21 +473,26 @@ func (walk *handoffWalk) complete() {
 // It is only ever called on the deepest frame, and open frames are a contiguous
 // suffix of the stack, so reaching here means every frame is released and the
 // walk starts from the base.
-func (walk *handoffWalk) topRoot() (*os.Root, error) {
+func (walk *handoffWalk) topRoot() (*os.Root, int, error) {
 	index := len(walk.stack) - 1
 	frame := walk.stack[index]
 	if frame.run != nil {
-		return frame.run, nil
+		return frame.run, -1, nil
 	}
-	current := walk.base
-	var transient *os.Root
+	current, start := walk.base, 0
+	// Start below the deepest cached step that is still this walk's ancestry.
+	// Every component above it is one the last re-open already resolved and
+	// nothing has changed since.
+	for depth := min(frame.depth, len(walk.anchors)-1); depth >= 0; depth-- {
+		if walk.anchors[depth] != nil {
+			current, start = walk.anchors[depth], depth+1
+			break
+		}
+	}
 	firstOpen := walk.firstOpen
 	var openedFrames []*handoffWalkFrame
 	complete := false
 	defer func() {
-		if transient != nil {
-			walk.closeHandle(transient)
-		}
 		if !complete {
 			// A failed re-open owns none of the frame handles it acquired.
 			// Restoring both ownership and the window marker makes every retry
@@ -339,29 +504,31 @@ func (walk *handoffWalk) topRoot() (*os.Root, error) {
 		}
 	}()
 	cursor := 0
-	for depth := 0; depth <= frame.depth; depth++ {
+	for cursor <= index && walk.stack[cursor].depth < start {
+		cursor++
+	}
+	for depth := start; depth <= frame.depth; depth++ {
 		child, err := walk.openDirectory(current, walk.path[depth])
-		if transient != nil {
-			// The step that led here is no longer needed now that its child is
-			// open, so it never counts against the descriptor bound.
-			walk.closeHandle(transient)
-			transient = nil
-		}
+		walk.tally.reopenOpens++
 		if err != nil {
-			return nil, err
+			return nil, depth, err
 		}
 		for cursor <= index && walk.stack[cursor].depth < depth {
 			cursor++
 		}
 		if cursor > index || walk.stack[cursor].depth != depth {
-			transient, current = child, child
+			// A step on the way rather than a frame. It is kept for the next
+			// re-open, which is what makes a chain over a branching tree cost
+			// its prefix once instead of once per branch.
+			walk.anchor(depth, child)
+			current = child
 			continue
 		}
 		target := walk.stack[cursor]
 		actual, statErr := child.Stat(".")
 		if statErr != nil || !os.SameFile(target.identity, actual) {
 			walk.closeHandle(child)
-			return nil, errHandoffWalkMoved
+			return nil, depth, errHandoffWalkMoved
 		}
 		if target.run != nil {
 			// The frame already owns the original directory. The name still
@@ -374,22 +541,35 @@ func (walk *handoffWalk) topRoot() (*os.Root, error) {
 		if cursor < walk.firstOpen {
 			walk.firstOpen = cursor
 		}
-		walk.trim(cursor)
-		walk.own(target, child)
-		openedFrames = append(openedFrames, target)
-		current = child
 		// Keep the window behind this frame inside the bound. The frame in
 		// hand is never one of the released ones: the bound is far larger than
 		// the one handle this loop is holding.
+		walk.trim(cursor)
+		if err := walk.own(target, child); err != nil {
+			walk.closeHandle(child)
+			return nil, depth, err
+		}
+		openedFrames = append(openedFrames, target)
+		current = child
 	}
 	complete = true
-	return frame.run, nil
+	return frame.run, -1, nil
 }
 
 // openDirectory records every handle this walk opens. A handle leaves this
 // count only through closeHandle, whether it becomes frame-owned or remains a
 // transient reconstruction step.
 func (walk *handoffWalk) openDirectory(parent *os.Root, name string) (*os.Root, error) {
+	if walk.ctx != nil && walk.ctx.Err() != nil {
+		return nil, fmt.Errorf("%w: the agent is shutting down", errHandoffWalkTruncated)
+	}
+	if walk.opens != nil {
+		if *walk.opens <= 0 {
+			return nil, fmt.Errorf("%w: this pass has spent its budget of %d directory opens",
+				errHandoffWalkTruncated, maxWalkOpens)
+		}
+		*walk.opens--
+	}
 	run, err := openHandoffDirectory(parent, name)
 	if err == nil {
 		walk.liveHandles++
@@ -404,15 +584,22 @@ func (walk *handoffWalk) closeHandle(run *os.Root) error {
 }
 
 // own gives one open handle to a frame. A frame is its handle's sole owner.
-func (walk *handoffWalk) own(frame *handoffWalkFrame, run *os.Root) {
+//
+// A frame that already owns one is this walk noticing its own inconsistency,
+// and it refuses rather than panics: this runs on the collector goroutine, and
+// taking the agent down over an accounting figure is a worse outcome than a
+// run reported as truncated. The caller closes the handle it could not hand
+// over.
+func (walk *handoffWalk) own(frame *handoffWalkFrame, run *os.Root) error {
 	if frame.run != nil {
-		panic("handoff walk frame already owns a handle")
+		return errHandoffWalkOwnership
 	}
 	frame.run = run
 	walk.openFrames++
 	if walk.openFrames > walk.peakOpenFrames {
 		walk.peakOpenFrames = walk.openFrames
 	}
+	return nil
 }
 
 // release closes the handle owned by frame exactly once.
@@ -438,6 +625,7 @@ func (walk *handoffWalk) closeAll() {
 	for _, frame := range walk.stack {
 		walk.release(frame)
 	}
+	walk.dropAnchors(0)
 }
 
 // handoffWalkSkips reports the two ways a directory can stop being one while a
@@ -514,10 +702,11 @@ func handoffLogicalBytes(info os.FileInfo, seen map[handoffInode]struct{}) int64
 // One `seen` map spans the whole pass, so two runs that hard-link one file are
 // charged its bytes once. Part 1 charged them once per link, per run, which
 // overstated a node by however many links it held.
-func (m *handoffManager) measureNode(root *os.Root, now time.Time) RetainedResultsStatus {
+func (m *handoffManager) measureNode(ctx context.Context, root *os.Root, now time.Time) RetainedResultsStatus {
 	status := RetainedResultsStatus{MeasuredAt: now}
 	seen := make(map[handoffInode]struct{})
 	recorded := make(map[string]struct{})
+	budget := int64(maxWalkOpens)
 	for _, record := range m.loadRecords() {
 		recorded[record.RunID] = struct{}{}
 		status.Runs++
@@ -534,36 +723,60 @@ func (m *handoffManager) measureNode(root *os.Root, now time.Time) RetainedResul
 			}
 			continue
 		}
-		tally, err := walkHandoffTree(root, record.RunID, info, seen)
-		if err != nil {
+		tally, err := walkHandoffTree(ctx, &budget, root, record.RunID, info, seen)
+		if err != nil && !errors.Is(err, errHandoffWalkTruncated) {
 			// The partial tally is kept rather than discarded: the bytes it
 			// did reach are on the node whether or not the rest could be read,
 			// and a pass that drops them would report a node emptier than it is.
 			m.log("agent: measure run %s's retained results: %v (the figure below counts what could be read)",
 				record.RunID, err)
 		}
-		if tally.unaccounted != 0 {
-			m.log("agent: run %s: %d subtree(s) could not be reached again and are counted as unaccounted rather than measured; %d of them had a different directory standing where this pass had been measuring",
-				record.RunID, tally.unaccounted, tally.replaced)
+		if tally.truncated != 0 {
+			m.log("agent: run %s: its retained results were measured incompletely and the figures below are short by whatever is under it: %v",
+				record.RunID, err)
+		}
+		if tally.replaced != 0 || tally.vanished != 0 {
+			m.log("agent: run %s: %d subtree(s) had a different directory standing where this pass had been measuring and %d went away entirely; neither is counted in its bytes",
+				record.RunID, tally.replaced, tally.vanished)
+		}
+		if tally.closeFailures != 0 {
+			m.log("agent: run %s: %d directory handle(s) could not be closed after measuring; the figures are unaffected",
+				record.RunID, tally.closeFailures)
 		}
 		status.LogicalBytes += tally.logical
 		status.ChargedBytes += tally.charged
 		status.Entries += tally.entries
-		status.Unaccounted += tally.unaccounted
+		status.Replaced += tally.replaced + tally.vanished
+		status.Truncated += tally.truncated
+		// One row per run, in memory and nowhere else. The node budget the
+		// next slice enforces has to choose *which* run to give up, and
+		// choosing needs each run's own figure -- but a figure that moves with
+		// the files does not belong on the record, which is authority to
+		// delete and has to stay what an attempt wrote.
+		status.PerRun = append(status.PerRun, RetainedRunFigures{
+			RunID: record.RunID, Entries: tally.entries,
+			LogicalBytes: tally.logical, ChargedBytes: tally.charged,
+			Published: record.Published, Truncated: tally.truncated != 0,
+		})
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
 	}
-	status.Unaccounted += m.countUnaccounted(root, recorded)
+	status.Unrecorded = m.countUnrecorded(root, recorded)
 	return status
 }
 
-// countUnaccounted counts what is under the handoff root that no record names.
+// countUnrecorded counts what is under the handoff root that no record names.
 //
 // It counts and stops there. A directory with no record is not this agent's --
 // it is measured by nobody and removed by nobody, however full the node is
 // (docs/contracts/run-execution-context.md) -- and the one thing worse than not
 // knowing it is there is knowing and not saying. Adoption (adoptResidue) is the
 // one path that turns some of these into the agent's own, and it runs at
-// startup on the evidence of an ownership marker, not on a byte count.
-func (m *handoffManager) countUnaccounted(root *os.Root, recorded map[string]struct{}) int {
+// startup on the evidence of an ownership marker, not on a byte count. A
+// directory an agent created and died before marking is one of these, and stays
+// one: nothing distinguishes it from a directory that was never the agent's.
+func (m *handoffManager) countUnrecorded(root *os.Root, recorded map[string]struct{}) int {
 	directory, err := root.Open(".")
 	if err != nil {
 		m.log("agent: read the handoff root %q while accounting: %v", m.root, err)
@@ -575,21 +788,44 @@ func (m *handoffManager) countUnaccounted(root *os.Root, recorded map[string]str
 		m.log("agent: read the handoff root %q while accounting: %v", m.root, err)
 		return 0
 	}
-	unaccounted := 0
+	unrecorded := 0
 	for _, child := range children {
 		if _, known := recorded[child.Name()]; !known {
-			unaccounted++
+			unrecorded++
 		}
 	}
-	return unaccounted
+	return unrecorded
+}
+
+// accountNode is the accounting pass, and it is deliberately not on the path an
+// attempt's finalization takes.
+//
+// It holds no collector lock. Measuring takes no authority over anything: it
+// reads records and walks directories, and a directory expiry removes while it
+// reads is an ordinary missing entry the walk skips. Taking collectMu would
+// put this pass in front of every finalization again, which is the whole reason
+// it moved off that path.
+func (m *handoffManager) accountNode(ctx context.Context) error {
+	root, err := openPrivateHandoffDirectory(m.root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	m.reportNodeAccounting(m.measureNode(ctx, root, m.now().UTC()))
+	return nil
 }
 
 // reportNodeAccounting is the one line per pass a person reads, and the same
 // figures on the agent's status projection for whatever reads it next.
+//
+// Each number is worded to what it counts. They used to be one "unaccounted"
+// total over two different facts -- directories that are not this agent's, and
+// subtrees that stopped being the ones being measured -- described as only the
+// first, which made the sentence wrong whenever the second was not zero.
 func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
-	m.log("agent: retained results on this node: %d runs (%d still in flight), %d logical bytes, %d charged bytes across %d entries; %d quarantined records, still charged; %d entries under %q have no record and are neither measured nor removed",
+	m.log("agent: retained results on this node: %d runs (%d still in flight), %d logical bytes, %d charged bytes across %d entries; %d quarantined records, still charged; %d run(s) measured incompletely; %d subtree(s) stopped being the directory this pass was measuring; %d entries under %q have no record and are neither measured nor removed",
 		status.Runs, status.InFlight, status.LogicalBytes, status.ChargedBytes, status.Entries,
-		status.QuarantinedRecords, status.Unaccounted, m.root)
+		status.QuarantinedRecords, status.Truncated, status.Replaced, status.Unrecorded, m.root)
 	if m.observeAccounting != nil {
 		m.observeAccounting(status)
 	}
@@ -626,7 +862,7 @@ func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
 // schedule on a directory under this node's own handoff root.
 //
 // A directory with neither record nor marker is left exactly as it is, and is
-// counted every pass (countUnaccounted) rather than silently invisible.
+// counted every pass (countUnrecorded) rather than silently invisible.
 //
 // This is what openRun exists for. It had no caller outside tests until here.
 func (m *handoffManager) adoptResidue() error {

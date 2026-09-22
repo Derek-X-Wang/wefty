@@ -1282,7 +1282,7 @@ func TestDoctorReportsRetainedResults(t *testing.T) {
 		return RetainedResultsFacts{
 			MeasuredAt: &measured, Runs: 6, InFlight: 1, Entries: 4096,
 			LogicalBytes: 12 << 20, ChargedBytes: 20 << 20,
-			QuarantinedRecords: 1, Unaccounted: 3,
+			QuarantinedRecords: 1, Unrecorded: 3, Replaced: 2, Truncated: 1,
 		}, true
 	}
 	report := BuildDoctor(t.Context(), config)
@@ -1295,7 +1295,8 @@ func TestDoctorReportsRetainedResults(t *testing.T) {
 	if report.RetainedResults.Runs != 6 || report.RetainedResults.InFlight != 1 ||
 		report.RetainedResults.LogicalBytes != 12<<20 || report.RetainedResults.ChargedBytes != 20<<20 ||
 		report.RetainedResults.Entries != 4096 || report.RetainedResults.QuarantinedRecords != 1 ||
-		report.RetainedResults.Unaccounted != 3 {
+		report.RetainedResults.Unrecorded != 3 || report.RetainedResults.Replaced != 2 ||
+		report.RetainedResults.Truncated != 1 {
 		t.Fatalf("the doctor lost the measurement: %#v", report.RetainedResults)
 	}
 	item, found := findingFor(report, "retained-results")
@@ -1309,16 +1310,22 @@ func TestDoctorReportsRetainedResults(t *testing.T) {
 		t.Fatalf("unaccounted entries did not raise the finding: %#v", item)
 	}
 	if !strings.Contains(item.Detail, "12582912 logical bytes") ||
-		!strings.Contains(item.Detail, "20971520 charged bytes") ||
-		!strings.Contains(item.Detail, "3 entr") {
+		!strings.Contains(item.Detail, "20971520 charged bytes") {
 		t.Fatalf("the finding does not name what it measured: %q", item.Detail)
+	}
+	// Three different things to go and look at, each worded to its own number
+	// rather than summed into one that is accurate about none of them.
+	if !strings.Contains(item.Detail, "3 entr(ies) under the handoff root are not this agent's") ||
+		!strings.Contains(item.Detail, "2 subtree(s) stopped being the directory") ||
+		!strings.Contains(item.Detail, "1 run(s) were measured incompletely") {
+		t.Fatalf("the finding does not separate the three gaps: %q", item.Detail)
 	}
 
 	var human bytes.Buffer
 	if err := WriteDoctorHuman(&human, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(human.String(), "RETAINED RESULTS\tOK measured_at=2026-09-22T11:57:00Z runs=6 in_flight=1 entries=4096 logical_bytes=12582912 charged_bytes=20971520 quarantined=1 unaccounted=3") {
+	if !strings.Contains(human.String(), "RETAINED RESULTS\tOK measured_at=2026-09-22T11:57:00Z runs=6 in_flight=1 entries=4096 logical_bytes=12582912 charged_bytes=20971520 quarantined=1 unrecorded=3 replaced=2 truncated=1") {
 		t.Fatalf("the human report does not carry the measurement:\n%s", human.String())
 	}
 }
@@ -1412,5 +1419,53 @@ func TestDoctorAcceptsAnOlderAgentsResponse(t *testing.T) {
 	// never given a second one.
 	if again := noted.NoteUnreportedSections(); len(again.Findings) != len(noted.Findings) {
 		t.Fatalf("noting twice added a second finding: %d vs %d", len(again.Findings), len(noted.Findings))
+	}
+}
+
+// TestDoctorAcceptsANewerAgentsFinding is the other skew direction. An agent
+// ahead of this CLI sends findings it has never heard of, and refusing the
+// whole report over one unknown code makes doctor unusable in exactly the
+// window an operator is most likely to be running it.
+func TestDoctorAcceptsANewerAgentsFinding(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
+	newer := report
+	newer.Findings = append(append([]DiagnosticFinding{}, report.Findings...), DiagnosticFinding{
+		Check: "something-this-build-has-never-heard-of", Outcome: DiagnosticFailed,
+		Severity: DiagnosticError, Code: "oci_from_a_later_agent",
+		Detail: "the node says something is wrong", Runbook: DoctorRunbookPrefix + "from-a-later-agent",
+	})
+
+	if err := newer.Validate(); err != nil {
+		t.Fatalf("an older CLI refused a newer agent's doctor response: %v", err)
+	}
+	noted := newer.NoteUnreportedSections()
+	item, found := findingFor(noted, "something-this-build-has-never-heard-of")
+	if !found {
+		t.Fatal("the unknown finding was dropped rather than reported")
+	}
+	if !strings.Contains(item.Detail, "unknown finding code") ||
+		!strings.Contains(item.Detail, "upgrade the CLI") ||
+		!strings.Contains(item.Detail, "the node says something is wrong") {
+		t.Fatalf("the unknown finding does not say what it is or keep what the node said: %q", item.Detail)
+	}
+	if item.Outcome != DiagnosticFailed {
+		t.Fatalf("the unknown finding lost its outcome: %#v", item)
+	}
+	if err := noted.Validate(); err != nil {
+		t.Fatalf("the noted report does not validate: %v", err)
+	}
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, noted); err != nil {
+		t.Fatalf("a newer agent's report does not render: %v", err)
+	}
+	if !strings.Contains(human.String(), "unknown finding code") {
+		t.Fatalf("the rendered report hides the unknown finding:\n%s", human.String())
+	}
+	// A code this build does know is left exactly as the node sent it.
+	known, _ := findingFor(noted, "retained-results")
+	original, _ := findingFor(report, "retained-results")
+	if known.Detail != original.Detail {
+		t.Fatalf("a known finding was rewritten: %q", known.Detail)
 	}
 }

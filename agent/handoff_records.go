@@ -389,9 +389,26 @@ func (m *handoffManager) legacyRecordPath(runID string) (string, bool) {
 	return legacy, true
 }
 
+// errRecordBelongsToAnotherRun is the one refusal every writer owes a record
+// that is not its own.
+var errRecordBelongsToAnotherRun = errors.New("a retention record at this name belongs to another run")
+
 func (m *handoffManager) writeRecord(record retentionRecord) error {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return nil
+	}
+	// Every writer, not only adoption. The name is injective now, so reaching
+	// this is either a file an older agent wrote under its shared mapping --
+	// "a.b" and "a_b" were one name -- or a digest nobody should have been
+	// able to produce. Either way the record standing there is deletion
+	// authority over some other run's directory, and overwriting it would take
+	// that run's expiry away silently.
+	if standing, err := m.readRecord(m.recordPath(record.RunID)); err == nil &&
+		standing.RunID != "" && standing.RunID != record.RunID {
+		m.log("agent: refuse to write run %s's retention record: %q already belongs to run %q; that run keeps its own expiry and this one is not recorded",
+			record.RunID, m.recordPath(record.RunID), standing.RunID)
+		return fmt.Errorf("%w: %q belongs to run %q, not %q",
+			errRecordBelongsToAnotherRun, m.recordPath(record.RunID), standing.RunID, record.RunID)
 	}
 	if err := writeStateDocument(m.recordRoot(), recordComponent(record.RunID), record); err != nil {
 		return err

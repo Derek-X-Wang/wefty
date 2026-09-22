@@ -216,8 +216,10 @@ type ComputerStorageRecoveryFacts struct {
 // LogicalBytes is what the files hold, with a file two runs hard-link counted
 // once. ChargedBytes is the same measurement with a floor under every entry, so
 // a tree of a million empty files -- no logical bytes and a node out of inodes
-// -- is a number somebody can see. Unaccounted is what the node is holding that
-// neither figure includes.
+// -- is a number somebody can see. The three counts below are what the node is
+// holding that neither figure includes, and each says which of three different
+// things it is: storage that is not the agent's, subtrees that stopped being
+// the ones being measured, and runs the pass did not finish.
 type RetainedResultsFacts struct {
 	Outcome            DiagnosticOutcome `json:"outcome"`
 	MeasuredAt         *time.Time        `json:"measured_at,omitempty"`
@@ -227,7 +229,9 @@ type RetainedResultsFacts struct {
 	LogicalBytes       int64             `json:"logical_bytes"`
 	ChargedBytes       int64             `json:"charged_bytes"`
 	QuarantinedRecords int               `json:"quarantined_records"`
-	Unaccounted        int               `json:"unaccounted"`
+	Unrecorded         int               `json:"unrecorded"`
+	Replaced           int               `json:"replaced"`
+	Truncated          int               `json:"truncated"`
 }
 
 type DiagnosticFinding struct {
@@ -470,16 +474,31 @@ func buildRetainedResults(config DoctorConfig, report *DoctorResponse) {
 	report.RetainedResults = &facts
 	detail := fmt.Sprintf("the node retains %d run(s) (%d still in flight) across %d entries: %d logical bytes, %d charged bytes, %d quarantined record(s) still charged",
 		facts.Runs, facts.InFlight, facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords)
-	if facts.Unaccounted == 0 {
+	if facts.Unrecorded == 0 && facts.Replaced == 0 && facts.Truncated == 0 {
 		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
 			ran: true, passed: true, code: "oci_retained_results_measured", detail: detail,
 		}))
 		return
 	}
+	// Each of the three is a different thing to go and look at, so each is
+	// worded to its own number rather than summed into one that would be
+	// accurate about none of them.
+	gaps := make([]string, 0, 3)
+	if facts.Unrecorded != 0 {
+		gaps = append(gaps, fmt.Sprintf("%d entr(ies) under the handoff root are not this agent's and are neither measured nor removed, however full the node is",
+			facts.Unrecorded))
+	}
+	if facts.Replaced != 0 {
+		gaps = append(gaps, fmt.Sprintf("%d subtree(s) stopped being the directory the pass was measuring and are left out of the figures rather than measured elsewhere",
+			facts.Replaced))
+	}
+	if facts.Truncated != 0 {
+		gaps = append(gaps, fmt.Sprintf("%d run(s) were measured incompletely, so the figures above are a floor rather than a measurement",
+			facts.Truncated))
+	}
 	report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
 		ran: true, code: "oci_retained_results_unaccounted", severity: DiagnosticWarn,
-		detail: fmt.Sprintf("%s; %d entr(ies) under the handoff root are not this agent's and are neither measured nor removed, however full the node is",
-			detail, facts.Unaccounted),
+		detail: detail + "; " + strings.Join(gaps, "; "),
 	}))
 }
 
@@ -1381,9 +1400,12 @@ func (report DoctorResponse) Validate() error {
 		if item.Check == "" || !item.Outcome.Valid() || !item.Severity.Valid() || item.Code == "" || item.Detail == "" || !strings.HasPrefix(item.Runbook, DoctorRunbookPrefix) {
 			return fmt.Errorf("invalid doctor finding for %q", item.Check)
 		}
-		if _, ok := stableCodes[item.Code]; !ok {
-			return fmt.Errorf("doctor finding %q used undocumented code %q", item.Check, item.Code)
-		}
+		// An unrecognised code is a newer agent, not a broken report. Refusing
+		// it means a CLI one version behind cannot read doctor at all, which
+		// is the command an operator reaches for when something is already
+		// wrong; NoteUnreportedSections marks it instead so the reader is told
+		// to upgrade rather than told nothing.
+		_ = stableCodes
 		if item.ReasonCode != "" && !item.ReasonCode.Valid() {
 			return fmt.Errorf("invalid doctor reason %q", item.ReasonCode)
 		}
@@ -1492,9 +1514,10 @@ func retainedResultsLine(facts *RetainedResultsFacts) string {
 	if facts == nil {
 		return "RETAINED RESULTS\tNOT-RUN not reported by this agent version"
 	}
-	return fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unaccounted=%d",
+	return fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unrecorded=%d replaced=%d truncated=%d",
 		facts.Outcome, formatOptionalTime(facts.MeasuredAt), facts.Runs, facts.InFlight,
-		facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords, facts.Unaccounted)
+		facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords,
+		facts.Unrecorded, facts.Replaced, facts.Truncated)
 }
 
 // NoteUnreportedSections returns the report with one finding added for every
@@ -1504,16 +1527,33 @@ func retainedResultsLine(facts *RetainedResultsFacts) string {
 // has to say "this agent does not report that" rather than either refuse the
 // whole report or print a section of zeroes that reads like a measurement.
 func (report DoctorResponse) NoteUnreportedSections() DoctorResponse {
+	noted := report
+	noted.Findings = append([]DiagnosticFinding{}, report.Findings...)
+	// Skew runs both ways. A newer agent sends findings this build has never
+	// heard of, and the honest thing to say about one is that it exists and
+	// this reader cannot interpret it -- not to drop it, which hides a finding
+	// an operator is meant to act on, and not to refuse the report.
+	stable := make(map[string]struct{}, len(StableDoctorCodes()))
+	for _, code := range StableDoctorCodes() {
+		stable[code] = struct{}{}
+	}
+	for index, item := range noted.Findings {
+		if _, known := stable[item.Code]; known {
+			continue
+		}
+		noted.Findings[index].Detail = fmt.Sprintf(
+			"unknown finding code %q, upgrade the CLI to read it; the agent reported: %s", item.Code, item.Detail)
+		noted.Findings[index].Runbook = DoctorRunbookPrefix + "unknown-finding-code"
+	}
 	if report.RetainedResults != nil {
-		return report
+		return noted
 	}
 	for _, item := range report.Findings {
 		if item.Check == "retained-results" {
-			return report
+			return noted
 		}
 	}
-	noted := report
-	noted.Findings = append(append([]DiagnosticFinding{}, report.Findings...),
+	noted.Findings = append(noted.Findings,
 		finding("retained-results", diagnosticReceipt{
 			code: "oci_retained_results_not_read", notRunCause: NotRunPeerDoesNotReport,
 			detail: "the agent that answered does not report retained-results accounting; it predates the measurement",

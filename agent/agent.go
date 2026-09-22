@@ -144,6 +144,7 @@ type Agent struct {
 	// mailbox the agent cannot open keeps its bookkeeping.
 	mailboxStateRoot      string
 	collectorCancel       context.CancelFunc
+	collectorContext      context.Context
 	collectorDone         chan struct{}
 	logf                  func(string, ...any)
 	clock                 Clock
@@ -562,6 +563,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		// the node lock is released, so nothing is sweeping a node another
 		// agent may already have taken.
 		a.startResultCollector()
+		// The first accounting pass runs here, after reconciliation and the
+		// first sweep, so the node has a figure to report from the moment it
+		// is up. It never runs on an attempt's finalization path, where one
+		// workload's tree would sit in front of every other run.
+		if err := a.handoffs.accountNode(a.collectorContext); err != nil {
+			a.log("measure this node's retained results: %v", err)
+		}
 	}
 	if a.outbox != nil && a.session != nil {
 		a.outbox.startRecovery(ctx, a.session.client, func(err error) {
@@ -623,6 +631,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 func (a *Agent) startResultCollector() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.collectorCancel = cancel
+	a.collectorContext = ctx
 	a.collectorDone = make(chan struct{})
 	go func() {
 		defer close(a.collectorDone)
@@ -636,6 +645,12 @@ func (a *Agent) startResultCollector() {
 			}
 			if err := a.handoffs.collect(); err != nil {
 				a.log("collect retained results: %v", err)
+			}
+			// Measuring is this goroutine's work and nobody else's. It carries
+			// the collector's context, so a shutdown interrupts a walk partway
+			// rather than making the node lock wait for a workload's tree.
+			if err := a.handoffs.accountNode(ctx); err != nil {
+				a.log("measure this node's retained results: %v", err)
 			}
 		}
 	}()
@@ -651,6 +666,7 @@ func (a *Agent) stopResultCollector() {
 	a.collectorCancel()
 	<-a.collectorDone
 	a.collectorCancel = nil
+	a.collectorContext = nil
 }
 
 func (a *Agent) currentOCIRuntimeGeneration() (workloadrunner.RuntimeGeneration, bool) {

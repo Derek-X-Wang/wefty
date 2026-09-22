@@ -728,7 +728,8 @@ func run() error {
 							MeasuredAt: &measuredAt, Runs: status.Runs, InFlight: status.InFlight,
 							Entries: status.Entries, LogicalBytes: status.LogicalBytes,
 							ChargedBytes: status.ChargedBytes, QuarantinedRecords: status.QuarantinedRecords,
-							Unaccounted: status.Unaccounted,
+							Unrecorded: status.Unrecorded, Replaced: status.Replaced,
+							Truncated: status.Truncated,
 						}, true
 					},
 					Intent:                        (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,

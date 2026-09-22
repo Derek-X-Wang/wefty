@@ -92,13 +92,44 @@ type RetainedResultsStatus struct {
 	// "excluded from accounting", and excluding them would make quarantine a
 	// way to hide storage.
 	QuarantinedRecords int `json:"quarantined_records"`
-	// Unaccounted counts the bytes on this node that the figures above do not
-	// include: entries under the handoff root that no record names, which are
-	// neither measured nor removed because they are not this agent's, plus
-	// subtrees a mid-pass identity change put out of the walk's reach. Both
-	// are storage the node is holding and cannot charge, which is the one
-	// thing a budget must not be allowed to forget.
-	Unaccounted int `json:"unaccounted"`
+	// Unrecorded counts entries under the handoff root that no record names.
+	// They are neither measured nor removed, because they are not this
+	// agent's, and a count that keeps growing is the shape of a node quietly
+	// filling up with storage it cannot give back.
+	Unrecorded int `json:"unrecorded"`
+	// Replaced counts subtrees that stopped being the directory this pass was
+	// measuring -- moved, or replaced by another -- and were therefore left
+	// out of the figures above rather than measured somewhere else.
+	Replaced int `json:"replaced"`
+	// Truncated counts runs whose tree the pass stopped measuring partway,
+	// because it spent its opens budget or the agent began shutting down.
+	// Their figures above are short by whatever was under them.
+	Truncated int `json:"truncated"`
+	// PerRun is each run's own share of the figures above, which is what
+	// choosing a run to give up needs. It lives here and nowhere durable: it
+	// moves with the files, and a retention record is authority to delete and
+	// has to stay what an attempt wrote.
+	PerRun []RetainedRunFigures `json:"per_run,omitempty"`
+}
+
+// RetainedRunFigures is one run's share of a pass.
+//
+// The bytes are as the pass saw them, which is not the same as what deleting
+// that run would recover: a file two runs hard-link is charged to whichever the
+// pass reached first, so giving up the other recovers nothing for it. The node
+// remeasures after every deletion rather than subtracting, which is what makes
+// that safe to act on.
+type RetainedRunFigures struct {
+	RunID        string `json:"run_id"`
+	Entries      int64  `json:"entries"`
+	LogicalBytes int64  `json:"logical_bytes"`
+	ChargedBytes int64  `json:"charged_bytes"`
+	// Published is the run's own record, carried here so an eviction order can
+	// read it without re-reading every record.
+	Published bool `json:"published,omitempty"`
+	// Truncated says this run's figures are short, so they are a floor rather
+	// than a measurement.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // Status is a point-in-time, process-local health projection. SessionBackoff

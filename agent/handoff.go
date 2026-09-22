@@ -523,7 +523,18 @@ func (m *handoffManager) admissionOf(runID, nodeID, path string, now time.Time) 
 	case current.RunID != runID || current.NodeID != nodeID || current.Directory != path || current.AdmittedAt.IsZero():
 		m.log("agent: run %s: the record at finish is not the one its preparation wrote; recording this run as admitted when it finished", runID)
 	default:
-		return current.AdmittedAt.UTC()
+		admitted := current.AdmittedAt.UTC()
+		if admitted.After(now) {
+			// A record admitted after the moment this run finished is a clock
+			// that moved backwards between the two writes. Carrying it forward
+			// would hand the validator a record it refuses -- "admitted in the
+			// future" -- which would make the run's own retention record
+			// untrustworthy and stop the sweep acting on it at all.
+			m.log("agent: run %s: its admission is recorded after this finish (%s > %s); the earlier of the two is kept so the record stays one the sweep will act on",
+				runID, admitted.Format(time.RFC3339), now.Format(time.RFC3339))
+			return now
+		}
+		return admitted
 	}
 	return now
 }
@@ -666,15 +677,17 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 	return nil
 }
 
-// collect expires, and then measures. A recorded run whose window has closed
-// and which no attempt is holding is removed, together with its record; what is
-// left is counted, in both units, and reported.
+// collect expires. A recorded run whose window has closed and which no attempt
+// is holding is removed, together with its record.
 //
-// There is still no node-wide byte budget here and no eviction order: nothing
-// this function does after expiry deletes anything. Accounting lands before the
-// budget on purpose -- a budget is only as good as the number it enforces, and
-// this slice is where that number is made visible and checked while it can
-// still cost nothing to be wrong.
+// It does not measure the node. Every attempt's finalization calls this
+// synchronously, and the node pass walks every retained run on the node, so
+// measuring here put one workload's tree in front of every other run's
+// finalization -- and in front of shutdown, which joins the collector before
+// releasing the node lock. The pass runs on the collector's own timer instead
+// (accountNode), and status and the doctor read its last figures.
+//
+// There is still no node-wide byte budget here and no eviction order.
 //
 // It acts only on directories the agent has a record for. A directory under
 // the root with no record is someone else's and is never measured or removed.
@@ -703,8 +716,6 @@ func (m *handoffManager) collect() error {
 		}
 		m.expireRun(root, record, now)
 	}
-	// Accounting runs after expiry, on what is left, and changes nothing.
-	m.reportNodeAccounting(m.measureNode(root, m.now().UTC()))
 	return nil
 }
 
@@ -1083,7 +1094,11 @@ func handoffEntries(run *os.Root) ([]handoffEntry, int64, error) {
 // hard-linked file once per link, which is what part 1 states its unit to be.
 // Cross-run identity belongs to the node pass, which sees a whole root.
 func measureEntry(run *os.Root, name string, info os.FileInfo) (int64, error) {
-	tally, err := walkHandoffTree(run, name, info, nil)
+	// No context and no budget: this runs inside one attempt's own
+	// finalization, on the one directory that attempt prepared, and stopping
+	// early would mean trimming against a figure the bound knows is short.
+	// The node pass is the one with a budget, because it walks every run.
+	tally, err := walkHandoffTree(context.Background(), nil, run, name, info, nil)
 	return tally.logical, err
 }
 
