@@ -29,6 +29,13 @@ const (
 
 type handoffManager struct {
 	root string
+	// ledgerRoot is the root the run ledger derives dispatched handoff paths
+	// from. It is this node's knowledge of the wire default, not a second place
+	// results may live: a dispatched path under it is adopted onto root above
+	// before anything prepares, retains, reads or sweeps it. It is a field
+	// rather than a direct constant read so a test can prove the mapping
+	// without writing into the real default root.
+	ledgerRoot string
 	// stateRoot keeps retention records away from casual writes through the
 	// handoff directory. It is not a tamper boundary against the same OS UID.
 	stateRoot string
@@ -104,8 +111,9 @@ func newHandoffManager(root, stateRoot, nodeID string, retention time.Duration, 
 		root = contract.DefaultHandoffRoot
 	}
 	return &handoffManager{
-		root: filepath.Clean(root), stateRoot: strings.TrimSpace(stateRoot),
-		nodeID: strings.TrimSpace(nodeID), retention: retention,
+		root: filepath.Clean(root), ledgerRoot: filepath.Clean(contract.DefaultHandoffRoot),
+		stateRoot: strings.TrimSpace(stateRoot),
+		nodeID:    strings.TrimSpace(nodeID), retention: retention,
 		runBytes: contract.MaxRetainedResultBytes,
 		now:      time.Now, logf: logf,
 		paths: make(map[string]*handoffPathLock),
@@ -159,6 +167,82 @@ func (m *handoffManager) releasePathReference(path string, pathLock *handoffPath
 	}
 }
 
+// errUnmanagedHandoffDirectory is the one refusal this node owes a dispatcher
+// whose handoff path it cannot adopt.
+//
+// It is typed because the defect it replaces was untyped. A path this agent did
+// not manage used to produce no ownership and no error at all: the run
+// executed, wrote its files into a directory nothing here swept, uploaded no
+// result, and `wefty inspect` still advertised a retention window over a
+// directory the agent had never taken responsibility for. A node that cannot
+// manage the directory a run was given says so.
+var errUnmanagedHandoffDirectory = errors.New("handoff directory is not one this node manages")
+
+// ownsHandoff reports that this job carries the run identity everything the
+// agent does with a handoff directory is keyed by: the retention record, the
+// per-run bound, the sweep, and the result upload all name a run.
+//
+// A one-shot process job submitted straight to L1 may carry none — the job spec
+// requires a handoff directory, not a run — and such a job has no retained
+// results and no result row on this node by construction. Its directory is
+// still created for the workload, explicitly and with a log line, rather than
+// being an unannounced nil somewhere inside preparation.
+func (m *handoffManager) ownsHandoff(spec contract.JobSpec) bool {
+	return handoffOwnerRunID(spec) != ""
+}
+
+// prepareUnownedDirectory creates the directory of a job this node manages no
+// results for. It owns nothing, records nothing and sweeps nothing: the
+// workload is simply given the directory it was dispatched with.
+func (m *handoffManager) prepareUnownedDirectory(spec contract.JobSpec) error {
+	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	if path == "." || !filepath.IsAbs(path) {
+		return errors.New("handoff directory must be an absolute path")
+	}
+	directory, err := openPrivateHandoffDirectory(path)
+	if err != nil {
+		return err
+	}
+	m.log("agent: handoff directory %q belongs to a job with no run identity; this node retains and uploads nothing for it", path)
+	return directory.Close()
+}
+
+// resolveHandoffDirectory maps a dispatched handoff path onto the root this
+// node actually manages, and is the single definition of which paths this agent
+// accepts for a run it is responsible for.
+//
+// The node's configured root wins. L3 keeps sending the path it derives from
+// the ledger's default root — that path is wire format, and an older node has
+// to keep reading it — so a node configured elsewhere adopts the same run-keyed
+// leaf under its own root instead. Ownership, the retention record, the result
+// upload and what `wefty inspect` claims is retained then all name the one
+// directory the agent is really sweeping.
+//
+// A path under neither root is refused rather than adopted: it is a directory
+// this agent has no authority over, and running into one is exactly the silence
+// this error exists to replace.
+func (m *handoffManager) resolveHandoffDirectory(spec contract.JobSpec) (string, error) {
+	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	if path == "." || !filepath.IsAbs(path) {
+		return "", fmt.Errorf("%w: %q is not an absolute path",
+			errUnmanagedHandoffDirectory, spec.Execution.HandoffDirectory)
+	}
+	runID := handoffOwnerRunID(spec)
+	if runID == "" {
+		return "", fmt.Errorf("%w: %q names no handoff owner run", errUnmanagedHandoffDirectory, path)
+	}
+	if !validRunMailboxSegment(runID) {
+		return "", fmt.Errorf("%w: handoff owner run %q is not one safe path component",
+			errUnmanagedHandoffDirectory, runID)
+	}
+	managed := filepath.Join(m.root, runID)
+	if path == managed || path == filepath.Join(m.ledgerRoot, runID) {
+		return managed, nil
+	}
+	return "", fmt.Errorf("%w: %q is under neither this node's handoff root %q nor the ledger's default %q",
+		errUnmanagedHandoffDirectory, path, m.root, m.ledgerRoot)
+}
+
 func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nodeID string) (*handoffOwnership, error) {
 	path := filepath.Clean(spec.Execution.HandoffDirectory)
 	m.mu.Lock()
@@ -167,20 +251,23 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 	if !owned {
 		return nil, errors.New("handoff preparation requires this attempt's path lock")
 	}
-	if path == "." || !filepath.IsAbs(path) {
-		return nil, errors.New("handoff directory must be an absolute path")
+	// Preparation either returns a receipt or says why it could not. It never
+	// returns neither: an attempt that proceeds with no ownership is one whose
+	// results nothing retains, reads or uploads.
+	managed, err := m.resolveHandoffDirectory(spec)
+	if err != nil {
+		return nil, err
+	}
+	if managed != path {
+		// The lock this attempt holds is on the dispatched path, so preparing a
+		// different directory here would retain and read one nothing else in
+		// the attempt is holding. The claim adopts the path before the lock is
+		// taken; reaching this means it did not, and a refusal is louder than
+		// a silent divergence.
+		return nil, fmt.Errorf("%w: this attempt holds %q while this node manages %q",
+			errUnmanagedHandoffDirectory, path, managed)
 	}
 	runID := handoffOwnerRunID(spec)
-	if runID == "" || !m.manages(path, runID) {
-		directory, err := openPrivateHandoffDirectory(path)
-		if err != nil {
-			return nil, err
-		}
-		return nil, directory.Close()
-	}
-	if !validRunMailboxSegment(runID) {
-		return nil, errors.New("handoff run ID must be one safe component")
-	}
 	root, err := openPrivateHandoffDirectory(m.root)
 	if err != nil {
 		return nil, err
