@@ -316,12 +316,30 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 // that L1 has declared stalled is a standing chore with its own durable
 // backoff, not an unfinished boot step, so the duplicate prune reconciliation
 // for exactly the copies its standing directive names is suppressed here.
-// Every other directive in the response is reconciled and still gates, and
-// nothing about the helper's namespace sweep and verification changes.
+//
+// The same reasoning reaches the removal's own retries, which #513 left on the
+// gate: suppressing only the duplicate prune fixed the shape that run found --
+// a typed per-copy refusal -- and left the identical wedge one transport loss
+// away, because an untyped failure of the very same retry still withdrew
+// kind:oci. A declared stall is L1's own record that this cleanup is not proven
+// and the Slot is released, so a retry that fails again, of any shape, is that
+// removal's cadence and not the node's health (#530). Its failure is accounted
+// and logged on the removal and kept out of this joined error, unless the pass
+// was already cancelled, which teaches nothing about that removal.
+//
+// What this joined error gates on is the work reconciled synchronously here:
+// boot resumption, the standing removal directives, Backup prunes, Computer
+// Storage resets and grows, and reimage preflights. Every failure of theirs
+// other than the declared removal's own retries still withdraws kind:oci
+// exactly as before. Backup creations, Computer Storage copies and custody
+// exports are dispatched asynchronously below and return nil here, so they
+// never gated the barrier and are untouched by this change; each reports
+// through its own operation outcome. Nothing about the helper's namespace
+// sweep and verification changes either.
 func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
 	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 	return errors.Join(session.resumePendingRemovals(ctx),
-		session.processRemovalDirectives(ctx, response.RemovalDirectives),
+		session.processRemovalDirectives(ctx, response.RemovalDirectives, retention),
 		session.processStorageResetDirectives(ctx, response.StorageResetDirectives),
 		session.processStorageGrowDirectives(ctx, response.StorageGrowDirectives),
 		session.processReimageDirectives(ctx, response.ReimageDirectives),
@@ -331,7 +349,8 @@ func (session *agentSession) processStandingDirectives(ctx context.Context, resp
 		session.processCustodyExportDirectives(ctx, response.CustodyExportDirectives))
 }
 
-func (session *agentSession) processRemovalDirectives(ctx context.Context, directives []l1.RemovalDirective) error {
+func (session *agentSession) processRemovalDirectives(ctx context.Context, directives []l1.RemovalDirective,
+	retention stalledRemovalRetention) error {
 	if session.removals == nil {
 		return nil
 	}
@@ -342,9 +361,20 @@ func (session *agentSession) processRemovalDirectives(ctx context.Context, direc
 		// exact refusal an accepted declaration already stands for. Without
 		// it a declared stall would fail registration on every restart and
 		// registration is what restores the retained image pin (#450).
-		if err := session.removals.reconcile(ctx, directive); err != nil {
-			failures = append(failures, fmt.Errorf("reconcile removed OCI binding %q: %w", directive.JobID, err))
+		err := session.removals.reconcile(ctx, directive)
+		if err == nil {
+			continue
 		}
+		// Every failure is attributed to the directive that produced it. A
+		// declared-stalled removal's own retry failure is its cadence, whatever
+		// its shape, and it is recorded and logged on the removal rather than
+		// withdrawing the capability that removal's released Slot exists to
+		// make usable (#530). A cancelled pass is not that removal's news.
+		if ctx.Err() == nil && retention.declaresStalled(directive) {
+			session.removals.noteStalledRetryFailure(directive.JobID, err)
+			continue
+		}
+		failures = append(failures, fmt.Errorf("reconcile removed OCI binding %q: %w", directive.JobID, err))
 	}
 	return errors.Join(failures...)
 }

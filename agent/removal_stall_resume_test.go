@@ -18,9 +18,18 @@ import (
 // stalledRemovalFault is the staged Mac Computer lane fault: every cleanup
 // step the helper performs is refused until the operator clears it, and the
 // node under test is never restarted.
-type stalledRemovalFault struct{ standing bool }
+type stalledRemovalFault struct {
+	standing bool
+	// untyped is the same cleanup step losing its transport instead of
+	// reaching an engine: a failure with no refusal code at all, which is the
+	// shape a declaration could never recognize (#530).
+	untyped bool
+}
 
 func (fault *stalledRemovalFault) refusal() error {
+	if fault.untyped {
+		return errors.New("OCI helper session is unavailable")
+	}
 	return &ocihelper.RPCError{
 		Code: ocihelper.CodeEngineFailure, Message: "OCI engine operation failed",
 		EngineFailure: &ocihelper.EngineFailureFact{
@@ -550,5 +559,55 @@ func TestStalledRemovalRetryAndPruneSuppressionDoNotFight(t *testing.T) {
 	}
 	if !slices.Contains(node.copyIDs, attempted[0]) {
 		t.Fatalf("the removal's retry deleted %q, want one of its own copies %v", attempted[0], node.copyIDs)
+	}
+}
+
+// TestBootResumptionOfADeclaredStalledRemovalDoesNotGateOnAnUntypedFailure is
+// the boot-resumption half of #530. Resumption carries no standing directive,
+// so it attributes a failure from the durable record alone -- and its error is
+// joined into the very same boot-sequence result that decides whether the node
+// may advertise `kind:oci`. A declared-stalled removal whose retry loses its
+// transport there must leave that result clean, with the failure accounted and
+// logged on the removal; the identical failure of a removal that has declared
+// nothing must still be returned.
+func TestBootResumptionOfADeclaredStalledRemovalDoesNotGateOnAnUntypedFailure(t *testing.T) {
+	harness := newStalledRemovalHarness(t, "resume-untyped-node")
+	harness.declareStall(t)
+	harness.fault.untyped = true
+	harness.advanceToNextRetry(t)
+	before := harness.record(t)
+
+	if err := harness.controller.resume(t.Context()); err != nil {
+		t.Fatalf("boot resumption of a declared-stalled removal whose retry lost its transport = %v, "+
+			"want the boot sequence's gate open", err)
+	}
+	after := harness.record(t)
+	if after.stallDeclaredAt == nil {
+		t.Fatal("the removal stopped being declared stalled")
+	}
+	if after.stallRetryAttempts <= before.stallRetryAttempts {
+		t.Fatalf("stall retry attempts = %d, want more than the %d recorded before the retry failed",
+			after.stallRetryAttempts, before.stallRetryAttempts)
+	}
+	if after.lastRefusalCode != "" || after.failedAttempts != 0 {
+		t.Fatalf("refusal streak = %q/%d, want an untyped failure to leave no refusal code and end the streak",
+			after.lastRefusalCode, after.failedAttempts)
+	}
+	logged := slices.ContainsFunc(harness.logs, func(line string) bool {
+		return strings.Contains(line, harness.removal.jobID) &&
+			strings.Contains(line, "cleanup failed again after its declared stall") &&
+			strings.Contains(line, "OCI helper session is unavailable")
+	})
+	if !logged {
+		t.Fatalf("resumption logs = %v, want the dropped failure reported on the removal", harness.logs)
+	}
+
+	// Only the accepted declaration takes that failure off the gate. The same
+	// transport loss on a removal L1 has declared nothing about is still an
+	// unfinished boot step.
+	undeclared := newStalledRemovalHarness(t, "resume-untyped-undeclared-node")
+	undeclared.fault.untyped = true
+	if err := undeclared.controller.resume(t.Context()); err == nil {
+		t.Fatal("boot resumption of an undeclared removal whose retry failed untyped left the gate open")
 	}
 }

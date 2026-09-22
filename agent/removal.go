@@ -482,6 +482,24 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	return controller.handleRemovalFailure(ctx, removal, err)
 }
 
+// noteStalledRetryFailure is where a declared-stalled removal's own retry
+// failure ends. L1 already has this node's word that the cleanup is not
+// proven and the Slot is released, so the retry that failed again is that
+// removal's cadence, not the node's health: it must not withdraw the OCI
+// capability the released Slot exists to make usable (#530). The failure is
+// still accounted on the removal by the ordinary path -- streak, backoff and
+// stall bookkeeping are untouched -- and the durable record keeps the last
+// refusal and its shape for `wefty node doctor`. Only the log line is added
+// here, and only for a failure no other path has already reported, so an
+// identical refusal retried on its backoff is not narrated twice.
+func (controller *removalController) noteStalledRetryFailure(jobID string, cause error) {
+	var attemptErr *removalAttemptError
+	if errors.As(cause, &attemptErr) && attemptErr.disposition != removalFailureUnlogged {
+		return
+	}
+	controller.log("agent: service %q cleanup failed again after its declared stall; the node keeps admitting OCI work: %v", jobID, cause)
+}
+
 func (controller *removalController) handleRemovalFailure(ctx context.Context, removal localRemoval, cause error) error {
 	suppressed, disposition, acknowledgementErr := controller.noteRemovalFailureDisposition(ctx, l1.RemovalDirective{
 		JobID: removal.jobID, BoundNodeID: controller.nodeID, Kind: removal.kind,
@@ -616,6 +634,24 @@ func (controller *removalController) prepareAuthorityLoss(ctx context.Context, j
 	return nil
 }
 
+// resumeRuntimeRemoval runs one durable record's cleanup during boot
+// resumption and decides whose failure it is. A removal L1 has already
+// declared stalled has no unfinished boot step left to hold the node back:
+// its Slot is released and its retries run on their own durable backoff, so a
+// retry that fails again is recorded and logged on the removal instead of
+// being returned to the boot sequence (#530). Every other record's failure is
+// still the boot sequence's, including one whose row this agent cannot
+// validate -- record validation is what would prove the declaration.
+func (controller *removalController) resumeRuntimeRemoval(ctx context.Context, removal localRemoval,
+	record *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
+	err := controller.continueRuntimeRemoval(ctx, removal, record, computerStorages, nil)
+	if err == nil || ctx.Err() != nil || record.stallDeclaredAt == nil || record.invalidReason != "" {
+		return err
+	}
+	controller.noteStalledRetryFailure(removal.jobID, err)
+	return nil
+}
+
 func (controller *removalController) resume(ctx context.Context) error {
 	if controller == nil {
 		return nil
@@ -644,7 +680,7 @@ func (controller *removalController) resume(ctx context.Context) error {
 			}
 			// Resume has no standing directive, so it carries no Backup-copy
 			// claims; the heartbeat path is what deletes them.
-			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, computerStorages, nil); err != nil {
+			if err := controller.resumeRuntimeRemoval(ctx, record.removal, &record, computerStorages); err != nil {
 				return err
 			}
 		}
@@ -691,7 +727,7 @@ func (controller *removalController) resume(ctx context.Context) error {
 				// Do not guess a destructive subset during local-only resumption.
 				continue
 			}
-			if err := controller.continueRuntimeRemoval(ctx, removal, &record, computerStorages, nil); err != nil {
+			if err := controller.resumeRuntimeRemoval(ctx, removal, &record, computerStorages); err != nil {
 				return err
 			}
 			continue
@@ -861,11 +897,44 @@ func stalledBackupCopy(directive l1.ComputerBackupPruneDirective) stalledBackupC
 // nothing from the helper's namespace sweep and verification: runtime residue
 // belonging to a stalled Computer is still refused there.
 type stalledRemovalRetention struct {
-	copies map[stalledBackupCopyKey]struct{}
+	copies   map[stalledBackupCopyKey]struct{}
+	removals map[stalledRemovalKey]struct{}
 }
 
 func (retention stalledRemovalRetention) empty() bool {
-	return len(retention.copies) == 0
+	return len(retention.copies) == 0 && len(retention.removals) == 0
+}
+
+// stalledRemovalKey is the full removal authority a standing directive and the
+// node's own durable record must agree on before a failure may be read as that
+// declared-stalled removal's own retry. It is the same correspondence the
+// retained copies are matched under, for the same reason: a shared job ID
+// proves only that some removal of that job was declared stalled.
+type stalledRemovalKey struct {
+	jobID             string
+	removalGeneration uint64
+	cleanupFence      string
+	rootInstanceID    string
+	boundNodeID       string
+}
+
+func stalledRemoval(directive l1.RemovalDirective) stalledRemovalKey {
+	return stalledRemovalKey{
+		jobID: directive.JobID, removalGeneration: directive.RemovalGeneration,
+		cleanupFence: directive.CleanupFence, rootInstanceID: directive.RootInstanceID,
+		boundNodeID: directive.BoundNodeID,
+	}
+}
+
+// declaresStalled reports whether this directive belongs to a removal whose
+// stall L1 has already accepted, so a failure it produces is that removal's own
+// retry cadence rather than the node's health (#530).
+func (retention stalledRemovalRetention) declaresStalled(directive l1.RemovalDirective) bool {
+	if directive.JobID == "" {
+		return false
+	}
+	_, declared := retention.removals[stalledRemoval(directive)]
+	return declared
 }
 
 func (retention stalledRemovalRetention) retains(directive l1.ComputerBackupPruneDirective) bool {
@@ -880,7 +949,7 @@ func (retention stalledRemovalRetention) retains(directive l1.ComputerBackupPrun
 // returns the input untouched when nothing is stalled, so the ordinary node
 // carries no per-directive bookkeeping at all.
 func (retention stalledRemovalRetention) excludeBackupPrunes(directives []l1.ComputerBackupPruneDirective) []l1.ComputerBackupPruneDirective {
-	if retention.empty() || len(directives) == 0 {
+	if len(retention.copies) == 0 || len(directives) == 0 {
 		return directives
 	}
 	kept := make([]l1.ComputerBackupPruneDirective, 0, len(directives))
@@ -898,6 +967,9 @@ func (retention stalledRemovalRetention) excludeBackupPrunes(directives []l1.Com
 // declaration" -- `stall_declared_ns` is written only after the acknowledgement
 // lands -- and the standing removal directive L1 already redispatches for that
 // job names the copies it retains.
+//
+// The same pass names the declared removals themselves, which is how one
+// boot-sequence failure is attributed to the removal that produced it (#530).
 //
 // A shared job ID is not that correspondence. The record must be one this
 // agent can validate and must agree with the directive on removal generation,
@@ -924,6 +996,10 @@ func (controller *removalController) declaredStalledRetention(ctx context.Contex
 		}) {
 			continue
 		}
+		if retention.removals == nil {
+			retention.removals = make(map[stalledRemovalKey]struct{})
+		}
+		retention.removals[stalledRemoval(directive)] = struct{}{}
 		for _, copy := range backupCopyDirectives(directive.ComputerBackupCopies) {
 			if copy.CopyID == "" || copy.BoundNodeID != controller.nodeID {
 				continue

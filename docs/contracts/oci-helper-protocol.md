@@ -333,7 +333,9 @@ would otherwise run for such a removal -- exactly the copies its standing
 directive names, matched on their full removal authority -- so the declared
 removal's own durable retries are the only cadence that touches those copies,
 and a node is not held back from advertising OCI by work it has already
-reported to L1 that it cannot finish. `state-machines.md` owns that rule.
+reported to L1 that it cannot finish. Nor is it held back by that removal's own
+retries: a declared-stalled removal's own retry failures, of any shape, do not
+gate the barrier. `state-machines.md` owns both rules.
 
 The client-side boot barrier waits for an incumbent session's monotonic
 heartbeat deadline and reap rather than preempting it, then acquires exclusive
