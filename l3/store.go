@@ -1345,12 +1345,23 @@ func (s *Store) GetLineage(ctx context.Context, runID string) (RunLineage, error
 		return RunLineage{}, internalError(err, "read lineage target")
 	}
 	lineage := RunLineage{RunID: runID, Ancestors: []LineageEntry{}, Descendants: []LineageEntry{}}
+	// The recursive step climbs a.parent_run_id when set (an ordinary
+	// workflow-dispatched child), and falls back to the rerun trigger's
+	// source_run_id otherwise: CreateRerun stores the new run with
+	// parent_run_id NULL and records its source separately in run_triggers
+	// (source='rerun'), so a rerun's ancestry would otherwise vanish even
+	// though `wefty inspect` reports trigger.type=rerun with a source_run_id
+	// (#509).
 	ancestors, err := s.db.QueryContext(ctx, `
 WITH RECURSIVE ancestors(run_id, parent_run_id, status, depth) AS (
   SELECT run_id, parent_run_id, status, 0 FROM runs WHERE run_id=?
   UNION ALL
   SELECT r.run_id, r.parent_run_id, r.status, a.depth + 1
-  FROM runs r JOIN ancestors a ON a.parent_run_id=r.run_id
+  FROM ancestors a
+  JOIN runs r ON r.run_id = COALESCE(
+    a.parent_run_id,
+    (SELECT source_run_id FROM run_triggers WHERE run_id=a.run_id AND source='rerun')
+  )
 )
 SELECT run_id, COALESCE(parent_run_id, ''), status, depth
 FROM ancestors WHERE depth > 0 ORDER BY depth DESC, run_id`, runID)

@@ -340,6 +340,72 @@ func TestLineageQueryChainProvenanceAndTerminalReconciliation(t *testing.T) {
 	}
 }
 
+// TestLineageQueryAncestorsIncludeRerunSource guards the #509 fix to
+// GetLineage's ancestors walk: CreateRerun stores the new run with
+// parent_run_id NULL (a rerun is not a workflow-dispatched child) and
+// records its source separately via run_triggers (source='rerun',
+// source_run_id). Before the fix, the ancestors query only climbed
+// parent_run_id, so a rerun's own lineage.ancestors came back empty even
+// though its trigger names type:rerun and the source run ID.
+func TestLineageQueryAncestorsIncludeRerunSource(t *testing.T) {
+	h := newIntegrationHarness(t)
+	request := inlineRunRequest("#!/bin/sh\nexit 0\n")
+	request.Tags = append(request.Tags, contract.StableNodeTagPrefix+"node-1")
+	source := h.submit(request, "rerun-lineage-source")
+
+	jobs := &recordingJobClient{}
+	reconciler, err := NewReconciler(h.l3Store, jobs, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil,
+		http.Header{"Idempotency-Key": []string{"rerun-lineage-rerun"}})
+	if status != http.StatusCreated {
+		t.Fatalf("rerun status = %d body=%s", status, body)
+	}
+	var rerun RunAccepted
+	if err := json.Unmarshal(body, &rerun); err != nil {
+		t.Fatal(err)
+	}
+
+	rerunRecord, err := h.l3Store.GetRun(context.Background(), rerun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rerunRecord.ParentRunID != "" || rerunRecord.Trigger.Type != "rerun" || rerunRecord.Trigger.SourceRunID != source.RunID {
+		t.Fatalf("rerun provenance = parent %q trigger %#v, want empty parent, type rerun, source %q",
+			rerunRecord.ParentRunID, rerunRecord.Trigger, source.RunID)
+	}
+
+	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+rerun.RunID+"/lineage", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("lineage query = %d body=%s", status, body)
+	}
+	var lineage RunLineage
+	if err := json.Unmarshal(body, &lineage); err != nil {
+		t.Fatal(err)
+	}
+	if len(lineage.Ancestors) != 1 || lineage.Ancestors[0].RunID != source.RunID || lineage.Ancestors[0].Depth != 1 {
+		t.Fatalf("rerun lineage.ancestors = %#v, want one entry for source run %q at depth 1", lineage.Ancestors, source.RunID)
+	}
+
+	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+source.RunID+"/lineage", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("source lineage query = %d body=%s", status, body)
+	}
+	var sourceLineage RunLineage
+	if err := json.Unmarshal(body, &sourceLineage); err != nil {
+		t.Fatal(err)
+	}
+	if len(sourceLineage.Ancestors) != 0 {
+		t.Fatalf("source lineage.ancestors = %#v, want none", sourceLineage.Ancestors)
+	}
+}
+
 func validEnvelope(runID, attemptID, idempotencyKey string) contract.Envelope {
 	return contract.Envelope{
 		SchemaVersion:  contract.SchemaVersionV1,
