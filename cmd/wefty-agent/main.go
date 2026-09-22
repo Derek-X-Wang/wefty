@@ -448,7 +448,7 @@ func run() error {
 		logSpoolDirectory     = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
 		logSpoolMaxBytes      = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged one-shot log payload bytes retained on disk (service logs use a 32 MiB ring)")
 		managedRoot           = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
-		handoffRoot           = flag.String("handoff-root", contract.DefaultHandoffRoot, "agent-managed one-shot handoff root")
+		handoffRoot           = flag.String("handoff-root", contract.DefaultHandoffRoot, "agent-managed one-shot handoff root; dispatched handoff paths are adopted under it, and retained results and result upload follow it")
 		ociHelperSocket       = flag.String("oci-helper-socket", "", "private OCI helper Unix socket; empty disables OCI")
 		ociHelperChecksum     = flag.String("oci-helper-checksum", "", "expected OCI helper binary checksum")
 		ociProbeImage         = flag.String("oci-probe-image", "", "preloaded local OCI probe image reference")

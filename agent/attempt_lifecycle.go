@@ -425,6 +425,10 @@ func (lifecycle *attemptLifecycle) storeMailbox(mailbox *runMailbox) {
 }
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
+	// Before anything reads the claim: the handoff directory this node manages
+	// is the one every later step -- the workload's own environment, the lock,
+	// retention, the result upload -- has to agree on.
+	claim = lifecycle.adoptHandoffDirectory(claim)
 	// The attempt context is deliberately not a direct child of ctx: every
 	// route to its cancellation passes through the mailbox fence first.
 	attemptContext, cancelAttempt, releaseFenceGate := fencedAttemptContext(ctx, lifecycle.fenceMailbox)
@@ -842,6 +846,7 @@ func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult
 }
 
 func (lifecycle *attemptLifecycle) runWorkload(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+	claim = lifecycle.adoptHandoffDirectory(claim)
 	finalization := newAttemptFinalization(ctx, lifecycle.dependencies.finalizationTimeout)
 	defer finalization.stop()
 	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil, nil, nil)
@@ -1228,12 +1233,19 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		lifecycle.dependencies.observer.configurePortfulAttempt(claim.Lease.AttemptID)
 	}
-	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		owner, err := lifecycle.dependencies.handoffs.prepare(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID)
-		if err != nil {
+	if handoffs := lifecycle.dependencies.handoffs; handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
+		// Which of the two this is decides whether the run has results at all,
+		// so it is decided here, in the open, rather than inside a preparation
+		// that would otherwise have to answer "prepared, owned by nobody".
+		if handoffs.ownsHandoff(claim.Job.Spec) {
+			owner, err := handoffs.prepare(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID)
+			if err != nil {
+				return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+			}
+			lifecycle.handoffOwnership = owner
+		} else if err := handoffs.prepareUnownedDirectory(claim.Job.Spec); err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
-		lifecycle.handoffOwnership = owner
 	}
 	// The run mailbox is prepared before the workload starts, so a job that
 	// writes its first event immediately has somewhere to write it. Mailbox
@@ -1502,6 +1514,40 @@ func workloadAuthority(nodeID, bootSessionID string, claim l1.Claim) workloadrun
 
 func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
 	return spec.Kind == contract.JobKindProcess && spec.Class == contract.JobClassOneShot
+}
+
+// adoptHandoffDirectory rewrites a dispatched handoff path onto the root this
+// node manages, once, before anything in the attempt uses it.
+//
+// It happens at the claim rather than inside the handoff manager because the
+// path is not only the agent's: the workload is told it in WEFTY_HANDOFF_DIR
+// and writes its result there, the run mailbox is opened under it, and the
+// attempt's lock, retention record and result read are all keyed by it. One
+// answer for all of them is the only arrangement in which the directory the
+// workload writes into is the directory the node sweeps and uploads from.
+//
+// A path this node cannot adopt is left exactly as it arrived. Preparation
+// refuses it with the typed error, which completes the attempt with a named
+// handoff-preparation failure — a verdict a reader can act on, rather than an
+// unexplained refusal from here.
+func (lifecycle *attemptLifecycle) adoptHandoffDirectory(claim l1.Claim) l1.Claim {
+	handoffs := lifecycle.dependencies.handoffs
+	if handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) || !handoffs.ownsHandoff(claim.Job.Spec) {
+		return claim
+	}
+	dispatched := claim.Job.Spec.Execution.HandoffDirectory
+	managed, err := handoffs.resolveHandoffDirectory(claim.Job.Spec)
+	if err != nil || managed == dispatched {
+		return claim
+	}
+	spec := claim.Job.Spec
+	spec.Execution.HandoffDirectory = managed
+	spec.Execution.Env = cloneEnvironment(spec.Execution.Env)
+	spec.Execution.Env[contract.EnvHandoffDir] = managed
+	claim.Job.Spec = spec
+	lifecycle.log("agent: handoff directory %q dispatched for attempt %s is managed here as %q",
+		dispatched, claim.Lease.AttemptID, managed)
+	return claim
 }
 
 func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
