@@ -238,20 +238,21 @@ func hasJSONFlag(args []string) bool {
 }
 
 type globalOptions struct {
-	fabricMode     string
-	l1Address      string
-	l3Address      string
-	plainIdentity  string
-	plainUserID    string
-	plainDeviceID  string
-	plainFabricID  string
-	fabricName     string
-	stateDirectory string
-	authKey        string
-	controlURL     string
-	ephemeral      bool
-	jsonOutput     bool
-	nodeConfigPath string
+	fabricMode         string
+	l1Address          string
+	l3Address          string
+	plainIdentity      string
+	plainUserID        string
+	plainDeviceID      string
+	plainFabricID      string
+	fabricName         string
+	stateDirectory     string
+	authKey            string
+	controlURL         string
+	ephemeral          bool
+	printEnrollmentURL bool
+	jsonOutput         bool
+	nodeConfigPath     string
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -283,6 +284,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	resolveFabricEnvironment(&options)
+	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
+	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
+	// #498). The resolved boolean, not just the true case, always wins.
+	if options.printEnrollmentURL {
+		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+	} else {
+		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
+	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
 		Identity:       plainIdentity,
@@ -355,6 +364,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.authKey, "auth-key", "", "tsnet auth key (default $TS_AUTHKEY)")
 	flags.StringVar(&options.controlURL, "control-url", "", "optional tsnet coordination URL (default $TS_CONTROL_URL)")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
+	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by singular node commands")
 	flags.Usage = func() { fmt.Fprint(stderr, rootUsage) }
 	if err := flags.Parse(args); err != nil {
@@ -468,6 +478,8 @@ Global flags:
   --plain-device-id DEVICE_ID
   --json
   --node-config PATH
+  --fabric-print-enrollment-url
+                             Print the raw Fabric enrollment URL on first login instead of the wefty notice
 `
 
 type usageError string

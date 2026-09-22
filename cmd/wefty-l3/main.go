@@ -37,6 +37,7 @@ func run() error {
 		authKey                   = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
 		controlURL                = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
 		ephemeral                 = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
+		printEnrollmentURL        = flag.Bool("fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 		readyFile                 = flag.String("ready-file", "", "write listener metadata after the server is ready")
 		controlPlaneNodeID        = flag.String("control-plane-node-id", "control-plane", "authenticated Fabric Node ID allowed to revoke Computer grants administratively")
 		computerAuthorityInstance = flag.String("computer-authority-instance", "default", "persisted L3 authority instance marker; change only for restore or promotion")
@@ -46,6 +47,14 @@ func run() error {
 		return fmt.Errorf("--reconcile-interval must be positive")
 	}
 
+	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
+	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
+	// #498). The resolved boolean, not just the true case, always wins.
+	if *printEnrollmentURL {
+		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "1")
+	} else {
+		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
+	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:          *fabricMode,
 		PlainFabricID: *plainFabricID,
