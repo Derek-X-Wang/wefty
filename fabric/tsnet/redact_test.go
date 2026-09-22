@@ -235,24 +235,34 @@ func TestWrapUserLogfBlanksTheWholeRunWhenNoURLPrefixParses(t *testing.T) {
 			`control server key from https://operator:s3cr)et@control.example.test: ts2021=[nUcW1]`,
 			`control server key from [REDACTED-URL]: ts2021=[nUcW1]`,
 		},
+		{
+			// The comma-bounded prefix "https://operator:1234" parses on its
+			// own (host operator, port 1234); the '@' left in the run marks
+			// it as the front half of a password, so the run is blanked.
+			"password whose delimiter-bounded prefix parses as host and port",
+			`control server key from https://operator:1234,secret!tail@control.example.test: ts2021=[nUcW1]`,
+			`control server key from [REDACTED-URL]: ts2021=[nUcW1]`,
+		},
 	}
 	for _, optedIn := range []string{"", "1"} {
 		for _, tt := range tests {
-			t.Run(tt.name+"/opted-in="+optedIn, func(t *testing.T) {
-				t.Setenv(printEnrollmentURLEnv, optedIn)
+			for hook, wrap := range map[string]func(func(string, ...any)) func(string, ...any){"user": wrapUserLogf, "backend": wrapBackendLogf} {
+				t.Run(tt.name+"/"+hook+"/opted-in="+optedIn, func(t *testing.T) {
+					t.Setenv(printEnrollmentURLEnv, optedIn)
 
-				var got []string
-				wrapUserLogf(func(format string, args ...any) {
-					got = append(got, fmt.Sprintf(format, args...))
-				})("%s", tt.line)
+					var got []string
+					wrap(func(format string, args ...any) {
+						got = append(got, fmt.Sprintf(format, args...))
+					})("%s", tt.line)
 
-				if len(got) != 1 || got[0] != tt.want {
-					t.Fatalf("unparseable URL run = %q, want %q", got, tt.want)
-				}
-				if strings.Contains(got[0], "et@control.example.test") {
-					t.Fatalf("line %q kept the tail of a basic-auth password", got[0])
-				}
-			})
+					if len(got) != 1 || got[0] != tt.want {
+						t.Fatalf("unparseable URL run = %q, want %q", got, tt.want)
+					}
+					if strings.Contains(got[0], "@control.example.test") || strings.Contains(got[0], "secret") {
+						t.Fatalf("line %q kept part of a basic-auth password", got[0])
+					}
+				})
+			}
 		}
 	}
 }

@@ -247,6 +247,16 @@ func processFabricLine(line string) string {
 		rest := line[start:]
 		run := rest[:httpURLRunLength(rest)]
 		token, u, ok := parseHTTPURLToken(run)
+		// A parse that stopped at a delimiter is only trustworthy when the
+		// rest of the run cannot be userinfo: "https://operator:1234" parses
+		// as host operator, port 1234, yet inside
+		// "https://operator:1234,secret@control.example.test" it is the
+		// front half of a password. An '@' anywhere after the token marks
+		// the run credential-bearing and ambiguous, so the whole run is
+		// blanked instead of handing the tail to the text redactor.
+		if ok && strings.ContainsRune(run[len(token):], '@') {
+			ok = false
+		}
 		if !ok {
 			out.WriteString("[REDACTED-URL]")
 			line = rest[len(trimURLTail(run)):]
