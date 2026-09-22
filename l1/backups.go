@@ -753,6 +753,31 @@ func (s *Store) ListNodeComputerBackupPruneDirectives(ctx context.Context, ident
 	return directives, rows.Err()
 }
 
+// refuseReusedBackupAbsenceKey is the one refusal left for a Backup copy whose
+// removal L1 has already accepted. Every identity and authority field on the
+// receipt -- Backup, copy, Computer, Storage and generation, bound node, root
+// instance, operation revision and cleanup fence -- is checked against the
+// planned copy before a caller reaches here, so a receipt that arrives with a
+// different receipt identity proves exactly the absence L1 already recorded.
+// The helper mints a fresh receipt identity on every deletion call, so
+// replaying a directive list built before the acknowledgement produces one;
+// refusing it as conflicting authority turned an already-removed copy into a
+// permanent `l1_conflict` that, since #465, counts into the removal's stall
+// streak (#501). Renewed positive-absence evidence is accepted without
+// mutation instead, and the first accepted receipt stays the record.
+//
+// Reusing one idempotency key for two different bodies remains the ordinary
+// idempotency violation, and a receipt that disagrees about authority is still
+// refused as a conflict before this point.
+func refuseReusedBackupAbsenceKey(acknowledgementKey, acknowledgementHash sql.NullString, requestKey, bodyHash, subject string) error {
+	if acknowledgementKey.Valid && acknowledgementKey.String == requestKey &&
+		(!acknowledgementHash.Valid || acknowledgementHash.String != bodyHash) {
+		return protocolError(contract.ErrorIdempotencyConflict,
+			"%s idempotency key was reused with a different receipt", subject)
+	}
+	return nil
+}
+
 func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNodeID, computerID string, request ComputerBackupPruneAcknowledgementRequest) (Backup, error) {
 	if request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" || !request.Receipt.Absent || request.Receipt.Kind != computerBackupRemovalReceiptKind {
 		return Backup{}, protocolError(contract.ErrorInvalidRequest, "positive Computer Backup copy absence receipt is required")
@@ -832,9 +857,9 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 				return Backup{}, internalError(err, "read restore predecessor Backup absence replay")
 			}
 			if absenceKey.Valid {
-				if absenceKey.String != request.IdempotencyKey || !absenceHash.Valid || absenceHash.String != bodyHash {
-					return Backup{}, protocolError(contract.ErrorConflict,
-						"restore predecessor Backup removal replay differs from the accepted receipt")
+				if err := refuseReusedBackupAbsenceKey(absenceKey, absenceHash, request.IdempotencyKey,
+					bodyHash, "restore predecessor Backup removal"); err != nil {
+					return Backup{}, err
 				}
 				return Backup{}, nil
 			}
@@ -868,9 +893,9 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 			return Backup{}, protocolError(contract.ErrorConflict, "Computer Backup removal receipt does not match superseded planned copy")
 		}
 		if operation.AcknowledgementKey.Valid {
-			if operation.AcknowledgementKey.String != request.IdempotencyKey ||
-				!operation.AcknowledgementHash.Valid || operation.AcknowledgementHash.String != bodyHash {
-				return Backup{}, protocolError(contract.ErrorConflict, "Computer Backup removal replay differs from the accepted receipt")
+			if err := refuseReusedBackupAbsenceKey(operation.AcknowledgementKey, operation.AcknowledgementHash,
+				request.IdempotencyKey, bodyHash, "superseded Computer Backup copy removal"); err != nil {
+				return Backup{}, err
 			}
 			return Backup{}, nil
 		}
@@ -904,9 +929,9 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 		return Backup{}, protocolError(contract.ErrorConflict, "Computer Backup prune receipt does not match planned copy")
 	}
 	if storedStatus == "removed" {
-		if !acknowledgementKey.Valid || acknowledgementKey.String != request.IdempotencyKey ||
-			!acknowledgementHash.Valid || acknowledgementHash.String != bodyHash {
-			return Backup{}, protocolError(contract.ErrorConflict, "Computer Backup prune replay differs from the accepted receipt")
+		if err := refuseReusedBackupAbsenceKey(acknowledgementKey, acknowledgementHash,
+			request.IdempotencyKey, bodyHash, "Computer Backup prune"); err != nil {
+			return Backup{}, err
 		}
 		backup, err := readBackup(ctx, tx, stored.BackupID)
 		if err != nil {

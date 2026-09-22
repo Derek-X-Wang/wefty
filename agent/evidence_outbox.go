@@ -177,6 +177,14 @@ func (outbox *evidenceOutbox) completeRemoval(ctx context.Context, removal local
 	return outbox.spool.completeRemoval(ctx, removal)
 }
 
+func (outbox *evidenceOutbox) backupCopyRemovalAcknowledged(ctx context.Context, directive l1.ComputerBackupPruneDirective) (bool, error) {
+	return outbox.spool.backupCopyRemovalAcknowledged(ctx, directive)
+}
+
+func (outbox *evidenceOutbox) recordBackupCopyRemovalAcknowledged(ctx context.Context, directive l1.ComputerBackupPruneDirective) error {
+	return outbox.spool.recordBackupCopyRemovalAcknowledged(ctx, directive, outbox.clock.Now())
+}
+
 // startRecovery starts the durable replay scan before registration without
 // waiting for any network call. Pending evidence is never a startup gate.
 func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client, report func(error)) {

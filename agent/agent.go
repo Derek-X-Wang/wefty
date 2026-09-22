@@ -419,7 +419,7 @@ func New(config Config) (*Agent, error) {
 		config.BootSessionID, registration.RootInstanceID, logf)
 	session.reimagePreflights = newReimagePreflightController(client, computerReimagePreflighter,
 		config.NodeID, config.BootSessionID, registration.RootInstanceID, logf)
-	session.backups = newBackupController(client, computerBackupper, config.NodeID, config.BootSessionID,
+	session.backups = newBackupController(client, outbox, computerBackupper, config.NodeID, config.BootSessionID,
 		registration.RootInstanceID, logf)
 	if session.backups != nil {
 		session.removals.removeBackupCopies = func(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {

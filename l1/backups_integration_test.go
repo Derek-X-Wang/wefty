@@ -512,3 +512,100 @@ func TestComputerBackupAcknowledgementsRequireBoundNodeAndCurrentRoot(t *testing
 		t.Fatalf("recreated prune root acknowledgement = %v, want %q", err, contract.ErrorConflict)
 	}
 }
+
+// TestAlreadyRemovedBackupPruneAcceptsRenewedAbsenceEvidence is the L1 half of
+// #501. The helper mints a fresh receipt identity on every deletion call, so a
+// replayed directive list produces a different receipt for a copy L1 has
+// already recorded as absent. Refusing that as conflicting authority made an
+// already-removed copy a permanent `conflict` -- and since #465 that refusal
+// counts into the removal's stall streak. Every identity and authority field is
+// still checked against the planned copy, so what arrives here proves exactly
+// the absence L1 recorded: it is accepted, without mutation, and the first
+// accepted receipt stays the record.
+func TestAlreadyRemovedBackupPruneAcceptsRenewedAbsenceEvidence(t *testing.T) {
+	h, node, computer := backupHarness(t, 1, nil)
+	computer, claim := startBackupComputer(t, h, node, computer)
+	if _, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+			IdempotencyKey: "backup-renewed-absence", AllowPowerOff: true}); err != nil {
+		t.Fatal(err)
+	}
+	finishBackupQuiescence(t, h, claim, "backup-renewed-absence-quiescence")
+	creates, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(creates) != 1 {
+		t.Fatalf("Backup create directive = %#v err=%v", creates, err)
+	}
+	backup, completed := acknowledgeBackup(t, h, node, creates[0], successfulBackupReceipt(creates[0]))
+	if _, _, err := h.store.BeginComputerBackupPrune(context.Background(), completed.ComputerID,
+		ComputerBackupPruneRequest{ComputerMutationPrecondition: computerPrecondition(completed, "operator"),
+			BackupID: backup.BackupID, IdempotencyKey: "prune-renewed-absence"}); err != nil {
+		t.Fatal(err)
+	}
+	prunes, err := h.store.ListNodeComputerBackupPruneDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(prunes) != 1 {
+		t.Fatalf("Backup prune directive = %#v err=%v", prunes, err)
+	}
+	accepted := backupRemovalReceipt(prunes[0])
+	pruned, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", completed.ComputerID,
+		ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: accepted.ReceiptID, Receipt: accepted})
+	if err != nil || pruned.Status != "pruned" || len(pruned.Copies) != 1 || pruned.Copies[0].Phase != "removed" {
+		t.Fatalf("first accepted absence = %#v err=%v", pruned, err)
+	}
+	var storedKey string
+	var removedNS int64
+	if err := h.store.db.QueryRow(`SELECT p.acknowledgement_key, c.removed_ns FROM computer_backup_prunes p
+		JOIN backup_copies c ON c.copy_id=p.copy_id WHERE p.computer_id=? AND p.backup_id=?`,
+		completed.ComputerID, backup.BackupID).Scan(&storedKey, &removedNS); err != nil {
+		t.Fatal(err)
+	}
+
+	// The helper deleted the copy again from a stale list and minted a new
+	// receipt for the same authority.
+	renewed := accepted
+	renewed.ReceiptID = "removed-again-" + accepted.CopyID
+	replayed, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", completed.ComputerID,
+		ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: renewed.ReceiptID, Receipt: renewed})
+	if err != nil || replayed.Status != "pruned" || len(replayed.Copies) != 1 || replayed.Copies[0].Phase != "removed" {
+		t.Fatalf("renewed absence for an already-removed copy = %#v err=%v", replayed, err)
+	}
+	var replayedKey string
+	var replayedRemovedNS int64
+	if err := h.store.db.QueryRow(`SELECT p.acknowledgement_key, c.removed_ns FROM computer_backup_prunes p
+		JOIN backup_copies c ON c.copy_id=p.copy_id WHERE p.computer_id=? AND p.backup_id=?`,
+		completed.ComputerID, backup.BackupID).Scan(&replayedKey, &replayedRemovedNS); err != nil {
+		t.Fatal(err)
+	}
+	if replayedKey != storedKey || replayedRemovedNS != removedNS {
+		t.Fatalf("renewed absence rewrote the accepted record: key %q->%q removed_ns %d->%d",
+			storedKey, replayedKey, removedNS, replayedRemovedNS)
+	}
+
+	// Reusing the accepted key for a different body is still the ordinary
+	// idempotency violation.
+	reused := accepted
+	reused.HelperGeneration = accepted.HelperGeneration + 1
+	if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", completed.ComputerID,
+		ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: accepted.ReceiptID, Receipt: reused}); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("reused prune key with a different receipt = %v, want %q", err, contract.ErrorIdempotencyConflict)
+	}
+	// Conflicting authority remains a conflict however fresh the receipt is.
+	for name, mutate := range map[string]func(*ComputerBackupCopyRemovalReceipt){
+		"fence":     func(r *ComputerBackupCopyRemovalReceipt) { r.CleanupFence = "other" },
+		"operation": func(r *ComputerBackupCopyRemovalReceipt) { r.OperationRevision++ },
+		"root":      func(r *ComputerBackupCopyRemovalReceipt) { r.RootInstanceID = "other" },
+	} {
+		t.Run("still refuses "+name, func(t *testing.T) {
+			foreign := accepted
+			foreign.ReceiptID = "forged-" + name
+			mutate(&foreign)
+			if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", completed.ComputerID,
+				ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: foreign.ReceiptID, Receipt: foreign}); errorCode(err) != contract.ErrorConflict {
+				t.Fatalf("mutated %s on an already-removed prune = %v, want %q", name, err, contract.ErrorConflict)
+			}
+		})
+	}
+}
