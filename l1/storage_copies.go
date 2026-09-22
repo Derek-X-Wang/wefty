@@ -828,6 +828,39 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 	return requireComputerCAS(result, row.DestinationComputerID, row.OperationRevision)
 }
 
+// validateStorageCopyPreparationOutcome binds one generation-bound preparation
+// outcome to the reserved destination it claims. Custody import and Computer
+// clone share it because they share the evidence: the helper authors the same
+// typed words for both, and an outcome that does not name the exact reserved
+// generation is never allowed to close or defer somebody else's copy.
+func validateStorageCopyPreparationOutcome(row computerStorageCopyRow, subject string, outcome *ComputerStoragePreparationOutcome) error {
+	if outcome == nil || (outcome.Code != ComputerStoragePreparationInterrupted && outcome.Code != ComputerStoragePreparationResumeDeferred && outcome.Code != ComputerStoragePreparationQuarantined) ||
+		outcome.DestinationComputerID != row.DestinationComputerID || outcome.DestinationStorageID != row.DestinationStorageID ||
+		outcome.DestinationGeneration != row.DestinationGeneration || outcome.IntentRevision != row.OperationRevision ||
+		outcome.DiskBytes != row.DestinationSize || outcome.HelperGeneration == 0 || outcome.RecordedAt == nil || outcome.RecordedAt.IsZero() {
+		return protocolError(contract.ErrorStorageReferenceConflict, "%s preparation outcome does not bind the reserved destination generation", subject)
+	}
+	if outcome.Code == ComputerStoragePreparationInterrupted &&
+		(outcome.SweepEpoch != "" || outcome.DiskName != "" || outcome.Operation != "computer_storage_copy" || outcome.Reason == "") {
+		return protocolError(contract.ErrorInvalidRequest, "interrupted %s preparation outcome is incomplete", subject)
+	}
+	if outcome.SweepEpoch != "" && (outcome.DiskName == "" || outcome.Operation == "" || outcome.Reason == "") {
+		return protocolError(contract.ErrorInvalidRequest, "receipt-backed %s preparation outcome is incomplete", subject)
+	}
+	return nil
+}
+
+// terminalClonePreparationFailure reports whether a preparation outcome ends a
+// Computer clone. Quarantine is terminal because a generation whose bytes
+// cannot be trusted is never cleared automatically, and observed helper
+// runtime loss is terminal because nothing survives it that a later sweep
+// would resume. A deferral is the one outcome that is not: the helper kept the
+// payload and asked to be called again, and its own abandonment bound turns a
+// deferral that never converges into a quarantine, which ends here.
+func terminalClonePreparationFailure(code string) bool {
+	return code == ComputerStoragePreparationQuarantined || code == ComputerStoragePreparationInterrupted
+}
+
 // latchComputerCloneCapacityFailure gives a refused clone the terminal
 // capacity latch a refused grow already has. The receipt's own requested and
 // observed bytes become the Job's typed `insufficient_disk` failure, the
@@ -837,16 +870,8 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 // read why it stopped. The source Computer and its Backup are untouched.
 func latchComputerCloneCapacityFailure(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
 	request ComputerStorageCopyAcknowledgementRequest, receiptJSON []byte, bodyHash string, now time.Time) error {
-	if row.Operation != "clone" {
-		return protocolError(contract.ErrorInvalidRequest, "only a Computer clone latches a typed Storage copy refusal")
-	}
-	computer, err := readComputerAuthority(ctx, tx, row.DestinationComputerID, now)
-	if err != nil {
-		return internalError(err, "read refused Computer clone target")
-	}
-	if computer.IntentRevision != row.OperationRevision || computer.ReconfigurationPhase != ComputerReconfigurationCloning ||
-		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != row.OperationRevision {
-		return protocolError(contract.ErrorStaleIntentRevision, "Computer clone no longer owns its refusal")
+	if err := requireCloningComputerCloneAuthority(ctx, tx, row, now); err != nil {
+		return err
 	}
 	latchedFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk,
 		Message: "Computer clone disk capacity was refused", NodeID: row.BoundNodeID,
@@ -862,6 +887,65 @@ func latchComputerCloneCapacityFailure(ctx context.Context, tx *sql.Tx, row comp
 		now.UnixNano(), now.UnixNano(), row.DestinationComputerID, row.OperationRevision); err != nil {
 		return internalError(err, "record refused Computer clone")
 	}
+	return closeTerminalComputerClone(ctx, tx, row, latchedFailure, now)
+}
+
+// latchComputerClonePreparationFailure closes a clone whose destination can
+// never be prepared, with the same terminal shape the capacity refusal has.
+// The acknowledgement deletes nothing: the quarantined generation, or the
+// retained root the lost copy left behind, stays exactly where the helper put
+// it and remains readable for inspection. Only the L1 generation row is
+// retired, for the same reason a refused clone retires one -- the destination
+// never published bytes, so no later start may format a fresh empty disk under
+// its identity. The operation records the typed outcome the helper authored,
+// the destination Job latches it with `next_restart_at` null, and the
+// destination leaves `cloning`, so L1 stops handing the Node a copy that no
+// sweep will ever finish.
+func latchComputerClonePreparationFailure(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	request ComputerStorageCopyAcknowledgementRequest, outcomeJSON []byte, bodyHash string, now time.Time) error {
+	if err := requireCloningComputerCloneAuthority(ctx, tx, row, now); err != nil {
+		return err
+	}
+	outcome := *request.PreparationOutcome
+	latchedFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureCode(outcome.Code),
+		Message: "Computer clone preparation reported " + outcome.Code, NodeID: row.BoundNodeID,
+		RequestedBytes: row.DestinationSize})
+	if err != nil {
+		return internalError(err, "encode Computer clone preparation failure")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+		failure_code=?, preparation_outcome_json=?, preparation_acknowledgement_key=?,
+		preparation_acknowledgement_hash=?, completed_ns=?
+		WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
+		outcome.Code, outcomeJSON, request.IdempotencyKey, bodyHash, now.UnixNano(),
+		row.DestinationComputerID, row.OperationRevision); err != nil {
+		return internalError(err, "record unpreparable Computer clone")
+	}
+	return closeTerminalComputerClone(ctx, tx, row, latchedFailure, now)
+}
+
+func requireCloningComputerCloneAuthority(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow, now time.Time) error {
+	if row.Operation != "clone" {
+		return protocolError(contract.ErrorInvalidRequest, "only a Computer clone latches a typed Storage copy refusal")
+	}
+	computer, err := readComputerAuthority(ctx, tx, row.DestinationComputerID, now)
+	if err != nil {
+		return internalError(err, "read refused Computer clone target")
+	}
+	if computer.IntentRevision != row.OperationRevision || computer.ReconfigurationPhase != ComputerReconfigurationCloning ||
+		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != row.OperationRevision {
+		return protocolError(contract.ErrorStaleIntentRevision, "Computer clone no longer owns its refusal")
+	}
+	return nil
+}
+
+// closeTerminalComputerClone retires the never-published destination
+// generation and latches the destination failed with the caller's typed
+// failure. It is the shared tail of every terminal clone outcome, so a
+// capacity refusal and an unpreparable destination leave exactly the same
+// readable wreckage behind.
+func closeTerminalComputerClone(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	latchedFailure []byte, now time.Time) error {
 	retired, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
 		WHERE computer_id=? AND storage_generation=? AND phase='staging' AND reset_revision=?`, now.UnixNano(),
 		row.DestinationComputerID, row.DestinationGeneration, row.OperationRevision)
@@ -932,6 +1016,16 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
 		return Computer{}, err
 	}
+	if request.PreparationOutcome != nil {
+		computer, err := acknowledgeComputerClonePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)
+		if err != nil {
+			return Computer{}, err
+		}
+		if terminalClonePreparationFailure(request.PreparationOutcome.Code) {
+			s.notifyComputerPolicyChanged()
+		}
+		return computer, nil
+	}
 	if row.KeepOldBackup && request.OldBackupReceipt != nil && request.OldBackupReceipt.Kind == computerBackupFailureReceiptKind {
 		if err := abortRestoreForFailedPredecessorCopy(ctx, tx, row, *request.OldBackupReceipt, now); err != nil {
 			return Computer{}, err
@@ -1001,6 +1095,84 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return Computer{}, internalError(err, "commit Computer Storage copy verification")
 	}
 	return s.publishVerifiedComputerStorageCopy(ctx, destinationComputerID, row.OperationRevision)
+}
+
+// acknowledgeComputerClonePreparation records one generation-bound preparation
+// outcome for a Computer clone. Quarantine and observed helper runtime loss
+// close the operation terminally, so L1 stops redispatching a copy the node
+// can never finish; a deferral is recorded as the retryable observation it is,
+// exactly as a Custody import records one, so the operator can see why the
+// clone has not landed yet without the node being told to give up.
+func acknowledgeComputerClonePreparation(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string,
+	now time.Time) (Computer, error) {
+	if row.Operation != "clone" {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "only a Computer clone or Custody import acknowledges a Storage copy preparation outcome")
+	}
+	if request.Receipt.Kind != "" || request.OldBackupReceipt != nil {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Computer clone preparation outcome is mutually exclusive with copy receipts")
+	}
+	if err := validateStorageCopyPreparationOutcome(row, "Computer clone", request.PreparationOutcome); err != nil {
+		return Computer{}, err
+	}
+	var storedOutcomeJSON []byte
+	var storedKey, storedHash sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT preparation_outcome_json, preparation_acknowledgement_key,
+		preparation_acknowledgement_hash FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND operation_revision=?`, destinationComputerID, row.OperationRevision).
+		Scan(&storedOutcomeJSON, &storedKey, &storedHash); err != nil {
+		return Computer{}, internalError(err, "read Computer clone preparation idempotency")
+	}
+	// The replay check precedes the status check because the terminal outcome
+	// leaves the operation `failed`: a node that never saw the acknowledgement
+	// land must be able to send the same one again and read the same answer.
+	if storedKey.Valid && storedKey.String == request.IdempotencyKey {
+		if !storedHash.Valid || storedHash.String != bodyHash {
+			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer clone preparation replay differs from durable evidence")
+		}
+		return readComputerAuthority(ctx, tx, destinationComputerID, now)
+	}
+	if row.Status != "reserved" {
+		return Computer{}, protocolError(contract.ErrorConflict, "Computer clone is not awaiting preparation")
+	}
+	if len(storedOutcomeJSON) != 0 {
+		var stored ComputerStoragePreparationOutcome
+		if err := json.Unmarshal(storedOutcomeJSON, &stored); err != nil {
+			return Computer{}, internalError(err, "decode prior Computer clone preparation outcome")
+		}
+		if stored.RecordedAt == nil || request.PreparationOutcome.HelperGeneration < stored.HelperGeneration ||
+			request.PreparationOutcome.RecordedAt.Before(*stored.RecordedAt) {
+			return Computer{}, protocolError(contract.ErrorConflict, "Computer clone preparation outcome is older than durable evidence")
+		}
+	}
+	outcomeJSON, err := json.Marshal(*request.PreparationOutcome)
+	if err != nil {
+		return Computer{}, internalError(err, "encode Computer clone preparation outcome")
+	}
+	if terminalClonePreparationFailure(request.PreparationOutcome.Code) {
+		if err := latchComputerClonePreparationFailure(ctx, tx, row, request, outcomeJSON, bodyHash, now); err != nil {
+			return Computer{}, err
+		}
+	} else {
+		result, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET preparation_outcome_json=?,
+			preparation_acknowledgement_key=?, preparation_acknowledgement_hash=?
+			WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`, outcomeJSON,
+			request.IdempotencyKey, bodyHash, destinationComputerID, row.OperationRevision)
+		if err != nil {
+			return Computer{}, internalError(err, "record Computer clone preparation outcome")
+		}
+		if err := requireSingleStorageGenerationMutation(result, "record Computer clone preparation outcome"); err != nil {
+			return Computer{}, err
+		}
+	}
+	computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
+	if err != nil {
+		return Computer{}, internalError(err, "read Computer clone preparation authority")
+	}
+	if err := tx.Commit(); err != nil {
+		return Computer{}, internalError(err, "commit Computer clone preparation outcome")
+	}
+	return computer, nil
 }
 
 func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinationComputerID string, operationRevision int64) (Computer, error) {

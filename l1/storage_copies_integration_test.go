@@ -233,6 +233,170 @@ func refusedStorageCopyReceipt(directive ComputerStorageCopyDirective, failureCo
 		ObservedAvailableBytes: observedAvailableBytes}
 }
 
+func clonePreparationOutcome(directive ComputerStorageCopyDirective, code string,
+	helperGeneration uint64, recordedAt time.Time) *ComputerStoragePreparationOutcome {
+	outcome := &ComputerStoragePreparationOutcome{Code: code,
+		DestinationComputerID: directive.DestinationComputerID, DestinationStorageID: directive.DestinationStorageID,
+		DestinationGeneration: directive.DestinationGeneration, IntentRevision: directive.OperationRevision,
+		DiskBytes: directive.DestinationSize, HelperGeneration: helperGeneration, RecordedAt: &recordedAt}
+	if code == ComputerStoragePreparationInterrupted {
+		outcome.Operation, outcome.Reason = "computer_storage_copy", "runtime_loss"
+		return outcome
+	}
+	outcome.SweepEpoch, outcome.DiskName = "sweep-clone", "disk-clone"
+	outcome.Operation, outcome.Reason = "computer_storage_copy", code
+	return outcome
+}
+
+// A clone whose helper session is lost mid-copy, or whose destination
+// generation is genuinely quarantined, used to have no way into L1 at all: the
+// directive came back on every sweep forever. It now reaches the same terminal
+// typed outcome the capacity refusal reaches, exactly once, while the
+// destination the helper retained stays readable (#526).
+func TestUnpreparableComputerCloneReachesTerminalOutcomeAndStopsRedispatch(t *testing.T) {
+	for _, terminal := range []string{ComputerStoragePreparationQuarantined, ComputerStoragePreparationInterrupted} {
+		t.Run(terminal, func(t *testing.T) {
+			h, node, sourceComputer, sourceBackup, _ := publishedBackupForStorageCopy(t, 2)
+			clone, _, err := h.store.BeginComputerClone(context.Background(), ComputerCloneRequest{BackupID: sourceBackup.BackupID,
+				ComputerMutationPrecondition: computerPrecondition(sourceComputer, "operator"), Name: "lost-clone",
+				DiskBytes: sourceBackup.AllocatedSize, IdempotencyKey: "lost", Actor: "operator"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			directives, err := h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("clone directive = %#v err=%v", directives, err)
+			}
+			directive := directives[0]
+			recordedAt := time.Date(2026, 9, 22, 4, 0, 0, 0, time.UTC)
+			// Evidence that does not name the exact reserved generation may
+			// never close somebody else's copy.
+			for name, mutate := range map[string]func(*ComputerStoragePreparationOutcome){
+				"computer":   func(o *ComputerStoragePreparationOutcome) { o.DestinationComputerID = "other-computer" },
+				"storage":    func(o *ComputerStoragePreparationOutcome) { o.DestinationStorageID = "other-storage" },
+				"generation": func(o *ComputerStoragePreparationOutcome) { o.DestinationGeneration++ },
+				"revision":   func(o *ComputerStoragePreparationOutcome) { o.IntentRevision++ },
+				"bytes":      func(o *ComputerStoragePreparationOutcome) { o.DiskBytes++ },
+				"helper":     func(o *ComputerStoragePreparationOutcome) { o.HelperGeneration = 0 },
+			} {
+				foreign := clonePreparationOutcome(directive, terminal, 11, recordedAt)
+				mutate(foreign)
+				if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+					ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+						IdempotencyKey: "foreign-" + name, PreparationOutcome: foreign}); errorCode(err) != contract.ErrorStorageReferenceConflict {
+					t.Fatalf("foreign %s preparation outcome error = %v", name, err)
+				}
+			}
+			// A deferral is the helper keeping the payload and asking to be
+			// called again, so it stays retryable and the node keeps the copy.
+			deferred := clonePreparationOutcome(directive, ComputerStoragePreparationResumeDeferred, 10, recordedAt)
+			deferred.DeferredReason, deferred.Attempts = "recovery_attempt_budget", 3
+			if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+				ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: "deferred", PreparationOutcome: deferred}); err != nil {
+				t.Fatal(err)
+			}
+			directives, err = h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("deferred clone directive = %#v err=%v", directives, err)
+			}
+			outcome := clonePreparationOutcome(directive, terminal, 11, recordedAt.Add(time.Minute))
+			closed, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+				ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: "terminal", PreparationOutcome: outcome})
+			if err != nil || closed.ReconfigurationPhase != ComputerReconfigurationStable || closed.ReconfigurationRevision != nil ||
+				closed.AppliedRevision != 1 || closed.DesiredState != contract.ServiceDesiredStopped ||
+				closed.CurrentJob.State != contract.JobFailed {
+				t.Fatalf("unpreparable clone = %#v err=%v", closed, err)
+			}
+			var failure contract.SpawnFailure
+			if closed.CurrentJob.ServiceJob == nil || json.Unmarshal(closed.CurrentJob.LastFailure, &failure) != nil ||
+				string(failure.Code) != terminal || failure.NodeID != node.NodeID ||
+				failure.RequestedBytes != directive.DestinationSize || failure.ObservedAvailableBytes != 0 ||
+				closed.CurrentJob.NextRestartAt != nil {
+				t.Fatalf("unpreparable clone latch = %s failure=%#v next_restart=%v", closed.CurrentJob.LastFailure, failure, closed.CurrentJob.NextRestartAt)
+			}
+			var status, failureCode string
+			var storedOutcome []byte
+			if err := h.store.db.QueryRow(`SELECT status, failure_code, preparation_outcome_json
+				FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=1`,
+				clone.ComputerID).Scan(&status, &failureCode, &storedOutcome); err != nil {
+				t.Fatal(err)
+			}
+			var recorded ComputerStoragePreparationOutcome
+			if status != "failed" || failureCode != terminal || json.Unmarshal(storedOutcome, &recorded) != nil ||
+				recorded.Code != terminal || recorded.HelperGeneration != 11 {
+				t.Fatalf("unpreparable clone operation = %q/%q outcome=%s", status, failureCode, storedOutcome)
+			}
+			// The acknowledgement deletes nothing on the Node; only the
+			// never-published generation row is retired so no later start can
+			// format an empty disk under the clone's identity.
+			generations, err := h.store.ListComputerStorageGenerations(context.Background(), clone.ComputerID)
+			if err != nil || len(generations.Generations) != 1 || generations.Generations[0].Phase != "retired" {
+				t.Fatalf("unpreparable clone generations = %#v err=%v", generations.Generations, err)
+			}
+			directives, err = h.store.ListNodeComputerStorageCopyDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 0 {
+				t.Fatalf("redispatched unpreparable clone = %#v err=%v", directives, err)
+			}
+			replayed, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+				ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: "terminal", PreparationOutcome: outcome})
+			if err != nil || replayed.AppliedRevision != 1 || replayed.ReconfigurationPhase != ComputerReconfigurationStable ||
+				replayed.CurrentJob.State != contract.JobFailed {
+				t.Fatalf("unpreparable clone replay = %#v err=%v", replayed, err)
+			}
+			if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+				ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: "late-deferral",
+					PreparationOutcome: clonePreparationOutcome(directive, ComputerStoragePreparationResumeDeferred, 12,
+						recordedAt.Add(2*time.Minute))}); errorCode(err) != contract.ErrorConflict {
+				t.Fatalf("late deferral after a terminal clone outcome = %v", err)
+			}
+			if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
+				ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					IdempotencyKey: "late-success", Receipt: successfulStorageCopyReceipt(directive)}); err == nil {
+				t.Fatal("late verified receipt was accepted after a terminal clone outcome")
+			}
+			unchanged, err := h.store.GetComputer(context.Background(), sourceComputer.ComputerID)
+			if err != nil || unchanged.StorageID != sourceComputer.StorageID ||
+				unchanged.StorageGeneration != sourceComputer.StorageGeneration ||
+				unchanged.IntentRevision != sourceComputer.IntentRevision ||
+				unchanged.ReconfigurationPhase != ComputerReconfigurationStable {
+				t.Fatalf("unpreparable clone changed source Computer = %#v err=%v", unchanged, err)
+			}
+		})
+	}
+}
+
+// A restore's destination is a live Computer whose predecessor still owns the
+// bytes: it has no never-attached generation to close, so it never acquires an
+// acknowledgement path a clone needed.
+func TestRestoreRejectsAStorageCopyPreparationOutcome(t *testing.T) {
+	h, node, sourceComputer, sourceBackup, _ := publishedBackupForStorageCopy(t, 2)
+	restored, _, err := h.store.BeginComputerRestore(context.Background(), sourceComputer.ComputerID,
+		ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(sourceComputer, "operator"),
+			BackupID: sourceBackup.BackupID, IdempotencyKey: "restore-preparation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var directive ComputerStorageCopyDirective
+	if err := h.store.db.QueryRow(`SELECT destination_storage_id, destination_generation, destination_size
+		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation='restore'`,
+		restored.ComputerID).Scan(&directive.DestinationStorageID, &directive.DestinationGeneration,
+		&directive.DestinationSize); err != nil {
+		t.Fatal(err)
+	}
+	directive.DestinationComputerID, directive.OperationRevision = restored.ComputerID, restored.IntentRevision
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", restored.ComputerID,
+		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: "restore-preparation",
+			PreparationOutcome: clonePreparationOutcome(directive, ComputerStoragePreparationQuarantined, 7,
+				time.Date(2026, 9, 22, 4, 0, 0, 0, time.UTC))}); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("restore preparation outcome error = %v, want invalid_request", err)
+	}
+}
+
 func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t *testing.T) {
 	h, node, sourceComputer, sourceBackup, _ := publishedBackupForStorageCopy(t, 2)
 	requestedBytes := sourceBackup.AllocatedSize + (64 << 20)

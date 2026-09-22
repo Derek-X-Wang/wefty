@@ -880,6 +880,15 @@ const (
 	SpawnFailureReconfigurationAborted     SpawnFailureCode = "reconfiguration_aborted"
 	SpawnFailureReimagePreflight           SpawnFailureCode = "computer_reimage_preflight_failed"
 	SpawnFailurePassUnavailable            SpawnFailureCode = "pass_unavailable"
+	// The two Storage copy preparation outcomes that are terminal for a
+	// Computer clone reach the Job's latched failure surface under their own
+	// names. They are the same typed words the helper and the Custody import
+	// ledger already use, not a second vocabulary for the same facts, so an
+	// operator reading `last_failure.code` reads exactly what stopped the
+	// copy: a generation whose bytes cannot be trusted, or a copy whose
+	// helper session was lost while it ran.
+	SpawnFailureComputerStorageQuarantined            SpawnFailureCode = "computer_storage_quarantined"
+	SpawnFailureComputerStoragePreparationInterrupted SpawnFailureCode = "computer_storage_preparation_interrupted"
 )
 
 // TerminationCause identifies who initiated a signal termination. A service

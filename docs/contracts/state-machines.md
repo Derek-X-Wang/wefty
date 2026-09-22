@@ -403,6 +403,24 @@ it. The source Computer, its Storage, and its Backup are untouched. Quarantine
 stays reserved for a copy whose integrity is in doubt and is never how a clone
 reports that the disk was too small.
 
+A clone whose destination genuinely is quarantined, or whose helper session is
+lost while it copies, is terminal in the same shape for the same reason:
+nothing survives either outcome that a later sweep would finish, so L1 records
+the operation `failed` with the exact typed code the helper authored
+(`computer_storage_quarantined` or `computer_storage_preparation_interrupted`),
+retires the never-published destination generation, latches that same code on
+the destination Job's `last_failure` with `next_restart_at` null, and returns
+the destination to `stable` and latched failed. The acknowledgement deletes
+nothing: the quarantined generation, or the retained root and its authority
+record, stays readable for inspection, and it is only the L1 generation row
+that retires, so no later start can format an empty disk under an identity
+whose copy never happened. A `computer_storage_resume_deferred` outcome is not
+terminal -- the helper kept the payload and asked to be called again, and its
+own abandonment bound turns a deferral that never converges into a quarantine
+-- so it is recorded as the retryable observation a Custody import records and
+the directive stays live. Restore acquires no such path: its destination is a
+live Computer whose predecessor still owns the bytes.
+
 A Computer whose current Storage generation was never published owns no bytes
 to start from or to change. Start, restart, and claim admission refuse it with
 the typed reason `storage_generation_retired`, and so do reimage, projection

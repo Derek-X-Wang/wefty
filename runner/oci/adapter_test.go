@@ -67,33 +67,49 @@ func TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity(t *testing.
 }
 
 func TestComputerStorageCopyRuntimeLossCarriesHelperGenerationToAgent(t *testing.T) {
-	engine := &adapterTestEngine{storageCopyErr: io.ErrUnexpectedEOF}
-	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
-	defer closeAdapter()
-	session, err := barrier.Session()
-	if err != nil {
-		t.Fatal(err)
-	}
-	handshake := session.Handshake()
-	request := workloadrunner.ComputerStorageCopyRequest{
-		Operation: "import", BackupID: "backup-import", CopyID: "copy-import",
-		SourceComputerID: "source-computer", SourceStorageID: "source-storage", SourceGeneration: 1,
-		SourceSize: 1 << 20, SourceDigest: adapterTestDigest, ExportID: "export-import",
-		ExternalPath: "/operator/import", ManifestDigest: adapterTestDigest,
-		Destination: workloadrunner.ComputerStorage{ComputerID: "computer-import", StorageID: "storage-import",
-			StorageGeneration: 1, IntentRevision: 3, DiskBytes: 2 << 20},
-		NodeID: "node", BootSessionID: "boot", RootInstanceID: "root-import", JobID: "job-import",
-		OperationRevision: 3, CleanupFence: "cleanup-import",
-	}
-	_, err = adapter.CopyComputerStorage(t.Context(), request)
-	var loss *workloadrunner.RuntimeLossError
-	var rpcError *ocihelper.RPCError
-	if !errors.As(err, &loss) || loss.Generation.InstanceID != handshake.HelperInstanceID ||
-		loss.Generation.Generation != handshake.SessionGeneration || !errors.As(err, &rpcError) ||
-		rpcError.Code != ocihelper.CodeEngineFailure || rpcError.EngineFailure == nil ||
-		rpcError.EngineFailure.Operation != ocihelper.MethodCopyStorage ||
-		rpcError.EngineFailure.Reason != ocihelper.EngineFailureOperationFailed {
-		t.Fatalf("Storage copy runtime loss = %#v err=%v", loss, err)
+	// A clone owns a fresh destination generation exactly as an import does,
+	// so both carry the helper generation the agent needs to close the
+	// interruption at L1 instead of copying forever (#526). A restore keeps
+	// its predecessor's bytes and stays an ordinary engine failure.
+	for _, test := range []struct {
+		operation string
+		bound     bool
+	}{{operation: "import", bound: true}, {operation: "clone", bound: true}, {operation: "restore"}} {
+		t.Run(test.operation, func(t *testing.T) {
+			engine := &adapterTestEngine{storageCopyErr: io.ErrUnexpectedEOF}
+			adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+			defer closeAdapter()
+			session, err := barrier.Session()
+			if err != nil {
+				t.Fatal(err)
+			}
+			handshake := session.Handshake()
+			request := workloadrunner.ComputerStorageCopyRequest{
+				Operation: test.operation, BackupID: "backup-copy", CopyID: "copy-copy",
+				SourceComputerID: "source-computer", SourceStorageID: "source-storage", SourceGeneration: 1,
+				SourceSize: 1 << 20, SourceDigest: adapterTestDigest, ExportID: "export-copy",
+				ExternalPath: "/operator/import", ManifestDigest: adapterTestDigest,
+				Destination: workloadrunner.ComputerStorage{ComputerID: "computer-copy", StorageID: "storage-copy",
+					StorageGeneration: 1, IntentRevision: 3, DiskBytes: 2 << 20},
+				NodeID: "node", BootSessionID: "boot", RootInstanceID: "root-copy", JobID: "job-copy",
+				OperationRevision: 3, CleanupFence: "cleanup-copy",
+			}
+			_, err = adapter.CopyComputerStorage(t.Context(), request)
+			var loss *workloadrunner.RuntimeLossError
+			var rpcError *ocihelper.RPCError
+			if !errors.As(err, &rpcError) || rpcError.Code != ocihelper.CodeEngineFailure ||
+				rpcError.EngineFailure == nil || rpcError.EngineFailure.Operation != ocihelper.MethodCopyStorage ||
+				rpcError.EngineFailure.Reason != ocihelper.EngineFailureOperationFailed {
+				t.Fatalf("%s engine failure = %v", test.operation, err)
+			}
+			if errors.As(err, &loss) != test.bound {
+				t.Fatalf("%s runtime loss = %#v, want bound=%t", test.operation, loss, test.bound)
+			}
+			if test.bound && (loss.Generation.InstanceID != handshake.HelperInstanceID ||
+				loss.Generation.Generation != handshake.SessionGeneration) {
+				t.Fatalf("%s runtime loss generation = %#v", test.operation, loss.Generation)
+			}
+		})
 	}
 }
 

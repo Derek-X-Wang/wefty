@@ -495,7 +495,7 @@ heartbeats.
 | `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. The server snapshots the live-attempt registry, releases its mutex for the engine scan, then rechecks the registry before returning; heartbeat and Run dispatch stay live throughout the scan, and a new matching attempt fails the inventory closed. Computer reimage serialization is context-bounded. A Job-scoped scan returns runtime authorities once. Each per-generation scan returns only Storage proof and never repeats runtime authorities: a prepared disk backed by a durable copy/reset receipt and no attachment lineage, loop, mount, pending attachment, or retirement, a distinct typed absent-Storage authority (a missing root or exact refusal tombstone with no payload), or `no_storage_evidence` with empty typed evidence. The Job-scoped runtime scan is the sole runtime authority; reconstruction refuses only when neither scan proves authority. Per-generation calls perform filesystem inventory without containerd lease, snapshot, or container scans. The helper never creates a missing root while proving absence. Every result is bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. A prepared-removal Storage-only authority requires its helper-originated never-attached witness; reset/restore predecessor and failed-import cleanup use separate typed operation authorities and cannot claim that witness. After separate durable-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
-| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. A destination the Node cannot hold returns a typed `insufficient_disk` failure receipt carrying the available bytes observed at the refusal and proven staging absence, not an opaque engine failure. |
+| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. A destination the Node cannot hold returns a typed `insufficient_disk` failure receipt carrying the available bytes observed at the refusal and proven staging absence, not an opaque engine failure. A destination that cannot be prepared at all answers with the same exact-generation preparation outcome for clone and for import -- `computer_storage_resume_deferred`, `computer_storage_quarantined`, or, for helper runtime loss the agent observes, `computer_storage_preparation_interrupted` -- and the last two are terminal for a clone. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path that is outside the managed root and a strict descendant of one of the helper's configured operator mount roots. L1 has already committed the custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A missing manifest cannot be reconstructed as empty lineage when an immutable copy receipt or durable reset-preparation record proves prior storage preparation; that contradiction returns typed `computer_storage_grow_uncertain` before reserving capacity or mutating bytes. A failure after ext4 may have expanded returns the same typed uncertainty, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
@@ -1306,21 +1306,26 @@ loop device, and never when the destination already owns published bytes; a
 failure after publication stays an error, because an absence receipt authorizes
 deletion.
 
-Clone has exactly this one typed failure code. Every other clone failure leaves
-the copy's integrity in doubt and keeps the existing path: an engine failure, a
-deferred resume, or a quarantined generation, which is reserved for a copy
-whose bytes cannot be trusted.
+Clone has exactly this one typed refusal code. Every other clone failure leaves
+the copy's integrity in doubt: an engine failure, a deferred resume, or a
+quarantined generation, which is reserved for a copy whose bytes cannot be
+trusted.
 
-For a Custody import, typed helper runtime loss during `CopyComputerStorage`
-becomes an exact-generation `computer_storage_preparation_interrupted`
-observation; startup recovery also carries exact-generation
-`computer_storage_resume_deferred` or `computer_storage_quarantined` results.
+For a Custody import or a clone, typed helper runtime loss during
+`CopyComputerStorage` becomes an exact-generation
+`computer_storage_preparation_interrupted` observation; startup recovery also
+carries exact-generation `computer_storage_resume_deferred` or
+`computer_storage_quarantined` results.
 Receipt-backed outcomes retain the sweep epoch, disk name, closed reason,
 attempt count, and deferral timestamps. All outcomes bind Computer ID, Storage
 ID, generation, intent revision, disk bytes, helper generation, and observation
-time; an identity mismatch never attaches to an import. L1 records the
+time; an identity mismatch never attaches to the copy it claims. L1 records the
 preparation idempotency key and body hash, accepts identical replay, and rejects
-an older helper generation or timestamp. This evidence grants no publication
+an older helper generation or timestamp. Restore has no such path at all: its
+destination is a live Computer whose predecessor still owns the bytes, so it
+holds no never-attached generation that a preparation outcome could close.
+
+For an import this evidence grants no publication
 or cleanup authority, leaves the reserved directive retryable, and is cleared
 by later success, terminal failure, or supersession. L1's import ledger remains
 the immutable idempotency and provenance authority even after a terminal result
@@ -1328,6 +1333,24 @@ has released the reserved Computer identity, so its row is not age-pruned.
 `services custody import --wait` ends on the first durable preparation outcome
 and distinguishes deferred, quarantined, failed/interrupted, and superseded
 exit statuses instead of timing out on an unchanging Computer projection.
+
+For a clone a deferral is the same retryable observation, because the helper
+kept the payload and asked to be called again, and its own abandonment bound
+turns a deferral that never converges into a quarantine. Quarantine and
+observed runtime loss are terminal instead. Without that the clone had no
+acknowledgement path at all and its directive came back on every sweep for as
+long as the destination existed. The acknowledgement deletes nothing: the
+quarantined generation, or the retained root and its authority record, stays
+exactly where the helper put it and remains readable for inspection, and only
+the never-published L1 generation is retired -- the same reason a refused clone
+retires one, so no later start formats a fresh empty disk under an identity
+whose copy never happened. The operation records `failed` with
+`computer_storage_quarantined` or `computer_storage_preparation_interrupted`,
+the destination Job latches that same typed code on its ordinary failure
+surface with `next_restart_at` null and no `observed_available_bytes`, which
+belongs to the capacity refusal alone, and the destination leaves `cloning`
+latched failed. Nothing redispatches it, `services clone --wait` ends on it,
+and ordinary removal remains the exit. The refused-capacity latch is unchanged.
 
 Required-file recovery classification is exact:
 

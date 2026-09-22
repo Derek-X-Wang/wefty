@@ -74,7 +74,10 @@ func TestStorageCopyControllerMapsPreparationOutcomeToL1(t *testing.T) {
 	}
 }
 
-func TestStorageCopyControllerDoesNotMisrouteNonImportPreparationError(t *testing.T) {
+// A restore's destination is a live Computer whose predecessor still owns the
+// bytes, so it has no never-attached generation to close and its preparation
+// failures stay ordinary errors. Only clone and import acknowledge.
+func TestStorageCopyControllerDoesNotMisrouteRestorePreparationError(t *testing.T) {
 	requests := 0
 	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		requests++
@@ -86,10 +89,97 @@ func TestStorageCopyControllerDoesNotMisrouteNonImportPreparationError(t *testin
 	controller := newStorageCopyController(client, storageCopyTestCopier{err: preparation}, nil,
 		"node-copy", "boot-copy", "root-copy", nil)
 	err := controller.process(t.Context(), l1.ComputerStorageCopyDirective{
-		Operation: "clone", BoundNodeID: "node-copy", RootInstanceID: "root-copy",
+		Operation: "restore", BoundNodeID: "node-copy", RootInstanceID: "root-copy",
 	})
 	if !errors.Is(err, preparation) || requests != 0 {
-		t.Fatalf("non-import preparation error = %v, acknowledgement requests=%d", err, requests)
+		t.Fatalf("restore preparation error = %v, acknowledgement requests=%d", err, requests)
+	}
+}
+
+// The helper's own classification of a half-copied clone destination is the
+// acknowledgement L1 needs; without it the clone directive came back every
+// sweep forever (#526).
+func TestStorageCopyControllerAcknowledgesQuarantinedCloneDestination(t *testing.T) {
+	recordedAt := time.Date(2026, 9, 22, 4, 5, 6, 0, time.UTC)
+	outcome := workloadrunner.ComputerStoragePreparationOutcome{
+		Code: workloadrunner.ComputerStoragePreparationQuarantined,
+		Storage: workloadrunner.ComputerStorage{ComputerID: "computer-clone", StorageID: "storage-clone",
+			StorageGeneration: 1, IntentRevision: 1, DiskBytes: 128 << 20},
+		HelperGeneration: 21, SweepEpoch: "sweep-clone", DiskName: "disk-clone",
+		Operation: "computer_storage_copy", Reason: "computer_disk_anomaly_quarantined",
+		RecordedAt: recordedAt,
+	}
+	received := make(chan l1.ComputerStorageCopyAcknowledgementRequest, 1)
+	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.EscapedPath() != "/v1/agent/computers/computer-clone/storage-copy-acknowledgement" {
+			t.Errorf("acknowledgement path = %q", request.URL.EscapedPath())
+			response.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var acknowledgement l1.ComputerStorageCopyAcknowledgementRequest
+		if err := json.NewDecoder(request.Body).Decode(&acknowledgement); err != nil {
+			t.Errorf("decode quarantined clone acknowledgement: %v", err)
+		}
+		received <- acknowledgement
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{}`))
+	}))
+	controller := newStorageCopyController(client, storageCopyTestCopier{err: &workloadrunner.ComputerStoragePreparationError{Outcome: outcome}},
+		nil, "node-clone", "boot-clone", "root-clone", nil)
+	directive := l1.ComputerStorageCopyDirective{Operation: "clone", BoundNodeID: "node-clone", RootInstanceID: "root-clone",
+		DestinationComputerID: "computer-clone", DestinationStorageID: "storage-clone", DestinationGeneration: 1,
+		DestinationSize: 128 << 20, OperationRevision: 1}
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgement := <-received
+	got := acknowledgement.PreparationOutcome
+	if acknowledgement.IdempotencyKey != "preparation-computer_storage_quarantined-21-sweep-clone" || got == nil ||
+		got.Code != l1.ComputerStoragePreparationQuarantined || got.DestinationComputerID != "computer-clone" ||
+		got.DestinationStorageID != "storage-clone" || got.DestinationGeneration != 1 || got.IntentRevision != 1 ||
+		got.DiskBytes != 128<<20 || got.HelperGeneration != 21 || got.SweepEpoch != "sweep-clone" ||
+		got.DiskName != "disk-clone" || got.Operation != "computer_storage_copy" ||
+		got.Reason != "computer_disk_anomaly_quarantined" || got.RecordedAt == nil || !got.RecordedAt.Equal(recordedAt) {
+		t.Fatalf("quarantined clone acknowledgement = %#v outcome=%#v", acknowledgement, got)
+	}
+}
+
+func TestStorageCopyControllerRecordsCloneRuntimeLossAsInterruptedPreparation(t *testing.T) {
+	received := make(chan l1.ComputerStorageCopyAcknowledgementRequest, 1)
+	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var acknowledgement l1.ComputerStorageCopyAcknowledgementRequest
+		if err := json.NewDecoder(request.Body).Decode(&acknowledgement); err != nil {
+			t.Errorf("decode interrupted clone acknowledgement: %v", err)
+		}
+		received <- acknowledgement
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{}`))
+	}))
+	loss := &workloadrunner.RuntimeLossError{
+		Generation: workloadrunner.RuntimeGeneration{InstanceID: "helper-clone", Generation: 9},
+		Err:        errors.New("oci helper engine_failure operation_failed: EOF"),
+	}
+	controller := newStorageCopyController(client, storageCopyTestCopier{err: loss}, nil,
+		"node-clone", "boot-clone", "root-clone", nil)
+	directive := l1.ComputerStorageCopyDirective{Operation: "clone", BoundNodeID: "node-clone", RootInstanceID: "root-clone",
+		DestinationComputerID: "computer-clone", DestinationStorageID: "storage-clone", DestinationGeneration: 1,
+		DestinationSize: 128 << 20, OperationRevision: 1}
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgement := <-received
+	if acknowledgement.IdempotencyKey != "preparation-computer_storage_preparation_interrupted-9-" ||
+		acknowledgement.PreparationOutcome == nil ||
+		acknowledgement.PreparationOutcome.Code != l1.ComputerStoragePreparationInterrupted ||
+		acknowledgement.PreparationOutcome.DestinationComputerID != directive.DestinationComputerID ||
+		acknowledgement.PreparationOutcome.DestinationGeneration != directive.DestinationGeneration ||
+		acknowledgement.PreparationOutcome.IntentRevision != directive.OperationRevision ||
+		acknowledgement.PreparationOutcome.DiskBytes != directive.DestinationSize ||
+		acknowledgement.PreparationOutcome.HelperGeneration != 9 ||
+		acknowledgement.PreparationOutcome.Operation != "computer_storage_copy" ||
+		acknowledgement.PreparationOutcome.Reason != "runtime_loss" ||
+		acknowledgement.PreparationOutcome.RecordedAt == nil {
+		t.Fatalf("interrupted clone acknowledgement = %#v", acknowledgement)
 	}
 }
 
