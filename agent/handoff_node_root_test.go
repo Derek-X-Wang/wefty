@@ -25,6 +25,16 @@ func TestTheNodesHandoffRootIsAuthoritative(t *testing.T) {
 	ledgerRoot := filepath.Join(t.TempDir(), "ledger-handoffs")
 	manager := newHandoffManager(nodeRoot, t.TempDir(), "node-1", time.Hour, nil)
 	manager.ledgerRoot = ledgerRoot
+	// Another name for this node's root, to prove the rule is about the path
+	// that was dispatched and not about where it might eventually lead. The
+	// target is deliberately never created: resolution reads no filesystem.
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(nodeRoot, alias); err != nil {
+		t.Fatal(err)
+	}
+	// Every path below is spelled exactly as it would arrive, because
+	// filepath.Join in a test would clean a traversal away before the resolver
+	// ever saw it -- and cleaning it is the resolver's job to be judged on.
 
 	for _, testCase := range []struct {
 		name       string
@@ -47,8 +57,39 @@ func TestTheNodesHandoffRootIsAuthoritative(t *testing.T) {
 		{
 			name:       "an untidy spelling of the same directory is the same directory",
 			runID:      "run_untidy",
-			dispatched: filepath.Join(ledgerRoot, "..", filepath.Base(ledgerRoot), "run_untidy"),
+			dispatched: ledgerRoot + "/./run_untidy",
 			want:       filepath.Join(nodeRoot, "run_untidy"),
+		},
+		{
+			name:       "a trailing separator does not make it another directory",
+			runID:      "run_trailing",
+			dispatched: ledgerRoot + "/run_trailing/",
+			want:       filepath.Join(nodeRoot, "run_trailing"),
+		},
+		{
+			name:       "traversal out of a known root is refused, not cleaned into one",
+			runID:      "run_escape",
+			dispatched: ledgerRoot + "/../run_escape",
+		},
+		{
+			name:       "traversal back onto the root itself is refused",
+			runID:      "run_dotdot",
+			dispatched: ledgerRoot + "/run_dotdot/..",
+		},
+		{
+			name:       "the ledger's root is not a run's directory",
+			runID:      "run_at_root",
+			dispatched: ledgerRoot,
+		},
+		{
+			name:       "this node's root is not a run's directory either",
+			runID:      "run_at_node_root",
+			dispatched: nodeRoot,
+		},
+		{
+			name:       "a symlink pointing at this node's root is not this node's root",
+			runID:      "run_aliased",
+			dispatched: alias + "/run_aliased",
 		},
 		{
 			name:       "a path under neither root is refused",
@@ -97,6 +138,13 @@ func TestTheNodesHandoffRootIsAuthoritative(t *testing.T) {
 					testCase.dispatched, got, err, testCase.want)
 			}
 		})
+	}
+	// Resolution decides; it never creates. Neither root exists yet, and an
+	// adopted path that was only resolved has nothing on disk behind it.
+	for _, root := range []string{nodeRoot, ledgerRoot} {
+		if _, err := os.Lstat(root); !os.IsNotExist(err) {
+			t.Fatalf("resolving handoff paths created %q: %v", root, err)
+		}
 	}
 }
 
@@ -232,5 +280,36 @@ func TestAJobWithNoRunIdentityKeepsItsOwnDirectory(t *testing.T) {
 	}
 	if records := manager.loadRecords(); len(records) != 0 {
 		t.Fatalf("an unowned directory produced retention records: %#v", records)
+	}
+}
+
+// TestAnUnmanageableHandoffFailsTheAttemptWithANamedCode carries the refusal
+// the whole way out. A reader does not see the sentinel; what L1 records, and
+// what an operator reads back, is the attempt's completion code -- so the code
+// is what this asserts, along with the two things that must not have happened:
+// the workload did not run, and the directory was not created.
+func TestAnUnmanageableHandoffFailsTheAttemptWithANamedCode(t *testing.T) {
+	nodeRoot := filepath.Join(t.TempDir(), "node-handoffs")
+	manager := newHandoffManager(nodeRoot, t.TempDir(), "node-1", time.Hour, nil)
+	manager.ledgerRoot = filepath.Join(t.TempDir(), "ledger-handoffs")
+	foreign := filepath.Join(t.TempDir(), "not-ours", "run_refused")
+	executor := &preflightExecutor{}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: processrunner.NewAdapter(executor)},
+		clock:    systemClock{}, nodeID: "node-1", bootSessionID: "boot-1", handoffs: manager,
+	})
+
+	result, err := lifecycle.runWorkload(t.Context(), handoffClaim("run_refused", foreign, nil))
+	if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureHandoffPreparation {
+		t.Fatalf("attempt result = (%#v, %v), want %s", result, err, contract.SpawnFailureHandoffPreparation)
+	}
+	if !errors.Is(err, errUnmanagedHandoffDirectory) {
+		t.Fatalf("attempt error = %v, want the typed refusal beneath the code", err)
+	}
+	if executor.calls != 0 {
+		t.Fatalf("a refused handoff still ran the workload %d times", executor.calls)
+	}
+	if _, statErr := os.Stat(foreign); !os.IsNotExist(statErr) {
+		t.Fatalf("a refused handoff directory was created anyway: %v", statErr)
 	}
 }

@@ -606,12 +606,16 @@ credential either, exactly like a process one.
 
 For `kind=process`, L3 assigns `/tmp/wefty/handoffs/<run_id>`, and the node's
 own handoff root decides where that directory actually lives: an agent started
-with `--handoff-root` elsewhere adopts the same run-keyed leaf under its own
-root before preparing it, and the run's `WEFTY_HANDOFF_DIR`, its retained
-files, its retention record and its uploaded result all name the adopted
-directory. The dispatched path is unchanged on the wire, so an older node keeps
-reading it. A dispatched path under neither the node's root nor the ledger's
-default is refused before execution rather than run into. Before execution, the
+with `--handoff-root` elsewhere adopts the same leaf — the job's
+`handoff_owner_run_id`, or its run — under its own root before preparing it, and
+the run's `WEFTY_HANDOFF_DIR`, its retained files, its retention record and its
+uploaded result all name the adopted directory. The dispatched path is
+unchanged on the wire, so an older node keeps reading it. A dispatched path
+under neither the node's root nor the ledger's default is refused before
+execution rather than run into. A job carrying no run identity at all — possible
+only for a spec submitted straight to L1, since every dispatch names its run —
+keeps the directory it was dispatched with, and has no retained results, no
+retention record and no result row on the node either way. Before execution, the
 node agent rejects symlinks and non-directories, creates the directory when it
 is absent, forces mode `0700`, and writes an ownership marker at mode `0600`.
 For `kind=oci`, the agent instead requests a helper-owned
