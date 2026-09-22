@@ -492,7 +492,7 @@ heartbeats.
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only, except that one tombstoned attempt whose helper deadman completed a successful guardian reap may authorize exactly one later `Delete` with full seven-field attempt-authority equality and the current node/boot-session gate. That exception still calls engine `Delete`, repeats independent absence verification, and releases image pins, capacity, ports, and retained runtime state before returning positive deletion; it never treats the earlier reap alone as the response. The helper consumes the guardian evidence when that call completes, so a second exact call, stale fence, foreign attempt, different removal generation or boot session, and every failed guardian reap remain refused. In every path, a positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
-| `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. The server snapshots the live-attempt registry, releases its mutex for the engine scan, then rechecks the registry before returning; heartbeat and Run dispatch stay live throughout the scan, and a new matching attempt fails the inventory closed. Computer reimage serialization is context-bounded. A Job-scoped scan returns runtime authorities once. Each per-generation scan returns only Storage proof and never repeats runtime authorities: a prepared disk backed by a durable copy/reset receipt and no attachment lineage, loop, mount, pending attachment, or retirement, a distinct typed absent-Storage authority (a missing root or exact refusal tombstone with no payload), or `no_storage_evidence` with empty typed evidence. The Job-scoped runtime scan is the sole runtime authority; reconstruction refuses only when neither scan proves authority. Per-generation calls perform filesystem inventory without containerd lease, snapshot, or container scans. The helper never creates a missing root while proving absence. Every result is bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity. |
+| `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. The server snapshots the live-attempt registry, releases its mutex for the engine scan, then rechecks the registry before returning; heartbeat and Run dispatch stay live throughout the scan, and a new matching attempt fails the inventory closed. Computer reimage serialization is context-bounded. A Job-scoped scan returns runtime authorities once. Each per-generation scan returns only Storage proof and never repeats runtime authorities: a prepared disk backed by a durable copy/reset receipt and no attachment lineage, loop, mount, pending attachment, or retirement, a distinct typed absent-Storage authority (a missing root, an exact refusal tombstone with no payload, or a root holding nothing but its own lock -- what an interrupted copy's rollback leaves behind), or `no_storage_evidence` with empty typed evidence. The Job-scoped runtime scan is the sole runtime authority; reconstruction refuses only when neither scan proves authority. Per-generation calls perform filesystem inventory without containerd lease, snapshot, or container scans. The helper never creates a missing root while proving absence. Every result is bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. A prepared-removal Storage-only authority requires its helper-originated never-attached witness; reset/restore predecessor and failed-import cleanup use separate typed operation authorities and cannot claim that witness. After separate durable-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. A destination the Node cannot hold returns a typed `insufficient_disk` failure receipt carrying the available bytes observed at the refusal and proven staging absence, not an opaque engine failure. A destination that cannot be prepared at all answers with the same exact-generation preparation outcome for clone and for import -- `computer_storage_resume_deferred`, `computer_storage_quarantined`, or, for helper runtime loss the agent observes, `computer_storage_preparation_interrupted` -- and the last two are terminal for a clone. |
@@ -1335,22 +1335,46 @@ and distinguishes deferred, quarantined, failed/interrupted, and superseded
 exit statuses instead of timing out on an unchanging Computer projection.
 
 For a clone a deferral is the same retryable observation, because the helper
-kept the payload and asked to be called again, and its own abandonment bound
-turns a deferral that never converges into a quarantine. Quarantine and
-observed runtime loss are terminal instead. Without that the clone had no
-acknowledgement path at all and its directive came back on every sweep for as
-long as the destination existed. The acknowledgement deletes nothing: the
-quarantined generation, or the retained root and its authority record, stays
-exactly where the helper put it and remains readable for inspection, and only
-the never-published L1 generation is retired -- the same reason a refused clone
-retires one, so no later start formats a fresh empty disk under an identity
-whose copy never happened. The operation records `failed` with
-`computer_storage_quarantined` or `computer_storage_preparation_interrupted`,
-the destination Job latches that same typed code on its ordinary failure
-surface with `next_restart_at` null and no `observed_available_bytes`, which
-belongs to the capacity refusal alone, and the destination leaves `cloning`
-latched failed. Nothing redispatches it, `services clone --wait` ends on it,
-and ordinary removal remains the exit. The refused-capacity latch is unchanged.
+kept the payload and asked to be called again. That deferral is bounded by
+work, not by the clock: an ordinary `CopyComputerStorage` on a destination a
+sweep deferred runs the same recovery step the sweep runs, under the locks the
+call already holds, and counts the attempt. Recovery that succeeds falls
+through into the ordinary copy -- a rolled-back destination starts again, a
+completed one replays its receipt -- a destination still faulted answers
+`computer_storage_resume_deferred` with the incremented count, and the
+`resume_abandoned` bound answers `computer_storage_quarantined`. Without that,
+nothing advanced the bound: healthy heartbeats run no sweep, and the bound
+needs counted attempts as well as elapsed hours.
+
+Quarantine and observed runtime loss are terminal for a clone instead. Without
+them the clone had no acknowledgement path at all and its directive came back
+on every sweep for as long as the destination existed. Runtime loss proves a
+lost observation, not unrecoverable bytes, and what survives it depends on the
+phase the copy had reached: before `manifest_written` recovery rolls the
+attempt back, deleting the staged image and the copy's own authority record
+and leaving a root holding nothing but its lock; from `manifest_written` on,
+recovery completes the helper's *local* publication and persists a verified
+receipt beside the retained bytes. That local publication is not L1
+publication. The generation L1 retired is never started, never attached, and
+never becomes a Computer's current Storage; a receipt that lands after the
+terminal outcome records what the node did and grants nothing.
+
+The acknowledgement itself deletes nothing: whatever the helper kept -- the
+quarantined generation, the retained root and its receipt, or the lock-only
+residue of a rolled-back attempt -- stays exactly where the helper put it and
+remains readable for inspection, and only the never-published L1 generation is
+retired, the same reason a refused clone retires one, so no later start formats
+a fresh empty disk under an identity whose copy never happened. The operation
+records `failed` with `computer_storage_quarantined` or
+`computer_storage_preparation_interrupted`, the destination Job latches that
+same typed code on its ordinary failure surface with `next_restart_at` null and
+no `observed_available_bytes`, which belongs to the capacity refusal alone, and
+the destination leaves `cloning` latched failed. Nothing redispatches it,
+`services clone --wait` ends on it, and ordinary removal remains the exit: a
+lock-only root proves exact absence through `InventoryRemoval`'s per-generation
+scan under its own generation flock, exactly as a refusal tombstone does, so a
+destination rolled back to its lock is never a removal that cannot start. The
+refused-capacity latch is unchanged.
 
 Required-file recovery classification is exact:
 

@@ -2125,6 +2125,24 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 		}
 		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
 	}
+	// A copy interrupted before `manifest_written` is rolled back to a root
+	// holding nothing but its own lock: the destination published nothing,
+	// attached nothing, and carries no tombstone, so there is no manifest to
+	// read and nothing to delete but the root itself. Reading that as "no
+	// readable disk manifest" would leave the destination a terminal clone
+	// outcome just latched with no way out, which is the wedge removal exists
+	// to avoid. The predicate is the one deletion already uses, and it is read
+	// under this call's own generation flock, so bytes cannot reappear between
+	// the proof and the authority it grants.
+	if absent, residueErr := computerDiskRemovalResidueAbsent(root, name); residueErr != nil {
+		return InventoryRemovalResponse{}, residueErr
+	} else if absent {
+		attempt, attemptErr := absentComputerStorageRemovalAttempt(request, storage)
+		if attemptErr != nil {
+			return InventoryRemovalResponse{}, attemptErr
+		}
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	}
 	manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 	if manifestErr != nil || !present {
 		return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
