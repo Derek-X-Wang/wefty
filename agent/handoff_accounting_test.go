@@ -1203,3 +1203,142 @@ func TestNoWriterOverwritesAnotherRunsRecord(t *testing.T) {
 		t.Fatalf("the refusal was silent: %v", harness.logs)
 	}
 }
+
+// TestAReplacedPrefixIsCaughtOnEveryReopen: a re-open resolves every component
+// by name, every time, and that is the only thing that makes the identity
+// checks below it mean anything.
+//
+// Caching the prefix broke exactly this. Once the steps above a branch were
+// held open, renaming the prefix away and leaving a different directory at its
+// name kept the walk measuring the detached original: every check below the
+// cache passed, because they were checks on the original's own descendants, and
+// nothing was reported. The fixture stages that precisely -- the replacement
+// mirrors the prefix down to the first frame, so the walk reaches a real
+// identity check rather than failing on a missing path.
+func TestAReplacedPrefixIsCaughtOnEveryReopen(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// Deeper than the frame bound so ancestors really are released and really
+	// have to be reached again by name.
+	const teeth = 160
+	const chain = 6
+	// The replacement's own payload. Nothing measured may come from it, and
+	// the original's teeth carry no bytes, so any logical byte at all is the
+	// walk having wandered into the replacement.
+	const decoy = 7777
+	path := harness.plantDirectory("run_detached", nil)
+	buildComb(t, buildNamedChain(t, path, "chain", chain), teeth, 0)
+
+	// The swap happens between two re-opens, not during the descent: a walk
+	// that resolves the prefix on its first re-open would catch a swap staged
+	// before that, whatever it does afterwards. This is the interleaving a
+	// cached prefix walks straight past.
+	swapped := false
+	handoffWalkReopened = func(int) {
+		if swapped {
+			return
+		}
+		swapped = true
+		// Move the whole prefix aside and put one that looks just like it,
+		// down to the name of the first frame, at the name the walk will
+		// re-open.
+		if err := os.Rename(filepath.Join(path, "chain"), filepath.Join(path, "detached")); err != nil {
+			t.Error(err)
+			return
+		}
+		replacement := buildNamedChain(t, path, "chain", chain)
+		if err := replacement.Mkdir("comb", 0o700); err != nil {
+			replacement.Close()
+			t.Error(err)
+			return
+		}
+		imposter, err := replacement.OpenRoot("comb")
+		replacement.Close()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		writeCombPayload(t, imposter, "decoy.bin", decoy)
+		imposter.Close()
+	}
+	t.Cleanup(func() { handoffWalkReopened = nil })
+
+	run, err := harness.manager.openRun("run_detached")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	info, err := run.Lstat("chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tally, err := walkHandoffTree(t.Context(), nil, run, "chain", info, nil)
+	if err != nil {
+		t.Fatalf("walk a tree whose prefix was replaced: %v", err)
+	}
+	if !swapped {
+		t.Fatal("the fixture never drove a re-open, so nothing was staged")
+	}
+	if tally.replaced == 0 {
+		t.Fatalf("a prefix replaced between two re-opens was not noticed: %#v", tally)
+	}
+	// Nothing from the replacement, and nothing further from the original the
+	// rename detached: the walk stopped at the identity check rather than
+	// measuring through either.
+	if tally.logical != 0 {
+		t.Fatalf("the walk measured %d bytes it could only have found in the replacement: %#v",
+			tally.logical, tally)
+	}
+	// The prefix, the comb root, and the teeth it had already reached before
+	// the swap -- each tooth being its own directory plus an empty sibling.
+	if tally.entries > int64(chain+1+2*teeth) {
+		t.Fatalf("the walk counted %d entries, more than the original tree holds: %#v",
+			tally.entries, tally)
+	}
+}
+
+// TestARunFiledUnderTwoNamesIsCountedOnce: migrating a record to its current
+// name publishes that file and then removes the older one, and those are two
+// steps. The accounting pass holds no lock -- deliberately, so it never sits in
+// front of an attempt finishing -- so it can read the pair, and counting both
+// would report a node holding twice what it does.
+func TestARunFiledUnderTwoNamesIsCountedOnce(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// A run ID the two mappings disagree about, so it really has two names.
+	const runID = "run.migrating"
+	path := harness.retain(runID, true, true, map[string]int{"result.json": 4096})
+	current := recordComponent(runID)
+	legacy := legacyRecordComponent(runID)
+	if current == legacy {
+		t.Fatalf("the fixture run ID has one name (%q), so it cannot stage the race", current)
+	}
+	// Stage the window: both files present, both valid, for the same run.
+	payload, err := os.ReadFile(filepath.Join(harness.manager.recordRoot(), current))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(harness.manager.recordRoot(), legacy), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if records := harness.manager.loadRecords(); len(records) != 1 {
+		t.Fatalf("one run under two names loaded %d records: %#v", len(records), records)
+	}
+	status := harness.account()
+	if status.Runs != 1 {
+		t.Fatalf("one run under two names was accounted as %d runs: %#v", status.Runs, status)
+	}
+	if len(status.PerRun) != 1 || status.PerRun[0].RunID != runID {
+		t.Fatalf("one run under two names produced %d rows: %#v", len(status.PerRun), status.PerRun)
+	}
+	// The directory itself, its marker and its one result.json -- once.
+	if status.Entries != 3 {
+		t.Fatalf("one run's entries were counted %d times over: %d entries", status.Entries/3, status.Entries)
+	}
+	if status.LogicalBytes < 4096 || status.LogicalBytes >= 8192 {
+		t.Fatalf("one run's bytes were counted twice: %d", status.LogicalBytes)
+	}
+	if !harness.logged("is filed under two names") {
+		t.Fatalf("the duplicate was not reported: %v", harness.logs)
+	}
+	_ = path
+}

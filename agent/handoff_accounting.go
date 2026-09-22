@@ -104,20 +104,6 @@ func (tally *handoffTally) add(logical int64) {
 // nothing.
 const maxOpenWalkFrames = 64
 
-// maxWalkAnchors bounds the re-opened ancestry one walk keeps warm.
-//
-// Re-opening a released frame used to start at the walk's base every time, so a
-// deep branching tree paid its whole prefix per re-open. The components above
-// the branching are the same every time -- a chain over a comb re-walks the
-// chain for every tooth -- so the last re-open's steps are kept and the next
-// one starts from the deepest one that is still valid. Handles are what this
-// costs, so it is bounded like everything else here: a walk holds at most
-// maxOpenWalkFrames frames plus this many anchors.
-//
-// It shortens the prefix; it is not what bounds the adversarial case. That is
-// maxWalkOpens, because no cache makes an arbitrarily branching tree cheap.
-const maxWalkAnchors = 64
-
 // maxWalkOpens is how many directories one accounting pass may open before it
 // stops and says so.
 //
@@ -192,13 +178,8 @@ type handoffWalk struct {
 	// above it is a component nothing remembers. Rebuilding a released frame
 	// from the stack then opened base/comb, which does not exist, and an
 	// unchanged tree reported its postponed siblings as unaccounted.
-	path []string
-	// anchors[d] is an open handle for path[:d+1] kept from the last re-open,
-	// so the next one starts below the prefix instead of at the base. An entry
-	// is dropped the moment its own component changes.
-	anchors     []*os.Root
-	anchorCount int
-	firstOpen   int
+	path      []string
+	firstOpen int
 	// opens is what is left of the pass's budget, shared by every run the pass
 	// measures. It is a pointer because the budget bounds the pass, not one
 	// tree: a node with a hundred adversarial runs is the same problem as one.
@@ -234,6 +215,13 @@ var handoffWalkFramesObserved func(open, peak int)
 // prove the re-open refuses it -- an interleaving that has to be staged rather
 // than raced for. Nothing outside a test ever sets it.
 var handoffWalkDescended func(depth int)
+
+// handoffWalkReopened is a test seam. It runs after each re-open that reached
+// its frame, so a test can change the ancestry *between* two re-opens -- the
+// interleaving a cached prefix used to walk straight past, and the only one
+// that shows whether every component is really resolved by name every time.
+// Nothing outside a test ever sets it.
+var handoffWalkReopened func(depth int)
 
 // walkHandoffTree sums one directory entry and, when it is a directory,
 // everything beneath it. It never follows a symlink and reaches every level
@@ -368,7 +356,6 @@ func (walk *handoffWalk) push(depth int, name string, run *os.Root) error {
 	// Truncate rather than append: a child opened after an earlier sibling's
 	// subtree finished belongs at its parent's depth plus one, not after
 	// whatever that subtree left behind.
-	walk.dropAnchors(depth)
 	walk.path = append(walk.path[:depth], name)
 	frame := &handoffWalkFrame{depth: depth, identity: identity, directories: directories}
 	walk.stack = append(walk.stack, frame)
@@ -400,7 +387,6 @@ func (walk *handoffWalk) complete() {
 	depth := walk.stack[len(walk.stack)-1].depth
 	walk.discard()
 	if depth < len(walk.path) {
-		walk.dropAnchors(depth)
 		walk.path = walk.path[:depth]
 	}
 	if walk.lostDepth >= depth {
@@ -410,65 +396,27 @@ func (walk *handoffWalk) complete() {
 	}
 }
 
-// dropAnchors closes every cached step at or below depth. An anchor stands for
-// one exact prefix of path, so the moment that prefix changes the handle is a
-// directory this walk is no longer inside.
-func (walk *handoffWalk) dropAnchors(depth int) {
-	for position := depth; position < len(walk.anchors); position++ {
-		if walk.anchors[position] != nil {
-			walk.closeHandle(walk.anchors[position])
-			walk.anchors[position] = nil
-			walk.anchorCount--
-		}
-	}
-	if depth < len(walk.anchors) {
-		walk.anchors = walk.anchors[:depth]
-	}
-}
-
-// anchor keeps one re-opened step for the next re-open, or closes it when the
-// cache is full. The deepest steps are the ones an unwinding walk asks for
-// next, so a full cache gives up its shallowest entry rather than refusing.
-func (walk *handoffWalk) anchor(depth int, run *os.Root) {
-	for len(walk.anchors) <= depth {
-		walk.anchors = append(walk.anchors, nil)
-	}
-	if walk.anchors[depth] != nil {
-		walk.closeHandle(walk.anchors[depth])
-		walk.anchors[depth] = nil
-		walk.anchorCount--
-	}
-	for walk.anchorCount >= maxWalkAnchors {
-		shallowest := -1
-		for position, cached := range walk.anchors {
-			if cached != nil {
-				shallowest = position
-				break
-			}
-		}
-		if shallowest < 0 || shallowest >= depth {
-			// Nothing shallower to give up. This step is the one that goes.
-			walk.closeHandle(run)
-			return
-		}
-		walk.closeHandle(walk.anchors[shallowest])
-		walk.anchors[shallowest] = nil
-		walk.anchorCount--
-	}
-	walk.anchors[depth] = run
-	walk.anchorCount++
-}
-
 // topRoot hands back the deepest frame's handle, re-opening what was released
 // to stay inside the bound.
 //
 // Re-opening walks the recorded ancestry from the walk's own base, component by
-// component, each no-follow and directory-only. Most of those components are
-// not frames at all -- a chain above a branch leaves components and no frames
-// -- so they are stepped through on transient handles. Every component that is
-// a frame must be the same inode the walk first saw; one that is not stops the
-// descent, because the walk refuses to keep measuring through a directory it
-// cannot prove is the one it was measuring.
+// component, each no-follow and directory-only, **every time**. Most of those
+// components are not frames at all -- a chain above a branch leaves components
+// and no frames -- so they are stepped through on transient handles. Every
+// component that is a frame must be the same inode the walk first saw; one that
+// is not stops the descent, because the walk refuses to keep measuring through
+// a directory it cannot prove is the one it was measuring.
+//
+// Caching those steps is what a previous version of this did, and the saving
+// was not worth what it cost. Measured on a 260-deep chain over a 160-tooth
+// comb it removed 32 of 420 re-opening opens -- the work that actually matters
+// is retaining the *frames* a re-open re-establishes, which the window below
+// does -- and it bought that 8% by never resolving the cached components again.
+// A workload that renamed the prefix away and left a different directory at its
+// name then kept the walk measuring the detached original: every identity check
+// below the cache passed, because they were checks on the original's own
+// descendants, and nothing was reported. Re-resolving by name every time is the
+// only thing that makes those checks mean anything.
 //
 // It is only ever called on the deepest frame, and open frames are a contiguous
 // suffix of the stack, so reaching here means every frame is released and the
@@ -479,20 +427,15 @@ func (walk *handoffWalk) topRoot() (*os.Root, int, error) {
 	if frame.run != nil {
 		return frame.run, -1, nil
 	}
-	current, start := walk.base, 0
-	// Start below the deepest cached step that is still this walk's ancestry.
-	// Every component above it is one the last re-open already resolved and
-	// nothing has changed since.
-	for depth := min(frame.depth, len(walk.anchors)-1); depth >= 0; depth-- {
-		if walk.anchors[depth] != nil {
-			current, start = walk.anchors[depth], depth+1
-			break
-		}
-	}
+	current := walk.base
+	var transient *os.Root
 	firstOpen := walk.firstOpen
 	var openedFrames []*handoffWalkFrame
 	complete := false
 	defer func() {
+		if transient != nil {
+			walk.closeHandle(transient)
+		}
 		if !complete {
 			// A failed re-open owns none of the frame handles it acquired.
 			// Restoring both ownership and the window marker makes every retry
@@ -504,12 +447,15 @@ func (walk *handoffWalk) topRoot() (*os.Root, int, error) {
 		}
 	}()
 	cursor := 0
-	for cursor <= index && walk.stack[cursor].depth < start {
-		cursor++
-	}
-	for depth := start; depth <= frame.depth; depth++ {
+	for depth := 0; depth <= frame.depth; depth++ {
 		child, err := walk.openDirectory(current, walk.path[depth])
 		walk.tally.reopenOpens++
+		if transient != nil {
+			// The step that led here is no longer needed now that its child is
+			// open, so it never counts against the descriptor bound.
+			walk.closeHandle(transient)
+			transient = nil
+		}
 		if err != nil {
 			return nil, depth, err
 		}
@@ -517,11 +463,9 @@ func (walk *handoffWalk) topRoot() (*os.Root, int, error) {
 			cursor++
 		}
 		if cursor > index || walk.stack[cursor].depth != depth {
-			// A step on the way rather than a frame. It is kept for the next
-			// re-open, which is what makes a chain over a branching tree cost
-			// its prefix once instead of once per branch.
-			walk.anchor(depth, child)
-			current = child
+			// A step on the way rather than a frame, held only until its own
+			// child is open.
+			transient, current = child, child
 			continue
 		}
 		target := walk.stack[cursor]
@@ -553,6 +497,9 @@ func (walk *handoffWalk) topRoot() (*os.Root, int, error) {
 		current = child
 	}
 	complete = true
+	if handoffWalkReopened != nil {
+		handoffWalkReopened(frame.depth)
+	}
 	return frame.run, -1, nil
 }
 
@@ -625,7 +572,6 @@ func (walk *handoffWalk) closeAll() {
 	for _, frame := range walk.stack {
 		walk.release(frame)
 	}
-	walk.dropAnchors(0)
 }
 
 // handoffWalkSkips reports the two ways a directory can stop being one while a
@@ -708,6 +654,13 @@ func (m *handoffManager) measureNode(ctx context.Context, root *os.Root, now tim
 	recorded := make(map[string]struct{})
 	budget := int64(maxWalkOpens)
 	for _, record := range m.loadRecords() {
+		if _, counted := recorded[record.RunID]; counted {
+			// loadRecords already answers one record per run. This is the
+			// second guard on the one arithmetic that must not double: the
+			// pass holds no lock, so what it reads is whatever the record
+			// directory looked like as it read it.
+			continue
+		}
 		recorded[record.RunID] = struct{}{}
 		status.Runs++
 		if record.RetainUntil.IsZero() {

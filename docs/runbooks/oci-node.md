@@ -603,6 +603,8 @@ Meaning: the node agent has not completed a retained-results accounting pass, or
 
 ## doctor-code-oci-retained-results-measured
 
+Upgrade order: upgrade the `wefty` CLI before or together with the agent. A CLI older than this release refuses a doctor response carrying the retained-results codes, so `wefty node doctor` fails outright against a newer agent until the CLI is upgraded; a CLI of this release or newer accepts unknown finding codes from any agent and reports them as codes it cannot interpret.
+
 Meaning: the node's retained results were measured and every byte under the handoff root belongs to a run the agent has a record for. The finding names the runs retained, how many are still in flight, the entries reached, and both byte figures: logical bytes, which count the length of regular files and charge a file two runs hard-link once, and charged bytes, which put a floor of 4 KiB under every entry so a tree of tiny files is visible as the node resource it is. Neither figure is enforced — the node-wide budget is #494 — so this is a reading, not a bound. Evidence: `wefty --json node oci doctor` for the figures. First action: none.
 
 ## doctor-code-oci-retained-results-unaccounted

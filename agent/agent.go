@@ -562,11 +562,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		// is the agent's, not this call's: Close cancels and joins it before
 		// the node lock is released, so nothing is sweeping a node another
 		// agent may already have taken.
-		a.startResultCollector()
+		a.startResultCollector(ctx)
 		// The first accounting pass runs here, after reconciliation and the
 		// first sweep, so the node has a figure to report from the moment it
 		// is up. It never runs on an attempt's finalization path, where one
 		// workload's tree would sit in front of every other run.
+		//
+		// It carries the collector's context, which is this call's -- a pass
+		// over an adversarial tree at startup is as much of a stall as one on
+		// the timer, and cancelling Run has to reach it before Close waits on
+		// anything.
 		if err := a.handoffs.accountNode(a.collectorContext); err != nil {
 			a.log("measure this node's retained results: %v", err)
 		}
@@ -628,8 +633,13 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 // startResultCollector expires retained results on a timer, so retention holds
 // on a node that is never restarted. Attempt completion collects too; this
 // covers a node that finishes nothing for a long time.
-func (a *Agent) startResultCollector() {
-	ctx, cancel := context.WithCancel(context.Background())
+// parent is Run's own context, so cancelling Run interrupts a pass already
+// under way rather than leaving Close to wait for it. Cancellation still also
+// comes from stopResultCollector, which runs before the node lock is released:
+// a sweep that outlived its agent would be deleting under a node another agent
+// has already claimed, and that is true whether or not Run was cancelled.
+func (a *Agent) startResultCollector(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
 	a.collectorCancel = cancel
 	a.collectorContext = ctx
 	a.collectorDone = make(chan struct{})

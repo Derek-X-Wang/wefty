@@ -498,6 +498,15 @@ func (m *handoffManager) loadRecords() []retentionRecord {
 	}
 	now := m.now().UTC()
 	records := make([]retentionRecord, 0, len(entries))
+	// One run, one record. A record that arrived under an older agent's name
+	// is rewritten to the current one and the old file is then removed, and
+	// those are two steps: for the moment between them both names hold a valid
+	// document for the same run. Nothing here takes a lock -- the accounting
+	// pass deliberately does not, so it never sits in front of an attempt
+	// finishing -- so a pass can read the pair, and a pass that returned both
+	// would count the run twice, its entries twice and its per-entry floor
+	// twice, and report a node holding more than it does.
+	seen := make(map[string]int, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasSuffix(name, ".json") {
@@ -512,6 +521,18 @@ func (m *handoffManager) loadRecords() []retentionRecord {
 			m.log("agent: skip untrustworthy retention record %q: %v", name, err)
 			continue
 		}
+		current := name == recordComponent(record.RunID)
+		if index, duplicate := seen[record.RunID]; duplicate {
+			// The current name wins: it is the one every write produces and
+			// the one the older file is on its way to becoming.
+			m.log("agent: run %s is filed under two names (%q and %q); the current one is used and the other is a migration this node has not finished",
+				record.RunID, recordComponent(record.RunID), legacyRecordComponent(record.RunID))
+			if current {
+				records[index] = record
+			}
+			continue
+		}
+		seen[record.RunID] = len(records)
 		records = append(records, record)
 	}
 	return records
