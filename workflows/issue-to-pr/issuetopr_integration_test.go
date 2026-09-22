@@ -396,6 +396,12 @@ type stubTools struct {
 	prArgsFile     string
 	prBodyFile     string
 	agentCallsFile string
+	// promptsDir holds a copy of the latest prompt file handed to the fake
+	// agent for each phase, named <phase>.txt. The run's own prompt file lives
+	// in its scratch directory, which is gone by the time a test can look --
+	// this is a test-owned, non-ephemeral copy so a test can assert on what
+	// the agent actually saw.
+	promptsDir string
 }
 
 func installStubTools(t *testing.T, origin string) stubTools {
@@ -407,8 +413,9 @@ func installStubTools(t *testing.T, origin string) stubTools {
 		prArgsFile:     filepath.Join(root, "pr-args.txt"),
 		prBodyFile:     filepath.Join(root, "pr-body.md"),
 		agentCallsFile: filepath.Join(root, "agent-calls.txt"),
+		promptsDir:     filepath.Join(root, "prompts"),
 	}
-	for _, directory := range []string{tools.binDir, tools.controlDir} {
+	for _, directory := range []string{tools.binDir, tools.controlDir, tools.promptsDir} {
 		if err := os.MkdirAll(directory, 0o750); err != nil {
 			t.Fatal(err)
 		}
@@ -476,15 +483,21 @@ exit 1
 set -u
 control=%q
 calls=%q
+prompts=%q
 phase=$1
 prompt=$2
 printf '%%s %%s\n' "$phase" "$prompt" >>"$calls"
 [ -s "$prompt" ] || { printf 'the agent was given an empty prompt\n' >&2; exit 1; }
+cp "$prompt" "$prompts/$phase.txt" 2>/dev/null || true
 case $phase in
 plan)
 	printf '# Plan\n\nthe plan the fake agent wrote for issue %s.\n' >PLAN.md
 	;;
 implement)
+	if [ -f "$control/fail-implement" ]; then
+		printf 'the agent shim was told to fail implement\n' >&2
+		exit 1
+	fi
 	if [ -f "$control/agent-does-nothing" ]; then
 		exit 0
 	fi
@@ -498,13 +511,13 @@ implement)
 	;;
 esac
 exit 0
-`, tools.controlDir, tools.agentCallsFile, issueNumber, issueNumber))
+`, tools.controlDir, tools.agentCallsFile, tools.promptsDir, issueNumber, issueNumber))
 
 	// A `go` shim that can be made to fail, so the exercise can stop a run at
 	// the gates without killing the process and racing the agent's publication.
 	// It is also the fake gate for the reserved-name leak: `vet` and `test` both
 	// run through it, so it is where the gate subshell's own environment can be
-	// inspected. It checks the six reserved names by name rather than every
+	// inspected. It checks the seven reserved names by name rather than every
 	// WEFTY_-prefixed variable, because this exercise's own environment carries
 	// WEFTY_ISSUE_TO_PR_EXERCISE (and, in the shellcheck-required lane,
 	// WEFTY_REQUIRE_SHELLCHECK) into every job's base environment; those are not
@@ -1215,7 +1228,7 @@ func TestAnAgentThatEditsWithoutCommittingStillCounts(t *testing.T) {
 // would fail for exactly that reason on every real run.
 //
 // The `go` shim installStubTools wires up (both `vet` and `test` run through
-// it) is the fake gate: it fails the instant it sees any of the six reserved
+// it) is the fake gate: it fails the instant it sees any of the seven reserved
 // names in its own environment. A run that reaches a draft pull request here
 // is proof the gate subshell saw none of them.
 func TestGatesDoNotInheritTheRunExecutionContext(t *testing.T) {
@@ -1241,5 +1254,158 @@ func TestGatesDoNotInheritTheRunExecutionContext(t *testing.T) {
 		if outcomes[gate] != contract.GatePass {
 			t.Fatalf("gate %s = %q, want pass; logs:\n%s", gate, outcomes[gate], logs)
 		}
+	}
+}
+
+// TestPlanSurvivesResumeThroughTheMarkerMessage is #507's other half. PLAN.md
+// itself never reaches a resumed run: it is excluded from the worktree's git,
+// and a resumed run's scratch directory -- where a run first writes it -- is
+// new and empty. The first run here is stopped right after the `plan` marker
+// is pushed but before `implement` starts, so the second, resumed run has to
+// recover the plan from somewhere other than a file it wrote itself: the
+// `plan` marker commit's own message, which phase_complete embeds it in.
+func TestPlanSurvivesResumeThroughTheMarkerMessage(t *testing.T) {
+	requireExercise(t)
+	origin := initializeOriginRepository(t)
+	tools := installStubTools(t, origin)
+	caller, store := startStack(t)
+
+	// Stopping right after the plan marker: the fake agent fails `implement`
+	// outright, so the first run dies there with `plan` (and `read-issue`)
+	// already marked and pushed.
+	writeFile(t, tools.controlDir, "fail-implement", "1")
+	first := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject",
+	})
+	firstRecord := waitForTerminalRun(t, store, first.RunID, runBudget)
+	firstLogs := runLogs(t, caller, first.RunID, settleBudget)
+	if firstRecord.Status != contract.RunFailed {
+		t.Fatalf("the interrupted run ended %q, want failed; logs:\n%s", firstRecord.Status, firstLogs)
+	}
+	branch := branchFromLogs(t, firstLogs)
+	if branch == "" {
+		t.Fatalf("the first run never named its branch:\n%s", firstLogs)
+	}
+	subjects := runGit(t, origin, "log", "--format=%s", branch)
+	for _, phase := range []string{"read-issue", "plan"} {
+		if !strings.Contains(subjects, "issue-to-pr: phase "+phase+" complete") {
+			t.Fatalf("the interrupted run did not push the %s marker:\n%s", phase, subjects)
+		}
+	}
+	if strings.Contains(subjects, "issue-to-pr: phase implement complete") {
+		t.Fatalf("the interrupted run marked a phase it did not finish:\n%s", subjects)
+	}
+
+	// Now let implement succeed and resume. Scratch is empty again -- this is
+	// a cold process, not the same one continuing -- so PLAN.md does not exist
+	// on disk anywhere until the resumed run recovers it.
+	if err := os.Remove(filepath.Join(tools.controlDir, "fail-implement")); err != nil {
+		t.Fatal(err)
+	}
+	second := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject", "continue_from": branch,
+	})
+	secondRecord := waitForTerminalRun(t, store, second.RunID, runBudget)
+	secondLogs := runLogs(t, caller, second.RunID, settleBudget)
+	if secondRecord.Status != contract.RunSucceeded {
+		t.Fatalf("the resumed run ended %q, want succeeded; logs:\n%s", secondRecord.Status, secondLogs)
+	}
+	secondSteps := l3.DeriveRunSteps(secondRecord.Envelopes)
+	ran := map[string]bool{}
+	for _, step := range secondSteps.Steps {
+		ran[step.Name] = true
+	}
+	for _, skipped := range []string{"read-issue", "plan"} {
+		if ran[skipped] {
+			t.Fatalf("the resumed run re-ran phase %s:\n%s", skipped, secondLogs)
+		}
+	}
+	assertPhasesRan(t, secondSteps, []string{"implement", "gates", "push", "open-pr"}, secondLogs)
+
+	// The plan the fake agent wrote in the first run reached the resumed
+	// run's implement prompt, recovered from the plan marker's own message --
+	// not from a PLAN.md the resumed run never wrote.
+	wantPlan := "the plan the fake agent wrote for issue " + issueNumber + "."
+	implementPrompt := readFile(t, filepath.Join(tools.promptsDir, "implement.txt"))
+	if !strings.Contains(implementPrompt, wantPlan) {
+		t.Fatalf("the resumed run's implement prompt does not carry the recovered plan:\n%s", implementPrompt)
+	}
+	// And the pull request body quotes the same recovered text.
+	body := readFile(t, tools.prBodyFile)
+	if !strings.Contains(body, wantPlan) {
+		t.Fatalf("the pull request body does not carry the recovered plan:\n%s", body)
+	}
+	// The plan marker's own tree diff is still empty; only its message carries
+	// the plan.
+	assertMarkerCommitsAreEmpty(t, origin, branch, []string{"read-issue", "plan", "implement", "gates", "push", "open-pr"})
+}
+
+// TestALegacyTrackedPLANMdIsRetiredOnResume is #507's compatibility half. A
+// branch from before PLAN.md was excluded from this worktree's git may still
+// track it -- exactly the shape the attended #479 run's own
+// issue-to-pr/505-... branch is in. Resuming onto one must still end with no
+// PLAN.md in the pull request diff, and the plan it carried must still reach
+// the run: its content becomes the recovered plan when the branch's own
+// `plan` marker predates carrying the text in its message.
+func TestALegacyTrackedPLANMdIsRetiredOnResume(t *testing.T) {
+	requireExercise(t)
+	origin := initializeOriginRepository(t)
+	tools := installStubTools(t, origin)
+	caller, store := startStack(t)
+
+	// A branch built the way a pre-#507 run would have left it: `plan`'s
+	// marker in the same commit as a tracked PLAN.md, no plan text in the
+	// message, authored and trailer-carrying exactly as phase_done() trusts.
+	branch := "issue-to-pr/" + issueNumber + "-legacy"
+	forge := t.TempDir()
+	runGit(t, forge, "clone", origin, "work")
+	work := filepath.Join(forge, "work")
+	runGit(t, work, "checkout", "-b", branch)
+	runGit(t, work, "config", "user.name", "wefty issue-to-pr")
+	runGit(t, work, "config", "user.email", "issue-to-pr@wefty.invalid")
+	legacyPlan := "# Plan\n\nlegacy tracked plan for issue " + issueNumber + ".\n"
+	writeFile(t, work, "PLAN.md", legacyPlan)
+	runGit(t, work, "add", "PLAN.md")
+	runGit(t, work, "commit", "-m", "issue-to-pr: phase plan complete",
+		"-m", "Issue-To-PR-Marker: "+issueNumber+"/plan\nIssue-To-PR-Run: run_legacy")
+	runGit(t, work, "push", "origin", branch)
+
+	accepted := submitIssueToPR(t, caller, map[string]string{
+		"issue": issueNumber, "repo": "example/subject", "continue_from": branch,
+	})
+	record := waitForTerminalRun(t, store, accepted.RunID, runBudget)
+	logs := runLogs(t, caller, accepted.RunID, settleBudget)
+	if record.Status != contract.RunSucceeded {
+		t.Fatalf("run status = %q, want succeeded; logs:\n%s", record.Status, logs)
+	}
+	if !strings.Contains(logs, "phase plan: already complete") {
+		t.Fatalf("the run did not skip the already-marked plan phase:\n%s", logs)
+	}
+	if !strings.Contains(logs, "retired the tracked PLAN.md") {
+		t.Fatalf("the run did not report retiring the tracked PLAN.md:\n%s", logs)
+	}
+
+	// PLAN.md never reaches the pull request diff, even though it started
+	// tracked: it was added then retired, so the branch's final tree carries
+	// no trace of it.
+	diff := runGit(t, origin, "diff", "--name-only", "main", branch)
+	if strings.Contains(diff, "PLAN.md") {
+		t.Fatalf("PLAN.md is still in the pull request diff:\n%s", diff)
+	}
+	subjects := runGit(t, origin, "log", "--format=%s", branch)
+	if !strings.Contains(subjects, "issue-to-pr: retire tracked PLAN.md") {
+		t.Fatalf("origin has no retirement commit for the tracked PLAN.md:\n%s", subjects)
+	}
+
+	// The legacy plan's own text -- recovered from the retired PLAN.md, since
+	// this branch's plan marker predates carrying it in the message -- still
+	// reached the implement prompt and the pull request body.
+	implementPrompt := readFile(t, filepath.Join(tools.promptsDir, "implement.txt"))
+	if !strings.Contains(implementPrompt, "legacy tracked plan for issue "+issueNumber) {
+		t.Fatalf("the implement prompt does not carry the legacy plan:\n%s", implementPrompt)
+	}
+	body := readFile(t, tools.prBodyFile)
+	if !strings.Contains(body, "legacy tracked plan for issue "+issueNumber) {
+		t.Fatalf("the pull request body does not carry the legacy plan:\n%s", body)
 	}
 }

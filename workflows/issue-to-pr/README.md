@@ -73,11 +73,31 @@ one a run is in and `wefty inspect` shows how long each took:
 | `open-pr` | `gh pr create --draft`, and `pr.json` + `summary.md` |
 
 `PLAN.md` is excluded from the worktree's git, so it is never part of the
-change: it exists for the `implement` phase and the pull request body to read,
-and does not reach a commit or the diff a reviewer sees.
+change: it exists on disk for the `implement` phase and the pull request body
+to read, and does not reach a commit or the diff a reviewer sees. Its content
+still has to survive a resume, whose scratch directory starts empty every run,
+so the `plan` phase's own marker commit carries it as a paragraph in the
+commit message. Its tree diff is still empty; only `plan`'s message is not:
 
-Each phase ends by recording an empty marker commit and **pushing** it. The
-subject is prose; the part that counts is the trailers:
+```
+issue-to-pr: phase plan complete
+
+<the plan, verbatim>
+
+Issue-To-PR-Marker: <issue>/plan
+Issue-To-PR-Run: <run id>
+```
+
+Resuming past `plan` recovers the text from that message, not from `PLAN.md`
+on disk. A branch from before this existed may still track `PLAN.md` itself;
+resuming onto one retires it with its own commit,
+`issue-to-pr: retire tracked PLAN.md`, before any phase runs, and that
+tracked copy becomes the recovered plan if the branch's own `plan` marker
+predates carrying the text in its message.
+
+Every other phase's marker commit carries no such paragraph. Each phase ends
+by recording an empty-diff marker commit and **pushing** it. The subject is
+prose; the part that counts is the trailers:
 
 ```
 issue-to-pr: phase <name> complete
