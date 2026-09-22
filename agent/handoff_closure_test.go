@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -254,36 +255,149 @@ func TestHandoffAttemptArrivingDuringExpiryAcquiresAfterDeletion(t *testing.T) {
 	waitHandoffReferences(t, harness.manager, path, 0)
 }
 
+// TestHandoffFIFOMarkerDoesNotBlockPreparation covers both halves of the marker
+// read, and the second half is the one that matters.
+//
+// A FIFO planted before the Lstat is refused by the mode check, so a test that
+// plants it there passes whether or not the non-blocking open and the post-open
+// identity check exist at all -- it proves nothing about either. The guards
+// those two exist for are only reached when the name is a regular file at the
+// check and a FIFO by the time it is opened, which is exactly the swap a
+// same-UID workload can perform, so that is what the second case does.
 func TestHandoffFIFOMarkerDoesNotBlockPreparation(t *testing.T) {
-	harness := newRetentionHarness(t, time.Hour)
-	path := filepath.Join(harness.root, "run_fifo")
-	if err := os.MkdirAll(path, 0700); err != nil {
+	t.Run("a FIFO already in place is refused by the mode check", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(harness.root, "run_fifo")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(path, handoffMarkerName)
+		if err := syscall.Mkfifo(marker, 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := prepareWithoutBlocking(t, harness, "run_fifo", path, marker)
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("preparation error = %v, want one naming the mode check", err)
+		}
+	})
+
+	t.Run("a regular marker swapped for a FIFO after its check is refused", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(harness.root, "run_fifo_swapped")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(path, handoffMarkerName)
+		// Regular, valid, and this run's own: the mode check has no reason to
+		// refuse it, so everything below is the later guards' work.
+		if err := os.WriteFile(marker, markerPayload(t, "run_fifo_swapped", "node-1", harness.now), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// The swap happens in the window the seam names: after the Lstat that
+		// found a regular file, before the open. No writer is attached, so a
+		// regressed blocking open hangs here and the deadline below reports it.
+		var once sync.Once
+		handoffMarkerOpenRace = func() {
+			once.Do(func() {
+				if err := os.Remove(marker); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := syscall.Mkfifo(marker, 0600); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		t.Cleanup(func() { handoffMarkerOpenRace = nil })
+
+		err := prepareWithoutBlocking(t, harness, "run_fifo_swapped", path, marker)
+		if err == nil || !strings.Contains(err.Error(), "changed identity while opening") {
+			t.Fatalf("preparation error = %v, want the post-open identity refusal", err)
+		}
+	})
+
+	t.Run("a regular marker swapped for a different regular file is refused", func(t *testing.T) {
+		// The swapped-FIFO case above reaches the post-open check with a
+		// non-regular mode, so the mode half of it fires and SameFile is never
+		// consulted. This case swaps in another *regular* file, so the mode
+		// half passes and only SameFile can refuse. The original inode is kept
+		// alive by an open descriptor for the whole swap, so the replacement
+		// cannot land on a recycled inode number and pass by accident.
+		harness := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(harness.root, "run_marker_swapped")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(path, handoffMarkerName)
+		if err := os.WriteFile(marker, markerPayload(t, "run_marker_swapped", "node-1", harness.now), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// A marker naming another node: if SameFile is gone, this one is read
+		// and preparation fails on the node mismatch instead, which is a
+		// different error and a failing assertion below.
+		replacement := markerPayload(t, "run_marker_swapped", "some-other-node", harness.now)
+		var once sync.Once
+		handoffMarkerOpenRace = func() {
+			once.Do(func() {
+				original, err := os.Open(marker)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				t.Cleanup(func() { original.Close() })
+				if err := os.Remove(marker); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := os.WriteFile(marker, replacement, 0600); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		t.Cleanup(func() { handoffMarkerOpenRace = nil })
+
+		err := prepareWithoutBlocking(t, harness, "run_marker_swapped", path, marker)
+		if err == nil || !strings.Contains(err.Error(), "changed identity while opening") {
+			t.Fatalf("preparation error = %v, want the post-open SameFile refusal", err)
+		}
+	})
+}
+
+// markerPayload encodes one ownership marker exactly as the agent writes it.
+func markerPayload(t *testing.T, runID, nodeID string, now time.Time) []byte {
+	t.Helper()
+	payload, err := json.Marshal(handoffMarker{
+		RunID: runID, NodeID: nodeID, RetainUntil: now.Add(time.Hour),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	marker := filepath.Join(path, handoffMarkerName)
-	if err := syscall.Mkfifo(marker, 0600); err != nil {
-		t.Fatal(err)
-	}
-	spec := handoffClaim("run_fifo", path, nil).Job.Spec
+	return payload
+}
+
+// prepareWithoutBlocking runs preparation with a deadline and unblocks a
+// regressed blocking open on the marker before reporting the failure, so one
+// hung open cannot wedge the whole package's test binary.
+func prepareWithoutBlocking(t *testing.T, harness *retentionHarness, runID, path, marker string) error {
+	t.Helper()
+	spec := handoffClaim(runID, path, nil).Job.Spec
 	lease, err := harness.manager.lock(t.Context(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.release()
+	t.Cleanup(lease.release)
 	done := make(chan error, 1)
 	go func() { _, err := harness.manager.prepare(lease, spec, "node-1"); done <- err }()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("FIFO marker accepted")
-		}
-	case <-time.After(time.Second):
-		// Unblock a regressed blocking open before reporting the failure.
+		return err
+	case <-time.After(5 * time.Second):
 		file, _ := os.OpenFile(marker, os.O_RDWR|syscall.O_NONBLOCK, 0)
 		if file != nil {
 			file.Close()
 		}
-		t.Fatal("FIFO marker blocked preparation")
+		t.Fatal("the marker read blocked preparation")
+		return nil
 	}
 }
 
@@ -314,7 +428,12 @@ func TestHandoffNonemptyResultDirectoryIsRemovedBeforeBounding(t *testing.T) {
 	}
 }
 
-func TestHandoffFinalizationUsesPreparedDirectoryAfterPathReplacement(t *testing.T) {
+// TestHandoffFinalizationTrimsNothingWhenTheRunNameWasReplaced: the run's name
+// is a symlink to another run by the time the attempt finishes. Nothing is
+// trimmed -- not through the link, and not through the prepared handle either,
+// which the name no longer leads to -- and the fact that the bound did not run
+// is on the record instead of nowhere.
+func TestHandoffFinalizationTrimsNothingWhenTheRunNameWasReplaced(t *testing.T) {
 	harness := newRetentionHarness(t, time.Hour)
 	harness.manager.runBytes = 1024
 	path := filepath.Join(harness.root, "run_original")
@@ -345,10 +464,13 @@ func TestHandoffFinalizationUsesPreparedDirectoryAfterPathReplacement(t *testing
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(victim, "keep.bin")); err != nil {
-		t.Fatalf("trim redirected to another run: %v", err)
+		t.Fatalf("trim followed the link into another run: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(moved, "large.bin")); !os.IsNotExist(err) {
-		t.Fatalf("prepared handle was not trimmed: %v", err)
+	if info, err := os.Stat(filepath.Join(moved, "large.bin")); err != nil || info.Size() != 4096 {
+		t.Fatalf("a directory the run's name no longer leads to was trimmed: %v, %v", info, err)
+	}
+	if !harness.logged("no longer the directory preparation pinned") {
+		t.Fatalf("the drift was silent: %v", harness.logs)
 	}
 }
 

@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -530,4 +531,412 @@ func TestTheResultCollectorStopsWhenTheAgentDoes(t *testing.T) {
 	}
 	// Idempotent: Close may run after an explicit stop.
 	a.stopResultCollector()
+}
+
+// TestThePerRunBoundReportsADriftedDirectoryRatherThanSkippingItSilently is the
+// recreated-directory no-op. A workload that does
+// `rm -rf $handoff && mkdir $handoff` between preparation and finish left the
+// handle preparation pinned pointing at an unlinked inode, so finish trimmed
+// nothing, reported nothing, and left every oversized byte on the node while
+// the node believed the run fit its bound.
+//
+// The fix is deliberately the conservative half. Nothing here can prove a
+// directory that appeared after preparation is this run's -- the only evidence
+// would be the ownership marker, which a workload can write whatever it likes
+// into -- so the replacement is left alone and the drift is named in the log
+// and on the record instead. The bound is no longer silently skipped; it is
+// openly not met.
+func TestThePerRunBoundReportsADriftedDirectoryRatherThanSkippingItSilently(t *testing.T) {
+	t.Run("removed and recreated by the workload", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		harness.manager.runBytes = 1024
+		path := filepath.Join(harness.root, "run_recreated")
+		spec := handoffClaim("run_recreated", path, nil).Job.Spec
+		owner := prepareHandoffForTest(t, harness.manager, spec)
+
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "oversize.bin"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Lstat(filepath.Join(path, "oversize.bin")); err != nil || info.Size() != 8192 {
+			t.Fatalf("a directory this agent cannot prove is the run's was trimmed: %v, %v", info, err)
+		}
+		if size := measureRun(t, harness.manager, "run_recreated"); size <= harness.manager.runBytes {
+			t.Fatalf("the fixture is not over the bound: %d bytes", size)
+		}
+		if !harness.logged("no longer the directory preparation pinned") {
+			t.Fatalf("the drift was silent: %v", harness.logs)
+		}
+		if !harness.logged("run run_recreated:") {
+			t.Fatalf("the drift did not name the run: %v", harness.logs)
+		}
+		if anomaly := requireRetentionRecord(t, harness.manager, "run_recreated").BoundAnomaly; anomaly != handoffBoundDirectoryReplaced {
+			t.Fatalf("bound anomaly = %q, want %q", anomaly, handoffBoundDirectoryReplaced)
+		}
+	})
+
+	t.Run("renamed away and replaced", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		harness.manager.runBytes = 1024
+		path := filepath.Join(harness.root, "run_renamed")
+		spec := handoffClaim("run_renamed", path, nil).Job.Spec
+		owner := prepareHandoffForTest(t, harness.manager, spec)
+		if err := os.WriteFile(filepath.Join(path, "pinned-oversize.bin"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		moved := path + "-moved"
+		if err := os.Rename(path, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "theirs.bin"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+			t.Fatal(err)
+		}
+		// Neither is trimmed: the name no longer leads to the prepared
+		// directory, and the replacement is not provably this run's.
+		if info, err := os.Lstat(filepath.Join(moved, "pinned-oversize.bin")); err != nil || info.Size() != 8192 {
+			t.Fatalf("a directory the run's name no longer leads to was trimmed: %v, %v", info, err)
+		}
+		if info, err := os.Lstat(filepath.Join(path, "theirs.bin")); err != nil || info.Size() != 8192 {
+			t.Fatalf("an unproven replacement was trimmed: %v, %v", info, err)
+		}
+		if anomaly := requireRetentionRecord(t, harness.manager, "run_renamed").BoundAnomaly; anomaly != handoffBoundDirectoryReplaced {
+			t.Fatalf("bound anomaly = %q, want %q", anomaly, handoffBoundDirectoryReplaced)
+		}
+	})
+}
+
+// TestABoundThatCannotReachItsDirectoryRecordsWhy: a symlink planted at the
+// run's name is never followed, never trimmed and never opened, and the fact
+// that the bound stopped at the pinned directory is on the record rather than
+// nowhere.
+func TestABoundThatCannotReachItsDirectoryRecordsWhy(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	harness.manager.runBytes = 1024
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, "not-ours.bin"), make([]byte, 8192), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(harness.root, "run_linked")
+	spec := handoffClaim("run_linked", path, nil).Job.Spec
+	owner := prepareHandoffForTest(t, harness.manager, spec)
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := harness.manager.finish(owner, spec, "node-1", true, true); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(filepath.Join(elsewhere, "not-ours.bin")); err != nil || info.Size() != 8192 {
+		t.Fatalf("the bound followed a symlink out of the handoff root: %v, %v", info, err)
+	}
+	record := requireRetentionRecord(t, harness.manager, "run_linked")
+	if record.BoundAnomaly != handoffBoundDirectoryReplaced {
+		t.Fatalf("bound anomaly = %q, want %q", record.BoundAnomaly, handoffBoundDirectoryReplaced)
+	}
+	if !harness.logged("no longer the directory preparation pinned") {
+		t.Fatalf("the drift was silent: %v", harness.logs)
+	}
+}
+
+// plantSymlinkAtExpiredRun retains one run, replaces its name with a symlink
+// out of the handoff root, and moves the clock past the window -- the shape the
+// sweep structurally cannot remove and must not follow.
+func plantSymlinkAtExpiredRun(t *testing.T, harness *retentionHarness, runID string) (path, elsewhere string) {
+	t.Helper()
+	elsewhere = t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, "not-ours"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path = harness.retain(runID, true, true, map[string]int{"result.json": 16})
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Fatal(err)
+	}
+	harness.now = harness.now.Add(2 * time.Hour)
+	return path, elsewhere
+}
+
+// TestAStructurallyUnremovableExpiredRunPausesAndResumesByItself: a symlink at
+// an expired run's name is refused identically by every sweep, so before this
+// the same refusal was logged hourly for as long as the node ran and nothing
+// ever decided. The retry is bounded -- and the pause is not a retirement: the
+// sweep keeps looking at the name, once and cheaply, and resumes the moment a
+// directory is back there. No operator, no restart.
+func TestAStructurallyUnremovableExpiredRunPausesAndResumesByItself(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path, elsewhere := plantSymlinkAtExpiredRun(t, harness, "run_stuck")
+
+	for attempt := 1; attempt < maxStructuralRefusals; attempt++ {
+		if err := harness.manager.collect(); err != nil {
+			t.Fatal(err)
+		}
+		record := requireRetentionRecord(t, harness.manager, "run_stuck")
+		if record.StructuralRefusals != attempt {
+			t.Fatalf("after %d sweeps the record counts %d structural refusals", attempt, record.StructuralRefusals)
+		}
+		if record.Quarantine != "" {
+			t.Fatalf("the sweep paused after %d of %d refusals", attempt, maxStructuralRefusals)
+		}
+	}
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	record := requireRetentionRecord(t, harness.manager, "run_stuck")
+	if record.Quarantine != handoffExpiryNameNotADirectory {
+		t.Fatalf("quarantine = %q, want %q", record.Quarantine, handoffExpiryNameNotADirectory)
+	}
+	if record.QuarantinedAt.IsZero() || !strings.Contains(record.QuarantineDetail, "not a directory") {
+		t.Fatalf("quarantine carries no usable cause: %+v", record)
+	}
+	if !harness.logged("left exactly as it is until a directory is back there") {
+		t.Fatalf("the pause was silent: %v", harness.logs)
+	}
+
+	// Paused: further sweeps say nothing more, and touch nothing.
+	before := len(harness.logs)
+	for range 3 {
+		if err := harness.manager.collect(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, line := range harness.logs[before:] {
+		if strings.Contains(line, "run_stuck") {
+			t.Fatalf("a paused record was retried: %q", line)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, "not-ours")); err != nil {
+		t.Fatalf("the sweep followed the symlink it refused: %v", err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the planted name was removed: %v, %v", info, err)
+	}
+
+	// The workload puts a directory back. The pause lifts by itself and the
+	// same sweep expires the run.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if !harness.logged("quarantine is lifted") {
+		t.Fatalf("the pause never lifted: %v", harness.logs)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("the run was not expired once its name was a directory again: %v", err)
+	}
+	for _, record := range harness.manager.loadRecords() {
+		if record.RunID == "run_stuck" {
+			t.Fatalf("the expired run's record survived: %+v", record)
+		}
+	}
+}
+
+// TestATransientExpiryFailureIsNeverQuarantined: four unlucky sweeps must not
+// end the seven-day sweep for a run. An attempt's own finalization triggers
+// collection, so four failures can happen in minutes, and a busy, briefly
+// unreadable or briefly unwritable filesystem is exactly the fault that clears
+// on its own.
+func TestATransientExpiryFailureIsNeverQuarantined(t *testing.T) {
+	t.Run("a retryable failure never pauses the sweep", func(t *testing.T) {
+		harness := newRetentionHarness(t, time.Hour)
+		harness.retain("run_busy", true, true, map[string]int{"result.json": 16})
+		harness.now = harness.now.Add(2 * time.Hour)
+		record := requireRetentionRecord(t, harness.manager, "run_busy")
+
+		// The failures a sweep really meets: EBUSY, EIO, a permission the node
+		// regains. None of them is the one structural refusal repeating cannot
+		// fix, so none of them may ever stop the sweep.
+		for sweep := 1; sweep <= maxStructuralRefusals+2; sweep++ {
+			harness.manager.noteExpiryFailure(record, fmt.Errorf("remove run_busy: %w", errors.New("device or resource busy")))
+			record = requireRetentionRecord(t, harness.manager, "run_busy")
+			if record.Quarantine != "" {
+				t.Fatalf("a transient failure paused the sweep after %d of them: %+v", sweep, record)
+			}
+			if record.StructuralRefusals != 0 {
+				t.Fatalf("a transient failure counted as structural: %+v", record)
+			}
+			if record.ExpiryFailures != sweep {
+				t.Fatalf("after %d failures the record counts %d", sweep, record.ExpiryFailures)
+			}
+		}
+		if !harness.logged("the sweep will try again") {
+			t.Fatalf("a retryable failure was not reported as one: %v", harness.logs)
+		}
+
+		// And the sweep really does still act: the directory is there, so this
+		// one expires it.
+		if err := harness.manager.collect(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(harness.root, "run_busy")); !os.IsNotExist(err) {
+			t.Fatalf("the run was never expired: %v", err)
+		}
+	})
+
+	t.Run("a directory the sweep cannot empty is expired once the fault clears", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("this fixture denies the sweep write permission, which root ignores")
+		}
+		harness := newRetentionHarness(t, time.Hour)
+		path := harness.retain("run_locked", true, true, map[string]int{"result.json": 16})
+		harness.now = harness.now.Add(2 * time.Hour)
+		child := filepath.Join(path, "stubborn")
+		if err := os.Mkdir(child, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+
+		for sweep := 1; sweep <= maxStructuralRefusals+2; sweep++ {
+			if err := harness.manager.collect(); err != nil {
+				t.Fatal(err)
+			}
+			record := requireRetentionRecord(t, harness.manager, "run_locked")
+			if record.Quarantine != "" {
+				t.Fatalf("a transient failure paused the sweep after %d sweeps: %+v", sweep, record)
+			}
+			if record.ExpiryFailures != sweep {
+				t.Fatalf("after %d sweeps the record counts %d failures", sweep, record.ExpiryFailures)
+			}
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := harness.manager.collect(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("the run was not expired once the fault cleared: %v", err)
+		}
+	})
+}
+
+// TestAFailedSweepNeverOverwritesRefreshedTerminalFacts is the interleaving the
+// sweep used to lose results to. Deletion fails, the sweep persists that
+// failure from a snapshot it loaded before it held the lease, and a rerun that
+// finished in between has its fresh deadline and verdict overwritten by the
+// expired copy -- after which the next sweep deletes results a run retained
+// seconds ago.
+//
+// The staging is deterministic rather than concurrent: the seam runs inside the
+// sweep's failure handling, and what it does there is exactly what the losing
+// interleaving does.
+func TestAFailedSweepNeverOverwritesRefreshedTerminalFacts(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	plantSymlinkAtExpiredRun(t, harness, "run_raced")
+
+	// What a rerun's finish would have written: a new window, a new verdict.
+	refreshed := retentionRecord{
+		RunID: "run_raced", NodeID: "node-1", Directory: filepath.Join(harness.root, "run_raced"),
+		RetainedAt: harness.now, RetainUntil: harness.now.Add(time.Hour),
+		Published: false, Succeeded: false,
+	}
+	var seamRan bool
+	handoffSweepRace = func(stage string, loaded retentionRecord) {
+		if stage != handoffSweepFailureRecorded {
+			return
+		}
+		seamRan = true
+		// The failure is being persisted while the sweep still holds this
+		// record's path lease: a rerun could not have reached finish here.
+		if lease := harness.manager.tryCollectLease(loaded.Directory); lease != nil {
+			lease.release()
+			t.Error("the sweep recorded its failure without holding the record's path lease")
+		}
+		if err := harness.manager.writeRecord(refreshed); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { handoffSweepRace = nil })
+
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if !seamRan {
+		t.Fatal("the interleaving never happened; this test proves nothing")
+	}
+	record := requireRetentionRecord(t, harness.manager, "run_raced")
+	if !record.RetainUntil.Equal(refreshed.RetainUntil) || record.Succeeded || record.Published {
+		t.Fatalf("a failed sweep overwrote a rerun's terminal facts: %+v", record)
+	}
+	if record.ExpiryFailures != 0 || record.StructuralRefusals != 0 || record.Quarantine != "" {
+		t.Fatalf("the sweep wrote its own bookkeeping over the newer record: %+v", record)
+	}
+	if !harness.logged("the sweep's copy is the older one") {
+		t.Fatalf("the refusal to overwrite was silent: %v", harness.logs)
+	}
+}
+
+// TestASweepActsOnTheRecordAsItIsUnderTheLease is the other half of the same
+// interleaving. The sweep's candidate list is a snapshot taken before it holds
+// anything; if an attempt finishes in that window and retains the run again,
+// deciding from the snapshot deletes files a run retained seconds ago. The
+// decision is taken from the record as it is under the lease instead.
+func TestASweepActsOnTheRecordAsItIsUnderTheLease(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	path := harness.retain("run_rerun", true, true, map[string]int{"result.json": 16})
+	harness.now = harness.now.Add(2 * time.Hour)
+
+	// What a rerun that finished between loadRecords and the lease writes: a
+	// window that has not closed yet.
+	refreshed := retentionRecord{
+		RunID: "run_rerun", NodeID: "node-1", Directory: path,
+		RetainedAt: harness.now, RetainUntil: harness.now.Add(time.Hour),
+		Published: true, Succeeded: true,
+	}
+	var seamRan bool
+	handoffSweepRace = func(stage string, _ retentionRecord) {
+		if stage != handoffSweepLeaseAcquired {
+			return
+		}
+		seamRan = true
+		if err := harness.manager.writeRecord(refreshed); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { handoffSweepRace = nil })
+
+	if err := harness.manager.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if !seamRan {
+		t.Fatal("the interleaving never happened; this test proves nothing")
+	}
+	if _, err := os.Stat(filepath.Join(path, "result.json")); err != nil {
+		t.Fatalf("the sweep deleted results a rerun had just retained: %v", err)
+	}
+	record := requireRetentionRecord(t, harness.manager, "run_rerun")
+	if !record.RetainUntil.Equal(refreshed.RetainUntil) {
+		t.Fatalf("the rerun's window was replaced: %+v", record)
+	}
+	if !harness.logged("the sweep acts on the newer record") {
+		t.Fatalf("the sweep did not say it was re-reading: %v", harness.logs)
+	}
 }

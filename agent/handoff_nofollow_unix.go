@@ -22,7 +22,8 @@ func openHandoffDirectory(parent *os.Root, name string) (*os.Root, error) {
 		return nil, err
 	}
 	if !expected.IsDir() || expected.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("handoff path %q is not a directory (symbolic links are refused)", name)
+		return nil, fmt.Errorf("%w: handoff path %q is not a directory (symbolic links are refused)",
+			errHandoffNameNotADirectory, name)
 	}
 	file, err := openHandoffFile(parent, name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
 	if err != nil {
