@@ -567,6 +567,7 @@ func TestAdmissionContentionNeverBecomesARemovalStall(t *testing.T) {
 		return runtimeRemovalRecord{failedAttempts: 99, lastRefusalCode: "unauthorized_attempt"}, true, nil
 	}
 	busy := &ocihelper.RPCError{Code: ocihelper.CodeComputerStorageBusy,
+		Detail:  ocihelper.DetailAdmissionContention,
 		Message: "Computer Storage root admission is contended: context deadline exceeded"}
 	for range l1.MinimumServiceRemovalStallAttempts {
 		declared, err := controller.noteRemovalFailure(t.Context(),
@@ -578,6 +579,48 @@ func TestAdmissionContentionNeverBecomesARemovalStall(t *testing.T) {
 	}
 	if counted != 0 || reset != l1.MinimumServiceRemovalStallAttempts {
 		t.Fatalf("admission contention counted=%d reset=%d, want 0/%d", counted, reset, l1.MinimumServiceRemovalStallAttempts)
+	}
+}
+
+// The same code without the contention token is a fact about this Job: its own
+// live attempt owns the Storage generation or fences removal inventory. A fence
+// that never clears is exactly what the bound exists to declare, so it must
+// still reach a stall rather than resetting the streak on every retry and
+// pinning the Slot forever.
+func TestALiveAttemptFenceStillReachesARemovalStall(t *testing.T) {
+	prepared := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	controller := &removalController{nodeID: "fence-node", stallBound: l1.DefaultRemovalStallBound}
+	controller.now = func() time.Time { return prepared.Add(l1.DefaultRemovalStallBound).Add(time.Hour) }
+	counted := 0
+	controller.recordRemovalFailure = func(context.Context, localRemoval, string, string) error {
+		counted++
+		return nil
+	}
+	controller.recordUntypedFailure = func(context.Context, localRemoval) error {
+		t.Fatal("a live-attempt fence reset the refusal streak")
+		return nil
+	}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return stallRecord(prepared, l1.MinimumServiceRemovalStallAttempts,
+			string(ocihelper.CodeComputerStorageBusy)), true, nil
+	}
+	declared := 0
+	controller.ackRemovalStall = func(context.Context, localRemoval, runtimeRemovalRecord) error {
+		declared++
+		return nil
+	}
+	// Exactly the refusal the helper's inventory and attachment fences emit:
+	// the busy code with no admission-contention token.
+	fence := &ocihelper.RPCError{Code: ocihelper.CodeComputerStorageBusy,
+		Message: "removal inventory is fenced by a live attempt authority"}
+	stalled, err := controller.noteRemovalFailure(t.Context(),
+		l1.RemovalDirective{JobID: "stall-job", BoundNodeID: "fence-node"},
+		fmt.Errorf("delete Computer disk resource: %w", fence))
+	if err != nil || !stalled {
+		t.Fatalf("a live-attempt fence past the bound reported stalled=%t err=%v", stalled, err)
+	}
+	if counted != 1 || declared != 1 {
+		t.Fatalf("live-attempt fence counted=%d declared=%d, want 1/1", counted, declared)
 	}
 }
 

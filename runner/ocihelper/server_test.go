@@ -170,6 +170,13 @@ func TestRemovalInventoryDispatchKeepsHeartbeatsLiveAndRechecksRunAdmission(t *t
 		t.Fatal("InventoryRemoval published stale no-attempt evidence after Run admission")
 	} else {
 		assertRPCCode(t, err, CodeComputerStorageBusy)
+		// A fact about this Job's own live attempt, not Node contention: it
+		// carries no admission-contention token, so a consumer counting
+		// refusals against a stall bound keeps counting it.
+		var refusal *RPCError
+		if !errors.As(err, &refusal) || refusal.Detail != "" {
+			t.Fatalf("live-attempt inventory fence detail = %q, want none", refusal.Detail)
+		}
 	}
 	close(engine.releaseRun)
 	if err := <-runErr; err != nil {

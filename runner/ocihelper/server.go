@@ -2281,7 +2281,12 @@ func writeEngineResponseWithMethod(connection *framedConn, method Method, respon
 		// a failed engine, and the same authority may be replayed.
 		var admissionContended *computerStorageAdmissionContendedError
 		if errors.As(err, &admissionContended) {
-			return writeFailure(connection, CodeComputerStorageBusy, admissionContended.Error())
+			// The detail token is what keeps one code honest for two causes:
+			// a consumer counting repeated refusals against a stall bound must
+			// not count Node contention, and must keep counting a live-attempt
+			// fence, which carries no token.
+			return writeRPCError(connection, &RPCError{Code: CodeComputerStorageBusy,
+				Detail: DetailAdmissionContention, Message: admissionContended.Error()})
 		}
 		var storageDeferred *ComputerStorageResumeDeferredError
 		if errors.As(err, &storageDeferred) {

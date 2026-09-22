@@ -273,11 +273,17 @@ The helper bounds that wait itself, at five seconds, independently of the
 caller's deadline. The client keeps its deadline locally and closes the
 connection when it expires, so a refusal produced only at that moment would be
 written to a socket nobody is reading; the shorter helper-side bound is what
-makes this code reach the caller over a connection that is still open. It is
-also why the agent's removal stall streak does not count it: admission
-contention says nothing about the resource a removal is asking about, so
-counting it would let unrelated traffic on the Node declare a healthy removal
-stalled. Like an untyped failure, it ends the streak. The retired form means a durable reset
+makes this code reach the caller over a connection that is still open. An admission
+refusal, and only an admission refusal, carries the closed detail token
+`admission_contention`. Nothing else does: a live attempt owning the Storage
+generation, and a live attempt fencing removal inventory, answer with the same
+code and no token, because those are facts about the requested resource rather
+than about the Node. That token is what keeps one code honest for two causes.
+The agent's removal stall streak does not count a refusal carrying it --
+unrelated traffic on the Node must never declare a healthy removal stalled, so
+like an untyped failure it ends the streak -- and it keeps counting the same
+code without it, because a live-attempt fence that never clears is exactly what
+the bound exists to declare. The retired form means a durable reset
 fence makes that Storage generation permanently ineligible for attachment;
 `computer_storage_grow_uncertain` keeps the same grow
 authority pending for inspection and retry after the filesystem may have

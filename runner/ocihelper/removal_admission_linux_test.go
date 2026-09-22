@@ -447,6 +447,12 @@ func TestAdmissionContentionReachesTheCallerOverALiveConnection(t *testing.T) {
 	_, err = session.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
 		Kind: ManagedVolumeHandoff, OwnerKey: "contended-volume"})
 	assertRPCCode(t, err, CodeComputerStorageBusy)
+	// The token is what lets a consumer tell Node contention from a fact about
+	// its own resource while both keep the one code.
+	var refusal *RPCError
+	if !errors.As(err, &refusal) || refusal.Detail != DetailAdmissionContention {
+		t.Fatalf("contention refusal detail = %q, want %q", refusal.Detail, DetailAdmissionContention)
+	}
 	if err := session.flushHeartbeat(t.Context()); err != nil {
 		t.Fatalf("admission contention marked the live helper session lost: %v", err)
 	}

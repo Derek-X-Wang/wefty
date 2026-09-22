@@ -1092,14 +1092,18 @@ func (controller *removalController) removalIsStalled(ctx context.Context, recor
 // and no streak would ever form.
 //
 // A qualifying code has to say something about the resource this removal is
-// asking about. `computer_storage_busy` raised by Node-wide disk admission
-// says only that another Computer's operation held the Node while this one
-// waited, so counting it would let unrelated traffic declare a healthy removal
-// stalled. It ends the streak instead, exactly like an untyped failure.
+// asking about. `computer_storage_busy` carrying the admission-contention
+// token says only that another Computer's operation held the Node while this
+// one waited, so counting it would let unrelated traffic declare a healthy
+// removal stalled; it ends the streak instead, exactly like an untyped
+// failure. The same code without that token is a fact about this very Job --
+// its own live attempt owns the Storage generation or fences the inventory --
+// and a fence that never clears is exactly what the bound exists to declare,
+// so it keeps counting.
 func removalRefusalCode(cause error) (string, string) {
 	var rpcErr *ocihelper.RPCError
 	if errors.As(cause, &rpcErr) && strings.TrimSpace(string(rpcErr.Code)) != "" {
-		if rpcErr.Code == ocihelper.CodeComputerStorageBusy {
+		if rpcErr.Code == ocihelper.CodeComputerStorageBusy && rpcErr.Detail == ocihelper.DetailAdmissionContention {
 			return "", ""
 		}
 		return string(rpcErr.Code), rpcErr.Message
