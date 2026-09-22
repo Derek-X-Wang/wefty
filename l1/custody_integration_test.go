@@ -338,6 +338,77 @@ func TestCustodyExportFailureClosesPhaseAndPathCanBeReused(t *testing.T) {
 	}
 }
 
+func TestCustodyExportRefusedBeforeAnyExternalByteLeavesTheSourceUntainted(t *testing.T) {
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+	_, directive := beginCustodyExport(t, h, node, computer, backup, "unconfined")
+	refusal := successfulCustodyExportReceipt(directive)
+	refusal.Kind, refusal.ManifestDigest = "computer_custody_export_failed", ""
+	refusal.FailureCode = contract.CustodyExportPathUnconfined
+	refusal.ExternalRoots = []string{"/srv/wefty"}
+	refusal.ExternalOwnerUID, refusal.ExternalOwnerGID = 0, 0
+	refusal.OwnershipApplied, refusal.PrivateModeApplied = false, false
+	refused, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
+		computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: refusal.ReceiptID, Receipt: refusal})
+	if err != nil || refused.Status != "failed" || refused.FailureCode != contract.CustodyExportPathUnconfined {
+		t.Fatalf("refused Custody export = %#v err=%v", refused, err)
+	}
+	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	if err != nil || provenance.CustodyTainted || len(provenance.CustodyExports) != 1 {
+		t.Fatalf("refused export tainted the source = %#v err=%v", provenance, err)
+	}
+	current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := h.store.RemoveComputer(context.Background(), current.ComputerID,
+		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator-remove")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removalDirectives, err := h.store.ListNodeRemovalDirectives(context.Background(),
+		"fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(removalDirectives) != 1 {
+		t.Fatalf("removal directives = %#v err=%v", removalDirectives, err)
+	}
+	for _, copy := range removalDirectives[0].ComputerBackupCopies.Copies {
+		if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "removed-" + copy.CopyID, Receipt: backupRemovalReceipt(copy)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		removalDirectives[0].JobID, RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			RemovalGeneration: removalDirectives[0].RemovalGeneration, CleanupFence: removalDirectives[0].CleanupFence,
+			RootInstanceID: removalDirectives[0].RootInstanceID, IdempotencyKey: "untainted-removed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := h.store.FinalizeServiceRemoval(context.Background(), removalDirectives[0].JobID); err != nil || !changed {
+		t.Fatalf("finalize removal changed=%t err=%v", changed, err)
+	}
+	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+	if err != nil || removed.RemovalOutcome != "removed_verified" {
+		t.Fatalf("refused export reduced the removal outcome = %#v err=%v", removed, err)
+	}
+}
+
+func TestCustodyExportVerifiedAtTheDestinationTaintsTheSource(t *testing.T) {
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+	_, directive := beginCustodyExport(t, h, node, computer, backup, "verified")
+	receipt := successfulCustodyExportReceipt(directive)
+	completed, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
+		computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+	if err != nil || completed.Status != "available" {
+		t.Fatalf("verified Custody export = %#v err=%v", completed, err)
+	}
+	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	if err != nil || !provenance.CustodyTainted {
+		t.Fatalf("verified export left the source untainted = %#v err=%v", provenance, err)
+	}
+}
+
 func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	h, node, source, backup, _ := publishedBackupForStorageCopy(t, 2)
 	export, directive := beginCustodyExport(t, h, node, source, backup, "import-failure")

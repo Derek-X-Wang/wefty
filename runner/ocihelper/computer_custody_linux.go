@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -27,8 +28,9 @@ type custodyExternalOwner struct {
 }
 
 type custodyExportMechanicsError struct {
-	code string
-	err  error
+	code  string
+	roots []string
+	err   error
 }
 
 func (err *custodyExportMechanicsError) Error() string { return err.err.Error() }
@@ -36,6 +38,14 @@ func (err *custodyExportMechanicsError) Unwrap() error { return err.err }
 
 func custodyMechanicsError(code string, err error) error {
 	return &custodyExportMechanicsError{code: code, err: err}
+}
+
+// custodyConfinementError is a refusal raised before the helper creates or
+// writes anything at the operator destination. It carries the node-facing
+// operator mount roots so the refusal itself tells the operator where an
+// export may go.
+func custodyConfinementError(code string, roots []string, err error) error {
+	return &custodyExportMechanicsError{code: code, roots: roots, err: err}
 }
 
 func custodyManifestDigest(payload []byte) string {
@@ -55,9 +65,175 @@ func sameCustodyManifest(manifest computerCustodyManifest, request ExportCompute
 		manifest.CustodyFence == request.Authority.CustodyFence && manifest.DiskFile == "storage.ext4"
 }
 
-func safeExternalCustodyRoot(runtimeRoot, externalPath string) (string, error) {
-	root, _, err := resolveSafeExternalCustodyRoot(runtimeRoot, externalPath)
-	return root, err
+// custodyExternalDestination is one Custody destination the helper has proven
+// it may write to: the operator mount root that admits it, the deepest
+// directory that already exists under that root, and the destination itself.
+// Every path here is in the helper's own filesystem view, which on a Node
+// whose helper runs inside a VM is a translation of the node path the
+// operator named.
+type custodyExternalDestination struct {
+	root             string
+	allowedRoot      string
+	existingAncestor string
+}
+
+// custodyExternalRoots names the operator mount roots as the node names them:
+// the same list `node oci doctor` publishes, so a refusal and the doctor fact
+// cannot disagree.
+func (engine *ContainerdEngine) custodyExternalRoots() []string {
+	if engine.config.HostMountRoot != "" {
+		return []string{engine.config.HostMountRoot}
+	}
+	roots := make([]string, 0, len(engine.config.AllowedMountRoots))
+	for _, root := range engine.config.AllowedMountRoots {
+		roots = append(roots, filepath.Clean(root))
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+// resolveCustodyExternalDestination is the whole admission decision for an
+// operator-named Custody path. It translates the node path into the helper's
+// view exactly as an operator mount source is translated, refuses anything
+// that is not a strict descendant of a configured operator mount root, and —
+// where the helper reads a translated view — refuses a root that is not
+// actually mounted. Without that last proof a missing host mount turns a
+// destination that mimics the node's path into a directory the helper would
+// create inside its own rootfs, which is #511.
+func (engine *ContainerdEngine) resolveCustodyExternalDestination(externalPath string) (custodyExternalDestination, error) {
+	roots := engine.custodyExternalRoots()
+	if !filepath.IsAbs(externalPath) {
+		return custodyExternalDestination{}, errors.New("Custody path must be absolute")
+	}
+	helperPath, err := engine.translateOperatorMountSource(filepath.Clean(externalPath))
+	if err != nil {
+		return custodyExternalDestination{}, custodyConfinementError(contract.CustodyExportPathUnconfined, roots,
+			fmt.Errorf("Custody path %q is not under an operator mount root %v: %w", externalPath, roots, err))
+	}
+	root, _, err := resolveSafeExternalCustodyRoot(engine.config.RuntimeRoot, helperPath)
+	if err != nil {
+		return custodyExternalDestination{}, err
+	}
+	allowedRoot, err := selectAllowedMountRoot(root, engine.config.AllowedMountRoots)
+	if err != nil {
+		return custodyExternalDestination{}, custodyConfinementError(contract.CustodyExportPathUnconfined, roots,
+			fmt.Errorf("Custody path %q is not under an operator mount root %v: %w", externalPath, roots, err))
+	}
+	existingAncestor, mounted, err := walkCustodyExternalRoot(allowedRoot, root)
+	if err != nil {
+		return custodyExternalDestination{}, custodyConfinementError(contract.CustodyExportPathUnconfined, roots,
+			fmt.Errorf("Custody path %q is not confined to operator mount root %q: %w", externalPath, allowedRoot, err))
+	}
+	if engine.config.HostMountRoot != "" && !mounted {
+		return custodyExternalDestination{}, custodyConfinementError(contract.CustodyExportRootUnmounted, roots,
+			fmt.Errorf("operator mount root %v is not mounted in the helper's view at %q, so Custody path %q would never leave the helper's own filesystem",
+				roots, allowedRoot, externalPath))
+	}
+	return custodyExternalDestination{root: root, allowedRoot: allowedRoot, existingAncestor: existingAncestor}, nil
+}
+
+// walkCustodyExternalRoot walks from the operator mount root towards the
+// destination through descriptors it opens itself, refusing a symlinked or
+// non-directory component, and reports the deepest directory that already
+// exists plus whether a real mount covers the walk at or under that root. The
+// mount answer is a device comparison over those same descriptors, never a
+// parsed path or mount table.
+func walkCustodyExternalRoot(allowedRoot, destination string) (string, bool, error) {
+	if err := rejectSymlinkComponents(allowedRoot); err != nil {
+		return "", false, fmt.Errorf("operator mount root is not stable: %w", err)
+	}
+	parent, err := os.Stat(filepath.Dir(allowedRoot))
+	if err != nil {
+		return "", false, err
+	}
+	parentDevice, err := custodyPathDevice(parent)
+	if err != nil {
+		return "", false, err
+	}
+	root, err := os.OpenRoot(allowedRoot)
+	if err != nil {
+		return "", false, err
+	}
+	defer root.Close()
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return "", false, err
+	}
+	device, err := custodyPathDevice(rootInfo)
+	if err != nil {
+		return "", false, err
+	}
+	mounted := device != parentDevice
+	relative, err := filepath.Rel(allowedRoot, destination)
+	if err != nil {
+		return "", false, err
+	}
+	existing := allowedRoot
+	current := root
+	defer func() {
+		if current != root {
+			_ = current.Close()
+		}
+	}()
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		if component == "" || component == "." || component == ".." {
+			return "", false, errors.New("Custody path contains an invalid component")
+		}
+		before, err := current.Lstat(component)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if before.Mode()&os.ModeSymlink != 0 {
+			return "", false, fmt.Errorf("Custody path component %q is a symlink", component)
+		}
+		if !before.IsDir() {
+			return "", false, fmt.Errorf("Custody path component %q is not a directory", component)
+		}
+		next, err := current.OpenRoot(component)
+		if err != nil {
+			return "", false, err
+		}
+		opened, err := next.Stat(".")
+		if err != nil {
+			_ = next.Close()
+			return "", false, err
+		}
+		after, err := current.Lstat(component)
+		if err != nil {
+			_ = next.Close()
+			return "", false, err
+		}
+		if after.Mode()&os.ModeSymlink != 0 || !after.IsDir() || !os.SameFile(after, opened) {
+			_ = next.Close()
+			return "", false, fmt.Errorf("Custody path component %q changed while opening", component)
+		}
+		openedDevice, err := custodyPathDevice(opened)
+		if err != nil {
+			_ = next.Close()
+			return "", false, err
+		}
+		if openedDevice != device {
+			mounted = true
+			device = openedDevice
+		}
+		existing = filepath.Join(existing, component)
+		if current != root {
+			_ = current.Close()
+		}
+		current = next
+	}
+	return existing, mounted, nil
+}
+
+func custodyPathDevice(info os.FileInfo) (uint64, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, errors.New("Custody path device is unavailable")
+	}
+	return uint64(stat.Dev), nil
 }
 
 func resolveSafeExternalCustodyRoot(runtimeRoot, externalPath string) (string, string, error) {
@@ -102,7 +278,8 @@ func resolveSafeExternalCustodyRoot(runtimeRoot, externalPath string) (string, s
 		return "", "", err
 	}
 	if relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
-		return "", "", errors.New("Custody path must be outside the managed root")
+		return "", "", custodyMechanicsError(contract.CustodyExportManagedRootPath,
+			errors.New("Custody path must be outside the managed root"))
 	}
 	return root, existingAncestor, nil
 }
@@ -271,10 +448,19 @@ func readCustodyManifest(root string) (computerCustodyManifest, []byte, bool, er
 	return manifest, payload, true, nil
 }
 
-func validateImportCustodySource(runtimeRoot string, request CopyComputerStorageRequest) (string, error) {
-	root, err := safeExternalCustodyRoot(runtimeRoot, request.ExternalPath)
+// validateImportCustodySource admits an import source through the same
+// confinement and mount proof as an export destination: on a Node whose
+// helper reads a translated view, an unconfined path would otherwise be read
+// out of the helper's own filesystem rather than the operator's storage.
+func (engine *ContainerdEngine) validateImportCustodySource(request CopyComputerStorageRequest) (string, error) {
+	destination, err := engine.resolveCustodyExternalDestination(request.ExternalPath)
 	if err != nil {
 		return "", err
+	}
+	root := destination.root
+	if destination.existingAncestor != root {
+		return "", fmt.Errorf("Custody import source %q does not exist under operator mount root %q",
+			request.ExternalPath, destination.allowedRoot)
 	}
 	manifest, payload, present, err := readCustodyManifest(root)
 	if err != nil || !present {
@@ -323,7 +509,7 @@ func (reader custodyContextReader) Read(payload []byte) (int, error) {
 	return reader.r.Read(payload)
 }
 
-func custodyExportFailure(request ExportComputerCustodyRequest, code string) (ExportComputerCustodyResponse, error) {
+func custodyExportFailure(request ExportComputerCustodyRequest, code string, roots ...string) (ExportComputerCustodyResponse, error) {
 	receiptID, err := randomCapability()
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
@@ -336,6 +522,7 @@ func custodyExportFailure(request ExportComputerCustodyRequest, code string) (Ex
 		OperationRevision: request.Authority.OperationRevision, CustodyFence: request.Authority.CustodyFence,
 		HelperGeneration: request.Authority.HelperGeneration, ExternalPath: request.ExternalPath,
 		AllocatedSize: request.SourceSize, ContentDigest: request.SourceDigest, FailureCode: code,
+		ExternalRoots: roots,
 	}}, nil
 }
 
@@ -351,12 +538,14 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		case errors.Is(returnedErr, syscall.ENOSPC):
 			code = "insufficient_disk"
 		}
+		var roots []string
 		var mechanics *custodyExportMechanicsError
 		if errors.As(returnedErr, &mechanics) {
 			code = mechanics.code
+			roots = mechanics.roots
 		}
 		if code != "" {
-			response, returnedErr = custodyExportFailure(request, code)
+			response, returnedErr = custodyExportFailure(request, code, roots...)
 		}
 	}()
 	engine.computerBackupMu.Lock()
@@ -370,13 +559,14 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	} else if quarantined {
 		return ExportComputerCustodyResponse{}, &ComputerStorageQuarantinedError{Storage: request.Storage}
 	}
-	externalRoot, existingAncestor, err := resolveSafeExternalCustodyRoot(engine.config.RuntimeRoot, request.ExternalPath)
+	// Admission first: nothing on the operator's filesystem is created, and no
+	// Backup byte is read, until the destination is proven to be inside a
+	// configured operator mount root the helper can really reach.
+	admitted, err := engine.resolveCustodyExternalDestination(request.ExternalPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "outside the managed root") {
-			return custodyExportFailure(request, "managed_root_path")
-		}
 		return ExportComputerCustodyResponse{}, err
 	}
+	externalRoot, existingAncestor := admitted.root, admitted.existingAncestor
 	copyName, err := deterministicComputerBackupCopyName(request.CopyID)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err

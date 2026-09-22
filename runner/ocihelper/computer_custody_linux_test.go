@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 func custodyFileOwner(t *testing.T, path string) (uint32, uint32) {
@@ -26,6 +28,18 @@ func custodyFileOwner(t *testing.T, path string) (uint32, uint32) {
 		t.Fatalf("Custody path %s has no Linux ownership", path)
 	}
 	return stat.Uid, stat.Gid
+}
+
+// custodyOperatorMountRoot is the shape every Node is configured with: an
+// operator mount root the helper admits, and a destination under it.
+func custodyEngineConfig(runtimeRoot, mountRoot string) NativeEngineConfig {
+	return NativeEngineConfig{RuntimeRoot: runtimeRoot, AllowedMountRoots: []string{mountRoot}}
+}
+
+func custodyOperatorMountRoot(t *testing.T) (string, string) {
+	t.Helper()
+	mountRoot := t.TempDir()
+	return mountRoot, filepath.Join(mountRoot, "operator-custody")
 }
 
 func custodyExportTestRequest(source CreateComputerBackupResponse, externalPath string) ExportComputerCustodyRequest {
@@ -55,10 +69,10 @@ func importFinalize(_ context.Context, operation, imagePath, _ string, _ int64, 
 
 func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
-	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
 	request := custodyExportTestRequest(source, externalRoot)
 	crash := errors.New("injected mid-export crash")
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
 	engine.computerCustodyCopyN = func(destination io.Writer, source io.Reader, size int64) (int64, error) {
 		written, err := io.CopyN(destination, source, size/2)
 		if err != nil {
@@ -81,7 +95,7 @@ func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *tes
 		uid, gid int
 	}
 	var chownCalls []chownCall
-	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+	engine = &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
 		computerCustodyChown: func(file *os.File, uid, gid int) error {
 			chownCalls = append(chownCalls, chownCall{name: filepath.Base(file.Name()), uid: uid, gid: gid})
 			return file.Chown(uid, gid)
@@ -127,9 +141,9 @@ func TestComputerCustodyExportRejectsSymlinkBackIntoManagedRoot(t *testing.T) {
 
 func TestComputerCustodyExportRefusesSymlinkDestinationWithoutTouchingTarget(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
-	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
 	request := custodyExportTestRequest(source, externalRoot)
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
 	if _, err := engine.ExportComputerCustody(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -163,9 +177,9 @@ func TestComputerCustodyExportRefusesSymlinkDestinationWithoutTouchingTarget(t *
 
 func TestComputerCustodyExportReassertsPrivateModeAndTypesChownFailure(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
-	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
 	request := custodyExportTestRequest(source, externalRoot)
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
 	if _, err := engine.ExportComputerCustody(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +219,7 @@ func TestComputerCustodyExportInheritsNearestAncestorOwnerForCreatedDirectories(
 		uid, gid int
 	}
 	var calls []ownershipCall
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, ancestor), diskSystem: system,
 		computerCustodyOwner: func(path string) (custodyExternalOwner, error) {
 			if path != ancestor {
 				t.Fatalf("owner resolved from %q, want nearest existing ancestor %q", path, ancestor)
@@ -236,10 +250,10 @@ func TestComputerCustodyExportInheritsNearestAncestorOwnerForCreatedDirectories(
 
 func TestComputerCustodyExportCommitBarrierAndCancellationAreTyped(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
-	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
 	request := custodyExportTestRequest(source, externalRoot)
 	committed := false
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
 		computerCustodyHook: func(phase string) error {
 			if phase == "before_external_write" && !committed {
 				return errors.New("Custody event was not committed")
@@ -281,9 +295,9 @@ func TestComputerCustodyExportCommitBarrierAndCancellationAreTyped(t *testing.T)
 
 func TestComputerCustodyImportRejectsTamperThenResumesMidImport(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
-	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
 	exportRequest := custodyExportTestRequest(source, externalRoot)
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
 	exported, err := engine.ExportComputerCustody(t.Context(), exportRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -318,7 +332,7 @@ func TestComputerCustodyImportRejectsTamperThenResumesMidImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	crash := errors.New("injected mid-import crash")
-	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+	engine = &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
 		storageCopyFinalize: importFinalize}
 	engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
 		if phase == computerStorageCopyCopied {
@@ -329,7 +343,7 @@ func TestComputerCustodyImportRejectsTamperThenResumesMidImport(t *testing.T) {
 	if _, err := engine.CopyComputerStorage(t.Context(), importRequest); !errors.Is(err, crash) {
 		t.Fatalf("mid-import failure = %v, want injected crash", err)
 	}
-	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+	engine = &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
 		storageCopyFinalize: importFinalize}
 	imported, err := engine.CopyComputerStorage(t.Context(), importRequest)
 	if err != nil || imported.Receipt.Operation != "import" || !imported.Receipt.OSIdentityRekeyed ||
@@ -486,5 +500,198 @@ func TestStartupStructuralCopyImageLossQuarantinesImmediately(t *testing.T) {
 		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "image_missing"
 	}) {
 		t.Fatalf("structural copy evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+// translatedCustodyEngineConfig is a Node whose helper sees the operator mount
+// root only through a translation of the node's own paths — the Lima shape.
+func translatedCustodyEngineConfig(runtimeRoot, hostRoot, guestRoot string) NativeEngineConfig {
+	return NativeEngineConfig{RuntimeRoot: runtimeRoot, AllowedMountRoots: []string{guestRoot},
+		HostMountRoot: hostRoot, GuestMountRoot: guestRoot}
+}
+
+func TestComputerCustodyExportRefusesDestinationOutsideEveryOperatorMountRoot(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	mountRoot := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "not-an-operator-root", "custody")
+	request := custodyExportTestRequest(source, outside)
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+		response.Receipt.FailureCode != contract.CustodyExportPathUnconfined ||
+		response.Receipt.ExternalPath != outside || !slices.Equal(response.Receipt.ExternalRoots, []string{mountRoot}) {
+		t.Fatalf("unconfined Custody export = %+v err=%v", response, err)
+	}
+	if _, err := os.Lstat(filepath.Dir(outside)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused Custody path created a directory outside every operator mount root: %v", err)
+	}
+}
+
+func TestComputerCustodyExportRefusesOperatorRootThatIsNotMountedInTheHelperView(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	guestRoot := t.TempDir()
+	hostRoot := "/operator/mounts"
+	external := filepath.Join(hostRoot, "custody")
+	request := custodyExportTestRequest(source, external)
+	engine := &ContainerdEngine{config: translatedCustodyEngineConfig(root, hostRoot, guestRoot), diskSystem: system}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+		response.Receipt.FailureCode != contract.CustodyExportRootUnmounted ||
+		response.Receipt.ExternalPath != external || !slices.Equal(response.Receipt.ExternalRoots, []string{hostRoot}) {
+		t.Fatalf("unmounted operator root Custody export = %+v err=%v", response, err)
+	}
+	entries, err := os.ReadDir(guestRoot)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("refused Custody export wrote into the helper's own filesystem: %v err=%v", entries, err)
+	}
+	if _, err := os.Lstat(external); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused Custody export created the node path inside the helper: %v", err)
+	}
+}
+
+// mountedOperatorRoot returns a directory that really is a mount point, so the
+// mount proof is exercised against the kernel and not a fake.
+func mountedOperatorRoot(t *testing.T) string {
+	t.Helper()
+	const candidate = "/dev/shm"
+	info, err := os.Stat(candidate)
+	if err != nil || !info.IsDir() {
+		t.Skipf("no writable mount is available for the Custody mount proof: %v", err)
+	}
+	parent, err := os.Stat(filepath.Dir(candidate))
+	if err != nil {
+		t.Skipf("no writable mount is available for the Custody mount proof: %v", err)
+	}
+	mount, err := custodyPathDevice(info)
+	if err != nil {
+		t.Skip(err)
+	}
+	above, err := custodyPathDevice(parent)
+	if err != nil {
+		t.Skip(err)
+	}
+	if mount == above {
+		t.Skipf("%s is not a mount point on this host", candidate)
+	}
+	probe, err := os.MkdirTemp(candidate, "wefty-custody-probe-")
+	if err != nil {
+		t.Skipf("%s is not writable: %v", candidate, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(probe) })
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	return candidate
+}
+
+func TestComputerCustodyExportWritesThroughAMountedOperatorRoot(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	guestRoot := mountedOperatorRoot(t)
+	hostRoot := "/operator/mounts"
+	directory, err := os.MkdirTemp(guestRoot, "wefty-custody-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Remove(directory); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(hostRoot, filepath.Base(directory))
+	request := custodyExportTestRequest(source, external)
+	engine := &ContainerdEngine{config: translatedCustodyEngineConfig(root, hostRoot, guestRoot), diskSystem: system}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_verified" ||
+		response.Receipt.ExternalPath != external || response.Receipt.ManifestDigest == "" ||
+		len(response.Receipt.ExternalRoots) != 0 {
+		t.Fatalf("mounted-root Custody export = %+v err=%v", response, err)
+	}
+	// The receipt names the node's path; the bytes are at the translated one.
+	digest, err := digestFile(t.Context(), filepath.Join(directory, "storage.ext4"))
+	if err != nil || digest != request.SourceDigest {
+		t.Fatalf("Custody bytes at the mounted destination = %s err=%v", digest, err)
+	}
+	payload, err := os.ReadFile(filepath.Join(directory, "custody.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if custodyManifestDigest(payload) != response.Receipt.ManifestDigest {
+		t.Fatalf("manifest digest %s does not match the bytes at the destination", response.Receipt.ManifestDigest)
+	}
+	if _, err := os.Lstat(external); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Custody export also created the node path inside the helper: %v", err)
+	}
+}
+
+func TestComputerCustodyExportConfinementNegatives(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	mountRoot := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("do-not-touch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(mountRoot, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(mountRoot, "pipe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		name string
+		path string
+	}{
+		{name: "symlinked component", path: filepath.Join(mountRoot, "escape", "custody")},
+		{name: "symlinked destination", path: filepath.Join(mountRoot, "escape")},
+		{name: "traversal out of the root", path: filepath.Join(mountRoot, "..", filepath.Base(outside), "custody")},
+		{name: "fifo component", path: filepath.Join(mountRoot, "pipe", "custody")},
+		{name: "fifo destination", path: filepath.Join(mountRoot, "pipe")},
+	}
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			response, err := engine.ExportComputerCustody(t.Context(), custodyExportTestRequest(source, row.path))
+			if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+				response.Receipt.FailureCode != contract.CustodyExportPathUnconfined {
+				t.Fatalf("confinement refusal = %+v err=%v", response, err)
+			}
+			payload, err := os.ReadFile(victim)
+			if err != nil || string(payload) != "do-not-touch" {
+				t.Fatalf("refused Custody path touched %s: %q err=%v", victim, payload, err)
+			}
+			if _, err := os.Lstat(filepath.Join(outside, "custody")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("refused Custody path created bytes through the symlink: %v", err)
+			}
+		})
+	}
+}
+
+func TestComputerCustodyImportRefusesSourceOutsideEveryOperatorMountRoot(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
+	exportRequest := custodyExportTestRequest(source, externalRoot)
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
+		storageCopyFinalize: importFinalize}
+	exported, err := engine.ExportComputerCustody(t.Context(), exportRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	importRequest := storageCopyTestRequest(source, "import", source.Receipt.AllocatedSize)
+	importRequest.Destination.ComputerID = "import-computer"
+	importRequest.Destination.StorageID = "import-storage"
+	importRequest.Destination.StorageGeneration = 1
+	importRequest.ExportID = exportRequest.ExportID
+	importRequest.ExternalPath = externalRoot
+	importRequest.ManifestDigest = exported.Receipt.ManifestDigest
+	importRequest.Authority.JobID = "import-job"
+
+	unconfined := &ContainerdEngine{config: custodyEngineConfig(root, t.TempDir()), diskSystem: system,
+		storageCopyFinalize: importFinalize}
+	if _, err := unconfined.CopyComputerStorage(t.Context(), importRequest); err == nil ||
+		!strings.Contains(err.Error(), "operator mount root") {
+		t.Fatalf("unconfined Custody import = %v", err)
+	}
+	imported, err := engine.CopyComputerStorage(t.Context(), importRequest)
+	if err != nil || imported.Receipt.Operation != "import" {
+		t.Fatalf("confined Custody import = %+v err=%v", imported, err)
 	}
 }

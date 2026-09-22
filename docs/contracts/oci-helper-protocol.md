@@ -450,7 +450,7 @@ heartbeats.
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. A prepared-removal Storage-only authority requires its helper-originated never-attached witness; reset/restore predecessor and failed-import cleanup use separate typed operation authorities and cannot claim that witness. After separate durable-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
-| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
+| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path that is outside the managed root and a strict descendant of one of the helper's configured operator mount roots. L1 has already committed the custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A missing manifest cannot be reconstructed as empty lineage when an immutable copy receipt or durable reset-preparation record proves prior storage preparation; that contradiction returns typed `computer_storage_grow_uncertain` before reserving capacity or mutating bytes. A failure after ext4 may have expanded returns the same typed uncertainty, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace. `namespace` is the mutating boot-barrier proof that may update pins, cache state, and sweep completion. `namespace_read_only` is an observation-only inventory route for acceptance baselines; it cannot satisfy the boot barrier or update helper policy state. |
@@ -1342,8 +1342,25 @@ Node, and root instance. It deletes only the deterministic Wefty-owned copy
 root and returns `computer_backup_copy_removed` only after positive absence.
 The helper does not choose retention, auto-delete, restore, clone, export,
 encryption, or replica policy. `ExportComputerCustody` accepts only an
-already-recorded event bound to one published Backup copy and rejects paths
-inside the managed root. It writes the external manifest before the disk,
+already-recorded event bound to one published Backup copy. It admits the
+operator's path before it creates anything: the node path is translated into
+the helper's own filesystem view exactly as an operator mount source is, and
+must then be a strict descendant of one of the helper's configured operator
+mount roots (`--oci-allowed-mount-root`, the list `node oci doctor`
+publishes). A path inside the managed root is `managed_root_path`; a path
+under no configured root, reached through a symlinked component, or through a
+component that is not a directory, is `external_path_unconfined`. Where the
+helper reads a translated view of the node's paths — a Lima Node, whose
+operator mount root is the host directory bind-mounted into the guest — the
+admitted root must also prove to be a real mount, by comparing devices across
+the descriptors the helper itself opened from that root downward; otherwise
+the refusal is `external_root_unmounted`, because an absent host mount would
+silently take the export into the helper's own rootfs under a path that
+mimics the node's. Those three refusals carry the node-facing roots in the
+receipt and are raised before any directory is created, any manifest is
+written, and any Backup byte is read, so the helper never creates a directory
+outside a configured root. `CopyComputerStorage(import)` admits its external
+source through the same decision. It writes the external manifest before the disk,
 retains partial bytes after interruption, and returns a receipt only after
 size, content digest, and manifest digest are observed. Files remain mode
 `0600` but inherit the owner and group of the nearest existing ancestor of the

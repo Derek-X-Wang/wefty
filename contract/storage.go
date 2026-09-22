@@ -263,4 +263,48 @@ type ComputerCustodyExportReceipt struct {
 	OwnershipApplied   bool   `json:"ownership_applied"`
 	PrivateModeApplied bool   `json:"private_mode_applied"`
 	FailureCode        string `json:"failure_code,omitempty"`
+	// ExternalRoots names the node's operator mount roots on a confinement or
+	// mount refusal. An operator who asked for the wrong path learns the
+	// answer from the refusal itself instead of from `node oci doctor`.
+	ExternalRoots []string `json:"external_roots,omitempty"`
+}
+
+// Typed Custody export refusals the helper raises strictly before it creates
+// or writes anything at the destination.
+const (
+	// CustodyExportManagedRootPath is an operator path that resolves inside
+	// the helper-managed root.
+	CustodyExportManagedRootPath = "managed_root_path"
+	// CustodyExportPathUnconfined is an operator path that is not a strict
+	// descendant of one of the node's configured operator mount roots.
+	CustodyExportPathUnconfined = "external_path_unconfined"
+	// CustodyExportRootUnmounted is an operator mount root the helper sees
+	// only as a directory in its own filesystem: on a Node whose helper reads
+	// a translated view of the node's paths, an absent mount would silently
+	// take the export into the helper's own rootfs.
+	CustodyExportRootUnmounted = "external_root_unmounted"
+)
+
+// CustodyExportLeftDestinationUntouched reports whether a durable Custody
+// export ended without the helper creating, writing, or replacing anything at
+// the operator destination. Only such an export leaves the source Storage
+// free of custody taint: every other outcome, including a missing or late
+// receipt, means bytes may exist outside managed custody.
+func CustodyExportLeftDestinationUntouched(status, failureCode string) bool {
+	if status != "failed" {
+		return false
+	}
+	switch failureCode {
+	case CustodyExportManagedRootPath, CustodyExportPathUnconfined, CustodyExportRootUnmounted:
+		return true
+	default:
+		return false
+	}
+}
+
+// CustodyExportUntouchedRefusalCodes lists the failure codes
+// CustodyExportLeftDestinationUntouched accepts, for callers that must express
+// the same predicate in a query.
+func CustodyExportUntouchedRefusalCodes() []string {
+	return []string{CustodyExportManagedRootPath, CustodyExportPathUnconfined, CustodyExportRootUnmounted}
 }

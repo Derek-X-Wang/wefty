@@ -108,6 +108,21 @@ type ComputerCustodyImportObservation struct {
 	CompletedAt        *time.Time                         `json:"completed_at,omitempty"`
 }
 
+// custodyExportTaintingPredicate is the SQL form of
+// contract.CustodyExportLeftDestinationUntouched for a custody export row
+// aliased as e: every export taints its source Storage except one the helper
+// refused before it could create or write anything at the destination.
+var custodyExportTaintingPredicate = buildCustodyExportTaintingPredicate()
+
+func buildCustodyExportTaintingPredicate() string {
+	codes := contract.CustodyExportUntouchedRefusalCodes()
+	quoted := make([]string, 0, len(codes))
+	for _, code := range codes {
+		quoted = append(quoted, "'"+code+"'")
+	}
+	return "NOT (e.status='failed' AND e.failure_code IN (" + strings.Join(quoted, ", ") + "))"
+}
+
 func scanCustodyExport(scanner interface{ Scan(...any) error }) (ComputerCustodyExport, error) {
 	var value ComputerCustodyExport
 	var requested int64
@@ -316,16 +331,23 @@ func validateCustodyExportReceipt(export ComputerCustodyExportDirective, receipt
 	}
 	switch receipt.Kind {
 	case "computer_custody_export_verified":
-		if receipt.FailureCode != "" || !backupDigestPattern.MatchString(receipt.ManifestDigest) ||
+		if receipt.FailureCode != "" || len(receipt.ExternalRoots) > 0 || !backupDigestPattern.MatchString(receipt.ManifestDigest) ||
 			!receipt.OwnershipApplied || !receipt.PrivateModeApplied {
 			return protocolError(contract.ErrorInvalidRequest, "successful Custody export receipt is incomplete")
 		}
 	case "computer_custody_export_failed":
 		if receipt.ManifestDigest != "" || receipt.OwnershipApplied || receipt.PrivateModeApplied ||
 			receipt.ExternalOwnerUID != 0 || receipt.ExternalOwnerGID != 0 || (receipt.FailureCode != "insufficient_disk" &&
-			receipt.FailureCode != "destination_not_empty" && receipt.FailureCode != "managed_root_path" &&
+			receipt.FailureCode != "destination_not_empty" && receipt.FailureCode != contract.CustodyExportManagedRootPath &&
+			receipt.FailureCode != contract.CustodyExportPathUnconfined && receipt.FailureCode != contract.CustodyExportRootUnmounted &&
 			receipt.FailureCode != "destination_substituted" && receipt.FailureCode != "ownership_failed" &&
 			receipt.FailureCode != "cancelled") {
+			return protocolError(contract.ErrorInvalidRequest, "failed Custody export receipt is incomplete")
+		}
+		// Only a refusal that proves the destination untouched may name the
+		// node's operator mount roots, because only that refusal is about
+		// where the export was allowed to go.
+		if len(receipt.ExternalRoots) > 0 && !contract.CustodyExportLeftDestinationUntouched("failed", receipt.FailureCode) {
 			return protocolError(contract.ErrorInvalidRequest, "failed Custody export receipt is incomplete")
 		}
 	default:

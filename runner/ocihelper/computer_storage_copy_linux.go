@@ -398,7 +398,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	var sourcePath string
 	var err error
 	if importSource {
-		sourcePath, err = validateImportCustodySource(engine.config.RuntimeRoot, request)
+		sourcePath, err = engine.validateImportCustodySource(request)
 	} else {
 		var copyName string
 		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
