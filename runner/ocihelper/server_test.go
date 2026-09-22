@@ -3432,7 +3432,7 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 	left := ResourceInventory{
 		Leases: []string{"b", "a"}, Snapshots: []string{"b", "a"}, Containers: []string{"b", "a"},
 		Tasks: []string{"b", "a"}, Shims: []string{"b", "a"}, Cgroups: []string{"b", "a"},
-		LogSegments: []string{"b", "a"}, ImageSpools: []string{"b", "a"}, ManagedVolumes: []string{"b", "a"}, ManagedVolumeRecords: []string{"b", "a"},
+		LogSegments: []string{"b", "a"}, ImageSpools: []string{"b", "a"}, ManagedVolumes: []string{"b", "a"}, ManagedVolumeRecords: []string{"b", "a"}, HandoffRetentionRecords: []string{"b", "a"},
 		ComputerDiskImages: []string{"b", "a"}, ComputerDiskAllocations: []string{"b", "a"}, ComputerDiskQuotas: []string{"b", "a"},
 		ComputerDiskManifests: []string{"b", "a"}, ComputerDiskMounts: []string{"b", "a"}, ComputerDiskLoops: []string{"b", "a"},
 		ComputerAttachments: []string{"b", "a"}, ComputerResetManifests: []string{"b", "a"}, ComputerQuarantines: []string{"b", "a"},
@@ -3441,7 +3441,7 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 	right := ResourceInventory{
 		Leases: []string{"a", "c"}, Snapshots: []string{"a", "c"}, Containers: []string{"a", "c"},
 		Tasks: []string{"a", "c"}, Shims: []string{"a", "c"}, Cgroups: []string{"a", "c"},
-		LogSegments: []string{"a", "c"}, ImageSpools: []string{"a", "c"}, ManagedVolumes: []string{"a", "c"}, ManagedVolumeRecords: []string{"a", "c"},
+		LogSegments: []string{"a", "c"}, ImageSpools: []string{"a", "c"}, ManagedVolumes: []string{"a", "c"}, ManagedVolumeRecords: []string{"a", "c"}, HandoffRetentionRecords: []string{"a", "c"},
 		ComputerDiskImages: []string{"a", "c"}, ComputerDiskAllocations: []string{"a", "c"}, ComputerDiskQuotas: []string{"a", "c"},
 		ComputerDiskManifests: []string{"a", "c"}, ComputerDiskMounts: []string{"a", "c"}, ComputerDiskLoops: []string{"a", "c"},
 		ComputerAttachments: []string{"a", "c"}, ComputerResetManifests: []string{"a", "c"}, ComputerQuarantines: []string{"a", "c"},
@@ -3455,6 +3455,7 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 		merged.ComputerDiskAllocations, merged.ComputerDiskQuotas, merged.ComputerDiskManifests,
 		merged.ComputerDiskMounts, merged.ComputerDiskLoops, merged.ComputerAttachments,
 		merged.ComputerResetManifests, merged.ComputerQuarantines, merged.ComputerDiskAnomalies,
+		merged.HandoffRetentionRecords,
 	}
 	for index, class := range classes {
 		if !slices.Equal(class, want) {
@@ -4812,6 +4813,15 @@ type fakeEngine struct {
 	copyStorageResponse         CopyComputerStorageResponse
 	copyStorageErr              error
 	exportCustodyResponse       ExportComputerCustodyResponse
+	handoffInventory            InventoryHandoffVolumesResponse
+	handoffInventoryErr         error
+}
+
+func (engine *fakeEngine) InventoryHandoffVolumes(context.Context, InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.calls = append(engine.calls, "InventoryHandoffVolumes")
+	return engine.handoffInventory, engine.handoffInventoryErr
 }
 
 type delayedFirstResponseConn struct {
@@ -5661,4 +5671,106 @@ func TestStorageAbsencePreconditionIsClosedToComputerDisks(t *testing.T) {
 	requireSweep(t, session)
 	_, err = session.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "handoff", StorageAbsent: true})
 	assertRPCCode(t, err, CodeInvalidRequest)
+}
+
+// InventoryHandoffVolumes is session-authorized, and it has to be: it spans
+// every handoff volume the node still holds, and the attempts that produced
+// them are long gone. There is no attempt whose fence could stand for them,
+// which is exactly why the attempt-scoped mailbox authority cannot serve it.
+func TestRetainedHandoffInventoryIsServedOnSessionAuthorityAlone(t *testing.T) {
+	engine := newFakeEngine()
+	engine.handoffInventory = InventoryHandoffVolumesResponse{Volumes: []RetainedHandoffVolume{
+		{Name: "wefty-handoff-volume-" + strings.Repeat("a", 32), TerminalKnown: true, LogicalBytes: 17},
+	}}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	// Before the boot sweep the node has proved nothing about its own
+	// namespace, so this read is refused like every other OCI operation.
+	_, err = session.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeSweepRequired {
+		t.Fatalf("pre-sweep retained handoff inventory = %#v err=%v", rpcErr, err)
+	}
+
+	requireSweep(t, session)
+	response, err := session.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatalf("session-authorized retained handoff inventory: %v", err)
+	}
+	if len(response.Volumes) != 1 || response.Volumes[0].LogicalBytes != 17 {
+		t.Fatalf("retained handoff inventory = %+v", response.Volumes)
+	}
+	// No live attempt exists in this session, and the call still answered:
+	// that is the whole point of session rather than attempt authority.
+	if len(engine.attemptReaps) != 0 {
+		t.Fatalf("the inventory read touched attempts: %+v", engine.attemptReaps)
+	}
+}
+
+// Attempt authority is not merely unnecessary on this method, it is
+// unrepresentable: the request carries no such field, so a client that
+// attaches one is refused rather than quietly served as if it had proved
+// something.
+func TestRetainedHandoffInventoryRefusesAttemptAuthority(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	var response InventoryHandoffVolumesResponse
+	err = session.call(t.Context(), MethodInventoryHandoffs,
+		map[string]any{"authority": testAuthority()}, &response)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeInvalidRequest {
+		t.Fatalf("attempt-authorized retained handoff inventory = %#v err=%v", rpcErr, err)
+	}
+	engine.mu.Lock()
+	served := slices.Contains(engine.calls, "InventoryHandoffVolumes")
+	engine.mu.Unlock()
+	if served {
+		t.Fatal("a request carrying attempt authority reached the engine")
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("a refused inventory body marked the live helper session lost: %v", err)
+	}
+}
+
+// A node whose accounting read failed is still a node that can place work.
+// Reading this refusal as node-wide loss would drop kind:oci over a byte
+// count -- the #513 shape.
+func TestRetainedHandoffInventoryFailureDoesNotInvalidateSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.handoffInventoryErr = errors.New("handoff root is unreadable")
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure ||
+		rpcErr.EngineFailure == nil || rpcErr.EngineFailure.Operation != MethodInventoryHandoffs {
+		t.Fatalf("retained handoff inventory mechanics = %#v err=%v", rpcErr, err)
+	}
+	var runtimeLoss *RuntimeLossError
+	if errors.As(err, &runtimeLoss) {
+		t.Fatalf("a failed accounting read became runtime loss: %v", err)
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("a failed accounting read marked the live helper session lost: %v", err)
+	}
 }

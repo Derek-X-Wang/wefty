@@ -1862,6 +1862,7 @@ func mergeNativeExpectedInventory(left, right ocihelper.ResourceInventory) ocihe
 	left.ImageSpools = mergeNativeIdentityClass(left.ImageSpools, right.ImageSpools)
 	left.ManagedVolumes = mergeNativeIdentityClass(left.ManagedVolumes, right.ManagedVolumes)
 	left.ManagedVolumeRecords = mergeNativeIdentityClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
+	left.HandoffRetentionRecords = mergeNativeIdentityClass(left.HandoffRetentionRecords, right.HandoffRetentionRecords)
 	left.ComputerDiskImages = mergeNativeIdentityClass(left.ComputerDiskImages, right.ComputerDiskImages)
 	left.ComputerDiskAllocations = mergeNativeIdentityClass(left.ComputerDiskAllocations, right.ComputerDiskAllocations)
 	left.ComputerDiskQuotas = mergeNativeIdentityClass(left.ComputerDiskQuotas, right.ComputerDiskQuotas)
@@ -1894,6 +1895,7 @@ func subtractNativeInventory(inventory, baseline ocihelper.ResourceInventory) oc
 	inventory.ImageSpools = subtractNativeIdentityClass(inventory.ImageSpools, baseline.ImageSpools)
 	inventory.ManagedVolumes = subtractNativeIdentityClass(inventory.ManagedVolumes, baseline.ManagedVolumes)
 	inventory.ManagedVolumeRecords = subtractNativeIdentityClass(inventory.ManagedVolumeRecords, baseline.ManagedVolumeRecords)
+	inventory.HandoffRetentionRecords = subtractNativeIdentityClass(inventory.HandoffRetentionRecords, baseline.HandoffRetentionRecords)
 	inventory.ComputerDiskImages = subtractNativeIdentityClass(inventory.ComputerDiskImages, baseline.ComputerDiskImages)
 	inventory.ComputerDiskAllocations = subtractNativeIdentityClass(inventory.ComputerDiskAllocations, baseline.ComputerDiskAllocations)
 	inventory.ComputerDiskQuotas = subtractNativeIdentityClass(inventory.ComputerDiskQuotas, baseline.ComputerDiskQuotas)
@@ -1942,6 +1944,7 @@ func nonEmptyInventoryClassNames(inventory ocihelper.ResourceInventory) []string
 	}{
 		{"image_spools", inventory.ImageSpools},
 		{"managed_volumes", inventory.ManagedVolumes}, {"managed_volume_records", inventory.ManagedVolumeRecords},
+		{"handoff_retention_records", inventory.HandoffRetentionRecords},
 		{"computer_disk_images", inventory.ComputerDiskImages}, {"computer_disk_allocations", inventory.ComputerDiskAllocations},
 		{"computer_disk_quotas", inventory.ComputerDiskQuotas}, {"computer_disk_manifests", inventory.ComputerDiskManifests},
 	} {
@@ -1961,6 +1964,10 @@ func expectedRetainedWithHandoffExemption(observed, expected ocihelper.ResourceI
 			expected.ManagedVolumes = mergeNativeIdentityClass(expected.ManagedVolumes, []string{volume})
 		}
 	}
+	// A retained handoff volume's terminal receipt is retained with it, and it
+	// is the helper's own record rather than an attempt's resource, so it is
+	// exempt on the same grounds.
+	expected.HandoffRetentionRecords = mergeNativeIdentityClass(expected.HandoffRetentionRecords, observed.HandoffRetentionRecords)
 	return expected
 }
 
@@ -1982,6 +1989,7 @@ func inventoryIdentityClasses(inventory ocihelper.ResourceInventory) [][]string 
 		inventory.ComputerDiskAllocations, inventory.ComputerDiskQuotas, inventory.ComputerDiskManifests,
 		inventory.ComputerDiskMounts, inventory.ComputerDiskLoops, inventory.ComputerAttachments,
 		inventory.ComputerResetManifests, inventory.ComputerQuarantines, inventory.ComputerDiskAnomalies,
+		inventory.HandoffRetentionRecords,
 	}
 }
 

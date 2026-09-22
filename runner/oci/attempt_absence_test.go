@@ -209,7 +209,7 @@ func TestAgentAbsenceProofUsesTheHelpersOwnAttemptProjection(t *testing.T) {
 	kept := []string{}
 	for _, list := range [][]string{projected.Leases, projected.Snapshots, projected.Containers, projected.Tasks,
 		projected.Shims, projected.Cgroups, projected.LogSegments, projected.ManagedVolumes,
-		projected.ManagedVolumeRecords, projected.ComputerDiskImages, projected.ComputerDiskMounts} {
+		projected.ManagedVolumeRecords, projected.HandoffRetentionRecords, projected.ComputerDiskImages, projected.ComputerDiskMounts} {
 		kept = append(kept, list...)
 	}
 	for _, name := range kept {

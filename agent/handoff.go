@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 const (
@@ -55,6 +56,12 @@ type handoffManager struct {
 	// beyond the log line and that projection -- the node budget that will is
 	// a later slice of #494.
 	observeAccounting func(RetainedResultsStatus)
+	// ociHandoffs reads the node's second handoff root, which belongs to the
+	// OCI helper and which this agent cannot stat: on a Mac node the helper
+	// runs inside a Lima VM. It is nil on a node with no OCI runtime. Read
+	// only in this slice -- the accounting pass reports what it finds and
+	// nothing acts on it yet.
+	ociHandoffs workloadrunner.RetainedHandoffInventory
 
 	mu    sync.Mutex
 	paths map[string]*handoffPathLock

@@ -242,6 +242,39 @@ func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, err
 	return record, true, nil
 }
 
+// loadUploadRunIDs reads back the run IDs this node has recorded an upload
+// outcome for. It is the only place an OCI run is named by this agent: that
+// run's handoff volume belongs to the helper and has no retention record.
+func (m *handoffManager) loadUploadRunIDs() []string {
+	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
+		return nil
+	}
+	root := m.uploadRecordRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.log("agent: read result upload records: %v", err)
+		}
+		return nil
+	}
+	runIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		payload, err := readStateDocument(filepath.Join(root, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var record uploadRecord
+		if json.Unmarshal(payload, &record) != nil || strings.TrimSpace(record.RunID) == "" {
+			continue
+		}
+		runIDs = append(runIDs, record.RunID)
+	}
+	return runIDs
+}
+
 func (m *handoffManager) recordRoot() string {
 	return filepath.Join(m.stateRoot, retentionRecordDirectoryName)
 }

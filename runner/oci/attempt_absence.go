@@ -61,7 +61,7 @@ func attemptAbsentFromNamespace(verification ocihelper.VerifyResponse, authority
 	// Their presence here is the contract working, and the removal deletes them
 	// in its own attested step. They were still required absent from the
 	// runtime residue above.
-	survivors.ManagedVolumes, survivors.ManagedVolumeRecords = nil, nil
+	survivors.ManagedVolumes, survivors.ManagedVolumeRecords, survivors.HandoffRetentionRecords = nil, nil, nil
 	survivors.ComputerDiskImages, survivors.ComputerDiskAllocations, survivors.ComputerDiskQuotas = nil, nil, nil
 	survivors.ComputerDiskManifests, survivors.ComputerDiskMounts, survivors.ComputerDiskLoops = nil, nil, nil
 	survivors.ComputerAttachments, survivors.ComputerResetManifests, survivors.ComputerQuarantines = nil, nil, nil
