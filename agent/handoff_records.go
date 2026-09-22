@@ -67,13 +67,16 @@ type handoffRecordAnomaly string
 
 const (
 	// handoffBoundDirectoryReplaced: at finish the run's name no longer led to
-	// the directory preparation pinned. The per-run bound reached the pinned
-	// directory and nothing else, so what stands at the name now is unbounded
-	// and unaccounted, and is deliberately left untouched.
+	// the directory preparation pinned. Nothing was trimmed: not the pinned
+	// directory, which the workload has unlinked or moved, and not whatever
+	// stands at the name now, whose files the agent cannot prove are this
+	// run's. What is there is unbounded and unaccounted, and deliberately
+	// left untouched.
 	handoffBoundDirectoryReplaced handoffRecordAnomaly = "bound_directory_replaced"
 	// handoffBoundDirectoryUnverifiable: the agent could not establish either
-	// way whether the name still led to the pinned directory. The bound reached
-	// the pinned directory; whether that was the whole story is unknown.
+	// way whether the name still led to the pinned directory. Nothing was
+	// trimmed; the bound was skipped rather than applied to a directory whose
+	// identity is unknown.
 	handoffBoundDirectoryUnverifiable handoffRecordAnomaly = "bound_directory_unverifiable"
 	// handoffExpiryNameNotADirectory: the run's name is structurally not
 	// something the sweep can remove -- a symlink, a FIFO, a regular file -- and
