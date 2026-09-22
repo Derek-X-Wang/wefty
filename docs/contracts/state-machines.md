@@ -62,8 +62,8 @@ resumable.
 | `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only |
 | `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified`, `stalled_cleanup_unverified` |
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
-| `removed_verified` | Remaining attempt/service rows were deleted and the verified tombstone was committed. Terminal. | none |
-| `forgotten_cleanup_unverified` | The operator waived proof. The deletion directive remains until a returning node cleans it, and the tombstone warning is permanent. Terminal operator outcome. | none |
+| `removed_verified` | Cleanup was proven. An ordinary service deleted its remaining attempt/service rows and committed the verified tombstone; a Computer-projecting Job is finalized in place and keeps its Job and removal rows. Terminal. | none |
+| `forgotten_cleanup_unverified` | The operator waived proof. The deletion directive remains until a returning node cleans it, and the unverified outcome is permanent -- carried in the tombstone for an ordinary service and in the retained Job and removal rows for a Computer. Terminal operator outcome. | none |
 | `stalled_cleanup_unverified` | The bound agent declared, after the removal retried past the ten-minute bound against the same refusal, that cleanup cannot complete. The service slot is released and nothing claims any part of cleanup succeeded -- neither runtime deletion nor, for a Computer, deletion of the Backup copies the directive names. The deletion directive remains for a returning node and the unverified outcome is permanent. Terminal agent outcome. | none |
 
 Legal desired/observed pairings are: desired `running` with `queued`,
