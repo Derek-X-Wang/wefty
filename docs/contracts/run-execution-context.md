@@ -670,9 +670,8 @@ quiescence and validated, is #494.
 
 Collection expires and evicts nothing; measuring what is left is a separate
 pass on the collector's own timer. Collection runs at agent startup, after
-finalizing
-an attempt's prepared handoff — including attempts that never completed cleanly
-— and hourly.
+finalizing an attempt's prepared handoff — including attempts that never
+completed cleanly — and hourly.
 The collector is the agent's own and is cancelled and joined before the node
 lock is released. A run an attempt is holding is never swept: the sweep takes
 the same path lock an attempt does, re-checks its ownership immediately before
@@ -687,7 +686,8 @@ directory with no agent record is never measured or removed, however full the
 node is — including one this agent created and died before marking, which
 nothing distinguishes from a directory that was never the agent's and which
 therefore stays unrecorded — but at startup one carrying this node's own
-ownership marker for that run is adopted, which means given a record whose deadline comes from that
+ownership marker for that run is adopted, which means given a record whose
+deadline comes from that
 marker, and one carrying neither a record nor such a marker is left exactly as
 it is and counted in the accounting pass rather than left invisible. A record
 is validated against the file it was found in, the root, this node's identity
