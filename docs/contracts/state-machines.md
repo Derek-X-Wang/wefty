@@ -135,6 +135,12 @@ acknowledgement replay, use a separate durable monotonic counter, independent
 of the qualifying refusal streak, to back off from fifteen seconds to a
 three-minute cap. The agent logs refusal-code transitions once, including a
 return to an earlier code, rather than logging every identical retry.
+A stalled removal is retried by the node that declared it on its bounded
+cadence and by a returning node; whichever finishes first completes cleanup.
+Each retry attempts the same cleanup steps against the live runtime -- no step
+answers from an earlier attempt's failure -- and a retry that finally succeeds
+completes cleanup exactly as a returning node's would, without changing the
+removal's permanent unverified outcome.
 After positive cleanup is finalized, a returning boot may replay a bare
 positive acknowledgement when the authenticated identity, node, removal
 generation, and root instance match; its boot-derived key and cleanup fence

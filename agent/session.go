@@ -82,6 +82,7 @@ type agentSession struct {
 	// runtime teardown takes its first resident snapshot. Production leaves it nil.
 	ociStopBeforeResidentScan func()
 	reapPriorBoot             func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error)
+	reapRemovalAttempt        func(context.Context, string, workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, error)
 	removals                  *removalController
 	storageResets             *storageResetController
 	storageGrows              *storageGrowController
@@ -1407,15 +1408,20 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID, k
 			outcome, found := session.serviceReaps[jobID]
 			serviceBoot := session.serviceBoots[jobID]
 			priorBootReap := session.reapPriorBoot
+			removalReap := session.reapRemovalAttempt
+			nodeID := session.registration.NodeID
 			bootSessionID := session.registration.BootSessionID
 			session.claimMu.Unlock()
-			if found {
+			if found && outcome.err == nil {
 				return verifiedRuntimeReap(jobID, outcome)
 			}
 			// Only after the admission and residency gates are both clear may a
 			// current-helper Storage-only inventory prove that no guardian exists.
 			if receipt, ok := storageOnlyAttemptsReceipt(jobID, bootSessionID, attempts); ok {
 				return receipt, nil
+			}
+			if found {
+				return session.reaskRuntimeReap(ctx, jobID, kind, nodeID, bootSessionID, attempts, outcome, removalReap)
 			}
 			if serviceBoot == session.registration.BootSessionID || priorBootReap == nil {
 				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q has no runtime reap receipt", jobID)
@@ -1431,6 +1437,63 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID, k
 		case <-changed:
 		}
 	}
+}
+
+// reaskRuntimeReap asks the runtime again for a service whose one recorded
+// reap ended in failure.
+//
+// The recorded outcome is the answer this session replays for the rest of the
+// boot, and that is right for a positive receipt: quiescence, once proven,
+// stays proven. A failure proves nothing at all. Latching it turned every
+// later removal attempt into a replay of a moment that had already passed --
+// a removal whose helper was lost while its cleanup was refused could never
+// finish on the node that was still running it, however long the refusal had
+// since been cleared, because no retry ever touched the runtime again. Only a
+// restart, which empties this map, could complete it (#514).
+//
+// The re-ask is the same seam the attempt lifecycle used, under the same
+// frozen attempt authority the removal already carries, and the adapter keeps
+// that call retryable for exactly this reason: a typed runtime loss leaves the
+// tracking entry in place. Every proof stays the adapter's; only the moment of
+// asking is new. It runs solely on the removal path, where the agent holds no
+// live attempt for the job, and a still-refused re-ask returns its own
+// refusal so the removal's refusal accounting sees this attempt, not the
+// stale one.
+func (session *agentSession) reaskRuntimeReap(
+	ctx context.Context,
+	jobID, kind, nodeID, bootSessionID string,
+	attempts []workloadrunner.RuntimeResourceManifest,
+	recorded runtimeReapOutcome,
+	reap func(context.Context, string, workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, error),
+) (workloadrunner.ReapReceipt, error) {
+	if reap == nil {
+		return verifiedRuntimeReap(jobID, recorded)
+	}
+	var refusals []error
+	for _, attempt := range attempts {
+		// A Storage-only row names no runtime to reap, and a row belonging to
+		// another job, node or boot is not this attempt's authority.
+		if attempt.StorageOnly || attempt.JobID != jobID || attempt.NodeID != nodeID ||
+			attempt.BootSessionID != bootSessionID || validateRuntimeResourceManifest(attempt) != nil {
+			continue
+		}
+		receipt, err := reap(ctx, kind, workloadrunner.AttemptAuthority{
+			NodeID: attempt.NodeID, BootSessionID: attempt.BootSessionID, JobID: attempt.JobID,
+			AttemptID: attempt.AttemptID, FencingToken: attempt.FencingToken,
+			WorkloadClass: attempt.WorkloadClass, RemovalGeneration: attempt.RemovalGeneration,
+		})
+		if err != nil {
+			refusals = append(refusals, err)
+			continue
+		}
+		return verifiedRuntimeReap(jobID, runtimeReapOutcome{receipt: receipt})
+	}
+	if len(refusals) != 0 {
+		return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q runtime reap: %w", jobID, errors.Join(refusals...))
+	}
+	// Nothing in the frozen manifest carries an authority this node can ask
+	// again, so the recorded failure remains the only answer there is.
+	return verifiedRuntimeReap(jobID, recorded)
 }
 
 func storageOnlyAttemptsReceipt(jobID, bootSessionID string, attempts []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, bool) {

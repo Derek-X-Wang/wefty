@@ -783,9 +783,18 @@ the removal's own attested step. The resulting receipt is ordinary `attempt`
 evidence, because it speaks for exactly one attempt authority. A projection
 that cannot name every resource, or that finds one present, fails the reap
 rather than granting absence. A `Verify` that never completed is not evidence
-either way: it stays a recoverable runtime loss the caller retries, because the
-agent latches one reap outcome per job and a transport failure folded into the
-refusal would wedge the removal just as permanently.
+either way: it stays a recoverable runtime loss the caller retries.
+
+The agent keeps one reap *receipt* per job for the rest of the boot, because
+quiescence once proven stays proven. A reap that failed proved nothing, so it
+is never kept as that job's answer: a removal retrying on its own cadence asks
+the runtime again under the frozen attempt authority it already holds, and
+carries back whatever that attempt refused rather than an older moment's
+failure. The adapter keeps that call answerable for exactly this reason -- a
+typed runtime loss leaves the attempt's tracking entry in place -- and every
+proof behind the receipt stays the adapter's. Without it a removal whose
+helper was lost while its cleanup was refused could never finish on the node
+still running it, however long the refusal had since been cleared.
 
 ## Authority clock
 
