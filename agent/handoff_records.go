@@ -86,16 +86,41 @@ const (
 	handoffExpiryNameNotADirectory handoffRecordAnomaly = "expiry_name_is_not_a_directory"
 )
 
-// retentionRecord is the agent's own answer to "what is retained, since when,
-// and what may be given up first".
+// retentionRecord is the agent's own answer to "what is this node holding,
+// since when, until when, and what may be given up first".
+//
+// It has two states. A record with an admission and no window is a run this
+// node is executing: its bytes count, and nothing expires it. A record with a
+// window is a finished run's retained results. Preparation writes the first
+// and finish updates it into the second, so the record is one run's whole
+// life on this node rather than only its afterlife.
 type retentionRecord struct {
-	RunID       string    `json:"run_id"`
-	NodeID      string    `json:"node_id"`
-	Directory   string    `json:"directory"`
-	RetainedAt  time.Time `json:"retained_at"`
-	RetainUntil time.Time `json:"retain_until"`
+	RunID     string `json:"run_id"`
+	NodeID    string `json:"node_id"`
+	Directory string `json:"directory"`
+	// AdmittedAt is when preparation took responsibility for this directory,
+	// and it is written before the workload starts rather than after it stops.
+	//
+	// A record that began at finish made an in-flight run invisible to
+	// accounting and made a crash mid-run leave a directory no record named --
+	// residue by construction, which nothing measures and nothing sweeps. A
+	// record with an admission and no deadline is exactly that state, said out
+	// loud: this node is holding these bytes and does not yet know for how
+	// long. Startup resolves it (adoptResidue); the sweep never acts on it.
+	AdmittedAt time.Time `json:"admitted_at,omitempty"`
+	// RetainedAt and RetainUntil are the terminal window, written at finish.
+	// Both are absent while a run is in flight, and a record carrying one
+	// without the other is not trusted at all.
+	RetainedAt  time.Time `json:"retained_at,omitempty"`
+	RetainUntil time.Time `json:"retain_until,omitempty"`
 	Published   bool      `json:"published,omitempty"`
 	Succeeded   bool      `json:"succeeded,omitempty"`
+	// Adopted marks a window the agent derived rather than one an attempt
+	// wrote: either an admission that never finished, or a directory carrying
+	// this node's ownership marker and no record at all. It changes nothing
+	// about how the record is treated -- it is a note to whoever reads one and
+	// wonders why a run has a deadline but no verdict.
+	Adopted bool `json:"adopted,omitempty"`
 	// BoundAnomaly names why the per-run bound did not reach the directory that
 	// actually stood at this run's name when the attempt finished. It is
 	// recorded rather than returned because a workload that destroys its own
@@ -379,17 +404,34 @@ func validRetentionRecord(record retentionRecord, fileName, root, nodeID string,
 	if nodeID != "" && record.NodeID != nodeID {
 		return fmt.Errorf("record belongs to node %q, not %q", record.NodeID, nodeID)
 	}
-	if record.RetainedAt.IsZero() || record.RetainUntil.IsZero() {
-		return errors.New("record carries no retention window")
+	if record.AdmittedAt.After(now.Add(retentionClockSkew)) {
+		return errors.New("record was admitted in the future")
 	}
-	if !record.RetainUntil.After(record.RetainedAt) {
-		return errors.New("record expires before it was retained")
-	}
-	if record.RetainedAt.After(now.Add(retentionClockSkew)) {
-		return errors.New("record was retained in the future")
-	}
-	if retention > 0 && record.RetainUntil.After(record.RetainedAt.Add(retention)) {
-		return fmt.Errorf("record keeps run %q past the retention window", record.RunID)
+	switch {
+	case record.RetainedAt.IsZero() && record.RetainUntil.IsZero():
+		// A run admitted and not yet finished. It is a legitimate earlier
+		// state of the same record, not a partial one: preparation writes it
+		// so the node can account for a run while it is executing and so a
+		// crash leaves a record instead of residue. It is never expiry
+		// authority -- the sweep skips a record with no deadline -- so the
+		// window checks below have nothing to check.
+		if record.AdmittedAt.IsZero() {
+			return errors.New("record carries neither an admission nor a retention window")
+		}
+	case record.RetainedAt.IsZero() || record.RetainUntil.IsZero():
+		// Half a window is not one of the two states a record is allowed to be
+		// in, so it fails closed exactly as a missing field always has.
+		return errors.New("record carries half a retention window")
+	default:
+		if !record.RetainUntil.After(record.RetainedAt) {
+			return errors.New("record expires before it was retained")
+		}
+		if record.RetainedAt.After(now.Add(retentionClockSkew)) {
+			return errors.New("record was retained in the future")
+		}
+		if retention > 0 && record.RetainUntil.After(record.RetainedAt.Add(retention)) {
+			return fmt.Errorf("record keeps run %q past the retention window", record.RunID)
+		}
 	}
 	return nil
 }

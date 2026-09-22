@@ -63,6 +63,41 @@ type AttemptStatus struct {
 	Ready            *bool `json:"ready,omitempty"`
 }
 
+// RetainedResultsStatus is what the last accounting pass found in this node's
+// process handoff root. It is a measurement and not a budget: nothing enforces
+// any of these figures yet, and this slice of #494 deliberately stops at making
+// them exist and be right.
+//
+// Both byte figures are reported because they answer different questions.
+// LogicalBytes is what the files hold and what trimming one would recover, with
+// a file two runs hard-link counted once. ChargedBytes is what the node is
+// really giving up, with a floor under every entry, so that a tree of a million
+// empty files -- no logical bytes and a node out of inodes -- is a number
+// somebody can see. Neither is derived from the other.
+type RetainedResultsStatus struct {
+	MeasuredAt time.Time `json:"measured_at"`
+	// Runs counts every run this node has a record for, and InFlight how many
+	// of those have been admitted and have not finished. An in-flight run's
+	// bytes are on the node and are counted below; its results are not
+	// retained yet and it has no expiry deadline.
+	Runs     int `json:"runs"`
+	InFlight int `json:"in_flight"`
+	// Entries is every directory entry the pass reached, which is the inode
+	// cost the byte figures cannot show on their own.
+	Entries      int64 `json:"entries"`
+	LogicalBytes int64 `json:"logical_bytes"`
+	ChargedBytes int64 `json:"charged_bytes"`
+	// QuarantinedRecords counts the runs whose directory the sweep has paused
+	// on. They are included in every figure above: "unsafe to delete" is not
+	// "excluded from accounting", and excluding them would make quarantine a
+	// way to hide storage.
+	QuarantinedRecords int `json:"quarantined_records"`
+	// Unaccounted counts what is under the handoff root that no record names.
+	// Those entries are neither measured nor removed -- they are not this
+	// agent's -- and this is the count that stops them being invisible.
+	Unaccounted int `json:"unaccounted"`
+}
+
 // Status is a point-in-time, process-local health projection. SessionBackoff
 // is separate from per-attempt failures and class occupancy so an idle daemon
 // cannot be confused with one pinned in recovery.
@@ -73,6 +108,10 @@ type Status struct {
 	OneShot           ClassOccupancy           `json:"one_shot"`
 	Services          ClassOccupancy           `json:"services"`
 	Attempts          map[string]AttemptStatus `json:"attempts"`
+	// RetainedResults is absent until the first accounting pass has run, which
+	// is at startup, so an agent that reports none has not measured rather
+	// than measured nothing.
+	RetainedResults *RetainedResultsStatus `json:"retained_results,omitempty"`
 }
 
 type lifecycleObserver struct {
@@ -81,6 +120,7 @@ type lifecycleObserver struct {
 	sessionBackoff    time.Duration
 	lastSemanticError *SemanticError
 	attempts          map[string]AttemptStatus
+	retainedResults   *RetainedResultsStatus
 	clock             Clock
 }
 
@@ -185,6 +225,18 @@ func (observer *lifecycleObserver) setServiceReadiness(attemptID string, startup
 	observer.mu.Unlock()
 }
 
+// recordRetainedResults publishes one accounting pass. The collector runs on
+// its own goroutine, so this is the seam where its figures become readable by
+// whatever asks the daemon what it is holding.
+func (observer *lifecycleObserver) recordRetainedResults(status RetainedResultsStatus) {
+	if observer == nil {
+		return
+	}
+	observer.mu.Lock()
+	observer.retainedResults = &status
+	observer.mu.Unlock()
+}
+
 func (observer *lifecycleObserver) finishAttempt(attemptID string) {
 	if observer == nil {
 		return
@@ -206,9 +258,14 @@ func (observer *lifecycleObserver) snapshot(oneShot, services ClassOccupancy) St
 		copied := *observer.lastSemanticError
 		semanticError = &copied
 	}
+	var retained *RetainedResultsStatus
+	if observer.retainedResults != nil {
+		copied := *observer.retainedResults
+		retained = &copied
+	}
 	return Status{
 		State: observer.state, SessionBackoff: observer.sessionBackoff,
 		LastSemanticError: semanticError, OneShot: oneShot, Services: services,
-		Attempts: attempts,
+		Attempts: attempts, RetainedResults: retained,
 	}
 }

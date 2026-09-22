@@ -430,11 +430,28 @@ func TestARecordNamingAPathComponentItIsNotIsRefused(t *testing.T) {
 			want: "belongs to node",
 		},
 		{
-			name: "no retention window",
+			// A record may legitimately carry an admission and no window --
+			// that is a run still executing -- but one carrying neither says
+			// nothing at all about the directory it names.
+			name: "neither an admission nor a retention window",
 			record: retentionRecord{
 				RunID: "run_ok", NodeID: "node-1", Directory: "",
 			},
-			want: "carries no retention window",
+			want: "carries neither an admission nor a retention window",
+		},
+		{
+			name: "half a retention window",
+			record: retentionRecord{
+				RunID: "run_ok", NodeID: "node-1", Directory: "",
+			},
+			want: "carries half a retention window",
+		},
+		{
+			name: "admitted in the future",
+			record: retentionRecord{
+				RunID: "run_ok", NodeID: "node-1", Directory: "",
+			},
+			want: "admitted in the future",
 		},
 		{
 			name: "a window longer than the contract allows",
@@ -459,7 +476,12 @@ func TestARecordNamingAPathComponentItIsNotIsRefused(t *testing.T) {
 				record.Directory = filepath.Join(root, record.RunID)
 			}
 			switch testCase.want {
-			case "carries no retention window":
+			case "carries neither an admission nor a retention window":
+			case "carries half a retention window":
+				record.AdmittedAt = now
+				record.RetainedAt = now
+			case "admitted in the future":
+				record.AdmittedAt = now.Add(time.Hour)
 			case "past the retention window":
 				record.RetainedAt = now
 				record.RetainUntil = now.Add(48 * time.Hour)

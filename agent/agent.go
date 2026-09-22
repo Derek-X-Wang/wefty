@@ -542,6 +542,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		// One clock: the ticker above and the retention timestamps below have
 		// to move together, or a test can only ever exercise one of them.
 		a.handoffs.now = func() time.Time { return a.clock.Now() }
+		a.handoffs.observeAccounting = a.observer.recordRetainedResults
+		// Adoption before collection, and only here: it gives a deadline to
+		// what a crash left behind -- a run that was executing when this node
+		// stopped, or a directory carrying this node's ownership marker and no
+		// record -- so the sweep below has something to act on instead of
+		// residue nothing measures. It is logged rather than fatal: leftovers
+		// the agent could not claim are a node that keeps too much, while
+		// refusing to start is a node that runs nothing at all.
+		if err := a.handoffs.adoptResidue(); err != nil {
+			a.log("adopt the retained results a previous agent left behind: %v", err)
+		}
 		if err := a.handoffs.collect(); err != nil {
 			return fmt.Errorf("agent: collect retained results: %w", err)
 		}

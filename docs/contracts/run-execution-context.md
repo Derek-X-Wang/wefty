@@ -668,7 +668,8 @@ the same ownership limit the mailbox records (`oci-helper-protocol.md`, "Run
 mailbox confinement"). A helper-owned terminal timestamp, recorded after
 quiescence and validated, is #494.
 
-Collection expires and nothing else. It runs at agent startup, after finalizing
+Collection expires, and then measures what is left so the node can report what
+it holds; it evicts nothing. It runs at agent startup, after finalizing
 an attempt's prepared handoff — including attempts that never completed cleanly
 — and hourly.
 The collector is the agent's own and is cancelled and joined before the node
@@ -681,13 +682,19 @@ directory, never a file inside the handoff directory: a process workload shares
 the agent's OS identity, so anything in there is a file it can rewrite. Keeping
 records separately avoids casual alteration through the handoff directory; it
 is not a tamper boundary against another process with the same OS identity. A
-directory with no agent record is not the agent's and is never measured or
-removed, however full the node is. A record is validated against the file it was
-found in, the root, this node's identity and the retention window, and one that
-fails any of those — including one from an older agent missing fields — is
-skipped with a logged reason and never stops the sweep. The marker inside the
-handoff directory keeps only its cold-rerun ownership job and is read once, at
-preparation.
+directory with no agent record is never measured or removed, however full the
+node is — but at startup one carrying this node's own ownership marker for that
+run is adopted, which means given a record whose deadline comes from that
+marker, and one carrying neither a record nor such a marker is left exactly as
+it is and counted in the accounting pass rather than left invisible. A record
+is validated against the file it was found in, the root, this node's identity
+and the retention window, and one that fails any of those — including one from
+an older agent missing fields — is skipped with a logged reason and never stops the sweep. The marker inside the
+handoff directory keeps its cold-rerun ownership job and that adoption, and is
+read at preparation and, for a directory no record names, once at startup.
+Adoption only ever adds a directory this agent created to this agent's own
+accounting, and the deadline it takes from the marker is clamped to the
+retention window, so a forged marker can at worst expire its own run early.
 
 Terminal recording and trimming require the opaque preparation receipt from
 that attempt's lock acquisition. A canceled waiter has no receipt and performs

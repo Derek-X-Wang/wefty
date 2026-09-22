@@ -178,8 +178,13 @@ func TestHandoffCancelledWaiterCannotRetainOwnersResults(t *testing.T) {
 	if err != nil || info.Size() != 4096 {
 		t.Fatalf("waiter changed owner's live file: %v %v", info, err)
 	}
-	if records := harness.manager.loadRecords(); len(records) != 0 {
-		t.Fatalf("waiter recorded owner's run: %#v", records)
+	// Preparation records the owner's admission, so what must not exist here
+	// is a *terminal* record: the waiter retaining results for a run whose
+	// directory it never held.
+	for _, record := range harness.manager.loadRecords() {
+		if record.RunID != "run_shared" || !record.RetainUntil.IsZero() {
+			t.Fatalf("waiter recorded owner's run as retained: %#v", record)
+		}
 	}
 	if err := harness.manager.finish(nil, claim.Job.Spec, "node-1", false, false); err != nil {
 		t.Fatal(err)
