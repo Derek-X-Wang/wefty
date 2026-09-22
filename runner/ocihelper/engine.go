@@ -19,6 +19,26 @@ var errComputerStorageAttachmentOwned = errors.New("Computer Storage generation 
 
 var errComputerReimageDetachmentRequired = errors.New("Computer reimage requires exact positive detachment evidence")
 
+// computerStorageAdmissionContendedError is the typed refusal a Computer
+// Storage call gets when it gives up waiting for one of the Node-wide disk
+// admission mutexes. It claims replayable contention and nothing more: the
+// call may already have progressed under the generation lock it owns -- a
+// deletion refused at its finalization acquisition has removed the payload --
+// so it is not a promise that storage is unchanged. What it does promise is
+// that no absence proof was produced and that the exact same authority
+// replayed under a fresh deadline finishes the work. A contended Node is not a
+// broken one, so this must never read as an engine failure.
+type computerStorageAdmissionContendedError struct {
+	Admission string
+	cause     error
+}
+
+func (err *computerStorageAdmissionContendedError) Error() string {
+	return fmt.Sprintf("Computer %s admission is contended: %v", err.Admission, err.cause)
+}
+
+func (err *computerStorageAdmissionContendedError) Unwrap() error { return err.cause }
+
 // computerStorageRetiredError is a definitive attachment refusal for a
 // generation whose durable reset fence prevents it from ever becoming current
 // again. It is distinct from an engine failure: the attempted successor has no

@@ -355,9 +355,13 @@ func deterministicComputerDiskRemovalName(storage ComputerStorage) string {
 }
 
 type RuntimeRemovalProofRequest struct {
-	NodeID            string
-	BootSessionID     string
-	JobID             string
+	NodeID        string
+	BootSessionID string
+	JobID         string
+	// PriorJobID is the Job this removal supersedes. Durable helper evidence
+	// written before `current_job_id` rotated names it, so removal inventory
+	// carries it alongside the current Job.
+	PriorJobID        string
 	RemovalGeneration uint64
 	CleanupFence      string
 	RootInstanceID    string

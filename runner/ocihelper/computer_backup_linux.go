@@ -105,13 +105,17 @@ func validBackupDetachmentEvidence(evidence *computerDiskEvidence, storage Compu
 // lockDetachedBackupSource holds the same attachment flock used by attach and
 // detach until release. Backup create retains it across copy, both digests,
 // and durable publication so no delayed attach can reopen a write window.
-func (engine *ContainerdEngine) lockDetachedBackupSource(storage ComputerStorageReference, authority ComputerBackupAuthority) (string, func(), error) {
+// The flock is taken through root admission: this call reaches
+// openComputerDiskLock, which MkdirAlls the root, so a Backup of a generation
+// that is being removed must not create a replacement root under a deletion
+// that has already proved the old one absent.
+func (engine *ContainerdEngine) lockDetachedBackupSource(ctx context.Context, storage ComputerStorageReference, authority ComputerBackupAuthority) (string, func(), error) {
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return "", nil, err
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-	lock, err := openComputerDiskLock(diskRoot)
+	lock, err := engine.openComputerStorageDestination(ctx, diskRoot)
 	if err != nil {
 		return "", nil, err
 	}
@@ -367,7 +371,7 @@ func backupFailureReceipt(request CreateComputerBackupRequest, helperGeneration 
 }
 
 func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
-	sourcePath, releaseSource, err := engine.lockDetachedBackupSource(request.Storage, request.Authority)
+	sourcePath, releaseSource, err := engine.lockDetachedBackupSource(ctx, request.Storage, request.Authority)
 	if err != nil {
 		return CreateComputerBackupResponse{}, err
 	}

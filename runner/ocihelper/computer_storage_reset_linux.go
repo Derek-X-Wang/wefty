@@ -71,6 +71,39 @@ func openComputerDiskLock(root string) (*os.File, error) {
 	return lock, nil
 }
 
+// openComputerDiskLockWithoutCreatingRoot takes the same exclusive flock as
+// openComputerDiskLock but never creates the directory the lock lives in.
+// Quarantine collection acts on a listing it took earlier, so MkdirAll there
+// would put a quarantine root back after an authorized removal's final listing
+// had already proved it gone -- and that separate inode is not covered by the
+// generation flock the removal holds. A root that is no longer there was
+// collected by someone else, which is reported as absent rather than as a
+// failure.
+func openComputerDiskLockWithoutCreatingRoot(root string) (*os.File, bool, error) {
+	directory, err := os.OpenFile(root, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if err := directory.Close(); err != nil {
+		return nil, false, err
+	}
+	lock, err := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lock.Close()
+		return nil, false, errComputerStorageAttachmentOwned
+	}
+	return lock, true, nil
+}
+
 func closeComputerDiskLock(lock *os.File) {
 	if lock == nil {
 		return
@@ -304,9 +337,12 @@ func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, reques
 
 // openComputerStorageDestination orders root publication against absence
 // observation/deletion without taking reimageMu underneath storageResetMu.
+// It is the only way a caller may reach openComputerDiskLock, because that
+// call MkdirAlls the root: a creator that skipped this admission could take a
+// replacement inode inside the interval a deletion has already proved empty.
 func (engine *ContainerdEngine) openComputerStorageDestination(ctx context.Context, root string) (*os.File, error) {
-	if !lockComputerReimageMutex(ctx, &engine.computerStorageRootMu) {
-		return nil, context.Cause(ctx)
+	if err := admitComputerStorage(ctx, &engine.computerStorageRootMu, "Storage root"); err != nil {
+		return nil, err
 	}
 	defer engine.computerStorageRootMu.Unlock()
 	return openComputerDiskLock(root)

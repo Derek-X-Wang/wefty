@@ -505,6 +505,37 @@ func refusedComputerStorageAbsent(root, name string) (computerStorageCopyRefusal
 	return refusal, true, nil
 }
 
+// computerDiskRemovalResidueAbsent reports the generation-root shapes that
+// hold no bytes at all, which an authorized removal therefore deletes whole:
+// the exact refusal shape -- its own lock and its own durable tombstone -- and
+// a root holding nothing but the lock. The second is what a creator leaves
+// when it takes the flock and fails before writing anything, and what a
+// removal leaves if it is interrupted between dropping the payload and
+// unlinking the root. Reading it as bytes without an authority manifest would
+// wedge the removal of a refused clone for good.
+//
+// Only removal may read a root this way. A lock-only root is also the ordinary
+// first-allocation shape, so attachment, inventory, and the startup sweep keep
+// judging it by the narrower refusal rule.
+func computerDiskRemovalResidueAbsent(root, name string) (bool, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false, err
+	}
+	lockOnly := true
+	for _, entry := range entries {
+		if entry.Name() != computerDiskAttachmentLockFile {
+			lockOnly = false
+			break
+		}
+	}
+	if lockOnly {
+		return true, nil
+	}
+	_, absent, err := refusedComputerStorageAbsent(root, name)
+	return absent, err
+}
+
 func removeComputerStorageCopyPayload(root string) error {
 	entries, err := os.ReadDir(root)
 	if err != nil {

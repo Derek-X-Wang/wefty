@@ -113,12 +113,30 @@ const (
 	CodeStartupBoundTripped ErrorCode = "startup_bound_tripped"
 )
 
+// ErrorDetail is a closed, stable token that narrows one ErrorCode without
+// splitting it into two. A code says what the caller may do; a detail says
+// which of that code's causes produced this one, for the consumers that must
+// tell them apart.
+type ErrorDetail string
+
+// DetailAdmissionContention marks the one `computer_storage_busy` refusal that
+// is about the Node rather than about the resource: the helper gave up waiting
+// for a Node-wide Computer disk admission mutex. Every other busy refusal --
+// a live attempt owning the Storage generation, or fencing removal inventory
+// -- is a fact about the requested resource and carries no detail, so a
+// consumer can tell unrelated Node traffic from its own live attempt without a
+// second code.
+const DetailAdmissionContention ErrorDetail = "admission_contention"
+
 // RPCError is safe to cross the private protocol. Engine failures may include
 // bounded one-line mechanics detail in Message so native diagnostics retain the
 // causal engine error; the closed EngineFailure fact remains policy authority.
 type RPCError struct {
-	Code          ErrorCode          `json:"code"`
-	Message       string             `json:"message"`
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+	// Detail narrows Code for a consumer that must distinguish its causes. It
+	// is optional, closed, and never carries identifiers.
+	Detail        ErrorDetail        `json:"detail,omitempty"`
 	ImageFailure  *ImageFailureFact  `json:"image_failure,omitempty"`
 	EngineFailure *EngineFailureFact `json:"engine_failure,omitempty"`
 	MemoryFailure *MemoryFailureFact `json:"memory_failure,omitempty"`

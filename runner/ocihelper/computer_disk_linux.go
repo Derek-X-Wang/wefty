@@ -32,6 +32,7 @@ type computerDiskCheckpoint string
 const (
 	computerDiskRefusalChecked      computerDiskCheckpoint = "refusal_checked"
 	computerDiskPreLockChecked      computerDiskCheckpoint = "pre_lock_checked"
+	computerDiskPayloadRemoved      computerDiskCheckpoint = "payload_removed"
 	computerDiskRootRemoved         computerDiskCheckpoint = "root_removed"
 	computerDiskRemovalAbsent       computerDiskCheckpoint = "removal_absent"
 	computerDiskManifestBeforeImage computerDiskCheckpoint = "manifest_before_image"
@@ -508,13 +509,36 @@ func (engine *ContainerdEngine) quarantineComputerDiskCleanup(request DeleteMana
 	return receipt, nil
 }
 
+// deleteComputerDisk and deleteComputerDiskWithAbsence are the deadline-free
+// forms, for callers that have no RPC context to spend on admission.
 func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority) error {
 	return engine.deleteComputerDiskWithAbsence(storage, removal, false)
 }
 
 func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority, storageAbsent bool) error {
-	engine.computerReimageMu.Lock()
-	defer engine.computerReimageMu.Unlock()
+	return engine.deleteComputerDiskUnderAdmission(context.Background(), storage, removal, storageAbsent)
+}
+
+// deleteComputerDiskUnderAdmission removes one Computer Storage generation
+// under the caller's own deadline.
+//
+// Admission is Node-wide, so it is held only where nothing else can carry the
+// exclusion. Once this call owns the generation flock, the root and the lock
+// inode inside it are still there, so no creator can take a replacement: the
+// payload and the quarantined payloads come off under the flock alone, and
+// removing a fully allocated image no longer stalls attach, start, and reimage
+// preflight for every other Computer on the Node. Admission is retaken, in the
+// established reimage-then-root order, for exactly the root unlink and the
+// absence proof -- the interval where the flock is unlinked along with the
+// root it lives in and can no longer exclude anyone. A root that was never
+// there has no flock to stand in for admission, so that path keeps the hold
+// from the first observation through the proof.
+//
+// Retaking admission can expire. The payload is gone by then and the root is
+// left holding nothing but its lock, which is deletable residue, so the same
+// authority replayed under a fresh deadline finishes the removal.
+func (engine *ContainerdEngine) deleteComputerDiskUnderAdmission(ctx context.Context, storage ComputerStorageReference,
+	removal ManagedVolumeRemovalAuthority, storageAbsent bool) error {
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return err
@@ -523,12 +547,32 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 		return entry == name || strings.HasPrefix(entry, name+"-") ||
 			strings.HasPrefix(entry, "."+name+"-") && strings.HasSuffix(entry, computerDiskQuarantineGCFailureSuffix)
 	}
-	engine.computerStorageRootMu.Lock()
-	defer engine.computerStorageRootMu.Unlock()
-	// Keep the established reimage -> root-admission order through deletion
-	// and the final absence proof. The flock lives inside the deleted root;
-	// its descriptor cannot exclude a creator opening a replacement inode.
-	// Reimage admission excludes attachments, root admission copy/reset.
+	reimageHeld, rootHeld := false, false
+	admit := func() error {
+		if err := admitComputerStorage(ctx, &engine.computerReimageMu, "attachment"); err != nil {
+			return err
+		}
+		reimageHeld = true
+		if err := admitComputerStorage(ctx, &engine.computerStorageRootMu, "Storage root"); err != nil {
+			return err
+		}
+		rootHeld = true
+		return nil
+	}
+	relinquish := func() {
+		if rootHeld {
+			engine.computerStorageRootMu.Unlock()
+			rootHeld = false
+		}
+		if reimageHeld {
+			engine.computerReimageMu.Unlock()
+			reimageHeld = false
+		}
+	}
+	defer relinquish()
+	if err := admit(); err != nil {
+		return err
+	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	var lock *os.File
 	defer func() {
@@ -550,9 +594,10 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 	}
 	if lock != nil && storageAbsent {
 		// Frozen absence permits only no payload. A refusal's retained lock
-		// and tombstone satisfy that precondition; any reappeared bytes do not.
-		if _, absent, refusalErr := refusedComputerStorageAbsent(diskRoot, name); refusalErr != nil || !absent {
-			return errors.Join(refusalErr, errors.New("Computer disk deletion observed a reappeared generation after frozen Storage absence"))
+		// and tombstone satisfy that precondition, and so does a root left
+		// holding nothing but its lock; any reappeared bytes do not.
+		if absent, residueErr := computerDiskRemovalResidueAbsent(diskRoot, name); residueErr != nil || !absent {
+			return errors.Join(residueErr, errors.New("Computer disk deletion observed a reappeared generation after frozen Storage absence"))
 		}
 	}
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
@@ -573,17 +618,21 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 			return errors.New("Computer disk deletion lacks detachment or staging authority")
 		}
 	} else if _, statErr := os.Lstat(diskRoot); statErr == nil {
-		// A refused copy's own lock and tombstone are not bytes: that
-		// generation never published anything, and authorized removal deletes
-		// the retained root whole.
-		if _, absent, refusalErr := refusedComputerStorageAbsent(diskRoot, name); refusalErr != nil || !absent {
-			return errors.Join(refusalErr, errors.New("Computer disk deletion found bytes without an authority manifest"))
+		// A refused copy's own lock and tombstone are not bytes, and neither
+		// is a bare lock: that generation published nothing, and authorized
+		// removal deletes the retained root whole.
+		if absent, residueErr := computerDiskRemovalResidueAbsent(diskRoot, name); residueErr != nil || !absent {
+			return errors.Join(residueErr, errors.New("Computer disk deletion found bytes without an authority manifest"))
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
 	imagePath := filepath.Join(diskRoot, "disk.ext4")
 	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
+	if lock != nil {
+		// From here the generation flock carries the exclusion on its own.
+		relinquish()
+	}
 	if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
 		return err
 	} else if mounted {
@@ -598,6 +647,33 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 			return errors.New("Computer disk loop remains during deletion")
 		}
 	}
+	if lock != nil {
+		if err := removeComputerDiskPayloadUnderLock(diskRoot); err != nil {
+			return err
+		}
+		if err := engine.computerDiskCheckpoint(computerDiskPayloadRemoved); err != nil {
+			return err
+		}
+	}
+	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
+	quarantines, err := readDirectoryIfPresent(quarantineRoot)
+	if err != nil {
+		return err
+	}
+	for _, entry := range quarantines {
+		if quarantineEntryMatches(entry.Name()) {
+			quarantined := filepath.Join(quarantineRoot, entry.Name())
+			if err := os.RemoveAll(quarantined); err != nil {
+				return err
+			}
+			engine.forgetComputerDiskQuarantineGC(quarantined)
+		}
+	}
+	if lock != nil {
+		if err := admit(); err != nil {
+			return err
+		}
+	}
 	if err := os.RemoveAll(diskRoot); err != nil {
 		return err
 	}
@@ -610,20 +686,6 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 	resetManifestPath := filepath.Join(engine.config.RuntimeRoot, "computer-storage-resets", name+".json")
 	if err := os.Remove(resetManifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
-	}
-	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
-	quarantines, err := readDirectoryIfPresent(quarantineRoot)
-	if err != nil {
-		return err
-	}
-	for _, entry := range quarantines {
-		if quarantineEntryMatches(entry.Name()) {
-			root := filepath.Join(quarantineRoot, entry.Name())
-			if err := os.RemoveAll(root); err != nil {
-				return err
-			}
-			engine.forgetComputerDiskQuarantineGC(root)
-		}
 	}
 	for _, path := range []string{diskRoot, imagePath, filepath.Join(diskRoot, "attachment.json"), mountPath} {
 		if _, err := os.Lstat(path); err == nil {
@@ -663,6 +725,38 @@ func (engine *ContainerdEngine) deleteComputerDiskWithAbsence(storage ComputerSt
 	return nil
 }
 
+// removeComputerDiskPayloadUnderLock drops everything the generation root
+// holds except the flock this call owns, the durable refusal tombstone that
+// keeps a refused generation terminal, and the authority manifest, which goes
+// last. Dropping the manifest before the bytes it describes would leave an
+// interrupted removal an image with no authority, and no later call could
+// remove that.
+func removeComputerDiskPayloadUnderLock(root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	manifestPresent := false
+	for _, entry := range entries {
+		switch entry.Name() {
+		case computerDiskAttachmentLockFile, computerStorageCopyRefusalRecord:
+			continue
+		case "attachment.json":
+			manifestPresent = true
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	if manifestPresent {
+		if err := os.Remove(filepath.Join(root, "attachment.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return syncDirectory(root)
+}
+
 // computerHasRemainingStorage reports whether any Storage generation of this
 // Computer still has a managed disk root on the node.
 func (engine *ContainerdEngine) computerHasRemainingStorage(computerID string) (bool, error) {
@@ -675,9 +769,18 @@ func (engine *ContainerdEngine) computerHasRemainingStorage(computerID string) (
 		if !entry.IsDir() {
 			continue
 		}
-		manifest, present, readErr := readComputerDiskManifest(filepath.Join(diskRoot, entry.Name(), "attachment.json"))
+		root := filepath.Join(diskRoot, entry.Name())
+		manifest, present, readErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 		if readErr != nil || !present {
-			// An unreadable neighbour is treated as still present: the
+			// A refused generation's retained lock and tombstone are not a
+			// Storage generation: every other reader of that exact shape
+			// already calls it absent, and a reader that did not would defer
+			// this sweep for every Computer on the node until an operator
+			// removed the tombstoned root.
+			if _, refused, refusalErr := refusedComputerStorageAbsent(root, entry.Name()); refusalErr == nil && refused {
+				continue
+			}
+			// Any other unreadable neighbour is treated as still present: the
 			// records are only ever dropped on a certain answer.
 			return true, nil
 		}
@@ -1520,7 +1623,10 @@ diskLoop:
 				}
 			}
 		}
-		recoveryLock, err := openComputerDiskLock(root)
+		// Root admission, not just the flock: this listing can name a root a
+		// concurrent deletion has since unlinked, and openComputerDiskLock
+		// would MkdirAll it back under the deletion's own absence proof.
+		recoveryLock, err := engine.openComputerStorageDestination(ctx, root)
 		if err != nil {
 			if errors.Is(err, errComputerStorageAttachmentOwned) {
 				return errors.New("Computer attachment lock remained owned after sweep")
