@@ -47,6 +47,13 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		Intent: func(context.Context) (lima.OCIIntent, error) {
 			return lima.OCIIntent{Version: lima.OCIIntentVersion, Revision: 4, Enabled: true, UpdatedAt: now.Add(-time.Hour)}, nil
 		},
+		RetainedResults: func() (RetainedResultsFacts, bool) {
+			measured := now.Add(-time.Minute)
+			return RetainedResultsFacts{
+				MeasuredAt: &measured, Runs: 2, Entries: 12,
+				LogicalBytes: 1 << 20, ChargedBytes: 2 << 20,
+			}, true
+		},
 		Helper: func(context.Context) (HelperDoctorSnapshot, error) {
 			return HelperDoctorSnapshot{
 				ProtocolVersion: ocihelper.ProtocolVersion, Version: "v1.2.3", Checksum: "sha256:helper",
