@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -333,7 +335,8 @@ func TestMeasureEntryWalksACombWithinItsFrameBound(t *testing.T) {
 	buildComb(t, path, teeth, payload)
 
 	size, peak := walkFrames(t, run, "comb")
-	if want := int64(teeth * payload); size != want {
+	// One file per tooth and one inside each postponed sibling.
+	if want := int64(teeth * payload * 2); size != want {
 		t.Fatalf("a comb of %d teeth measured %d bytes, want %d", teeth, size, want)
 	}
 	if peak > frameCeiling {
@@ -515,17 +518,18 @@ func buildComb(t *testing.T, path string, teeth, payload int) {
 			t.Fatal(err)
 		}
 		if payload > 0 {
-			file, err := current.Create("tooth.bin")
+			writeCombPayload(t, current, "tooth.bin", payload)
+			// A file inside the postponed sibling too: the sibling is only
+			// reached after the descent comes back up, through an ancestor the
+			// walk released, so these bytes are exactly what a broken re-open
+			// loses.
+			sibling, err := current.OpenRoot("sibling")
 			if err != nil {
 				current.Close()
 				t.Fatal(err)
 			}
-			_, err = file.Write(make([]byte, payload))
-			file.Close()
-			if err != nil {
-				current.Close()
-				t.Fatal(err)
-			}
+			writeCombPayload(t, sibling, "sibling.bin", payload)
+			sibling.Close()
 		}
 		next, err := current.OpenRoot("down")
 		current.Close()
@@ -798,4 +802,123 @@ func TestTheAccountingPassReachesTheStatusTheNodeDoctorReads(t *testing.T) {
 	if projected == nil || *projected != status {
 		t.Fatalf("the lifecycle projection and the doctor accessor disagree: %#v vs %#v", projected, status)
 	}
+}
+
+// TestAHashedRecordNameCannotBeSpelledByALiteralRunID is the counterexample a
+// readable prefix plus a short digest could not survive, and it needs no hash
+// collision: 97 "a"s hash to D, and the run ID "79 a's, a dash, the first 16 of
+// D" is itself a valid, short-enough run ID that spells the first run's file
+// name exactly. Preparation and the upload record write at these names without
+// passing adoption's guard, so that is one run overwriting another's record.
+func TestAHashedRecordNameCannotBeSpelledByALiteralRunID(t *testing.T) {
+	hashed := strings.Repeat("a", 97)
+	digest := sha256.Sum256([]byte(hashed))
+	literal := strings.Repeat("a", 79) + "-" + hex.EncodeToString(digest[:])[:16]
+	for _, runID := range []string{hashed, literal} {
+		if !validRunMailboxSegment(runID) {
+			t.Fatalf("the fixture run ID %q is not a valid run name", runID)
+		}
+	}
+	if recordComponent(hashed) == recordComponent(literal) {
+		t.Fatalf("a literal run ID still spells a hashed one's file name: %q", recordComponent(hashed))
+	}
+	if !strings.HasPrefix(recordComponent(hashed), hashedRecordPrefix) {
+		t.Fatalf("the long run ID is not filed in the hashed namespace: %q", recordComponent(hashed))
+	}
+	if strings.HasPrefix(recordComponent(literal), hashedRecordPrefix) {
+		t.Fatalf("a short run ID reached the hashed namespace: %q", recordComponent(literal))
+	}
+
+	// The separator is a byte a literal name escapes, so a run ID carrying it
+	// cannot reach the hashed namespace either.
+	carrier := hashedRecordPrefix + hex.EncodeToString(digest[:])
+	component := recordComponent(carrier)
+	if strings.HasPrefix(component, hashedRecordPrefix) {
+		t.Fatalf("a run ID beginning with %q reached the hashed namespace: %q", hashedRecordPrefix, component)
+	}
+	if component == recordComponent(hashed) {
+		t.Fatalf("a run ID spelling a digest collided with the run that hashes to it: %q", component)
+	}
+}
+
+// TestAChainPrefixedCombIsMeasuredWhole: the walk drops a directory from its
+// stack the moment it descends into that directory's last child, so for
+// chain/comb/... the stack holds the comb and nothing remembers the chain.
+// Rebuilding a released frame from the stack opened base/comb, which does not
+// exist, and an unchanged tree reported its postponed siblings as lost.
+func TestAChainPrefixedCombIsMeasuredWhole(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	// Deeper than the frame bound, so ancestors really are released and really
+	// have to be re-opened by name.
+	const chain = 8
+	const teeth = 192
+	// Past the 4 KiB entry floor, so the logical and charged figures are
+	// different numbers and the assertion below checks both rather than one
+	// twice.
+	const payload = 8192
+	path := harness.plantDirectory("run_prefixed", nil)
+	root := buildChainPrefix(t, path, chain)
+	buildComb(t, root, teeth, payload)
+
+	run, err := harness.manager.openRun("run_prefixed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	info, err := run.Lstat("chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tally, err := walkHandoffTree(run, "chain", info, nil)
+	if err != nil {
+		t.Fatalf("walk a chain-prefixed comb: %v", err)
+	}
+	if tally.unaccounted != 0 || tally.replaced != 0 {
+		t.Fatalf("an unchanged tree reported lost subtrees: %#v", tally)
+	}
+	// Every tooth's file plus every sibling's file: buildComb writes one file
+	// per level, and buildCombSiblingPayload one inside each postponed sibling.
+	if want := int64(teeth * payload * 2); tally.logical != want {
+		t.Fatalf("measured %d logical bytes, want %d", tally.logical, want)
+	}
+	// Per tooth: the tooth directory, its file, its sibling, the sibling's
+	// file. Plus the chain's directories and the comb root.
+	if want := int64(teeth*4 + chain + 1); tally.entries != want {
+		t.Fatalf("reached %d entries, want %d", tally.entries, want)
+	}
+	// The files carry their own bytes; every directory entry carries the floor.
+	if want := int64(teeth)*2*payload + int64(teeth*2+chain+1)*4096; tally.charged != want {
+		t.Fatalf("charged %d bytes, want %d", tally.charged, want)
+	}
+}
+
+func writeCombPayload(t *testing.T, root *os.Root, name string, payload int) {
+	t.Helper()
+	file, err := root.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.Write(make([]byte, payload))
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// buildChainPrefix builds a run of single-child directories and returns the
+// deepest one, so a branching fixture can be planted under an ancestry the walk
+// keeps no frames for.
+func buildChainPrefix(t *testing.T, path string, depth int) string {
+	t.Helper()
+	current := filepath.Join(path, "chain")
+	if err := os.Mkdir(current, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for range depth - 1 {
+		current = filepath.Join(current, "link")
+		if err := os.Mkdir(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return current
 }

@@ -58,6 +58,11 @@ const (
 	// name. A run ID may be 128 bytes and escaping can double that, so a name
 	// past this carries a digest of the whole ID rather than a cut of it.
 	maxRecordComponentBytes = 96
+	// hashedRecordPrefix opens the namespace digest-named records live in, and
+	// it is deliberately a byte a literal name escapes. That is the whole
+	// separation: a literal name can never begin with it, so a digest name and
+	// a literal name can never be the same name.
+	hashedRecordPrefix = "~"
 )
 
 // handoffRecordAnomaly is a typed reason the agent could not do to a run's
@@ -262,6 +267,10 @@ func (m *handoffManager) recordRoot() string {
 // Names that need neither -- the ordinary case -- come out byte-for-byte as the
 // old mapping produced them, so an upgraded node reads its own existing
 // records. The rest are read through legacyRecordComponent as well.
+//
+// A digest name carries no readable prefix on purpose. Anything readable in it
+// would be a string a literal run ID can also produce, and the two namespaces
+// would meet again.
 func recordComponent(runID string) string {
 	escaped, complete := escapedRecordName(runID, maxRecordComponentBytes)
 	if escaped == "" {
@@ -272,10 +281,20 @@ func recordComponent(runID string) string {
 	if complete {
 		return escaped + ".json"
 	}
+	// A hashed name shares no namespace with a literal one. Keeping a readable
+	// prefix and appending a digest was not enough and the counterexample needs
+	// no hash collision at all: 97 "a"s hash to some digest D, and the run ID
+	// "79 a's - first 16 of D" is itself a valid run ID short enough to be
+	// written literally -- producing byte for byte the name the first run's
+	// digest produced. Preparation and the upload record write at these names
+	// without going through adoption's guard, so that is one run overwriting
+	// another's record with nothing forged.
+	//
+	// So a hashed name is the whole digest and nothing else, under a leading
+	// "~". A literal name escapes every byte outside [A-Za-z0-9_-], so "~"
+	// cannot appear in one at all, and the two forms can no longer meet.
 	digest := sha256.Sum256([]byte(runID))
-	suffix := "-" + hex.EncodeToString(digest[:8])
-	prefix, _ := escapedRecordName(runID, maxRecordComponentBytes-len(suffix))
-	return prefix + suffix + ".json"
+	return hashedRecordPrefix + hex.EncodeToString(digest[:]) + ".json"
 }
 
 // escapedRecordName escapes one run ID into at most limit bytes, and reports

@@ -1289,8 +1289,8 @@ func TestDoctorReportsRetainedResults(t *testing.T) {
 	if err := report.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if report.RetainedResults.Outcome != DiagnosticOK {
-		t.Fatalf("retained results outcome = %q", report.RetainedResults.Outcome)
+	if report.RetainedResults == nil || report.RetainedResults.Outcome != DiagnosticOK {
+		t.Fatalf("retained results = %#v", report.RetainedResults)
 	}
 	if report.RetainedResults.Runs != 6 || report.RetainedResults.InFlight != 1 ||
 		report.RetainedResults.LogicalBytes != 12<<20 || report.RetainedResults.ChargedBytes != 20<<20 ||
@@ -1340,8 +1340,8 @@ func TestDoctorSaysRetainedResultsAreUnmeasuredRatherThanEmpty(t *testing.T) {
 	if item.Outcome != DiagnosticNotRun || item.Code != "oci_retained_results_not_read" {
 		t.Fatalf("an unmeasured node was reported as measured: %#v", item)
 	}
-	if report.RetainedResults.Outcome != DiagnosticNotRun {
-		t.Fatalf("retained results outcome = %q, want NOT-RUN", report.RetainedResults.Outcome)
+	if report.RetainedResults == nil || report.RetainedResults.Outcome != DiagnosticNotRun {
+		t.Fatalf("retained results = %#v, want a NOT-RUN section", report.RetainedResults)
 	}
 }
 
@@ -1352,4 +1352,65 @@ func findingFor(report DoctorResponse, check string) (DiagnosticFinding, bool) {
 		}
 	}
 	return DiagnosticFinding{}, false
+}
+
+// TestDoctorAcceptsAnOlderAgentsResponse: doctor is the command an operator
+// reaches for when something is already wrong, and upgrading the CLI before the
+// node is an ordinary order to upgrade in. A section the answering agent
+// predates must read as unavailable, never as a refusal to print the report.
+func TestDoctorAcceptsAnOlderAgentsResponse(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
+
+	// Exactly what an older agent sends: no section, and no finding for it.
+	older := report
+	older.RetainedResults = nil
+	kept := make([]DiagnosticFinding, 0, len(report.Findings))
+	for _, item := range report.Findings {
+		if item.Check != "retained-results" {
+			kept = append(kept, item)
+		}
+	}
+	older.Findings = kept
+
+	// It must survive the wire as well as the struct: the CLI decodes JSON.
+	payload, err := json.Marshal(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded DoctorResponse
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RetainedResults != nil {
+		t.Fatalf("an absent section decoded as present: %#v", decoded.RetainedResults)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("a newer CLI refused an older agent's doctor response: %v", err)
+	}
+
+	noted := decoded.NoteUnreportedSections()
+	item, found := findingFor(noted, "retained-results")
+	if !found {
+		t.Fatal("the missing section was not reported at all")
+	}
+	if item.Outcome != DiagnosticNotRun || item.Code != "oci_retained_results_not_read" ||
+		item.NotRunCause != NotRunPeerDoesNotReport {
+		t.Fatalf("the missing section was not reported as a version gap: %#v", item)
+	}
+	if err := noted.Validate(); err != nil {
+		t.Fatalf("the noted report does not validate: %v", err)
+	}
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, noted); err != nil {
+		t.Fatalf("an older agent's report does not render: %v", err)
+	}
+	if !strings.Contains(human.String(), "RETAINED RESULTS\tNOT-RUN not reported by this agent version") {
+		t.Fatalf("the rendered report does not say the section is unavailable:\n%s", human.String())
+	}
+	// Noting is idempotent, so a report that already carries the finding is
+	// never given a second one.
+	if again := noted.NoteUnreportedSections(); len(again.Findings) != len(noted.Findings) {
+		t.Fatalf("noting twice added a second finding: %d vs %d", len(again.Findings), len(noted.Findings))
+	}
 }

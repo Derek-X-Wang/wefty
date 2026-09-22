@@ -90,13 +90,15 @@ var errHandoffWalkMoved = errors.New("a directory changed identity while the pas
 // handoffWalkFrame is one directory the walk has read and still has
 // subdirectories to descend into.
 //
-// It holds no path. A frame that still has its descriptor is reached through
-// that; a frame whose descriptor was released to stay inside the bound is
-// reached again by opening its ancestors' names one component at a time, each
-// no-follow, and is accepted only if it is the same inode it was.
+// A frame that still has its descriptor is reached through that; a frame whose
+// descriptor was released to stay inside the bound is reached again by opening
+// its ancestry one component at a time, each no-follow, and is accepted only if
+// it is the same inode it was.
 type handoffWalkFrame struct {
-	// name is this directory's component inside its parent.
-	name string
+	// depth is where this directory's own component sits in the walk's path.
+	// The ancestry of this frame is therefore path[:depth+1], whatever the
+	// stack currently holds.
+	depth int
 	// run is the open handle, or nil once it has been released.
 	run *os.Root
 	// identity is what this directory was when the walk first opened it, and
@@ -113,10 +115,21 @@ type handoffWalkFrame struct {
 // refill from the bottom. firstOpen is where that suffix starts, so
 // len(stack)-firstOpen is the number of descriptors this walk is holding.
 type handoffWalk struct {
-	base      *os.Root
-	seen      map[handoffInode]struct{}
-	tally     handoffTally
-	stack     []*handoffWalkFrame
+	base  *os.Root
+	seen  map[handoffInode]struct{}
+	tally handoffTally
+	stack []*handoffWalkFrame
+	// path is the component ancestry from the walk's base down to the deepest
+	// frame, and it is kept independently of the stack on purpose.
+	//
+	// The stack is not the ancestry and cannot stand in for it. A directory
+	// whose last subdirectory is being opened is dropped from the stack right
+	// then -- that is what keeps a chain at one descriptor -- so for a tree
+	// shaped chain/comb/... the stack holds only the comb while the chain
+	// above it is a component nothing remembers. Rebuilding a released frame
+	// from the stack then opened base/comb, which does not exist, and an
+	// unchanged tree reported its postponed siblings as unaccounted.
+	path      []string
 	firstOpen int
 	// peak is the most frames ever open at once, which is what a test asserts
 	// instead of watching the process's descriptor table and hoping to sample
@@ -176,13 +189,13 @@ func (walk *handoffWalk) descend(name string) error {
 		}
 		return err
 	}
-	if err := walk.push(name, top); err != nil {
+	if err := walk.push(0, name, top); err != nil {
 		return err
 	}
 	for len(walk.stack) > 0 {
 		frame := walk.stack[len(walk.stack)-1]
 		if len(frame.directories) == 0 {
-			walk.pop()
+			walk.complete()
 			continue
 		}
 		child := frame.directories[0]
@@ -197,15 +210,18 @@ func (walk *handoffWalk) descend(name string) error {
 			if errors.Is(err, errHandoffWalkMoved) {
 				walk.tally.replaced++
 			}
-			walk.pop()
+			walk.complete()
 			continue
 		}
+		depth := frame.depth + 1
 		next, err := openHandoffDirectory(run, child)
 		if len(frame.directories) == 0 {
 			// Nothing here needs this handle again. Dropping it now, rather
 			// than when the subtree returns, is what keeps a chain of
-			// directories at one descriptor instead of one per level.
-			walk.pop()
+			// directories at one descriptor instead of one per level. The
+			// frame goes; its component stays in path, because the child about
+			// to be pushed still lives under it.
+			walk.discard()
 		}
 		if err != nil {
 			if handoffWalkSkips(err) {
@@ -213,7 +229,7 @@ func (walk *handoffWalk) descend(name string) error {
 			}
 			return err
 		}
-		if err := walk.push(child, next); err != nil {
+		if err := walk.push(depth, child, next); err != nil {
 			return err
 		}
 	}
@@ -221,8 +237,10 @@ func (walk *handoffWalk) descend(name string) error {
 }
 
 // push reads one directory, adds its children to the tally, and keeps it on the
-// stack only if it has subdirectories left to visit.
-func (walk *handoffWalk) push(name string, run *os.Root) error {
+// stack only if it has subdirectories left to visit. depth is where this
+// directory's component belongs in the walk's ancestry, which the caller knows
+// and the stack no longer does.
+func (walk *handoffWalk) push(depth int, name string, run *os.Root) error {
 	identity, err := run.Stat(".")
 	if err != nil {
 		run.Close()
@@ -239,17 +257,24 @@ func (walk *handoffWalk) push(name string, run *os.Root) error {
 	if len(directories) == 0 {
 		return run.Close()
 	}
+	// Truncate rather than append: a child opened after an earlier sibling's
+	// subtree finished belongs at its parent's depth plus one, not after
+	// whatever that subtree left behind.
+	walk.path = append(walk.path[:depth], name)
 	walk.stack = append(walk.stack, &handoffWalkFrame{
-		name: name, run: run, identity: identity, directories: directories,
+		depth: depth, run: run, identity: identity, directories: directories,
 	})
 	walk.trim(len(walk.stack) - 1)
 	if handoffWalkDescended != nil {
-		handoffWalkDescended(len(walk.stack))
+		handoffWalkDescended(len(walk.path))
 	}
 	return nil
 }
 
-func (walk *handoffWalk) pop() {
+// discard drops the deepest frame and its descriptor, and leaves the ancestry
+// alone: the walk is about to descend into that directory's last child, which
+// is reached through its name.
+func (walk *handoffWalk) discard() {
 	last := len(walk.stack) - 1
 	if walk.stack[last].run != nil {
 		walk.stack[last].run.Close()
@@ -261,44 +286,79 @@ func (walk *handoffWalk) pop() {
 	}
 }
 
-// topRoot hands back the deepest frame's handle, re-opening the frames that
-// were released to stay inside the bound.
+// complete drops the deepest frame because its subtree is finished, and takes
+// its component out of the ancestry with it.
+func (walk *handoffWalk) complete() {
+	depth := walk.stack[len(walk.stack)-1].depth
+	walk.discard()
+	if depth < len(walk.path) {
+		walk.path = walk.path[:depth]
+	}
+}
+
+// topRoot hands back the deepest frame's handle, re-opening what was released
+// to stay inside the bound.
 //
-// Re-opening is component by component from the walk's own base, each component
-// no-follow and directory-only, and every re-opened frame must be the same
-// inode the walk first saw. A frame that is not stops the descent: the walk
-// refuses to keep measuring through a directory it cannot prove is the one it
-// was measuring.
+// Re-opening walks the recorded ancestry from the walk's own base, component by
+// component, each no-follow and directory-only. Most of those components are
+// not frames at all -- a chain above a branch leaves components and no frames
+// -- so they are stepped through on transient handles. Every component that is
+// a frame must be the same inode the walk first saw; one that is not stops the
+// descent, because the walk refuses to keep measuring through a directory it
+// cannot prove is the one it was measuring.
+//
+// It is only ever called on the deepest frame, and open frames are a contiguous
+// suffix of the stack, so reaching here means every frame is released and the
+// walk starts from the base.
 func (walk *handoffWalk) topRoot() (*os.Root, error) {
 	index := len(walk.stack) - 1
-	if run := walk.stack[index].run; run != nil {
-		return run, nil
+	frame := walk.stack[index]
+	if frame.run != nil {
+		return frame.run, nil
 	}
 	current := walk.base
-	for position := 0; position <= index; position++ {
-		frame := walk.stack[position]
-		if frame.run == nil {
-			child, err := openHandoffDirectory(current, frame.name)
-			if err != nil {
-				return nil, err
-			}
-			opened, err := child.Stat(".")
-			if err != nil || !os.SameFile(frame.identity, opened) {
-				child.Close()
-				return nil, errHandoffWalkMoved
-			}
-			frame.run = child
-			if position < walk.firstOpen {
-				walk.firstOpen = position
-			}
+	var transient *os.Root
+	defer func() {
+		if transient != nil {
+			transient.Close()
 		}
-		current = frame.run
-		// Keep the window behind this position inside the bound. The frame in
+	}()
+	cursor := 0
+	for depth := 0; depth <= frame.depth; depth++ {
+		child, err := openHandoffDirectory(current, walk.path[depth])
+		if transient != nil {
+			// The step that led here is no longer needed now that its child is
+			// open, so it never counts against the descriptor bound.
+			transient.Close()
+			transient = nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		for cursor <= index && walk.stack[cursor].depth < depth {
+			cursor++
+		}
+		if cursor > index || walk.stack[cursor].depth != depth {
+			transient, current = child, child
+			continue
+		}
+		target := walk.stack[cursor]
+		opened, statErr := child.Stat(".")
+		if statErr != nil || !os.SameFile(target.identity, opened) {
+			child.Close()
+			return nil, errHandoffWalkMoved
+		}
+		target.run = child
+		if cursor < walk.firstOpen {
+			walk.firstOpen = cursor
+		}
+		current = child
+		// Keep the window behind this frame inside the bound. The frame in
 		// hand is never one of the released ones: the bound is far larger than
 		// the one handle this loop is holding.
-		walk.trim(position)
+		walk.trim(cursor)
 	}
-	return walk.stack[index].run, nil
+	return frame.run, nil
 }
 
 // trim releases the oldest open frames until at most maxOpenWalkFrames handles

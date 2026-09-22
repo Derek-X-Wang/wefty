@@ -64,12 +64,17 @@ const (
 	NotRunNoProbeReceipt     NotRunCause = "no_probe_receipt"
 	NotRunDependencyMissing  NotRunCause = "dependency_unavailable"
 	NotRunDesiredUnavailable NotRunCause = "desired_unavailable"
+	// NotRunPeerDoesNotReport is for a section this build knows about and the
+	// agent that answered does not report at all. It is a version gap, not a
+	// node fault, and it is a separate cause so an operator is not sent to
+	// look for a source that was never meant to be there.
+	NotRunPeerDoesNotReport NotRunCause = "peer_does_not_report"
 )
 
 func (cause NotRunCause) Valid() bool {
 	switch cause {
 	case NotRunSourceUnavailable, NotRunHelperUnreachable, NotRunNotConfigured, NotRunNotApplicable,
-		NotRunNoProbeReceipt, NotRunDependencyMissing, NotRunDesiredUnavailable:
+		NotRunNoProbeReceipt, NotRunDependencyMissing, NotRunDesiredUnavailable, NotRunPeerDoesNotReport:
 		return true
 	default:
 		return false
@@ -261,7 +266,13 @@ type DoctorResponse struct {
 	LastSessionInvalidation *ocihelper.SessionInvalidationReceipt `json:"last_session_invalidation,omitempty"`
 	Convergence             ConvergenceDoctorFacts                `json:"convergence"`
 	ComputerStorageRecovery ComputerStorageRecoveryFacts          `json:"computer_storage_recovery"`
-	RetainedResults         RetainedResultsFacts                  `json:"retained_results"`
+	// RetainedResults is nil when the agent that answered does not report the
+	// section at all. That is how an older node looks to a newer CLI, and it
+	// must stay a readable report rather than a refusal: upgrading the CLI
+	// first is an ordinary order to upgrade in, and "doctor no longer runs" is
+	// the worst possible answer from the command an operator reaches for when
+	// something is already wrong.
+	RetainedResults *RetainedResultsFacts `json:"retained_results,omitempty"`
 	// AttemptOwnershipQuarantines names durable Attempt ownership records the
 	// boot sweep moved aside rather than wedge helper startup on. Empty is the
 	// healthy shape.
@@ -403,8 +414,7 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 		Convergence:             ConvergenceDoctorFacts{Outcome: DiagnosticNotRun},
 		ComputerStorageRecovery: ComputerStorageRecoveryFacts{Outcome: DiagnosticNotRun,
 			Deferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{}, Quarantined: []ocihelper.ComputerStorageRecoveryInventoryEntry{}},
-		RetainedResults: RetainedResultsFacts{Outcome: DiagnosticNotRun},
-		Findings:        []DiagnosticFinding{},
+		Findings: []DiagnosticFinding{},
 		Limitations: []DoctorLimitation{{
 			Code:   DoctorUIDLimitation,
 			Detail: "process-kind payloads currently share the agent user; operator peer credentials do not distinguish them",
@@ -440,6 +450,7 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 // removed, however full the node gets, so an unaccounted count that keeps
 // growing is the shape of a node quietly filling up.
 func buildRetainedResults(config DoctorConfig, report *DoctorResponse) {
+	report.RetainedResults = &RetainedResultsFacts{Outcome: DiagnosticNotRun}
 	if config.RetainedResults == nil {
 		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
 			code: "oci_retained_results_not_read", notRunCause: NotRunNotConfigured,
@@ -456,7 +467,7 @@ func buildRetainedResults(config DoctorConfig, report *DoctorResponse) {
 		return
 	}
 	facts.Outcome = DiagnosticOK
-	report.RetainedResults = facts
+	report.RetainedResults = &facts
 	detail := fmt.Sprintf("the node retains %d run(s) (%d still in flight) across %d entries: %d logical bytes, %d charged bytes, %d quarantined record(s) still charged",
 		facts.Runs, facts.InFlight, facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords)
 	if facts.Unaccounted == 0 {
@@ -1346,12 +1357,16 @@ func (report DoctorResponse) Validate() error {
 		return fmt.Errorf("invalid doctor header")
 	}
 	if len(report.Findings) == 0 || report.Probe.Capabilities == nil || report.Probe.MissingCapabilities == nil || report.Mounts.AllowedRoots == nil ||
-		!report.ComputerStorageRecovery.Outcome.Valid() || !report.ComputerScreenIsolation.Outcome.Valid() ||
-		!report.RetainedResults.Outcome.Valid() {
+		!report.ComputerStorageRecovery.Outcome.Valid() || !report.ComputerScreenIsolation.Outcome.Valid() {
 		return fmt.Errorf("doctor report is incomplete")
 	}
 	if len(report.Limitations) != 1 || report.Limitations[0].Code != DoctorUIDLimitation || report.Limitations[0].Issue != DoctorUIDIssue || report.Limitations[0].Detail == "" {
 		return fmt.Errorf("doctor UID-isolation limitation is missing")
+	}
+	// A section this build knows about and the answering agent does not report
+	// is absent, not invalid. Only what is present is checked.
+	if facts := report.RetainedResults; facts != nil && !facts.Outcome.Valid() {
+		return fmt.Errorf("invalid retained-results facts")
 	}
 	if evidence := report.LastSessionInvalidation; evidence != nil &&
 		(evidence.ObservedAt.IsZero() || evidence.SessionGeneration == 0 || evidence.RejectionCode == "") {
@@ -1381,7 +1396,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy", "removal-records", "retained-results"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake-stalls", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "computer-screen-isolation", "resource-admission", "attempt-ownership-quarantine", "mount-roots", "convergence", "helper-restart-policy", "removal-records"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}
@@ -1437,11 +1452,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t after_endpoint_ready=%t target_x_live=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.HostAbstractSocketObservedAfterEndpointReady, report.ComputerScreenIsolation.TargetAbstractSocketLive, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
-		fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unaccounted=%d",
-			report.RetainedResults.Outcome, formatOptionalTime(report.RetainedResults.MeasuredAt),
-			report.RetainedResults.Runs, report.RetainedResults.InFlight, report.RetainedResults.Entries,
-			report.RetainedResults.LogicalBytes, report.RetainedResults.ChargedBytes,
-			report.RetainedResults.QuarantinedRecords, report.RetainedResults.Unaccounted),
+		retainedResultsLine(report.RetainedResults),
 	}
 	if report.ResourceAdmission != nil {
 		admission := report.ResourceAdmission
@@ -1473,6 +1484,41 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 	)
 	_, err := fmt.Fprintln(writer, strings.Join(lines, "\n"))
 	return err
+}
+
+// retainedResultsLine renders the section, including the case where the agent
+// that answered does not carry one.
+func retainedResultsLine(facts *RetainedResultsFacts) string {
+	if facts == nil {
+		return "RETAINED RESULTS\tNOT-RUN not reported by this agent version"
+	}
+	return fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unaccounted=%d",
+		facts.Outcome, formatOptionalTime(facts.MeasuredAt), facts.Runs, facts.InFlight,
+		facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords, facts.Unaccounted)
+}
+
+// NoteUnreportedSections returns the report with one finding added for every
+// section this build knows about that the agent which answered did not report.
+//
+// It is the reader's note, not the node's: a newer CLI against an older agent
+// has to say "this agent does not report that" rather than either refuse the
+// whole report or print a section of zeroes that reads like a measurement.
+func (report DoctorResponse) NoteUnreportedSections() DoctorResponse {
+	if report.RetainedResults != nil {
+		return report
+	}
+	for _, item := range report.Findings {
+		if item.Check == "retained-results" {
+			return report
+		}
+	}
+	noted := report
+	noted.Findings = append(append([]DiagnosticFinding{}, report.Findings...),
+		finding("retained-results", diagnosticReceipt{
+			code: "oci_retained_results_not_read", notRunCause: NotRunPeerDoesNotReport,
+			detail: "the agent that answered does not report retained-results accounting; it predates the measurement",
+		}))
+	return noted
 }
 
 func formatOptionalTime(value *time.Time) string {
