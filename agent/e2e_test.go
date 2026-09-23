@@ -59,6 +59,8 @@ func TestAgentUploadsLongPartialAndInvalidUTF8Output(t *testing.T) {
 	server := startManagedProcess(t, controlPlanePath,
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
+		// No run ledger in this installation, said explicitly (wefty #548).
+		"--run-ledger=",
 		"--db="+filepath.Join(directory, "l1.sqlite"),
 		"--node-tags=stable-node=linux",
 		"--ready-file="+readyFile,
@@ -115,6 +117,8 @@ func TestAgentLogPollTailsRunningProcess(t *testing.T) {
 	server := startManagedProcess(t, controlPlanePath,
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
+		// No run ledger in this installation, said explicitly (wefty #548).
+		"--run-ledger=",
 		"--db="+filepath.Join(directory, "l1.sqlite"),
 		"--node-tags=stable-node=linux",
 		"--ready-file="+readyFile,
@@ -195,6 +199,8 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 	server := startManagedProcess(t, controlPlanePath,
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
+		// No run ledger in this installation, said explicitly (wefty #548).
+		"--run-ledger=",
 		"--db="+filepath.Join(directory, "l1.sqlite"),
 		"--lease-duration="+leaseDuration.String(),
 		"--node-tags=stable-node=linux",

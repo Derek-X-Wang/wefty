@@ -290,7 +290,24 @@ digest and immutable issuance/revocation audit, binding it to Computer,
 attempt, current Storage generation, submit-intent revision, host Node, grant
 revision, and L3 authority generation. L3 revalidates the live L1 scope on
 every bearer request. L1 submission-intent mutation revokes older L3 grants
-before reporting success. The caller's authenticated Fabric Node must equal the
+before reporting success.
+
+When L1 cannot reach the run ledger to perform one of those revocations it says
+so by name: typed `run_ledger_unavailable`, HTTP 503, `retryable: true`. It is
+never reported as `internal`, because the remedy is a deployment address, not
+an L1 fix, and a scrubbed message hides the only fact that leads to it. A
+revocation that follows an authority-losing Computer mutation says in its
+message that the mutation applied, so a retry is understood as owed revocation
+rather than an unapplied verb. The node heartbeat is the one surface that does
+not refuse: a pre-restore revocation the run ledger will not take is left owed
+and re-listed next pass, and only that Computer's restore directive is
+withheld. A blocked restore must never take a Node's whole convergence surface
+— and with it the capabilities the Node advertises — out of service.
+
+L1 logs the cause of every response it scrubs, as one
+`event=l1_internal_error_scrubbed` line naming the method, the path, the error
+class and the unwrapped cause. A fault an operator cannot see is worse than a
+fault they can. The caller's authenticated Fabric Node must equal the
 grant's host binding on every request. An ordinary L3 process restart preserves
 the authority generation; only adopting a different persisted authority
 instance marker during restore or explicit promotion advances it and revokes

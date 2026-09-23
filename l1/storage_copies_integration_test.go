@@ -72,9 +72,15 @@ func testRestoreHeartbeatRevocation(t *testing.T, skew time.Duration) {
 		t.Fatal(err)
 	}
 	agentClient := h.client(fabric.Identity{NodeID: "fabric-computer-node", Tags: []string{DefaultAgentPrincipalTag}})
+	// Without a run ledger the restore fails closed on its own directive, not
+	// on the node's whole convergence surface (wefty #548).
 	status, _, body := h.do(agentClient, http.MethodPost, "/v1/agent/nodes/"+node.NodeID+"/heartbeat", heartbeatRequestForNode(node))
-	if status != http.StatusInternalServerError {
-		t.Fatalf("heartbeat without revoker status=%d body=%s", status, body)
+	var unrevoked HeartbeatResponse
+	if status != http.StatusOK || json.Unmarshal(body, &unrevoked) != nil || len(unrevoked.StorageCopyDirectives) != 0 {
+		t.Fatalf("heartbeat without revoker status=%d response=%#v body=%s", status, unrevoked, body)
+	}
+	if owed, err := h.store.GetComputer(context.Background(), computer.ComputerID); err != nil || owed.LastRestoreRevocation != nil {
+		t.Fatalf("restore revocation recorded without a run ledger = %#v err=%v", owed.LastRestoreRevocation, err)
 	}
 	revocations := 0
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
