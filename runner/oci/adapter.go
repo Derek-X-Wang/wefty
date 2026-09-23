@@ -2474,7 +2474,7 @@ func (adapter *Adapter) RemoveRunMailboxEntry(ctx context.Context, reference wor
 // attempt whose authority could stand for them. Nothing here names an owner
 // key in either direction -- the agent derives the names it knows from its own
 // runs, and a name in this report it cannot place is residue a crash left.
-func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workloadrunner.RetainedHandoffReport, error) {
+func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context, after string) (workloadrunner.RetainedHandoffReport, error) {
 	if adapter == nil || adapter.sessions == nil {
 		return workloadrunner.RetainedHandoffReport{}, errors.New("OCI helper session is not configured")
 	}
@@ -2482,13 +2482,16 @@ func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workload
 	if err != nil {
 		return workloadrunner.RetainedHandoffReport{}, err
 	}
-	response, err := session.InventoryHandoffVolumes(ctx, ocihelper.InventoryHandoffVolumesRequest{})
+	response, err := session.InventoryHandoffVolumes(ctx, ocihelper.InventoryHandoffVolumesRequest{After: after})
 	if err != nil {
 		return workloadrunner.RetainedHandoffReport{}, err
 	}
 	report := workloadrunner.RetainedHandoffReport{
 		Volumes:       make([]workloadrunner.RetainedHandoffVolume, 0, len(response.Volumes)),
 		Exhausted:     response.Exhausted,
+		Next:          response.Next,
+		Restart:       response.Restart,
+		Generation:    response.Generation,
 		DetachedTrees: response.DetachedTrees,
 	}
 	for _, volume := range response.Volumes {
@@ -2499,7 +2502,8 @@ func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workload
 		report.Volumes = append(report.Volumes, workloadrunner.RetainedHandoffVolume{
 			Name: volume.Name, TerminalAt: volume.TerminalAt, TerminalKnown: volume.TerminalKnown,
 			LogicalBytes: volume.LogicalBytes, DedupedBytes: volume.DedupedBytes,
-			Entries: volume.Entries, Live: volume.Live, Truncated: volume.Truncated,
+			ChargedBytes: volume.ChargedBytes,
+			Entries:      volume.Entries, Live: volume.Live, Truncated: volume.Truncated,
 			Anomalies: anomalies,
 		})
 	}
@@ -2511,6 +2515,45 @@ func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workload
 // it, so no owner key ever has to cross the wire in either direction.
 func (adapter *Adapter) RetainedHandoffVolumeName(ownerKey string) (string, error) {
 	return ocihelper.DeterministicHandoffVolumeDirectory(ownerKey)
+}
+
+// EvictRetainedHandoff gives one retained handoff volume up because the node is
+// over its retained-results budget.
+//
+// It is the handoff arm of `DeleteManagedVolume` and nothing more: one owner
+// key in, one helper-derived identity removed, success only after the helper
+// has separately verified that the volume and its retention receipt are both
+// absent. No path and no volume name crosses in this direction either, which
+// is what keeps the agent able to evict only the volumes it can already name.
+func (adapter *Adapter) EvictRetainedHandoff(ctx context.Context, ownerKey string) error {
+	if adapter == nil || adapter.sessions == nil {
+		return errors.New("OCI helper session is not configured")
+	}
+	if strings.TrimSpace(ownerKey) == "" {
+		return errors.New("a retained handoff volume is evicted by its owner key")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return err
+	}
+	response, err := deleteManagedVolumeWithRecovery(ctx, session,
+		ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: ownerKey})
+	if err != nil {
+		// The helper's refusal of a volume an attempt still owns is carried
+		// across as its own answer rather than folded into "the eviction
+		// failed". The node has to tell the two apart: one is the guard
+		// working, and the node simply keeps the run's results; the other is a
+		// node that could not act on its own budget.
+		var rpcErr *ocihelper.RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == ocihelper.CodeHandoffVolumeLive {
+			return fmt.Errorf("%w: %s", workloadrunner.ErrRetainedHandoffLive, rpcErr.Message)
+		}
+		return err
+	}
+	if !response.Deleted {
+		return errors.New("OCI helper did not positively verify the retained handoff volume's removal")
+	}
+	return nil
 }
 
 func (adapter *Adapter) runMailboxRequest(reference workloadrunner.RunMailboxReference) (*ocihelper.Session, ocihelper.RunMailboxReference, error) {

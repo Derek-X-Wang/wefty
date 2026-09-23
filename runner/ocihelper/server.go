@@ -1901,6 +1901,15 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
+		// The cursor is a volume name, and the only thing the helper owes a
+		// caller here is that an unbounded string cannot be spent on the
+		// comparison. It is not validated as an existing name: resuming after
+		// a volume that has since been removed is ordinary, and the listing is
+		// sorted, so any string simply positions the page.
+		if len(body.After) > MaxHandoffInventoryCursorBytes {
+			_ = writeFailure(wire, CodeInvalidRequest, "retained handoff inventory cursor is longer than one volume name")
+			return
+		}
 		engine, ok := server.engine.(HandoffRetentionInventoryEngine)
 		if !ok {
 			_ = writeFailure(wire, CodeUnsupportedOperation, "retained handoff inventory is unavailable")
@@ -2317,6 +2326,15 @@ func writeEngineResponseWithMethod(connection *framedConn, method Method, respon
 		var serviceDataRejection *ServiceDataRejectionError
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
+		}
+		// A handoff volume an attempt still owns is a replayable refusal, not
+		// an engine failure: nothing was detached, nothing was freed, and the
+		// same request succeeds once that attempt finishes. Reporting it as an
+		// engine failure would make the node's budget eviction look like a
+		// broken runtime every time it raced a rerun.
+		var handoffLive *HandoffVolumeLiveError
+		if errors.As(err, &handoffLive) {
+			return writeFailure(connection, CodeHandoffVolumeLive, handoffLive.Error())
 		}
 		var preflightStage *computerReimagePreflightStageError
 		if method == MethodPreflightReimage && (errors.Is(err, errComputerReimageDetachmentRequired) || errors.As(err, &preflightStage)) {

@@ -544,7 +544,11 @@ Record four rows:
    must stand on its own when re-read later) and `expired=false`, and
    `wefty results RUN_ID` returns the document when the workload wrote one
    within the upload bound (#493 — a successful run's handoff is retained
-   through the retention window, not deleted).
+   through the retention window, not deleted). Attended-only, and not
+   reproducible in CI: record `results_terminal_source=receipt` — the node
+   agent's retained-results accounting reports this volume with a helper-owned
+   terminal time rather than the workload-writable mtime fallback, proving the
+   window runs from a receipt a uid-0 workload has no path to (#494 S3/S4).
 2. `oci_oneshot_prestarted_loss`: stop the VM or helper after image evidence
    but before authoritative `Started`. Require the old attempt to terminalize,
    the job to requeue with its original absolute deadline and digest, a fresh
@@ -571,14 +575,41 @@ Record four rows:
    executions must have distinct attempt IDs. Record the same opaque handoff
    owner identity, exact marker bytes, and the same retention proof as row 1 —
    the reused volume stays present and `retained_until`/`expired` still read
-   as retained after the rerun completes.
+   as retained after the rerun completes, and `results_terminal_source=receipt`
+   as row 1 does. Attended-only, and not reproducible in CI: then deliberately
+   put the node over its retained-results budget — submit further `kind=oci`
+   one-shots that retain files, or start the agent against a handoff root
+   already holding them, until the node's accounting reports more charged bytes
+   than `contract.MaxRetainedResultNodeBytes` — with one published run and one
+   unpublished run retained, and record
+   `over_budget_published_evicted_first=true`: on the next accounting pass the
+   published run's results are gone, the unpublished run's are still there, and
+   the agent log names the published run as given up early to fit the budget
+   (#494 S4). The budget is a contract constant, so the row is satisfied by
+   filling the node, never by reconfiguring it; a run that lowers the budget
+   instead does not satisfy it.
 
 For every row, record the ordinary L3 run and L1 job projections, redacted
 reserved-name presence (never values), helper generation, attempts, digest
 arrays, payload-execution count, logs, exact handoff marker bytes, the
 retention proof (`handoff_retained_after_completion=true`,
 `results_retained_until`, `results_expired=false`), and final residue
-inventory. The receipt must also carry `recorded_at`: the fixed instant the
+inventory. Rows 1 and 4 additionally carry the two attended-only facts above —
+`results_terminal_source=receipt` on both, and
+`over_budget_published_evicted_first=true` on row 4 — which no CI lane can
+produce: one needs a real uid-0 workload that cannot forge the receipt, the
+other a node genuinely filled past a gigabyte of retained results. They are
+rows 1 and 4 only: rows 2 and 3 lose the helper mid-attempt, so a volume there
+may legitimately have no helper-owned terminal time at all. The gate requires
+neither — an attended run against node software that predates them records
+neither, and a missing observation must not read as a failed one — but it
+holds what is recorded to its meaning: `results_terminal_source` is `receipt`
+or `mtime_fallback` and nothing else, and a row carrying
+`over_budget_published_evicted_first=false` is refused by name, because a node
+that gave an unpublished result up while a published one remained is a defect
+to file rather than a row to pass.
+
+The receipt must also carry `recorded_at`: the fixed instant the
 receipt builder finished assembling the artifact, which the gate compares
 `results_retained_until` against instead of the wall clock it happens to run
 under, so the same receipt reads the same way today and a month from now.

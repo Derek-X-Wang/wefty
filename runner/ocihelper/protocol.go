@@ -110,6 +110,17 @@ const (
 	CodeDiagnosticFailure    ErrorCode = "diagnostic_failure"
 	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
 	CodeSweepRequired        ErrorCode = "sweep_required"
+	// CodeHandoffVolumeLive refuses a handoff-volume deletion because an
+	// attempt of this node still owns the volume.
+	//
+	// It is a replayable refusal and not an engine failure: nothing was
+	// detached, nothing was freed, and the identical request succeeds once the
+	// owner finishes. The agent's budget eviction is the only caller that can
+	// meet it -- it selects from an inventory snapshot, and an attempt may
+	// claim a volume between that read and this call -- and the honest answer
+	// to "give up a volume a run is writing into" is to refuse, not to take
+	// the files out from under a running container.
+	CodeHandoffVolumeLive ErrorCode = "handoff_volume_live"
 	// CodeStartupBoundTripped refuses session admission because the startup
 	// barrier already burned its consecutive-failure bound. This generation
 	// never ran a startup sweep, so the refusal is cheap and repeatable, and
@@ -1807,6 +1818,16 @@ type RetainedHandoffVolume struct {
 	// counted once for the node. Symlinks are never followed.
 	LogicalBytes int64 `json:"logical_bytes"`
 	DedupedBytes int64 `json:"deduped_bytes"`
+	// ChargedBytes is what this volume costs a node budget, under exactly the
+	// rule the agent's own handoff root uses: every directory entry the pass
+	// reached contributes the larger of its deduplicated logical bytes and
+	// 4 KiB. One charging rule over both roots is the point -- an entry is an
+	// inode and a directory slot whatever it holds, so a tree of a million
+	// empty files is ~0 logical bytes and about 4 GiB here, and the node that
+	// is really out of inodes can see it. It is reported rather than derived
+	// from the two figures above, because no function of a volume total and an
+	// entry count reproduces a per-entry floor.
+	ChargedBytes int64 `json:"charged_bytes"`
 	// Entries is every directory entry the pass reached, which is the inode
 	// cost neither byte figure can show on its own.
 	Entries int64 `json:"entries"`
@@ -1859,16 +1880,70 @@ const (
 	HandoffAnomalySubtreeReplaced HandoffVolumeAnomaly = "subtree_replaced"
 )
 
-// InventoryHandoffVolumesRequest carries nothing beyond the session envelope.
+// HandoffVolumeLiveError refuses a handoff-volume deletion because an attempt
+// still owns the volume.
+//
+// It is a refusal, not a failure: nothing was detached and nothing was freed,
+// and the identical request succeeds once that attempt finishes. The caller it
+// exists for is the agent's budget eviction, which selects from an inventory
+// snapshot and can therefore arrive after a rerun has claimed the volume it
+// chose -- and taking a mounted tree out from under a running container is not
+// something a byte budget may do.
+//
+// It lives here rather than beside the engine that raises it because the
+// server maps it to a wire code on every platform, including the ones that
+// build no containerd engine at all.
+type HandoffVolumeLiveError struct {
+	// Name is the helper's own directory name for the volume. It is the
+	// helper's to say: the caller named an owner key, and this is what that
+	// key derives to here.
+	Name string
+}
+
+func (err *HandoffVolumeLiveError) Error() string {
+	return fmt.Sprintf("handoff volume %s is owned by a live attempt and is not the budget's to give up", err.Name)
+}
+
+func (err *HandoffVolumeLiveError) Code() ErrorCode { return CodeHandoffVolumeLive }
+
+// InventoryHandoffVolumesRequest carries a page cursor and nothing else.
 // Attempt authority is not merely unnecessary here, it is unrepresentable: a
 // body that tries to attach one is refused as an unknown field.
-type InventoryHandoffVolumesRequest struct{}
+type InventoryHandoffVolumesRequest struct {
+	// After resumes a listing from the opaque `Next` a previous response
+	// returned. It binds the last volume name to the cached scan identity, so a
+	// continuation cannot splice onto a scan that another first-page request
+	// installed for the session.
+	//
+	// A flag alone could not make the tail of a large root readable: it said
+	// the response stopped and gave no way to ask for the rest, so a node
+	// could not know whether the published result it must give up first was
+	// simply beyond the prefix.
+	After string `json:"after,omitempty"`
+}
 
 type InventoryHandoffVolumesResponse struct {
 	Volumes []RetainedHandoffVolume `json:"volumes"`
-	// Exhausted says the node holds more handoff volumes than one response
-	// carries, so the figures above are a floor rather than the node total.
+	// Exhausted says this page stopped before the end of the root -- its row
+	// or byte budget ran out, or its caller was cancelled -- so these figures
+	// are this page's, not the node's.
 	Exhausted bool `json:"exhausted"`
+	// Next is the cursor to pass as the following request's After. A page that
+	// stopped early carries one; a page that finished does not. What says the
+	// listing is complete is `exhausted=false`, never an empty cursor, because
+	// a page that stopped before its first row has an empty cursor too.
+	Next string `json:"next,omitempty"`
+	// Restart says the root changed under this listing, so there is no
+	// consistent page to return and the reader starts over from the first.
+	// Stitching a page of one root to a page of another is how a volume
+	// created behind the cursor becomes invisible to every call -- and to a
+	// budget that gives published results up first, an invisible published
+	// volume is an unpublished one destroyed.
+	Restart bool `json:"restart,omitempty"`
+	// Generation is the root's mutation counter for the scan this page came
+	// from, so a reader can assert that every page it stitches together
+	// describes the same root. On a restart it is the counter now.
+	Generation uint64 `json:"generation"`
 	// DetachedTrees counts the volumes an authorized deletion detached from
 	// their names and whose bytes are not yet freed, after this call finished
 	// what it could. They are in no volume's figures above -- a detached tree
@@ -1877,11 +1952,17 @@ type InventoryHandoffVolumesResponse struct {
 	DetachedTrees int `json:"detached_trees,omitempty"`
 }
 
-// MaxInventoriedHandoffVolumes bounds one InventoryHandoffVolumes response the
-// way the run mailbox listing is bounded: a node is told what it holds, or
-// told that it holds more than it was shown, and never handed an unbounded
-// frame.
+// MaxInventoriedHandoffVolumes bounds one InventoryHandoffVolumes page the way
+// the run mailbox listing is bounded: a node is handed a page and a cursor,
+// never an unbounded frame.
 const MaxInventoriedHandoffVolumes = 4096
+
+const handoffScanIDHexCharacters = 16
+
+// MaxHandoffInventoryCursorBytes bounds the opaque `<scan-id>:<volume-name>`
+// cursor a caller may send. A volume name is bounded by the prior 256-byte
+// allowance; the scan identity and separator are fixed-width overhead.
+const MaxHandoffInventoryCursorBytes = handoffScanIDHexCharacters + 1 + 256
 
 // handoffInventoryFrameHeadroom is what one InventoryHandoffVolumes response
 // leaves below MaxFrameBytes for the reply envelope and framing.

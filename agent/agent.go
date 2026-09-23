@@ -139,8 +139,12 @@ type Agent struct {
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
 	retainedHandoffs  workloadrunner.RetainedHandoffInventory
-	runLedger         runLedgerAppender
-	mailboxPoll       time.Duration
+	// evictRetainedHandoffs gives one retained handoff volume up when the node
+	// is over its retained-results budget. It is separate from the inventory
+	// above because that one only reads.
+	evictRetainedHandoffs workloadrunner.RetainedHandoffEvictor
+	runLedger             runLedgerAppender
+	mailboxPoll           time.Duration
 	// mailboxStateRoot is the agent-owned durable directory under which a
 	// mailbox the agent cannot open keeps its bookkeeping.
 	mailboxStateRoot      string
@@ -310,6 +314,7 @@ func New(config Config) (*Agent, error) {
 	var computerStorageCopier workloadrunner.ComputerStorageCopier
 	var computerCustodyExporter workloadrunner.ComputerCustodyExporter
 	var retainedHandoffs workloadrunner.RetainedHandoffInventory
+	var evictRetainedHandoffs workloadrunner.RetainedHandoffEvictor
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
@@ -326,6 +331,7 @@ func New(config Config) (*Agent, error) {
 		computerStorageCopier, _ = runtimeAdapter.(workloadrunner.ComputerStorageCopier)
 		computerCustodyExporter, _ = runtimeAdapter.(workloadrunner.ComputerCustodyExporter)
 		retainedHandoffs, _ = runtimeAdapter.(workloadrunner.RetainedHandoffInventory)
+		evictRetainedHandoffs, _ = runtimeAdapter.(workloadrunner.RetainedHandoffEvictor)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -452,7 +458,7 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs:         newHandoffManager(config.HandoffRoot, logSpoolDirectory, config.NodeID, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
-		retainedHandoffs: retainedHandoffs,
+		retainedHandoffs: retainedHandoffs, evictRetainedHandoffs: evictRetainedHandoffs,
 		runLedger:        newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
 		mailboxPoll:      durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
 		mailboxStateRoot: logSpoolDirectory,
@@ -549,9 +555,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.handoffs.now = func() time.Time { return a.clock.Now() }
 		a.handoffs.observeAccounting = a.observer.recordRetainedResults
 		// The node's other handoff root. It is the helper's filesystem, so the
-		// figures cross the runtime seam rather than being measured here; this
-		// slice reads and reports them and acts on none of them.
+		// figures cross the runtime seam rather than being measured here.
 		a.handoffs.ociHandoffs = a.retainedHandoffs
+		// And what gives one of its volumes up. The node budget is one figure
+		// over both roots, so the agent has to be able to act on the root it
+		// cannot measure as well as the one it can.
+		a.handoffs.ociEvictor = a.evictRetainedHandoffs
 		// Adoption before collection, and only here: it gives a deadline to
 		// what a crash left behind -- a run that was executing when this node
 		// stopped, or a directory carrying this node's ownership marker and no
@@ -576,11 +585,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		// is up. It never runs on an attempt's finalization path, where one
 		// workload's tree would sit in front of every other run.
 		//
+		// It measures and reports and gives nothing up. The budget's first
+		// irreversible decision does not belong inside the call that is
+		// bringing the node up, before it has claimed any work and while its
+		// helper session and record store are still settling; the first
+		// enforcing pass is the first timer tick, by which point the node is
+		// serving.
+		//
 		// It carries the collector's context, which is this call's -- a pass
 		// over an adversarial tree at startup is as much of a stall as one on
 		// the timer, and cancelling Run has to reach it before Close waits on
 		// anything.
-		if err := a.handoffs.accountNode(a.collectorContext); err != nil {
+		if err := a.handoffs.measureNodeOnly(a.collectorContext); err != nil {
 			a.log("measure this node's retained results: %v", err)
 		}
 	}

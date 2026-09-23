@@ -118,16 +118,22 @@ type ContainerdEngine struct {
 	nextPort                    uint16
 	serviceVolumeMu             sync.Mutex
 	handoffRetentionMu          sync.Mutex                   // serializes receipt publication only; never held across measurement or containerd work
+	handoffMutationGeneration   uint64                       // bumped under handoffRetentionMu by every change to the handoff root's shape
+	handoffScanMu               sync.Mutex                   // guards the cached whole-root scan; never held across the scan itself
+	handoffScan                 *handoffRootScan             // the last whole-root measurement, which every page of one listing is served from
+	afterAttemptOwnershipRename func() error                 // a test fails an ownership publication with its record already renamed into place
 	handoffMeasureEntered       func(string)                 // a test observes when one volume's measurement begins
 	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
 	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
 	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
+	handoffRetentionSync        func(string) error           // a test makes a published receipt's directory sync fail
 	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
 	handoffDetachedRemoving     func(string)                 // a test parks a deletion inside the free of its detached tree
 	handoffFreeChild            func(string, string) error   // a test makes one child of a detached tree fail to free
 	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
 	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
 	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
+	handoffScanID               func() (string, error)       // a test supplies deterministic identities for successive cached scans
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -1258,7 +1264,16 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
 		return RunResponse{}, err
 	}
-	if err := engine.ensureAttemptOwnershipRecord(request.Authority, request.Resources); err != nil {
+	// Durable ownership and the prior attempt's terminal receipt move together,
+	// under one hold of the retention lock and before the task exists.
+	//
+	// Publishing ownership first and superseding the receipt after the task was
+	// created left an interval in which the volume had an owner *and* a valid
+	// receipt -- and a volume with a valid receipt is not live, whoever owns
+	// it, because a finalized owner must not pin its volume forever. A deletion
+	// arriving in that interval found an idle volume and took the files this
+	// attempt was about to be given.
+	if err := engine.admitAttemptOwnershipAndSupersedeHandoff(request.Authority, request.Resources); err != nil {
 		return RunResponse{}, err
 	}
 	stdout := filepath.Join(logDirectory, "stdout.frames")
@@ -3384,20 +3399,41 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			} else if !errors.Is(err, os.ErrExist) {
 				return nil, nil, nil, err
 			}
-		} else if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, nil, nil, err
-		}
-		if volume.Kind == ManagedVolumeHandoff {
+		} else if volume.Kind == ManagedVolumeHandoff {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return nil, nil, nil, err
+			}
+			engine.handoffRetentionMu.Lock()
+			if err := os.Mkdir(path, 0o700); err == nil {
+				// The name is visible now, even if a later preparation step fails.
+				engine.noteHandoffRootMutationLocked()
+			} else if errors.Is(err, os.ErrExist) {
+				info, statErr := os.Lstat(path)
+				if statErr != nil || !info.IsDir() {
+					engine.handoffRetentionMu.Unlock()
+					return nil, nil, nil, errors.Join(err, statErr)
+				}
+			} else {
+				engine.handoffRetentionMu.Unlock()
+				return nil, nil, nil, err
+			}
 			// The mtime no longer decides anything: retention runs from the
 			// helper-owned receipt. It is stamped here so that a volume
 			// prepared and never finalized reports its preparation time as
 			// the labelled fallback, rather than whatever a workload last
-			// wrote. Run supersedes the old receipt only after durable and
-			// in-memory ownership both make this preparation live.
+			// wrote. Run supersedes the old receipt as it publishes ownership,
+			// in one hold of the retention lock.
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
+				engine.handoffRetentionMu.Unlock()
 				return nil, nil, nil, err
 			}
+			// Receiptless volumes expose this fallback time, so changing it also
+			// invalidates a measurement made before preparation.
+			engine.noteHandoffRootMutationLocked()
+			engine.handoffRetentionMu.Unlock()
+		} else if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, nil, nil, err
 		}
 		result[volume.Kind] = path
 	}
@@ -4060,9 +4096,23 @@ func (engine *ContainerdEngine) ensureAttemptOwnershipRecordLocked(authority Att
 			return errors.Join(readErr, err)
 		}
 	}
-	return engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
+	writeErr := engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
 		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
 	})
+	// Ownership is half of what makes a handoff volume live, so publishing it
+	// changes the shape a listing of that root describes. The caller holds
+	// handoffRetentionMu -- both callers of this do -- which is what makes the
+	// record and the bump one event to a reader sampling the generation under
+	// the same lock.
+	//
+	// It bumps whether or not the write reported success, because the record
+	// is renamed into place before the durability step that can still fail:
+	// a record the filesystem is holding and a generation that never moved is
+	// a listing told nothing happened. A bump for a publication that really
+	// did not land costs a listing one restart; a missing one costs a volume
+	// its liveness.
+	engine.noteHandoffRootMutationLocked()
+	return writeErr
 }
 
 // quarantineAttemptOwnershipRecordLocked moves one unreconcilable record out of
@@ -4088,6 +4138,11 @@ func (engine *ContainerdEngine) quarantineAttemptOwnershipRecordLocked(name stri
 	if err := os.Rename(filepath.Join(engine.attemptOwnershipRoot(), name), filepath.Join(directory, attemptOwnershipQuarantinedRecordName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("quarantine durable Attempt ownership record %s: %w", name, err)
 	}
+	// A record moved out of the ownership root is an owner that stopped
+	// existing, which is a volume that may have stopped being live. It is
+	// noted here rather than left to the caller because the caller returns
+	// early on the errors below, and the record has already moved.
+	engine.noteHandoffRootMutationLocked()
 	receipt := AttemptOwnershipQuarantine{
 		Kind: AttemptOwnershipQuarantineKind, ReceiptID: receiptID, Record: name,
 		Reason: reason, QuarantinedAt: now.UTC(),
@@ -4206,6 +4261,14 @@ func (engine *ContainerdEngine) writeAttemptOwnershipRecordLocked(record durable
 	}
 	if err := os.Rename(temporaryName, engine.attemptOwnershipPath(record.Resources)); err != nil {
 		return fmt.Errorf("publish durable Attempt ownership: %w", err)
+	}
+	if engine.afterAttemptOwnershipRename != nil {
+		// A test makes the durability step below fail with the record already
+		// renamed into place, which is the window the caller's unconditional
+		// bump exists for.
+		if err := engine.afterAttemptOwnershipRename(); err != nil {
+			return err
+		}
 	}
 	directory, err := os.Open(root)
 	if err != nil {
@@ -5051,10 +5114,38 @@ func (engine *ContainerdEngine) removeQuiescentAttemptOwnershipRecords(records m
 	return nil
 }
 
+// removeAttemptOwnershipRecord releases one attempt's durable ownership.
+//
+// The handoff root's generation moves for it, because ownership is half of
+// what makes a volume live and a release can therefore make a volume
+// evictable -- and it moves *inside the same hold of handoffRetentionMu as the
+// release itself*. Bumping afterwards left a window in which the record was
+// gone and the generation had not moved, and a listing continued in that
+// window completed from a cached scan that still said the volume was live: a
+// node reading that page would leave an idle volume unevictable until some
+// later change moved the counter.
+//
+// The lock order is the one publication uses -- handoffRetentionMu, then
+// attemptOwnershipMu -- so taking the retention lock out here rather than
+// around the bump alone is what keeps the two paths from inverting.
 func (engine *ContainerdEngine) removeAttemptOwnershipRecord(record durableAttemptOwnership) error {
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	return engine.removeAttemptOwnershipRecordLocked(record)
+}
+
+// removeAttemptOwnershipRecordLocked expects handoffRetentionMu.
+func (engine *ContainerdEngine) removeAttemptOwnershipRecordLocked(record durableAttemptOwnership) error {
 	engine.attemptOwnershipMu.Lock()
 	defer engine.attemptOwnershipMu.Unlock()
-	if err := os.Remove(engine.attemptOwnershipPath(record.Resources)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	switch err := os.Remove(engine.attemptOwnershipPath(record.Resources)); {
+	case err == nil:
+		// The owner is gone from this moment, so the generation moves from
+		// this moment -- before the directory sync below, which can fail
+		// without putting the record back.
+		engine.noteHandoffRootMutationLocked()
+	case errors.Is(err, os.ErrNotExist):
+	default:
 		return err
 	}
 	directory, err := os.Open(engine.attemptOwnershipRoot())

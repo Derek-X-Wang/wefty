@@ -56,7 +56,7 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 	for {
 		manager.mu.Lock()
 		refs := 0
-		if pathLock := manager.paths[path]; pathLock != nil {
+		if pathLock := manager.paths[handoffPathLeaseKey(path)]; pathLock != nil {
 			refs = pathLock.refs
 		}
 		manager.mu.Unlock()

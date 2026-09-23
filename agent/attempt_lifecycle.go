@@ -1173,6 +1173,29 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			defer lifecycle.retainResultsFallback(claim)
 		}
 	}
+	// An OCI one-shot's results live in a helper-owned volume, so this agent
+	// prepares no directory for it -- but it is still the node that admits the
+	// volume, and the node budget must not give up a volume an attempt is
+	// about to write into. The lease and the admission record are taken here,
+	// before the runtime request that registers ownership with the helper, and
+	// held for as long as the process root's are: through the workload, the
+	// verdict, and the result upload that binds this attempt's publication.
+	if handoffs := lifecycle.dependencies.handoffs; handoffs != nil && usesOCIHandoffLifecycle(claim.Job.Spec) {
+		lease, err := handoffs.lockOCIHandoff(ctx, handoffOwnerRunID(claim.Job.Spec))
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+		if retainHandoffLock != nil {
+			retainHandoffLock(lease.release)
+		} else {
+			defer lease.release()
+			defer lifecycle.retainResultsFallback(claim)
+		}
+		if err := handoffs.admitOCIHandoff(lease, claim.Job.Spec,
+			lifecycle.dependencies.nodeID, claim.Lease.AttemptID); err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+	}
 	executionSpec := request.Execution
 	var publishedListener net.Listener
 	var endpoint serviceRuntimeEndpoint
@@ -1620,7 +1643,22 @@ func (lifecycle *attemptLifecycle) retainResultsFallback(claim l1.Claim) {
 }
 
 func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
-	if lifecycle.dependencies.handoffs == nil || lifecycle.handoffOwnership == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
+	if lifecycle.dependencies.handoffs == nil {
+		return nil
+	}
+	if usesOCIHandoffLifecycle(claim.Job.Spec) {
+		// The volume is the helper's, so there is no directory to trim and no
+		// sweep to run here: what finish owes an OCI run is its terminal facts
+		// on this node's own record, which is what stops the budget treating
+		// an admitted volume as idle and what binds this attempt's publication
+		// to the contents it produced.
+		if !lifecycle.resultsRetained.CompareAndSwap(false, true) {
+			return nil
+		}
+		return lifecycle.dependencies.handoffs.finishOCIHandoff(
+			claim.Job.Spec, lifecycle.dependencies.nodeID, claim.Lease.AttemptID, succeeded, published)
+	}
+	if lifecycle.handoffOwnership == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return nil
 	}
 	if !lifecycle.resultsRetained.CompareAndSwap(false, true) {
@@ -1686,6 +1724,18 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 			handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID,
 			claim.Lease.AttemptID, recorded); noteErr != nil {
 			lifecycle.log("agent: record result upload for attempt %s: %v", claim.Lease.AttemptID, noteErr)
+		}
+		// And, for an OCI run, onto the record eviction reads. It is bound to
+		// this attempt: an upload recorded against an owner key alone would be
+		// inherited by the next rerun of that owner, whose contents no ledger
+		// has seen.
+		if usesOCIHandoffLifecycle(claim.Job.Spec) {
+			if noteErr := lifecycle.dependencies.handoffs.noteOCIHandoffUpload(
+				handoffOwnerRunID(claim.Job.Spec), claim.Lease.AttemptID,
+				len(recorded.document) > 0 && recorded.skip == ""); noteErr != nil {
+				lifecycle.log("agent: record the result upload on run %s's OCI handoff record: %v",
+					handoffOwnerRunID(claim.Job.Spec), noteErr)
+			}
 		}
 	}
 }

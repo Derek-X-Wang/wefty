@@ -23,6 +23,10 @@ type retentionHarness struct {
 	manager *handoffManager
 	now     time.Time
 	logs    []string
+	// measured is what the last budget pass found before it acted on it. A
+	// pass that evicted reports twice, and the figures a test wants are
+	// usually the first ones.
+	measured RetainedResultsStatus
 }
 
 func newRetentionHarness(t *testing.T, retention time.Duration) *retentionHarness {
@@ -795,7 +799,7 @@ func TestATransientExpiryFailureIsNeverQuarantined(t *testing.T) {
 		// regains. None of them is the one structural refusal repeating cannot
 		// fix, so none of them may ever stop the sweep.
 		for sweep := 1; sweep <= maxStructuralRefusals+2; sweep++ {
-			harness.manager.noteExpiryFailure(record, fmt.Errorf("remove run_busy: %w", errors.New("device or resource busy")))
+			harness.manager.noteRemovalFailure(record, fmt.Errorf("remove run_busy: %w", errors.New("device or resource busy")))
 			record = requireRetentionRecord(t, harness.manager, "run_busy")
 			if record.Quarantine != "" {
 				t.Fatalf("a transient failure paused the sweep after %d of them: %+v", sweep, record)
@@ -807,7 +811,7 @@ func TestATransientExpiryFailureIsNeverQuarantined(t *testing.T) {
 				t.Fatalf("after %d failures the record counts %d", sweep, record.ExpiryFailures)
 			}
 		}
-		if !harness.logged("the sweep will try again") {
+		if !harness.logged("the next pass will try again") {
 			t.Fatalf("a retryable failure was not reported as one: %v", harness.logs)
 		}
 
@@ -889,7 +893,7 @@ func TestAFailedSweepNeverOverwritesRefreshedTerminalFacts(t *testing.T) {
 		seamRan = true
 		// The failure is being persisted while the sweep still holds this
 		// record's path lease: a rerun could not have reached finish here.
-		if lease := harness.manager.tryCollectLease(loaded.Directory); lease != nil {
+		if lease := harness.manager.tryCollectLease(handoffPathLeaseKey(loaded.Directory)); lease != nil {
 			lease.release()
 			t.Error("the sweep recorded its failure without holding the record's path lease")
 		}

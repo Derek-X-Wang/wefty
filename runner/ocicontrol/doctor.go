@@ -208,9 +208,11 @@ type ComputerStorageRecoveryFacts struct {
 // RetainedResultsFacts is what the node agent's last retained-results
 // accounting pass found under its process handoff root.
 //
-// It is a measurement, not a budget: nothing on the node enforces any of these
-// figures yet (#494). It reaches an operator here because the alternative is
-// the agent log, and a number nobody can ask for is a number nobody reads.
+// It is one root's share of the measurement the node budget is enforced on:
+// the budget is one figure across this root and the OCI helper's, and only
+// this root's figures are on the doctor. It reaches an operator here because
+// the alternative is the agent log, and a number nobody can ask for is a
+// number nobody reads.
 //
 // Both byte figures are carried because they answer different questions.
 // LogicalBytes is what the files hold, with a file two runs hard-link counted

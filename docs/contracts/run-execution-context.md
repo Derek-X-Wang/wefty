@@ -637,32 +637,51 @@ is the whole rule, and it replaces the previous one under which a successful
 attempt deleted its own directory — which meant the outcome an operator most
 wants to read was the only one that left nothing behind.
 
-Two bounds apply, and both are contract values rather than node configuration,
-because a person reading `wefty inspect` has to know when their results stop
-existing:
+Three bounds apply, and all three are contract values rather than node
+configuration, because a person reading `wefty inspect` has to know when their
+results stop existing, and the only honest way to tell them without asking the
+node is for the rule to be the same everywhere:
 
 | Bound | Value | Applies to | What happens past it |
 | --- | --- | --- | --- |
 | Retention window | 7 days | both kinds | The whole directory or volume is swept. |
-| Per run | 64 MiB | the process handoff directory | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. A `result.json` that is not a regular file is not a result at all and is removed, because the alternative is a dangling link named like a verdict. |
+| Per run | 64 MiB, logical bytes | the process handoff directory | `result.json` is kept whole and everything else goes, largest first, with a logged reason. A `result.json` larger than the bound on its own is still kept whole: a partial result document is not a result. A `result.json` that is not a regular file is not a result at all and is removed, because the alternative is a dangling link named like a verdict. |
+| Per node | 1 GiB, charged bytes | both roots together | Whole runs are given up before their window runs out, published ones first, until the node fits. |
 
-**There is no node-wide budget in part 1.** A budget across every retained run
-needs accounting and an eviction order, and both need to be right: measuring a
-tree a workload is still writing, deciding which run to lose, and doing it
-without racing the attempt that owns the directory. Part 1 keeps the two rules
-it can enforce correctly and leaves the node budget to #494. A node's retained
-results are therefore bounded by how many runs it executes within the window and
-by 64 MiB each, not by a single figure.
+**Seven days is the schedule, not a guarantee.** A node over its budget gives
+results up earlier, published ones first, and `wefty inspect`'s
+`retained_until` is that schedule rather than a promise the node will keep it.
+Nothing is reported to the ledger when a node evicts early: an uploaded result
+document is already in L1 and stays readable with `wefty results`, so what an
+early eviction usually costs is the supporting files beside it, not the
+verdict. **Usually, and not always**: a run whose result never reached the
+ledger has no copy anywhere else, which is exactly why those results are the
+last thing a node gives up and why it says so by name when it does.
 
-**The per-run bound covers the process handoff directory only.** An OCI run's
-results live in a helper-owned volume the agent cannot measure — on a Mac node
-the helper runs inside a Lima VM, so the agent cannot even stat that filesystem
-— and no per-run byte bound is enforced there. The helper does measure it: it
+**The node budget is one figure over both roots.** It is 1 GiB for every node,
+the same way the window is 7 days for every node; an operator override is a
+later ticket if a real node needs one, not something a reader has to go and ask
+a node about. Two budgets could not be one number — each root could be inside
+its own share while the node was over — and the order the node gives results up
+in depends on a fact only the agent holds, so there is one budget and one
+decider.
+
+**Its unit is charged bytes, which is not the per-run bound's unit.** The
+per-run bound trims names, so it has to count what trimming recovers, and it
+counts logical bytes. A node runs out of inodes, directory-read time and backup
+windows as well as disk, so the node figure puts a floor of 4 KiB under every
+directory entry: a tree of a million empty files is ~0 logical bytes, a node in
+real trouble, and about 4 GiB against this budget. Neither figure is derived
+from the other and both are reported.
+
+**OCI volumes are counted against the same number.** An OCI run's results live
+in a helper-owned volume the agent cannot measure — on a Mac node the helper
+runs inside a Lima VM, so the agent cannot even stat that filesystem — and no
+per-run byte bound is enforced there. The helper measures its own root and
 reports every retained handoff volume's logical bytes, bytes deduplicated by
-inode across its whole root, and entry count over the protocol
-(`oci-helper-protocol.md`, `InventoryHandoffVolumes`), and the node agent reads
-those figures beside its own root's and reports both. Nothing acts on them yet;
-the node budget that will is #494's last slice.
+inode across its whole root, entry count and charged bytes over the protocol
+(`oci-helper-protocol.md`, `InventoryHandoffVolumes`), and the node counts the
+charged figure it is given.
 
 **The OCI window runs from a helper-owned terminal receipt**, written after the
 attempt's task is reaped and its absence verified, in a durable root the
@@ -676,14 +695,21 @@ its age is reported with the mtime labelled as a workload-writable fallback,
 and the next boot sweep, once it has proved the previous workloads stopped,
 gives it a helper-owned terminal time so its window can start at all.
 
-Collection expires and evicts nothing; measuring what is left is a separate
-pass on the collector's own timer. Collection runs at agent startup, after
-finalizing an attempt's prepared handoff — including attempts that never
-completed cleanly — and hourly.
+Collection expires and nothing else; measuring what is left, and giving results
+up to fit the node budget, are the accounting pass on the collector's own
+timer. Collection runs at agent startup, after finalizing an attempt's prepared
+handoff — including attempts that never completed cleanly — and hourly. The
+accounting pass runs at startup and on that timer and **never on an attempt's
+finalization**: eviction has to measure first, and one workload's directory
+tree must never sit in front of another run finishing or of the node lock being
+released.
 The collector is the agent's own and is cancelled and joined before the node
-lock is released. A run an attempt is holding is never swept: the sweep takes
-the same path lock an attempt does, re-checks its ownership immediately before
-deleting, and releases the lock to attempts that arrived during deletion.
+lock is released. A run an attempt is holding is never swept and never evicted:
+both take the same path lock an attempt does, re-check ownership immediately
+before deleting, and release the lock to attempts that arrived during deletion.
+An attempt that claims a path after the node was measured and before it was
+evicted therefore keeps its directory — the eviction skips that candidate and
+says so rather than deleting it.
 
 The authority it acts on is a record the agent keeps under its own state
 directory, never a file inside the handoff directory: a process workload shares
@@ -747,27 +773,40 @@ writes: configured ancestor directories remain trusted, and another process
 with that identity can still move or alter files. The agent's path locks exclude
 its own attempts while it collects.
 
-**The budgets are logical bytes**, summed over regular files: the length a file
-reports, not the blocks it occupies. A symlink is never followed and contributes
-nothing; the per-run bound charges a hard-linked file once per link, because
-that bound trims names and dropping one name recovers nothing while another
-still holds the inode. Sparse files are charged their logical length. No budget
-bounds inodes or entry counts, so many tiny files can consume node resources
-while barely moving the per-run budget.
+**Both figures are measured over regular files**, by the length a file reports
+rather than the blocks it occupies. A symlink is never followed and contributes
+nothing, and a sparse file is charged its logical length.
 
-**What the node reports is measured differently from what it enforces.** The
-agent's accounting pass reports two figures over the runs its records name, and
-enforces neither. Logical bytes are as above, except that a file two runs
+**The per-run bound is in logical bytes** and charges a hard-linked file once
+per link, because that bound trims names and dropping one name recovers nothing
+while another still holds the inode. It bounds no inodes and no entry counts,
+so many tiny files can consume node resources while barely moving it. **The
+node budget is in charged bytes** and is what answers that: a floor of 4 KiB
+under every directory entry, which is what makes a tree of a million empty
+files — no logical bytes, and a node out of inodes — a figure something can
+act on. Neither is derived from the other and both are reported.
+
+**What the node reports is more than what it enforces.** The accounting pass
+reports both figures over the runs its records name, and the node budget acts
+on the second. Logical bytes are as above, except that a file two runs
 hard-link is counted once per pass rather than once per link, because one inode
 is one piece of storage however many names reach it — and it is charged to
 whichever run the pass reached first, so giving up the other run recovers none
 of those bytes. That is safe to act on only because the node remeasures after
-every deletion rather than subtracting what it thought a run was worth. Charged
-bytes are that same measurement with a floor of 4 KiB under every directory
-entry, which is what makes a tree of a million empty files — no logical bytes,
-and a node out of inodes — a number an operator can see. Each run's own share
-of both figures is kept in memory beside the totals and never on its record: a
-record is authority to delete, and has to stay what an attempt wrote.
+every deletion rather than subtracting what it thought a run was worth. Each
+run's own share of both figures is kept in memory beside the totals and never
+on its record: a record is authority to delete, and has to stay what an attempt
+wrote.
+
+**The helper measures its own root by the same rule and reports both figures.**
+Charged bytes cross the protocol rather than being derived on this side,
+because no function of a volume total and an entry count reproduces a per-entry
+floor: one 600 MiB file beside 150,000 empty ones is about 600 MiB of data and
+about 1.2 GiB of node, and a node that inferred the second from the first would
+read an over-budget root as fitting. Deduplication spans the whole root: the helper
+measures it once per listing and serves every page of that listing from the one
+measurement, so a file two volumes hard-link is charged once however far apart
+those volumes sort.
 
 The pass also counts, separately, three things it cannot charge: entries under
 the handoff root that no record names, which are neither measured nor removed;
@@ -778,12 +817,100 @@ interrupts it. A truncated run's figures are a floor, not a measurement. The
 pass runs at agent startup and on the collector's own timer, never on an
 attempt's finalization, so one workload's directory tree never sits in front of
 another run finishing or of the node lock being released. All of it reaches a
-person through the agent log and the node doctor's retained-results line. The
-budget that will enforce a node-wide figure is #494.
+person through the agent log and the node doctor's retained-results line.
 
-The record also carries whether the run's evidence reached the ledger. Nothing
-in part 1 reads it — there is no eviction order for it to inform — and it is
-kept because part 2 reports it and #494's eviction order needs it.
+**What the node gives up when it is over budget.** On the collector's timer, and only
+there, the node evicts until it fits. The pass at agent startup measures and
+reports and gives nothing up: the budget's first irreversible decision does not
+belong inside the call bringing the node up, before it has claimed any work. Published results go first: a run whose
+evidence reached a ledger has a copy somewhere else, and the `published` fact
+the record carries — the mailbox drain verdict, and the result upload, which is
+the only place an OCI run is named at all — is what says so. Within each of
+those two classes the oldest terminal time goes first, except that a handoff
+volume with no helper-owned terminal receipt is given up **last** rather than
+first: that timestamp is one the workload could have written, and ordering
+evictions by it would let one workload push an honest run's results off a full
+node — the same forgery the window already refuses, with a slower fuse.
+
+The node **remeasures after every deletion rather than subtracting** what it
+thought a run was worth. A file two runs hard-link is charged to whichever the
+pass reached first, so giving that run up recovers none of those bytes while
+the other still holds a link, and a pass that subtracted would stop while the
+node was still full. One pass gives up a bounded number of results and reports
+what is left over; the next hourly pass continues.
+
+**When nothing published can be given up** and the node is still over budget,
+the oldest unpublished result is given up anyway, with a loud log line under a
+fixed token that names the run. Those files are the only copy of what that run
+did, and giving one up is a real loss — but a node that fills and stops serving
+loses every run after it, which is the worse one. "Nothing published" means the
+node holds no published result it may take at all: none, or only ones it may
+never take — the list below. Within a class the node tries candidates in order until one is given up: a
+result an attempt is holding, or whose record moved on, is that class being
+busy rather than a reason to leave a full node full. A published result that is
+merely *busy* this pass
+is not one of those, and the node ends the pass rather than reaching past it to
+a run's only copy; the next hourly pass tries again.
+
+**Before it may give up a result no ledger saw, the node has to know both
+roots whole.** An empty list of published candidates is not the same fact as a
+node holding none: a page of the helper's root nobody read, a read that failed
+outright, or a run whose tree the pass could not finish can each hide the
+published result the node is supposed to give up first. A pass that cannot say
+it read both roots to the end therefore gives up nothing rather than the only
+copy of what some run did, and says so under a fixed log token. Everything else
+it does is unchanged — it reports every figure, it still gives up published
+results, and expiry is untouched. The helper's root is read as pages with a
+cursor for exactly this reason: a bound with no way to ask for the rest left
+the tail unreadable by any number of calls.
+
+**What the budget cannot give up, however full the node is.** A run an attempt
+is holding, on either root and by the same mechanism: the agent takes the run's
+path lease before it prepares a directory or admits a volume, and the budget
+takes that same lease before it gives anything up, so a candidate an attempt
+claimed while the node was being measured is skipped rather than deleted. An
+OCI run's volume is admitted on a record this node writes **before** the
+runtime request, which is what makes it visible as in-flight from before the
+helper has heard of the attempt at all; the helper then refuses the deletion
+outright, under the lock that publishes ownership, for any volume an attempt
+owns when the request arrives. That refusal is replayable and is not a failure:
+it is the guard working, and the node keeps the results and chooses again. A run whose name the sweep
+has paused as unsafe to delete — and it is still charged, or quarantine would
+be a way to hide storage from the budget. A run that has been admitted and has
+not finished. And **a handoff volume whose name no run of this node derives**:
+a volume is evicted by asking the helper for the owner key the agent derived,
+and one it cannot derive it cannot ask about, so such a volume is counted,
+reported, and left to the helper's own expiry — which is a stated limit rather
+than a solved problem. A node holding nothing but idle crash-residue volumes
+stays over its budget until that expiry runs. Closing it needs a reclamation
+handle the helper can bind to an identity, with the same live-owner refusal the
+owner-keyed arm has; manufacturing an owner key for a name the node cannot
+place would be a deletion authority nobody validated, which is worse than the
+wait. Results whose removal the node
+already authorized and which the helper has not finished freeing are treated as
+already reclaimed, for the symmetric reason: nothing the budget could decide
+would change their fate, and charging them would make the node give live
+results up to make room for bytes that are already going away.
+
+A pass reads the helper's root as pages of one measurement, until a page
+reports that it reached the end. Every page carries the generation of the
+measurement it came from, and the node asserts that the pages it stitches
+together are one; if the root changes under the listing the helper says so and
+the node starts over, bounded. A pass that spends its page or restart bound, or
+that is told a page stopped with no way to resume, reports its figures for that
+root as a floor and withholds the one decision that needs complete knowledge.
+Its own root withholds it the same way: a run measured incompletely, or one
+whose subtree stopped being the directory the pass was measuring, can report
+nothing and drop out of the published candidates entirely.
+
+The record carries whether the run's evidence reached the ledger, and that is
+what this order reads. For an OCI run that record is the node's own admission
+document, written before the runtime request and naming the attempt it admitted
+— which is what makes publication a fact about an attempt rather than about an
+owner. A rerun of a published owner replaces it, so the rerun's own contents,
+which no ledger has seen, are not given up first on the strength of what an
+earlier attempt uploaded. The upload outcome is joined to the attempt that
+produced it for the same reason.
 
 These are the agent's own bounds. Cache-pressure rules elsewhere — the OCI image
 cache, a node running out of disk — govern their own resources and neither

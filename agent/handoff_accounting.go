@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 // handoffChargedEntryFloor is what one directory entry costs the node figure
@@ -632,9 +634,9 @@ func handoffLogicalBytes(info os.FileInfo, seen map[handoffInode]struct{}) int64
 // measureNode is the accounting pass: what this node is holding in retained
 // results, in both units, across every run it has a record for.
 //
-// It enforces nothing. There is no node budget here and nothing is evicted;
-// this slice's whole job is that the figure a budget will need exists, is
-// right, and is visible before anything acts on it.
+// It enforces nothing itself. What the node gives up is decided by the budget
+// pass over both roots (handoff_budget.go) on the figures this produces; this
+// one only has to be right, and to be right before anything acts on it.
 //
 // Every record is measured, including a quarantined one. Quarantine means "the
 // sweep cannot safely delete this", which is the opposite of a reason to stop
@@ -701,11 +703,11 @@ func (m *handoffManager) measureNode(ctx context.Context, root *os.Root, now tim
 		status.Entries += tally.entries
 		status.Replaced += tally.replaced + tally.vanished
 		status.Truncated += tally.truncated
-		// One row per run, in memory and nowhere else. The node budget the
-		// next slice enforces has to choose *which* run to give up, and
-		// choosing needs each run's own figure -- but a figure that moves with
-		// the files does not belong on the record, which is authority to
-		// delete and has to stay what an attempt wrote.
+		// One row per run, in memory and nowhere else. The node budget has to
+		// choose *which* run to give up, and choosing needs each run's own
+		// figure -- but a figure that moves with the files does not belong on
+		// the record, which is authority to delete and has to stay what an
+		// attempt wrote.
 		status.PerRun = append(status.PerRun, RetainedRunFigures{
 			RunID: record.RunID, Entries: tally.entries,
 			LogicalBytes: tally.logical, ChargedBytes: tally.charged,
@@ -759,14 +761,42 @@ func (m *handoffManager) countUnrecorded(root *os.Root, recorded map[string]stru
 // put this pass in front of every finalization again, which is the whole reason
 // it moved off that path.
 func (m *handoffManager) accountNode(ctx context.Context) error {
+	return m.accountNodeEnforcing(ctx, true)
+}
+
+// measureNodeOnly is the startup pass: it measures and reports and gives
+// nothing up.
+//
+// Startup is the one moment a node is holding everything it will ever hold
+// from its last life and has admitted nothing from this one. A pass that
+// enforced there would run before the agent has claimed any work, inside the
+// call that is trying to bring the node up, and would hand a node whose helper
+// session or record store is still settling its first irreversible decision --
+// deletions -- on the thinnest information it will ever have. It reports
+// instead, so an operator sees the figures immediately, and the first pass
+// that acts is the first timer tick, by which time the node is serving and its
+// second measurement agrees with its first.
+func (m *handoffManager) measureNodeOnly(ctx context.Context) error {
+	return m.accountNodeEnforcing(ctx, false)
+}
+
+func (m *handoffManager) accountNodeEnforcing(ctx context.Context, enforce bool) error {
 	root, err := openPrivateHandoffDirectory(m.root)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
 	status := m.measureNode(ctx, root, m.now().UTC())
-	status.OCI = m.measureOCIHandoffs(ctx)
+	status.OCI, status.OCIInventoryFailed = m.measureOCIHandoffs(ctx)
 	m.reportNodeAccounting(status)
+	if !enforce {
+		return nil
+	}
+	// And then, on the same pass and the same goroutine, the node budget acts
+	// on those figures. It is here rather than in collect() because eviction
+	// needs a measurement and measuring a workload's tree must never sit in
+	// front of an attempt's finalization.
+	m.enforceNodeBudget(ctx, root, status)
 	return nil
 }
 
@@ -782,10 +812,16 @@ func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
 		status.Runs, status.InFlight, status.LogicalBytes, status.ChargedBytes, status.Entries,
 		status.QuarantinedRecords, status.Truncated, status.Replaced, status.Unrecorded, m.root)
 	if status.OCI != nil {
-		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live), %d logical bytes, %d deduped bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d measured incompletely, whose figures are a floor; %d carrying a name no run of this node derives; %d result(s) whose removal is authorized and not yet finished freeing, whose bytes are in none of those figures%s",
-			status.OCI.Volumes, status.OCI.Live, status.OCI.LogicalBytes, status.OCI.DedupedBytes, status.OCI.Entries,
+		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live, %d of them admitted here and not yet finished), %d logical bytes, %d deduped bytes, %d charged bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d measured incompletely, whose figures are a floor; %d carrying a name no run of this node derives; %d result(s) whose removal is authorized and not yet finished freeing, whose bytes are in none of those figures and which the budget treats as already reclaimed; %s",
+			status.OCI.Volumes, status.OCI.Live, status.OCI.AdmittedHere, status.OCI.LogicalBytes, status.OCI.DedupedBytes, status.OCI.ChargedBytes, status.OCI.Entries,
 			status.OCI.TerminalUnknown, status.OCI.Anomalies, status.OCI.Truncated, status.OCI.Unattributable, status.OCI.DetachedTrees,
-			map[bool]string{true: "; the helper holds more than it reported, so these are a floor"}[status.OCI.Exhausted])
+			map[bool]string{
+				true:  "this root was read to its end",
+				false: "this root was NOT read to its end, so these figures are a floor and no result no ledger saw may be given up this pass",
+			}[status.OCI.Complete])
+	}
+	if status.OCIInventoryFailed {
+		m.log("agent: this node's OCI handoff root could not be read at all this pass; its figures are absent rather than zero, and no result no ledger saw may be given up while one of this node's two roots is unreadable")
 	}
 	if m.observeAccounting != nil {
 		m.observeAccounting(status)
@@ -827,6 +863,10 @@ func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
 //
 // This is what openRun exists for. It had no caller outside tests until here.
 func (m *handoffManager) adoptResidue() error {
+	// The OCI root's admissions first, and outside the collector lock: they
+	// touch no directory, only this node's own records, and an OCI admission
+	// that never finished is the same shape of residue as a process one.
+	m.reconcileOCIAdmissions()
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
 	root, err := openPrivateHandoffDirectory(m.root)
@@ -876,7 +916,7 @@ func (m *handoffManager) adoptResidue() error {
 // run can have finished between the load and the lease, and a finished record
 // is not this function's to touch.
 func (m *handoffManager) reconcileAdmission(root *os.Root, record retentionRecord, now time.Time) {
-	lease := m.tryCollectLease(record.Directory)
+	lease := m.tryCollectLease(handoffPathLeaseKey(record.Directory))
 	if lease == nil {
 		// An attempt holds this path, so the run is not a prior boot's after
 		// all and its own finish writes the window.
@@ -963,7 +1003,7 @@ func (m *handoffManager) adoptDirectory(runID string, now time.Time) {
 		return
 	}
 	path := filepath.Join(m.root, runID)
-	lease := m.tryCollectLease(path)
+	lease := m.tryCollectLease(handoffPathLeaseKey(path))
 	if lease == nil {
 		return
 	}
@@ -1076,38 +1116,141 @@ func (m *handoffManager) adoptedDeadline(marker handoffMarker, valid bool) func(
 // measureOCIHandoffs reads the node's second handoff root -- the OCI helper's
 // own -- and turns it into the same kind of figure the process root reports.
 //
-// It is a read and only a read in this slice. Nothing is expired here and
-// nothing is evicted: the node budget that will act on both roots is a later
-// slice, and this exists so that when it arrives the figures it needs are
-// already there and already right.
+// It is a read and only a read. Nothing is expired here and nothing is
+// evicted; what acts on these figures is the budget pass (handoff_budget.go),
+// which decides over both roots at once.
 //
 // The agent cannot measure this root itself. On a Mac node the helper runs
 // inside a Lima VM, so the helper measures its own filesystem and the bytes
 // cross the runtime seam. What the agent still owns is the *policy*, and the
-// one fact it adds here is attribution: it derives the volume name each of its
-// own runs would have, so a reported name it cannot place is residue a crash
-// left behind rather than a run this node is accounting for.
-func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIResultsStatus {
+// two facts it adds here are the ones the helper cannot hold: attribution --
+// it derives the volume name each of its own runs would have, so a reported
+// name it cannot place is residue a crash left behind -- and publication,
+// which lives in this agent's own upload and retention records and is what an
+// eviction order has to read.
+func (m *handoffManager) measureOCIHandoffs(ctx context.Context) (*RetainedOCIResultsStatus, bool) {
 	if m == nil || m.ociHandoffs == nil {
-		return nil
+		return nil, false
 	}
-	report, err := m.ociHandoffs.InventoryRetainedHandoffs(ctx)
-	if err != nil {
-		// A node whose accounting read failed is still a node that can place
-		// work. Saying so and reporting no OCI figures is the honest answer;
-		// reporting zeroes would read as an empty root.
-		m.log("agent: read the OCI helper's retained handoff volumes: %v", err)
-		return nil
+	known := m.derivedHandoffVolumes()
+	for restart := 0; ; restart++ {
+		if restart > maxHandoffInventoryRestarts {
+			m.log("agent: the OCI helper's handoff root changed under this node's listing %d times; what this node holds there is a floor",
+				restart)
+			return m.emptyOCIStatus(), false
+		}
+		status, again := m.readOCIHandoffPages(ctx, known)
+		if again {
+			continue
+		}
+		// A nil status is a read that failed outright, which is a different
+		// fact from a root this node has no helper for and a different one
+		// again from a root it read incompletely. All three withhold the
+		// unpublished eviction; only this one says the node could not look.
+		return status, status == nil
 	}
-	known := m.derivedHandoffVolumeNames()
-	status := &RetainedOCIResultsStatus{Exhausted: report.Exhausted, DetachedTrees: report.DetachedTrees}
+}
+
+// emptyOCIStatus is what a pass reports when it read the helper's root and
+// cannot claim to have seen all of it. Every figure it did gather would be a
+// floor over an unknown fraction of the root, and a floor nobody can bound is
+// worse than none -- so the pass reports an incomplete read and no figures,
+// which is exactly what withholds the one decision that needs them.
+func (m *handoffManager) emptyOCIStatus() *RetainedOCIResultsStatus {
+	return &RetainedOCIResultsStatus{Exhausted: true, PerVolume: []RetainedOCIVolumeFigures{}}
+}
+
+// readOCIHandoffPages reads one listing end to end.
+//
+// Every page of one listing comes from one whole-root measurement the helper
+// took, which is what makes stitching them together a consistent view: a
+// volume cannot be created behind the cursor and go unseen, and a file two
+// volumes hard-link is charged once however far apart they sort. When the root
+// changes under the listing the helper says so and this starts over, because
+// half of one root joined to half of another is precisely the answer that
+// hides a published volume from a budget that must give published results up
+// first.
+//
+// It reports the figures -- nil when the read itself failed -- and whether the
+// caller should start over. Whether the listing reached the end of the root is
+// on the figures, as Complete.
+func (m *handoffManager) readOCIHandoffPages(ctx context.Context, known map[string]handoffVolumeAttribution) (*RetainedOCIResultsStatus, bool) {
+	status := &RetainedOCIResultsStatus{PerVolume: make([]RetainedOCIVolumeFigures, 0, MaxHandoffInventoryPageVolumes)}
+	after, generation := "", uint64(0)
+	for page := 0; ; page++ {
+		if page >= maxHandoffInventoryPages {
+			m.log("agent: stop reading the OCI helper's retained handoff volumes after %d pages; what this node holds there is a floor", page)
+			status.Exhausted = true
+			return status, false
+		}
+		report, err := m.ociHandoffs.InventoryRetainedHandoffs(ctx, after)
+		if err != nil {
+			// A node whose accounting read failed is still a node that can
+			// place work. Saying so and reporting no OCI figures is the honest
+			// answer; reporting zeroes would read as an empty root, and a
+			// budget acting on an empty root would give up the other root's
+			// results to make room for bytes it simply could not see.
+			m.log("agent: read the OCI helper's retained handoff volumes: %v", err)
+			return nil, false
+		}
+		if report.Restart {
+			m.log("agent: the OCI helper's handoff root changed while this node was listing it; the listing starts over")
+			return nil, true
+		}
+		if page != 0 && report.Generation != generation {
+			// The helper says this page belongs to a different scan than the
+			// one this listing started. It should not happen -- a changed root
+			// comes back as a restart -- and a listing that stitched two scans
+			// together is the exact defect the restart exists to prevent, so
+			// it is treated as one rather than trusted.
+			m.log("agent: the OCI helper's handoff pages came from different scans (%d then %d); the listing starts over",
+				generation, report.Generation)
+			return nil, true
+		}
+		generation = report.Generation
+		m.foldOCIPage(report, known, status)
+		if !report.Exhausted {
+			// The page reached the end of the root. Only this answer -- never
+			// an empty cursor, which a page that stopped before its first row
+			// also carries -- says the node has been shown everything.
+			status.Complete = true
+			return status, false
+		}
+		status.Exhausted = true
+		if report.Next == "" || report.Next <= after {
+			// A page that stopped and could not say where to resume. Reading
+			// again would ask the same question, so the node stops and says
+			// its figures are a floor.
+			m.log("agent: the OCI helper's retained handoff listing stopped at %q and gave no further cursor; what this node holds there is a floor", after)
+			return status, false
+		}
+		after = report.Next
+	}
+}
+
+// foldOCIPage adds one page of the helper's answer to the node's figures.
+func (m *handoffManager) foldOCIPage(report workloadrunner.RetainedHandoffReport, known map[string]handoffVolumeAttribution, status *RetainedOCIResultsStatus) {
+	// Pending frees are this call's count, not a running total: every page
+	// reports what the helper is still freeing now, so the last word wins.
+	status.DetachedTrees = report.DetachedTrees
 	for _, volume := range report.Volumes {
 		status.Volumes++
 		status.Entries += volume.Entries
 		status.LogicalBytes += volume.LogicalBytes
 		status.DedupedBytes += volume.DedupedBytes
-		if volume.Live {
+		status.ChargedBytes += volume.ChargedBytes
+		attribution, placed := known[volume.Name]
+		if volume.Live || attribution.live {
+			// One volume, one count, however many of the two sources say an
+			// attempt is writing there.
 			status.Live++
+		}
+		if attribution.live {
+			// This node's own record says so, which is a separate fact from
+			// the helper's: the helper learns of an attempt when `Run`
+			// registers it, and this record is written before the request that
+			// does so.
+			status.AdmittedHere++
 		}
 		if !volume.TerminalKnown {
 			status.TerminalUnknown++
@@ -1119,41 +1262,122 @@ func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIRes
 			status.Anomalies++
 			m.log("agent: the OCI helper's handoff volume %s: %s", volume.Name, strings.Join(volume.Anomalies, ", "))
 		}
-		if _, placed := known[volume.Name]; !placed {
+		if !placed {
 			status.Unattributable++
 		}
+		status.PerVolume = append(status.PerVolume, RetainedOCIVolumeFigures{
+			Name: volume.Name, OwnerKey: attribution.ownerKey,
+			Entries: volume.Entries, LogicalBytes: volume.LogicalBytes,
+			DedupedBytes: volume.DedupedBytes, ChargedBytes: volume.ChargedBytes,
+			TerminalAt: volume.TerminalAt, TerminalKnown: volume.TerminalKnown,
+			Live: volume.Live || attribution.live, Truncated: volume.Truncated,
+			Published: attribution.published,
+		})
 	}
-	return status
 }
 
-// derivedHandoffVolumeNames is every handoff volume name this node's own runs
-// would have.
+// maxHandoffInventoryPages bounds one accounting pass's reading of the helper's
+// root. It is a bound on the node's own work rather than on what the helper
+// holds: a pass that spends it reports its figures as a floor, which withholds
+// the one decision that needs complete knowledge and changes nothing else.
+const maxHandoffInventoryPages = 64
+
+// maxHandoffInventoryRestarts bounds how often one pass will start its listing
+// over because the helper's root changed under it.
 //
-// It is derived rather than remembered, and derived from two sources because
-// an OCI run has no retention record at all -- its directory is the helper's --
-// so the upload record, which every runtime writes, is the only place this
-// agent names such a run.
-func (m *handoffManager) derivedHandoffVolumeNames() map[string]struct{} {
-	names := make(map[string]struct{})
-	add := func(runID string) {
-		if strings.TrimSpace(runID) == "" {
-			return
+// A busy node can change that root faster than a node can list it, and a pass
+// that kept starting over would never finish and never report anything. The
+// bound turns that into an incomplete read, which is a thing the budget
+// already knows what to do with: it reports what it has, withholds the one
+// decision that needs a whole view, and the next hourly pass tries again.
+const maxHandoffInventoryRestarts = 4
+
+// MaxHandoffInventoryPageVolumes is the page size the agent expects, used only
+// to size the first allocation.
+const MaxHandoffInventoryPageVolumes = 4096
+
+// handoffVolumeAttribution is what this node knows about one handoff volume in
+// the helper's root that the helper does not: which of its own runs the name
+// belongs to, whether an attempt of this node is writing into it right now,
+// and whether that run's evidence reached the ledger.
+type handoffVolumeAttribution struct {
+	ownerKey  string
+	published bool
+	live      bool
+}
+
+// derivedHandoffVolumes is every handoff volume name this node's own runs would
+// have, with the owner key it was derived from and what became of that run's
+// evidence.
+//
+// The names are derived rather than remembered, and derived from two sources
+// because an OCI run has no retention record at all -- its directory is the
+// helper's -- so the upload record, which every runtime writes, is the only
+// place this agent names such a run.
+//
+// Publication is joined here, on the agent's side, rather than carried on the
+// wire. The helper has no way to know it: publication is the mailbox drain
+// verdict and the result upload, both of which happen in this process.
+//
+// Three sources, in decreasing authority, and the order matters more than the
+// count.
+//
+// The **OCI handoff record** is authoritative when it exists. It is written
+// before the runtime request and it names the attempt it admitted, so it is
+// the only source that can say "an attempt is writing here right now" and the
+// only one whose publication belongs to the contents the volume holds now. A
+// rerun of a published owner replaces it, which is what stops the new,
+// unpublished contents inheriting the old attempt's authority and being given
+// up first.
+//
+// The **upload record** is the legacy fallback, for a volume this node
+// retained before it wrote OCI handoff records at all. It is keyed by owner
+// and not by attempt, so it is used only when no handoff record names the
+// volume -- exactly the case where no rerun has happened since the upgrade.
+//
+// The **retention record** contributes attribution and nothing else. A process
+// run's owner key derives a name the OCI root will never hold; it is kept
+// because a record shape that predates OCI records is still a name this node
+// can derive, and "a name I cannot derive" is the crash-residue signal.
+func (m *handoffManager) derivedHandoffVolumes() map[string]handoffVolumeAttribution {
+	volumes := make(map[string]handoffVolumeAttribution)
+	name := func(ownerKey string) (string, bool) {
+		if strings.TrimSpace(ownerKey) == "" {
+			return "", false
 		}
-		name, err := m.ociHandoffs.RetainedHandoffVolumeName(runID)
+		derived, err := m.ociHandoffs.RetainedHandoffVolumeName(ownerKey)
 		if err != nil {
-			return
+			return "", false
 		}
-		names[name] = struct{}{}
+		return derived, true
 	}
 	for _, record := range m.loadRecords() {
 		// The owner key, not the run ID: a rerun pointed at a source run's
 		// results keeps that run's handoff volume, so naming the volume from
 		// the rerun would look for a directory that does not exist and report
 		// the one that does as residue a crash left behind.
-		add(record.handoffOwnerKey())
+		if derived, ok := name(record.handoffOwnerKey()); ok {
+			volumes[derived] = handoffVolumeAttribution{ownerKey: record.handoffOwnerKey()}
+		}
 	}
 	for _, runID := range m.loadUploadRunIDs() {
-		add(runID)
+		derived, ok := name(runID)
+		if !ok {
+			continue
+		}
+		upload, found, err := m.readUploadRecord(runID)
+		volumes[derived] = handoffVolumeAttribution{
+			ownerKey: runID, published: err == nil && found && upload.Uploaded,
+		}
 	}
-	return names
+	for _, record := range m.loadOCIRecords() {
+		derived, ok := name(record.OwnerKey)
+		if !ok {
+			continue
+		}
+		volumes[derived] = handoffVolumeAttribution{
+			ownerKey: record.OwnerKey, published: record.evidenceReachedLedger(), live: record.live(),
+		}
+	}
+	return volumes
 }

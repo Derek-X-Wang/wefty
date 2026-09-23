@@ -128,7 +128,7 @@ func waitHandoffReferences(t *testing.T, manager *handoffManager, path string, w
 	for {
 		manager.mu.Lock()
 		refs := 0
-		if entry := manager.paths[path]; entry != nil {
+		if entry := manager.paths[handoffPathLeaseKey(path)]; entry != nil {
 			refs = entry.refs
 		}
 		manager.mu.Unlock()
@@ -207,7 +207,7 @@ func TestHandoffAttemptArrivingDuringExpiryAcquiresAfterDeletion(t *testing.T) {
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
 	harness.manager.logf = func(format string, args ...any) {
-		if format == "agent: removing expired results for run %s" {
+		if format == "agent: removing run %s's retained results: %s" {
 			close(entered)
 			<-release
 		}
@@ -527,7 +527,7 @@ func TestHandoffExpiryKeepsRootHandleAfterAncestorReplacement(t *testing.T) {
 	}
 	moved := harness.root + "-moved"
 	harness.manager.logf = func(format string, args ...any) {
-		if format != "agent: removing expired results for run %s" {
+		if format != "agent: removing run %s's retained results: %s" {
 			return
 		}
 		if err := os.Rename(harness.root, moved); err != nil {
