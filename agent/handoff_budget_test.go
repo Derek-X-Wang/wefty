@@ -1839,3 +1839,142 @@ func TestAdoptionAndReconciliationTakeTheSameLeaseAnAttemptDoes(t *testing.T) {
 		}
 	}
 }
+
+// TestARerunThatFinishesPublishedWhileHoldingItsLeaseStopsTheWalk is the last
+// shape of the same defect. A and B are both unpublished; A reruns, finishes
+// *published*, and is still holding its lease when the budget reaches it. A
+// held lease used to be answered "unavailable" without looking at the record,
+// so the walk went on and deleted B's only copy while A -- now the published
+// result that should have gone first -- sat beside it.
+func TestARerunThatFinishesPublishedWhileHoldingItsLeaseStopsTheWalk(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	first := harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_b_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+
+	harness.manager.nodeBytes = 3 << 20
+	var held *handoffLease
+	republished := false
+	handoffBudgetRace = func(stage string, candidate handoffEvictionCandidate) {
+		if republished || stage != handoffBudgetCandidateChosen || candidate.runID != "run_a_unpublished" {
+			return
+		}
+		republished = true
+		// The rerun finishes published and keeps its lease, which is what an
+		// attempt does until its result upload is recorded.
+		harness.now = harness.now.Add(time.Hour)
+		spec := handoffClaim("run_a_unpublished", first, []string{contract.StableNodeTagPrefix + "node-1"}).Job.Spec
+		ownership := prepareHandoffForTest(t, harness.manager, spec)
+		if err := harness.manager.finish(ownership, spec, "node-1", true, true); err != nil {
+			t.Error(err)
+		}
+		held = ownership.lease
+	}
+	t.Cleanup(func() {
+		handoffBudgetRace = nil
+		if held != nil {
+			held.release()
+		}
+	})
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !republished || held == nil {
+		t.Fatal("the fixture never reached the window it exists to stage")
+	}
+	if !harness.exists("run_b_unpublished") {
+		t.Fatalf("the node gave up an unpublished run's only copy while a held candidate had become published: %v", harness.logs)
+	}
+	if !harness.exists("run_a_unpublished") {
+		t.Fatal("the node gave up results an attempt was holding")
+	}
+	if !harness.logged("is held by an attempt and no longer carries the same answer to whether its evidence reached the ledger") {
+		t.Fatalf("the held candidate's record was never read: %v", harness.logs)
+	}
+	if harness.logged(handoffUnpublishedEviction) {
+		t.Fatalf("a result no ledger saw was given up while a published one existed: %v", harness.logs)
+	}
+}
+
+// TestAnOCIVolumeHeldByARerunThatPublishedStopsTheWalk is the same case on the
+// other root, where the held lease is the volume's and the record read is the
+// node's own admission record.
+func TestAnOCIVolumeHeldByARerunThatPublishedStopsTheWalk(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retainOCI("run_a_oci", "attempt-1", false)
+	harness.now = harness.now.Add(time.Hour)
+	harness.retainOCI("run_b_oci", "attempt-1", false)
+	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_a_oci", 2<<20, 2, harness.now),
+		ociVolume(t, "run_b_oci", 2<<20, 2, harness.now),
+	}}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	harness.manager.nodeBytes = 3 << 20
+	var held *handoffLease
+	republished := false
+	handoffBudgetRace = func(stage string, candidate handoffEvictionCandidate) {
+		if republished || stage != handoffBudgetCandidateChosen || candidate.ownerKey != "run_a_oci" {
+			return
+		}
+		republished = true
+		// The rerun admits the volume, finishes published, and keeps the
+		// volume's lease.
+		lease := harness.admitOCI("run_a_oci", "attempt-2")
+		spec := ociHandoffClaim("run_a_oci", "attempt-2").Job.Spec
+		if err := harness.manager.finishOCIHandoff(spec, "node-1", "attempt-2", true, true); err != nil {
+			t.Error(err)
+		}
+		held = lease
+	}
+	t.Cleanup(func() {
+		handoffBudgetRace = nil
+		if held != nil {
+			held.release()
+		}
+	})
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !republished || held == nil {
+		t.Fatal("the fixture never reached the window it exists to stage")
+	}
+	if len(helper.evicted) != 0 {
+		t.Fatalf("the node gave up %v while a held volume had become published: %v", helper.evicted, harness.logs)
+	}
+	if !harness.logged("is held by an attempt and no longer carries the same answer to whether its evidence reached the ledger") {
+		t.Fatalf("the held volume's record was never read: %v", harness.logs)
+	}
+}
+
+// TestAHeldCandidateWhoseRecordIsUnchangedStillAdvances is the other side: the
+// read is there to tell a changed class from a busy one, not to turn every
+// held candidate into a restart. A run an attempt is simply holding leaves the
+// order intact and the walk goes on.
+func TestAHeldCandidateWhoseRecordIsUnchangedStillAdvances(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	held := harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_b_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+
+	lease, err := harness.manager.lock(t.Context(), handoffClaim("run_a_unpublished", held, nil).Job.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.release()
+
+	harness.budget(3 << 20)
+
+	if !harness.exists("run_a_unpublished") {
+		t.Fatal("the node gave up results an attempt was holding")
+	}
+	if harness.exists("run_b_unpublished") {
+		t.Fatalf("an unchanged held candidate stopped the walk: %v", harness.logs)
+	}
+	if !harness.logged("an attempt holds them and its record is unchanged") {
+		t.Fatalf("the node did not say why it advanced: %v", harness.logs)
+	}
+}

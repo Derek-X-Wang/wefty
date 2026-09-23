@@ -507,6 +507,54 @@ func (m *handoffManager) evictCandidate(ctx context.Context, root *os.Root, cand
 	return m.evictRetainedRun(root, candidate, charged)
 }
 
+// candidateMoved re-reads one candidate's own record and says whether it still
+// describes the result this pass chose, and what changed when it does not.
+//
+// It takes no lease and needs none. A read of a record is safe without one
+// because every write to a record is a rename over it -- a reader sees one
+// whole version or another and never half of two -- and what this asks is not
+// "may I delete this" but "is the sorted list I am walking still the right
+// list". That question has to be answerable precisely when the lease is *not*
+// available, because an attempt that reran a run and finished it published
+// holds its lease until the upload is recorded, and a run that changed
+// publication has changed class.
+//
+// It is deliberately conservative about a record it cannot read: unknowable is
+// treated as moved, which costs a remeasure and never costs a run its results.
+func (m *handoffManager) candidateMoved(candidate handoffEvictionCandidate) (bool, string) {
+	if candidate.ociVolume {
+		record, found, err := m.readOCIRecord(candidate.ownerKey)
+		switch {
+		case err != nil:
+			return true, "no longer has a record this node can read"
+		case !found:
+			// No admission record names it, which is what a volume attributed
+			// through the legacy upload record looks like. Nothing about the
+			// order has been shown to have changed.
+			return false, ""
+		case record.live():
+			// An attempt is writing into it. It has left the candidate set
+			// without joining the other class, so the order is intact and the
+			// caller's own message says who holds it.
+			return false, ""
+		case record.evidenceReachedLedger() != candidate.published:
+			return true, "no longer carries the same answer to whether its evidence reached the ledger"
+		}
+		return false, ""
+	}
+	record, ok := m.currentRecord(candidate.record)
+	if !ok {
+		return true, "no longer has a record this node can act on"
+	}
+	if record.Published != candidate.published {
+		return true, "no longer carries the same answer to whether its evidence reached the ledger"
+	}
+	if !record.AdmittedAt.Equal(candidate.admittedAt) || !record.RetainedAt.Equal(candidate.retainedAt) {
+		return true, "was retained again"
+	}
+	return false, ""
+}
+
 // evictRetainedRun gives one run's retained results up early, through exactly
 // the removal expiry uses.
 //
@@ -520,7 +568,20 @@ func (m *handoffManager) evictCandidate(ctx context.Context, root *os.Root, cand
 func (m *handoffManager) evictRetainedRun(root *os.Root, candidate handoffEvictionCandidate, charged int64) evictionOutcome {
 	lease := m.tryCollectLease(handoffPathLeaseKey(candidate.record.Directory))
 	if lease == nil {
-		m.log("agent: leave run %s's retained results alone this pass: an attempt holds them, and the node is over its budget by %d bytes",
+		// A held lease says an attempt has this run. It does not say the order
+		// is still right, and those are different questions: an attempt that
+		// reran this run and finished it *published* keeps its lease until its
+		// result upload is recorded, so the run can have changed class while
+		// still being held. Answering "unavailable" without looking is how the
+		// walk goes on to delete an unpublished run's only copy while the
+		// candidate it skipped has become the published result that should
+		// have gone first.
+		if moved, why := m.candidateMoved(candidate); moved {
+			m.log("agent: run %s is held by an attempt and %s; it is not the result this pass chose to give up, and the node will choose again",
+				candidate.runID, why)
+			return evictionReselect
+		}
+		m.log("agent: leave run %s's retained results alone this pass: an attempt holds them and its record is unchanged, and the node is over its budget by %d bytes",
 			candidate.runID, charged-m.nodeBytes)
 		return evictionUnavailable
 	}
@@ -548,10 +609,9 @@ func (m *handoffManager) evictRetainedRun(root *os.Root, candidate handoffEvicti
 	// giving up something the order would not have picked. Publication
 	// matching is not enough on its own -- a rerun of a published run is
 	// published too.
-	if !record.AdmittedAt.Equal(candidate.admittedAt) || !record.RetainedAt.Equal(candidate.retainedAt) ||
-		record.Published != candidate.published {
-		m.log("agent: run %s was retained again while this node was being measured; it is not the result this pass chose to give up, and the node will choose again",
-			candidate.runID)
+	if moved, why := m.candidateMoved(candidate); moved {
+		m.log("agent: run %s %s while this node was being measured; it is not the result this pass chose to give up, and the node will choose again",
+			candidate.runID, why)
 		return evictionReselect
 	}
 	removed, err := m.removeRetainedRun(root, record, lease, handoffRemovalOverBudget)
@@ -598,7 +658,16 @@ func (m *handoffManager) evictHandoffVolume(ctx context.Context, candidate hando
 	}
 	lease := m.tryCollectLease(ociHandoffLeaseKey(candidate.ownerKey))
 	if lease == nil {
-		m.log("agent: leave the OCI handoff volume for run %s alone this pass: an attempt of this node holds it, and the node is over its budget by %d bytes",
+		// Same question, same answer as the process root: the lease says an
+		// attempt has this volume, not that the order is still right. An
+		// attempt that reran it and finished it published holds the volume's
+		// lease until its upload is recorded.
+		if moved, why := m.candidateMoved(candidate); moved {
+			m.log("agent: the OCI handoff volume for run %s is held by an attempt and %s; it is not the result this pass chose to give up, and the node will choose again",
+				candidate.ownerKey, why)
+			return evictionReselect
+		}
+		m.log("agent: leave the OCI handoff volume for run %s alone this pass: an attempt of this node holds it and its record is unchanged, and the node is over its budget by %d bytes",
 			candidate.ownerKey, charged-m.nodeBytes)
 		return evictionUnavailable
 	}
