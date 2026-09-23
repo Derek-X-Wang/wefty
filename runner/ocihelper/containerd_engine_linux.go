@@ -125,12 +125,14 @@ type ContainerdEngine struct {
 	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
 	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
 	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
+	handoffRetentionSync        func(string) error           // a test makes a published receipt's directory sync fail
 	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
 	handoffDetachedRemoving     func(string)                 // a test parks a deletion inside the free of its detached tree
 	handoffFreeChild            func(string, string) error   // a test makes one child of a detached tree fail to free
 	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
 	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
 	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
+	handoffScanID               func() (string, error)       // a test supplies deterministic identities for successive cached scans
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -3395,10 +3397,24 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			} else if !errors.Is(err, os.ErrExist) {
 				return nil, nil, nil, err
 			}
-		} else if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, nil, nil, err
-		}
-		if volume.Kind == ManagedVolumeHandoff {
+		} else if volume.Kind == ManagedVolumeHandoff {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return nil, nil, nil, err
+			}
+			engine.handoffRetentionMu.Lock()
+			if err := os.Mkdir(path, 0o700); err == nil {
+				// The name is visible now, even if a later preparation step fails.
+				engine.noteHandoffRootMutationLocked()
+			} else if errors.Is(err, os.ErrExist) {
+				info, statErr := os.Lstat(path)
+				if statErr != nil || !info.IsDir() {
+					engine.handoffRetentionMu.Unlock()
+					return nil, nil, nil, errors.Join(err, statErr)
+				}
+			} else {
+				engine.handoffRetentionMu.Unlock()
+				return nil, nil, nil, err
+			}
 			// The mtime no longer decides anything: retention runs from the
 			// helper-owned receipt. It is stamped here so that a volume
 			// prepared and never finalized reports its preparation time as
@@ -3407,11 +3423,15 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			// in one hold of the retention lock.
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
+				engine.handoffRetentionMu.Unlock()
 				return nil, nil, nil, err
 			}
-			// The handoff root's shape changed, so any listing in flight is
-			// reading a root that no longer exists as it was measured.
-			engine.noteHandoffRootMutation()
+			// Receiptless volumes expose this fallback time, so changing it also
+			// invalidates a measurement made before preparation.
+			engine.noteHandoffRootMutationLocked()
+			engine.handoffRetentionMu.Unlock()
+		} else if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, nil, nil, err
 		}
 		result[volume.Kind] = path
 	}

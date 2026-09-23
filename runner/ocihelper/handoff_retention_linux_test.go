@@ -1905,12 +1905,154 @@ func TestAFinishedListingSaysSoWithExhaustedRatherThanAnEmptyCursor(t *testing.T
 	}
 	// Resuming past the only volume is an empty, finished page -- not an
 	// exhausted one.
-	beyond, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: page.Volumes[0].Name})
+	beyond, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{
+		After: engine.handoffScan.id + ":" + page.Volumes[0].Name,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if beyond.Exhausted || len(beyond.Volumes) != 0 {
 		t.Fatalf("a cursor past the end reported %+v", beyond)
+	}
+}
+
+// Repair is the scan prologue. A volume that appears while repair is working
+// must be present when the generation-labelled measurement enumerates names;
+// reusing repair's earlier name list would omit it without any later restart.
+func TestAVolumeCreatedDuringTheInventoryPrologueIsScanned(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	first, _ := makeHandoffVolume(t, root, "prologue-first")
+	created := ""
+	engine.handoffRepairMeasured = func(string) {
+		if created != "" {
+			return
+		}
+		created, _ = makeHandoffVolume(t, root, "prologue-late")
+	}
+
+	page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, volume := range page.Volumes {
+		seen[volume.Name] = true
+	}
+	if created == "" || !seen[first] || !seen[created] {
+		t.Fatalf("the prologue created %q; scan returned %+v", created, page.Volumes)
+	}
+	if page.Exhausted || page.Restart {
+		t.Fatalf("a stable post-prologue root was not read whole: %+v", page)
+	}
+}
+
+// A mutation after the starting generation invalidates the measurement. The
+// helper retries internally, so the first page it exposes is already one
+// validated view and includes the late volume.
+func TestAMutationDuringMeasurementIsInternallyRescanned(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	first, _ := makeHandoffVolume(t, root, "measure-first")
+	stamp(t, engine, first, now)
+	created := ""
+	measurements := 0
+	engine.handoffMeasureEntered = func(string) {
+		measurements++
+		if created != "" {
+			return
+		}
+		created, _ = makeHandoffVolume(t, root, "measure-late")
+		engine.noteHandoffRootMutation()
+	}
+
+	page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, volume := range page.Volumes {
+		seen[volume.Name] = true
+	}
+	if measurements < 2 || created == "" || !seen[first] || !seen[created] {
+		t.Fatalf("measurements=%d created=%q volumes=%+v", measurements, created, page.Volumes)
+	}
+	if page.Exhausted || page.Restart {
+		t.Fatalf("the internally retried scan was not complete: %+v", page)
+	}
+}
+
+// Rename publishes the receipt before its directory is synced. A sync failure
+// still leaves a visible receipt, so it must invalidate an already cached scan.
+func TestAReceiptPublishedBeforeDirectorySyncFailureBumpsGeneration(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "sync-failure")
+	before := engine.handoffRootGeneration()
+	want := errors.New("directory sync failed")
+	engine.handoffRetentionSync = func(string) error { return want }
+
+	err := engine.writeHandoffRetentionReceipt(t.Context(), name, now)
+	if !errors.Is(err, want) {
+		t.Fatalf("receipt publication error = %v, want %v", err, want)
+	}
+	if !receiptPresent(t, root, name) {
+		t.Fatal("the receipt was not visible after rename")
+	}
+	if after := engine.handoffRootGeneration(); after <= before {
+		t.Fatalf("the visible publication left generation at %d (before %d)", after, before)
+	}
+}
+
+// One session caches one scan. A new first-page request may replace it, but a
+// continuation from the displaced scan must restart instead of taking rows
+// from the replacement under the same root generation.
+func TestAContinuationFromAReplacedScanRestarts(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	for _, owner := range []string{"replace-a", "replace-b"} {
+		name, _ := makeHandoffVolume(t, root, owner)
+		stamp(t, engine, name, now)
+	}
+	ids := []string{"0000000000000001", "0000000000000002"}
+	engine.handoffScanID = func() (string, error) {
+		id := ids[0]
+		ids = ids[1:]
+		return id, nil
+	}
+	engine.handoffInventoryBytes = len(`{"volumes":[],"exhausted":false,"detached_trees":0,"generation":0,"next":""}`) + 1
+
+	first, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Exhausted || !strings.HasPrefix(first.Next, "0000000000000001:") {
+		t.Fatalf("first scan did not produce its cursor: %+v", first)
+	}
+	if _, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: first.Next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale.Restart || len(stale.Volumes) != 0 || stale.Next != "" {
+		t.Fatalf("stale continuation spliced onto the replacement scan: %+v", stale)
+	}
+}
+
+func TestTheWholeRootRowCapBoundsTheCachedAllocation(t *testing.T) {
+	names := make([]string, maxScannedHandoffVolumes+1)
+	scan, bounded := newHandoffRootScan("0000000000000001", 1, names, 0)
+	if len(bounded) != maxScannedHandoffVolumes || cap(scan.volumes) > maxScannedHandoffVolumes {
+		t.Fatalf("bounded names=%d cached capacity=%d, cap=%d", len(bounded), cap(scan.volumes), maxScannedHandoffVolumes)
+	}
+	if !scan.truncated {
+		t.Fatal("a root above the row cap was reported complete")
 	}
 }
 

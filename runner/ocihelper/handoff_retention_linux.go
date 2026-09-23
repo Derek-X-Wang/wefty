@@ -4,6 +4,8 @@ package ocihelper
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -314,15 +316,20 @@ func (engine *ContainerdEngine) publishHandoffRetentionReceipt(name string, meas
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("create handoff retention state root: %w", err)
 	}
-	if err := writeAtomicDurableJSONRecord(root, HandoffRetentionRecordName(name), handoffRetentionReceipt{
+	published, err := writeAtomicDurableJSONRecord(root, HandoffRetentionRecordName(name), handoffRetentionReceipt{
 		Version: handoffRetentionReceiptVersion, Device: identity.device, Inode: identity.inode,
 		TerminalAt: terminalAt.UTC(), LogicalBytes: measurement.logical,
 		DedupedBytes: measurement.deduped, Entries: measurement.entries,
 		Truncated: measurement.truncated,
-	}); err != nil {
+	}, engine.handoffRetentionSync)
+	if published {
+		// Rename is the visible mutation. The directory sync may fail after it,
+		// but a cached scan is stale from the instant the name exists.
+		engine.noteHandoffRootMutationLocked()
+	}
+	if err != nil {
 		return err
 	}
-	engine.noteHandoffRootMutationLocked()
 	return nil
 }
 
@@ -386,6 +393,9 @@ func (engine *ContainerdEngine) detachHandoffVolumeAndReceipt(name string) (stri
 			return "", err
 		}
 		detached = ""
+	} else {
+		// The volume disappeared from inventory even if receipt removal fails.
+		engine.noteHandoffRootMutationLocked()
 	}
 	if engine.handoffVolumeRemoved != nil {
 		// A test observes the window between the two: whether a concurrent
@@ -398,10 +408,13 @@ func (engine *ContainerdEngine) detachHandoffVolumeAndReceipt(name string) (stri
 	// The receipt is retained exactly while its volume is. Removing them
 	// together is what keeps "observed = residue union retained" true over
 	// the durable class.
-	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return detached, err
+	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return detached, err
+		}
+	} else {
+		engine.noteHandoffRootMutationLocked()
 	}
-	engine.noteHandoffRootMutationLocked()
 	return detached, nil
 }
 
@@ -574,10 +587,12 @@ func (engine *ContainerdEngine) admitAttemptOwnershipAndSupersedeHandoff(authori
 	if err := engine.ensureAttemptOwnershipRecordLocked(authority, resources); err != nil {
 		return err
 	}
+	// Ownership changes the live projection even if removing an old receipt
+	// subsequently fails.
+	engine.noteHandoffRootMutationLocked()
 	if err := engine.removeHandoffRetentionReceiptLocked(resources.HandoffVolumeDirectory); err != nil {
 		return err
 	}
-	engine.noteHandoffRootMutationLocked()
 	return nil
 }
 
@@ -591,10 +606,13 @@ func (engine *ContainerdEngine) removeHandoffRetentionReceiptLocked(name string)
 	if name == "" {
 		return nil
 	}
-	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else {
+		engine.noteHandoffRootMutationLocked()
 	}
-	engine.noteHandoffRootMutationLocked()
 	return nil
 }
 
@@ -885,15 +903,19 @@ func (engine *ContainerdEngine) publishHandoffRetentionReceiptCreateOnly(name st
 		DedupedBytes: measurement.deduped, Entries: measurement.entries,
 		Truncated: measurement.truncated,
 	})
-	if err != nil {
-		return err
+	if published {
+		// Publication is visible even when the fallback could not unlink its
+		// temporary or the directory sync subsequently fails.
+		engine.noteHandoffRootMutationLocked()
 	}
 	if !published {
+		if err != nil {
+			return err
+		}
 		log.Printf("handoff retention: skip repairing %s because a receipt won create-only publication", name)
 		return nil
 	}
-	engine.noteHandoffRootMutationLocked()
-	return nil
+	return err
 }
 
 // removeOrphanHandoffRetentionReceipts keeps the durable class honest: a
@@ -920,6 +942,9 @@ func (engine *ContainerdEngine) removeOrphanHandoffRetentionReceipts(volumes []s
 			// its own `.attempt.tmp-` leftovers.
 			engine.handoffRetentionMu.Lock()
 			err := os.Remove(filepath.Join(engine.handoffRetentionRoot(), name))
+			if err == nil {
+				engine.noteHandoffRootMutationLocked()
+			}
 			engine.handoffRetentionMu.Unlock()
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				failures = append(failures, err)
@@ -934,6 +959,9 @@ func (engine *ContainerdEngine) removeOrphanHandoffRetentionReceipts(volumes []s
 		}
 		engine.handoffRetentionMu.Lock()
 		err := os.Remove(filepath.Join(engine.handoffRetentionRoot(), name))
+		if err == nil {
+			engine.noteHandoffRootMutationLocked()
+		}
 		engine.handoffRetentionMu.Unlock()
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			failures = append(failures, err)
@@ -1018,12 +1046,9 @@ func (engine *ContainerdEngine) cleanupExpiredHandoffs(ctx context.Context, now 
 // root reports `exhausted=false`, and only that answer means "this is
 // everything".
 //
-// Deduplication is per page. One `(device, inode)` map spans one call, so a
-// file two volumes hard-link is counted once when both land on the same page
-// and once per page when they do not. Carrying the map across calls would mean
-// remembering a caller's pass between requests; charging a shared inode twice
-// across a page boundary overstates a node, which is the safe direction for a
-// bound on what a node keeps.
+// Deduplication spans the cached scan. One `(device, inode)` map covers every
+// volume before the result is cut into pages, so a file two volumes hard-link
+// is charged once however far apart those volumes sort.
 func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, request InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
 	if request.After == "" {
 		scan, err := engine.scanHandoffRoot(ctx)
@@ -1033,16 +1058,27 @@ func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, req
 		engine.storeHandoffScan(scan)
 		return engine.pageHandoffScan(scan, ""), nil
 	}
+	scanID, after, valid := parseHandoffScanCursor(request.After)
 	scan, current := engine.cachedHandoffScan()
-	if scan == nil || scan.generation != current {
+	if !valid || scan == nil || scan.id != scanID || scan.generation != current {
 		// The root changed under the listing, or this session has no scan to
-		// resume. Either way there is no consistent answer to give: stitching
-		// a page of one root to a page of another is how a volume created
-		// behind the cursor becomes invisible to every call. The reader starts
-		// over, which is the only answer that can be whole.
+		// resume. A second first-page request also replaces the one session
+		// cache, and its distinct scan identity keeps an older continuation
+		// from silently splicing pages from the replacement.
 		return InventoryHandoffVolumesResponse{Restart: true, Generation: current}, nil
 	}
-	return engine.pageHandoffScan(scan, request.After), nil
+	return engine.pageHandoffScan(scan, after), nil
+}
+
+func parseHandoffScanCursor(cursor string) (string, string, bool) {
+	scanID, after, ok := strings.Cut(cursor, ":")
+	if !ok || len(scanID) != handoffScanIDHexCharacters || after == "" {
+		return "", "", false
+	}
+	if _, err := hex.DecodeString(scanID); err != nil {
+		return "", "", false
+	}
+	return scanID, after, true
 }
 
 // handoffRootScan is one whole-root measurement, and one listing's whole
@@ -1055,6 +1091,7 @@ func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, req
 // `(device, inode)` map spans the whole root, so a file two volumes hard-link
 // is charged once however far apart those volumes sort.
 type handoffRootScan struct {
+	id string
 	// generation is the root's mutation counter as it stood when this
 	// measurement began. A later page compares it with the counter now; any
 	// difference means this scan describes a root that no longer exists.
@@ -1072,6 +1109,11 @@ type handoffRootScan struct {
 // memory one session's cached scan holds.
 const maxScannedHandoffVolumes = 1 << 16
 
+// maxHandoffRootScanAttempts bounds internal retries when the root changes
+// during measurement. Exhausting it returns the last measurement as
+// incomplete, so the agent withholds decisions that require a whole root.
+const maxHandoffRootScanAttempts = 3
+
 // scanHandoffRoot performs the prologue and the measurement.
 //
 // The prologue -- finishing detached frees, repairing missing receipts --
@@ -1080,26 +1122,53 @@ const maxScannedHandoffVolumes = 1 << 16
 // every listing at its second page forever.
 func (engine *ContainerdEngine) scanHandoffRoot(ctx context.Context) (*handoffRootScan, error) {
 	detached := engine.collectDetachedHandoffTrees(ctx)
-	names, live, ok := engine.repairMissingHandoffRetentionReceipts(ctx, engine.handoffNow())
+	_, _, ok := engine.repairMissingHandoffRetentionReceipts(ctx, engine.handoffNow())
 	if !ok {
 		return nil, errors.New("the handoff root could not be read")
 	}
 	if detached != 0 {
 		log.Printf("handoff retention: %d detached tree(s) are still being freed; their bytes are on the node and are in no volume's figures", detached)
 	}
-	scan := &handoffRootScan{
-		generation: engine.handoffRootGeneration(),
-		volumes:    make([]RetainedHandoffVolume, 0, len(names)),
-		detached:   detached,
+	var last *handoffRootScan
+	for attempt := 0; attempt < maxHandoffRootScanAttempts; attempt++ {
+		scan, err := engine.measureHandoffRoot(ctx, detached)
+		if err != nil {
+			return nil, err
+		}
+		last = scan
+		current := engine.handoffRootGeneration()
+		if scan.generation == current {
+			return scan, nil
+		}
+		last.generation = current
 	}
+	// The root changed during every bounded attempt. These rows are still a
+	// useful floor, but they cannot authorize a conclusion about the whole root.
+	last.truncated = true
+	return last, nil
+}
+
+func (engine *ContainerdEngine) measureHandoffRoot(ctx context.Context, detached int) (*handoffRootScan, error) {
+	// The prologue is complete before this read. Any shape change from here
+	// through the final generation read invalidates this attempt.
+	generation := engine.handoffRootGeneration()
+	names, err := engine.handoffVolumeNames()
+	if err != nil {
+		return nil, err
+	}
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		return nil, err
+	}
+	id, err := engine.newHandoffScanID()
+	if err != nil {
+		return nil, err
+	}
+	scan, names := newHandoffRootScan(id, generation, names, detached)
 	seen := make(map[handoffInodeIdentity]struct{})
 	budget := engine.newHandoffMeasureBudget()
 	for _, name := range names {
-		if ctx.Err() != nil {
-			scan.truncated = true
-			return scan, nil
-		}
-		if len(scan.volumes) >= maxScannedHandoffVolumes {
+		if ctx != nil && ctx.Err() != nil {
 			scan.truncated = true
 			return scan, nil
 		}
@@ -1110,6 +1179,28 @@ func (engine *ContainerdEngine) scanHandoffRoot(ctx context.Context) (*handoffRo
 		scan.volumes = append(scan.volumes, volume)
 	}
 	return scan, nil
+}
+
+func newHandoffRootScan(id string, generation uint64, names []string, detached int) (*handoffRootScan, []string) {
+	truncated := len(names) > maxScannedHandoffVolumes
+	if truncated {
+		names = names[:maxScannedHandoffVolumes]
+	}
+	return &handoffRootScan{
+		id: id, generation: generation, detached: detached, truncated: truncated,
+		volumes: make([]RetainedHandoffVolume, 0, len(names)),
+	}, names
+}
+
+func (engine *ContainerdEngine) newHandoffScanID() (string, error) {
+	if engine.handoffScanID != nil {
+		return engine.handoffScanID()
+	}
+	var value [handoffScanIDHexCharacters / 2]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("mint handoff inventory scan identity: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
 }
 
 func (engine *ContainerdEngine) storeHandoffScan(scan *handoffRootScan) {
@@ -1147,7 +1238,8 @@ func (engine *ContainerdEngine) pageHandoffScan(scan *handoffRootScan, after str
 			continue
 		}
 		if len(response.Volumes) >= MaxInventoriedHandoffVolumes {
-			response.Exhausted, response.Next = true, response.Volumes[len(response.Volumes)-1].Name
+			response.Exhausted = true
+			response.Next = scan.id + ":" + response.Volumes[len(response.Volumes)-1].Name
 			return response
 		}
 		size, err := json.Marshal(volume)
@@ -1160,7 +1252,8 @@ func (engine *ContainerdEngine) pageHandoffScan(scan *handoffRootScan, after str
 			continue
 		}
 		if len(response.Volumes) != 0 && encoded+len(size)+1 > engine.handoffInventoryByteBudget() {
-			response.Exhausted, response.Next = true, response.Volumes[len(response.Volumes)-1].Name
+			response.Exhausted = true
+			response.Next = scan.id + ":" + response.Volumes[len(response.Volumes)-1].Name
 			return response
 		}
 		encoded += len(size) + 1
@@ -1354,15 +1447,15 @@ func chargeHandoffInode(stat unix.Stat_t, seen map[handoffInodeIdentity]struct{}
 // writeAtomicDurableJSONRecord is writeAtomicDurableOwnerRecord's shape for a
 // second durable class: versioned bytes, 0600, fsynced, renamed into place,
 // and the directory fsynced after, so a crash leaves a whole record or none.
-func writeAtomicDurableJSONRecord(root, name string, record any) error {
+func writeAtomicDurableJSONRecord(root, name string, record any, syncRoot func(string) error) (bool, error) {
 	payload, err := json.Marshal(record)
 	if err != nil {
-		return err
+		return false, err
 	}
 	payload = append(payload, '\n')
 	temporary, err := os.CreateTemp(root, "."+name+".tmp-")
 	if err != nil {
-		return fmt.Errorf("create durable record %q: %w", name, err)
+		return false, fmt.Errorf("create durable record %q: %w", name, err)
 	}
 	temporaryName := temporary.Name()
 	defer os.Remove(temporaryName)
@@ -1375,16 +1468,19 @@ func writeAtomicDurableJSONRecord(root, name string, record any) error {
 	}
 	writeErr = errors.Join(writeErr, temporary.Close())
 	if writeErr != nil {
-		return fmt.Errorf("write durable record %q: %w", name, writeErr)
+		return false, fmt.Errorf("write durable record %q: %w", name, writeErr)
 	}
 	if err := os.Rename(temporaryName, filepath.Join(root, name)); err != nil {
-		return fmt.Errorf("publish durable record %q: %w", name, err)
+		return false, fmt.Errorf("publish durable record %q: %w", name, err)
+	}
+	if syncRoot != nil {
+		return true, syncRoot(root)
 	}
 	directory, err := os.Open(root)
 	if err != nil {
-		return fmt.Errorf("open durable record root %q: %w", root, err)
+		return true, fmt.Errorf("open durable record root %q: %w", root, err)
 	}
-	return errors.Join(directory.Sync(), directory.Close())
+	return true, errors.Join(directory.Sync(), directory.Close())
 }
 
 // writeAtomicDurableJSONRecordCreateOnly publishes repair evidence without

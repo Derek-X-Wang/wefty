@@ -1910,10 +1910,10 @@ func (err *HandoffVolumeLiveError) Code() ErrorCode { return CodeHandoffVolumeLi
 // Attempt authority is not merely unnecessary here, it is unrepresentable: a
 // body that tries to attach one is refused as an unknown field.
 type InventoryHandoffVolumesRequest struct {
-	// After resumes a listing after this volume name, which is the `Next` a
-	// previous response returned. Names are listed in sorted order, so a
-	// cursor is a name and nothing about it has to be remembered by the
-	// helper between calls.
+	// After resumes a listing from the opaque `Next` a previous response
+	// returned. It binds the last volume name to the cached scan identity, so a
+	// continuation cannot splice onto a scan that another first-page request
+	// installed for the session.
 	//
 	// A flag alone could not make the tail of a large root readable: it said
 	// the response stopped and gave no way to ask for the rest, so a node
@@ -1957,10 +1957,12 @@ type InventoryHandoffVolumesResponse struct {
 // never an unbounded frame.
 const MaxInventoriedHandoffVolumes = 4096
 
-// MaxHandoffInventoryCursorBytes bounds the page cursor a caller may send. A
-// cursor is a volume name, and a name this root can hold is far shorter; the
-// bound exists so an unbounded string cannot be spent on the comparison.
-const MaxHandoffInventoryCursorBytes = 256
+const handoffScanIDHexCharacters = 16
+
+// MaxHandoffInventoryCursorBytes bounds the opaque `<scan-id>:<volume-name>`
+// cursor a caller may send. A volume name is bounded by the prior 256-byte
+// allowance; the scan identity and separator are fixed-width overhead.
+const MaxHandoffInventoryCursorBytes = handoffScanIDHexCharacters + 1 + 256
 
 // handoffInventoryFrameHeadroom is what one InventoryHandoffVolumes response
 // leaves below MaxFrameBytes for the reply envelope and framing.
