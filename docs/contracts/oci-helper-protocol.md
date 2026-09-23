@@ -1083,10 +1083,15 @@ removal. **The handoff arm has no agent caller in this slice**: a handoff
 volume is removed by the helper's own sweep when its retention window has run
 out, and the arm exists for the agent-driven budget eviction a later slice of
 #494 supplies. Neither arm grants general path deletion authority. Deleting a
-handoff volume removes its retention receipt with it, under one hold of the
-helper's retention lock and volume first, so a concurrent accounting repair
-cannot publish a receipt into the gap and leave an orphan behind; absence is
-verified over both names.
+handoff volume removes its retention receipt with it. Under one hold of the
+helper's retention lock the volume is detached from its name first and the
+receipt unlinked second, so a concurrent accounting repair, which reopens the
+volume by name under that same lock before it publishes, finds nothing to bind
+to and cannot leave an orphan behind; the detached tree is then freed outside
+the lock, under the caller's deadline, so no other attempt's finalization waits
+on the size of a workload's tree, and a tree a crash or a cancelled caller
+leaves detached is freed by the next sweep. Absence is verified over the volume
+name and the receipt name.
 
 Handoff retention receipts are their own inventory class,
 `handoff_retention_records`, for the same reason service-data owner records
