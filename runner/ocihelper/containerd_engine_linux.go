@@ -152,6 +152,7 @@ type ContainerdEngine struct {
 	computerGrowHook            func(string) error
 	computerGrowResize          func(context.Context, string, string, int64, int64) error
 	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
+	computerGrowAvailableBytes  func(string) (int64, error) // a test pins the free-byte reading so two reservations race a fixed snapshot instead of the real disk's own drift
 	computerGrowAllocate        func(string, int64) error
 	computerGrowPreen           func(context.Context, string) error
 	computerRecoveryDigest      func(context.Context, string) (string, error)
