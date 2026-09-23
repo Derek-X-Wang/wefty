@@ -169,9 +169,9 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
 		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: boolPointer(false),
 			IdempotencyKey: "disable-route"})
-	if status != http.StatusInternalServerError {
-		t.Fatalf("disable without L3 status=%d body=%s", status, body)
-	}
+	// Typed, not scrubbed: an operator who cannot reach the run ledger must be
+	// able to read that from the refusal itself (wefty #548).
+	assertRunLedgerUnavailable(t, status, body, "the submission mutation was not applied")
 	current, err := readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now())
 	if err != nil {
 		t.Fatal(err)

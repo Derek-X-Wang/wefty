@@ -103,7 +103,7 @@ func run() error {
 		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
 		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
 		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
-		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address")
+		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address; pass --run-ledger= for an installation that has no run ledger")
 		runLedgerNodeID          = flag.String("run-ledger-node-id", "run-ledger", "authenticated Fabric identity allowed to request Computer scope proofs and classified as run-ledger job provenance; on tsnet this is the run ledger's Tailscale StableID, not a friendly name")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
@@ -142,6 +142,10 @@ func run() error {
 		return json.NewEncoder(os.Stdout).Encode(challenge)
 	}
 
+	if err := requireReachableRunLedger(*fabricMode, *runLedgerAddress); err != nil {
+		return err
+	}
+
 	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
 	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
 	// #498). The resolved boolean, not just the true case, always wins.
@@ -170,11 +174,18 @@ func run() error {
 		return err
 	}
 	defer store.Close()
-	computerTokenRevoker, err := l1.NewComputerTokenRevocationClient(participant, *runLedgerAddress)
-	if err != nil {
-		return err
+	// An installation that names no run ledger has no Computer submission
+	// tokens to revoke; it says so by passing --run-ledger= rather than by
+	// holding an address that cannot answer.
+	var computerTokenRevoker l1.ComputerTokenRevoker
+	if strings.TrimSpace(*runLedgerAddress) != "" {
+		revocationClient, err := l1.NewComputerTokenRevocationClient(participant, *runLedgerAddress)
+		if err != nil {
+			return err
+		}
+		defer revocationClient.CloseIdleConnections()
+		computerTokenRevoker = revocationClient
 	}
-	defer computerTokenRevoker.CloseIdleConnections()
 	server, err := l1.NewServer(participant, store, l1.ServerConfig{
 		NodePolicies: nodePolicies, AllowSelfAssertedPersonIdentities: *allowPlainPersonIDs,
 		ComputerTokenRevoker: computerTokenRevoker, RunLedgerNodeID: *runLedgerNodeID,
@@ -206,4 +217,26 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return server.Serve(ctx, listener)
+}
+
+// requireReachableRunLedger refuses a start that could never revoke Computer
+// authority. Plain Fabric resolves a wefty:// logical name only inside the
+// process that registered it, so the default run-ledger name is unreachable
+// from a separate L1 process, and every authority-loss revocation fails for
+// the life of the deployment. wefty #548 shipped exactly that: operator verbs
+// that applied answered a scrubbed 500, and a node lost kind:oci because the
+// same failure met its heartbeat. The address is knowable at start, so it is
+// refused at start rather than on the first Computer that is stopped.
+func requireReachableRunLedger(fabricMode, runLedgerAddress string) error {
+	if !strings.EqualFold(strings.TrimSpace(fabricMode), "plain") {
+		return nil
+	}
+	if strings.TrimSpace(runLedgerAddress) == "" {
+		return nil
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(runLedgerAddress)), "wefty:") {
+		return nil
+	}
+	return fmt.Errorf("-run-ledger=%s is a logical Fabric address that plain Fabric resolves only within one process; "+
+		"pass the run ledger's host:port instead, or -run-ledger= if this installation has no run ledger", runLedgerAddress)
 }

@@ -382,7 +382,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/admin-policy", s.authorize(personPrincipal, person))
 	root.Handle("/v1/admin-policy/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/whoami", s.authorize(personPrincipal, person))
-	return root
+	return s.observeInternalErrors(root)
 }
 
 func (s *Server) proveServiceBinding(w http.ResponseWriter, r *http.Request) {
@@ -446,7 +446,7 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 	}
 	var receipt *contract.ComputerTokenRevocationReceipt
 	if mutationApplied && s.computerTokenRevoker == nil {
-		writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"), "revoke Computer token grants"))
+		writeError(w, runLedgerUnavailable(nil, "this control plane has no run-ledger address, so Computer token grants cannot be revoked"))
 		return
 	}
 	if mutationApplied {
@@ -455,7 +455,8 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 			Reason: "submission_intent_advanced",
 		})
 		if revokeErr != nil {
-			writeError(w, internalError(revokeErr, "revoke Computer token grants before submission mutation"))
+			writeError(w, runLedgerUnavailable(revokeErr,
+				"the run ledger could not be reached to revoke Computer token grants, so the submission mutation was not applied"))
 			return
 		}
 		if observed.ComputerID != computer.ComputerID || observed.SubmitIntentRevision != computer.SubmitIntentRevision+1 || observed.CommittedAt.IsZero() {
@@ -1480,6 +1481,34 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
+// withoutUnrevokedRestores drops the copy directives for restores whose
+// pre-restore authority revocation is still owed. A restore must never reach a
+// node while the Computer's submission tokens are still live; withholding the
+// one directive keeps that closed without taking the heartbeat down with it.
+func withoutUnrevokedRestores(directives []ComputerStorageCopyDirective, owed map[string]struct{}) []ComputerStorageCopyDirective {
+	if len(owed) == 0 {
+		return directives
+	}
+	kept := make([]ComputerStorageCopyDirective, 0, len(directives))
+	for _, directive := range directives {
+		if _, blocked := owed[directive.DestinationComputerID]; blocked && directive.Operation == "restore" {
+			continue
+		}
+		kept = append(kept, directive)
+	}
+	return kept
+}
+
+// logRunLedgerRevocationDeferred records a pre-restore authority revocation
+// the run ledger did not take. The heartbeat still answers, so this log line
+// is the only place the deferral is named.
+func (s *Server) logRunLedgerRevocationDeferred(computerID string, err error) {
+	if s.logf == nil {
+		return
+	}
+	s.logf("event=l1_restore_revocation_deferred computer_id=%s cause=%q", computerID, scrubbedCause(err))
+}
+
 func (s *Server) revokeComputerAuthority(ctx context.Context, computerID, reason string) error {
 	_, err := s.revokeComputerAuthorityWithReceipt(ctx, computerID, reason)
 	return err
@@ -1493,7 +1522,12 @@ func (s *Server) revokeComputerAuthorityWithReceipt(ctx context.Context, compute
 		ComputerID: computerID, NewSubmitIntentRevision: 1, RevokeAll: true, Reason: reason,
 	})
 	if err != nil {
-		return nil, internalError(err, "revoke Computer token grants after authority loss")
+		// The store mutation that caused this authority loss has already
+		// committed. Saying so in the refusal is the difference between an
+		// operator retrying a verb that already applied and an operator
+		// fixing the run-ledger address (wefty #548).
+		return nil, runLedgerUnavailable(err,
+			"the Computer mutation applied, but the run ledger could not be reached to revoke its authority")
 	}
 	return &receipt, nil
 }
@@ -1739,19 +1773,31 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// A pre-restore revocation the run ledger will not take is owed, not
+	// fatal. It stays un-receipted, so the next heartbeat lists it again, and
+	// this heartbeat withholds that one Computer's copy directive below: the
+	// restore still fails closed, which is the whole point of revoking first.
+	// What no longer happens is the rest of the node going with it. Failing
+	// the entire heartbeat took the node's convergence surface down over one
+	// blocked Computer, so the agent could never finish a boot pass and
+	// withdrew kind:oci while still reporting itself alive and claiming
+	// (wefty #548).
+	authorityStillOwed := map[string]struct{}{}
 	for _, revocation := range restoreRevocations {
 		if s.computerTokenRevoker == nil {
-			writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"),
-				"revoke pre-restore Computer authority"))
-			return
+			authorityStillOwed[revocation.ComputerID] = struct{}{}
+			s.logRunLedgerRevocationDeferred(revocation.ComputerID,
+				errors.New("this control plane has no run-ledger address"))
+			continue
 		}
 		tokenReceipt, err := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
 			ComputerID: revocation.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true,
 			Reason: "computer_restoring", RestoreOperationRevision: revocation.OperationRevision,
 		})
 		if err != nil {
-			writeError(w, err)
-			return
+			authorityStillOwed[revocation.ComputerID] = struct{}{}
+			s.logRunLedgerRevocationDeferred(revocation.ComputerID, err)
+			continue
 		}
 		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), revocation.ComputerID, revocation.OperationRevision, ComputerRestoreRevocationEvidence{
 			RevokeAll: true, TokenRevocation: tokenReceipt,
@@ -1765,6 +1811,7 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	storageCopies = withoutUnrevokedRestores(storageCopies, authorityStillOwed)
 	custodyExports, err := s.store.ListNodeComputerCustodyExportDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
 	if err != nil {
 		writeError(w, err)
@@ -2266,6 +2313,38 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// scrubbedErrorSink is how the response layer tells the log what it is about
+// to take out of the response. An operator reading "internal server error"
+// has no way to name the fault; L1 owes itself the cause in its own log.
+type scrubbedErrorSink interface {
+	recordScrubbedInternalError(err error)
+}
+
+// observedResponse is the ResponseWriter every route writes through. It holds
+// the request so a scrubbed cause can be logged against the path that raised
+// it, without threading the request through 200-odd writeError call sites.
+type observedResponse struct {
+	http.ResponseWriter
+	request *http.Request
+	logf    func(string, ...any)
+}
+
+func (o *observedResponse) recordScrubbedInternalError(err error) {
+	if o == nil || o.logf == nil {
+		return
+	}
+	o.logf("event=l1_internal_error_scrubbed method=%s path=%s class=%s cause=%q",
+		o.request.Method, o.request.URL.Path, scrubbedClass(err), scrubbedCause(err))
+}
+
+// observeInternalErrors installs the sink for one request. It wraps the whole
+// route tree, so authorization refusals and handler failures alike are seen.
+func (s *Server) observeInternalErrors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&observedResponse{ResponseWriter: w, request: r, logf: s.logf}, r)
+	})
+}
+
 func writeError(w http.ResponseWriter, err error) {
 	code := errorCode(err)
 	status := http.StatusConflict
@@ -2283,6 +2362,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusUnprocessableEntity
 	case contract.ErrorNotImplemented:
 		status = http.StatusNotImplemented
+	case contract.ErrorRunLedgerUnavailable:
+		status = http.StatusServiceUnavailable
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
 	}
@@ -2294,9 +2375,14 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 	if code == contract.ErrorInternal {
 		message = "internal server error"
+		if sink, ok := w.(scrubbedErrorSink); ok {
+			sink.recordScrubbedInternalError(err)
+		}
 	}
 	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{
-		Code: code, Message: message, Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted,
+		Code: code, Message: message,
+		Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted ||
+			code == contract.ErrorRunLedgerUnavailable,
 		Details: details,
 	}})
 }
