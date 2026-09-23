@@ -630,6 +630,12 @@ type RetainedHandoffReport struct {
 	Exhausted bool
 	// Next is the cursor to pass as the next call's `after`.
 	Next string
+	// Restart says the runtime's root changed under this listing, so there is
+	// no consistent page to return and the reader starts over from the first.
+	Restart bool
+	// Generation identifies the scan this page came from, so a reader can
+	// assert that every page it stitches together describes the same root.
+	Generation uint64
 	// DetachedTrees counts results whose removal was authorized and has not
 	// finished freeing. Their bytes are on the node and belong to no volume
 	// above, so a budget that could not see them would read the node emptier

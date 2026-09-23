@@ -1764,6 +1764,129 @@ func TestTheHandoffInventoryPagesToTheEndOfItsRoot(t *testing.T) {
 	}
 }
 
+// TestAnInodeTwoVolumesShareIsChargedOnceAcrossPages is the other thing one
+// whole-root scan buys. Dedup spans the root, not the page, so two volumes
+// that hard-link one file and land on different pages are charged its bytes
+// once -- per-page dedup charged it twice, and a budget that overstates a node
+// gives up a run's results it did not have to.
+func TestAnInodeTwoVolumesShareIsChargedOnceAcrossPages(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	const payload = 1 << 20
+	first, firstPath := makeHandoffVolume(t, root, "run-shared-a")
+	second, secondPath := makeHandoffVolume(t, root, "run-shared-b")
+	if first == second {
+		t.Fatal("the fixture needs two distinct volumes")
+	}
+	if err := os.WriteFile(filepath.Join(firstPath, "big.bin"), make([]byte, payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(firstPath, "big.bin"), filepath.Join(secondPath, "big.bin")); err != nil {
+		t.Fatalf("link one file into two volumes: %v", err)
+	}
+	// One volume per page, so the two ends of the link are provably in
+	// different pages of the same listing.
+	engine.handoffInventoryBytes = len(`{"volumes":[],"exhausted":false,"detached_trees":0,"generation":0,"next":""}`) + 1
+
+	var deduped, logical int64
+	pages, after := 0, ""
+	for {
+		pages++
+		if pages > 8 {
+			t.Fatal("the listing never reached the end of its root")
+		}
+		page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: after})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Restart {
+			t.Fatalf("page %d restarted; nothing changed the root", pages)
+		}
+		for _, volume := range page.Volumes {
+			deduped += volume.DedupedBytes
+			logical += volume.LogicalBytes
+		}
+		if !page.Exhausted {
+			break
+		}
+		after = page.Next
+	}
+	if pages < 2 {
+		t.Fatalf("the fixture read the whole root in %d page(s); the two volumes are not on different pages", pages)
+	}
+	if deduped != payload {
+		t.Fatalf("the node was charged %d deduplicated bytes for one %d-byte inode two volumes share", deduped, payload)
+	}
+	// And the per-volume logical figure still counts it in both, because that
+	// is what giving up either one would recover on its own.
+	if logical != 2*payload {
+		t.Fatalf("the per-volume logical total is %d, want %d", logical, 2*payload)
+	}
+}
+
+// TestAVolumeCreatedBehindTheCursorRestartsTheListing is the pagination
+// window, from the helper's side. Pages measured independently let a volume
+// appear behind the cursor and be shown by no call at all; the generation is
+// what turns that into an answer a reader can act on.
+func TestAVolumeCreatedBehindTheCursorRestartsTheListing(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	makeHandoffVolume(t, root, "run-aaa")
+	makeHandoffVolume(t, root, "run-bbb")
+	engine.handoffInventoryBytes = len(`{"volumes":[],"exhausted":false,"detached_trees":0,"generation":0,"next":""}`) + 1
+
+	first, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Exhausted || first.Next == "" {
+		t.Fatalf("the first page did not stop partway: %+v", first)
+	}
+
+	// A rerun prepares its volume while the reader is between pages.
+	makeHandoffVolume(t, root, "run-ccc")
+	engine.noteHandoffRootMutation()
+
+	second, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: first.Next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Restart {
+		t.Fatalf("a page of a root that had changed was served anyway: %+v", second)
+	}
+	if len(second.Volumes) != 0 || second.Next != "" {
+		t.Fatalf("a restart carried rows or a cursor: %+v", second)
+	}
+
+	// Starting over shows all three, from one consistent scan.
+	seen, after, pages := map[string]struct{}{}, "", 0
+	for {
+		pages++
+		if pages > 8 {
+			t.Fatal("the restarted listing never reached the end of its root")
+		}
+		page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: after})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Restart {
+			t.Fatalf("page %d restarted; nothing changed the root this time", pages)
+		}
+		for _, volume := range page.Volumes {
+			seen[volume.Name] = struct{}{}
+		}
+		if !page.Exhausted {
+			break
+		}
+		after = page.Next
+	}
+	if len(seen) != 3 {
+		t.Fatalf("the restarted listing showed %d volumes, want all three", len(seen))
+	}
+}
+
 // TestAFinishedListingSaysSoWithExhaustedRatherThanAnEmptyCursor pins which
 // answer means "this is everything". A page that stops before its first row
 // has an empty cursor too, so emptiness cannot carry that meaning.
@@ -1908,5 +2031,114 @@ func TestDeletingAHandoffVolumeAnAttemptOwnsIsRefused(t *testing.T) {
 	})
 	if err != nil || !response.Deleted {
 		t.Fatalf("the replayed deletion = %+v, %v", response, err)
+	}
+}
+
+// TestDeletingAReusedVolumeBetweenAdmissionAndRegistrationIsRefused is the
+// residual half of the admission window. `Run` used to publish durable
+// ownership, create the container and the task, and only then supersede the
+// prior attempt's receipt -- and a volume with a valid receipt is not live,
+// whoever owns it, because a finalized owner must not pin its volume forever.
+// So for the whole of container and task creation the reused volume read as
+// idle, and a deletion arriving there took the files the attempt was about to
+// be given.
+func TestDeletingAReusedVolumeBetweenAdmissionAndRegistrationIsRefused(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	const ownerKey = "reused-between"
+	name, path := makeHandoffVolume(t, root, ownerKey)
+	if err := os.WriteFile(filepath.Join(path, "result.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The previous attempt finished: its terminal receipt stands, and the
+	// volume is idle and evictable. This is the snapshot a node acts on.
+	if err := engine.writeHandoffRetentionReceipt(t.Context(), name, now); err != nil {
+		t.Fatal(err)
+	}
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, owned := live[name]; owned {
+		t.Fatal("the fixture starts with the volume already live, so it proves nothing")
+	}
+
+	// The rerun's admission: durable ownership and the prior receipt move
+	// together, before any task exists and before the volume is mounted.
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: ownerKey, AttemptID: "attempt-2",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+	if err := engine.admitAttemptOwnershipAndSupersedeHandoff(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing has registered an in-memory attempt yet -- this is the interval
+	// that used to be open, between admission and registration.
+	engine.mu.Lock()
+	registered := len(engine.attempts)
+	engine.mu.Unlock()
+	if registered != 0 {
+		t.Fatalf("the fixture registered %d in-memory attempt(s); the window under test is before that", registered)
+	}
+
+	_, err = engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+		Kind: ManagedVolumeHandoff, OwnerKey: ownerKey,
+	})
+	var refused *HandoffVolumeLiveError
+	if !errors.As(err, &refused) {
+		t.Fatalf("deleting a volume admitted but not yet registered = %v, want the typed refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "result.json")); err != nil {
+		t.Fatalf("the rerun lost the files it was admitted to: %v", err)
+	}
+
+	// And the later registration is idempotent about the receipt, which is
+	// already gone.
+	if err := engine.registerAttemptLiveAndSupersedeHandoff(&containerdAttempt{authority: authority, resources: resources}); err != nil {
+		t.Fatal(err)
+	}
+	live, err = engine.liveHandoffVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, owned := live[name]; !owned {
+		t.Fatal("the volume stopped being live once its attempt registered")
+	}
+}
+
+// TestAdmittingAnAttemptMovesTheHandoffRootsGeneration keeps the two halves of
+// the snapshot honest: an admission changes which volumes carry a receipt, so
+// a listing in flight is reading a root that no longer exists as measured.
+func TestAdmittingAnAttemptMovesTheHandoffRootsGeneration(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "generation-run")
+	if err := engine.writeHandoffRetentionReceipt(t.Context(), name, now); err != nil {
+		t.Fatal(err)
+	}
+	before := engine.handoffRootGeneration()
+
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "generation-run", AttemptID: "attempt-1",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+	if err := engine.admitAttemptOwnershipAndSupersedeHandoff(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	if after := engine.handoffRootGeneration(); after <= before {
+		t.Fatalf("the generation went %d -> %d; an admission changes the root's shape", before, after)
 	}
 }

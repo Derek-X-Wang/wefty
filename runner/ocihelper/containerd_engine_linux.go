@@ -118,6 +118,9 @@ type ContainerdEngine struct {
 	nextPort                    uint16
 	serviceVolumeMu             sync.Mutex
 	handoffRetentionMu          sync.Mutex                   // serializes receipt publication only; never held across measurement or containerd work
+	handoffMutationGeneration   uint64                       // bumped under handoffRetentionMu by every change to the handoff root's shape
+	handoffScanMu               sync.Mutex                   // guards the cached whole-root scan; never held across the scan itself
+	handoffScan                 *handoffRootScan             // the last whole-root measurement, which every page of one listing is served from
 	handoffMeasureEntered       func(string)                 // a test observes when one volume's measurement begins
 	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
 	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
@@ -1257,7 +1260,16 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
 		return RunResponse{}, err
 	}
-	if err := engine.ensureAttemptOwnershipRecord(request.Authority, request.Resources); err != nil {
+	// Durable ownership and the prior attempt's terminal receipt move together,
+	// under one hold of the retention lock and before the task exists.
+	//
+	// Publishing ownership first and superseding the receipt after the task was
+	// created left an interval in which the volume had an owner *and* a valid
+	// receipt -- and a volume with a valid receipt is not live, whoever owns
+	// it, because a finalized owner must not pin its volume forever. A deletion
+	// arriving in that interval found an idle volume and took the files this
+	// attempt was about to be given.
+	if err := engine.admitAttemptOwnershipAndSupersedeHandoff(request.Authority, request.Resources); err != nil {
 		return RunResponse{}, err
 	}
 	stdout := filepath.Join(logDirectory, "stdout.frames")
@@ -3391,12 +3403,15 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			// helper-owned receipt. It is stamped here so that a volume
 			// prepared and never finalized reports its preparation time as
 			// the labelled fallback, rather than whatever a workload last
-			// wrote. Run supersedes the old receipt only after durable and
-			// in-memory ownership both make this preparation live.
+			// wrote. Run supersedes the old receipt as it publishes ownership,
+			// in one hold of the retention lock.
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
 				return nil, nil, nil, err
 			}
+			// The handoff root's shape changed, so any listing in flight is
+			// reading a root that no longer exists as it was measured.
+			engine.noteHandoffRootMutation()
 		}
 		result[volume.Kind] = path
 	}

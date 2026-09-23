@@ -1928,10 +1928,22 @@ type InventoryHandoffVolumesResponse struct {
 	// or byte budget ran out, or its caller was cancelled -- so these figures
 	// are this page's, not the node's.
 	Exhausted bool `json:"exhausted"`
-	// Next is the cursor to pass as the following request's After. It is empty
-	// exactly when this page reached the end of the root, which is the only
-	// thing that lets a reader say it has seen everything the node holds.
+	// Next is the cursor to pass as the following request's After. A page that
+	// stopped early carries one; a page that finished does not. What says the
+	// listing is complete is `exhausted=false`, never an empty cursor, because
+	// a page that stopped before its first row has an empty cursor too.
 	Next string `json:"next,omitempty"`
+	// Restart says the root changed under this listing, so there is no
+	// consistent page to return and the reader starts over from the first.
+	// Stitching a page of one root to a page of another is how a volume
+	// created behind the cursor becomes invisible to every call -- and to a
+	// budget that gives published results up first, an invisible published
+	// volume is an unpublished one destroyed.
+	Restart bool `json:"restart,omitempty"`
+	// Generation is the root's mutation counter for the scan this page came
+	// from, so a reader can assert that every page it stitches together
+	// describes the same root. On a restart it is the counter now.
+	Generation uint64 `json:"generation"`
 	// DetachedTrees counts the volumes an authorized deletion detached from
 	// their names and whose bytes are not yet freed, after this call finished
 	// what it could. They are in no volume's figures above -- a detached tree

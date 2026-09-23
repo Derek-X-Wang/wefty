@@ -1110,14 +1110,55 @@ func (m *handoffManager) measureOCIHandoffs(ctx context.Context) (*RetainedOCIRe
 		return nil, false
 	}
 	known := m.derivedHandoffVolumes()
-	status := &RetainedOCIResultsStatus{}
-	status.PerVolume = make([]RetainedOCIVolumeFigures, 0, MaxHandoffInventoryPageVolumes)
-	after := ""
+	for restart := 0; ; restart++ {
+		if restart > maxHandoffInventoryRestarts {
+			m.log("agent: the OCI helper's handoff root changed under this node's listing %d times; what this node holds there is a floor",
+				restart)
+			return m.emptyOCIStatus(), false
+		}
+		status, again := m.readOCIHandoffPages(ctx, known)
+		if again {
+			continue
+		}
+		// A nil status is a read that failed outright, which is a different
+		// fact from a root this node has no helper for and a different one
+		// again from a root it read incompletely. All three withhold the
+		// unpublished eviction; only this one says the node could not look.
+		return status, status == nil
+	}
+}
+
+// emptyOCIStatus is what a pass reports when it read the helper's root and
+// cannot claim to have seen all of it. Every figure it did gather would be a
+// floor over an unknown fraction of the root, and a floor nobody can bound is
+// worse than none -- so the pass reports an incomplete read and no figures,
+// which is exactly what withholds the one decision that needs them.
+func (m *handoffManager) emptyOCIStatus() *RetainedOCIResultsStatus {
+	return &RetainedOCIResultsStatus{Exhausted: true, PerVolume: []RetainedOCIVolumeFigures{}}
+}
+
+// readOCIHandoffPages reads one listing end to end.
+//
+// Every page of one listing comes from one whole-root measurement the helper
+// took, which is what makes stitching them together a consistent view: a
+// volume cannot be created behind the cursor and go unseen, and a file two
+// volumes hard-link is charged once however far apart they sort. When the root
+// changes under the listing the helper says so and this starts over, because
+// half of one root joined to half of another is precisely the answer that
+// hides a published volume from a budget that must give published results up
+// first.
+//
+// It reports the figures -- nil when the read itself failed -- and whether the
+// caller should start over. Whether the listing reached the end of the root is
+// on the figures, as Complete.
+func (m *handoffManager) readOCIHandoffPages(ctx context.Context, known map[string]handoffVolumeAttribution) (*RetainedOCIResultsStatus, bool) {
+	status := &RetainedOCIResultsStatus{PerVolume: make([]RetainedOCIVolumeFigures, 0, MaxHandoffInventoryPageVolumes)}
+	after, generation := "", uint64(0)
 	for page := 0; ; page++ {
 		if page >= maxHandoffInventoryPages {
-			m.log("agent: stop reading the OCI helper's retained handoff volumes after %d pages; what this node holds there is a floor",
-				page)
-			return status, true
+			m.log("agent: stop reading the OCI helper's retained handoff volumes after %d pages; what this node holds there is a floor", page)
+			status.Exhausted = true
+			return status, false
 		}
 		report, err := m.ociHandoffs.InventoryRetainedHandoffs(ctx, after)
 		if err != nil {
@@ -1127,8 +1168,23 @@ func (m *handoffManager) measureOCIHandoffs(ctx context.Context) (*RetainedOCIRe
 			// budget acting on an empty root would give up the other root's
 			// results to make room for bytes it simply could not see.
 			m.log("agent: read the OCI helper's retained handoff volumes: %v", err)
+			return nil, false
+		}
+		if report.Restart {
+			m.log("agent: the OCI helper's handoff root changed while this node was listing it; the listing starts over")
 			return nil, true
 		}
+		if page != 0 && report.Generation != generation {
+			// The helper says this page belongs to a different scan than the
+			// one this listing started. It should not happen -- a changed root
+			// comes back as a restart -- and a listing that stitched two scans
+			// together is the exact defect the restart exists to prevent, so
+			// it is treated as one rather than trusted.
+			m.log("agent: the OCI helper's handoff pages came from different scans (%d then %d); the listing starts over",
+				generation, report.Generation)
+			return nil, true
+		}
+		generation = report.Generation
 		m.foldOCIPage(report, known, status)
 		if !report.Exhausted {
 			// The page reached the end of the root. Only this answer -- never
@@ -1202,6 +1258,16 @@ func (m *handoffManager) foldOCIPage(report workloadrunner.RetainedHandoffReport
 // holds: a pass that spends it reports its figures as a floor, which withholds
 // the one decision that needs complete knowledge and changes nothing else.
 const maxHandoffInventoryPages = 64
+
+// maxHandoffInventoryRestarts bounds how often one pass will start its listing
+// over because the helper's root changed under it.
+//
+// A busy node can change that root faster than a node can list it, and a pass
+// that kept starting over would never finish and never report anything. The
+// bound turns that into an incomplete read, which is a thing the budget
+// already knows what to do with: it reports what it has, withholds the one
+// decision that needs a whole view, and the next hourly pass tries again.
+const maxHandoffInventoryRestarts = 4
 
 // MaxHandoffInventoryPageVolumes is the page size the agent expects, used only
 // to size the first allocation.

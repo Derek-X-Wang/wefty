@@ -47,6 +47,26 @@ type fakeHelperHandoffRoot struct {
 	// beforeEvict parks a deletion where a real one spends its time: a helper
 	// round trip and a tree free on the far side of the runtime seam.
 	beforeEvict func(ownerKey string)
+	// scan is the whole-root measurement this fixture's pages are cut from,
+	// and generation is the root's shape. A page after the first is refused
+	// with Restart when the two have diverged, exactly as the helper does.
+	scan           []workloadrunner.RetainedHandoffVolume
+	generation     uint64
+	scanGeneration uint64
+	scans          int
+	restarts       int
+	// onPage runs after each page is served, which is where a test makes the
+	// root change underneath a listing.
+	onPage func(fake *fakeHelperHandoffRoot, page int)
+	// forgetScan drops the cached scan once, without moving the generation:
+	// a helper that restarted mid-listing and has nothing to resume from, on a
+	// root quiet enough that its counter reads the same either side.
+	forgetScan bool
+	// driftGeneration makes the reported generation differ from page to page
+	// without the helper ever saying the root changed: a helper the node
+	// cannot take at its word, which is what the node's own assertion exists
+	// for.
+	driftGeneration bool
 	// attempted records every owner key the node asked about, whether or not
 	// the ask succeeded. "the node never asked" is a different assertion from
 	// "the node asked and the helper refused", and only the first is what
@@ -61,10 +81,32 @@ func (fake *fakeHelperHandoffRoot) InventoryRetainedHandoffs(_ context.Context, 
 	if fake.readErr != nil {
 		return workloadrunner.RetainedHandoffReport{}, fake.readErr
 	}
-	sorted := append([]workloadrunner.RetainedHandoffVolume(nil), fake.volumes...)
-	sort.Slice(sorted, func(left, right int) bool { return sorted[left].Name < sorted[right].Name })
-	report := workloadrunner.RetainedHandoffReport{DetachedTrees: fake.detached}
-	for _, volume := range sorted {
+	if after == "" {
+		// A first-page request is a fresh whole-root scan, and the scan is
+		// what every page of this listing is served from.
+		fake.scan = append([]workloadrunner.RetainedHandoffVolume(nil), fake.volumes...)
+		sort.Slice(fake.scan, func(left, right int) bool { return fake.scan[left].Name < fake.scan[right].Name })
+		fake.scanGeneration = fake.generation
+		fake.scans++
+	} else if fake.forgetScan || fake.scan == nil || fake.scanGeneration != fake.generation {
+		fake.restarts++
+		fake.scan, fake.forgetScan = nil, false
+		// The generation it reports is the one now. On a helper that restarted
+		// and simply has no cached scan, that can equal the generation the
+		// reader's first page carried -- a quiet root whose counter never
+		// moved -- so `Restart` is the only thing saying the listing cannot be
+		// resumed.
+		return workloadrunner.RetainedHandoffReport{Restart: true, Generation: fake.generation}, nil
+	}
+	if fake.onPage != nil {
+		fake.onPage(fake, fake.reads)
+	}
+	generation := fake.scanGeneration
+	if fake.driftGeneration {
+		generation += uint64(fake.reads)
+	}
+	report := workloadrunner.RetainedHandoffReport{DetachedTrees: fake.detached, Generation: generation}
+	for _, volume := range fake.scan {
 		if volume.Name <= after {
 			continue
 		}
@@ -75,6 +117,14 @@ func (fake *fakeHelperHandoffRoot) InventoryRetainedHandoffs(_ context.Context, 
 		report.Volumes = append(report.Volumes, volume)
 	}
 	return report, nil
+}
+
+// mutate is a volume appearing behind a listing's cursor -- a rerun preparing
+// its handoff volume while the node is paging -- which is what the generation
+// exists to make visible.
+func (fake *fakeHelperHandoffRoot) mutate(volume workloadrunner.RetainedHandoffVolume) {
+	fake.volumes = append(fake.volumes, volume)
+	fake.generation++
 }
 
 func (fake *fakeHelperHandoffRoot) RetainedHandoffVolumeName(ownerKey string) (string, error) {
@@ -1232,5 +1282,175 @@ func TestAnAdmissionThatLandsAfterTheCandidateIsChosenIsSeenUnderTheLease(t *tes
 	// And the pass still did its job with what was left.
 	if harness.exists("run_process") {
 		t.Fatalf("the node chose again and then gave up nothing: %v", harness.logs)
+	}
+}
+
+// TestAVolumeCreatedBehindTheCursorRestartsTheListing is the pagination
+// window. Independently measured pages let a volume appear behind the cursor
+// and be shown by no call at all -- and an invisible published volume is an
+// unpublished one destroyed, because the budget concludes that nothing
+// published remains. The helper says the root changed, the node starts over,
+// and the second listing sees it.
+func TestAVolumeCreatedBehindTheCursorRestartsTheListing(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	// Two volumes sort before the published one that appears mid-listing, so
+	// it lands behind the cursor and only a restart can reach it.
+	for _, owner := range []string{"run_aaa", "run_bbb"} {
+		harness.retainOCI(owner, "attempt-1", false)
+	}
+	harness.retainOCI("run_late", "attempt-1", true)
+	volumes := make([]workloadrunner.RetainedHandoffVolume, 0, 2)
+	for _, owner := range []string{"run_aaa", "run_bbb"} {
+		live := ociVolume(t, owner, 1<<20, 2, harness.now)
+		live.Live = true // neither is a candidate; only the published latecomer is
+		volumes = append(volumes, live)
+	}
+	late := ociVolume(t, "run_late", 1<<20, 2, harness.now)
+	// Sort it last so it is genuinely behind the cursor when it appears.
+	names := []string{volumes[0].Name, volumes[1].Name, late.Name}
+	sort.Strings(names)
+	if names[2] != late.Name {
+		t.Skipf("the derived names do not put %s last; this fixture needs it behind the cursor", late.Name)
+	}
+
+	helper := &fakeHelperHandoffRoot{volumes: volumes, page: 1}
+	helper.onPage = func(fake *fakeHelperHandoffRoot, page int) {
+		if page == 1 {
+			// The rerun prepares its volume while the node is on page one.
+			fake.mutate(late)
+		}
+	}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	harness.budget(4<<20 + 512<<10)
+
+	if helper.restarts == 0 {
+		t.Fatalf("the listing never restarted, so the fixture did not stage the window: scans=%d reads=%d", helper.scans, helper.reads)
+	}
+	if helper.scans < 2 {
+		t.Fatalf("the node took %d whole-root scans; a restart has to produce a fresh one", helper.scans)
+	}
+	if len(helper.evicted) != 1 || helper.evicted[0] != "run_late" {
+		t.Fatalf("the node gave up %v, want the published volume that appeared behind the cursor", helper.evicted)
+	}
+	if !harness.exists("run_unpublished") {
+		t.Fatal("the node gave up a result no ledger saw while a published volume was hidden behind the cursor")
+	}
+}
+
+// TestARootThatKeepsChangingWithholdsTheUnpublishedEviction is the bound on
+// that. A node whose helper root changes faster than it can be listed never
+// gets a whole view, and a pass without one gives nothing up rather than the
+// only copy of what some run did.
+func TestARootThatKeepsChangingWithholdsTheUnpublishedEviction(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
+	harness.retainOCI("run_one", "attempt-1", false)
+	harness.retainOCI("run_two", "attempt-1", false)
+	volumes := []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_one", 1<<20, 2, harness.now),
+		ociVolume(t, "run_two", 1<<20, 2, harness.now),
+	}
+	helper := &fakeHelperHandoffRoot{volumes: volumes, page: 1}
+	// Every page is followed by a change, so no listing ever finishes.
+	helper.onPage = func(fake *fakeHelperHandoffRoot, _ int) { fake.generation++ }
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	harness.budget(1 << 20)
+
+	if helper.restarts <= maxHandoffInventoryRestarts-1 {
+		t.Fatalf("the node restarted %d time(s); the bound is %d", helper.restarts, maxHandoffInventoryRestarts)
+	}
+	if helper.restarts > maxHandoffInventoryRestarts+1 {
+		t.Fatalf("the node restarted %d times; the bound did not hold", helper.restarts)
+	}
+	if !harness.exists("run_unpublished") {
+		t.Fatal("the node gave up its only copy of a run without ever seeing its other root whole")
+	}
+	if !harness.logged(handoffUnpublishedEvictionWithheld) {
+		t.Fatalf("the node withheld the eviction without saying so under its token: %v", harness.logs)
+	}
+}
+
+// TestPagesOfOneListingMustComeFromOneScan is the assertion the node makes for
+// itself. A helper that served two pages from two different measurements would
+// be handing the node half of one root joined to half of another, which is the
+// defect the restart exists to prevent, so the node treats it as one.
+func TestPagesOfOneListingMustComeFromOneScan(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	// Something to give up, so the pass reaches the decision the assertion is
+	// about rather than stopping for want of a candidate.
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
+	harness.retainOCI("run_one", "attempt-1", false)
+	harness.retainOCI("run_two", "attempt-1", false)
+	helper := &fakeHelperHandoffRoot{page: 1, volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_one", 1<<20, 2, harness.now),
+		ociVolume(t, "run_two", 1<<20, 2, harness.now),
+	}}
+	// The generation on the wire drifts without the helper ever saying the
+	// root changed, which is a helper the node cannot take at its word.
+	helper.driftGeneration = true
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	harness.budget(1 << 20)
+
+	if !harness.logged("came from different scans") {
+		t.Fatalf("the node stitched pages from different scans together: %v", harness.logs)
+	}
+	if !harness.logged(handoffUnpublishedEvictionWithheld) {
+		t.Fatalf("the node acted on a view it could not vouch for: %v", harness.logs)
+	}
+	if !harness.exists("run_unpublished") {
+		t.Fatal("the node gave up its only copy of a run on a view it could not vouch for")
+	}
+}
+
+// TestARestartWithAnUnchangedGenerationIsStillARestart isolates the flag from
+// the generation. A helper that restarted mid-listing has no scan to resume
+// from, and on a quiet root its counter reads the same either side -- so
+// `restart` is the only thing that can say the listing cannot be continued.
+func TestARestartWithAnUnchangedGenerationIsStillARestart(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
+	harness.retainOCI("run_one", "attempt-1", true)
+	harness.retainOCI("run_two", "attempt-1", true)
+	helper := &fakeHelperHandoffRoot{page: 1, volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_one", 1<<20, 2, harness.now),
+		ociVolume(t, "run_two", 1<<20, 2, harness.now),
+	}}
+	forgotten := false
+	helper.onPage = func(fake *fakeHelperHandoffRoot, _ int) {
+		if !forgotten {
+			forgotten, fake.forgetScan = true, true
+		}
+	}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	// Room for the process run once both published volumes are given up, so
+	// the pass ends without ever having to reach an unpublished result.
+	harness.budget(4<<20 + 512<<10)
+
+	if helper.restarts == 0 {
+		t.Fatal("the fixture never made the helper forget its scan")
+	}
+	if helper.scanGeneration != helper.generation {
+		t.Fatalf("the fixture moved the generation (%d vs %d); then the flag is not what is under test",
+			helper.scanGeneration, helper.generation)
+	}
+	if !harness.logged("root changed while this node was listing it") {
+		t.Fatalf("the node continued a listing the helper could not resume: %v", harness.logs)
+	}
+	// And it finished properly afterwards: the published volumes were given up
+	// and the unpublished process run kept.
+	if len(helper.evicted) == 0 {
+		t.Fatalf("the node never completed a listing after the restart: %v", harness.logs)
+	}
+	if !harness.exists("run_unpublished") {
+		t.Fatal("the node gave up a result no ledger saw while published volumes remained")
 	}
 }

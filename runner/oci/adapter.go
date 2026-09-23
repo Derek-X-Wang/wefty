@@ -2490,6 +2490,8 @@ func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context, after str
 		Volumes:       make([]workloadrunner.RetainedHandoffVolume, 0, len(response.Volumes)),
 		Exhausted:     response.Exhausted,
 		Next:          response.Next,
+		Restart:       response.Restart,
+		Generation:    response.Generation,
 		DetachedTrees: response.DetachedTrees,
 	}
 	for _, volume := range response.Volumes {

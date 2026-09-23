@@ -807,10 +807,10 @@ Charged bytes cross the protocol rather than being derived on this side,
 because no function of a volume total and an entry count reproduces a per-entry
 floor: one 600 MiB file beside 150,000 empty ones is about 600 MiB of data and
 about 1.2 GiB of node, and a node that inferred the second from the first would
-read an over-budget root as fitting. Deduplication is per response page: a file
-two volumes hard-link is counted once when both land on one page and once per
-page when they do not, which overstates a node — the safe direction for a bound
-on what it keeps — rather than hiding storage from it.
+read an over-budget root as fitting. Deduplication spans the whole root: the helper
+measures it once per listing and serves every page of that listing from the one
+measurement, so a file two volumes hard-link is charged once however far apart
+those volumes sort.
 
 The pass also counts, separately, three things it cannot charge: entries under
 the handoff root that no record names, which are neither measured nor removed;
@@ -891,10 +891,13 @@ already reclaimed, for the symmetric reason: nothing the budget could decide
 would change their fate, and charging them would make the node give live
 results up to make room for bytes that are already going away.
 
-A pass reads the helper's root as pages until one reports that it reached the
-end. A pass that spends its page bound, or that is told a page stopped with no
-way to resume, reports its figures for that root as a floor and withholds the
-one decision that needs complete knowledge.
+A pass reads the helper's root as pages of one measurement, until a page
+reports that it reached the end. Every page carries the generation of the
+measurement it came from, and the node asserts that the pages it stitches
+together are one; if the root changes under the listing the helper says so and
+the node starts over, bounded. A pass that spends its page or restart bound, or
+that is told a page stopped with no way to resume, reports its figures for that
+root as a floor and withholds the one decision that needs complete knowledge.
 
 The record carries whether the run's evidence reached the ledger, and that is
 what this order reads. For an OCI run that record is the node's own admission
