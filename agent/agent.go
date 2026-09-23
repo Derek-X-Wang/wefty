@@ -585,11 +585,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		// is up. It never runs on an attempt's finalization path, where one
 		// workload's tree would sit in front of every other run.
 		//
+		// It measures and reports and gives nothing up. The budget's first
+		// irreversible decision does not belong inside the call that is
+		// bringing the node up, before it has claimed any work and while its
+		// helper session and record store are still settling; the first
+		// enforcing pass is the first timer tick, by which point the node is
+		// serving.
+		//
 		// It carries the collector's context, which is this call's -- a pass
 		// over an adversarial tree at startup is as much of a stall as one on
 		// the timer, and cancelling Run has to reach it before Close waits on
 		// anything.
-		if err := a.handoffs.accountNode(a.collectorContext); err != nil {
+		if err := a.handoffs.measureNodeOnly(a.collectorContext); err != nil {
 			a.log("measure this node's retained results: %v", err)
 		}
 	}

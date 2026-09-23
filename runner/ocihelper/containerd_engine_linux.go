@@ -4094,9 +4094,18 @@ func (engine *ContainerdEngine) ensureAttemptOwnershipRecordLocked(authority Att
 			return errors.Join(readErr, err)
 		}
 	}
-	return engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
+	if err := engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
 		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
-	})
+	}); err != nil {
+		return err
+	}
+	// Ownership is half of what makes a handoff volume live, so publishing it
+	// changes the shape a listing of that root describes. The caller holds
+	// handoffRetentionMu -- both callers of this do -- which is what makes the
+	// record and the bump one event to a reader sampling the generation under
+	// the same lock.
+	engine.noteHandoffRootMutationLocked()
+	return nil
 }
 
 // quarantineAttemptOwnershipRecordLocked moves one unreconcilable record out of
@@ -4122,6 +4131,11 @@ func (engine *ContainerdEngine) quarantineAttemptOwnershipRecordLocked(name stri
 	if err := os.Rename(filepath.Join(engine.attemptOwnershipRoot(), name), filepath.Join(directory, attemptOwnershipQuarantinedRecordName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("quarantine durable Attempt ownership record %s: %w", name, err)
 	}
+	// A record moved out of the ownership root is an owner that stopped
+	// existing, which is a volume that may have stopped being live. It is
+	// noted here rather than left to the caller because the caller returns
+	// early on the errors below, and the record has already moved.
+	engine.noteHandoffRootMutationLocked()
 	receipt := AttemptOwnershipQuarantine{
 		Kind: AttemptOwnershipQuarantineKind, ReceiptID: receiptID, Record: name,
 		Reason: reason, QuarantinedAt: now.UTC(),
@@ -5085,7 +5099,20 @@ func (engine *ContainerdEngine) removeQuiescentAttemptOwnershipRecords(records m
 	return nil
 }
 
+// removeAttemptOwnershipRecord releases one attempt's durable ownership.
+//
+// The handoff root's generation moves for it, because ownership is half of
+// what makes a volume live and a release can therefore make a volume
+// evictable. The bump happens after attemptOwnershipMu is released rather than
+// under it: publication takes handoffRetentionMu and then attemptOwnershipMu,
+// so taking them the other way round here would be an inversion.
 func (engine *ContainerdEngine) removeAttemptOwnershipRecord(record durableAttemptOwnership) error {
+	err := engine.removeAttemptOwnershipRecordLocked(record)
+	engine.noteHandoffRootMutation()
+	return err
+}
+
+func (engine *ContainerdEngine) removeAttemptOwnershipRecordLocked(record durableAttemptOwnership) error {
 	engine.attemptOwnershipMu.Lock()
 	defer engine.attemptOwnershipMu.Unlock()
 	if err := os.Remove(engine.attemptOwnershipPath(record.Resources)); err != nil && !errors.Is(err, os.ErrNotExist) {

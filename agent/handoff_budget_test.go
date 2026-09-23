@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -834,23 +835,34 @@ func TestAVolumeARerunClaimedMidPassIsNotGivenUp(t *testing.T) {
 func TestTheHelpersRefusalOfALiveVolumeIsNotAFailure(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	harness.retainOCI("run_helper_live", "attempt-1", true)
+	harness.now = harness.now.Add(time.Hour)
+	harness.retainOCI("run_next", "attempt-1", true)
 	helper := &fakeHelperHandoffRoot{
-		volumes: []workloadrunner.RetainedHandoffVolume{ociVolume(t, "run_helper_live", 8<<20, 4, harness.now)},
-		live:    map[string]struct{}{"run_helper_live": {}},
+		volumes: []workloadrunner.RetainedHandoffVolume{
+			ociVolume(t, "run_helper_live", 4<<20, 2, harness.now),
+			ociVolume(t, "run_next", 4<<20, 2, harness.now),
+		},
+		live: map[string]struct{}{"run_helper_live": {}},
 	}
 	harness.manager.ociHandoffs = helper
 	harness.manager.ociEvictor = helper
 
-	harness.budget(1 << 20)
+	harness.budget(5 << 20)
 
 	if len(helper.attempted) == 0 {
 		t.Fatal("the node never asked, so the helper's refusal was never exercised")
 	}
-	if len(helper.evicted) != 0 || len(helper.volumes) != 1 {
-		t.Fatalf("a volume the helper refused was given up anyway: evicted=%v volumes=%d", helper.evicted, len(helper.volumes))
+	if slices.Contains(helper.evicted, "run_helper_live") {
+		t.Fatalf("a volume the helper refused was given up anyway: %v", helper.evicted)
 	}
 	if !harness.logged("refused to give the handoff volume for run run_helper_live up because an attempt owns it") {
 		t.Fatalf("the refusal was not reported as one: %v", harness.logs)
+	}
+	// It took the reselect arm, not the failure arm: the pass went on to the
+	// next published volume rather than ending. A failure would have stopped
+	// the pass with the node still over budget.
+	if !slices.Contains(helper.evicted, "run_next") {
+		t.Fatalf("the refusal ended the pass instead of choosing again: evicted=%v logs=%v", helper.evicted, harness.logs)
 	}
 }
 
@@ -1452,5 +1464,215 @@ func TestARestartWithAnUnchangedGenerationIsStillARestart(t *testing.T) {
 	}
 	if !harness.exists("run_unpublished") {
 		t.Fatal("the node gave up a result no ledger saw while published volumes remained")
+	}
+}
+
+// --- the independent review's findings ---
+
+// TestAPublishedResultAnAttemptTakesMidPassYieldsToTheNextPublishedOne is the
+// per-class advance. A candidate the pass cannot take is this class being
+// busy, not a reason to leave a full node full -- but it is never a reason to
+// reach into the other class either, which the surviving unpublished run here
+// proves.
+func TestAPublishedResultAnAttemptTakesMidPassYieldsToTheNextPublishedOne(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	oldest := harness.retain("run_oldest_published", true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_next_published", true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+
+	harness.manager.nodeBytes = 5 << 20
+	claimed := false
+	handoffBudgetRace = func(stage string, candidate handoffEvictionCandidate) {
+		if claimed || stage != handoffBudgetCandidateChosen || candidate.runID != "run_oldest_published" {
+			return
+		}
+		claimed = true
+		// A rerun takes the oldest published run's directory between the
+		// choice and the lease.
+		lease, err := harness.manager.lock(t.Context(), handoffClaim("run_oldest_published", oldest, nil).Job.Spec)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		t.Cleanup(lease.release)
+	}
+	t.Cleanup(func() { handoffBudgetRace = nil })
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !claimed {
+		t.Fatal("the fixture never reached the window it exists to stage")
+	}
+	if !harness.exists("run_oldest_published") {
+		t.Fatal("the node gave up results an attempt was holding")
+	}
+	if harness.exists("run_next_published") {
+		t.Fatalf("the node stopped at the first candidate it could not take: %v", harness.logs)
+	}
+	if !harness.exists("run_unpublished") {
+		t.Fatal("the node reached past a published class that still had members")
+	}
+	if harness.logged(handoffUnpublishedEviction) {
+		t.Fatalf("a busy published run let the node reach an unpublished one: %v", harness.logs)
+	}
+}
+
+// TestAClassWhoseEveryCandidateIsHeldEndsThePassWithoutReachingTheOther is the
+// other half: exhausting a class is where the pass stops, and it stops rather
+// than falling through.
+func TestAClassWhoseEveryCandidateIsHeldEndsThePassWithoutReachingTheOther(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	held := make([]string, 0, 2)
+	for _, runID := range []string{"run_pub_one", "run_pub_two"} {
+		held = append(held, harness.retain(runID, true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20}))
+		harness.now = harness.now.Add(time.Minute)
+	}
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	for index, path := range held {
+		lease, err := harness.manager.lock(t.Context(), handoffClaim([]string{"run_pub_one", "run_pub_two"}[index], path, nil).Job.Spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lease.release()
+	}
+
+	harness.budget(1 << 20)
+
+	if !harness.exists("run_unpublished") {
+		t.Fatal("the node reached an unpublished result while published ones were merely busy")
+	}
+	if !harness.exists("run_pub_one") || !harness.exists("run_pub_two") {
+		t.Fatal("the node gave up results attempts were holding")
+	}
+	// Both were tried, not just the first.
+	for _, runID := range []string{"run_pub_one", "run_pub_two"} {
+		if !harness.logged("leave run " + runID + "'s retained results alone this pass") {
+			t.Fatalf("%s was never tried: %v", runID, harness.logs)
+		}
+	}
+}
+
+// TestGivingUpOneRootDoesNotRemeasureTheOther is the cost of a deletion. The
+// two roots are separate filesystems that deduplicate independently, so no
+// deletion on one can move the other's figures -- and re-reading the helper's
+// root after a process deletion is a protocol round trip nothing depends on.
+func TestGivingUpOneRootDoesNotRemeasureTheOther(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_process_one", true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Minute)
+	harness.retain("run_process_two", true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.retainOCI("run_oci", "attempt-1", false)
+	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_oci", 1<<20, 2, harness.now),
+	}}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	// Room for one process run and the volume, so two process deletions happen
+	// and neither may re-read the helper's root.
+	harness.budget(2 << 20)
+
+	if harness.exists("run_process_one") || harness.exists("run_process_two") {
+		t.Fatalf("the node did not give both process runs up: %v", harness.logs)
+	}
+	if len(helper.evicted) != 0 {
+		t.Fatalf("the node gave up an OCI volume it did not have to: %v", helper.evicted)
+	}
+	// One read for the measurement, one for the final report, and none for
+	// either deletion.
+	if helper.reads > 2 {
+		t.Fatalf("the node read the helper's root %d times across two process deletions", helper.reads)
+	}
+}
+
+// TestAReplacedSubtreeWithholdsUnpublishedEviction is the third way a pass can
+// be ignorant of its own root. A published run whose tree stopped being the
+// one the pass was measuring is left out of that run's figures entirely, so it
+// reports zero charged bytes and is filtered out of the candidates -- and the
+// node would conclude that nothing published remains.
+func TestAReplacedSubtreeWithholdsUnpublishedEviction(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
+	status := RetainedResultsStatus{Replaced: 1}
+	if reason := harness.manager.incompleteKnowledge(status); reason == "" {
+		t.Fatal("a pass that lost a subtree claimed it knew its own root whole")
+	} else if !strings.Contains(reason, "stopped being the directory") {
+		t.Fatalf("the reason does not name what was lost: %q", reason)
+	}
+	if reason := harness.manager.incompleteKnowledge(RetainedResultsStatus{}); reason != "" {
+		t.Fatalf("a whole pass on a one-root node reported %q", reason)
+	}
+}
+
+// TestAHandoffDirectoryThatIsNotAnAbsolutePathTakesNoLease is the namespacing.
+// The lease is taken from what the dispatcher sent, before anything has proved
+// it is a path this node manages -- so a spec naming an OCI volume's lease key
+// would have held that volume's lease for the length of an attempt, and an
+// attempt that holds a lease is a thing the budget refuses to give up.
+func TestAHandoffDirectoryThatIsNotAnAbsolutePathTakesNoLease(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	for _, directory := range []string{"", "relative/handoff", ociHandoffLeaseKey("run_victim")} {
+		spec := handoffClaim("run_forging", directory, nil).Job.Spec
+		lease, err := harness.manager.lock(t.Context(), spec)
+		if err == nil {
+			lease.release()
+			t.Fatalf("a handoff directory of %q took a lease", directory)
+		}
+		if !errors.Is(err, errUnmanagedHandoffDirectory) {
+			t.Fatalf("the refusal of %q is not the typed one: %v", directory, err)
+		}
+	}
+	// And the two namespaces cannot spell each other even when they could
+	// collide: a process directory whose cleaned path is the OCI key's text
+	// is refused above, and the keys themselves differ by construction.
+	if handoffPathLeaseKey("/tmp/x") == ociHandoffLeaseKey("/tmp/x") {
+		t.Fatal("the two lease namespaces produce the same key")
+	}
+	// The OCI volume's lease is free, which is what the refusals protect.
+	lease, err := harness.manager.lockOCIHandoff(t.Context(), "run_victim")
+	if err != nil {
+		t.Fatalf("the victim volume's lease was held by the refused specs: %v", err)
+	}
+	lease.release()
+}
+
+// TestTheStartupPassMeasuresAndGivesNothingUp is where the budget's first
+// irreversible decision may happen. Not inside the call bringing the node up,
+// before it has claimed any work; the first enforcing pass is the first timer
+// tick.
+func TestTheStartupPassMeasuresAndGivesNothingUp(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_published", true, true, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
+	harness.retainOCI("run_oci", "attempt-1", true)
+	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_oci", 8<<20, 4, harness.now),
+	}}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+	harness.manager.nodeBytes = 1 << 20
+
+	if err := harness.manager.measureNodeOnly(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !harness.exists("run_published") || len(helper.evicted) != 0 {
+		t.Fatalf("the startup pass gave results up: process=%v oci=%v",
+			harness.exists("run_published"), helper.evicted)
+	}
+	if !harness.logged("retained results on this node:") {
+		t.Fatalf("the startup pass did not report what it found: %v", harness.logs)
+	}
+	if harness.logged("given up early") {
+		t.Fatalf("the startup pass enforced the budget: %v", harness.logs)
+	}
+
+	// And the pass that does act, does.
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if harness.exists("run_published") && len(helper.evicted) == 0 {
+		t.Fatalf("the enforcing pass gave nothing up either: %v", harness.logs)
 	}
 }

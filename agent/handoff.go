@@ -165,11 +165,38 @@ func (m *handoffManager) log(format string, args ...any) {
 	}
 }
 
+// handoffPathLeaseKey is the registry key for one process run's handoff
+// directory, and ociHandoffLeaseKey is the key for one OCI run's handoff
+// volume. Both are prefixed, and neither prefix is a legal start for the other
+// kind's identity, so the two namespaces cannot meet.
+//
+// They used to share one namespace, with a process directory keyed by its
+// cleaned path. A path is what the *dispatcher* sent, and the lease is taken
+// before it has been proved to be under this node's root -- so a spec naming
+// `oci-handoff-volume:run-x` as its handoff directory would have taken the
+// lease of a volume it has nothing to do with, and an attempt that holds a
+// lease is a thing the budget refuses to give up. Prefixing costs nothing and
+// makes the two kinds of identity unable to spell each other.
+func handoffPathLeaseKey(directory string) string {
+	return "path:" + directory
+}
+
 // lock holds exclusive ownership of one handoff path across the complete
 // prepare, execution, completion, and finish lifecycle. Per-call locking is
 // insufficient because finish may trim a directory another attempt uses.
+//
+// A directory that is not an absolute path is refused before any lease is
+// taken. Preparation refuses it too, with the same typed error, but that is
+// afterwards: a lease taken on a relative or empty name is a key this node
+// never manages, held for the length of an attempt, and the sweep and the
+// budget both read that as "an attempt holds this".
 func (m *handoffManager) lock(ctx context.Context, spec contract.JobSpec) (*handoffLease, error) {
-	return m.lockPath(ctx, filepath.Clean(spec.Execution.HandoffDirectory))
+	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	if path == "." || !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("%w: %q is not an absolute path",
+			errUnmanagedHandoffDirectory, spec.Execution.HandoffDirectory)
+	}
+	return m.lockPath(ctx, handoffPathLeaseKey(path))
 }
 
 // lockPath is the registry itself, keyed by a string rather than by a spec.
@@ -302,7 +329,7 @@ func (m *handoffManager) resolveHandoffDirectory(spec contract.JobSpec) (string,
 func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nodeID string) (*handoffOwnership, error) {
 	path := filepath.Clean(spec.Execution.HandoffDirectory)
 	m.mu.Lock()
-	owned := lease != nil && lease.manager == m && lease.path == path && lease.pathLock.owner == lease && lease.ownership == nil
+	owned := lease != nil && lease.manager == m && lease.path == handoffPathLeaseKey(path) && lease.pathLock.owner == lease && lease.ownership == nil
 	m.mu.Unlock()
 	if !owned {
 		return nil, errors.New("handoff preparation requires this attempt's path lock")
@@ -596,7 +623,7 @@ func (m *handoffManager) holdsReceipt(owner *handoffOwnership, path string) bool
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return owner.lease.manager == m && owner.lease.path == path &&
+	return owner.lease.manager == m && owner.lease.path == handoffPathLeaseKey(path) &&
 		owner.lease.pathLock.owner == owner.lease && owner.lease.ownership == owner
 }
 
@@ -768,7 +795,7 @@ func (m *handoffManager) collect() error {
 // re-reads the record and refuses if it is no longer the one this sweep loaded
 // (rewriteRecord).
 func (m *handoffManager) expireRun(root *os.Root, record retentionRecord, now time.Time) {
-	lease := m.tryCollectLease(record.Directory)
+	lease := m.tryCollectLease(handoffPathLeaseKey(record.Directory))
 	if lease == nil {
 		// An attempt holds this path. It is not the sweep's to touch, and it is
 		// not a failure either.
@@ -1038,7 +1065,7 @@ func (m *handoffManager) removeRetainedRun(root *os.Root, record retentionRecord
 	m.log("agent: removing run %s's retained results: %s", record.RunID, because)
 	// Recheck ownership and directory identity immediately before deleting.
 	m.mu.Lock()
-	owned := lease.pathLock.owner == lease && m.paths[record.Directory] == lease.pathLock
+	owned := lease.pathLock.owner == lease && m.paths[handoffPathLeaseKey(record.Directory)] == lease.pathLock
 	m.mu.Unlock()
 	if !owned {
 		return false, errors.New("the collector lost ownership of this run's handoff path")

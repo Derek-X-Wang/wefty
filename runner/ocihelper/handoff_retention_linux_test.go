@@ -2284,3 +2284,98 @@ func TestAdmittingAnAttemptMovesTheHandoffRootsGeneration(t *testing.T) {
 		t.Fatalf("the generation went %d -> %d; an admission changes the root's shape", before, after)
 	}
 }
+
+// TestEveryOwnershipChangeMovesTheHandoffRootsGeneration is the third input to
+// liveness. A volume is live when it is owned and carries no valid receipt, so
+// an ownership record published, released or quarantined changes what a
+// listing of this root would say just as surely as a volume appearing does --
+// and a listing in flight has to be told.
+func TestEveryOwnershipChangeMovesTheHandoffRootsGeneration(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "ownership-run")
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "ownership-run", AttemptID: "attempt-1",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+
+	// Publication.
+	before := engine.handoffRootGeneration()
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	published := engine.handoffRootGeneration()
+	if published <= before {
+		t.Fatalf("publishing ownership left the generation at %d", published)
+	}
+
+	// Release.
+	if err := engine.removeAttemptOwnershipRecord(durableAttemptOwnership{
+		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	released := engine.handoffRootGeneration()
+	if released <= published {
+		t.Fatalf("releasing ownership left the generation at %d", released)
+	}
+
+	// Quarantine: an unreadable record is moved aside, which is an owner that
+	// stopped existing.
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(engine.attemptOwnershipPath(resources), []byte("not a record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeQuarantine := engine.handoffRootGeneration()
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	if quarantined := engine.handoffRootGeneration(); quarantined <= beforeQuarantine+1 {
+		t.Fatalf("quarantining a record and republishing moved the generation to %d from %d; both are changes",
+			quarantined, beforeQuarantine)
+	}
+}
+
+// TestAScanTheRootHasMovedPastIsDropped keeps one session's memory bounded. A
+// reader that stops after its first page, or never comes back, would otherwise
+// leave a whole root's rows held for the life of the session -- and a scan the
+// generation has moved past can answer nothing, so there is no reason to keep
+// it until some later listing happens to replace it.
+func TestAScanTheRootHasMovedPastIsDropped(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	makeHandoffVolume(t, root, "run-aaa")
+	makeHandoffVolume(t, root, "run-bbb")
+	engine.handoffInventoryBytes = len(`{"volumes":[],"exhausted":false,"detached_trees":0,"generation":0,"next":""}`) + 1
+
+	if _, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	engine.handoffScanMu.Lock()
+	cached := engine.handoffScan != nil
+	engine.handoffScanMu.Unlock()
+	if !cached {
+		t.Fatal("the first page cached no scan, so this fixture proves nothing")
+	}
+
+	// The reader abandons the listing and the root moves on.
+	engine.noteHandoffRootMutation()
+	if _, current := engine.cachedHandoffScan(); current == 0 {
+		t.Fatal("the generation did not move")
+	}
+	engine.handoffScanMu.Lock()
+	held := engine.handoffScan
+	engine.handoffScanMu.Unlock()
+	if held != nil {
+		t.Fatal("a scan the root has moved past is still held")
+	}
+}

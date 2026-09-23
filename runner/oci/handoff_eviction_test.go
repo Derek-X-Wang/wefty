@@ -2,6 +2,7 @@ package oci
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -21,9 +22,23 @@ type handoffEvictionEngine struct {
 	// unverified makes the helper answer without saying the volume is gone,
 	// which is exactly what a node must never treat as a reclaim.
 	unverified bool
+	// live makes the helper refuse because an attempt owns the volume. It is
+	// the engine's own error type, so what the test drives is the real
+	// server-side mapping to a wire code and the real client-side mapping back.
+	live bool
 }
 
 func (engine *handoffEvictionEngine) DeleteManagedVolume(ctx context.Context, request ocihelper.DeleteManagedVolumeRequest) (ocihelper.DeleteManagedVolumeResponse, error) {
+	if engine.live {
+		engine.mu.Lock()
+		engine.volumeDeleteRequests = append(engine.volumeDeleteRequests, request)
+		engine.mu.Unlock()
+		name, err := ocihelper.DeterministicHandoffVolumeDirectory(request.OwnerKey)
+		if err != nil {
+			return ocihelper.DeleteManagedVolumeResponse{}, err
+		}
+		return ocihelper.DeleteManagedVolumeResponse{}, &ocihelper.HandoffVolumeLiveError{Name: name}
+	}
 	if engine.unverified {
 		engine.mu.Lock()
 		engine.volumeDeleteRequests = append(engine.volumeDeleteRequests, request)
@@ -97,5 +112,43 @@ func TestAnEmptyOwnerKeyIsRefusedByTheAgentRatherThanTheHelper(t *testing.T) {
 	defer engine.mu.Unlock()
 	if len(engine.volumeDeleteRequests) != 0 {
 		t.Fatalf("the helper saw %d deletions for an empty owner key", len(engine.volumeDeleteRequests))
+	}
+}
+
+// TestTheHelpersLiveRefusalArrivesAsItsOwnAnswer drives the whole seam: the
+// engine raises its refusal, the server maps it to the wire code, and the
+// client maps it back to the sentinel the node branches on. The node has to
+// tell a refusal from a failure -- one is the guard working and the node keeps
+// a run's results, the other is a node that could not act on its own budget --
+// and the mapping is the only thing that carries that difference across the
+// runtime seam.
+func TestTheHelpersLiveRefusalArrivesAsItsOwnAnswer(t *testing.T) {
+	engine := &handoffEvictionEngine{live: true}
+	adapter, stop := startAdapterTestServer(t, engine)
+	defer stop()
+
+	var evictor workloadrunner.RetainedHandoffEvictor = adapter
+	err := evictor.EvictRetainedHandoff(t.Context(), "run-alpha")
+	if err == nil {
+		t.Fatal("a volume the helper refused was reported as given up")
+	}
+	if !errors.Is(err, workloadrunner.ErrRetainedHandoffLive) {
+		t.Fatalf("the refusal arrived as %v, want the live sentinel the node branches on", err)
+	}
+	// It is not merely an error with the right words: an ordinary failure must
+	// not satisfy the same branch, or every failed eviction would read as the
+	// guard working and the node would never report that it could not act.
+	plain := &handoffEvictionEngine{unverified: true}
+	plainAdapter, stopPlain := startAdapterTestServer(t, plain)
+	defer stopPlain()
+	plainErr := plainAdapter.EvictRetainedHandoff(t.Context(), "run-alpha")
+	if plainErr == nil || errors.Is(plainErr, workloadrunner.ErrRetainedHandoffLive) {
+		t.Fatalf("an unverified removal read as a live refusal: %v", plainErr)
+	}
+
+	// And the helper's own words survive the crossing, so a person reading the
+	// node's log is told which volume.
+	if !strings.Contains(err.Error(), "owned by a live attempt") {
+		t.Fatalf("the refusal lost its reason crossing the seam: %v", err)
 	}
 }

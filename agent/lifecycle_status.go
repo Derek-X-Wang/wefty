@@ -141,13 +141,13 @@ type RetainedOCIResultsStatus struct {
 	LogicalBytes   int64 `json:"logical_bytes"`
 	DedupedBytes   int64 `json:"deduped_bytes"`
 	// ChargedBytes is what these volumes cost the node budget, in the same
-	// unit the process root's figure uses. The helper reports deduped bytes
-	// and an entry count rather than a charged figure, so the node charges a
-	// volume the larger of its deduped bytes and 4 KiB per entry. That is a
-	// floor on what the per-entry rule would charge -- a volume mixing one
-	// large file with many tiny ones is charged less here than the same tree
-	// under the agent's own root -- and it is deliberately not a second number
-	// on the wire that could disagree with the first.
+	// unit the process root's figure uses: every directory entry contributes
+	// the larger of its deduplicated logical bytes and 4 KiB. The helper
+	// computes it during its own walk and reports it, because no function of a
+	// volume total and an entry count reproduces a per-entry floor -- one
+	// 600 MiB file beside 150,000 empty ones is about 600 MiB of data and
+	// about 1.2 GiB of node, and a figure derived from the totals would read
+	// the second as the first.
 	ChargedBytes int64 `json:"charged_bytes"`
 	// TerminalUnknown counts the volumes with no helper-owned terminal time.
 	// Their age comes from a timestamp the workload could have written, so

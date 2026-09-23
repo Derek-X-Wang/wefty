@@ -893,7 +893,7 @@ func TestAFailedSweepNeverOverwritesRefreshedTerminalFacts(t *testing.T) {
 		seamRan = true
 		// The failure is being persisted while the sweep still holds this
 		// record's path lease: a rerun could not have reached finish here.
-		if lease := harness.manager.tryCollectLease(loaded.Directory); lease != nil {
+		if lease := harness.manager.tryCollectLease(handoffPathLeaseKey(loaded.Directory)); lease != nil {
 			lease.release()
 			t.Error("the sweep recorded its failure without holding the record's path lease")
 		}

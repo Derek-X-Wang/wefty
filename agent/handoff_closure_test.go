@@ -128,7 +128,7 @@ func waitHandoffReferences(t *testing.T, manager *handoffManager, path string, w
 	for {
 		manager.mu.Lock()
 		refs := 0
-		if entry := manager.paths[path]; entry != nil {
+		if entry := manager.paths[handoffPathLeaseKey(path)]; entry != nil {
 			refs = entry.refs
 		}
 		manager.mu.Unlock()

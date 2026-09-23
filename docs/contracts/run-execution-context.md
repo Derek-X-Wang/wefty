@@ -677,15 +677,11 @@ from the other and both are reported.
 **OCI volumes are counted against the same number.** An OCI run's results live
 in a helper-owned volume the agent cannot measure — on a Mac node the helper
 runs inside a Lima VM, so the agent cannot even stat that filesystem — and no
-per-run byte bound is enforced there. The helper reports every retained handoff
-volume's logical bytes, bytes deduplicated by inode across its whole root, and
-entry count over the protocol (`oci-helper-protocol.md`,
-`InventoryHandoffVolumes`), and the node charges a volume the larger of its
-deduped bytes and 4 KiB per entry. That is a floor on what the per-entry rule
-charges the agent's own root — a volume mixing one large file with many tiny
-ones is charged less here than the same tree under the process root would be —
-and it is deliberately not a second number on the wire that could disagree with
-the first.
+per-run byte bound is enforced there. The helper measures its own root and
+reports every retained handoff volume's logical bytes, bytes deduplicated by
+inode across its whole root, entry count and charged bytes over the protocol
+(`oci-helper-protocol.md`, `InventoryHandoffVolumes`), and the node counts the
+charged figure it is given.
 
 **The OCI window runs from a helper-owned terminal receipt**, written after the
 attempt's task is reaped and its absence verified, in a durable root the
@@ -823,8 +819,10 @@ attempt's finalization, so one workload's directory tree never sits in front of
 another run finishing or of the node lock being released. All of it reaches a
 person through the agent log and the node doctor's retained-results line.
 
-**What the node gives up when it is over budget.** On the same pass, and only
-there, the node evicts until it fits. Published results go first: a run whose
+**What the node gives up when it is over budget.** On the collector's timer, and only
+there, the node evicts until it fits. The pass at agent startup measures and
+reports and gives nothing up: the budget's first irreversible decision does not
+belong inside the call bringing the node up, before it has claimed any work. Published results go first: a run whose
 evidence reached a ledger has a copy somewhere else, and the `published` fact
 the record carries — the mailbox drain verdict, and the result upload, which is
 the only place an OCI run is named at all — is what says so. Within each of
@@ -847,7 +845,10 @@ fixed token that names the run. Those files are the only copy of what that run
 did, and giving one up is a real loss — but a node that fills and stops serving
 loses every run after it, which is the worse one. "Nothing published" means the
 node holds no published result it may take at all: none, or only ones it may
-never take — the list below. A published result that is merely *busy* this pass
+never take — the list below. Within a class the node tries candidates in order until one is given up: a
+result an attempt is holding, or whose record moved on, is that class being
+busy rather than a reason to leave a full node full. A published result that is
+merely *busy* this pass
 is not one of those, and the node ends the pass rather than reaching past it to
 a run's only copy; the next hourly pass tries again.
 
@@ -898,6 +899,9 @@ together are one; if the root changes under the listing the helper says so and
 the node starts over, bounded. A pass that spends its page or restart bound, or
 that is told a page stopped with no way to resume, reports its figures for that
 root as a floor and withholds the one decision that needs complete knowledge.
+Its own root withholds it the same way: a run measured incompletely, or one
+whose subtree stopped being the directory the pass was measuring, can report
+nothing and drop out of the published candidates entirely.
 
 The record carries whether the run's evidence reached the ledger, and that is
 what this order reads. For an OCI run that record is the node's own admission

@@ -761,6 +761,26 @@ func (m *handoffManager) countUnrecorded(root *os.Root, recorded map[string]stru
 // put this pass in front of every finalization again, which is the whole reason
 // it moved off that path.
 func (m *handoffManager) accountNode(ctx context.Context) error {
+	return m.accountNodeEnforcing(ctx, true)
+}
+
+// measureNodeOnly is the startup pass: it measures and reports and gives
+// nothing up.
+//
+// Startup is the one moment a node is holding everything it will ever hold
+// from its last life and has admitted nothing from this one. A pass that
+// enforced there would run before the agent has claimed any work, inside the
+// call that is trying to bring the node up, and would hand a node whose helper
+// session or record store is still settling its first irreversible decision --
+// deletions -- on the thinnest information it will ever have. It reports
+// instead, so an operator sees the figures immediately, and the first pass
+// that acts is the first timer tick, by which time the node is serving and its
+// second measurement agrees with its first.
+func (m *handoffManager) measureNodeOnly(ctx context.Context) error {
+	return m.accountNodeEnforcing(ctx, false)
+}
+
+func (m *handoffManager) accountNodeEnforcing(ctx context.Context, enforce bool) error {
 	root, err := openPrivateHandoffDirectory(m.root)
 	if err != nil {
 		return err
@@ -769,6 +789,9 @@ func (m *handoffManager) accountNode(ctx context.Context) error {
 	status := m.measureNode(ctx, root, m.now().UTC())
 	status.OCI, status.OCIInventoryFailed = m.measureOCIHandoffs(ctx)
 	m.reportNodeAccounting(status)
+	if !enforce {
+		return nil
+	}
 	// And then, on the same pass and the same goroutine, the node budget acts
 	// on those figures. It is here rather than in collect() because eviction
 	// needs a measurement and measuring a workload's tree must never sit in

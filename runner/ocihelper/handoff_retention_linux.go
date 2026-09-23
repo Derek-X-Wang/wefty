@@ -540,8 +540,11 @@ func (engine *ContainerdEngine) collectDetachedHandoffTrees(ctx context.Context)
 
 // noteHandoffRootMutation records that the handoff root's shape changed.
 //
-// "Shape" is what a listing of it depends on: which volumes exist and which of
-// them carry a terminal receipt. A reader paging through a scan of this root
+// "Shape" is everything a listing of this root depends on: which volumes
+// exist, which of them carry a terminal receipt, and which of them an attempt
+// owns. The third is there because liveness is "owned and carrying no valid
+// receipt", so an ownership record published, released or quarantined changes
+// what a listing would say just as surely as a volume appearing does. A reader paging through a scan of this root
 // has to be told when what it is paging through stopped being true, and a
 // counter is the cheapest thing that can tell it -- the reader compares the
 // generation it started on with the current one and starts over if they
@@ -1209,10 +1212,21 @@ func (engine *ContainerdEngine) storeHandoffScan(scan *handoffRootScan) {
 	engine.handoffScan = scan
 }
 
+// cachedHandoffScan returns the session's scan when it still describes the root
+// as it is now, and drops it when it does not.
+//
+// Dropping matters on a node whose listings are abandoned rather than finished:
+// a reader that stops after its first page, or that never comes back, would
+// otherwise leave a whole root's rows held for the life of the session. A scan
+// the generation has already moved past can answer nothing, so there is no
+// reason to keep it until some later listing happens to replace it.
 func (engine *ContainerdEngine) cachedHandoffScan() (*handoffRootScan, uint64) {
 	current := engine.handoffRootGeneration()
 	engine.handoffScanMu.Lock()
 	defer engine.handoffScanMu.Unlock()
+	if engine.handoffScan != nil && engine.handoffScan.generation != current {
+		engine.handoffScan = nil
+	}
 	return engine.handoffScan, current
 }
 
