@@ -125,7 +125,11 @@ func classifyComputerGrowCapacity(reservation *capacityReservation, oldBytes, ne
 func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageRequest, diskRoot string, imageSize int64) (int64, bool, error) {
 	engine.capacityMu.Lock()
 	defer engine.capacityMu.Unlock()
-	available, err := filesystemAvailableBytes(diskRoot)
+	measureAvailable := filesystemAvailableBytes
+	if engine.computerGrowAvailableBytes != nil {
+		measureAvailable = engine.computerGrowAvailableBytes
+	}
+	available, err := measureAvailable(diskRoot)
 	if err != nil {
 		return 0, false, err
 	}

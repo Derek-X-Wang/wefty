@@ -590,12 +590,24 @@ func TestComputerGrowHeldDeltaChargesOnlyNewcomer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := growTestRequest(firstSafeGrowBytes(available))
-	engine := &ContainerdEngine{capacityReservations: make(map[string]*capacityReservation)}
+	// reserveGrowCapacity re-measures the filesystem's free bytes on every
+	// call. A real disk's free bytes can drift between this sizing read and
+	// the two reservation calls below -- another process on a shared runner
+	// freeing space is enough to move it -- which used to size "second"'s
+	// delta against a stale reading while the admission itself ran against a
+	// fresher, larger one, admitting a newcomer the test meant to prove
+	// refused. Freezing the reading makes both reservations race the exact
+	// same snapshot, which is what this test is actually asserting about the
+	// accounting: a newcomer must not see more room than a concurrent grow
+	// already charged against, independent of what the real disk is doing.
+	frozen := available
+	engine := &ContainerdEngine{capacityReservations: make(map[string]*capacityReservation),
+		computerGrowAvailableBytes: func(string) (int64, error) { return frozen, nil }}
+	first := growTestRequest(firstSafeGrowBytes(frozen))
 	if _, admitted, err := engine.reserveGrowCapacity(first, root, first.Storage.DiskBytes); err != nil || !admitted {
 		t.Fatalf("first held grow admitted=%t err=%v", admitted, err)
 	}
-	second := growTestRequest(first.Storage.DiskBytes + available/2 + 1)
+	second := growTestRequest(first.Storage.DiskBytes + frozen/2 + 1)
 	second.Authority.JobID = "job-2"
 	if _, admitted, err := engine.reserveGrowCapacity(second, root, second.Storage.DiskBytes); err != nil || admitted {
 		t.Fatalf("concurrent newcomer admitted=%t err=%v reservations=%#v", admitted, err, engine.capacityReservations)
