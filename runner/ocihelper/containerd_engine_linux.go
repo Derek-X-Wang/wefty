@@ -123,6 +123,7 @@ type ContainerdEngine struct {
 	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
 	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
 	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
+	handoffDetachedRemoving     func(string)                 // a test parks a deletion inside the free of its detached tree
 	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
 	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
 	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
@@ -1942,7 +1943,7 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 			return DeleteManagedVolumeResponse{}, err
 		}
 		path := filepath.Join(engine.config.RuntimeRoot, "handoffs", name)
-		if err := engine.removeHandoffVolumeAndReceipt(name); err != nil {
+		if err := engine.removeHandoffVolumeAndReceipt(ctx, name); err != nil {
 			return DeleteManagedVolumeResponse{}, err
 		}
 		if err := requirePathAbsent(path, "handoff managed volume"); err != nil {

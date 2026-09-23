@@ -95,7 +95,7 @@ func expire(t *testing.T, engine *ContainerdEngine, now time.Time) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine.cleanupExpiredHandoffs(now, names, live)
+	engine.cleanupExpiredHandoffs(t.Context(), now, names, live)
 }
 
 // A handoff volume is mounted read-write into the container and a uid-0
@@ -1410,5 +1410,111 @@ func TestACreateOnlyPublicationThatCannotUnlinkItsTemporaryIsStillPublished(t *t
 	}
 	if _, statErr := os.Stat(filepath.Join(root, "record")); statErr != nil {
 		t.Fatalf("the published record is not there: %v", statErr)
+	}
+}
+
+// Freeing a handoff volume walks a directory a workload built, so its cost is
+// a workload's choice. Holding the node-wide retention lock across that walk
+// put one run's tree in front of every other attempt's finalization -- the
+// same mistake measuring made, and neither side observed the ten-second
+// cleanup deadline the caller had already set.
+func TestFreeingOneVolumesTreeDoesNotBlockAnotherAttemptsFinalization(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	slow, slowPath := makeHandoffVolume(t, root, "slow-to-free")
+	quick, _ := makeHandoffVolume(t, root, "finishing-meanwhile")
+	if err := os.WriteFile(filepath.Join(slowPath, "result.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	freeing := make(chan struct{})
+	release := make(chan struct{})
+	engine.handoffDetachedRemoving = func(detached string) {
+		if !strings.HasPrefix(detached, handoffDetachedVolumePrefix+slow) {
+			return
+		}
+		close(freeing)
+		<-release
+	}
+	deleted := make(chan error, 1)
+	go func() {
+		_, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "slow-to-free"})
+		deleted <- err
+	}()
+	<-freeing
+
+	// The volume's own name is already gone: detaching is what makes the
+	// deletion's absence verification true, not the walk that follows.
+	if _, err := os.Stat(slowPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the volume name survived detachment: %v", err)
+	}
+
+	// Another attempt finalizes while that tree is still being freed.
+	published := make(chan error, 1)
+	go func() { published <- engine.writeHandoffRetentionReceipt(t.Context(), quick, now) }()
+	select {
+	case err := <-published:
+		if err != nil {
+			t.Fatalf("finalizing another attempt during a free: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("one volume's free blocked another attempt's finalization")
+	}
+	if !receiptPresent(t, root, quick) {
+		t.Fatal("the unblocked attempt published no receipt")
+	}
+
+	close(release)
+	if err := <-deleted; err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(root, "handoffs")); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), handoffDetachedVolumePrefix) {
+				t.Fatalf("a detached tree survived its own deletion: %s", entry.Name())
+			}
+		}
+	}
+}
+
+// A crash between detaching a volume and freeing it, or a deletion whose
+// caller was cancelled mid-free, leaves a detached tree. It is invisible to
+// every scan that matches the volume prefix, so nothing else would ever
+// collect it.
+func TestTheSweepFreesDetachedTreesACrashLeftBehind(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	live, _ := makeHandoffVolume(t, root, "an-ordinary-volume")
+	detached, err := detachedHandoffVolumeName(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanTree := filepath.Join(root, "handoffs", detached)
+	if err := os.MkdirAll(filepath.Join(orphanTree, "deep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanTree, "deep", "bytes"), []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// It is nobody's volume: not inventoried, not measured, not expired.
+	names, err := engine.handoffVolumeNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != live {
+		t.Fatalf("a detached tree was read as a handoff volume: %v", names)
+	}
+
+	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+	if _, err := os.Stat(orphanTree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a detached tree a crash left behind survived the sweep: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "handoffs", live)); err != nil {
+		t.Fatalf("collecting the detached tree took a live volume with it: %v", err)
 	}
 }

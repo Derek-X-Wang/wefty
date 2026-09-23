@@ -1904,6 +1904,11 @@ const (
 	// volumes precisely because a sibling carrying this prefix would be read
 	// as a volume.
 	handoffVolumeNamePrefix = "wefty-handoff-volume-"
+	// handoffDetachedVolumePrefix names a volume between being detached from
+	// its own name and having its bytes freed. It is dot-prefixed so no scan
+	// that matches handoffVolumeNamePrefix can see it -- neither the
+	// inventory, nor expiry, nor accounting repair.
+	handoffDetachedVolumePrefix = ".removing-"
 )
 
 type ComputerDiskQuarantineGCEvidenceStorage string

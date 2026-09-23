@@ -297,38 +297,123 @@ func (engine *ContainerdEngine) publishHandoffRetentionReceipt(name string, meas
 	})
 }
 
-// removeHandoffVolumeAndReceipt takes a handoff volume and its terminal
-// receipt together, volume first, under one hold of the retention mutex.
+// removeHandoffVolumeAndReceipt detaches a handoff volume and its terminal
+// receipt together, and then frees the bytes with nothing held.
 //
-// The order and the single hold are both load-bearing. Removing the receipt
-// first and then the volume unlocked left a window in which a concurrent
-// repair saw a receiptless volume and published a new receipt into it; the
-// volume then disappeared underneath and the receipt survived as an orphan,
-// which the absence projection reads as runtime residue and which therefore
-// refuses the boot barrier until another sweep collects it. Repair reopens the
-// volume under this same mutex before it publishes, so with the volume gone
-// first there is nothing left for it to bind to.
-func (engine *ContainerdEngine) removeHandoffVolumeAndReceipt(name string) error {
-	engine.handoffRetentionMu.Lock()
-	defer engine.handoffRetentionMu.Unlock()
-	if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+// Both halves are load-bearing, and they are separate because the tree being
+// freed is a workload's.
+//
+// Detaching is one rename and one unlink under the retention mutex. Doing the
+// receipt first and the volume afterwards, unlocked, left a window a
+// concurrent repair walked into: it saw a receiptless volume, published a
+// receipt, and the volume disappeared underneath -- an orphan the absence
+// projection reads as runtime residue, which refuses the boot barrier until
+// another sweep collects it. Repair reopens the volume under this same mutex
+// before publishing, so once the name is gone there is nothing left to bind
+// to.
+//
+// Freeing happens outside the mutex, because holding a node-wide lock across
+// a walk of a directory a workload built is the mistake this slice already
+// fixed once for measurement: one run's tree would sit in front of every other
+// attempt's Delete, and neither would observe the ten-second cleanup deadline
+// the caller had already set. The detached name is dot-prefixed, so the
+// inventory scan and repair -- both keyed on the volume prefix -- cannot see
+// it, and a crash between the two halves leaves a tree the sweep collects.
+func (engine *ContainerdEngine) removeHandoffVolumeAndReceipt(ctx context.Context, name string) error {
+	detached, err := engine.detachHandoffVolumeAndReceipt(name)
+	if err != nil {
 		return err
 	}
+	return engine.freeDetachedHandoffTree(ctx, detached)
+}
+
+// detachHandoffVolumeAndReceipt is the locked half: after it returns, the
+// volume's name and its receipt are both absent, whatever is still on the
+// disk under the detached name.
+func (engine *ContainerdEngine) detachHandoffVolumeAndReceipt(name string) (string, error) {
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	detached, err := detachedHandoffVolumeName(name)
+	if err != nil {
+		return "", err
+	}
+	root := engine.handoffVolumeRoot()
+	if err := os.Rename(filepath.Join(root, name), filepath.Join(root, detached)); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		detached = ""
+	}
 	if engine.handoffVolumeRemoved != nil {
-		// A test observes the window between the two removals: whether a
-		// concurrent repair can reach it, and what a receipt removal that
-		// fails right after its volume is gone leaves behind.
+		// A test observes the window between the two: whether a concurrent
+		// repair can reach it, and what a receipt removal that fails right
+		// after its volume is gone leaves behind.
 		if err := engine.handoffVolumeRemoved(name); err != nil {
-			return err
+			return detached, err
 		}
 	}
 	// The receipt is retained exactly while its volume is. Removing them
 	// together is what keeps "observed = residue union retained" true over
 	// the durable class.
 	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return detached, err
+	}
+	return detached, nil
+}
+
+// freeDetachedHandoffTree frees a detached tree with nothing held.
+//
+// A cancelled caller stops rather than working through a workload's tree past
+// its own deadline; the tree keeps its detached name and the next sweep
+// collects it, so the bytes are never lost track of.
+func (engine *ContainerdEngine) freeDetachedHandoffTree(ctx context.Context, detached string) error {
+	if detached == "" {
+		return nil
+	}
+	if engine.handoffDetachedRemoving != nil {
+		engine.handoffDetachedRemoving(detached)
+	}
+	if ctx != nil && ctx.Err() != nil {
+		log.Printf("handoff retention: %s is detached and will be freed by the next sweep: %v", detached, ctx.Err())
+		return nil
+	}
+	if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), detached)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+// detachedHandoffVolumeName is the name a volume wears between being detached
+// and being freed. The dot keeps it out of every scan that matches the volume
+// prefix, and the nonce keeps two detachments of the same name apart.
+func detachedHandoffVolumeName(name string) (string, error) {
+	nonce, err := randomCapability()
+	if err != nil {
+		return "", err
+	}
+	return handoffDetachedVolumePrefix + name + "-" + nonce[:16], nil
+}
+
+// collectDetachedHandoffTrees frees what a crash left between the two halves
+// of a deletion, and what a cancelled deletion deliberately left behind. It is
+// the handoff root's counterpart to the retention root's temporary sweep.
+func (engine *ContainerdEngine) collectDetachedHandoffTrees(ctx context.Context) {
+	entries, err := readDirectoryIfPresent(engine.handoffVolumeRoot())
+	if err != nil {
+		log.Printf("handoff retention: read the handoff root for detached trees: %v", err)
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), handoffDetachedVolumePrefix) {
+			continue
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("handoff retention: free detached tree %s: %v", entry.Name(), err)
+		}
+	}
 }
 
 func (engine *ContainerdEngine) removeHandoffRetentionReceipt(name string) error {
@@ -469,7 +554,7 @@ func (engine *ContainerdEngine) reconcileHandoffRetention(ctx context.Context, n
 	if !ok {
 		return
 	}
-	engine.cleanupExpiredHandoffs(now, names, live)
+	engine.cleanupExpiredHandoffs(ctx, now, names, live)
 	// The orphan pass re-lists rather than reusing the names above. Driving it
 	// off the pre-cleanup observation meant a receipt whose removal failed
 	// immediately after its volume was taken still counted as paired, so it
@@ -483,6 +568,7 @@ func (engine *ContainerdEngine) reconcileHandoffRetention(ctx context.Context, n
 	if err := engine.removeOrphanHandoffRetentionReceipts(survivors); err != nil {
 		log.Printf("handoff retention: remove receipts whose volume is gone: %v", err)
 	}
+	engine.collectDetachedHandoffTrees(ctx)
 }
 
 // repairMissingHandoffRetentionReceipts is the stamping half on its own, and
@@ -718,7 +804,7 @@ func (engine *ContainerdEngine) handoffVolumeExpired(name string, now time.Time,
 // One volume it cannot read is one volume it does not remove. It used to
 // abort, which meant a single directory replaced by a symlink stopped a node
 // expiring anything at all.
-func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time, names []string, live map[string]struct{}) {
+func (engine *ContainerdEngine) cleanupExpiredHandoffs(ctx context.Context, now time.Time, names []string, live map[string]struct{}) {
 	for _, name := range names {
 		expired, err := engine.handoffVolumeExpired(name, now, live)
 		if err != nil {
@@ -730,7 +816,7 @@ func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time, names []st
 		if !expired {
 			continue
 		}
-		if err := engine.removeHandoffVolumeAndReceipt(name); err != nil {
+		if err := engine.removeHandoffVolumeAndReceipt(ctx, name); err != nil {
 			log.Printf("handoff retention: remove expired %s: %v", name, err)
 		}
 	}
