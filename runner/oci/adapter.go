@@ -2487,8 +2487,9 @@ func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workload
 		return workloadrunner.RetainedHandoffReport{}, err
 	}
 	report := workloadrunner.RetainedHandoffReport{
-		Volumes:   make([]workloadrunner.RetainedHandoffVolume, 0, len(response.Volumes)),
-		Exhausted: response.Exhausted,
+		Volumes:       make([]workloadrunner.RetainedHandoffVolume, 0, len(response.Volumes)),
+		Exhausted:     response.Exhausted,
+		DetachedTrees: response.DetachedTrees,
 	}
 	for _, volume := range response.Volumes {
 		anomalies := make([]string, 0, len(volume.Anomalies))

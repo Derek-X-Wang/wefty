@@ -146,6 +146,10 @@ type RetainedOCIResultsStatus struct {
 	// Exhausted says the helper holds more volumes than one read carries, so
 	// the figures above are a floor.
 	Exhausted bool `json:"exhausted,omitempty"`
+	// DetachedTrees counts results whose removal was authorized and has not
+	// finished freeing. Their bytes are on the node and are in none of the
+	// figures above, because a detached tree is nobody's volume.
+	DetachedTrees int `json:"detached_trees,omitempty"`
 }
 
 // RetainedRunFigures is one run's share of a pass.

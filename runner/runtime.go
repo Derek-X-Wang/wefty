@@ -591,6 +591,11 @@ type RetainedHandoffInventory interface {
 type RetainedHandoffReport struct {
 	Volumes   []RetainedHandoffVolume
 	Exhausted bool
+	// DetachedTrees counts results whose removal was authorized and has not
+	// finished freeing. Their bytes are on the node and belong to no volume
+	// above, so a budget that could not see them would read the node emptier
+	// than it is.
+	DetachedTrees int
 }
 
 // RetainedHandoffVolume is one retained handoff directory as the runtime sees

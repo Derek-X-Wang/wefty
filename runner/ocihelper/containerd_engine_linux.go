@@ -124,6 +124,7 @@ type ContainerdEngine struct {
 	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
 	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
 	handoffDetachedRemoving     func(string)                 // a test parks a deletion inside the free of its detached tree
+	handoffFreeChild            func(string, string) error   // a test makes one child of a detached tree fail to free
 	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
 	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
 	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture

@@ -1518,3 +1518,189 @@ func TestTheSweepFreesDetachedTreesACrashLeftBehind(t *testing.T) {
 		t.Fatalf("collecting the detached tree took a live volume with it: %v", err)
 	}
 }
+
+// A deletion whose caller ran out of time leaves its tree detached. Nothing
+// else can see those bytes -- a detached name is invisible to the inventory,
+// to expiry and to repair -- so waiting for the next boot sweep hid them for
+// as long as the session lived.
+func TestACancelledFreeIsFinishedByTheNextAccountingReadWithNoSweep(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	_, path := makeHandoffVolume(t, root, "cancelled-free")
+	if err := os.MkdirAll(filepath.Join(path, "deep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "deep", "bytes"), []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	response, err := engine.DeleteManagedVolume(cancelled, DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "cancelled-free"})
+	if err != nil || !response.Deleted {
+		t.Fatalf("a cancelled free refused the deletion = %+v err=%v", response, err)
+	}
+	// The volume's own name and its receipt are gone -- that is what the
+	// deletion promised -- but the bytes are still here.
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the volume name survived: %v", err)
+	}
+	if detachedTrees(t, root) != 1 {
+		t.Fatalf("a cancelled free left %d detached tree(s), want exactly one", detachedTrees(t, root))
+	}
+
+	// No sweep. The agent's own accounting read finishes it, and says so
+	// until it has.
+	inventory, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.DetachedTrees != 0 {
+		t.Fatalf("the read reported %d detached tree(s) still pending after freeing them", inventory.DetachedTrees)
+	}
+	if detachedTrees(t, root) != 0 {
+		t.Fatal("an accounting read left the detached tree on the node")
+	}
+	if len(inventory.Volumes) != 0 {
+		t.Fatalf("a detached tree was reported as a volume: %+v", inventory.Volumes)
+	}
+}
+
+// One child that cannot be freed stops this tree and leaves the rest of it
+// where it is: the next pass tries again, and the response says the node is
+// still holding bytes no volume accounts for.
+func TestAFreeThatFailsOnOneChildLeavesTheRestForTheNextPass(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	_, path := makeHandoffVolume(t, root, "stubborn-child")
+	for _, child := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(path, child), []byte(child), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Whichever child the directory yields first, and the same one on every
+	// pass, so the fixture depends on no readdir order.
+	refuse, stubborn := true, ""
+	engine.handoffFreeChild = func(_, child string) error {
+		if stubborn == "" {
+			stubborn = child
+		}
+		if refuse && child == stubborn {
+			return errors.New("this child cannot be freed")
+		}
+		return nil
+	}
+	if _, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "stubborn-child"}); err == nil {
+		t.Fatal("a free that could not finish reported success")
+	}
+	if detachedTrees(t, root) != 1 {
+		t.Fatal("the failing tree did not stay detached")
+	}
+	// The rest of the tree is left where it is rather than half-freed: the
+	// next pass tries the whole thing again, and grinding through the
+	// remainder of a tree that is already failing buys nothing.
+	if remaining := detachedChildren(t, root); remaining != 3 {
+		t.Fatalf("a failing child left %d of 3 children; the rest of the tree was freed anyway", remaining)
+	}
+
+	// The read reports it rather than silently carrying bytes nothing names.
+	inventory, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.DetachedTrees != 1 {
+		t.Fatalf("the read reported %d detached tree(s), want the one it could not free", inventory.DetachedTrees)
+	}
+
+	// And the next pass, once the filesystem allows it, finishes the job.
+	refuse = false
+	after, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.DetachedTrees != 0 || detachedTrees(t, root) != 0 {
+		t.Fatalf("the next pass left %d detached tree(s) on the node", after.DetachedTrees)
+	}
+}
+
+func detachedTrees(t *testing.T, root string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "handoffs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), handoffDetachedVolumePrefix) {
+			count++
+		}
+	}
+	return count
+}
+
+// Cancellation is checked between the detached tree's top-level children, not
+// once before the walk: a caller out of time stops within one child's subtree
+// rather than after the whole tree, which is the difference between honouring
+// a ten-second cleanup deadline and merely starting inside it.
+func TestAFreeCancelledMidTreeStopsWithinOneChild(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	_, path := makeHandoffVolume(t, root, "cancelled-mid-tree")
+	for _, child := range []string{"a", "b", "c", "d"} {
+		if err := os.MkdirAll(filepath.Join(path, child), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	freed := 0
+	engine.handoffFreeChild = func(string, string) error {
+		freed++
+		// The caller's time runs out while this child is being freed.
+		cancel()
+		return nil
+	}
+	if _, err := engine.DeleteManagedVolume(ctx, DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "cancelled-mid-tree"}); err != nil {
+		t.Fatal(err)
+	}
+	if freed != 1 {
+		t.Fatalf("a cancelled free reached %d children, want exactly the one it had begun", freed)
+	}
+	if remaining := detachedChildren(t, root); remaining != 3 {
+		t.Fatalf("a cancelled free left %d of 4 children; it walked past its own cancellation", remaining)
+	}
+
+	// And nothing is lost: the next pass finishes it.
+	engine.handoffFreeChild = nil
+	inventory, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.DetachedTrees != 0 || detachedTrees(t, root) != 0 {
+		t.Fatalf("the next pass left %d detached tree(s)", inventory.DetachedTrees)
+	}
+}
+
+// detachedChildren counts the top-level entries under the node's one detached
+// tree.
+func detachedChildren(t *testing.T, root string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "handoffs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), handoffDetachedVolumePrefix) {
+			continue
+		}
+		children, err := os.ReadDir(filepath.Join(root, "handoffs", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(children)
+	}
+	t.Fatal("no detached tree is present")
+	return 0
+}

@@ -1869,6 +1869,12 @@ type InventoryHandoffVolumesResponse struct {
 	// Exhausted says the node holds more handoff volumes than one response
 	// carries, so the figures above are a floor rather than the node total.
 	Exhausted bool `json:"exhausted"`
+	// DetachedTrees counts the volumes an authorized deletion detached from
+	// their names and whose bytes are not yet freed, after this call finished
+	// what it could. They are in no volume's figures above -- a detached tree
+	// is nobody's volume -- so a node budget that could not see them would be
+	// reading a node emptier than it is.
+	DetachedTrees int `json:"detached_trees,omitempty"`
 }
 
 // MaxInventoriedHandoffVolumes bounds one InventoryHandoffVolumes response the

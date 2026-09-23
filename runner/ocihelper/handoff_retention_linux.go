@@ -363,9 +363,16 @@ func (engine *ContainerdEngine) detachHandoffVolumeAndReceipt(name string) (stri
 
 // freeDetachedHandoffTree frees a detached tree with nothing held.
 //
-// A cancelled caller stops rather than working through a workload's tree past
-// its own deadline; the tree keeps its detached name and the next sweep
-// collects it, so the bytes are never lost track of.
+// Cancellation is checked between top-level children rather than once at the
+// start: a caller that is out of time stops within one child's subtree, not
+// after the whole tree. Whatever is left keeps its detached name, and the next
+// pass -- a sweep or an accounting read -- finishes it, so the bytes are never
+// lost track of.
+//
+// A child that cannot be freed stops the pass for this tree and leaves the
+// rest of it where it is, for the same reason: the next pass will try again,
+// and grinding through the remainder of a tree that is already failing buys
+// nothing.
 func (engine *ContainerdEngine) freeDetachedHandoffTree(ctx context.Context, detached string) error {
 	if detached == "" {
 		return nil
@@ -373,11 +380,54 @@ func (engine *ContainerdEngine) freeDetachedHandoffTree(ctx context.Context, det
 	if engine.handoffDetachedRemoving != nil {
 		engine.handoffDetachedRemoving(detached)
 	}
-	if ctx != nil && ctx.Err() != nil {
-		log.Printf("handoff retention: %s is detached and will be freed by the next sweep: %v", detached, ctx.Err())
+	root := filepath.Join(engine.handoffVolumeRoot(), detached)
+	directory, err := os.Open(root)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), detached)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err != nil {
+		return err
+	}
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", detached, ctx.Err())
+			return errors.Join(directory.Close(), nil)
+		}
+		children, readErr := directory.Readdirnames(handoffReadChunk)
+		for _, child := range children {
+			if ctx != nil && ctx.Err() != nil {
+				log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", detached, ctx.Err())
+				return directory.Close()
+			}
+			if err := engine.freeDetachedHandoffChild(detached, child); err != nil {
+				return errors.Join(err, directory.Close())
+			}
+		}
+		if errors.Is(readErr, io.EOF) || len(children) == 0 {
+			break
+		}
+		if readErr != nil {
+			return errors.Join(readErr, directory.Close())
+		}
+	}
+	if err := directory.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) freeDetachedHandoffChild(detached, child string) error {
+	if engine.handoffFreeChild != nil {
+		// A test makes one child's removal fail, to prove the rest of the
+		// tree is left for the next pass rather than half-freed and forgotten.
+		if err := engine.handoffFreeChild(detached, child); err != nil {
+			return err
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), detached, child)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -394,26 +444,41 @@ func detachedHandoffVolumeName(name string) (string, error) {
 	return handoffDetachedVolumePrefix + name + "-" + nonce[:16], nil
 }
 
-// collectDetachedHandoffTrees frees what a crash left between the two halves
-// of a deletion, and what a cancelled deletion deliberately left behind. It is
-// the handoff root's counterpart to the retention root's temporary sweep.
-func (engine *ContainerdEngine) collectDetachedHandoffTrees(ctx context.Context) {
+// collectDetachedHandoffTrees finishes the frees an earlier authorized
+// deletion started, and reports how many are still pending afterwards.
+//
+// It runs on every pass that touches this root -- the sweep and the agent's
+// accounting read -- because a free that a cancelled caller or a filesystem
+// failure left unfinished is bytes on the node that nothing else can see: a
+// detached name is deliberately invisible to the inventory, to expiry and to
+// repair, so waiting for the next boot sweep would hide them for as long as
+// the session lived.
+//
+// It is best-effort per tree. One tree that cannot be freed costs that tree
+// and nothing else.
+func (engine *ContainerdEngine) collectDetachedHandoffTrees(ctx context.Context) int {
 	entries, err := readDirectoryIfPresent(engine.handoffVolumeRoot())
 	if err != nil {
 		log.Printf("handoff retention: read the handoff root for detached trees: %v", err)
-		return
+		return 0
 	}
+	pending := 0
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), handoffDetachedVolumePrefix) {
 			continue
 		}
 		if ctx != nil && ctx.Err() != nil {
-			return
+			pending++
+			continue
 		}
-		if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("handoff retention: free detached tree %s: %v", entry.Name(), err)
+		if err := engine.freeDetachedHandoffTree(ctx, entry.Name()); err != nil {
+			log.Printf("handoff retention: free detached tree %s: %v (the next pass tries again)", entry.Name(), err)
+		}
+		if _, err := os.Lstat(filepath.Join(engine.handoffVolumeRoot(), entry.Name())); err == nil {
+			pending++
 		}
 	}
+	return pending
 }
 
 func (engine *ContainerdEngine) removeHandoffRetentionReceipt(name string) error {
@@ -568,7 +633,9 @@ func (engine *ContainerdEngine) reconcileHandoffRetention(ctx context.Context, n
 	if err := engine.removeOrphanHandoffRetentionReceipts(survivors); err != nil {
 		log.Printf("handoff retention: remove receipts whose volume is gone: %v", err)
 	}
-	engine.collectDetachedHandoffTrees(ctx)
+	if pending := engine.collectDetachedHandoffTrees(ctx); pending != 0 {
+		log.Printf("handoff retention: %d detached tree(s) are still being freed and the next pass finishes them", pending)
+	}
 }
 
 // repairMissingHandoffRetentionReceipts is the stamping half on its own, and
@@ -846,11 +913,23 @@ func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ I
 	// hourly accounting pass, which is the right cadence for the repair too.
 	// This is create-only, skips volumes a live attempt holds, and removes
 	// nothing at all: expiry is the sweep's and eviction is the agent's.
+	// Finishing a free an earlier authorized deletion started is not deleting
+	// something on a read: a detached tree is neither a volume nor a receipt,
+	// it is bytes whose removal was already authorized and interrupted. It
+	// runs here because a detached name is invisible to the inventory, to
+	// expiry and to repair, so leaving it to the next boot sweep would hide
+	// those bytes for as long as the session lived.
+	detached := engine.collectDetachedHandoffTrees(ctx)
 	names, live, ok := engine.repairMissingHandoffRetentionReceipts(ctx, engine.handoffNow())
 	if !ok {
 		return InventoryHandoffVolumesResponse{}, errors.New("the handoff root could not be read")
 	}
-	response := InventoryHandoffVolumesResponse{Volumes: make([]RetainedHandoffVolume, 0, len(names))}
+	response := InventoryHandoffVolumesResponse{
+		Volumes: make([]RetainedHandoffVolume, 0, len(names)), DetachedTrees: detached,
+	}
+	if detached != 0 {
+		log.Printf("handoff retention: %d detached tree(s) are still being freed; their bytes are on the node and are in no volume's figures", detached)
+	}
 	if len(names) > MaxInventoriedHandoffVolumes {
 		names = names[:MaxInventoriedHandoffVolumes]
 		response.Exhausted = true
