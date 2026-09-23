@@ -87,11 +87,36 @@ type handoffInodeIdentity struct {
 }
 
 type handoffVolumeMeasurement struct {
-	logical   int64
-	deduped   int64
+	logical int64
+	deduped int64
+	// charged is what a node budget is measured in: every entry contributes
+	// the larger of its deduplicated logical bytes and handoffChargedEntryFloor.
+	// It is the identical rule the agent applies to its own handoff root, and
+	// it is accumulated here rather than derived afterwards because no
+	// function of a volume total and an entry count reproduces a per-entry
+	// floor -- one 600 MiB file beside 150,000 empty ones is ~600 MiB of data
+	// and ~1.2 GiB of node.
+	charged   int64
 	entries   int64
 	truncated bool
 	anomalies []HandoffVolumeAnomaly
+}
+
+// handoffChargedEntryFloor is what one directory entry costs the node figure
+// however little it holds. It is the agent's constant of the same name, spelled
+// here because the helper measures its own root and the two must charge alike.
+const handoffChargedEntryFloor = 4 << 10
+
+// charge records one directory entry's contribution to both byte figures'
+// node-facing half. logical is what the entry adds after inode deduplication:
+// a regular file's size the first time this pass reaches its inode, and zero
+// for a directory, a symlink, a device, or a second name for a file already
+// counted. The data is charged once; the name it takes is charged every time.
+func (measurement *handoffVolumeMeasurement) charge(logical int64) {
+	if logical < handoffChargedEntryFloor {
+		logical = handoffChargedEntryFloor
+	}
+	measurement.charged += logical
 }
 
 func (measurement *handoffVolumeMeasurement) note(anomaly HandoffVolumeAnomaly) {
@@ -330,9 +355,23 @@ func (engine *ContainerdEngine) removeHandoffVolumeAndReceipt(ctx context.Contex
 // detachHandoffVolumeAndReceipt is the locked half: after it returns, the
 // volume's name and its receipt are both absent, whatever is still on the
 // disk under the detached name.
+//
+// Liveness is checked here, under the same lock `Run` registers ownership and
+// supersedes the prior receipt under, and not in the caller. Anywhere else it
+// would be a check with a window after it: a rerun that registers between an
+// inventory read and this call is exactly the interleaving that loses a
+// running container its files, and only the lock that publishes ownership can
+// close it.
 func (engine *ContainerdEngine) detachHandoffVolumeAndReceipt(name string) (string, error) {
 	engine.handoffRetentionMu.Lock()
 	defer engine.handoffRetentionMu.Unlock()
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		return "", fmt.Errorf("read handoff ownership before removing %s: %w", name, err)
+	}
+	if _, owned := live[name]; owned {
+		return "", &HandoffVolumeLiveError{Name: name}
+	}
 	detached, err := detachedHandoffVolumeName(name)
 	if err != nil {
 		return "", err
@@ -905,7 +944,23 @@ func (engine *ContainerdEngine) cleanupExpiredHandoffs(ctx context.Context, now 
 // discards the write error and closes the connection, and the client reads
 // that as a lost session -- so a node with enough retained results would have
 // lost its runtime every time it tried to count them.
-func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
+//
+// It is therefore a *page*, and it carries a cursor. A bound with no way to
+// ask for the rest left the tail of a large root unreadable by any number of
+// calls, which is not merely incomplete accounting: the node budget gives
+// published results up first, and it cannot know that none remains while part
+// of the root has never been shown to it. `exhausted` says this page stopped
+// early and `next` says where to resume; a page that reached the end of the
+// root reports `exhausted=false`, and only that answer means "this is
+// everything".
+//
+// Deduplication is per page. One `(device, inode)` map spans one call, so a
+// file two volumes hard-link is counted once when both land on the same page
+// and once per page when they do not. Carrying the map across calls would mean
+// remembering a caller's pass between requests; charging a shared inode twice
+// across a page boundary overstates a node, which is the safe direction for a
+// bound on what a node keeps.
+func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, request InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
 	// Repair before reporting. The boot sweep used to be the only thing that
 	// stamped a missing receipt, so a receipt the filesystem refused stayed
 	// missing until somebody restarted the helper -- and a volume with no
@@ -930,33 +985,61 @@ func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ I
 	if detached != 0 {
 		log.Printf("handoff retention: %d detached tree(s) are still being freed; their bytes are on the node and are in no volume's figures", detached)
 	}
-	if len(names) > MaxInventoriedHandoffVolumes {
-		names = names[:MaxInventoriedHandoffVolumes]
-		response.Exhausted = true
-	}
+	// The cursor is a name, and names are listed sorted, so resuming is a
+	// comparison rather than anything the helper has to remember between
+	// calls. A page that stops short returns the last name it *considered* --
+	// including one that vanished between the listing and the read, which is
+	// counted as seen so the cursor cannot stall on it forever.
 	seen := make(map[handoffInodeIdentity]struct{})
 	budget := engine.newHandoffMeasureBudget()
-	encoded := len(`{"volumes":[],"exhausted":false}`)
+	// The envelope, plus room for the longest cursor this page could have to
+	// return. The cursor is not known until the page stops, so it is reserved
+	// rather than measured: a response that fit its budget only while it
+	// happened to end on a short name would be a frame the transport refuses,
+	// which costs the node its session rather than shortening its answer.
+	encoded := len(`{"volumes":[],"exhausted":false,"detached_trees":0,"next":""}`) + MaxHandoffInventoryCursorBytes
+	rows := 0
+	considered := ""
+	stop := func() (InventoryHandoffVolumesResponse, error) {
+		response.Exhausted, response.Next = true, considered
+		return response, nil
+	}
 	for _, name := range names {
-		if err := ctx.Err(); err != nil {
-			response.Exhausted = true
-			return response, nil
+		if name <= request.After {
+			continue
+		}
+		if ctx.Err() != nil {
+			return stop()
+		}
+		if rows >= MaxInventoriedHandoffVolumes {
+			return stop()
 		}
 		volume, present := engine.retainedHandoffVolume(ctx, name, live, seen, budget)
 		if !present {
+			considered = name
 			continue
 		}
 		size, err := json.Marshal(volume)
 		if err != nil {
 			return InventoryHandoffVolumesResponse{}, err
 		}
-		if encoded+len(size)+1 > engine.handoffInventoryByteBudget() {
-			response.Exhausted = true
-			break
+		if rows != 0 && encoded+len(size)+1 > engine.handoffInventoryByteBudget() {
+			// `rows != 0` keeps the cursor moving: a single volume whose own
+			// row will not fit is still emitted, because a page that carried
+			// nothing and returned the same cursor would be an endless
+			// listing rather than a bounded one.
+			return stop()
 		}
 		encoded += len(size) + 1
+		rows++
+		considered = name
 		response.Volumes = append(response.Volumes, volume)
 	}
+	// The listing reached the end of the root, and `exhausted=false` is what
+	// says so. That -- not an empty cursor, which a page that stopped before
+	// its first row also has -- is what lets a reader claim it has seen
+	// everything this node holds, which the node budget needs before it may
+	// give up a result no ledger ever saw.
 	return response, nil
 }
 
@@ -999,6 +1082,7 @@ func (engine *ContainerdEngine) retainedHandoffVolume(ctx context.Context, name 
 		measurement.note(anomaly)
 	}
 	volume.LogicalBytes, volume.DedupedBytes, volume.Entries = walked.logical, walked.deduped, walked.entries
+	volume.ChargedBytes = walked.charged
 	volume.Truncated, volume.Anomalies = walked.truncated, measurement.anomalies
 	return volume, true
 }
@@ -1066,18 +1150,22 @@ func (engine *ContainerdEngine) walkHandoffDirectory(ctx context.Context, volume
 			var stat unix.Stat_t
 			if unix.Fstatat(descriptor, entry, &stat, unix.AT_SYMLINK_NOFOLLOW) != nil {
 				// Gone between the listing and the stat, or unreadable. Either
-				// way there is nothing here to count.
+				// way there is nothing here to count -- not even a slot, since
+				// the entry no longer occupies one.
 				continue
 			}
+			deduplicated := int64(0)
 			switch stat.Mode & unix.S_IFMT {
 			case unix.S_IFDIR:
 				engine.descendHandoffDirectory(ctx, volume, descriptor, entry, stat, depth, seen, budget, measurement)
 			case unix.S_IFREG:
 				measurement.logical += stat.Size
 				if chargeHandoffInode(stat, seen) {
+					deduplicated = stat.Size
 					measurement.deduped += stat.Size
 				}
 			}
+			measurement.charge(deduplicated)
 		}
 		if errors.Is(err, io.EOF) || len(names) == 0 {
 			return

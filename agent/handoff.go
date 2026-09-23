@@ -169,7 +169,16 @@ func (m *handoffManager) log(format string, args ...any) {
 // prepare, execution, completion, and finish lifecycle. Per-call locking is
 // insufficient because finish may trim a directory another attempt uses.
 func (m *handoffManager) lock(ctx context.Context, spec contract.JobSpec) (*handoffLease, error) {
-	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	return m.lockPath(ctx, filepath.Clean(spec.Execution.HandoffDirectory))
+}
+
+// lockPath is the registry itself, keyed by a string rather than by a spec.
+//
+// The key is a cleaned absolute path for a process run's handoff directory and
+// a derived, non-path key for an OCI run's handoff volume, which has no path on
+// this node at all. One registry serves both because what it excludes is the
+// same thing in both cases: the node giving up results an attempt is holding.
+func (m *handoffManager) lockPath(ctx context.Context, path string) (*handoffLease, error) {
 	m.mu.Lock()
 	pathLock := m.paths[path]
 	if pathLock == nil {

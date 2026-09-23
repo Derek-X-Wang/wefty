@@ -110,6 +110,13 @@ type RetainedResultsStatus struct {
 	// moves with the files, and a retention record is authority to delete and
 	// has to stay what an attempt wrote.
 	PerRun []RetainedRunFigures `json:"per_run,omitempty"`
+	// OCIInventoryFailed says this node has an OCI helper and could not read
+	// its handoff root at all. It is a different fact from OCI being absent,
+	// and the node budget needs the difference: a root that was not read is
+	// not an empty root, and giving up a result no ledger saw while a
+	// published one may be sitting in a root nobody could read is exactly the
+	// loss the eviction order exists to prevent.
+	OCIInventoryFailed bool `json:"oci_inventory_failed,omitempty"`
 	// OCI is what the node's OCI helper reports about its own handoff root,
 	// absent when this node runs no OCI helper or the read failed. The node
 	// agent owns retention policy for both roots but can only measure one of
@@ -153,9 +160,21 @@ type RetainedOCIResultsStatus struct {
 	// Truncated counts the volumes whose byte and entry figures the helper
 	// measured incompletely, so those volumes' figures are a floor.
 	Truncated int `json:"truncated"`
-	// Exhausted says the helper holds more volumes than one read carries, so
-	// the figures above are a floor.
+	// Exhausted says at least one page of this pass stopped before the end of
+	// the root, so it took more than one call to read.
 	Exhausted bool `json:"exhausted,omitempty"`
+	// Complete says this pass read the helper's root to its end. It is the
+	// only thing that lets the node say it has seen every published result the
+	// helper holds, which is what giving up an unpublished one requires. An
+	// incomplete pass still reports every figure above; it withholds exactly
+	// one decision.
+	Complete bool `json:"complete"`
+	// AdmittedHere counts the volumes this node's own records say an attempt
+	// is writing into. It is counted separately from the helper's `live`
+	// because the two facts are learned at different moments: this one exists
+	// from before the runtime request, the helper's from when `Run` registers
+	// the attempt.
+	AdmittedHere int `json:"admitted_here,omitempty"`
 	// DetachedTrees counts results whose removal was authorized and has not
 	// finished freeing. Their bytes are on the node and are in none of the
 	// figures above, because a detached tree is nobody's volume. The node

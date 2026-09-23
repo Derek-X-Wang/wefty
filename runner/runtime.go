@@ -578,7 +578,13 @@ type PriorBootReaper interface {
 // It is a read. Nothing here deletes, and nothing here takes authority over an
 // attempt.
 type RetainedHandoffInventory interface {
-	InventoryRetainedHandoffs(context.Context) (RetainedHandoffReport, error)
+	// InventoryRetainedHandoffs reads one page. `after` is the `Next` a
+	// previous page returned, empty for the first. It is a page rather than a
+	// whole answer because a node with a large root cannot be described in one
+	// bounded frame, and a bound with no way to ask for the rest left the tail
+	// unreadable by any number of calls -- which a budget that gives published
+	// results up first cannot work from.
+	InventoryRetainedHandoffs(ctx context.Context, after string) (RetainedHandoffReport, error)
 	// RetainedHandoffVolumeName is how the agent places a name in the report
 	// above without any identity crossing the wire: it derives the name one of
 	// its own runs would have, and a reported name it cannot derive is residue
@@ -603,11 +609,27 @@ type RetainedHandoffEvictor interface {
 	EvictRetainedHandoff(ctx context.Context, ownerKey string) error
 }
 
-// RetainedHandoffReport is one runtime's answer. Exhausted says the runtime
-// holds more volumes than it returned, so these figures are a floor.
+// ErrRetainedHandoffLive is the runtime's refusal to give up a volume an
+// attempt still owns.
+//
+// It is a distinct answer from a failure, and the node needs the difference:
+// an eviction that raced a rerun is the system working -- the volume is a
+// running attempt's and the node keeps it -- while a failure is a node that
+// could not act. The runtime decides it, under the lock that publishes
+// ownership, because no check the node could make would still be true by the
+// time its request arrived.
+var ErrRetainedHandoffLive = errors.New("the retained handoff volume is owned by a live attempt")
+
+// RetainedHandoffReport is one page of one runtime's answer. Exhausted says
+// this page stopped before the end of the root, so these figures are the
+// page's rather than the node's; a page that reached the end reports it false,
+// and that -- not an empty cursor, which a page that stopped before its first
+// row also has -- is what says a reader has seen everything.
 type RetainedHandoffReport struct {
 	Volumes   []RetainedHandoffVolume
 	Exhausted bool
+	// Next is the cursor to pass as the next call's `after`.
+	Next string
 	// DetachedTrees counts results whose removal was authorized and has not
 	// finished freeing. Their bytes are on the node and belong to no volume
 	// above, so a budget that could not see them would read the node emptier
@@ -629,7 +651,13 @@ type RetainedHandoffVolume struct {
 	TerminalKnown bool
 	LogicalBytes  int64
 	DedupedBytes  int64
-	Entries       int64
+	// ChargedBytes is what this volume costs a node budget, under the same
+	// per-entry rule the agent applies to its own handoff root: every entry
+	// contributes the larger of its deduplicated logical bytes and 4 KiB. The
+	// runtime reports it rather than the node deriving it, because no function
+	// of a volume total and an entry count reproduces a per-entry floor.
+	ChargedBytes int64
+	Entries      int64
 	// Live says an attempt is still writing here.
 	Live bool
 	// Truncated says the byte and entry figures are a floor: the runtime

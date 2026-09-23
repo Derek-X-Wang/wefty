@@ -1704,3 +1704,209 @@ func detachedChildren(t *testing.T, root string) int {
 	t.Fatal("no detached tree is present")
 	return 0
 }
+
+// --- #494 S4 review: the page cursor, the per-entry charge, and the refusal
+// of a volume an attempt owns ---
+
+// TestTheHandoffInventoryPagesToTheEndOfItsRoot is what makes "no published
+// result remains" a thing a node can establish. A bound with no cursor left
+// the tail of a large root unreadable by any number of calls, so the node
+// could never tell an empty published list from an unseen one.
+func TestTheHandoffInventoryPagesToTheEndOfItsRoot(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	owners := []string{"run-a", "run-b", "run-c", "run-d", "run-e"}
+	expected := make(map[string]struct{}, len(owners))
+	for _, owner := range owners {
+		name, _ := makeHandoffVolume(t, root, owner)
+		expected[name] = struct{}{}
+	}
+	// One volume per page, which is the shape a byte budget produces on a real
+	// root and the shape that makes the cursor load-bearing.
+	engine.handoffInventoryBytes = len(`{"volumes":[],"exhausted":false,"next":""}`) + 1
+
+	seen := make(map[string]struct{}, len(owners))
+	after, pages := "", 0
+	for {
+		pages++
+		if pages > 2*len(owners)+2 {
+			t.Fatalf("the listing never reached the end of its root: after %d pages it had seen %d of %d", pages, len(seen), len(owners))
+		}
+		page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: after})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, volume := range page.Volumes {
+			if _, repeated := seen[volume.Name]; repeated {
+				t.Fatalf("the listing returned %s twice", volume.Name)
+			}
+			seen[volume.Name] = struct{}{}
+		}
+		if !page.Exhausted {
+			break
+		}
+		if page.Next == "" || page.Next <= after {
+			t.Fatalf("page %d stopped at %q and gave no way to resume (next=%q)", pages, after, page.Next)
+		}
+		after = page.Next
+	}
+	if len(seen) != len(expected) {
+		t.Fatalf("the listing showed %d volumes across %d pages, want all %d", len(seen), pages, len(expected))
+	}
+	for name := range expected {
+		if _, shown := seen[name]; !shown {
+			t.Fatalf("%s was never shown", name)
+		}
+	}
+	if pages < 2 {
+		t.Fatalf("the fixture read the whole root in %d page(s); it does not exercise the cursor", pages)
+	}
+}
+
+// TestAFinishedListingSaysSoWithExhaustedRatherThanAnEmptyCursor pins which
+// answer means "this is everything". A page that stops before its first row
+// has an empty cursor too, so emptiness cannot carry that meaning.
+func TestAFinishedListingSaysSoWithExhaustedRatherThanAnEmptyCursor(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	makeHandoffVolume(t, root, "only-run")
+
+	page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Exhausted || page.Next != "" || len(page.Volumes) != 1 {
+		t.Fatalf("a root read whole reported %+v", page)
+	}
+	// Resuming past the only volume is an empty, finished page -- not an
+	// exhausted one.
+	beyond, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{After: page.Volumes[0].Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beyond.Exhausted || len(beyond.Volumes) != 0 {
+		t.Fatalf("a cursor past the end reported %+v", beyond)
+	}
+}
+
+// TestAVolumeIsChargedAFloorUnderEveryEntry is the one charging rule over both
+// handoff roots. The mixed tree is the case a volume total and an entry count
+// cannot reproduce: its data is one large file and its cost to the node is
+// that file plus a slot for every empty one beside it.
+func TestAVolumeIsChargedAFloorUnderEveryEntry(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, path := makeHandoffVolume(t, root, "mixed-run")
+	const (
+		large = 64 << 10
+		empty = 200
+	)
+	if err := os.WriteFile(filepath.Join(path, "big.bin"), make([]byte, large), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for index := range empty {
+		if err := os.WriteFile(filepath.Join(path, fmt.Sprintf("tiny-%04d", index)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var volume RetainedHandoffVolume
+	for _, candidate := range page.Volumes {
+		if candidate.Name == name {
+			volume = candidate
+		}
+	}
+	// The receipt this pass stamps is one entry of its own, so the volume
+	// holds the large file, the empty ones, and nothing else.
+	if volume.Entries != empty+1 {
+		t.Fatalf("the volume reached %d entries, want %d", volume.Entries, empty+1)
+	}
+	if volume.LogicalBytes != large || volume.DedupedBytes != large {
+		t.Fatalf("the volume's byte figures = %d/%d, want %d", volume.LogicalBytes, volume.DedupedBytes, large)
+	}
+	// 4096 is written out rather than read back from the code under test: the
+	// number the node is charged is the assertion.
+	if want := int64(large) + empty*4096; volume.ChargedBytes != want {
+		t.Fatalf("the volume was charged %d bytes, want %d -- the large file plus a floor under every empty entry",
+			volume.ChargedBytes, want)
+	}
+	if volume.ChargedBytes <= volume.DedupedBytes {
+		t.Fatal("the charged figure did not exceed the data, so the per-entry floor is missing")
+	}
+}
+
+// TestDeletingAHandoffVolumeAnAttemptOwnsIsRefused is the helper's half of the
+// eviction guard. The node selects from an inventory snapshot, so a rerun can
+// register ownership after that read; only the lock that publishes ownership
+// can close the window, and it closes it by refusing.
+func TestDeletingAHandoffVolumeAnAttemptOwnsIsRefused(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	const ownerKey = "reused-run"
+	name, path := makeHandoffVolume(t, root, ownerKey)
+	if err := os.WriteFile(filepath.Join(path, "result.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The volume reads as idle first, which is the snapshot the node acts on.
+	if _, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{}); err != nil {
+		t.Fatal(err)
+	}
+
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: ownerKey, AttemptID: "attempt-2",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.registerAttemptLiveAndSupersedeHandoff(&containerdAttempt{authority: authority, resources: resources}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+		Kind: ManagedVolumeHandoff, OwnerKey: ownerKey,
+	})
+	var live *HandoffVolumeLiveError
+	if !errors.As(err, &live) {
+		t.Fatalf("deleting a volume a live attempt owns = %v, want the typed refusal", err)
+	}
+	if live.Name != name {
+		t.Fatalf("the refusal names %q, want the volume %q", live.Name, name)
+	}
+	// Nothing was detached and nothing was freed: the running attempt still
+	// has its files.
+	if _, err := os.Stat(filepath.Join(path, "result.json")); err != nil {
+		t.Fatalf("a refused deletion took the running attempt's files anyway: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a refused deletion detached the volume anyway: %v", err)
+	}
+
+	// And it is replayable: once the attempt finishes -- which is a reaped
+	// task and a published terminal receipt -- the identical request succeeds.
+	engine.mu.Lock()
+	delete(engine.attempts, authority.key())
+	engine.mu.Unlock()
+	if err := engine.writeHandoffRetentionReceipt(t.Context(), name, now); err != nil {
+		t.Fatal(err)
+	}
+	response, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+		Kind: ManagedVolumeHandoff, OwnerKey: ownerKey,
+	})
+	if err != nil || !response.Deleted {
+		t.Fatalf("the replayed deletion = %+v, %v", response, err)
+	}
+}

@@ -34,24 +34,25 @@ func TestRetainedHandoffInventoryCrossesTheRuntimeSeamIntact(t *testing.T) {
 	}
 	engine := &handoffInventoryEngine{response: ocihelper.InventoryHandoffVolumesResponse{
 		Volumes: []ocihelper.RetainedHandoffVolume{
-			{Name: name, TerminalAt: terminal, TerminalKnown: true, LogicalBytes: 4096, DedupedBytes: 4096, Entries: 3},
+			{Name: name, TerminalAt: terminal, TerminalKnown: true, LogicalBytes: 4096, DedupedBytes: 4096, ChargedBytes: 12288, Entries: 3},
 			{Name: "wefty-handoff-volume-deadbeefdeadbeefdeadbeefdeadbeef", Live: true, Anomalies: []ocihelper.HandoffVolumeAnomaly{ocihelper.HandoffAnomalyNoReceipt}},
 		},
-		Exhausted: true,
+		Exhausted: true, Next: "cursor-after-the-second",
 	}}
 	adapter, stop := startAdapterTestServer(t, engine)
 	defer stop()
 
-	report, err := adapter.InventoryRetainedHandoffs(t.Context())
+	report, err := adapter.InventoryRetainedHandoffs(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.Exhausted || len(report.Volumes) != 2 {
+	if !report.Exhausted || report.Next != "cursor-after-the-second" || len(report.Volumes) != 2 {
 		t.Fatalf("retained handoff report = %+v", report)
 	}
 	first := report.Volumes[0]
 	if first.Name != name || !first.TerminalKnown || !first.TerminalAt.Equal(terminal) ||
-		first.LogicalBytes != 4096 || first.DedupedBytes != 4096 || first.Entries != 3 || first.Live || len(first.Anomalies) != 0 {
+		first.LogicalBytes != 4096 || first.DedupedBytes != 4096 || first.ChargedBytes != 12288 ||
+		first.Entries != 3 || first.Live || len(first.Anomalies) != 0 {
 		t.Fatalf("the retained volume lost facts crossing the seam: %+v", first)
 	}
 	second := report.Volumes[1]

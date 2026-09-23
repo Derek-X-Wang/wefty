@@ -25,8 +25,14 @@ type stubHandoffInventory struct {
 	calls  int
 }
 
-func (stub *stubHandoffInventory) InventoryRetainedHandoffs(context.Context) (workloadrunner.RetainedHandoffReport, error) {
+func (stub *stubHandoffInventory) InventoryRetainedHandoffs(_ context.Context, after string) (workloadrunner.RetainedHandoffReport, error) {
 	stub.calls++
+	if after != "" {
+		// One page and no more: this fixture's root fits in a single read, so
+		// a second call would mean the pager asked for a tail that is not
+		// there.
+		return workloadrunner.RetainedHandoffReport{}, nil
+	}
 	return stub.report, stub.err
 }
 
@@ -47,7 +53,6 @@ func TestTheAccountingPassReportsTheOCIHelpersHandoffRootToo(t *testing.T) {
 			{Name: "wefty-handoff-volume-deadbeefdeadbeefdeadbeefdeadbeef", LogicalBytes: 64, DedupedBytes: 64, Entries: 1,
 				Anomalies: []string{string(ocihelper.HandoffAnomalyNoReceipt)}},
 		},
-		Exhausted: true,
 	}}
 	harness.manager.ociHandoffs = stub
 
@@ -61,7 +66,7 @@ func TestTheAccountingPassReportsTheOCIHelpersHandoffRootToo(t *testing.T) {
 	if status.OCI.Volumes != 2 || status.OCI.LogicalBytes != 4160 || status.OCI.DedupedBytes != 4160 || status.OCI.Entries != 3 {
 		t.Fatalf("OCI figures = %+v", *status.OCI)
 	}
-	if status.OCI.TerminalUnknown != 1 || status.OCI.Anomalies != 1 || !status.OCI.Exhausted {
+	if status.OCI.TerminalUnknown != 1 || status.OCI.Anomalies != 1 || !status.OCI.Complete {
 		t.Fatalf("OCI observations = %+v", *status.OCI)
 	}
 	// The run this node has a record for is placed; the one whose name no run

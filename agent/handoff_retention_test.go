@@ -23,6 +23,10 @@ type retentionHarness struct {
 	manager *handoffManager
 	now     time.Time
 	logs    []string
+	// measured is what the last budget pass found before it acted on it. A
+	// pass that evicted reports twice, and the figures a test wants are
+	// usually the first ones.
+	measured RetainedResultsStatus
 }
 
 func newRetentionHarness(t *testing.T, retention time.Duration) *retentionHarness {
