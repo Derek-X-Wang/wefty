@@ -110,6 +110,46 @@ type RetainedResultsStatus struct {
 	// moves with the files, and a retention record is authority to delete and
 	// has to stay what an attempt wrote.
 	PerRun []RetainedRunFigures `json:"per_run,omitempty"`
+	// OCI is what the node's OCI helper reports about its own handoff root,
+	// absent when this node runs no OCI helper or the read failed. The node
+	// agent owns retention policy for both roots but can only measure one of
+	// them: on a Mac node the helper runs inside a Lima VM, so the second
+	// root's figures arrive over the protocol or not at all.
+	OCI *RetainedOCIResultsStatus `json:"oci,omitempty"`
+}
+
+// RetainedOCIResultsStatus is the helper's handoff root as the last pass read
+// it. Nothing here is enforced in this slice; it is made to exist and be
+// right, the way the process root's figures were.
+type RetainedOCIResultsStatus struct {
+	// Volumes counts every handoff volume the helper still holds, Live how
+	// many of those an attempt is still writing into, and Unattributable how
+	// many carry a name this agent cannot map back to one of its own runs --
+	// which is the shape of what a crash left behind.
+	Volumes        int   `json:"volumes"`
+	Live           int   `json:"live"`
+	Unattributable int   `json:"unattributable"`
+	Entries        int64 `json:"entries"`
+	LogicalBytes   int64 `json:"logical_bytes"`
+	DedupedBytes   int64 `json:"deduped_bytes"`
+	// TerminalUnknown counts the volumes with no helper-owned terminal time.
+	// Their age comes from a timestamp the workload could have written, so
+	// they are reported and never expired on.
+	TerminalUnknown int `json:"terminal_unknown"`
+	// Anomalies counts the volumes carrying a per-volume observation -- an
+	// unreadable receipt, a measurement that hit its bound. They are still
+	// counted in every figure above.
+	Anomalies int `json:"anomalies"`
+	// Truncated counts the volumes whose byte and entry figures the helper
+	// measured incompletely, so those volumes' figures are a floor.
+	Truncated int `json:"truncated"`
+	// Exhausted says the helper holds more volumes than one read carries, so
+	// the figures above are a floor.
+	Exhausted bool `json:"exhausted,omitempty"`
+	// DetachedTrees counts results whose removal was authorized and has not
+	// finished freeing. Their bytes are on the node and are in none of the
+	// figures above, because a detached tree is nobody's volume.
+	DetachedTrees int `json:"detached_trees,omitempty"`
 }
 
 // RetainedRunFigures is one run's share of a pass.

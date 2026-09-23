@@ -109,6 +109,21 @@ type retentionRecord struct {
 	RunID     string `json:"run_id"`
 	NodeID    string `json:"node_id"`
 	Directory string `json:"directory"`
+	// HandoffOwnerKey is the stable identity a runtime derives this run's
+	// handoff volume name from -- `handoff_owner_run_id` when a rerun is
+	// pointed at a source run's results, and the run ID otherwise.
+	//
+	// It is recorded rather than re-derived because the two are only the same
+	// by construction today: preparation happens to key the directory on the
+	// owner key, so RunID carries it. Nothing said so, and anything that read
+	// RunID as the owner key was relying on that coincidence -- including the
+	// node's attribution of the OCI helper's volumes, where guessing wrong
+	// means reporting a run of this node's as crash residue.
+	//
+	// Optional: a record written before this field existed has none, and the
+	// validator accepts that. Readers fall back to RunID, which is what those
+	// records mean.
+	HandoffOwnerKey string `json:"handoff_owner_key,omitempty"`
 	// AdmittedAt is when preparation took responsibility for this directory,
 	// and it is written before the workload starts rather than after it stops.
 	//
@@ -240,6 +255,48 @@ func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, err
 		return uploadRecord{}, false, nil
 	}
 	return record, true, nil
+}
+
+// loadUploadRunIDs reads back the run IDs this node has recorded an upload
+// outcome for. It is the only place an OCI run is named by this agent: that
+// run's handoff volume belongs to the helper and has no retention record.
+func (m *handoffManager) loadUploadRunIDs() []string {
+	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
+		return nil
+	}
+	root := m.uploadRecordRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.log("agent: read result upload records: %v", err)
+		}
+		return nil
+	}
+	runIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		payload, err := readStateDocument(filepath.Join(root, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var record uploadRecord
+		if json.Unmarshal(payload, &record) != nil || strings.TrimSpace(record.RunID) == "" {
+			continue
+		}
+		runIDs = append(runIDs, record.RunID)
+	}
+	return runIDs
+}
+
+// handoffOwnerKey is the identity a runtime names this run's handoff volume
+// from. A record written before the field existed means its run ID.
+func (record retentionRecord) handoffOwnerKey() string {
+	if key := strings.TrimSpace(record.HandoffOwnerKey); key != "" {
+		return key
+	}
+	return record.RunID
 }
 
 func (m *handoffManager) recordRoot() string {

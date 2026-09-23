@@ -1211,7 +1211,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
 		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken,
-		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox:
+		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox, MethodInventoryHandoffs:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -1892,6 +1892,23 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		operation.monitorEOF()
 		response, err := engine.RemoveRunMailboxEntry(operation.ctx, body)
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+	case MethodInventoryHandoffs:
+		// Session authority and nothing else. The request body carries no
+		// attempt authority and cannot be made to: a client that attaches one
+		// is refused as an unknown field, because an attempt's fence says
+		// nothing about volumes whose attempts are gone.
+		var body InventoryHandoffVolumesRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		engine, ok := server.engine.(HandoffRetentionInventoryEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "retained handoff inventory is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.InventoryHandoffVolumes(operation.ctx, body)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodVerify:
 		var body VerifyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -2191,6 +2208,7 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.ImageSpools = mergeInventoryClass(left.ImageSpools, right.ImageSpools)
 	left.ManagedVolumes = mergeInventoryClass(left.ManagedVolumes, right.ManagedVolumes)
 	left.ManagedVolumeRecords = mergeInventoryClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
+	left.HandoffRetentionRecords = mergeInventoryClass(left.HandoffRetentionRecords, right.HandoffRetentionRecords)
 	left.ComputerDiskImages = mergeInventoryClass(left.ComputerDiskImages, right.ComputerDiskImages)
 	left.ComputerDiskAllocations = mergeInventoryClass(left.ComputerDiskAllocations, right.ComputerDiskAllocations)
 	left.ComputerDiskQuotas = mergeInventoryClass(left.ComputerDiskQuotas, right.ComputerDiskQuotas)

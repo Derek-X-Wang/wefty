@@ -459,6 +459,47 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	return spec, nil
 }
 
+// rejectManagedRootOverlap keeps an operator mount from handing a workload the
+// helper's own durable state.
+//
+// The allowed-root check answers "is this source inside a root the operator
+// allowed", which says nothing about whether that root also contains the
+// managed runtime root. Allowing `/var/lib/wefty` while the runtime root is
+// `/var/lib/wefty/oci` let a workload be given a writable mount of
+// `handoffs-state/` -- and a uid-0 workload with a writable path to a
+// retention receipt can read the volume identity out of it and rewrite or
+// remove it. Device and inode matching is no defence against a writer who can
+// spell both; the whole forgery boundary is that the container is never given
+// a path there.
+//
+// The managed root itself, any ancestor of it, and any descendant of it are
+// all refused: an ancestor exposes it by descent, a descendant is part of it.
+func rejectManagedRootOverlap(managedRoot, source string) error {
+	if managedRoot == "" || source == "" {
+		return nil
+	}
+	managed, from := filepath.Clean(managedRoot), filepath.Clean(source)
+	if managed == from {
+		return errors.New("source is the managed runtime root")
+	}
+	if within(from, managed) {
+		return errors.New("source is inside the managed runtime root")
+	}
+	if within(managed, from) {
+		return errors.New("source contains the managed runtime root")
+	}
+	return nil
+}
+
+// within reports whether path is a strict descendant of ancestor.
+func within(path, ancestor string) bool {
+	relative, err := filepath.Rel(ancestor, path)
+	if err != nil || relative == "." {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
 func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string, []string, bool) error) error {
 	if strings.TrimSpace(input.ContainerID) == "" || strings.IndexByte(input.ContainerID, 0) >= 0 {
 		return errors.New("container ID is required")
@@ -492,6 +533,11 @@ func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string
 	guestWorkload.OperatorMounts = slices.Clone(input.Workload.OperatorMounts)
 	for index := range guestWorkload.OperatorMounts {
 		guestWorkload.OperatorMounts[index].NodePath = input.OperatorMountSources[index]
+	}
+	for _, mount := range guestWorkload.OperatorMounts {
+		if err := rejectManagedRootOverlap(input.ManagedRoot, mount.NodePath); err != nil {
+			return fmt.Errorf("operator mount source %q is not permitted: %w", mount.NodePath, err)
+		}
 	}
 	if err := validateWorkloadWithSource(guestWorkload, input.AllowedMountRoots, validateSource); err != nil {
 		return err

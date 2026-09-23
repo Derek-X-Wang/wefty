@@ -507,6 +507,7 @@ heartbeats.
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
 | `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from the scope's directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
 | `ReadRunMailbox` | Same authority, plus one bounded entry name. Returns at most 64 KiB of one regular file in the `events` scope and at most 640 KiB in the `handoff_files` scope, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. An entry that is not there at all comes back as `absent`, which is what an agent-opened directory reports for a missing name, so both implementations of the read answer alike. |
+| `InventoryHandoffVolumes` | Session-authorized, and deliberately not attempt-authorized: it spans every handoff volume this node still holds, and the attempts that produced them are long gone, so no attempt's fence could stand for them. The request carries nothing beyond the session envelope and cannot carry attempt authority -- a body that attaches one is refused as an unknown field. It returns, for each volume, the deterministic directory name, the terminal time and whether that came from a helper-owned receipt, logical and deduped bytes, entry count, whether a live attempt is still writing there, whether the byte and entry figures are a floor rather than a measurement, and a bounded set of per-volume anomaly tokens from a closed vocabulary; and whether the node holds more volumes than the response carries. The response is bounded in encoded bytes rather than rows, because a frame past the wire limit is refused by the transport and read by the client as a lost session -- accounting must never cost a node its runtime -- and the anomaly vocabulary is closed for the same reason: what a node reports cannot grow with what a workload wrote. No owner key crosses this boundary in either direction: the agent derives the names of its own runs with the same deterministic mapping, so a reported name it cannot derive is precisely the crash-residue signal. One pass over the root shares one `(device, inode)` map, so a file two volumes hard-link is counted once in the deduped total and in each volume's own logical figure. An unreadable, invalid or mismatched receipt is a per-volume anomaly with `terminal_known=false`, never a failed call and never a new error code; a refusal of this read is scoped to it and is not runtime-loss evidence. Before reporting, it repairs: any handoff volume whose receipt path is absent, and which a fresh in-memory and durable ownership snapshot says no live attempt holds, is stamped with one, best-effort and atomically create-only, so a receipt the filesystem refused is not left waiting for another boot sweep. Repair revalidates the measured directory identity at publication and cannot replace a receipt concurrently written by `Delete`. It **deletes no volume and no receipt**, and re-dates no terminal time, because expiry belongs to the sweep and budget eviction to the agent, and a read must never cost a node a run's results. It does finish freeing trees an earlier authorized deletion detached: those are neither a volume nor a receipt but bytes whose removal was already authorized and interrupted, and a detached name is invisible to this inventory, to expiry and to repair, so leaving them to the next boot sweep would hide them for as long as the session lived. The response reports how many such frees are still pending, since their bytes are on the node and in no volume's figures. |
 | `RemoveRunMailboxEntry` | Same authority, scope and name. Removes one regular file, symlink or empty directory and reports whether it removed one or found it already absent, so a replayed retirement is not a failure. It never recurses: a nonempty directory or an unclassifiable object stays where it is. |
 | `Run` (run mailbox seed) | A `Run` may carry one run-mailbox seed: a bounded run ID and an optional JSON params document of at most 64 KiB, valid only alongside a handoff managed volume and never for a Computer. The helper creates `.wefty/<run id>/{tmp,events}` inside that volume, writes `params.json` by write-then-rename, and mints `WEFTY_RUN_DIR` from the seed as reserved environment. The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable but not writable (0711) — the volume root included, because containerd creates it 0700 and mounts it at `/wefty/handoff`, so without this a non-root image could not reach its mailbox at all; `tmp/` and `events/` are chowned to the image's process owner (0700); `params.json` is root-owned and world-readable (0644). Every mode and owner is applied through the descriptor just opened, never by name, and always explicitly, so a directory left by an earlier attempt is restored rather than trusted. No guest path is ever supplied by a caller. |
 
@@ -1016,12 +1017,54 @@ pending-sweep inventory and evidence; it does not renew any retention deadline.
 Handoff volumes live under a distinct helper-owned durable root, not the
 attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
-intact; reuse refreshes the default retention age, and sweep removes only
-expired direct children with the deterministic handoff prefix. That age is the
-contract's result-retention window (7 days), not a retry window: a handoff
-volume holds the run's results and is retained on every outcome. Attempt and
-namespace quiescence therefore project only unexpired handoff volumes (the
-retained bindings) out of their absence decision. `Verify` returns the observed
+intact, and sweep removes only expired direct children with the deterministic
+handoff prefix. That age is the contract's result-retention window (7 days),
+not a retry window: a handoff volume holds the run's results and is retained
+on every outcome. Attempt and namespace quiescence therefore project only
+unexpired handoff volumes (the retained bindings) out of their absence
+decision.
+
+Retention runs from a helper-owned terminal receipt, never from the volume's
+mtime. The handoff volume is mounted read-write into the container and a uid-0
+workload owns it, so its mtime is a timestamp the workload writes -- by
+`utimensat` or by merely creating a file. The helper therefore records the
+terminal time itself, in a separate durable root `handoffs-state/` that the
+container is never given a path to, as one versioned, fsynced,
+write-then-rename JSON receipt per volume named
+`wefty-handoff-volume-<hex>.retention` carrying the volume's device and inode,
+the terminal time, and the bytes and entries measured at that moment. That root
+is deliberately separate rather than a sibling inside `handoffs/`, because
+every scan of the handoff root matches on the deterministic volume prefix and
+a sibling carrying it would be read as a volume. The receipt is evidence and
+the no-follow directory descriptor is authority, exactly as for a service data
+owner record: a receipt whose device and inode no longer match the directory
+standing at that name is refused rather than believed.
+
+The helper writes the receipt at attempt finalization inside `Delete`, after
+the task is reaped and the attempt's absence independently verified, so the
+namespace is quiescent and no workload can still be writing there. Preparing a
+volume for reuse publishes durable ownership and registers the in-memory owner
+before superseding the previous attempt's receipt, all receipt-sensitive steps
+serialized against accounting repair: a run that has not finished has no
+terminal time, and inheriting one made a rerun's own `Delete`
+verify its volume as residue and never reach positive absence. The boot sweep
+writes one for any handoff volume that has none -- an older helper's, or an attempt
+that never reached finalization -- with the sweep time as the terminal time and
+the bytes measured then, and it never stamps a volume a live attempt is still
+writing into. A volume with no bound receipt is reported with
+`terminal_known=false` and the mtime as a labelled fallback: it may be counted
+and evicted against, and it is never expired, because a node must not give up a
+run's results on a timestamp that run could have written. A receipt is
+durable-retained exactly while the volume it is bound to is; one left over a
+volume that is gone is runtime residue the sweep removes. Both stamping and
+expiry are best-effort per volume: one volume the filesystem refuses costs that
+volume its receipt until the next pass and nothing else, and
+`InventoryHandoffVolumes` performs the same stamping repair on the agent's own
+reading cadence, so a refused receipt does not wait for another boot. Every
+measurement is bounded and takes its caller's cancellation; a volume whose tree
+is too large or too deep to walk is published with an exact terminal time over
+figures marked as a floor, because a tree too expensive to measure must not
+become a tree the node keeps forever. `Verify` returns the observed
 inventory unchanged alongside the exact, disjoint runtime-residue and
 durable-retained projections. Every consumer of `Absent` validates that their
 union is exactly the observation, and the boot receipt records all three with
@@ -1035,9 +1078,31 @@ narrow
 `DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
 `service_data`. It derives exactly one helper-owned identity, removes only that
 volume (and, for service data, its paired owner record), and returns success
-only after separate absence checks. The agent calls the handoff arm after
-accepted successful completion and the service-data arm during Job removal;
-neither arm grants general path deletion authority.
+only after separate absence checks. The service-data arm is called during Job
+removal. **The handoff arm has no agent caller in this slice**: a handoff
+volume is removed by the helper's own sweep when its retention window has run
+out, and the arm exists for the agent-driven budget eviction a later slice of
+#494 supplies. Neither arm grants general path deletion authority. Deleting a
+handoff volume removes its retention receipt with it. Under one hold of the
+helper's retention lock the volume is detached from its name first and the
+receipt unlinked second, so a concurrent accounting repair, which reopens the
+volume by name under that same lock before it publishes, finds nothing to bind
+to and cannot leave an orphan behind; the detached tree is then freed outside
+the lock, so no other attempt's finalization waits on the size of a workload's
+tree. That free checks its caller's cancellation between the detached tree's
+top-level children, so a caller that runs out of time stops within one child
+rather than after the whole tree; whatever a crash, a cancelled caller or a
+filesystem failure leaves detached is finished by the next pass over this root,
+which is every sweep and every retained-handoff inventory. Absence is verified over the volume
+name and the receipt name.
+
+Handoff retention receipts are their own inventory class,
+`handoff_retention_records`, for the same reason service-data owner records
+are: the boot receipt's "observed = runtime residue union durable retained"
+invariant has to keep holding over every durable thing the helper writes, and
+a class that is neither observed nor projected is a class nothing verifies. A
+receipt is projected durable-retained exactly while its paired volume is, and
+is runtime residue otherwise.
 
 Service-data volumes live under their own helper-owned guest-native durable
 root, outside the attempt inventory swept during boot takeover. They and their
@@ -1744,7 +1809,9 @@ later Verify or sweep rather than converting observation failure into an
 attempt-release failure.
 
 `SweepResponse.removed` is the number of identities in the initial observed
-inventory that are absent from the final observed inventory. Retained resources
+inventory that are absent from the final observed inventory, and that final
+observation is taken after every removal the sweep performs, handoff-retention
+reconciliation included. Retained resources
 are therefore not counted as removed. The response also carries durable
 retention receipts and typed per-resource sweep evidence; startup/session-reap
 folding preserves those fields in the client's verified receipt.

@@ -66,6 +66,11 @@ const (
 	MethodListRunMailbox     Method = "ListRunMailbox"
 	MethodReadRunMailbox     Method = "ReadRunMailbox"
 	MethodRemoveRunMailbox   Method = "RemoveRunMailboxEntry"
+	// MethodInventoryHandoffs is session-authorized rather than
+	// attempt-authorized on purpose: it spans every handoff volume this node
+	// still holds, and the attempts that produced them are long gone. There is
+	// no attempt whose authority could stand for the node's retained results.
+	MethodInventoryHandoffs Method = "InventoryHandoffVolumes"
 )
 
 // attemptPortBackendReady is emitted only after the helper has connected the
@@ -414,7 +419,7 @@ func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity
 		ContainerID: containerID, TaskID: containerID,
 		ShimID: containerID, CgroupID: "wefty-cgroup-" + suffix,
 		LogSegmentDirectory:      "wefty-log-segments-" + suffix,
-		HandoffVolumeDirectory:   "wefty-handoff-volume-" + suffix,
+		HandoffVolumeDirectory:   handoffVolumeNamePrefix + suffix,
 		ServiceVolumeDirectory:   serviceVolumeDirectory,
 		ServiceVolumeOwnerRecord: serviceVolumeOwnerRecord,
 		Labels: map[string]string{
@@ -443,7 +448,7 @@ func DeterministicHandoffVolumeDirectory(ownerKey string) (string, error) {
 		return "", errors.New("handoff owner key must be bounded and non-empty")
 	}
 	digest := sha256.Sum256([]byte("handoff\x00" + ownerKey))
-	return "wefty-handoff-volume-" + hex.EncodeToString(digest[:16]), nil
+	return handoffVolumeNamePrefix + hex.EncodeToString(digest[:16]), nil
 }
 
 // DeterministicComputerDiskName maps one non-transferable Storage generation
@@ -1768,7 +1773,149 @@ type ResourceInventory struct {
 	ComputerDiskAnomalies []string `json:"computer_disk_anomalies"`
 	ComputerNetworkLinks  []string `json:"computer_network_links"`
 	ComputerFirewallRules []string `json:"computer_firewall_rules"`
+	// HandoffRetentionRecords are the helper-owned terminal receipts under
+	// `handoffs-state/`, one per handoff volume. They are their own class
+	// because the boot receipt's "observed = runtime residue union durable
+	// retained" invariant has to keep holding over every durable thing the
+	// helper writes: a receipt whose volume is retained is retained with it,
+	// and a receipt left standing over a volume that is gone is residue to
+	// remove, exactly as a service data owner record is.
+	HandoffRetentionRecords []string `json:"handoff_retention_records"`
 }
+
+// RetainedHandoffVolume is one handoff volume this node still holds, as the
+// helper sees it.
+//
+// There is no owner key here, in either direction. The agent derives every
+// name it knows with DeterministicHandoffVolumeDirectory, so a name in this
+// list that it cannot map back to one of its own runs is precisely the
+// crash-residue signal -- and no identity the helper holds leaves the helper.
+type RetainedHandoffVolume struct {
+	Name string `json:"name"`
+	// TerminalAt is when the helper observed this volume's last attempt
+	// finish, read from the helper-owned receipt. TerminalKnown says whether
+	// that receipt was there and bound to this directory. When it is false,
+	// TerminalAt carries the directory's mtime as a labelled fallback: a
+	// uid-0 workload owns its own handoff directory and can move that
+	// timestamp, so it is a figure to report and to evict against, never one
+	// to expire on.
+	TerminalAt    time.Time `json:"terminal_at"`
+	TerminalKnown bool      `json:"terminal_known"`
+	// LogicalBytes is what this volume's regular files hold, counted once per
+	// link inside the volume; DedupedBytes charges an inode to the first
+	// volume of this pass that reached it, so a file two volumes hard-link is
+	// counted once for the node. Symlinks are never followed.
+	LogicalBytes int64 `json:"logical_bytes"`
+	DedupedBytes int64 `json:"deduped_bytes"`
+	// Entries is every directory entry the pass reached, which is the inode
+	// cost neither byte figure can show on its own.
+	Entries int64 `json:"entries"`
+	// Live says a live attempt of this session is still writing here. Its
+	// results are not retained yet and it is nobody's eviction candidate.
+	Live bool `json:"live"`
+	// Truncated says the measurement stopped early -- budget, depth or
+	// cancellation -- so the byte and entry figures are a floor rather than a
+	// measurement. The terminal time above is never a floor.
+	Truncated bool `json:"truncated,omitempty"`
+	// Anomalies are the per-volume observations that must not fail a
+	// node-wide call, the ComputerDiskAnomalies precedent. They are a closed
+	// token vocabulary, deduplicated and capped, rather than free text,
+	// because a response's size must not be a function of what a workload
+	// wrote: a frame over MaxFrameBytes costs the node its session, not its
+	// accounting. Empty means the volume was read whole.
+	Anomalies []HandoffVolumeAnomaly `json:"anomalies,omitempty"`
+}
+
+// HandoffVolumeAnomaly is the closed vocabulary of per-volume observations.
+//
+// It is a fixed token set rather than free text for two reasons: a reader and
+// a later consumer should name the same condition, and a response's size must
+// not be a function of what a workload wrote. An earlier draft carried the
+// walker's own error strings, repeated per failure, which made a node-wide
+// read's frame unbounded.
+type HandoffVolumeAnomaly string
+
+const (
+	// HandoffAnomalyNoReceipt: no helper-owned terminal time exists, so the
+	// reported one is the directory's mtime, which the workload owns.
+	HandoffAnomalyNoReceipt HandoffVolumeAnomaly = "no_receipt"
+	// HandoffAnomalyReceiptUnreadable: the receipt is there and could not be
+	// read.
+	HandoffAnomalyReceiptUnreadable HandoffVolumeAnomaly = "receipt_unreadable"
+	// HandoffAnomalyReceiptInvalid: the receipt is not a version-1 helper
+	// receipt, or carries no terminal time.
+	HandoffAnomalyReceiptInvalid HandoffVolumeAnomaly = "receipt_invalid"
+	// HandoffAnomalyReceiptMismatched: the receipt names a different directory
+	// than the one standing at this volume's name.
+	HandoffAnomalyReceiptMismatched HandoffVolumeAnomaly = "receipt_identity_mismatch"
+	// HandoffAnomalyVolumeUnreadable: the volume itself could not be opened or
+	// enumerated as a helper-owned directory.
+	HandoffAnomalyVolumeUnreadable HandoffVolumeAnomaly = "volume_unreadable"
+	// HandoffAnomalyMeasurementTruncated: the pass stopped early -- budget,
+	// depth, or cancellation -- so the figures are a floor.
+	HandoffAnomalyMeasurementTruncated HandoffVolumeAnomaly = "measurement_truncated"
+	// HandoffAnomalySubtreeReplaced: a directory stopped being the one this
+	// pass had just observed, so it was counted rather than measured.
+	HandoffAnomalySubtreeReplaced HandoffVolumeAnomaly = "subtree_replaced"
+)
+
+// InventoryHandoffVolumesRequest carries nothing beyond the session envelope.
+// Attempt authority is not merely unnecessary here, it is unrepresentable: a
+// body that tries to attach one is refused as an unknown field.
+type InventoryHandoffVolumesRequest struct{}
+
+type InventoryHandoffVolumesResponse struct {
+	Volumes []RetainedHandoffVolume `json:"volumes"`
+	// Exhausted says the node holds more handoff volumes than one response
+	// carries, so the figures above are a floor rather than the node total.
+	Exhausted bool `json:"exhausted"`
+	// DetachedTrees counts the volumes an authorized deletion detached from
+	// their names and whose bytes are not yet freed, after this call finished
+	// what it could. They are in no volume's figures above -- a detached tree
+	// is nobody's volume -- so a node budget that could not see them would be
+	// reading a node emptier than it is.
+	DetachedTrees int `json:"detached_trees,omitempty"`
+}
+
+// MaxInventoriedHandoffVolumes bounds one InventoryHandoffVolumes response the
+// way the run mailbox listing is bounded: a node is told what it holds, or
+// told that it holds more than it was shown, and never handed an unbounded
+// frame.
+const MaxInventoriedHandoffVolumes = 4096
+
+// handoffInventoryFrameHeadroom is what one InventoryHandoffVolumes response
+// leaves below MaxFrameBytes for the reply envelope and framing.
+//
+// A frame the transport refuses is not a smaller answer: the server discards
+// the write error and closes the connection, and the client reads that as a
+// lost session. A row cap alone did not bound this -- 4096 receiptless volumes
+// encode past MaxFrameBytes on their own -- so the budget is in encoded bytes.
+// Accounting must never cost a node its runtime.
+const handoffInventoryFrameHeadroom = 64 << 10
+
+// HandoffRetentionRecordName maps one handoff volume directory to the
+// helper-owned receipt that carries its terminal time. Both sides spell it
+// here and nowhere else.
+func HandoffRetentionRecordName(volume string) string {
+	if volume == "" {
+		return ""
+	}
+	return volume + handoffRetentionRecordSuffix
+}
+
+const (
+	handoffRetentionRecordSuffix = ".retention"
+	// handoffVolumeNamePrefix is what every scan of the handoff root matches
+	// on. The retention receipts live in their own root rather than beside the
+	// volumes precisely because a sibling carrying this prefix would be read
+	// as a volume.
+	handoffVolumeNamePrefix = "wefty-handoff-volume-"
+	// handoffDetachedVolumePrefix names a volume between being detached from
+	// its own name and having its bytes freed. It is dot-prefixed so no scan
+	// that matches handoffVolumeNamePrefix can see it -- neither the
+	// inventory, nor expiry, nor accounting repair.
+	handoffDetachedVolumePrefix = ".removing-"
+)
 
 type ComputerDiskQuarantineGCEvidenceStorage string
 type ComputerDiskQuarantineGCStopReason string

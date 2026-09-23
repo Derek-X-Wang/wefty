@@ -1301,9 +1301,15 @@ func TestSweepSkipsSpoolOwnedByLiveImageOperation(t *testing.T) {
 	}
 }
 
+// The window itself is unchanged: a stable owner key's volume survives every
+// attempt inside its retention window and is removed once past it. What #494
+// changes is *which clock* decides, and the second half asserts that: the
+// mtime the workload owns is moved past the window and does not expire the
+// volume, because the helper's own receipt says otherwise.
 func TestHandoffRetentionRefreshesAndExpiresStableOwnerVolumes(t *testing.T) {
 	root := t.TempDir()
-	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, HandoffRetention: time.Hour}}
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
 	name, err := DeterministicHandoffVolumeDirectory("run-owner")
 	if err != nil {
 		t.Fatal(err)
@@ -1312,22 +1318,24 @@ func TestHandoffRetentionRefreshesAndExpiresStableOwnerVolumes(t *testing.T) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	if err := os.Chtimes(path, now.Add(-30*time.Minute), now.Add(-30*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.cleanupExpiredHandoffs(now); err != nil {
-		t.Fatal(err)
-	}
+	stamp(t, engine, name, now.Add(-30*time.Minute))
+	expire(t, engine, now)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("retry-window handoff was removed: %v", err)
 	}
+
+	// A workload backdating its own directory changes nothing.
 	if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.cleanupExpiredHandoffs(now); err != nil {
-		t.Fatal(err)
+	expire(t, engine, now)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a workload-written mtime expired a handoff volume inside its window: %v", err)
 	}
+
+	// The helper's own terminal time running out is what removes it.
+	stamp(t, engine, name, now.Add(-2*time.Hour))
+	expire(t, engine, now)
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expired handoff remained: %v", err)
 	}

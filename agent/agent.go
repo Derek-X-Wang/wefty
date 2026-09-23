@@ -138,6 +138,7 @@ type Agent struct {
 	managedResource   managedResourceManager
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
+	retainedHandoffs  workloadrunner.RetainedHandoffInventory
 	runLedger         runLedgerAppender
 	mailboxPoll       time.Duration
 	// mailboxStateRoot is the agent-owned durable directory under which a
@@ -308,6 +309,7 @@ func New(config Config) (*Agent, error) {
 	var computerBackupper workloadrunner.ComputerBackupper
 	var computerStorageCopier workloadrunner.ComputerStorageCopier
 	var computerCustodyExporter workloadrunner.ComputerCustodyExporter
+	var retainedHandoffs workloadrunner.RetainedHandoffInventory
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
@@ -323,6 +325,7 @@ func New(config Config) (*Agent, error) {
 		computerBackupper, _ = runtimeAdapter.(workloadrunner.ComputerBackupper)
 		computerStorageCopier, _ = runtimeAdapter.(workloadrunner.ComputerStorageCopier)
 		computerCustodyExporter, _ = runtimeAdapter.(workloadrunner.ComputerCustodyExporter)
+		retainedHandoffs, _ = runtimeAdapter.(workloadrunner.RetainedHandoffInventory)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -449,6 +452,7 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs:         newHandoffManager(config.HandoffRoot, logSpoolDirectory, config.NodeID, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention), logf),
+		retainedHandoffs: retainedHandoffs,
 		runLedger:        newFabricRunLedgerAppender(config.Fabric, stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger")),
 		mailboxPoll:      durationOrDefault(config.RunMailboxPollInterval, DefaultRunMailboxPollInterval),
 		mailboxStateRoot: logSpoolDirectory,
@@ -544,6 +548,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		// to move together, or a test can only ever exercise one of them.
 		a.handoffs.now = func() time.Time { return a.clock.Now() }
 		a.handoffs.observeAccounting = a.observer.recordRetainedResults
+		// The node's other handoff root. It is the helper's filesystem, so the
+		// figures cross the runtime seam rather than being measured here; this
+		// slice reads and reports them and acts on none of them.
+		a.handoffs.ociHandoffs = a.retainedHandoffs
 		// Adoption before collection, and only here: it gives a deadline to
 		// what a crash left behind -- a run that was executing when this node
 		// stopped, or a directory carrying this node's ownership marker and no

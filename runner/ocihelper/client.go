@@ -759,6 +759,16 @@ func (session *Session) RemoveRunMailboxEntry(ctx context.Context, request Remov
 	return response, err
 }
 
+// InventoryHandoffVolumes reads what the node's handoff root holds. It carries
+// no owner key in either direction: the agent derives every name it knows, so
+// a name here it cannot map back to one of its runs is the crash-residue
+// signal.
+func (session *Session) InventoryHandoffVolumes(ctx context.Context, request InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
+	var response InventoryHandoffVolumesResponse
+	err := session.call(ctx, MethodInventoryHandoffs, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)
@@ -990,6 +1000,14 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		// retry, so the node dropped kind:oci and nothing could be placed while
 		// the stalled removal's Slot was free (#513).
 		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteBackup {
+			return false
+		}
+		// The retained-handoff inventory is a read. It mutates nothing, holds
+		// no authority over any attempt, and a node whose accounting pass
+		// failed is still a node that can place work -- so reading its
+		// refusal as node-wide loss would drop kind:oci over a byte count,
+		// the #513 shape.
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodInventoryHandoffs {
 			return false
 		}
 		// Delete is independently bounded and followed by attempt-scoped

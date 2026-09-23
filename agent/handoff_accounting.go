@@ -764,7 +764,9 @@ func (m *handoffManager) accountNode(ctx context.Context) error {
 		return err
 	}
 	defer root.Close()
-	m.reportNodeAccounting(m.measureNode(ctx, root, m.now().UTC()))
+	status := m.measureNode(ctx, root, m.now().UTC())
+	status.OCI = m.measureOCIHandoffs(ctx)
+	m.reportNodeAccounting(status)
 	return nil
 }
 
@@ -779,6 +781,12 @@ func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
 	m.log("agent: retained results on this node: %d runs (%d still in flight), %d logical bytes, %d charged bytes across %d entries; %d quarantined records, still charged; %d run(s) measured incompletely; %d subtree(s) stopped being the directory this pass was measuring; %d entries under %q have no record and are neither measured nor removed",
 		status.Runs, status.InFlight, status.LogicalBytes, status.ChargedBytes, status.Entries,
 		status.QuarantinedRecords, status.Truncated, status.Replaced, status.Unrecorded, m.root)
+	if status.OCI != nil {
+		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live), %d logical bytes, %d deduped bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d measured incompletely, whose figures are a floor; %d carrying a name no run of this node derives; %d result(s) whose removal is authorized and not yet finished freeing, whose bytes are in none of those figures%s",
+			status.OCI.Volumes, status.OCI.Live, status.OCI.LogicalBytes, status.OCI.DedupedBytes, status.OCI.Entries,
+			status.OCI.TerminalUnknown, status.OCI.Anomalies, status.OCI.Truncated, status.OCI.Unattributable, status.OCI.DetachedTrees,
+			map[bool]string{true: "; the helper holds more than it reported, so these are a floor"}[status.OCI.Exhausted])
+	}
 	if m.observeAccounting != nil {
 		m.observeAccounting(status)
 	}
@@ -1063,4 +1071,89 @@ func (m *handoffManager) adoptedDeadline(marker handoffMarker, valid bool) func(
 		}
 		return deadline
 	}
+}
+
+// measureOCIHandoffs reads the node's second handoff root -- the OCI helper's
+// own -- and turns it into the same kind of figure the process root reports.
+//
+// It is a read and only a read in this slice. Nothing is expired here and
+// nothing is evicted: the node budget that will act on both roots is a later
+// slice, and this exists so that when it arrives the figures it needs are
+// already there and already right.
+//
+// The agent cannot measure this root itself. On a Mac node the helper runs
+// inside a Lima VM, so the helper measures its own filesystem and the bytes
+// cross the runtime seam. What the agent still owns is the *policy*, and the
+// one fact it adds here is attribution: it derives the volume name each of its
+// own runs would have, so a reported name it cannot place is residue a crash
+// left behind rather than a run this node is accounting for.
+func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIResultsStatus {
+	if m == nil || m.ociHandoffs == nil {
+		return nil
+	}
+	report, err := m.ociHandoffs.InventoryRetainedHandoffs(ctx)
+	if err != nil {
+		// A node whose accounting read failed is still a node that can place
+		// work. Saying so and reporting no OCI figures is the honest answer;
+		// reporting zeroes would read as an empty root.
+		m.log("agent: read the OCI helper's retained handoff volumes: %v", err)
+		return nil
+	}
+	known := m.derivedHandoffVolumeNames()
+	status := &RetainedOCIResultsStatus{Exhausted: report.Exhausted, DetachedTrees: report.DetachedTrees}
+	for _, volume := range report.Volumes {
+		status.Volumes++
+		status.Entries += volume.Entries
+		status.LogicalBytes += volume.LogicalBytes
+		status.DedupedBytes += volume.DedupedBytes
+		if volume.Live {
+			status.Live++
+		}
+		if !volume.TerminalKnown {
+			status.TerminalUnknown++
+		}
+		if volume.Truncated {
+			status.Truncated++
+		}
+		if len(volume.Anomalies) != 0 {
+			status.Anomalies++
+			m.log("agent: the OCI helper's handoff volume %s: %s", volume.Name, strings.Join(volume.Anomalies, ", "))
+		}
+		if _, placed := known[volume.Name]; !placed {
+			status.Unattributable++
+		}
+	}
+	return status
+}
+
+// derivedHandoffVolumeNames is every handoff volume name this node's own runs
+// would have.
+//
+// It is derived rather than remembered, and derived from two sources because
+// an OCI run has no retention record at all -- its directory is the helper's --
+// so the upload record, which every runtime writes, is the only place this
+// agent names such a run.
+func (m *handoffManager) derivedHandoffVolumeNames() map[string]struct{} {
+	names := make(map[string]struct{})
+	add := func(runID string) {
+		if strings.TrimSpace(runID) == "" {
+			return
+		}
+		name, err := m.ociHandoffs.RetainedHandoffVolumeName(runID)
+		if err != nil {
+			return
+		}
+		names[name] = struct{}{}
+	}
+	for _, record := range m.loadRecords() {
+		// The owner key, not the run ID: a rerun pointed at a source run's
+		// results keeps that run's handoff volume, so naming the volume from
+		// the rerun would look for a directory that does not exist and report
+		// the one that does as residue a crash left behind.
+		add(record.handoffOwnerKey())
+	}
+	for _, runID := range m.loadUploadRunIDs() {
+		add(runID)
+	}
+	return names
 }

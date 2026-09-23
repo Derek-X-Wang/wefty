@@ -148,6 +148,14 @@ type RunMailboxEngine interface {
 	RemoveRunMailboxEntry(context.Context, RemoveRunMailboxEntryRequest) (RemoveRunMailboxEntryResponse, error)
 }
 
+// HandoffRetentionInventoryEngine reports what the node's own handoff root
+// holds. It is session work, not attempt work: the volumes it spans outlive
+// every attempt that produced them, and on a Mac node the agent cannot stat
+// this filesystem even in principle, so the figures must cross the protocol.
+type HandoffRetentionInventoryEngine interface {
+	InventoryHandoffVolumes(context.Context, InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

@@ -117,6 +117,17 @@ type ContainerdEngine struct {
 	ports                       map[uint16]string
 	nextPort                    uint16
 	serviceVolumeMu             sync.Mutex
+	handoffRetentionMu          sync.Mutex                   // serializes receipt publication only; never held across measurement or containerd work
+	handoffMeasureEntered       func(string)                 // a test observes when one volume's measurement begins
+	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
+	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
+	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
+	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
+	handoffDetachedRemoving     func(string)                 // a test parks a deletion inside the free of its detached tree
+	handoffFreeChild            func(string, string) error   // a test makes one child of a detached tree fail to free
+	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
+	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
+	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -1321,10 +1332,15 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		return deleteErr
 	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
 	engine.watchOOM(attempt)
-	engine.mu.Lock()
-	engine.attempts[request.Authority.key()] = attempt
-	engine.mu.Unlock()
 	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
+	// The durable ownership record was published before NewTask and the
+	// in-memory owner is now visible too. Only after both sources make this
+	// volume live may reuse remove the prior attempt's terminal receipt: an
+	// inventory repair that measured before this point takes a fresh ownership
+	// snapshot under the receipt lock and refuses to publish.
+	if err := engine.registerAttemptLiveAndSupersedeHandoff(attempt); err != nil {
+		return RunResponse{}, fmt.Errorf("supersede prior handoff terminal receipt: %w", err)
+	}
 	if err := document.RevalidateMounts(); err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
 	}
@@ -1801,6 +1817,20 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 			runtimeAbsent := verification.Absent
 			if deleteErr == nil && verifyErr == nil && runtimeAbsent {
 				if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
+					// The attempt's task is reaped and its absence
+					// independently verified, so nothing in this namespace can
+					// still be writing into the handoff volume. That is the
+					// one moment a terminal time is true, and the helper takes
+					// it here rather than trusting the directory's own mtime,
+					// which the workload owned.
+					//
+					// A receipt that cannot be written does not un-delete a
+					// verified attempt. The volume keeps its files and reports
+					// terminal_known=false until the next sweep stamps it,
+					// which is exactly the fallback that case exists for.
+					if receiptErr := engine.writeHandoffRetentionReceipt(cleanupCtx, resources.HandoffVolumeDirectory, engine.handoffNow()); receiptErr != nil && !errors.Is(receiptErr, os.ErrNotExist) {
+						log.Printf("stamp the terminal time on handoff volume %s: %v", resources.HandoffVolumeDirectory, receiptErr)
+					}
 					return DeleteResponse{Deleted: true}, nil
 				} else {
 					lastErr = releaseErr
@@ -1914,10 +1944,18 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 			return DeleteManagedVolumeResponse{}, err
 		}
 		path := filepath.Join(engine.config.RuntimeRoot, "handoffs", name)
-		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := engine.removeHandoffVolumeAndReceipt(ctx, name); err != nil {
 			return DeleteManagedVolumeResponse{}, err
 		}
 		if err := requirePathAbsent(path, "handoff managed volume"); err != nil {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		// The receipt is part of what this deletion owns, so absence is
+		// verified over both names. A receipt left standing over a volume that
+		// is gone is runtime residue by the projection's own rule, and a
+		// deletion that reported success while leaving one behind would refuse
+		// the next boot barrier.
+		if err := requirePathAbsent(engine.handoffRetentionPath(name), "handoff retention receipt"); err != nil {
 			return DeleteManagedVolumeResponse{}, err
 		}
 		return DeleteManagedVolumeResponse{Deleted: true}, nil
@@ -2506,9 +2544,6 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	if err := engine.cleanupExpiredHandoffs(time.Now()); err != nil {
-		return SweepResponse{}, err
-	}
 	if err := engine.sweepImageSpools(); err != nil {
 		return SweepResponse{}, err
 	}
@@ -2597,7 +2632,6 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
 	response.DurableRetentions = append(logRetentions, cgroupRetentions...)
 	response.Evidence = append(computerNetworkEvidence, computerDiskEvidence...)
@@ -2606,31 +2640,36 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
 		return SweepResponse{}, err
 	}
+	response.Removed, err = engine.reconcileHandoffsThenCountRemoved(ctx, engine.handoffNow(), observedInventory, remaining,
+		func() (ResourceInventory, error) { return engine.inventory(ctx) })
+	if err != nil {
+		return SweepResponse{}, err
+	}
 	return response, nil
 }
 
-func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time) error {
-	root := filepath.Join(engine.config.RuntimeRoot, "handoffs")
-	entries, err := readDirectoryIfPresent(root)
+// reconcileHandoffsThenCountRemoved is the sweep's last two steps, and their
+// order is the whole point.
+//
+// Handoff reconciliation runs last of all: every surviving task and container
+// has been reaped above, and the ownership records of attempts this node has
+// proved quiescent have just been removed, so what remains in that root is
+// exactly the set of runs nothing may call finished. Stamping a terminal time
+// before that proof is how a helper that restarted over a still-running
+// workload would have declared its results final while it was still writing
+// them.
+//
+// The count then comes after it. `removed` is the number of observed
+// identities absent from the *final* inventory, so taking it before the last
+// removal made a sweep that had just expired a handoff volume and its receipt
+// report that it had removed nothing.
+func (engine *ContainerdEngine) reconcileHandoffsThenCountRemoved(ctx context.Context, now time.Time, observed, remaining ResourceInventory, observe func() (ResourceInventory, error)) (int, error) {
+	engine.reconcileHandoffRetention(ctx, now, remaining)
+	final, err := observe()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), "wefty-handoff-volume-") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if now.Sub(info.ModTime()) < engine.config.HandoffRetention {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
+	return inventoryCount(subtractResourceInventory(observed, final)), nil
 }
 
 func (engine *ContainerdEngine) sweepImageSpools() error {
@@ -3348,6 +3387,12 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			return nil, nil, nil, err
 		}
 		if volume.Kind == ManagedVolumeHandoff {
+			// The mtime no longer decides anything: retention runs from the
+			// helper-owned receipt. It is stamped here so that a volume
+			// prepared and never finalized reports its preparation time as
+			// the labelled fallback, rather than whatever a workload last
+			// wrote. Run supersedes the old receipt only after durable and
+			// in-memory ownership both make this preparation live.
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
 				return nil, nil, nil, err
@@ -3713,7 +3758,7 @@ func (engine *ContainerdEngine) watchOOM(attempt *containerdAttempt) {
 }
 
 func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventory, error) {
-	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{}, ComputerStorageQuarantined: []ComputerStorageRecoveryInventoryEntry{}, ComputerDiskAnomalies: []string{}}
+	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{}, ComputerStorageQuarantined: []ComputerStorageRecoveryInventoryEntry{}, ComputerDiskAnomalies: []string{}, HandoffRetentionRecords: []string{}}
 	leaseList, err := engine.client.LeasesService().List(ctx)
 	if err != nil {
 		return result, err
@@ -3855,6 +3900,7 @@ func sortResourceInventory(result *ResourceInventory) {
 	sort.Strings(result.ComputerDiskAnomalies)
 	sort.Strings(result.ComputerNetworkLinks)
 	sort.Strings(result.ComputerFirewallRules)
+	sort.Strings(result.HandoffRetentionRecords)
 }
 
 func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInventory) error {
@@ -3863,7 +3909,7 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 		return err
 	}
 	for _, entry := range volumeEntries {
-		if strings.HasPrefix(entry.Name(), "wefty-handoff-volume-") {
+		if strings.HasPrefix(entry.Name(), handoffVolumeNamePrefix) {
 			result.ManagedVolumes = append(result.ManagedVolumes, entry.Name())
 		}
 	}
@@ -3883,6 +3929,15 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 	for _, entry := range ownerRecordEntries {
 		if strings.HasPrefix(entry.Name(), "wefty-service-volume-") && strings.HasSuffix(entry.Name(), ".owner") {
 			result.ManagedVolumeRecords = append(result.ManagedVolumeRecords, entry.Name())
+		}
+	}
+	retentionEntries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, handoffRetentionStateDirectory))
+	if err != nil {
+		return err
+	}
+	for _, entry := range retentionEntries {
+		if strings.HasPrefix(entry.Name(), handoffVolumeNamePrefix) && strings.HasSuffix(entry.Name(), handoffRetentionRecordSuffix) {
+			result.HandoffRetentionRecords = append(result.HandoffRetentionRecords, entry.Name())
 		}
 	}
 	return nil
@@ -3946,6 +4001,16 @@ func (engine *ContainerdEngine) attemptOwnershipPath(resources ResourceIdentity)
 // quarantined with a typed operator receipt, never deleted and never allowed to
 // wedge helper startup.
 func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAuthority, resources ResourceIdentity) error {
+	// Receipt repair takes the same lock before its fresh ownership snapshot.
+	// Once this record exists, no repair can still classify its handoff volume
+	// as idle; a repair already publishing finishes before ownership appears and
+	// Run later supersedes what it wrote.
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	return engine.ensureAttemptOwnershipRecordLocked(authority, resources)
+}
+
+func (engine *ContainerdEngine) ensureAttemptOwnershipRecordLocked(authority AttemptAuthority, resources ResourceIdentity) error {
 	expected, err := DeterministicResourceIdentity(authority)
 	if err != nil {
 		return err
@@ -4911,22 +4976,25 @@ func removeCgroupTree(path string) error {
 }
 
 func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInventory, now time.Time) (ResourceInventory, []DurableRetention, error) {
-	retention := engine.config.HandoffRetention
-	if retention <= 0 {
-		retention = defaultHandoffRetention
+	liveHandoffs, err := engine.liveHandoffVolumes()
+	if err != nil {
+		return ResourceInventory{}, nil, err
 	}
 	projected, err := projectRuntimeAbsenceInventory(inventory, engine.retainedServiceDataBinding, func(name string) (bool, error) {
-		info, err := os.Stat(filepath.Join(engine.config.RuntimeRoot, "handoffs", name))
-		if errors.Is(err, os.ErrNotExist) {
-			// A concurrently removed inventory entry cannot be retained evidence;
-			// keeping it in the projection makes the next verification retry prove
-			// absence from a fresh observation.
-			return false, nil
-		}
+		// The same predicate the sweep removes by, live-attempt guard
+		// included, so a volume this projection calls retained is exactly one
+		// the sweep will not take. They disagreed once: cleanup skipped a live
+		// volume and this did not, so a rerun of a stable owner key whose
+		// prior receipt had expired was classified as residue and its own
+		// Delete could never reach Absent.
+		// A concurrently removed entry is reported expired, so it stays in the
+		// projection as residue and the next verification retry proves absence
+		// from a fresh observation.
+		expired, err := engine.handoffVolumeExpired(name, now, liveHandoffs)
 		if err != nil {
 			return false, err
 		}
-		return now.Sub(info.ModTime()) < retention, nil
+		return !expired, nil
 	})
 	if err != nil {
 		return ResourceInventory{}, nil, err
@@ -5039,7 +5107,12 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedService
 	for _, record := range projected.ManagedVolumeRecords {
 		records[record] = struct{}{}
 	}
+	handoffReceipts := make(map[string]struct{}, len(projected.HandoffRetentionRecords))
+	for _, record := range projected.HandoffRetentionRecords {
+		handoffReceipts[record] = struct{}{}
+	}
 	retainedRecords := make(map[string]struct{})
+	retainedHandoffReceipts := make(map[string]struct{})
 	volumes := make([]string, 0, len(projected.ManagedVolumes))
 	for _, name := range projected.ManagedVolumes {
 		if strings.HasPrefix(name, "wefty-service-volume-") {
@@ -5057,7 +5130,7 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedService
 			volumes = append(volumes, name)
 			continue
 		}
-		if !strings.HasPrefix(name, "wefty-handoff-volume-") {
+		if !strings.HasPrefix(name, handoffVolumeNamePrefix) {
 			volumes = append(volumes, name)
 			continue
 		}
@@ -5067,11 +5140,25 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedService
 		}
 		if !retained {
 			volumes = append(volumes, name)
+			continue
+		}
+		// A retention receipt is durable-retained exactly while the volume it
+		// is bound to is. A receipt standing over a volume that is gone, or one
+		// whose volume has expired, stays residue for the sweep to remove --
+		// which is what keeps the union over this class exact.
+		if record := HandoffRetentionRecordName(name); record != "" {
+			if _, present := handoffReceipts[record]; present {
+				retainedHandoffReceipts[record] = struct{}{}
+			}
 		}
 	}
 	projected.ManagedVolumes = volumes
 	projected.ManagedVolumeRecords = slices.DeleteFunc(projected.ManagedVolumeRecords, func(name string) bool {
 		_, retained := retainedRecords[name]
+		return retained
+	})
+	projected.HandoffRetentionRecords = slices.DeleteFunc(projected.HandoffRetentionRecords, func(name string) bool {
+		_, retained := retainedHandoffReceipts[name]
 		return retained
 	})
 	// Import spools are helper-owned durable scratch. Sweep may collect them on
@@ -5163,6 +5250,7 @@ func subtractResourceInventory(observed, residue ResourceInventory) ResourceInve
 		ComputerDiskAnomalies:      subtract(observed.ComputerDiskAnomalies, residue.ComputerDiskAnomalies),
 		ComputerNetworkLinks:       subtract(observed.ComputerNetworkLinks, residue.ComputerNetworkLinks),
 		ComputerFirewallRules:      subtract(observed.ComputerFirewallRules, residue.ComputerFirewallRules),
+		HandoffRetentionRecords:    subtract(observed.HandoffRetentionRecords, residue.HandoffRetentionRecords),
 	}
 }
 
@@ -5197,7 +5285,7 @@ func readDirectoryIfPresent(path string) ([]os.DirEntry, error) {
 }
 
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies) + len(inventory.ComputerNetworkLinks) + len(inventory.ComputerFirewallRules)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies) + len(inventory.ComputerNetworkLinks) + len(inventory.ComputerFirewallRules) + len(inventory.HandoffRetentionRecords)
 }
 
 func subtractRecoveryInventory(values, excluded []ComputerStorageRecoveryInventoryEntry) []ComputerStorageRecoveryInventoryEntry {

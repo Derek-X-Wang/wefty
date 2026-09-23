@@ -570,6 +570,60 @@ type PriorBootReaper interface {
 	ReapPriorBoot(context.Context, PriorBootReapRequest) (ReapReceipt, error)
 }
 
+// RetainedHandoffInventory reports what a runtime's own handoff root still
+// holds. It exists because the node agent owns retention policy for both
+// handoff roots but can only measure one of them: on a Mac node the OCI helper
+// runs inside a Lima VM, so the bytes have to cross the runtime seam.
+//
+// It is a read. Nothing here deletes, and nothing here takes authority over an
+// attempt.
+type RetainedHandoffInventory interface {
+	InventoryRetainedHandoffs(context.Context) (RetainedHandoffReport, error)
+	// RetainedHandoffVolumeName is how the agent places a name in the report
+	// above without any identity crossing the wire: it derives the name one of
+	// its own runs would have, and a reported name it cannot derive is residue
+	// a crash left behind rather than a run this node can account for.
+	RetainedHandoffVolumeName(ownerKey string) (string, error)
+}
+
+// RetainedHandoffReport is one runtime's answer. Exhausted says the runtime
+// holds more volumes than it returned, so these figures are a floor.
+type RetainedHandoffReport struct {
+	Volumes   []RetainedHandoffVolume
+	Exhausted bool
+	// DetachedTrees counts results whose removal was authorized and has not
+	// finished freeing. Their bytes are on the node and belong to no volume
+	// above, so a budget that could not see them would read the node emptier
+	// than it is.
+	DetachedTrees int
+}
+
+// RetainedHandoffVolume is one retained handoff directory as the runtime sees
+// it. Name is the runtime's own deterministic directory name for a run's
+// handoff volume, which the agent derives independently: a name it cannot map
+// back to one of its runs is residue a crash left behind.
+type RetainedHandoffVolume struct {
+	Name string
+	// TerminalAt is when the runtime observed the volume's last attempt
+	// finish. TerminalKnown says whether that came from the runtime's own
+	// record; when it is false the timestamp is a fallback the workload could
+	// have written, so it may be evicted against but never expired on.
+	TerminalAt    time.Time
+	TerminalKnown bool
+	LogicalBytes  int64
+	DedupedBytes  int64
+	Entries       int64
+	// Live says an attempt is still writing here.
+	Live bool
+	// Truncated says the byte and entry figures are a floor: the runtime
+	// stopped measuring early. The terminal time is never a floor.
+	Truncated bool
+	// Anomalies are per-volume observations that must not fail the whole
+	// read. They are a closed token vocabulary, so what a node reports cannot
+	// grow with what a workload wrote.
+	Anomalies []string
+}
+
 // ManagedVolumeFinalizer deletes durable runtime-managed state only after the
 // agent has received authoritative acceptance of a successful completion.
 type ManagedVolumeFinalizer interface {

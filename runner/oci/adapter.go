@@ -2467,6 +2467,52 @@ func (adapter *Adapter) RemoveRunMailboxEntry(ctx context.Context, reference wor
 	return nil
 }
 
+// InventoryRetainedHandoffs reads what the helper's handoff root holds.
+//
+// It is session work rather than attempt work, and deliberately so: the
+// volumes it spans outlive every attempt that produced them, so there is no
+// attempt whose authority could stand for them. Nothing here names an owner
+// key in either direction -- the agent derives the names it knows from its own
+// runs, and a name in this report it cannot place is residue a crash left.
+func (adapter *Adapter) InventoryRetainedHandoffs(ctx context.Context) (workloadrunner.RetainedHandoffReport, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.RetainedHandoffReport{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.RetainedHandoffReport{}, err
+	}
+	response, err := session.InventoryHandoffVolumes(ctx, ocihelper.InventoryHandoffVolumesRequest{})
+	if err != nil {
+		return workloadrunner.RetainedHandoffReport{}, err
+	}
+	report := workloadrunner.RetainedHandoffReport{
+		Volumes:       make([]workloadrunner.RetainedHandoffVolume, 0, len(response.Volumes)),
+		Exhausted:     response.Exhausted,
+		DetachedTrees: response.DetachedTrees,
+	}
+	for _, volume := range response.Volumes {
+		anomalies := make([]string, 0, len(volume.Anomalies))
+		for _, anomaly := range volume.Anomalies {
+			anomalies = append(anomalies, string(anomaly))
+		}
+		report.Volumes = append(report.Volumes, workloadrunner.RetainedHandoffVolume{
+			Name: volume.Name, TerminalAt: volume.TerminalAt, TerminalKnown: volume.TerminalKnown,
+			LogicalBytes: volume.LogicalBytes, DedupedBytes: volume.DedupedBytes,
+			Entries: volume.Entries, Live: volume.Live, Truncated: volume.Truncated,
+			Anomalies: anomalies,
+		})
+	}
+	return report, nil
+}
+
+// RetainedHandoffVolumeName is the helper's deterministic directory name for
+// one run's handoff volume. The agent derives the names of its own runs with
+// it, so no owner key ever has to cross the wire in either direction.
+func (adapter *Adapter) RetainedHandoffVolumeName(ownerKey string) (string, error) {
+	return ocihelper.DeterministicHandoffVolumeDirectory(ownerKey)
+}
+
 func (adapter *Adapter) runMailboxRequest(reference workloadrunner.RunMailboxReference) (*ocihelper.Session, ocihelper.RunMailboxReference, error) {
 	if adapter == nil || adapter.sessions == nil {
 		return nil, ocihelper.RunMailboxReference{}, errors.New("OCI helper session is not configured")
