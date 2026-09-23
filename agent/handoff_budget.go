@@ -114,6 +114,13 @@ func (m *handoffManager) enforceNodeBudget(ctx context.Context, root *os.Root, s
 		if evicted == 0 {
 			return
 		}
+		// Both roots, freshly. What the pass carried forward between deletions
+		// was enough to decide on -- neither root's figures move when the
+		// other is deleted from -- but what a person and the node doctor read
+		// afterwards should be one measurement of the node as it is now, not
+		// one root measured after the last deletion and the other as it stood
+		// before the first.
+		status = m.remeasureNode(ctx, root)
 		m.log("agent: this node gave %d retained result(s) up to fit its budget and now holds %d charged bytes against %d",
 			evicted, nodeChargedBytes(status), m.nodeBytes)
 		m.reportNodeAccounting(status)
@@ -173,37 +180,50 @@ func (m *handoffManager) enforceNodeBudget(ctx context.Context, root *os.Root, s
 		// independently and dedup independently, so giving up a process run
 		// cannot change what the helper's volumes cost and vice versa --
 		// re-reading the other root would be a filesystem walk or a protocol
-		// round trip that no figure depends on. The final report at the end of
-		// the pass measures both, so what a person reads is never half stale.
+		// round trip that no figure depends on, and the figures carried
+		// forward are as true as they were when they were taken.
 		status = m.remeasureRoot(ctx, root, status, candidate.ociVolume)
 	}
 }
 
 // evictFromClass walks one publication class in order until something is given
-// up, and reports what happened: whether anything was taken, which candidate it
-// was, and how many candidates turned out to be stale.
+// up or until a candidate proves the walk is working from a stale order.
 //
-// Stale is counted rather than acted on here, because it means something
-// different to the caller: a candidate the pass could not take is this class
-// being busy, and a candidate that *moved* is this pass's picture of the node
-// being out of date, which only remeasuring fixes.
+// The two are different answers and the difference is the whole point. A
+// candidate the pass cannot take is this class being busy: the next result of
+// the same kind is still the right thing to try, and stopping would leave a
+// full node full because one run was momentarily held. A candidate whose
+// publication or order keys *moved* says something else -- that the sorted
+// list this walk is reading was built from a picture of the node that is no
+// longer true -- and the specific move that matters is a run rerunning and
+// finishing published, which takes it out of the unpublished class and into
+// the one that must be given up first. Walking on from there deletes a run's
+// only copy while a published result it just created sits beside it.
 func (m *handoffManager) evictFromClass(ctx context.Context, root *os.Root, class []handoffEvictionCandidate, charged int64) (bool, handoffEvictionCandidate, int) {
-	reselected := 0
-	for _, candidate := range class {
+	for position, candidate := range class {
 		if handoffBudgetRace != nil {
 			handoffBudgetRace(handoffBudgetCandidateChosen, candidate)
 		}
 		switch m.evictCandidate(ctx, root, candidate, charged) {
 		case evictionDone:
-			return true, candidate, reselected
+			return true, candidate, 0
 		case evictionReselect:
-			reselected++
+			// Stop here, not at the end of the class. Everything after this
+			// candidate was sorted against a picture of the node that has
+			// just been shown to be wrong, and the specific way it can be
+			// wrong is the dangerous one: the candidate may have joined the
+			// class that has to be given up first. One `reselected` is
+			// enough -- it says the pass is stale, and staleness is not a
+			// quantity.
+			m.log("agent: the node stopped part-way through %d candidate(s) because %s stopped being the result this pass had chosen; it will measure and choose again",
+				len(class)-position, candidate.describe())
+			return false, handoffEvictionCandidate{}, 1
 		}
 		if ctx != nil && ctx.Err() != nil {
-			return false, handoffEvictionCandidate{}, reselected
+			return false, handoffEvictionCandidate{}, 0
 		}
 	}
-	return false, handoffEvictionCandidate{}, reselected
+	return false, handoffEvictionCandidate{}, 0
 }
 
 // nodeChargedBytes is the one number the budget is about: what both handoff
@@ -446,13 +466,22 @@ type evictionOutcome int
 const (
 	// evictionDone: the results are gone and the node is smaller.
 	evictionDone evictionOutcome = iota
-	// evictionReselect: this candidate is not what the pass chose any more --
-	// an attempt holds it, or a rerun retained it between the measurement and
-	// the lease. Measuring again and choosing again is the answer.
+	// evictionReselect: this candidate's publication or its place in the order
+	// changed between the measurement and the lease. The class this pass is
+	// walking may not be the right class any more -- a run that reruns and
+	// finishes *published* has left the unpublished class and joined the one
+	// that must be given up first -- so the walk stops here and the pass
+	// measures and chooses again. Continuing on a stale class is how a node
+	// gives up a run's only copy while a published result it just created
+	// sits beside it.
 	evictionReselect
-	// evictionRefused: nothing was given up and asking again would produce the
-	// same answer, so the pass ends.
-	evictionRefused
+	// evictionUnavailable: this candidate cannot be taken now and nothing
+	// about the order changed. An attempt holds it, its record went in flight
+	// or into quarantine, the helper refused it as live, the removal failed.
+	// It left the candidate set; it did not move to the other class. The walk
+	// goes on to the next result of the same kind, because one busy run is not
+	// a reason to leave a full node full.
+	evictionUnavailable
 )
 
 // evictCandidate gives one candidate up and says what happened.
@@ -493,17 +522,23 @@ func (m *handoffManager) evictRetainedRun(root *os.Root, candidate handoffEvicti
 	if lease == nil {
 		m.log("agent: leave run %s's retained results alone this pass: an attempt holds them, and the node is over its budget by %d bytes",
 			candidate.runID, charged-m.nodeBytes)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	defer lease.release()
 	record, ok := m.currentRecord(candidate.record)
 	if !ok {
-		return evictionRefused
+		// The record is gone or is no longer one this node can act on. Either
+		// way the order was built on something that is not there, and what
+		// replaced it is not knowable from here.
+		return evictionReselect
 	}
 	if record.RetainUntil.IsZero() || record.Quarantine != "" {
+		// It left the candidate set -- readmitted, or paused as unsafe to
+		// delete. It did not join the other class, so the rest of this one is
+		// still ordered correctly.
 		m.log("agent: leave run %s's retained results alone this pass: its record moved on while the node was being measured",
 			candidate.runID)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	// The order keys, not only the facts the filter reads. currentRecord
 	// deliberately returns the *newer* record when the run was retained again,
@@ -522,7 +557,7 @@ func (m *handoffManager) evictRetainedRun(root *os.Root, candidate handoffEvicti
 	removed, err := m.removeRetainedRun(root, record, lease, handoffRemovalOverBudget)
 	if err != nil {
 		m.noteRemovalFailure(record, err)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	if !removed {
 		// The removal found nothing at the run's name and dropped its record
@@ -531,7 +566,7 @@ func (m *handoffManager) evictRetainedRun(root *os.Root, candidate handoffEvicti
 		// line rather than none.
 		m.log("agent: run %s's retained results were already gone when the node went to give them up, and its record went with them",
 			record.RunID)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	m.log("agent: run %s's retained results were given up early to fit this node's budget, recovering up to the %d charged bytes they were measured at; its result document, if it uploaded one, is still readable with `wefty results`",
 		record.RunID, candidate.charged)
@@ -559,13 +594,13 @@ func (m *handoffManager) evictHandoffVolume(ctx context.Context, candidate hando
 	if m.ociEvictor == nil {
 		m.log("agent: this node holds %d charged bytes of retained results against a budget of %d and cannot give the OCI handoff volume for run %s up: its runtime provides no eviction",
 			charged, m.nodeBytes, candidate.ownerKey)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	lease := m.tryCollectLease(ociHandoffLeaseKey(candidate.ownerKey))
 	if lease == nil {
 		m.log("agent: leave the OCI handoff volume for run %s alone this pass: an attempt of this node holds it, and the node is over its budget by %d bytes",
 			candidate.ownerKey, charged-m.nodeBytes)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	defer lease.release()
 	// Re-read under the lease. An attempt that admitted this volume between
@@ -575,13 +610,17 @@ func (m *handoffManager) evictHandoffVolume(ctx context.Context, candidate hando
 	// process root re-reads its own.
 	record, found, err := m.readOCIRecord(candidate.ownerKey)
 	if err != nil {
+		// The record the order was built on cannot be read, so what it says
+		// now is not knowable from here.
 		m.log("agent: leave the OCI handoff volume for run %s alone this pass: re-reading its record failed: %v", candidate.ownerKey, err)
-		return evictionRefused
+		return evictionReselect
 	}
 	if found && record.live() {
-		m.log("agent: the OCI handoff volume for run %s was claimed by attempt %s while this node was being measured; it is not the budget's to give up, and the node will choose again",
+		// An attempt admitted it. It left the candidate set without joining
+		// the other class, so the rest of this one is still in order.
+		m.log("agent: the OCI handoff volume for run %s was claimed by attempt %s while this node was being measured; it is not the budget's to give up",
 			candidate.ownerKey, record.AttemptID)
-		return evictionReselect
+		return evictionUnavailable
 	}
 	if found && record.evidenceReachedLedger() != candidate.published {
 		m.log("agent: whether run %s's evidence reached the ledger changed while this node was being measured; the node will choose again", candidate.ownerKey)
@@ -589,16 +628,19 @@ func (m *handoffManager) evictHandoffVolume(ctx context.Context, candidate hando
 	}
 	if err := m.ociEvictor.EvictRetainedHandoff(ctx, candidate.ownerKey); err != nil {
 		if errors.Is(err, workloadrunner.ErrRetainedHandoffLive) {
-			m.log("agent: the OCI helper refused to give the handoff volume for run %s up because an attempt owns it; the node keeps those results and will choose again: %v",
+			// The helper's guard, and the same shape as this node's own: the
+			// volume is an attempt's, so it is out of the candidate set and
+			// nothing about the order moved.
+			m.log("agent: the OCI helper refused to give the handoff volume for run %s up because an attempt owns it; the node keeps those results: %v",
 				candidate.ownerKey, err)
-			return evictionReselect
+			return evictionUnavailable
 		}
 		if ctx != nil && errors.Is(err, ctx.Err()) {
 			m.log("agent: the OCI handoff volume for run %s was not given up: the pass was cancelled", candidate.ownerKey)
-			return evictionRefused
+			return evictionUnavailable
 		}
 		m.log("agent: give the OCI handoff volume for run %s up to fit this node's budget: %v", candidate.ownerKey, err)
-		return evictionRefused
+		return evictionUnavailable
 	}
 	// The volume is gone, so the record that named it is not authority over
 	// anything any more. Leaving it would keep a published fact standing over

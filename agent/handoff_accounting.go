@@ -916,7 +916,7 @@ func (m *handoffManager) adoptResidue() error {
 // run can have finished between the load and the lease, and a finished record
 // is not this function's to touch.
 func (m *handoffManager) reconcileAdmission(root *os.Root, record retentionRecord, now time.Time) {
-	lease := m.tryCollectLease(record.Directory)
+	lease := m.tryCollectLease(handoffPathLeaseKey(record.Directory))
 	if lease == nil {
 		// An attempt holds this path, so the run is not a prior boot's after
 		// all and its own finish writes the window.
@@ -1003,7 +1003,7 @@ func (m *handoffManager) adoptDirectory(runID string, now time.Time) {
 		return
 	}
 	path := filepath.Join(m.root, runID)
-	lease := m.tryCollectLease(path)
+	lease := m.tryCollectLease(handoffPathLeaseKey(path))
 	if lease == nil {
 		return
 	}

@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1674,5 +1675,167 @@ func TestTheStartupPassMeasuresAndGivesNothingUp(t *testing.T) {
 	}
 	if harness.exists("run_published") && len(helper.evicted) == 0 {
 		t.Fatalf("the enforcing pass gave nothing up either: %v", harness.logs)
+	}
+}
+
+// TestARerunThatFinishesPublishedStopsTheWalkOfTheUnpublishedClass is the
+// defect the per-class advance introduced. Two unpublished candidates, A and
+// B, are sorted and walked in order; A reruns and finishes *published* while
+// the pass is looking at it. A has left the unpublished class and joined the
+// one that must be given up first, so the sorted list the walk is reading is
+// no longer the right list -- and walking on from there gives up B's only copy
+// while a published result exists beside it.
+func TestARerunThatFinishesPublishedStopsTheWalkOfTheUnpublishedClass(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	first := harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_b_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+
+	harness.manager.nodeBytes = 3 << 20
+	republished := false
+	handoffBudgetRace = func(stage string, candidate handoffEvictionCandidate) {
+		if republished || stage != handoffBudgetCandidateChosen || candidate.runID != "run_a_unpublished" {
+			return
+		}
+		republished = true
+		// The rerun: A runs again, finishes published, and releases its lease
+		// before the budget reaches its own. Nothing about A is held any more;
+		// what changed is which class it belongs to.
+		harness.now = harness.now.Add(time.Hour)
+		spec := handoffClaim("run_a_unpublished", first, []string{contract.StableNodeTagPrefix + "node-1"}).Job.Spec
+		ownership := prepareHandoffForTest(t, harness.manager, spec)
+		if err := harness.manager.finish(ownership, spec, "node-1", true, true); err != nil {
+			t.Error(err)
+		}
+		ownership.lease.release()
+	}
+	t.Cleanup(func() { handoffBudgetRace = nil })
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !republished {
+		t.Fatal("the fixture never reached the window it exists to stage")
+	}
+	if !harness.exists("run_b_unpublished") {
+		t.Fatalf("the node gave up an unpublished run's only copy while a published result existed: %v", harness.logs)
+	}
+	// A is what the node should have given up once it looked again: it is now
+	// the only published result on an over-budget node.
+	if harness.exists("run_a_unpublished") {
+		t.Fatalf("the node chose again and then gave nothing up: %v", harness.logs)
+	}
+	if !harness.logged("stopped part-way through") {
+		t.Fatalf("the walk did not stop when its order went stale: %v", harness.logs)
+	}
+	if harness.logged(handoffUnpublishedEviction) {
+		t.Fatalf("a result no ledger saw was given up while a published one existed: %v", harness.logs)
+	}
+}
+
+// TestAnUnavailableCandidateStillAdvancesWithinItsClass is the other half, and
+// the reason the two outcomes are separate. A candidate an attempt is holding
+// has left the candidate set without joining the other class, so the rest of
+// this class is still in the right order and the walk goes on.
+func TestAnUnavailableCandidateStillAdvancesWithinItsClass(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	held := harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_b_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+
+	lease, err := harness.manager.lock(t.Context(), handoffClaim("run_a_unpublished", held, nil).Job.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.release()
+
+	harness.budget(3 << 20)
+
+	if !harness.exists("run_a_unpublished") {
+		t.Fatal("the node gave up results an attempt was holding")
+	}
+	if harness.exists("run_b_unpublished") {
+		t.Fatalf("a held candidate stopped the walk instead of advancing it: %v", harness.logs)
+	}
+	if harness.logged("stopped part-way through") {
+		t.Fatalf("a busy candidate was treated as a stale order: %v", harness.logs)
+	}
+}
+
+// TestTheHelpersLiveRefusalAdvancesRatherThanRestartingThePass keeps the
+// helper's guard on the advancing side too: a volume an attempt owns is out of
+// the candidate set, and nothing about the order moved.
+func TestTheHelpersLiveRefusalAdvancesRatherThanRestartingThePass(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retainOCI("run_live_one", "attempt-1", false)
+	harness.now = harness.now.Add(time.Hour)
+	harness.retainOCI("run_next_two", "attempt-1", false)
+	helper := &fakeHelperHandoffRoot{
+		volumes: []workloadrunner.RetainedHandoffVolume{
+			ociVolume(t, "run_live_one", 4<<20, 2, harness.now),
+			ociVolume(t, "run_next_two", 4<<20, 2, harness.now),
+		},
+		live: map[string]struct{}{"run_live_one": {}},
+	}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	harness.budget(5 << 20)
+
+	if !slices.Contains(helper.evicted, "run_next_two") {
+		t.Fatalf("the helper's refusal ended the walk instead of advancing it: %v", harness.logs)
+	}
+	if harness.logged("stopped part-way through") {
+		t.Fatalf("a live refusal was treated as a stale order: %v", harness.logs)
+	}
+}
+
+// TestAdoptionAndReconciliationTakeTheSameLeaseAnAttemptDoes closes the
+// namespacing: both startup paths write to a run's record, and both must be
+// excluded by an attempt holding that run -- which they are only if they ask
+// for the same key an attempt takes.
+func TestAdoptionAndReconciliationTakeTheSameLeaseAnAttemptDoes(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+
+	// An admission that never finished, whose run an attempt now holds.
+	inflight := filepath.Join(harness.root, "run_inflight")
+	spec := handoffClaim("run_inflight", inflight, nil).Job.Spec
+	owner := prepareHandoffForTest(t, harness.manager, spec)
+	defer owner.lease.release()
+
+	// A directory with a marker and no record, whose run an attempt also
+	// holds: adoption must leave it alone.
+	adoptable := filepath.Join(harness.root, "run_adoptable")
+	if err := os.MkdirAll(adoptable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := json.Marshal(handoffMarker{RunID: "run_adoptable", NodeID: "node-1", RetainUntil: harness.now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(adoptable, handoffMarkerName), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adoptLease, err := harness.manager.lock(t.Context(),
+		handoffClaim("run_adoptable", adoptable, nil).Job.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adoptLease.release()
+
+	if err := harness.manager.adoptResidue(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The in-flight admission keeps its admission: an attempt holds it, so it
+	// is not a prior boot's after all.
+	if record := harness.record("run_inflight"); !record.RetainUntil.IsZero() {
+		t.Fatalf("reconciliation wrote a deadline over a run an attempt holds: %+v", record)
+	}
+	// And the marked directory is not adopted while an attempt holds it.
+	for _, record := range harness.manager.loadRecords() {
+		if record.RunID == "run_adoptable" {
+			t.Fatalf("adoption claimed a run an attempt holds: %+v", record)
+		}
 	}
 }

@@ -121,6 +121,7 @@ type ContainerdEngine struct {
 	handoffMutationGeneration   uint64                       // bumped under handoffRetentionMu by every change to the handoff root's shape
 	handoffScanMu               sync.Mutex                   // guards the cached whole-root scan; never held across the scan itself
 	handoffScan                 *handoffRootScan             // the last whole-root measurement, which every page of one listing is served from
+	afterAttemptOwnershipRename func() error                 // a test fails an ownership publication with its record already renamed into place
 	handoffMeasureEntered       func(string)                 // a test observes when one volume's measurement begins
 	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
 	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
@@ -4094,18 +4095,23 @@ func (engine *ContainerdEngine) ensureAttemptOwnershipRecordLocked(authority Att
 			return errors.Join(readErr, err)
 		}
 	}
-	if err := engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
+	writeErr := engine.writeAttemptOwnershipRecordLocked(durableAttemptOwnership{
 		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
-	}); err != nil {
-		return err
-	}
+	})
 	// Ownership is half of what makes a handoff volume live, so publishing it
 	// changes the shape a listing of that root describes. The caller holds
 	// handoffRetentionMu -- both callers of this do -- which is what makes the
 	// record and the bump one event to a reader sampling the generation under
 	// the same lock.
+	//
+	// It bumps whether or not the write reported success, because the record
+	// is renamed into place before the durability step that can still fail:
+	// a record the filesystem is holding and a generation that never moved is
+	// a listing told nothing happened. A bump for a publication that really
+	// did not land costs a listing one restart; a missing one costs a volume
+	// its liveness.
 	engine.noteHandoffRootMutationLocked()
-	return nil
+	return writeErr
 }
 
 // quarantineAttemptOwnershipRecordLocked moves one unreconcilable record out of
@@ -4254,6 +4260,14 @@ func (engine *ContainerdEngine) writeAttemptOwnershipRecordLocked(record durable
 	}
 	if err := os.Rename(temporaryName, engine.attemptOwnershipPath(record.Resources)); err != nil {
 		return fmt.Errorf("publish durable Attempt ownership: %w", err)
+	}
+	if engine.afterAttemptOwnershipRename != nil {
+		// A test makes the durability step below fail with the record already
+		// renamed into place, which is the window the caller's unconditional
+		// bump exists for.
+		if err := engine.afterAttemptOwnershipRename(); err != nil {
+			return err
+		}
 	}
 	directory, err := os.Open(root)
 	if err != nil {
@@ -5103,19 +5117,34 @@ func (engine *ContainerdEngine) removeQuiescentAttemptOwnershipRecords(records m
 //
 // The handoff root's generation moves for it, because ownership is half of
 // what makes a volume live and a release can therefore make a volume
-// evictable. The bump happens after attemptOwnershipMu is released rather than
-// under it: publication takes handoffRetentionMu and then attemptOwnershipMu,
-// so taking them the other way round here would be an inversion.
+// evictable -- and it moves *inside the same hold of handoffRetentionMu as the
+// release itself*. Bumping afterwards left a window in which the record was
+// gone and the generation had not moved, and a listing continued in that
+// window completed from a cached scan that still said the volume was live: a
+// node reading that page would leave an idle volume unevictable until some
+// later change moved the counter.
+//
+// The lock order is the one publication uses -- handoffRetentionMu, then
+// attemptOwnershipMu -- so taking the retention lock out here rather than
+// around the bump alone is what keeps the two paths from inverting.
 func (engine *ContainerdEngine) removeAttemptOwnershipRecord(record durableAttemptOwnership) error {
-	err := engine.removeAttemptOwnershipRecordLocked(record)
-	engine.noteHandoffRootMutation()
-	return err
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	return engine.removeAttemptOwnershipRecordLocked(record)
 }
 
+// removeAttemptOwnershipRecordLocked expects handoffRetentionMu.
 func (engine *ContainerdEngine) removeAttemptOwnershipRecordLocked(record durableAttemptOwnership) error {
 	engine.attemptOwnershipMu.Lock()
 	defer engine.attemptOwnershipMu.Unlock()
-	if err := os.Remove(engine.attemptOwnershipPath(record.Resources)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	switch err := os.Remove(engine.attemptOwnershipPath(record.Resources)); {
+	case err == nil:
+		// The owner is gone from this moment, so the generation moves from
+		// this moment -- before the directory sync below, which can fail
+		// without putting the record back.
+		engine.noteHandoffRootMutationLocked()
+	case errors.Is(err, os.ErrNotExist):
+	default:
 		return err
 	}
 	directory, err := os.Open(engine.attemptOwnershipRoot())

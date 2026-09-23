@@ -2379,3 +2379,102 @@ func TestAScanTheRootHasMovedPastIsDropped(t *testing.T) {
 		t.Fatal("a scan the root has moved past is still held")
 	}
 }
+
+// TestAnOwnershipReleaseMovesTheGenerationBeforeItIsVisible closes the window
+// the release used to leave open. Bumping after the ownership lock was dropped
+// meant there was an instant where the record was gone and the counter had not
+// moved -- and a listing continued in that instant completed from a cached
+// scan that still said the volume was live, leaving an idle volume
+// unevictable until some later change happened to move the counter.
+func TestAnOwnershipReleaseMovesTheGenerationBeforeItIsVisible(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "released-run")
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "released-run", AttemptID: "attempt-1",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := engine.liveHandoffVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, live := owned[name]; !live {
+		t.Fatal("the fixture never made the volume live")
+	}
+	before := engine.handoffRootGeneration()
+
+	if err := engine.removeAttemptOwnershipRecord(durableAttemptOwnership{
+		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The record and the counter moved together: at no point after the record
+	// is gone does the generation still read as it did while the volume was
+	// live.
+	idle, err := engine.liveHandoffVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, live := idle[name]; live {
+		t.Fatal("the volume is still live after its ownership was released")
+	}
+	if after := engine.handoffRootGeneration(); after <= before {
+		t.Fatalf("the generation went %d -> %d across a release that made a volume idle", before, after)
+	}
+}
+
+// TestAPublicationWhoseDurabilityStepFailsStillMovesTheGeneration is the other
+// window. The ownership record is renamed into place before the directory
+// sync, so a sync that fails leaves a record the filesystem is holding -- and
+// a generation that never moved is a listing told nothing happened.
+func TestAPublicationWhoseDurabilityStepFailsStillMovesTheGeneration(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "half-published-run")
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "half-published-run", AttemptID: "attempt-1",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+	before := engine.handoffRootGeneration()
+	engine.afterAttemptOwnershipRename = func() error {
+		return errors.New("the ownership root could not be synced")
+	}
+
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err == nil {
+		t.Fatal("the fixture's publication succeeded, so it proves nothing")
+	}
+	engine.afterAttemptOwnershipRename = nil
+
+	// The record really is on disk, which is the whole reason the generation
+	// has to have moved.
+	if _, err := os.Lstat(engine.attemptOwnershipPath(resources)); err != nil {
+		t.Fatalf("the fixture did not leave a renamed record behind: %v", err)
+	}
+	owned, err := engine.liveHandoffVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, live := owned[name]; !live {
+		t.Fatal("the half-published record did not make its volume live")
+	}
+	if after := engine.handoffRootGeneration(); after <= before {
+		t.Fatalf("the generation went %d -> %d across a publication that landed and did not report success",
+			before, after)
+	}
+}
