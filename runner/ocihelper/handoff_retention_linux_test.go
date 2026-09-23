@@ -151,6 +151,9 @@ func TestAHandoffVolumeWithNoReceiptIsReportedAndNeverExpiredOnItsMtime(t *testi
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("a handoff volume was expired on a timestamp its workload could have written: %v", err)
 	}
+	// A live attempt holds it, so nothing stamps it and the read has to say
+	// what it is looking at: an age the workload owns.
+	engine.attempts["live"] = &containerdAttempt{resources: ResourceIdentity{HandoffVolumeDirectory: name}}
 	inventory, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -395,7 +398,10 @@ func TestAnUnreadableReceiptIsAPerVolumeAnomalyRatherThanAFailedCall(t *testing.
 	broken, brokenPath := makeHandoffVolume(t, root, "broken-receipt")
 	sound, soundPath := makeHandoffVolume(t, root, "sound-receipt")
 	stamp(t, engine, sound, now.Add(-2*time.Hour))
-	if err := os.WriteFile(engine.handoffRetentionPath(broken), []byte("{not json"), 0o600); err != nil {
+	// A directory where the receipt goes: the read fails operationally rather
+	// than returning something invalid, which is the case the repair must not
+	// write over -- a receipt that cannot be read may still be a valid one.
+	if err := os.MkdirAll(engine.handoffRetentionPath(broken), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	inventory, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
@@ -408,7 +414,7 @@ func TestAnUnreadableReceiptIsAPerVolumeAnomalyRatherThanAFailedCall(t *testing.
 	for _, volume := range inventory.Volumes {
 		switch volume.Name {
 		case broken:
-			if volume.TerminalKnown || !slices.Contains(volume.Anomalies, HandoffAnomalyReceiptInvalid) {
+			if volume.TerminalKnown || !slices.Contains(volume.Anomalies, HandoffAnomalyReceiptUnreadable) {
 				t.Fatalf("the unreadable receipt reported %+v", volume)
 			}
 		case sound:
@@ -427,6 +433,58 @@ func TestAnUnreadableReceiptIsAPerVolumeAnomalyRatherThanAFailedCall(t *testing.
 	}
 	if _, err := os.Stat(brokenPath); err != nil {
 		t.Fatalf("a volume with an unreadable receipt was removed on a timestamp its workload could have written: %v", err)
+	}
+}
+
+// The repair fills a gap that can never close by itself and leaves alone one
+// that might. A receipt that is structurally not a version-1 receipt will
+// never become one, and leaving it would make its volume permanently
+// unexpirable; a receipt the filesystem could not read this time may be a
+// perfectly good terminal time next time, and writing over it would destroy a
+// fact this node had already recorded.
+func TestTheRepairFillsAStructuralReceiptGapAndNotAnOperationalOne(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	invalid, _ := makeHandoffVolume(t, root, "invalid-receipt")
+	unreadable, _ := makeHandoffVolume(t, root, "unreadable-receipt")
+	if err := os.MkdirAll(engine.handoffRetentionRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(engine.handoffRetentionPath(invalid), []byte("{not a receipt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(engine.handoffRetentionPath(unreadable), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+
+	receipt := readHandoffReceipt(t, root, invalid)
+	if !receipt.TerminalAt.Equal(now) {
+		t.Fatalf("a structurally invalid receipt was not repaired: %+v", receipt)
+	}
+	info, err := os.Lstat(engine.handoffRetentionPath(unreadable))
+	if err != nil || !info.IsDir() {
+		t.Fatalf("an operational read failure was written over: %v", err)
+	}
+
+	// The rule itself, across the whole vocabulary, because the filesystem
+	// case above cannot distinguish "was not written over" from "could not be
+	// written": only a gap that will never close by itself is filled.
+	for anomaly, structural := range map[HandoffVolumeAnomaly]bool{
+		HandoffAnomalyNoReceipt:            true,
+		HandoffAnomalyReceiptInvalid:       true,
+		HandoffAnomalyReceiptMismatched:    true,
+		HandoffAnomalyReceiptUnreadable:    false,
+		HandoffAnomalyVolumeUnreadable:     false,
+		HandoffAnomalyMeasurementTruncated: false,
+		HandoffAnomalySubtreeReplaced:      false,
+		"":                                 false,
+	} {
+		if handoffReceiptGapIsStructural(anomaly) != structural {
+			t.Fatalf("anomaly %q is treated as structural=%v", anomaly, !structural)
+		}
 	}
 }
 
@@ -604,6 +662,9 @@ func TestASubtreeReplacedBetweenItsStatAndItsOpenIsReportedNotMeasured(t *testin
 	if err := os.WriteFile(filepath.Join(decoy, "not-mine"), []byte(strings.Repeat("y", 4096)), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// A live attempt holds it, so the repair pass skips it and the one walk
+	// that happens is the one being observed.
+	engine.attempts["live"] = &containerdAttempt{resources: ResourceIdentity{HandoffVolumeDirectory: name}}
 	engine.handoffMeasureDescend = func(volume, entry string) {
 		if volume != name || entry != "subtree" {
 			return
@@ -716,12 +777,12 @@ func TestTheHandoffInventoryIsBoundedInEncodedBytesNotRows(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
 	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	engine.handoffInventoryBytes = 2 << 10
 	if err := os.MkdirAll(filepath.Join(root, "handoffs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// Enough receiptless volumes that a row-capped response would encode past
-	// the frame limit.
-	for index := range MaxInventoriedHandoffVolumes {
+	const volumes = 64
+	for index := range volumes {
 		if err := os.MkdirAll(filepath.Join(root, "handoffs", fmt.Sprintf("%s%064x", handoffVolumeNamePrefix, index)), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -733,15 +794,22 @@ func TestTheHandoffInventoryIsBoundedInEncodedBytesNotRows(t *testing.T) {
 	if !inventory.Exhausted {
 		t.Fatal("a response that could not carry the node's volumes did not say so")
 	}
+	if len(inventory.Volumes) == 0 || len(inventory.Volumes) >= volumes {
+		t.Fatalf("the response carried %d of %d volumes; the bound is in bytes, so it must stop partway", len(inventory.Volumes), volumes)
+	}
 	encoded, err := json.Marshal(inventory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded) > MaxFrameBytes-handoffInventoryFrameHeadroom {
-		t.Fatalf("the response encodes to %d bytes, past its %d-byte budget", len(encoded), MaxFrameBytes-handoffInventoryFrameHeadroom)
+	if len(encoded) > engine.handoffInventoryByteBudget() {
+		t.Fatalf("the response encodes to %d bytes, past its %d-byte budget", len(encoded), engine.handoffInventoryByteBudget())
 	}
-	if len(inventory.Volumes) == 0 {
-		t.Fatal("the budget left no room for any volume at all")
+
+	// And the production budget is the frame limit less its envelope headroom,
+	// because a frame the transport refuses costs the node its session.
+	unbounded := handoffRetentionEngine(t, t.TempDir(), time.Hour, now)
+	if budget := unbounded.handoffInventoryByteBudget(); budget >= MaxFrameBytes || budget != MaxFrameBytes-handoffInventoryFrameHeadroom {
+		t.Fatalf("the production response budget is %d against a %d-byte frame limit", budget, MaxFrameBytes)
 	}
 }
 
@@ -839,5 +907,136 @@ func TestAnOperatorMountMayNotOverlapTheManagedRuntimeRoot(t *testing.T) {
 				t.Fatalf("operator source %q was refused beside managed root %q: %v", testCase.source, testCase.managed, err)
 			}
 		})
+	}
+}
+
+// A receipt the filesystem refused used to wait for another boot: the sweep
+// was the only thing that stamped one, so a node that filled up mid-run kept
+// the affected volumes non-expirable until somebody restarted the helper. The
+// agent reads the inventory hourly, which is the right cadence for the repair
+// too.
+func TestTheInventoryCallRepairsAReceiptTheSweepCouldNotWrite(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "refused-receipt")
+
+	// A non-empty directory where the receipt goes: publishing it fails, and
+	// the first read reports a volume with no helper-owned terminal time.
+	blocked := filepath.Join(engine.handoffRetentionRoot(), HandoffRetentionRecordName(name))
+	if err := os.MkdirAll(filepath.Join(blocked, "occupied"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatalf("a receipt the filesystem refused failed the whole read: %v", err)
+	}
+	if len(first.Volumes) != 1 || first.Volumes[0].TerminalKnown {
+		t.Fatalf("first read = %+v, want one volume with no terminal time", first.Volumes)
+	}
+
+	// The filesystem recovers. No sweep, no restart -- the next accounting
+	// read is what repairs it.
+	if err := os.RemoveAll(blocked); err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Volumes) != 1 || !second.Volumes[0].TerminalKnown {
+		t.Fatalf("second read = %+v, want the receipt repaired without a sweep", second.Volumes)
+	}
+	if receipt := readHandoffReceipt(t, root, name); !receipt.TerminalAt.Equal(now) {
+		t.Fatalf("the repaired receipt = %+v, want the helper's own clock", receipt)
+	}
+}
+
+// The repair is create-only and skips a volume a live attempt holds: an
+// accounting read must not declare a run finished while it is still writing.
+func TestTheInventoryCallNeverStampsAVolumeALiveAttemptHolds(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	live, _ := makeHandoffVolume(t, root, "still-running")
+	idle, _ := makeHandoffVolume(t, root, "finished-without-a-receipt")
+	engine.attempts["live"] = &containerdAttempt{resources: ResourceIdentity{HandoffVolumeDirectory: live}}
+
+	if _, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if receiptPresent(t, root, live) {
+		t.Fatal("an accounting read stamped a terminal time on a volume a live attempt holds")
+	}
+	if !receiptPresent(t, root, idle) {
+		t.Fatal("an accounting read did not repair the volume no attempt holds")
+	}
+}
+
+// Reading is not deleting. Expiry belongs to the sweep and eviction to the
+// agent, so an accounting read may repair state but must never cost a node a
+// run's results.
+func TestTheInventoryCallRemovesNothing(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	expired, expiredPath := makeHandoffVolume(t, root, "long-expired")
+	stamp(t, engine, expired, now.Add(-2*time.Hour))
+	orphan := HandoffRetentionRecordName(handoffVolumeNamePrefix + strings.Repeat("d", 32))
+	if err := os.WriteFile(filepath.Join(engine.handoffRetentionRoot(), orphan), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(expiredPath); err != nil {
+		t.Fatalf("an accounting read removed an expired volume: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(engine.handoffRetentionRoot(), orphan)); err != nil {
+		t.Fatalf("an accounting read removed an orphan receipt: %v", err)
+	}
+}
+
+// `SweepResponse.removed` is the number of observed identities absent from the
+// final inventory. Taking that count before the last removal made a sweep that
+// had just expired a handoff volume and its receipt report that it had removed
+// nothing.
+//
+// The containerd half of the final inventory needs a real daemon; the handoff
+// half does not, so `observe` here is the same filesystem scan the engine's
+// own inventory performs over the managed-volume classes.
+func TestSweepCountsTheHandoffVolumeAndReceiptItExpiredLast(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	expired, expiredPath := makeHandoffVolume(t, root, "expired-at-sweep")
+	retained, _ := makeHandoffVolume(t, root, "still-retained")
+	stamp(t, engine, expired, now.Add(-2*time.Hour))
+	stamp(t, engine, retained, now.Add(-30*time.Minute))
+
+	observe := func() (ResourceInventory, error) {
+		observed := ResourceInventory{}
+		return observed, inventoryManagedVolumeResources(root, &observed)
+	}
+	observed, err := observe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observed.ManagedVolumes) != 2 || len(observed.HandoffRetentionRecords) != 2 {
+		t.Fatalf("the fixture observed %+v", observed)
+	}
+
+	removed, err := engine.reconcileHandoffsThenCountRemoved(t.Context(), now, observed, quiescent(), observe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(expiredPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the expired volume survived the sweep: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("sweep reported %d identities removed, want the expired volume and its receipt", removed)
+	}
+	if !receiptPresent(t, root, retained) {
+		t.Fatal("the retained volume's receipt was counted away with the expired one")
 	}
 }

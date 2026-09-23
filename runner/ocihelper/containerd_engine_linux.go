@@ -122,6 +122,7 @@ type ContainerdEngine struct {
 	handoffMeasureDescend       func(string, string) // a test replaces a child between its stat and its open
 	handoffMeasureEntryBudget   int64                // a test proves the entry bound without planting a million files
 	handoffMeasureOpenBudget    int64                // a test proves the open bound without planting a million directories
+	handoffInventoryBytes       int                  // a test proves the response byte bound without building a megabyte of fixture
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -2616,7 +2617,6 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
 	response.DurableRetentions = append(logRetentions, cgroupRetentions...)
 	response.Evidence = append(computerNetworkEvidence, computerDiskEvidence...)
@@ -2625,15 +2625,36 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
 		return SweepResponse{}, err
 	}
-	// Last, and only here. Every surviving task and container has been reaped
-	// above, and the ownership records of attempts this node has proved
-	// quiescent have just been removed -- so what remains in that root is
-	// exactly the set of runs nothing here may call finished. Stamping a
-	// terminal time before that proof is how a helper that restarted over a
-	// still-running workload would have declared its results final while it
-	// was still writing them.
-	engine.reconcileHandoffRetention(ctx, engine.handoffNow(), remaining)
+	response.Removed, err = engine.reconcileHandoffsThenCountRemoved(ctx, engine.handoffNow(), observedInventory, remaining,
+		func() (ResourceInventory, error) { return engine.inventory(ctx) })
+	if err != nil {
+		return SweepResponse{}, err
+	}
 	return response, nil
+}
+
+// reconcileHandoffsThenCountRemoved is the sweep's last two steps, and their
+// order is the whole point.
+//
+// Handoff reconciliation runs last of all: every surviving task and container
+// has been reaped above, and the ownership records of attempts this node has
+// proved quiescent have just been removed, so what remains in that root is
+// exactly the set of runs nothing may call finished. Stamping a terminal time
+// before that proof is how a helper that restarted over a still-running
+// workload would have declared its results final while it was still writing
+// them.
+//
+// The count then comes after it. `removed` is the number of observed
+// identities absent from the *final* inventory, so taking it before the last
+// removal made a sweep that had just expired a handoff volume and its receipt
+// report that it had removed nothing.
+func (engine *ContainerdEngine) reconcileHandoffsThenCountRemoved(ctx context.Context, now time.Time, observed, remaining ResourceInventory, observe func() (ResourceInventory, error)) (int, error) {
+	engine.reconcileHandoffRetention(ctx, now, remaining)
+	final, err := observe()
+	if err != nil {
+		return 0, err
+	}
+	return inventoryCount(subtractResourceInventory(observed, final)), nil
 }
 
 func (engine *ContainerdEngine) sweepImageSpools() error {

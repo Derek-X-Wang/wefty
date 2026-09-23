@@ -233,6 +233,15 @@ func (engine *ContainerdEngine) readHandoffRetentionFact(name string) (handoffRe
 	return fact, nil
 }
 
+// handoffInventoryByteBudget is a method so a test can prove the bound without
+// building a megabyte of fixture, the way the measurement budgets are.
+func (engine *ContainerdEngine) handoffInventoryByteBudget() int {
+	if engine.handoffInventoryBytes > 0 {
+		return engine.handoffInventoryBytes
+	}
+	return MaxFrameBytes - handoffInventoryFrameHeadroom
+}
+
 func (engine *ContainerdEngine) handoffRetentionPath(volume string) string {
 	return filepath.Join(engine.handoffRetentionRoot(), HandoffRetentionRecordName(volume))
 }
@@ -379,21 +388,42 @@ func (engine *ContainerdEngine) reconcileHandoffRetention(ctx context.Context, n
 		log.Printf("handoff retention: %d runtime resource(s) survived the sweep, so no handoff volume is stamped or expired this pass", surviving)
 		return
 	}
-	names, err := engine.handoffVolumeNames()
-	if err != nil {
-		log.Printf("handoff retention: read the handoff root: %v", err)
+	names, live, ok := engine.repairMissingHandoffRetentionReceipts(ctx, now)
+	if !ok {
 		return
 	}
-	live, err := engine.liveHandoffVolumes()
-	if err != nil {
-		log.Printf("handoff retention: read durable attempt ownership: %v", err)
-		return
-	}
-	engine.stampMissingHandoffRetentionReceipts(ctx, now, names, live)
 	engine.cleanupExpiredHandoffs(now, names, live)
 	if err := engine.removeOrphanHandoffRetentionReceipts(names); err != nil {
 		log.Printf("handoff retention: remove receipts whose volume is gone: %v", err)
 	}
+}
+
+// repairMissingHandoffRetentionReceipts is the stamping half on its own, and
+// it is separate because it has a second caller that deletes nothing.
+//
+// A receipt the filesystem refused used to wait for another boot: the sweep
+// was the only thing that stamped, so a node that filled up mid-run kept the
+// affected volumes non-expirable until somebody restarted the helper. The
+// agent's hourly accounting read now runs this first, so the repair happens on
+// the same schedule as the reading of it. Nothing here removes anything --
+// expiry belongs to the sweep, and budget eviction to the agent -- so a read
+// can never cost a node a run's results.
+//
+// It returns the volume names and the live set it computed, so the sweep's
+// remaining work uses exactly the observation this pass acted on.
+func (engine *ContainerdEngine) repairMissingHandoffRetentionReceipts(ctx context.Context, now time.Time) ([]string, map[string]struct{}, bool) {
+	names, err := engine.handoffVolumeNames()
+	if err != nil {
+		log.Printf("handoff retention: read the handoff root: %v", err)
+		return nil, nil, false
+	}
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		log.Printf("handoff retention: read durable attempt ownership: %v", err)
+		return nil, nil, false
+	}
+	engine.stampMissingHandoffRetentionReceipts(ctx, now, names, live)
+	return names, live, true
 }
 
 // stampMissingHandoffRetentionReceipts converts crash residue into accounted,
@@ -419,12 +449,31 @@ func (engine *ContainerdEngine) stampMissingHandoffRetentionReceipts(ctx context
 			}
 			continue
 		}
-		if fact.terminalKnown {
+		if fact.terminalKnown || !handoffReceiptGapIsStructural(fact.anomaly) {
+			// An operational read failure may clear on its own, and a receipt
+			// that cannot be read may still be a valid one. Writing over it
+			// would destroy a terminal time this node had already recorded, so
+			// only a gap that can never resolve itself is filled here: no
+			// receipt at all, one that is not a version-1 receipt, or one
+			// bound to a directory that no longer stands at this name. This is
+			// the structural/operational split the recovery table already
+			// makes for durable records.
 			continue
 		}
 		if err := engine.stampOneHandoffRetentionReceipt(ctx, name, now, budget); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Printf("handoff retention: stamp a terminal time on %s: %v (it keeps its files and the next sweep tries again)", name, err)
 		}
+	}
+}
+
+// handoffReceiptGapIsStructural reports whether a missing terminal time is one
+// that will never appear by itself.
+func handoffReceiptGapIsStructural(anomaly HandoffVolumeAnomaly) bool {
+	switch anomaly {
+	case HandoffAnomalyNoReceipt, HandoffAnomalyReceiptInvalid, HandoffAnomalyReceiptMismatched:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -549,18 +598,21 @@ func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time, names []st
 // that as a lost session -- so a node with enough retained results would have
 // lost its runtime every time it tried to count them.
 func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ InventoryHandoffVolumesRequest) (InventoryHandoffVolumesResponse, error) {
-	names, err := engine.handoffVolumeNames()
-	if err != nil {
-		return InventoryHandoffVolumesResponse{}, err
+	// Repair before reporting. The boot sweep used to be the only thing that
+	// stamped a missing receipt, so a receipt the filesystem refused stayed
+	// missing until somebody restarted the helper -- and a volume with no
+	// receipt is one the node can never expire. The agent reads this on its
+	// hourly accounting pass, which is the right cadence for the repair too.
+	// This is create-only, skips volumes a live attempt holds, and removes
+	// nothing at all: expiry is the sweep's and eviction is the agent's.
+	names, live, ok := engine.repairMissingHandoffRetentionReceipts(ctx, engine.handoffNow())
+	if !ok {
+		return InventoryHandoffVolumesResponse{}, errors.New("the handoff root could not be read")
 	}
 	response := InventoryHandoffVolumesResponse{Volumes: make([]RetainedHandoffVolume, 0, len(names))}
 	if len(names) > MaxInventoriedHandoffVolumes {
 		names = names[:MaxInventoriedHandoffVolumes]
 		response.Exhausted = true
-	}
-	live, err := engine.liveHandoffVolumes()
-	if err != nil {
-		return InventoryHandoffVolumesResponse{}, err
 	}
 	seen := make(map[handoffInodeIdentity]struct{})
 	budget := engine.newHandoffMeasureBudget()
@@ -578,7 +630,7 @@ func (engine *ContainerdEngine) InventoryHandoffVolumes(ctx context.Context, _ I
 		if err != nil {
 			return InventoryHandoffVolumesResponse{}, err
 		}
-		if encoded+len(size)+1 > MaxFrameBytes-handoffInventoryFrameHeadroom {
+		if encoded+len(size)+1 > engine.handoffInventoryByteBudget() {
 			response.Exhausted = true
 			break
 		}
