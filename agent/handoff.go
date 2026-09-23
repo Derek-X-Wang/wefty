@@ -26,6 +26,14 @@ const (
 	// maxHandoffMarkerBytes bounds the advisory ownership marker read at
 	// preparation. It is a handful of fields; anything larger is not one.
 	maxHandoffMarkerBytes = 8 << 10
+
+	// handoffRemovalExpired and handoffRemovalOverBudget are the two reasons a
+	// node gives a run's retained results up, and they are distinct words
+	// because they mean different things to whoever is reading the log: the
+	// first is the schedule everyone was told about, the second is the node
+	// beating that schedule because it is too full.
+	handoffRemovalExpired    = "its retention window ran out"
+	handoffRemovalOverBudget = "the node is over its retained-results budget"
 )
 
 type handoffManager struct {
@@ -47,21 +55,29 @@ type handoffManager struct {
 	// runBytes is a field rather than a direct constant read so a test can
 	// prove the bound without writing 64 MiB.
 	runBytes int64
-	now      func() time.Time
-	logf     func(string, ...any)
+	// nodeBytes is the whole node's budget across both handoff roots, and is a
+	// field for the same reason runBytes is: a test proves the eviction order
+	// without writing a gigabyte.
+	nodeBytes int64
+	now       func() time.Time
+	logf      func(string, ...any)
 	// observeAccounting publishes each accounting pass's figures onto the
 	// agent's status projection. It is a hook rather than a direct call
 	// because retention is filesystem work and the observer is session state;
-	// nothing here should have to know which. Nothing reads the figures yet
-	// beyond the log line and that projection -- the node budget that will is
-	// a later slice of #494.
+	// nothing here should have to know which. The budget pass reads the same
+	// figures directly, on the pass that produced them.
 	observeAccounting func(RetainedResultsStatus)
 	// ociHandoffs reads the node's second handoff root, which belongs to the
 	// OCI helper and which this agent cannot stat: on a Mac node the helper
-	// runs inside a Lima VM. It is nil on a node with no OCI runtime. Read
-	// only in this slice -- the accounting pass reports what it finds and
-	// nothing acts on it yet.
+	// runs inside a Lima VM. It is nil on a node with no OCI runtime.
 	ociHandoffs workloadrunner.RetainedHandoffInventory
+	// ociEvictor gives one volume in that second root up when the node is over
+	// its budget. It is separate from the inventory above because that one
+	// only reads, and because the node must be able to ask for a deletion it
+	// cannot perform itself. Nil on a node with no OCI runtime, and on one
+	// whose runtime reports volumes it cannot be asked to remove -- which the
+	// budget pass says out loud rather than silently failing to converge.
+	ociEvictor workloadrunner.RetainedHandoffEvictor
 
 	mu    sync.Mutex
 	paths map[string]*handoffPathLock
@@ -137,8 +153,8 @@ func newHandoffManager(root, stateRoot, nodeID string, retention time.Duration, 
 		root: filepath.Clean(root), ledgerRoot: filepath.Clean(contract.DefaultHandoffRoot),
 		stateRoot: strings.TrimSpace(stateRoot),
 		nodeID:    strings.TrimSpace(nodeID), retention: retention,
-		runBytes: contract.MaxRetainedResultBytes,
-		now:      time.Now, logf: logf,
+		runBytes: contract.MaxRetainedResultBytes, nodeBytes: contract.MaxRetainedResultNodeBytes,
+		now: time.Now, logf: logf,
 		paths: make(map[string]*handoffPathLock),
 	}
 }
@@ -205,7 +221,7 @@ var errUnmanagedHandoffDirectory = errors.New("handoff directory is not one this
 // the name a run's directory should be at holds something else -- a symlink, a
 // FIFO, a regular file. Every other failure the sweep meets can clear on its
 // own, so this is the only class it is allowed to stop retrying (see
-// noteExpiryFailure), and it is a sentinel rather than a string match because
+// noteRemovalFailure), and it is a sentinel rather than a string match because
 // "stop sweeping this run" is too consequential a decision to key off wording.
 var errHandoffNameNotADirectory = errors.New("handoff name is not a directory")
 
@@ -456,7 +472,7 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 // inode with no links, removed nothing, reported no error, and the files that
 // should have been bounded stayed on the node while the node believed they fit.
 // Every byte of that run is then mischarged for as long as it is retained,
-// which is exactly the number #494's node budget is about to be built on.
+// which is exactly the number the node budget is built on.
 //
 // Neither directory is trimmed on a mismatch. Not the replacement: the only
 // thing that could prove a directory that appeared after preparation is this
@@ -703,7 +719,7 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 // A record whose directory it cannot remove is retried for as long as the
 // failure can clear on its own. The one class that cannot -- the run's name
 // holds something that is not a directory -- pauses after a few identical
-// refusals (noteExpiryFailure) and resumes by itself the moment a directory is
+// refusals (noteRemovalFailure) and resumes by itself the moment a directory is
 // back there (liftQuarantine). Neither ever widens what the sweep is willing to
 // delete.
 func (m *handoffManager) collect() error {
@@ -774,9 +790,9 @@ func (m *handoffManager) expireRun(root *os.Root, record retentionRecord, now ti
 	if record.RetainUntil.IsZero() || now.Before(record.RetainUntil) {
 		return
 	}
-	removed, err := m.removeExpiredRun(root, record, lease)
+	removed, err := m.removeRetainedRun(root, record, lease, handoffRemovalExpired)
 	if err != nil {
-		m.noteExpiryFailure(record, err)
+		m.noteRemovalFailure(record, err)
 		return
 	}
 	if removed {
@@ -820,8 +836,15 @@ func (m *handoffManager) liftQuarantine(root *os.Root, record retentionRecord) (
 	return lifted, true
 }
 
-// noteExpiryFailure records that this sweep could not remove one run, and
-// bounds the retry only for the class of failure that repeating cannot fix.
+// noteRemovalFailure records that a pass could not remove one run's retained
+// results, and bounds the retry only for the class of failure that repeating
+// cannot fix.
+//
+// Both passes that remove reach it -- the sweep when a window has run out, and
+// the budget when the node is too full -- because the failures are the same
+// failures and the record's counters are about "this could not be removed",
+// not about which pass tried. The wording below says "remove" rather than
+// "expire" for that reason.
 //
 // A workload that replaces its own expired run name with a symlink used to buy
 // itself an unbounded retry: the sweep refuses to follow the link, logs the
@@ -837,7 +860,7 @@ func (m *handoffManager) liftQuarantine(root *os.Root, record retentionRecord) (
 // attempt's own finalization can trigger back to back, in minutes -- must not
 // end the seven-day sweep for that run. The count is still persisted, so being
 // stuck is visible even while the sweep keeps trying.
-func (m *handoffManager) noteExpiryFailure(record retentionRecord, cause error) {
+func (m *handoffManager) noteRemovalFailure(record retentionRecord, cause error) {
 	if handoffSweepRace != nil {
 		handoffSweepRace(handoffSweepFailureRecorded, record)
 	}
@@ -852,13 +875,13 @@ func (m *handoffManager) noteExpiryFailure(record retentionRecord, cause error) 
 		updated.Quarantine = handoffExpiryNameNotADirectory
 		updated.QuarantineDetail = boundedQuarantineDetail(cause)
 		updated.QuarantinedAt = m.now().UTC()
-		m.log("agent: remove expired results for run %s: %v; %d sweeps have found the same shape at %q, so the sweep pauses on it and the name is left exactly as it is until a directory is back there",
+		m.log("agent: remove run %s's retained results: %v; %d passes have found the same shape at %q, so removal pauses on it and the name is left exactly as it is until a directory is back there",
 			record.RunID, cause, updated.StructuralRefusals, record.Directory)
 	case structural:
-		m.log("agent: remove expired results for run %s: %v (%d of %d before the sweep pauses on it)",
+		m.log("agent: remove run %s's retained results: %v (%d of %d before removal pauses on it)",
 			record.RunID, cause, updated.StructuralRefusals, maxStructuralRefusals)
 	default:
-		m.log("agent: remove expired results for run %s: %v (%d consecutive failures; the sweep will try again)",
+		m.log("agent: remove run %s's retained results: %v (%d consecutive failures; the next pass will try again)",
 			record.RunID, cause, updated.ExpiryFailures)
 	}
 	m.rewriteRecord(record, updated)
@@ -979,12 +1002,18 @@ func (m *handoffManager) tryCollectLease(path string) *handoffLease {
 	return lease
 }
 
-// removeExpiredRun deletes one expired run. Its caller holds the record's path
-// lease for the whole call and for the failure accounting afterwards, and it
-// re-checks that no attempt holds the path while that lease is held. Selecting
-// candidates and then deleting them without it would let an attempt claim the
-// path in between and lose its directory to a sweep that decided earlier.
-func (m *handoffManager) removeExpiredRun(root *os.Root, record retentionRecord, lease *handoffLease) (bool, error) {
+// removeRetainedRun deletes one run's retained results. Its caller holds the
+// record's path lease for the whole call and for the failure accounting
+// afterwards, and it re-checks that no attempt holds the path while that lease
+// is held. Selecting candidates and then deleting them without it would let an
+// attempt claim the path in between and lose its directory to a sweep that
+// decided earlier.
+//
+// `because` is why this run is being given up, and it is a caller's word
+// rather than a fixed one because there are now two reasons: the run's
+// retention window ran out, or the node is over its budget and gave this run
+// up early. A person reading the log is owed the difference.
+func (m *handoffManager) removeRetainedRun(root *os.Root, record retentionRecord, lease *handoffLease, because string) (bool, error) {
 	run, err := openHandoffDirectory(root, record.RunID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, m.removeRecord(record.RunID)
@@ -997,20 +1026,20 @@ func (m *handoffManager) removeExpiredRun(root *os.Root, record retentionRecord,
 	if err != nil {
 		return false, err
 	}
-	m.log("agent: removing expired results for run %s", record.RunID)
+	m.log("agent: removing run %s's retained results: %s", record.RunID, because)
 	// Recheck ownership and directory identity immediately before deleting.
 	m.mu.Lock()
 	owned := lease.pathLock.owner == lease && m.paths[record.Directory] == lease.pathLock
 	m.mu.Unlock()
 	if !owned {
-		return false, errors.New("expired handoff lost collector ownership")
+		return false, errors.New("the collector lost ownership of this run's handoff path")
 	}
 	current, err := root.Lstat(record.RunID)
 	if err != nil {
 		return false, err
 	}
 	if !os.SameFile(expected, current) {
-		return false, errors.New("expired handoff changed directory identity")
+		return false, errors.New("this run's handoff directory changed identity")
 	}
 	directory, err := run.Open(".")
 	if err != nil {
@@ -1031,7 +1060,7 @@ func (m *handoffManager) removeExpiredRun(root *os.Root, record retentionRecord,
 		return false, err
 	}
 	if !os.SameFile(expected, current) {
-		return false, errors.New("expired handoff changed directory identity")
+		return false, errors.New("this run's handoff directory changed identity")
 	}
 	if err := root.Remove(record.RunID); err != nil {
 		return false, err

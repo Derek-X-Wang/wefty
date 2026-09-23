@@ -795,7 +795,7 @@ func TestATransientExpiryFailureIsNeverQuarantined(t *testing.T) {
 		// regains. None of them is the one structural refusal repeating cannot
 		// fix, so none of them may ever stop the sweep.
 		for sweep := 1; sweep <= maxStructuralRefusals+2; sweep++ {
-			harness.manager.noteExpiryFailure(record, fmt.Errorf("remove run_busy: %w", errors.New("device or resource busy")))
+			harness.manager.noteRemovalFailure(record, fmt.Errorf("remove run_busy: %w", errors.New("device or resource busy")))
 			record = requireRetentionRecord(t, harness.manager, "run_busy")
 			if record.Quarantine != "" {
 				t.Fatalf("a transient failure paused the sweep after %d of them: %+v", sweep, record)
@@ -807,7 +807,7 @@ func TestATransientExpiryFailureIsNeverQuarantined(t *testing.T) {
 				t.Fatalf("after %d failures the record counts %d", sweep, record.ExpiryFailures)
 			}
 		}
-		if !harness.logged("the sweep will try again") {
+		if !harness.logged("the next pass will try again") {
 			t.Fatalf("a retryable failure was not reported as one: %v", harness.logs)
 		}
 

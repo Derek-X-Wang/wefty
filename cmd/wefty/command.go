@@ -188,8 +188,10 @@ func observeUploadedResult(results *runResults, result l3.RunResult, err error) 
 // resultsNote says what the block's two halves mean, including the case the
 // ledger cannot describe: a node that could not upload at all leaves no row,
 // so absence here is not proof the run produced nothing.
-const resultsNote = "files are scheduled under the default retention window;" +
-	" an uploaded result document is read with `wefty results`." +
+const resultsNote = "files are scheduled under the default retention window," +
+	" which is a schedule rather than a guarantee: a node over its" +
+	" retained-results budget gives files up earlier, published runs first." +
+	" An uploaded result document is read with `wefty results` either way." +
 	" A run with no result here either wrote none or could not upload one;" +
 	" the node that ran it records which, beside its retained files"
 

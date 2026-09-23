@@ -632,9 +632,9 @@ func handoffLogicalBytes(info os.FileInfo, seen map[handoffInode]struct{}) int64
 // measureNode is the accounting pass: what this node is holding in retained
 // results, in both units, across every run it has a record for.
 //
-// It enforces nothing. There is no node budget here and nothing is evicted;
-// this slice's whole job is that the figure a budget will need exists, is
-// right, and is visible before anything acts on it.
+// It enforces nothing itself. What the node gives up is decided by the budget
+// pass over both roots (handoff_budget.go) on the figures this produces; this
+// one only has to be right, and to be right before anything acts on it.
 //
 // Every record is measured, including a quarantined one. Quarantine means "the
 // sweep cannot safely delete this", which is the opposite of a reason to stop
@@ -701,11 +701,11 @@ func (m *handoffManager) measureNode(ctx context.Context, root *os.Root, now tim
 		status.Entries += tally.entries
 		status.Replaced += tally.replaced + tally.vanished
 		status.Truncated += tally.truncated
-		// One row per run, in memory and nowhere else. The node budget the
-		// next slice enforces has to choose *which* run to give up, and
-		// choosing needs each run's own figure -- but a figure that moves with
-		// the files does not belong on the record, which is authority to
-		// delete and has to stay what an attempt wrote.
+		// One row per run, in memory and nowhere else. The node budget has to
+		// choose *which* run to give up, and choosing needs each run's own
+		// figure -- but a figure that moves with the files does not belong on
+		// the record, which is authority to delete and has to stay what an
+		// attempt wrote.
 		status.PerRun = append(status.PerRun, RetainedRunFigures{
 			RunID: record.RunID, Entries: tally.entries,
 			LogicalBytes: tally.logical, ChargedBytes: tally.charged,
@@ -767,6 +767,11 @@ func (m *handoffManager) accountNode(ctx context.Context) error {
 	status := m.measureNode(ctx, root, m.now().UTC())
 	status.OCI = m.measureOCIHandoffs(ctx)
 	m.reportNodeAccounting(status)
+	// And then, on the same pass and the same goroutine, the node budget acts
+	// on those figures. It is here rather than in collect() because eviction
+	// needs a measurement and measuring a workload's tree must never sit in
+	// front of an attempt's finalization.
+	m.enforceNodeBudget(ctx, root, status)
 	return nil
 }
 
@@ -782,8 +787,8 @@ func (m *handoffManager) reportNodeAccounting(status RetainedResultsStatus) {
 		status.Runs, status.InFlight, status.LogicalBytes, status.ChargedBytes, status.Entries,
 		status.QuarantinedRecords, status.Truncated, status.Replaced, status.Unrecorded, m.root)
 	if status.OCI != nil {
-		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live), %d logical bytes, %d deduped bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d measured incompletely, whose figures are a floor; %d carrying a name no run of this node derives; %d result(s) whose removal is authorized and not yet finished freeing, whose bytes are in none of those figures%s",
-			status.OCI.Volumes, status.OCI.Live, status.OCI.LogicalBytes, status.OCI.DedupedBytes, status.OCI.Entries,
+		m.log("agent: retained results in this node's OCI handoff root: %d volume(s) (%d still live), %d logical bytes, %d deduped bytes, %d charged bytes across %d entries; %d without a helper-owned terminal time (never expired on a workload-writable one); %d with an anomaly; %d measured incompletely, whose figures are a floor; %d carrying a name no run of this node derives; %d result(s) whose removal is authorized and not yet finished freeing, whose bytes are in none of those figures and which the budget treats as already reclaimed%s",
+			status.OCI.Volumes, status.OCI.Live, status.OCI.LogicalBytes, status.OCI.DedupedBytes, status.OCI.ChargedBytes, status.OCI.Entries,
 			status.OCI.TerminalUnknown, status.OCI.Anomalies, status.OCI.Truncated, status.OCI.Unattributable, status.OCI.DetachedTrees,
 			map[bool]string{true: "; the helper holds more than it reported, so these are a floor"}[status.OCI.Exhausted])
 	}
@@ -1076,17 +1081,18 @@ func (m *handoffManager) adoptedDeadline(marker handoffMarker, valid bool) func(
 // measureOCIHandoffs reads the node's second handoff root -- the OCI helper's
 // own -- and turns it into the same kind of figure the process root reports.
 //
-// It is a read and only a read in this slice. Nothing is expired here and
-// nothing is evicted: the node budget that will act on both roots is a later
-// slice, and this exists so that when it arrives the figures it needs are
-// already there and already right.
+// It is a read and only a read. Nothing is expired here and nothing is
+// evicted; what acts on these figures is the budget pass (handoff_budget.go),
+// which decides over both roots at once.
 //
 // The agent cannot measure this root itself. On a Mac node the helper runs
 // inside a Lima VM, so the helper measures its own filesystem and the bytes
 // cross the runtime seam. What the agent still owns is the *policy*, and the
-// one fact it adds here is attribution: it derives the volume name each of its
-// own runs would have, so a reported name it cannot place is residue a crash
-// left behind rather than a run this node is accounting for.
+// two facts it adds here are the ones the helper cannot hold: attribution --
+// it derives the volume name each of its own runs would have, so a reported
+// name it cannot place is residue a crash left behind -- and publication,
+// which lives in this agent's own upload and retention records and is what an
+// eviction order has to read.
 func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIResultsStatus {
 	if m == nil || m.ociHandoffs == nil {
 		return nil
@@ -1099,13 +1105,16 @@ func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIRes
 		m.log("agent: read the OCI helper's retained handoff volumes: %v", err)
 		return nil
 	}
-	known := m.derivedHandoffVolumeNames()
+	known := m.derivedHandoffVolumes()
 	status := &RetainedOCIResultsStatus{Exhausted: report.Exhausted, DetachedTrees: report.DetachedTrees}
+	status.PerVolume = make([]RetainedOCIVolumeFigures, 0, len(report.Volumes))
 	for _, volume := range report.Volumes {
 		status.Volumes++
 		status.Entries += volume.Entries
 		status.LogicalBytes += volume.LogicalBytes
 		status.DedupedBytes += volume.DedupedBytes
+		charged := ociChargedBytes(volume.DedupedBytes, volume.Entries)
+		status.ChargedBytes += charged
 		if volume.Live {
 			status.Live++
 		}
@@ -1119,41 +1128,89 @@ func (m *handoffManager) measureOCIHandoffs(ctx context.Context) *RetainedOCIRes
 			status.Anomalies++
 			m.log("agent: the OCI helper's handoff volume %s: %s", volume.Name, strings.Join(volume.Anomalies, ", "))
 		}
-		if _, placed := known[volume.Name]; !placed {
+		attribution, placed := known[volume.Name]
+		if !placed {
 			status.Unattributable++
 		}
+		status.PerVolume = append(status.PerVolume, RetainedOCIVolumeFigures{
+			Name: volume.Name, OwnerKey: attribution.ownerKey,
+			Entries: volume.Entries, LogicalBytes: volume.LogicalBytes,
+			DedupedBytes: volume.DedupedBytes, ChargedBytes: charged,
+			TerminalAt: volume.TerminalAt, TerminalKnown: volume.TerminalKnown,
+			Live: volume.Live, Truncated: volume.Truncated,
+			Published: attribution.published,
+		})
 	}
 	return status
 }
 
-// derivedHandoffVolumeNames is every handoff volume name this node's own runs
-// would have.
+// ociChargedBytes is what one handoff volume costs the node budget.
 //
-// It is derived rather than remembered, and derived from two sources because
-// an OCI run has no retention record at all -- its directory is the helper's --
-// so the upload record, which every runtime writes, is the only place this
-// agent names such a run.
-func (m *handoffManager) derivedHandoffVolumeNames() map[string]struct{} {
-	names := make(map[string]struct{})
-	add := func(runID string) {
-		if strings.TrimSpace(runID) == "" {
+// The helper reports deduped bytes and an entry count; it does not report a
+// charged figure, and widening the wire to carry one would put a second number
+// on the node that could disagree with the first. So the node charges the
+// larger of the two things it can derive: the bytes themselves, and the 4 KiB
+// floor under every entry that is what makes a million empty files visible at
+// all. It is a floor on what the per-entry rule charges the agent's own root,
+// which is the honest direction to be wrong in for a bound that decides what a
+// node gives up.
+func ociChargedBytes(deduped, entries int64) int64 {
+	floor := entries * handoffChargedEntryFloor
+	if floor > deduped {
+		return floor
+	}
+	return deduped
+}
+
+// handoffVolumeAttribution is what this node knows about one handoff volume in
+// the helper's root that the helper does not: which of its own runs the name
+// belongs to, and whether that run's evidence reached the ledger.
+type handoffVolumeAttribution struct {
+	ownerKey  string
+	published bool
+}
+
+// derivedHandoffVolumes is every handoff volume name this node's own runs would
+// have, with the owner key it was derived from and what became of that run's
+// evidence.
+//
+// The names are derived rather than remembered, and derived from two sources
+// because an OCI run has no retention record at all -- its directory is the
+// helper's -- so the upload record, which every runtime writes, is the only
+// place this agent names such a run.
+//
+// Publication is joined here, on the agent's side, rather than carried on the
+// wire. The helper has no way to know it: publication is the mailbox drain
+// verdict and the result upload, both of which happen in this process. A
+// volume counts as published when either says so, and the two are OR-ed rather
+// than one preferred, because either one is evidence that reached a ledger and
+// eviction gives published results up first.
+func (m *handoffManager) derivedHandoffVolumes() map[string]handoffVolumeAttribution {
+	volumes := make(map[string]handoffVolumeAttribution)
+	add := func(ownerKey string, published bool) {
+		if strings.TrimSpace(ownerKey) == "" {
 			return
 		}
-		name, err := m.ociHandoffs.RetainedHandoffVolumeName(runID)
+		name, err := m.ociHandoffs.RetainedHandoffVolumeName(ownerKey)
 		if err != nil {
 			return
 		}
-		names[name] = struct{}{}
+		existing, known := volumes[name]
+		if known {
+			published = published || existing.published
+		}
+		volumes[name] = handoffVolumeAttribution{ownerKey: ownerKey, published: published}
 	}
 	for _, record := range m.loadRecords() {
 		// The owner key, not the run ID: a rerun pointed at a source run's
 		// results keeps that run's handoff volume, so naming the volume from
 		// the rerun would look for a directory that does not exist and report
 		// the one that does as residue a crash left behind.
-		add(record.handoffOwnerKey())
+		add(record.handoffOwnerKey(), record.Published)
 	}
 	for _, runID := range m.loadUploadRunIDs() {
-		add(runID)
+		record, found, err := m.readUploadRecord(runID)
+		add(runID, err == nil && found && record.Uploaded)
 	}
-	return names
+	return volumes
 }

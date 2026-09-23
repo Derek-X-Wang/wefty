@@ -73,7 +73,8 @@ const (
 // consumer name the same condition. Today the only consumers are the agent log
 // and the retention record's own JSON under the agent state root; nothing in
 // `wefty inspect`, the node doctor or the agent status surfaces reads it yet.
-// Reporting it is #494's later slices, and this type is what they will read.
+// Reporting it on one of those surfaces is still open, and this type is what
+// such a reader would read.
 type handoffRecordAnomaly string
 
 const (
@@ -174,8 +175,8 @@ type retentionRecord struct {
 	// never a permanent retirement, and it needs no operator to clear.
 	//
 	// It means "unsafe to delete", and only that. It is deliberately not a
-	// statement about accounting: these bytes are still on the node, and #494's
-	// node budget must keep charging them, or quarantine becomes a way to hide
+	// statement about accounting: these bytes are still on the node, and the
+	// node budget keeps charging them, or quarantine becomes a way to hide
 	// storage from the budget.
 	Quarantine handoffRecordAnomaly `json:"quarantine,omitempty"`
 	// QuarantineDetail is the last failure's own words, bounded. The typed

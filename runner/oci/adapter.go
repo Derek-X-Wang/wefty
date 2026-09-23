@@ -2513,6 +2513,36 @@ func (adapter *Adapter) RetainedHandoffVolumeName(ownerKey string) (string, erro
 	return ocihelper.DeterministicHandoffVolumeDirectory(ownerKey)
 }
 
+// EvictRetainedHandoff gives one retained handoff volume up because the node is
+// over its retained-results budget.
+//
+// It is the handoff arm of `DeleteManagedVolume` and nothing more: one owner
+// key in, one helper-derived identity removed, success only after the helper
+// has separately verified that the volume and its retention receipt are both
+// absent. No path and no volume name crosses in this direction either, which
+// is what keeps the agent able to evict only the volumes it can already name.
+func (adapter *Adapter) EvictRetainedHandoff(ctx context.Context, ownerKey string) error {
+	if adapter == nil || adapter.sessions == nil {
+		return errors.New("OCI helper session is not configured")
+	}
+	if strings.TrimSpace(ownerKey) == "" {
+		return errors.New("a retained handoff volume is evicted by its owner key")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return err
+	}
+	response, err := deleteManagedVolumeWithRecovery(ctx, session,
+		ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: ownerKey})
+	if err != nil {
+		return err
+	}
+	if !response.Deleted {
+		return errors.New("OCI helper did not positively verify the retained handoff volume's removal")
+	}
+	return nil
+}
+
 func (adapter *Adapter) runMailboxRequest(reference workloadrunner.RunMailboxReference) (*ocihelper.Session, ocihelper.RunMailboxReference, error) {
 	if adapter == nil || adapter.sessions == nil {
 		return nil, ocihelper.RunMailboxReference{}, errors.New("OCI helper session is not configured")

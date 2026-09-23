@@ -64,9 +64,9 @@ type AttemptStatus struct {
 }
 
 // RetainedResultsStatus is what the last accounting pass found in this node's
-// process handoff root. It is a measurement and not a budget: nothing enforces
-// any of these figures yet, and this slice of #494 deliberately stops at making
-// them exist and be right.
+// process handoff root, together with what the OCI helper reported about its
+// own. It is the measurement the node budget is enforced on, and the figures
+// below are what an operator sees whether or not anything was given up.
 //
 // Both byte figures are reported because they answer different questions.
 // LogicalBytes is what the files hold and what trimming one would recover, with
@@ -119,8 +119,9 @@ type RetainedResultsStatus struct {
 }
 
 // RetainedOCIResultsStatus is the helper's handoff root as the last pass read
-// it. Nothing here is enforced in this slice; it is made to exist and be
-// right, the way the process root's figures were.
+// it. Its charged bytes are counted against the same node budget the process
+// root's are, because one node's retained results are one figure however many
+// filesystems they are spread over.
 type RetainedOCIResultsStatus struct {
 	// Volumes counts every handoff volume the helper still holds, Live how
 	// many of those an attempt is still writing into, and Unattributable how
@@ -132,6 +133,15 @@ type RetainedOCIResultsStatus struct {
 	Entries        int64 `json:"entries"`
 	LogicalBytes   int64 `json:"logical_bytes"`
 	DedupedBytes   int64 `json:"deduped_bytes"`
+	// ChargedBytes is what these volumes cost the node budget, in the same
+	// unit the process root's figure uses. The helper reports deduped bytes
+	// and an entry count rather than a charged figure, so the node charges a
+	// volume the larger of its deduped bytes and 4 KiB per entry. That is a
+	// floor on what the per-entry rule would charge -- a volume mixing one
+	// large file with many tiny ones is charged less here than the same tree
+	// under the agent's own root -- and it is deliberately not a second number
+	// on the wire that could disagree with the first.
+	ChargedBytes int64 `json:"charged_bytes"`
 	// TerminalUnknown counts the volumes with no helper-owned terminal time.
 	// Their age comes from a timestamp the workload could have written, so
 	// they are reported and never expired on.
@@ -148,8 +158,42 @@ type RetainedOCIResultsStatus struct {
 	Exhausted bool `json:"exhausted,omitempty"`
 	// DetachedTrees counts results whose removal was authorized and has not
 	// finished freeing. Their bytes are on the node and are in none of the
-	// figures above, because a detached tree is nobody's volume.
+	// figures above, because a detached tree is nobody's volume. The node
+	// budget treats them as already reclaimed for the same reason: their
+	// removal is already authorized, nothing the budget could decide would
+	// change it, and the next pass over the helper's root finishes them.
 	DetachedTrees int `json:"detached_trees,omitempty"`
+	// PerVolume is each volume's own share of the figures above, together with
+	// what the node knows about it that the helper does not: which of its own
+	// runs the name belongs to, and whether that run's evidence reached the
+	// ledger. It is what choosing a volume to give up needs, and it lives here
+	// and nowhere durable, exactly as the process root's per-run figures do.
+	PerVolume []RetainedOCIVolumeFigures `json:"per_volume,omitempty"`
+}
+
+// RetainedOCIVolumeFigures is one handoff volume as the last pass read it,
+// joined to the node's own record of the run it belongs to.
+//
+// OwnerKey is empty for a volume whose name no run of this node derives. That
+// is the crash-residue signal, and it is also the reason such a volume is
+// never evicted: the only way to ask the helper to remove one is by the owner
+// key the node cannot produce.
+type RetainedOCIVolumeFigures struct {
+	Name          string    `json:"name"`
+	OwnerKey      string    `json:"owner_key,omitempty"`
+	Entries       int64     `json:"entries"`
+	LogicalBytes  int64     `json:"logical_bytes"`
+	DedupedBytes  int64     `json:"deduped_bytes"`
+	ChargedBytes  int64     `json:"charged_bytes"`
+	TerminalAt    time.Time `json:"terminal_at,omitempty"`
+	TerminalKnown bool      `json:"terminal_known,omitempty"`
+	Live          bool      `json:"live,omitempty"`
+	Truncated     bool      `json:"truncated,omitempty"`
+	// Published is the node's own record that this run's evidence reached the
+	// ledger. For an OCI run that is the result upload, which is the only
+	// place this agent names such a run at all: the handoff volume is the
+	// helper's and carries no retention record.
+	Published bool `json:"published,omitempty"`
 }
 
 // RetainedRunFigures is one run's share of a pass.

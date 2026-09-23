@@ -1079,10 +1079,22 @@ narrow
 `service_data`. It derives exactly one helper-owned identity, removes only that
 volume (and, for service data, its paired owner record), and returns success
 only after separate absence checks. The service-data arm is called during Job
-removal. **The handoff arm has no agent caller in this slice**: a handoff
+removal. **The handoff arm is the node agent's budget eviction**: a handoff
 volume is removed by the helper's own sweep when its retention window has run
-out, and the arm exists for the agent-driven budget eviction a later slice of
-#494 supplies. Neither arm grants general path deletion authority. Deleting a
+out, and by this arm when the node is over the one retained-results budget it
+holds across both of its handoff roots and gives a run's results up before that
+window closes (`run-execution-context.md`, "Results and their retention"). The
+agent calls it on its own accounting pass, never on an attempt's finalization,
+and only for a volume it can already name: the owner key is the only identity
+this operation accepts and no owner key crosses the inventory boundary, so a
+volume whose name the agent cannot derive from its own records is one it cannot
+ask to have removed, and is left to the sweep. Whether an attempt is still
+writing into a volume is the helper's fact, not the agent's: the agent never
+selects a volume this root reported `live`, and it re-reads that fact on every
+remeasure, which leaves the same window between reading liveness and deleting
+on it that the helper's own sweep has. This arm itself checks nothing about
+liveness, for either caller.
+Neither arm grants general path deletion authority. Deleting a
 handoff volume removes its retention receipt with it. Under one hold of the
 helper's retention lock the volume is detached from its name first and the
 receipt unlinked second, so a concurrent accounting repair, which reopens the

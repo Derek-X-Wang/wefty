@@ -586,6 +586,23 @@ type RetainedHandoffInventory interface {
 	RetainedHandoffVolumeName(ownerKey string) (string, error)
 }
 
+// RetainedHandoffEvictor gives up one retained handoff volume because the node
+// is over its retained-results budget, before that volume's retention window
+// has run out.
+//
+// It is separate from the inventory beside it because that one is a read and
+// this one destroys a run's results, and separate from
+// ManagedVolumeFinalizer because that one acts on a completion the ledger
+// accepted and this one acts on a node that is too full.
+//
+// The volume is named by its owner key rather than by the name the inventory
+// reported, which is what confines this to volumes the node can already
+// account for: the agent derives the name from its own records, so a volume
+// whose name it cannot derive is one it cannot ask to have removed either.
+type RetainedHandoffEvictor interface {
+	EvictRetainedHandoff(ctx context.Context, ownerKey string) error
+}
+
 // RetainedHandoffReport is one runtime's answer. Exhausted says the runtime
 // holds more volumes than it returned, so these figures are a floor.
 type RetainedHandoffReport struct {

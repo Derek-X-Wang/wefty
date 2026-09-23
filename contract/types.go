@@ -84,6 +84,25 @@ const (
 	// for -- and loses the rest with a logged reason.
 	MaxRetainedResultBytes int64 = 64 << 20
 
+	// MaxRetainedResultNodeBytes bounds everything one node holds in retained
+	// results, across both handoff roots -- the process directories the agent
+	// owns and the handoff volumes the OCI helper owns. Past it the node gives
+	// results up before their window runs out, published ones first.
+	//
+	// It is one contract value for every node, and for the same reason as the
+	// retention window beside it: a person reading `wefty inspect` has to know
+	// when their results stop existing, and the only honest way to tell them
+	// without asking the node is for the rule to be the same everywhere. A
+	// 1 TB workstation and a small cloud node are not alike, and an operator
+	// override is a later ticket if a real node needs one -- not a number a
+	// reader has to go and look up per node.
+	//
+	// The unit is charged bytes, not logical bytes: the per-run bound trims
+	// names and must count what trimming recovers, while a node runs out of
+	// inodes and directory-read time as well as disk, so every directory entry
+	// costs the node figure at least 4 KiB.
+	MaxRetainedResultNodeBytes int64 = 1 << 30
+
 	// LabelRunParams carries a dispatched run's parameter document to the node
 	// agent, which writes it into the run mailbox. It travels on the claim path
 	// only: RedactJobLabels removes it from every public job projection, the
