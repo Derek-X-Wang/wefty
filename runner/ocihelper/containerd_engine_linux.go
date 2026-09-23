@@ -122,6 +122,7 @@ type ContainerdEngine struct {
 	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
 	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
 	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
+	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
 	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
 	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
 	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
@@ -1941,13 +1942,18 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 			return DeleteManagedVolumeResponse{}, err
 		}
 		path := filepath.Join(engine.config.RuntimeRoot, "handoffs", name)
-		if err := engine.removeHandoffRetentionReceipt(name); err != nil {
-			return DeleteManagedVolumeResponse{}, err
-		}
-		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := engine.removeHandoffVolumeAndReceipt(name); err != nil {
 			return DeleteManagedVolumeResponse{}, err
 		}
 		if err := requirePathAbsent(path, "handoff managed volume"); err != nil {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		// The receipt is part of what this deletion owns, so absence is
+		// verified over both names. A receipt left standing over a volume that
+		// is gone is runtime residue by the projection's own rule, and a
+		// deletion that reported success while leaving one behind would refuse
+		// the next boot barrier.
+		if err := requirePathAbsent(engine.handoffRetentionPath(name), "handoff retention receipt"); err != nil {
 			return DeleteManagedVolumeResponse{}, err
 		}
 		return DeleteManagedVolumeResponse{Deleted: true}, nil
@@ -4979,13 +4985,10 @@ func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInvent
 		// volume and this did not, so a rerun of a stable owner key whose
 		// prior receipt had expired was classified as residue and its own
 		// Delete could never reach Absent.
+		// A concurrently removed entry is reported expired, so it stays in the
+		// projection as residue and the next verification retry proves absence
+		// from a fresh observation.
 		expired, err := engine.handoffVolumeExpired(name, now, liveHandoffs)
-		if errors.Is(err, os.ErrNotExist) {
-			// A concurrently removed inventory entry cannot be retained evidence;
-			// keeping it in the projection makes the next verification retry prove
-			// absence from a fresh observation.
-			return false, nil
-		}
 		if err != nil {
 			return false, err
 		}

@@ -1078,12 +1078,15 @@ narrow
 `DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
 `service_data`. It derives exactly one helper-owned identity, removes only that
 volume (and, for service data, its paired owner record), and returns success
-only after separate absence checks. The agent calls the handoff arm after a
-volume's retention window has expired, and the service-data arm during Job
-removal; neither arm grants general path deletion authority. Deleting a handoff
-volume removes its retention receipt with it. Agent-driven eviction to fit a
-node budget is not implemented: the agent reads the retained-handoff inventory
-and acts on none of it, and the budget that will is a later slice of #494.
+only after separate absence checks. The service-data arm is called during Job
+removal. **The handoff arm has no agent caller in this slice**: a handoff
+volume is removed by the helper's own sweep when its retention window has run
+out, and the arm exists for the agent-driven budget eviction a later slice of
+#494 supplies. Neither arm grants general path deletion authority. Deleting a
+handoff volume removes its retention receipt with it, under one hold of the
+helper's retention lock and volume first, so a concurrent accounting repair
+cannot publish a receipt into the gap and leave an orphan behind; absence is
+verified over both names.
 
 Handoff retention receipts are their own inventory class,
 `handoff_retention_records`, for the same reason service-data owner records

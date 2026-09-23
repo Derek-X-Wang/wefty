@@ -5,6 +5,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -124,5 +126,90 @@ func TestANodeWithNoOCIRuntimeReportsNoOCIFigures(t *testing.T) {
 	harness := newRetentionHarness(t, time.Hour)
 	if status := harness.account(); status.OCI != nil {
 		t.Fatalf("a node with no OCI runtime reported OCI figures: %+v", *status.OCI)
+	}
+}
+
+// A rerun pointed at a source run's results keeps that run's handoff volume:
+// the runtime names the volume from `handoff_owner_run_id`, not from the run
+// that is executing. Attribution has to use the same identity, or the node
+// reports a volume of its own as residue a crash left behind -- and a budget
+// built on that would evict it as unowned.
+func TestARerunsVolumeIsAttributedToTheRunItsResultsBelongTo(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	const owner, rerun = "run_source", "run_rerun"
+	spec := handoffClaim(rerun, filepath.Join(harness.root, owner), nil).Job.Spec
+	spec.Labels["handoff_owner_run_id"] = owner
+	ownership := prepareHandoffForTest(t, harness.manager, spec)
+	if err := harness.manager.finish(ownership, spec, "node-1", true, true); err != nil {
+		t.Fatal(err)
+	}
+	ownership.lease.release()
+
+	// What the runtime calls this run's volume, derived exactly as the helper
+	// derives it.
+	name, err := ocihelper.DeterministicHandoffVolumeDirectory(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byRerun, err := ocihelper.DeterministicHandoffVolumeDirectory(rerun); err != nil || byRerun == name {
+		t.Fatalf("the fixture does not distinguish the two identities: %q vs %q (%v)", byRerun, name, err)
+	}
+
+	harness.manager.ociHandoffs = &stubHandoffInventory{report: workloadrunner.RetainedHandoffReport{
+		Volumes: []workloadrunner.RetainedHandoffVolume{{Name: name, TerminalKnown: true}},
+	}}
+	status := harness.account()
+	if status.OCI == nil || status.OCI.Unattributable != 0 {
+		t.Fatalf("a rerun's own handoff volume was reported as crash residue: %+v", status.OCI)
+	}
+
+	// And the record says which identity it is, rather than leaving a reader
+	// to infer it from the run ID. Preparation happens to key the directory on
+	// the owner key today, so the two agree here -- which is exactly why the
+	// field is recorded: anything reading the run ID as the owner key is
+	// relying on a coincidence nothing states.
+	record := harness.record(owner)
+	if record.handoffOwnerKey() != owner || record.RunID != owner {
+		t.Fatalf("the retention record = run %q / owner %q, want both %q", record.RunID, record.handoffOwnerKey(), owner)
+	}
+}
+
+// The coincidence broken: a record whose run ID and handoff owner key differ.
+// Attribution has to follow the owner key, because that is the identity the
+// runtime names the volume from.
+func TestAttributionFollowsTheOwnerKeyWhenItDiffersFromTheRunID(t *testing.T) {
+	harness := newRetentionHarness(t, time.Hour)
+	const owner, rerun = "run_source", "run_rerun"
+	if err := os.MkdirAll(filepath.Join(harness.root, rerun), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := harness.now
+	if err := harness.manager.writeRecord(retentionRecord{
+		RunID: rerun, NodeID: "node-1", Directory: filepath.Join(harness.root, rerun),
+		HandoffOwnerKey: owner, AdmittedAt: now, RetainedAt: now, RetainUntil: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	name, err := ocihelper.DeterministicHandoffVolumeDirectory(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.manager.ociHandoffs = &stubHandoffInventory{report: workloadrunner.RetainedHandoffReport{
+		Volumes: []workloadrunner.RetainedHandoffVolume{{Name: name, TerminalKnown: true}},
+	}}
+	status := harness.account()
+	if status.OCI == nil || status.OCI.Unattributable != 0 {
+		t.Fatalf("a volume named from the record's own owner key read as crash residue: %+v", status.OCI)
+	}
+}
+
+// A record written before the owner key was persisted means its run ID, which
+// is what preparation has always keyed the directory on.
+func TestARecordWithNoOwnerKeyMeansItsRunID(t *testing.T) {
+	if key := (retentionRecord{RunID: "run_legacy"}).handoffOwnerKey(); key != "run_legacy" {
+		t.Fatalf("a record with no owner key resolved to %q", key)
+	}
+	if key := (retentionRecord{RunID: "run_legacy", HandoffOwnerKey: "run_source"}).handoffOwnerKey(); key != "run_source" {
+		t.Fatalf("a record carrying an owner key resolved to %q", key)
 	}
 }

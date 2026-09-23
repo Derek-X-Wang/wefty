@@ -377,7 +377,8 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 	// or expire this run's results, and saying so before the workload starts
 	// is better than discovering it at finish with the files already written.
 	if err := m.writeRecord(retentionRecord{
-		RunID: runID, NodeID: nodeID, Directory: path, AdmittedAt: m.now().UTC(),
+		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: handoffOwnerRunID(spec),
+		AdmittedAt: m.now().UTC(),
 	}); err != nil {
 		return nil, fmt.Errorf("record the admission of handoff directory %q: %w", path, err)
 	}
@@ -414,7 +415,7 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 	}
 	now := m.now().UTC()
 	record := retentionRecord{
-		RunID: runID, NodeID: nodeID, Directory: path,
+		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: handoffOwnerRunID(spec),
 		AdmittedAt: m.admissionOf(runID, nodeID, path, now),
 		RetainedAt: now, RetainUntil: now.Add(m.retention),
 		Published: published, Succeeded: succeeded,

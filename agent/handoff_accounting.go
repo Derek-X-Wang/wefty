@@ -1146,7 +1146,11 @@ func (m *handoffManager) derivedHandoffVolumeNames() map[string]struct{} {
 		names[name] = struct{}{}
 	}
 	for _, record := range m.loadRecords() {
-		add(record.RunID)
+		// The owner key, not the run ID: a rerun pointed at a source run's
+		// results keeps that run's handoff volume, so naming the volume from
+		// the rerun would look for a directory that does not exist and report
+		// the one that does as residue a crash left behind.
+		add(record.handoffOwnerKey())
 	}
 	for _, runID := range m.loadUploadRunIDs() {
 		add(runID)

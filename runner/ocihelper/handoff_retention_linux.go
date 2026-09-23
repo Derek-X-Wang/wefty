@@ -297,6 +297,40 @@ func (engine *ContainerdEngine) publishHandoffRetentionReceipt(name string, meas
 	})
 }
 
+// removeHandoffVolumeAndReceipt takes a handoff volume and its terminal
+// receipt together, volume first, under one hold of the retention mutex.
+//
+// The order and the single hold are both load-bearing. Removing the receipt
+// first and then the volume unlocked left a window in which a concurrent
+// repair saw a receiptless volume and published a new receipt into it; the
+// volume then disappeared underneath and the receipt survived as an orphan,
+// which the absence projection reads as runtime residue and which therefore
+// refuses the boot barrier until another sweep collects it. Repair reopens the
+// volume under this same mutex before it publishes, so with the volume gone
+// first there is nothing left for it to bind to.
+func (engine *ContainerdEngine) removeHandoffVolumeAndReceipt(name string) error {
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if engine.handoffVolumeRemoved != nil {
+		// A test observes the window between the two removals: whether a
+		// concurrent repair can reach it, and what a receipt removal that
+		// fails right after its volume is gone leaves behind.
+		if err := engine.handoffVolumeRemoved(name); err != nil {
+			return err
+		}
+	}
+	// The receipt is retained exactly while its volume is. Removing them
+	// together is what keeps "observed = residue union retained" true over
+	// the durable class.
+	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (engine *ContainerdEngine) removeHandoffRetentionReceipt(name string) error {
 	engine.handoffRetentionMu.Lock()
 	defer engine.handoffRetentionMu.Unlock()
@@ -355,11 +389,11 @@ func (engine *ContainerdEngine) supersedeHandoffRetentionReceipt(name string) er
 // owner-key-derived handoff volume name precisely because the boot sweep
 // cannot re-derive it.
 func (engine *ContainerdEngine) liveHandoffVolumes() (map[string]struct{}, error) {
-	live := make(map[string]struct{})
+	owned := make(map[string]struct{})
 	engine.mu.Lock()
 	for _, attempt := range engine.attempts {
 		if name := attempt.resources.HandoffVolumeDirectory; name != "" {
-			live[name] = struct{}{}
+			owned[name] = struct{}{}
 		}
 	}
 	engine.mu.Unlock()
@@ -369,8 +403,29 @@ func (engine *ContainerdEngine) liveHandoffVolumes() (map[string]struct{}, error
 	}
 	for _, record := range records {
 		if name := record.Resources.HandoffVolumeDirectory; name != "" {
-			live[name] = struct{}{}
+			owned[name] = struct{}{}
 		}
+	}
+	live := make(map[string]struct{}, len(owned))
+	for name := range owned {
+		fact, err := engine.readHandoffRetentionFact(name)
+		if err == nil && fact.terminalKnown {
+			// An owner that has already been finalized is not a run still
+			// writing here. An ownership release the helper had to defer --
+			// a retryable inventory failure leaves the record in place -- used
+			// to keep its volume live forever, so a run whose Delete had
+			// published a terminal time never expired at all.
+			//
+			// A valid receipt is exactly the proof needed: Delete publishes
+			// one only after the task is reaped and the attempt's absence is
+			// independently verified, and repair is create-only and skips
+			// every owned volume, so no other writer can produce one while an
+			// owner is registered. Reuse stays consistent because Run
+			// registers ownership and only then supersedes the receipt, so a
+			// rerun is owned and receiptless -- live -- from that moment.
+			continue
+		}
+		live[name] = struct{}{}
 	}
 	return live, nil
 }
@@ -415,7 +470,17 @@ func (engine *ContainerdEngine) reconcileHandoffRetention(ctx context.Context, n
 		return
 	}
 	engine.cleanupExpiredHandoffs(now, names, live)
-	if err := engine.removeOrphanHandoffRetentionReceipts(names); err != nil {
+	// The orphan pass re-lists rather than reusing the names above. Driving it
+	// off the pre-cleanup observation meant a receipt whose removal failed
+	// immediately after its volume was taken still counted as paired, so it
+	// survived as an orphan -- runtime residue by the projection's own rule --
+	// until another sweep.
+	survivors, err := engine.handoffVolumeNames()
+	if err != nil {
+		log.Printf("handoff retention: re-read the handoff root after expiry: %v", err)
+		return
+	}
+	if err := engine.removeOrphanHandoffRetentionReceipts(survivors); err != nil {
 		log.Printf("handoff retention: remove receipts whose volume is gone: %v", err)
 	}
 }
@@ -469,6 +534,12 @@ func (engine *ContainerdEngine) repairMissingHandoffRetentionReceipts(ctx contex
 func (engine *ContainerdEngine) stampMissingHandoffRetentionReceipts(ctx context.Context, now time.Time, names []string, live map[string]struct{}) {
 	budget := engine.newHandoffMeasureBudget()
 	for _, name := range names {
+		if ctx != nil && ctx.Err() != nil {
+			// The caller's deadline bounds the whole pass, not one volume's
+			// walk. A sweep or an accounting read that was cancelled stops
+			// stamping rather than working through the rest of the node.
+			return
+		}
 		if _, writing := live[name]; writing {
 			continue
 		}
@@ -585,6 +656,20 @@ func (engine *ContainerdEngine) removeOrphanHandoffRetentionReceipts(volumes []s
 	var failures []error
 	for _, entry := range entries {
 		name := entry.Name()
+		if strings.HasPrefix(name, ".") && strings.Contains(name, ".tmp-") && !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			// A crash between writing a receipt and publishing it leaves the
+			// temporary behind. It carries no volume prefix, so the pairing
+			// below can never reach it, and it would accumulate on the node
+			// forever -- the same reason the attempt-ownership root collects
+			// its own `.attempt.tmp-` leftovers.
+			engine.handoffRetentionMu.Lock()
+			err := os.Remove(filepath.Join(engine.handoffRetentionRoot(), name))
+			engine.handoffRetentionMu.Unlock()
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				failures = append(failures, err)
+			}
+			continue
+		}
 		if !strings.HasPrefix(name, handoffVolumeNamePrefix) || !strings.HasSuffix(name, handoffRetentionRecordSuffix) {
 			continue
 		}
@@ -645,15 +730,8 @@ func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time, names []st
 		if !expired {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := engine.removeHandoffVolumeAndReceipt(name); err != nil {
 			log.Printf("handoff retention: remove expired %s: %v", name, err)
-			continue
-		}
-		// The receipt is retained exactly while its volume is. Removing them
-		// together is what keeps "observed = residue union retained" true over
-		// the new durable class.
-		if err := engine.removeHandoffRetentionReceipt(name); err != nil {
-			log.Printf("handoff retention: remove %s's receipt after its volume: %v", name, err)
 		}
 	}
 }
@@ -931,6 +1009,14 @@ func writeAtomicDurableJSONRecord(root, name string, record any) error {
 // hard link followed by unlinking the temporary name, which has the same
 // no-replace property.
 func (engine *ContainerdEngine) writeAtomicDurableJSONRecordCreateOnly(root, name string, record any) (bool, error) {
+	return writeAtomicDurableJSONRecordCreateOnlyWithRename(root, name, record, engine.handoffRepairWrite, renameNoReplace)
+}
+
+// writeAtomicDurableJSONRecordCreateOnlyWithRename takes its write and publish
+// steps as arguments so a test can drive the outcomes the filesystem decides:
+// a partial write, and a link fallback that creates the name and then cannot
+// unlink the temporary.
+func writeAtomicDurableJSONRecordCreateOnlyWithRename(root, name string, record any, write func(*os.File, []byte) error, publish func(string, string) (bool, error)) (bool, error) {
 	payload, err := json.Marshal(record)
 	if err != nil {
 		return false, err
@@ -944,8 +1030,8 @@ func (engine *ContainerdEngine) writeAtomicDurableJSONRecordCreateOnly(root, nam
 	defer os.Remove(temporaryName)
 	writeErr := temporary.Chmod(0o600)
 	if writeErr == nil {
-		if engine.handoffRepairWrite != nil {
-			writeErr = engine.handoffRepairWrite(temporary, payload)
+		if write != nil {
+			writeErr = write(temporary, payload)
 		} else {
 			_, writeErr = temporary.Write(payload)
 		}
@@ -958,18 +1044,24 @@ func (engine *ContainerdEngine) writeAtomicDurableJSONRecordCreateOnly(root, nam
 		return false, fmt.Errorf("write durable record %q: %w", name, writeErr)
 	}
 	path := filepath.Join(root, name)
-	published, err := renameNoReplace(temporaryName, path)
-	if err != nil {
-		return false, fmt.Errorf("publish durable record %q create-only: %w", name, err)
-	}
+	published, publishErr := publish(temporaryName, path)
 	if !published {
+		if publishErr != nil {
+			return false, fmt.Errorf("publish durable record %q create-only: %w", name, publishErr)
+		}
 		return false, nil
 	}
+	// Published is published. The link fallback can succeed at creating the
+	// name and then fail to unlink the temporary, and returning that as a
+	// plain failure skipped the directory fsync on a record that is now on
+	// disk -- so a crash could lose a receipt the helper had already
+	// committed. The unlink failure is still reported, joined rather than
+	// masking the publication.
 	directory, err := os.Open(root)
 	if err != nil {
-		return true, fmt.Errorf("open durable record root %q: %w", root, err)
+		return true, errors.Join(publishErr, fmt.Errorf("open durable record root %q: %w", root, err))
 	}
-	return true, errors.Join(directory.Sync(), directory.Close())
+	return true, errors.Join(publishErr, directory.Sync(), directory.Close())
 }
 
 func renameNoReplace(oldPath, newPath string) (bool, error) {

@@ -318,6 +318,13 @@ func TestOneFailedReceiptDoesNotStopTheRestOfTheNodeBeingSweptOrStamped(t *testi
 	stampable, _ := makeHandoffVolume(t, root, "zzz-can-be-stamped")
 	expired, expiredPath := makeHandoffVolume(t, root, "mmm-already-expired")
 	stamp(t, engine, expired, now.Add(-2*time.Hour))
+	// The pass walks the root in name order, and names are digests, so the
+	// fixture only proves "a failure does not stop what comes after" if the
+	// blocked volume really does come first. Assert it rather than hope: a
+	// changed owner key would otherwise turn this into a test of nothing.
+	if blocked >= stampable {
+		t.Fatalf("the fixture is not in failure-first order: blocked=%s stampable=%s", blocked, stampable)
+	}
 
 	// The test seam fails the temporary receipt's write for the first volume.
 	// It sorts first, so a real publication failure happens before the rest of
@@ -745,15 +752,10 @@ func TestReusingAVolumeSupersedesThePreviousAttemptsTerminalTime(t *testing.T) {
 	if err != nil || expired {
 		t.Fatalf("a live rerun's volume was expirable: expired=%v err=%v", expired, err)
 	}
-	// Defence in depth for the same failure: a terminal time that survives
-	// onto a live volume by any route -- a supersede that did not run, a
-	// clock step -- must still not make that volume residue. Expiry skips a
-	// live volume, so the projection has to as well, or the two disagree
-	// about the same directory and Delete's Verify never reaches Absent.
-	stamp(t, engine, name, now.Add(-2*time.Hour))
-	if expired, err := engine.handoffVolumeExpired(name, now, live); err != nil || expired {
-		t.Fatalf("a live rerun carrying an expired receipt was expirable: expired=%v err=%v", expired, err)
-	}
+	// The projection has to agree with expiry about this exact directory, or
+	// the rerun's own Delete verifies its volume as residue and never reaches
+	// Absent. Superseding is what makes both say the same thing: an owned,
+	// receiptless volume is a run that has not finished.
 	observed := ResourceInventory{}
 	if err := inventoryManagedVolumeResources(root, &observed); err != nil {
 		t.Fatal(err)
@@ -1187,5 +1189,226 @@ func TestSweepCountsTheHandoffVolumeAndReceiptItExpiredLast(t *testing.T) {
 	}
 	if !receiptPresent(t, root, retained) {
 		t.Fatal("the retained volume's receipt was counted away with the expired one")
+	}
+}
+
+// Removing the receipt first and then the volume unlocked left a window: a
+// repair that had already measured the volume saw it receiptless, published
+// one, and the volume then disappeared underneath -- leaving a receipt the
+// absence projection reads as runtime residue, which refuses the boot barrier
+// until another sweep collects it.
+func TestDeletingAHandoffVolumeLeavesNoReceiptForARacingRepairToOrphan(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, path := makeHandoffVolume(t, root, "raced-deletion")
+	if err := os.WriteFile(filepath.Join(path, "result.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The interleaving that matters is inside the deletion: a repair that has
+	// already measured tries to publish while the deletion is between its two
+	// removals. Under one lock, volume first, the repair blocks and then finds
+	// nothing to bind to; with the receipt taken first and the volume removed
+	// unlocked, the repair slips in and its receipt outlives the volume.
+	measured := make(chan struct{})
+	attempted := make(chan struct{})
+	engine.handoffRepairMeasured = func(volume string) {
+		if volume != name {
+			return
+		}
+		close(measured)
+		<-attempted
+	}
+	done := make(chan struct{})
+	entered := false
+	engine.handoffVolumeRemoved = func(string) error {
+		if entered {
+			return nil
+		}
+		entered = true
+		// Release the parked repair inside the window and give it every
+		// chance to publish. Holding one lock across both removals is what
+		// makes it block here instead; a deletion that let go of the lock
+		// between them would let this repair reach a volume that is about to
+		// disappear.
+		close(attempted)
+		select {
+		case <-done:
+		case <-time.After(250 * time.Millisecond):
+		}
+		return nil
+	}
+
+	go func() {
+		defer close(done)
+		engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+	}()
+	<-measured
+	response, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "raced-deletion"})
+	if err != nil || !response.Deleted {
+		t.Fatalf("finalization during repair = %+v err=%v", response, err)
+	}
+	<-done
+	if !entered {
+		t.Fatal("the fixture never reached the window between the two removals")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the finalized volume remains: %v", err)
+	}
+	if receiptPresent(t, root, name) {
+		t.Fatal("a repair published a receipt for a volume that had just been finalized, orphaning it")
+	}
+
+	// And the projection agrees, which is what the boot barrier reads.
+	observed := ResourceInventory{}
+	if err := inventoryManagedVolumeResources(root, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if len(observed.HandoffRetentionRecords) != 0 || len(observed.ManagedVolumes) != 0 {
+		t.Fatalf("the node still observes %+v after a finalized deletion", observed)
+	}
+}
+
+// A crash between writing a receipt and publishing it leaves the temporary
+// behind. It carries no volume prefix, so nothing paired it with a volume and
+// nothing ever collected it.
+func TestTheSweepCollectsReceiptTemporariesACrashLeftBehind(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "crashed-mid-publish")
+	stamp(t, engine, name, now)
+	temporary := filepath.Join(engine.handoffRetentionRoot(), "."+HandoffRetentionRecordName(name)+".tmp-123456")
+	if err := os.WriteFile(temporary, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+
+	if _, err := os.Stat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a crash-left receipt temporary survived the sweep: %v", err)
+	}
+	if !receiptPresent(t, root, name) {
+		t.Fatal("collecting the temporary took the published receipt with it")
+	}
+}
+
+// The orphan pass used to run off the names observed before expiry, so a
+// receipt whose removal failed immediately after its volume was taken still
+// counted as paired and survived -- runtime residue by the projection's own
+// rule -- until another sweep.
+func TestTheOrphanPassSeesTheReceiptsExpiryCouldNotTake(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, path := makeHandoffVolume(t, root, "expired-then-orphaned")
+	stamp(t, engine, name, now.Add(-2*time.Hour))
+
+	// Expiry takes the volume and then cannot take its receipt. The pass
+	// observed the volume, so a pairing built from that observation still
+	// calls the receipt paired -- and leaves an orphan the projection reads as
+	// runtime residue.
+	engine.handoffVolumeRemoved = func(string) error {
+		return errors.New("the receipt could not be removed after its volume")
+	}
+	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the expired volume was not removed: %v", err)
+	}
+	if receiptPresent(t, root, name) {
+		t.Fatal("a receipt whose volume is gone survived the same pass that observed it")
+	}
+}
+
+// An ownership release the helper had to defer leaves the record in place. That
+// used to keep the volume live forever, so a run whose Delete had already
+// published a terminal time never expired at all. A valid receipt is proof of
+// finalization: Delete writes one only after the task is reaped and absence is
+// verified, and repair is create-only and skips every owned volume.
+func TestAStaleOwnershipRecordDoesNotKeepAFinalizedVolumeAliveForever(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	finalized, finalizedPath := makeHandoffVolume(t, root, "finalized-but-still-owned")
+	unfinished, unfinishedPath := makeHandoffVolume(t, root, "owned-and-unfinished")
+	writeOwnershipRecord(t, engine, "finalized-but-still-owned", finalized)
+	writeOwnershipRecord(t, engine, "owned-and-unfinished", unfinished)
+
+	// Delete published this one's terminal time before the release was
+	// deferred.
+	stamp(t, engine, finalized, now.Add(-2*time.Hour))
+
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, writing := live[finalized]; writing {
+		t.Fatal("a volume whose Delete had published a terminal time was still called live")
+	}
+	if _, writing := live[unfinished]; !writing {
+		t.Fatal("an owned volume with no terminal time stopped being live")
+	}
+
+	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+	if _, err := os.Stat(finalizedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a finalized volume held by a stale ownership record never expired: %v", err)
+	}
+	if _, err := os.Stat(unfinishedPath); err != nil {
+		t.Fatalf("an unfinished owned volume was expired: %v", err)
+	}
+	if receiptPresent(t, root, unfinished) {
+		t.Fatal("an owned, unfinished volume was stamped terminal by the repair")
+	}
+}
+
+// writeOwnershipRecord plants the durable record a previous helper generation
+// leaves behind, carrying the owner-key-derived handoff volume name.
+func writeOwnershipRecord(t *testing.T, engine *ContainerdEngine, jobID, volume string) {
+	t.Helper()
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "prior-boot", JobID: jobID, AttemptID: "attempt-" + jobID,
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = volume
+	if err := os.MkdirAll(engine.attemptOwnershipRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(durableAttemptOwnership{
+		Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(engine.attemptOwnershipPath(resources), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Published is published. The link fallback can create the name and then fail
+// to unlink the temporary; returning that as a plain failure skipped the
+// directory fsync on a record already on disk, so a crash could lose a receipt
+// the helper had committed.
+func TestACreateOnlyPublicationThatCannotUnlinkItsTemporaryIsStillPublished(t *testing.T) {
+	root := t.TempDir()
+	published, err := writeAtomicDurableJSONRecordCreateOnlyWithRename(root, "record", map[string]string{"a": "b"}, nil,
+		func(oldPath, newPath string) (bool, error) {
+			if err := os.Link(oldPath, newPath); err != nil {
+				return false, err
+			}
+			return true, errors.New("temporary could not be unlinked")
+		})
+	if !published {
+		t.Fatalf("a record that reached its name was reported unpublished: %v", err)
+	}
+	if err == nil {
+		t.Fatal("the unlink failure was swallowed")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "record")); statErr != nil {
+		t.Fatalf("the published record is not there: %v", statErr)
 	}
 }

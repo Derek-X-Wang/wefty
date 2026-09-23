@@ -109,6 +109,21 @@ type retentionRecord struct {
 	RunID     string `json:"run_id"`
 	NodeID    string `json:"node_id"`
 	Directory string `json:"directory"`
+	// HandoffOwnerKey is the stable identity a runtime derives this run's
+	// handoff volume name from -- `handoff_owner_run_id` when a rerun is
+	// pointed at a source run's results, and the run ID otherwise.
+	//
+	// It is recorded rather than re-derived because the two are only the same
+	// by construction today: preparation happens to key the directory on the
+	// owner key, so RunID carries it. Nothing said so, and anything that read
+	// RunID as the owner key was relying on that coincidence -- including the
+	// node's attribution of the OCI helper's volumes, where guessing wrong
+	// means reporting a run of this node's as crash residue.
+	//
+	// Optional: a record written before this field existed has none, and the
+	// validator accepts that. Readers fall back to RunID, which is what those
+	// records mean.
+	HandoffOwnerKey string `json:"handoff_owner_key,omitempty"`
 	// AdmittedAt is when preparation took responsibility for this directory,
 	// and it is written before the workload starts rather than after it stops.
 	//
@@ -273,6 +288,15 @@ func (m *handoffManager) loadUploadRunIDs() []string {
 		runIDs = append(runIDs, record.RunID)
 	}
 	return runIDs
+}
+
+// handoffOwnerKey is the identity a runtime names this run's handoff volume
+// from. A record written before the field existed means its run ID.
+func (record retentionRecord) handoffOwnerKey() string {
+	if key := strings.TrimSpace(record.HandoffOwnerKey); key != "" {
+		return key
+	}
+	return record.RunID
 }
 
 func (m *handoffManager) recordRoot() string {
