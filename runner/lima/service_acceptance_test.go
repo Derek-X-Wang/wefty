@@ -103,6 +103,23 @@ type attendedResult struct {
 	HandoffRetainedAfterCompletion *bool  `json:"handoff_retained_after_completion,omitempty"`
 	ResultsRetainedUntil           string `json:"results_retained_until,omitempty"`
 	ResultsExpired                 *bool  `json:"results_expired,omitempty"`
+	// ResultsTerminalSource and OverBudgetPublishedEvictedFirst are the two
+	// #494 facts no CI lane can produce: that the retention window runs from
+	// a helper-owned receipt a real uid-0 workload cannot forge, and that a
+	// node genuinely filled past MaxRetainedResultNodeBytes gave the
+	// published run up before the unpublished one.
+	//
+	// Neither is required. An attended run against node software that
+	// predates them records neither, and a gate that turned a missing
+	// observation into a failed row could not tell that apart from a row that
+	// observed the wrong thing. What the gate does instead is hold what is
+	// recorded to its meaning: the source token comes from a closed
+	// vocabulary, and an explicit
+	// over_budget_published_evicted_first=false is refused by name, because a
+	// node that gave an unpublished result up while a published one remained
+	// is a defect the receipt must not carry quietly.
+	ResultsTerminalSource           string `json:"results_terminal_source,omitempty"`
+	OverBudgetPublishedEvictedFirst *bool  `json:"over_budget_published_evicted_first,omitempty"`
 	// QuiescenceFaultInjected, QuiescenceLatched and ServiceJobState carry the
 	// service_failed_quiescence outcome. The row keeps its intent -- an
 	// unprovable stop must not be reported as stopped -- while recording what
@@ -620,6 +637,38 @@ func validateHandoffRetention(row attendedResult, sessionEnd time.Time) error {
 	if *expired {
 		return errors.New("row's results_expired=true; retention proof requires expired=false")
 	}
+	return validateRetainedResultsBudgetFacts(row)
+}
+
+const (
+	// resultsTerminalSourceReceipt is what an attended row records when the
+	// node reports the volume's terminal time from the helper-owned receipt,
+	// which is the fact a real uid-0 workload cannot forge and no CI lane can
+	// demonstrate.
+	resultsTerminalSourceReceipt = "receipt"
+	// resultsTerminalSourceMtime is the labelled fallback: a volume with no
+	// receipt is dated by a timestamp the workload could have written. It is
+	// a legitimate observation to record and is not the #494 proof.
+	resultsTerminalSourceMtime = "mtime_fallback"
+)
+
+// validateRetainedResultsBudgetFacts holds the two attended-only #494 facts to
+// their meaning without requiring either of them.
+//
+// The vocabulary is closed for the same reason the helper's anomaly tokens
+// are: what a receipt can say must not grow with what a workload wrote, and a
+// misspelled source token that passed would read to the next person as a
+// proof the row never made.
+func validateRetainedResultsBudgetFacts(row attendedResult) error {
+	switch row.ResultsTerminalSource {
+	case "", resultsTerminalSourceReceipt, resultsTerminalSourceMtime:
+	default:
+		return fmt.Errorf("row's results_terminal_source %q is neither %q nor %q",
+			row.ResultsTerminalSource, resultsTerminalSourceReceipt, resultsTerminalSourceMtime)
+	}
+	if row.OverBudgetPublishedEvictedFirst != nil && !*row.OverBudgetPublishedEvictedFirst {
+		return errors.New("row records over_budget_published_evicted_first=false: the node gave an unpublished result up while a published one remained, which is a defect to file rather than a row to pass")
+	}
 	return nil
 }
 
@@ -645,6 +694,35 @@ func TestServiceAcceptanceHandoffRetentionRowOutcomes(t *testing.T) {
 			},
 			sessionEnd: sessionEnd,
 			accept:     true,
+		},
+		{
+			// The retention rows are the ones that carry the attended #494
+			// facts, so the retention check is where they are held to their
+			// meaning -- a row that satisfies every #509 fact and then
+			// misspells the terminal source is still refused.
+			name: "an otherwise complete retention row with an unknown terminal source",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion: boolPtr(true),
+				ResultsRetainedUntil:           "2026-09-29T04:24:49Z",
+				ResultsExpired:                 boolPtr(false),
+				ResultsTerminalSource:          "reciept",
+			},
+			sessionEnd:  sessionEnd,
+			accept:      false,
+			wantMissing: "results_terminal_source",
+		},
+		{
+			name: "an otherwise complete retention row that observed the wrong eviction order",
+			row: attendedResult{
+				HandoffRetainedAfterCompletion:  boolPtr(true),
+				ResultsRetainedUntil:            "2026-09-29T04:24:49Z",
+				ResultsExpired:                  boolPtr(false),
+				ResultsTerminalSource:           resultsTerminalSourceReceipt,
+				OverBudgetPublishedEvictedFirst: boolPtr(false),
+			},
+			sessionEnd:  sessionEnd,
+			accept:      false,
+			wantMissing: "over_budget_published_evicted_first=false",
 		},
 		{
 			name: "explicit retained=true with nested results_block (run-7 shape)",
@@ -772,6 +850,54 @@ func TestServiceAcceptanceHandoffRetentionRowOutcomes(t *testing.T) {
 			}
 			if !testCase.accept && !strings.Contains(err.Error(), testCase.wantMissing) {
 				t.Fatalf("validateHandoffRetention(%+v) error %q does not name %q", testCase.row, err.Error(), testCase.wantMissing)
+			}
+		})
+	}
+}
+
+// TestServiceAcceptanceRetainedResultsBudgetFacts pins what the gate does with
+// the two attended-only #494 facts: it requires neither, refuses a source
+// token outside the closed vocabulary, and refuses a row that recorded the
+// node giving an unpublished result up while a published one remained.
+func TestServiceAcceptanceRetainedResultsBudgetFacts(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	for _, testCase := range []struct {
+		name        string
+		row         attendedResult
+		accept      bool
+		wantMissing string
+	}{
+		{name: "neither fact recorded", row: attendedResult{}, accept: true},
+		{
+			name:   "the receipt-sourced terminal time and the published-first order",
+			row:    attendedResult{ResultsTerminalSource: "receipt", OverBudgetPublishedEvictedFirst: boolPtr(true)},
+			accept: true,
+		},
+		{
+			name:   "the labelled mtime fallback is a legitimate observation",
+			row:    attendedResult{ResultsTerminalSource: "mtime_fallback"},
+			accept: true,
+		},
+		{
+			name:        "a source token outside the vocabulary",
+			row:         attendedResult{ResultsTerminalSource: "reciept"},
+			accept:      false,
+			wantMissing: "neither",
+		},
+		{
+			name:        "the node gave an unpublished result up while a published one remained",
+			row:         attendedResult{OverBudgetPublishedEvictedFirst: boolPtr(false)},
+			accept:      false,
+			wantMissing: "over_budget_published_evicted_first=false",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateRetainedResultsBudgetFacts(testCase.row)
+			if testCase.accept != (err == nil) {
+				t.Fatalf("validateRetainedResultsBudgetFacts(%+v) = %v, accept=%t", testCase.row, err, testCase.accept)
+			}
+			if !testCase.accept && !strings.Contains(err.Error(), testCase.wantMissing) {
+				t.Fatalf("the rejection %q does not name %q", err.Error(), testCase.wantMissing)
 			}
 		})
 	}
