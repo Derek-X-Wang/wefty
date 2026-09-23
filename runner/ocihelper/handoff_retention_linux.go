@@ -300,10 +300,32 @@ func (engine *ContainerdEngine) publishHandoffRetentionReceipt(name string, meas
 func (engine *ContainerdEngine) removeHandoffRetentionReceipt(name string) error {
 	engine.handoffRetentionMu.Lock()
 	defer engine.handoffRetentionMu.Unlock()
+	return engine.removeHandoffRetentionReceiptLocked(name)
+}
+
+func (engine *ContainerdEngine) removeHandoffRetentionReceiptLocked(name string) error {
+	if name == "" {
+		return nil
+	}
 	if err := os.Remove(engine.handoffRetentionPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+// registerAttemptLiveAndSupersedeHandoff is the Run transition from durable
+// ownership to an in-memory live attempt. Durable ownership is published first
+// by ensureAttemptOwnershipRecord. Under the same lock repair uses for its
+// final liveness check, this adds the in-memory owner and only then removes the
+// prior terminal receipt. From the moment either owner exists, repair must not
+// stamp the volume.
+func (engine *ContainerdEngine) registerAttemptLiveAndSupersedeHandoff(attempt *containerdAttempt) error {
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	engine.mu.Lock()
+	engine.attempts[attempt.authority.key()] = attempt
+	engine.mu.Unlock()
+	return engine.removeHandoffRetentionReceiptLocked(attempt.resources.HandoffVolumeDirectory)
 }
 
 // supersedeHandoffRetentionReceipt drops the prior terminal time when a volume
@@ -423,6 +445,14 @@ func (engine *ContainerdEngine) repairMissingHandoffRetentionReceipts(ctx contex
 		return nil, nil, false
 	}
 	engine.stampMissingHandoffRetentionReceipts(ctx, now, names, live)
+	// Publication deliberately rechecks liveness per volume. Refresh once more
+	// for the report so an attempt that became live while repair was measuring
+	// is not returned as idle from the earlier snapshot.
+	live, err = engine.liveHandoffVolumes()
+	if err != nil {
+		log.Printf("handoff retention: refresh durable attempt ownership after repair: %v", err)
+		return nil, nil, false
+	}
 	return names, live, true
 }
 
@@ -449,15 +479,13 @@ func (engine *ContainerdEngine) stampMissingHandoffRetentionReceipts(ctx context
 			}
 			continue
 		}
-		if fact.terminalKnown || !handoffReceiptGapIsStructural(fact.anomaly) {
+		if fact.terminalKnown || !handoffReceiptGapIsRepairable(fact.anomaly) {
 			// An operational read failure may clear on its own, and a receipt
 			// that cannot be read may still be a valid one. Writing over it
-			// would destroy a terminal time this node had already recorded, so
-			// only a gap that can never resolve itself is filled here: no
-			// receipt at all, one that is not a version-1 receipt, or one
-			// bound to a directory that no longer stands at this name. This is
-			// the structural/operational split the recovery table already
-			// makes for durable records.
+			// would destroy a terminal time this node had already recorded.
+			// Repair is create-only, so malformed and mismatched receipt paths
+			// are reported but never replaced here either. Only absence is a
+			// gap this read may fill.
 			continue
 		}
 		if err := engine.stampOneHandoffRetentionReceipt(ctx, name, now, budget); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -466,15 +494,10 @@ func (engine *ContainerdEngine) stampMissingHandoffRetentionReceipts(ctx context
 	}
 }
 
-// handoffReceiptGapIsStructural reports whether a missing terminal time is one
-// that will never appear by itself.
-func handoffReceiptGapIsStructural(anomaly HandoffVolumeAnomaly) bool {
-	switch anomaly {
-	case HandoffAnomalyNoReceipt, HandoffAnomalyReceiptInvalid, HandoffAnomalyReceiptMismatched:
-		return true
-	default:
-		return false
-	}
+// handoffReceiptGapIsRepairable reports whether accounting may fill this gap.
+// Repair never replaces any receipt path, even one it cannot validate.
+func handoffReceiptGapIsRepairable(anomaly HandoffVolumeAnomaly) bool {
+	return anomaly == HandoffAnomalyNoReceipt
 }
 
 // stampOneHandoffRetentionReceipt measures and publishes one volume against a
@@ -489,7 +512,61 @@ func (engine *ContainerdEngine) stampOneHandoffRetentionReceipt(ctx context.Cont
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return engine.publishHandoffRetentionReceipt(name, identity, now, measurement)
+	if engine.handoffRepairMeasured != nil {
+		engine.handoffRepairMeasured(name)
+	}
+	return engine.publishHandoffRetentionReceiptCreateOnly(name, identity, now, measurement)
+}
+
+// publishHandoffRetentionReceiptCreateOnly is repair's commit point. The
+// measurement happens before this lock. Under it, repair refreshes both live
+// ownership sources, confirms that no receipt exists, and reopens the volume
+// without following symlinks to bind publication to the measured identity.
+// Delete uses publishHandoffRetentionReceipt instead and may replace this
+// repair receipt with its authoritative terminal fact.
+func (engine *ContainerdEngine) publishHandoffRetentionReceiptCreateOnly(name string, measured handoffInodeIdentity, terminalAt time.Time, measurement handoffVolumeMeasurement) error {
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	live, err := engine.liveHandoffVolumes()
+	if err != nil {
+		return fmt.Errorf("refresh live handoff ownership before repairing %s: %w", name, err)
+	}
+	if _, writing := live[name]; writing {
+		log.Printf("handoff retention: skip repairing %s because a fresh ownership snapshot says it is live", name)
+		return nil
+	}
+	receiptPath := engine.handoffRetentionPath(name)
+	if _, err := os.Lstat(receiptPath); err == nil {
+		log.Printf("handoff retention: skip repairing %s because a receipt now exists", name)
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check for a concurrent handoff receipt for %s: %w", name, err)
+	}
+	_, identity, err := engine.openHandoffVolumeIdentity(name)
+	if err != nil {
+		return err
+	}
+	if identity != measured {
+		log.Printf("handoff retention: skip repairing %s because its identity changed after measurement", name)
+		return nil
+	}
+	root := engine.handoffRetentionRoot()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return fmt.Errorf("create handoff retention state root: %w", err)
+	}
+	published, err := engine.writeAtomicDurableJSONRecordCreateOnly(root, HandoffRetentionRecordName(name), handoffRetentionReceipt{
+		Version: handoffRetentionReceiptVersion, Device: identity.device, Inode: identity.inode,
+		TerminalAt: terminalAt.UTC(), LogicalBytes: measurement.logical,
+		DedupedBytes: measurement.deduped, Entries: measurement.entries,
+		Truncated: measurement.truncated,
+	})
+	if err != nil {
+		return err
+	}
+	if !published {
+		log.Printf("handoff retention: skip repairing %s because a receipt won create-only publication", name)
+	}
+	return nil
 }
 
 // removeOrphanHandoffRetentionReceipts keeps the durable class honest: a
@@ -846,4 +923,74 @@ func writeAtomicDurableJSONRecord(root, name string, record any) error {
 		return fmt.Errorf("open durable record root %q: %w", root, err)
 	}
 	return errors.Join(directory.Sync(), directory.Close())
+}
+
+// writeAtomicDurableJSONRecordCreateOnly publishes repair evidence without
+// replacing anything already at name. renameat2 provides the atomic Linux
+// primitive; filesystems or kernels that do not support it use a same-directory
+// hard link followed by unlinking the temporary name, which has the same
+// no-replace property.
+func (engine *ContainerdEngine) writeAtomicDurableJSONRecordCreateOnly(root, name string, record any) (bool, error) {
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return false, err
+	}
+	payload = append(payload, '\n')
+	temporary, err := os.CreateTemp(root, "."+name+".tmp-")
+	if err != nil {
+		return false, fmt.Errorf("create durable record %q: %w", name, err)
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	writeErr := temporary.Chmod(0o600)
+	if writeErr == nil {
+		if engine.handoffRepairWrite != nil {
+			writeErr = engine.handoffRepairWrite(temporary, payload)
+		} else {
+			_, writeErr = temporary.Write(payload)
+		}
+	}
+	if writeErr == nil {
+		writeErr = temporary.Sync()
+	}
+	writeErr = errors.Join(writeErr, temporary.Close())
+	if writeErr != nil {
+		return false, fmt.Errorf("write durable record %q: %w", name, writeErr)
+	}
+	path := filepath.Join(root, name)
+	published, err := renameNoReplace(temporaryName, path)
+	if err != nil {
+		return false, fmt.Errorf("publish durable record %q create-only: %w", name, err)
+	}
+	if !published {
+		return false, nil
+	}
+	directory, err := os.Open(root)
+	if err != nil {
+		return true, fmt.Errorf("open durable record root %q: %w", root, err)
+	}
+	return true, errors.Join(directory.Sync(), directory.Close())
+}
+
+func renameNoReplace(oldPath, newPath string) (bool, error) {
+	err := unix.Renameat2(unix.AT_FDCWD, oldPath, unix.AT_FDCWD, newPath, unix.RENAME_NOREPLACE)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, unix.EEXIST) {
+		return false, nil
+	}
+	if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.EOPNOTSUPP) {
+		return false, err
+	}
+	if err := os.Link(oldPath, newPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.Remove(oldPath); err != nil {
+		return true, err
+	}
+	return true, nil
 }

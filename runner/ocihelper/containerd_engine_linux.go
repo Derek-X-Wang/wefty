@@ -117,12 +117,14 @@ type ContainerdEngine struct {
 	ports                       map[uint16]string
 	nextPort                    uint16
 	serviceVolumeMu             sync.Mutex
-	handoffRetentionMu          sync.Mutex           // serializes receipt publication only; never held across measurement or containerd work
-	handoffMeasureEntered       func(string)         // a test observes when one volume's measurement begins
-	handoffMeasureDescend       func(string, string) // a test replaces a child between its stat and its open
-	handoffMeasureEntryBudget   int64                // a test proves the entry bound without planting a million files
-	handoffMeasureOpenBudget    int64                // a test proves the open bound without planting a million directories
-	handoffInventoryBytes       int                  // a test proves the response byte bound without building a megabyte of fixture
+	handoffRetentionMu          sync.Mutex                   // serializes receipt publication only; never held across measurement or containerd work
+	handoffMeasureEntered       func(string)                 // a test observes when one volume's measurement begins
+	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
+	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
+	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
+	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
+	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
+	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -1327,10 +1329,15 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		return deleteErr
 	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
 	engine.watchOOM(attempt)
-	engine.mu.Lock()
-	engine.attempts[request.Authority.key()] = attempt
-	engine.mu.Unlock()
 	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
+	// The durable ownership record was published before NewTask and the
+	// in-memory owner is now visible too. Only after both sources make this
+	// volume live may reuse remove the prior attempt's terminal receipt: an
+	// inventory repair that measured before this point takes a fresh ownership
+	// snapshot under the receipt lock and refuses to publish.
+	if err := engine.registerAttemptLiveAndSupersedeHandoff(attempt); err != nil {
+		return RunResponse{}, fmt.Errorf("supersede prior handoff terminal receipt: %w", err)
+	}
 	if err := document.RevalidateMounts(); err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
 	}
@@ -3372,21 +3379,12 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			return nil, nil, nil, err
 		}
 		if volume.Kind == ManagedVolumeHandoff {
-			// Reuse supersedes the previous attempt's terminal time. Leaving
-			// it authoritative meant a rerun inherited a deadline it had
-			// nothing to do with: when that deadline passed mid-run, the new
-			// attempt's own Delete verified the volume as residue and retried
-			// until its cleanup deadline instead of recording the completion.
-			// A live run has no terminal time, which is exactly what no
-			// receipt means.
-			if err := engine.supersedeHandoffRetentionReceipt(name); err != nil {
-				return nil, nil, nil, err
-			}
 			// The mtime no longer decides anything: retention runs from the
 			// helper-owned receipt. It is stamped here so that a volume
 			// prepared and never finalized reports its preparation time as
 			// the labelled fallback, rather than whatever a workload last
-			// wrote, until a sweep gives it a real terminal time.
+			// wrote. Run supersedes the old receipt only after durable and
+			// in-memory ownership both make this preparation live.
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
 				return nil, nil, nil, err
@@ -3995,6 +3993,16 @@ func (engine *ContainerdEngine) attemptOwnershipPath(resources ResourceIdentity)
 // quarantined with a typed operator receipt, never deleted and never allowed to
 // wedge helper startup.
 func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAuthority, resources ResourceIdentity) error {
+	// Receipt repair takes the same lock before its fresh ownership snapshot.
+	// Once this record exists, no repair can still classify its handoff volume
+	// as idle; a repair already publishing finishes before ownership appears and
+	// Run later supersedes what it wrote.
+	engine.handoffRetentionMu.Lock()
+	defer engine.handoffRetentionMu.Unlock()
+	return engine.ensureAttemptOwnershipRecordLocked(authority, resources)
+}
+
+func (engine *ContainerdEngine) ensureAttemptOwnershipRecordLocked(authority AttemptAuthority, resources ResourceIdentity) error {
 	expected, err := DeterministicResourceIdentity(authority)
 	if err != nil {
 		return err

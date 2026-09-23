@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -318,15 +319,21 @@ func TestOneFailedReceiptDoesNotStopTheRestOfTheNodeBeingSweptOrStamped(t *testi
 	expired, expiredPath := makeHandoffVolume(t, root, "mmm-already-expired")
 	stamp(t, engine, expired, now.Add(-2*time.Hour))
 
-	// A non-empty directory standing where one volume's receipt goes makes the
-	// publishing rename fail for that volume and no other. It sorts first, so
-	// the failure happens before the rest of the pass.
-	blockedPath := filepath.Join(engine.handoffRetentionRoot(), HandoffRetentionRecordName(blocked))
-	if err := os.MkdirAll(filepath.Join(blockedPath, "occupied"), 0o700); err != nil {
-		t.Fatal(err)
+	// The test seam fails the temporary receipt's write for the first volume.
+	// It sorts first, so a real publication failure happens before the rest of
+	// the pass without turning the receipt path into an unreadable existing
+	// record that create-only repair would correctly leave alone.
+	writeRefused := errors.New("receipt write refused")
+	engine.handoffRepairWrite = func(file *os.File, payload []byte) error {
+		if strings.HasPrefix(filepath.Base(file.Name()), "."+HandoffRetentionRecordName(blocked)+".tmp-") {
+			return writeRefused
+		}
+		_, err := file.Write(payload)
+		return err
 	}
 
 	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
+	engine.handoffRepairWrite = nil
 
 	if !receiptPresent(t, root, stampable) {
 		t.Fatal("one volume's failed receipt stopped a later volume being stamped")
@@ -338,9 +345,6 @@ func TestOneFailedReceiptDoesNotStopTheRestOfTheNodeBeingSweptOrStamped(t *testi
 	// non-expirable, and the next pass tries again.
 	if _, err := os.Stat(filepath.Join(root, "handoffs", blocked)); err != nil {
 		t.Fatalf("a volume whose receipt could not be written lost its files: %v", err)
-	}
-	if err := os.RemoveAll(blockedPath); err != nil {
-		t.Fatal(err)
 	}
 	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
 	if !receiptPresent(t, root, blocked) {
@@ -436,16 +440,14 @@ func TestAnUnreadableReceiptIsAPerVolumeAnomalyRatherThanAFailedCall(t *testing.
 	}
 }
 
-// The repair fills a gap that can never close by itself and leaves alone one
-// that might. A receipt that is structurally not a version-1 receipt will
-// never become one, and leaving it would make its volume permanently
-// unexpirable; a receipt the filesystem could not read this time may be a
-// perfectly good terminal time next time, and writing over it would destroy a
-// fact this node had already recorded.
-func TestTheRepairFillsAStructuralReceiptGapAndNotAnOperationalOne(t *testing.T) {
+// Repair fills only an absent receipt path. Invalid, mismatched, and unreadable
+// paths remain anomalies because accounting is create-only and may not replace
+// evidence already present there.
+func TestTheRepairFillsOnlyAnAbsentReceiptGap(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
 	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	absent, _ := makeHandoffVolume(t, root, "absent-receipt")
 	invalid, _ := makeHandoffVolume(t, root, "invalid-receipt")
 	unreadable, _ := makeHandoffVolume(t, root, "unreadable-receipt")
 	if err := os.MkdirAll(engine.handoffRetentionRoot(), 0o700); err != nil {
@@ -460,30 +462,31 @@ func TestTheRepairFillsAStructuralReceiptGapAndNotAnOperationalOne(t *testing.T)
 
 	engine.reconcileHandoffRetention(t.Context(), now, quiescent())
 
-	receipt := readHandoffReceipt(t, root, invalid)
+	receipt := readHandoffReceipt(t, root, absent)
 	if !receipt.TerminalAt.Equal(now) {
-		t.Fatalf("a structurally invalid receipt was not repaired: %+v", receipt)
+		t.Fatalf("an absent receipt was not repaired: %+v", receipt)
+	}
+	invalidPayload, err := os.ReadFile(engine.handoffRetentionPath(invalid))
+	if err != nil || string(invalidPayload) != "{not a receipt" {
+		t.Fatalf("an invalid receipt was replaced: payload=%q err=%v", invalidPayload, err)
 	}
 	info, err := os.Lstat(engine.handoffRetentionPath(unreadable))
 	if err != nil || !info.IsDir() {
 		t.Fatalf("an operational read failure was written over: %v", err)
 	}
 
-	// The rule itself, across the whole vocabulary, because the filesystem
-	// case above cannot distinguish "was not written over" from "could not be
-	// written": only a gap that will never close by itself is filled.
-	for anomaly, structural := range map[HandoffVolumeAnomaly]bool{
+	for anomaly, repairable := range map[HandoffVolumeAnomaly]bool{
 		HandoffAnomalyNoReceipt:            true,
-		HandoffAnomalyReceiptInvalid:       true,
-		HandoffAnomalyReceiptMismatched:    true,
+		HandoffAnomalyReceiptInvalid:       false,
+		HandoffAnomalyReceiptMismatched:    false,
 		HandoffAnomalyReceiptUnreadable:    false,
 		HandoffAnomalyVolumeUnreadable:     false,
 		HandoffAnomalyMeasurementTruncated: false,
 		HandoffAnomalySubtreeReplaced:      false,
 		"":                                 false,
 	} {
-		if handoffReceiptGapIsStructural(anomaly) != structural {
-			t.Fatalf("anomaly %q is treated as structural=%v", anomaly, !structural)
+		if handoffReceiptGapIsRepairable(anomaly) != repairable {
+			t.Fatalf("anomaly %q is treated as repairable=%v", anomaly, !repairable)
 		}
 	}
 }
@@ -704,12 +707,27 @@ func TestReusingAVolumeSupersedesThePreviousAttemptsTerminalTime(t *testing.T) {
 	engine := handoffRetentionEngine(t, root, time.Hour, now)
 	name, _ := makeHandoffVolume(t, root, "rerun-owner")
 	stamp(t, engine, name, now.Add(-2*time.Hour))
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "rerun", AttemptID: "attempt",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
 
 	request := RunRequest{
-		Resources: ResourceIdentity{HandoffVolumeDirectory: name},
-		Workload:  WorkloadInput{ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "rerun-owner"}}},
+		Authority: authority, Resources: resources,
+		Workload: WorkloadInput{ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "rerun-owner"}}},
 	}
 	if _, _, _, err := engine.managedVolumeSources(t.Context(), &request); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.registerAttemptLiveAndSupersedeHandoff(&containerdAttempt{authority: authority, resources: resources}); err != nil {
 		t.Fatal(err)
 	}
 	if receiptPresent(t, root, name) {
@@ -719,7 +737,6 @@ func TestReusingAVolumeSupersedesThePreviousAttemptsTerminalTime(t *testing.T) {
 	// It is now a live run with no terminal time, which is exactly what "this
 	// run has not finished" means -- and neither expiry nor the absence
 	// projection may call it residue.
-	engine.attempts["rerun"] = &containerdAttempt{resources: ResourceIdentity{HandoffVolumeDirectory: name}}
 	live, err := engine.liveHandoffVolumes()
 	if err != nil {
 		t.Fatal(err)
@@ -921,13 +938,14 @@ func TestTheInventoryCallRepairsAReceiptTheSweepCouldNotWrite(t *testing.T) {
 	engine := handoffRetentionEngine(t, root, time.Hour, now)
 	name, _ := makeHandoffVolume(t, root, "refused-receipt")
 
-	// A non-empty directory where the receipt goes: publishing it fails, and
-	// the first read reports a volume with no helper-owned terminal time.
-	blocked := filepath.Join(engine.handoffRetentionRoot(), HandoffRetentionRecordName(name))
-	if err := os.MkdirAll(filepath.Join(blocked, "occupied"), 0o700); err != nil {
-		t.Fatal(err)
+	// Fail the temporary receipt write itself. An existing directory at the
+	// receipt path would be an unreadable receipt, which create-only repair must
+	// leave alone rather than treating as a refused publication.
+	engine.handoffRepairWrite = func(*os.File, []byte) error {
+		return errors.New("receipt write refused")
 	}
 	first, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+	engine.handoffRepairWrite = nil
 	if err != nil {
 		t.Fatalf("a receipt the filesystem refused failed the whole read: %v", err)
 	}
@@ -937,9 +955,6 @@ func TestTheInventoryCallRepairsAReceiptTheSweepCouldNotWrite(t *testing.T) {
 
 	// The filesystem recovers. No sweep, no restart -- the next accounting
 	// read is what repairs it.
-	if err := os.RemoveAll(blocked); err != nil {
-		t.Fatal(err)
-	}
 	second, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -970,6 +985,140 @@ func TestTheInventoryCallNeverStampsAVolumeALiveAttemptHolds(t *testing.T) {
 	}
 	if !receiptPresent(t, root, idle) {
 		t.Fatal("an accounting read did not repair the volume no attempt holds")
+	}
+}
+
+func TestInventoryRepairRacingRunPreparationDoesNotStampTheLiveVolume(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "preparing-run")
+	measured := make(chan struct{})
+	resume := make(chan struct{})
+	engine.handoffRepairMeasured = func(volume string) {
+		if volume == name {
+			close(measured)
+			<-resume
+		}
+	}
+	type result struct {
+		inventory InventoryHandoffVolumesResponse
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		inventory, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+		done <- result{inventory: inventory, err: err}
+	}()
+	<-measured
+
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "preparing", AttemptID: "attempt",
+		FencingToken: "fence", Class: contract.JobClassOneShot, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.HandoffVolumeDirectory = name
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.registerAttemptLiveAndSupersedeHandoff(&containerdAttempt{authority: authority, resources: resources}); err != nil {
+		t.Fatal(err)
+	}
+	close(resume)
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if receiptPresent(t, root, name) {
+		t.Fatal("repair published a terminal receipt after Run made the volume live")
+	}
+	if len(got.inventory.Volumes) != 1 || !got.inventory.Volumes[0].Live || got.inventory.Volumes[0].TerminalKnown {
+		t.Fatalf("inventory after Run preparation = %+v, want one live volume with no terminal time", got.inventory.Volumes)
+	}
+}
+
+func TestInventoryRepairRacingDeleteCannotReplaceDeletesReceipt(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	deletedAt := now.Add(5 * time.Minute)
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, _ := makeHandoffVolume(t, root, "finalizing-run")
+	measured := make(chan struct{})
+	resume := make(chan struct{})
+	engine.handoffRepairMeasured = func(volume string) {
+		if volume == name {
+			close(measured)
+			<-resume
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+		done <- err
+	}()
+	<-measured
+	if err := engine.writeHandoffRetentionReceipt(t.Context(), name, deletedAt); err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := engine.handoffRetentionPath(name)
+	want, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(resume)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("repair replaced Delete's receipt: got %q want %q", got, want)
+	}
+}
+
+func TestInventoryRepairDoesNotPublishAfterTheVolumeIdentityIsReused(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	engine := handoffRetentionEngine(t, root, time.Hour, now)
+	name, path := makeHandoffVolume(t, root, "reused-name")
+	replacement := filepath.Join(root, "preallocated-replacement")
+	if err := os.Mkdir(replacement, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	measured := make(chan struct{})
+	resume := make(chan struct{})
+	engine.handoffRepairMeasured = func(volume string) {
+		if volume == name {
+			close(measured)
+			<-resume
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.InventoryHandoffVolumes(t.Context(), InventoryHandoffVolumesRequest{})
+		done <- err
+	}()
+	<-measured
+	// Linux does not replace an existing directory with rename. Remove the
+	// empty measured directory while repair is paused, then move the already
+	// allocated replacement inode into the same stable name.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	close(resume)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if receiptPresent(t, root, name) {
+		t.Fatal("repair published figures measured from the directory previously at the reused name")
 	}
 }
 
