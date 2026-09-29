@@ -408,17 +408,15 @@ attempt's lease runs, then `lease_expired` with late evidence; an attempt that
 is no longer the job's current or retained replay attempt is `attempt_mismatch`
 (#553).
 
-An accepted completion of a Computer Job is followed by a Computer-wide
-`attempt_terminal` token revocation at the run ledger only while that Job is
-still the Computer's current Job, read in the completion's own transaction
-together with the attempt binding above. A replay re-drives it under the same
-rule, since the replay is the retry path for a revocation that failed after
-the completion committed. Once a reimage has installed a newer current Job,
-the old Job keeps its completion replay binding and its identical replay is
-still answered as recorded, but no revocation is sent: a Computer-wide
-revocation would end the replacement attempt's live tokens, and the old
-attempt's own tokens already fail the scope proof, which admits only a claimed
-or running attempt of the Computer's current Job.
+An accepted completion of a Computer Job -- first write or replay, of the
+Computer's current Job or of one a reimage has since superseded -- is followed
+by an `attempt_terminal` revocation at the run ledger scoped to exactly the
+completed attempt (`computer_attempt_id`), never a Computer-wide revoke-all.
+The request leaves L1 after the completion transaction ends, so a reimage or
+restart may already have minted the next attempt's pass by the time it lands;
+an attempt-scoped revocation cannot touch that pass. A replay re-drives the
+same request, which is the retry path for a revocation that failed after the
+completion committed (#548).
 
 An accepted completion writes the exact `ProcessResult` into
 `attempts.result_json` in the same transaction that finalizes the attempt and

@@ -3582,19 +3582,15 @@ type CompletionOutcome struct {
 	// Replayed is true for an identical replay of the completion the attempt
 	// already recorded; such a call wrote nothing.
 	Replayed bool
-	// RevokeComputerID names the Computer whose token authority this
-	// completion ends, or is empty. It is read in the completion's own
-	// transaction and set only while the completed Job is still that
-	// Computer's current Job and still binds the completed attempt, so the
-	// Computer-wide revocation that follows can never reach the tokens of a
-	// newer Job's attempt (a reimage installs a new current Job while the old
-	// one keeps its completion replay binding, #553 review).
-	RevokeComputerID string
+	// ComputerID names the Computer the completed Job belongs to, or is
+	// empty for an ordinary job. The completed attempt's Computer tokens are
+	// revoked, and only those.
+	ComputerID string
 }
 
 // CompleteAttemptOutcome is CompleteAttempt that additionally reports whether
-// the call was an identical replay and which Computer's tokens, if any, the
-// accepted completion ends.
+// the call was an identical replay and which Computer, if any, the completed
+// attempt held tokens for.
 func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobID, attemptID string, request CompletionRequest) (CompletionOutcome, error) {
 	if request.FencingToken == "" || request.IdempotencyKey == "" {
 		return CompletionOutcome{}, protocolError(contract.ErrorInvalidRequest, "fencing_token and idempotency_key are required")
@@ -3678,11 +3674,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err != nil {
 			return CompletionOutcome{}, internalError(err, "read completed job replay")
 		}
-		revokeComputerID, err := currentComputerForJob(ctx, tx, jobID)
+		computerID, err := computerForJob(ctx, tx, jobID)
 		if err != nil {
 			return CompletionOutcome{}, err
 		}
-		return CompletionOutcome{Job: job, Replayed: true, RevokeComputerID: revokeComputerID}, nil
+		return CompletionOutcome{Job: job, Replayed: true, ComputerID: computerID}, nil
 	}
 	if attempt.state == contract.AttemptLost {
 		lateEvidence := LateResultEvidence{
@@ -3839,22 +3835,21 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err != nil {
 		return CompletionOutcome{}, internalError(err, "read completed job")
 	}
-	revokeComputerID, err := currentComputerForJob(ctx, tx, jobID)
+	computerID, err := computerForJob(ctx, tx, jobID)
 	if err != nil {
 		return CompletionOutcome{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return CompletionOutcome{}, internalError(err, "commit completion")
 	}
-	return CompletionOutcome{Job: job, RevokeComputerID: revokeComputerID}, nil
+	return CompletionOutcome{Job: job, ComputerID: computerID}, nil
 }
 
-// currentComputerForJob returns the Computer whose current Job is jobID, or
-// "" when jobID is not a Computer's current Job (a plain job, or a Computer
-// Job a reimage has superseded).
-func currentComputerForJob(ctx context.Context, q queryer, jobID string) (string, error) {
+// computerForJob returns the Computer jobID was projected for, current or
+// superseded, or "" for an ordinary job.
+func computerForJob(ctx context.Context, q queryer, jobID string) (string, error) {
 	var computerID string
-	err := q.QueryRowContext(ctx, `SELECT computer_id FROM computers WHERE current_job_id=?`, jobID).Scan(&computerID)
+	err := q.QueryRowContext(ctx, `SELECT computer_id FROM computer_job_projections WHERE job_id=?`, jobID).Scan(&computerID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

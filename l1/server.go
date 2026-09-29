@@ -1622,6 +1622,21 @@ func (s *Server) revokeComputerAuthorityWithReceipt(ctx context.Context, compute
 	return &receipt, nil
 }
 
+// revokeComputerAttemptAuthority revokes only the Computer tokens bound to one
+// attempt, leaving any other attempt's tokens -- including a newer attempt's
+// minted concurrently -- untouched.
+func (s *Server) revokeComputerAttemptAuthority(ctx context.Context, computerID, attemptID, reason string) error {
+	if s.computerTokenRevoker == nil {
+		return nil
+	}
+	if _, err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
+		ComputerID: computerID, ComputerAttemptID: attemptID, Reason: reason,
+	}); err != nil {
+		return computerRevocationNotRecorded(err)
+	}
+	return nil
+}
+
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	if err := requireServiceClass(r); err != nil {
 		writeError(w, err)
@@ -2305,15 +2320,15 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	// The Computer-wide revocation is sent only while the completed Job is
-	// still the Computer's current Job, as read by the completion itself;
-	// otherwise it would revoke a newer Job's live tokens. A replay re-drives
-	// it under the same rule: it is the only retry of a revocation that failed
-	// after the completion committed (#548). A superseded attempt's tokens need
-	// no revocation, since L3 refuses a token whose attempt is no longer live
-	// (#551).
-	if outcome.RevokeComputerID != "" {
-		if revokeErr := s.revokeComputerAuthority(r.Context(), outcome.RevokeComputerID, "attempt_terminal"); revokeErr != nil {
+	// A completion ends exactly one attempt's authority, so it revokes exactly
+	// that attempt's Computer tokens. Never Computer-wide: by the time the
+	// request reaches the run ledger a reimage or restart may already have
+	// minted the next attempt's tokens (#553 review). A replay re-drives it,
+	// which is the only retry of a revocation that failed after the completion
+	// committed (#548).
+	if outcome.ComputerID != "" {
+		if revokeErr := s.revokeComputerAttemptAuthority(r.Context(), outcome.ComputerID,
+			r.PathValue("attempt_id"), "attempt_terminal"); revokeErr != nil {
 			writeError(w, revokeErr)
 			return
 		}

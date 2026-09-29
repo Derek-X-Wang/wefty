@@ -267,7 +267,11 @@ type ComputerTokenRevocationRequest struct {
 	ComputerID               string `json:"computer_id"`
 	SubmitIntentRevision     int64  `json:"submit_intent_revision"`
 	RevokeAll                bool   `json:"revoke_all,omitempty"`
-	Reason                   string `json:"reason"`
+	// ComputerAttemptID, when set, revokes only the grants bound to that one
+	// attempt of the Computer, whichever host holds them. It excludes
+	// RevokeAll, RestoreOperationRevision, and SubmitIntentRevision.
+	ComputerAttemptID string `json:"computer_attempt_id,omitempty"`
+	Reason            string `json:"reason"`
 }
 
 type ComputerAttemptTokenRevocationRequest struct {
