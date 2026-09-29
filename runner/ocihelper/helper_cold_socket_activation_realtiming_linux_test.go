@@ -47,12 +47,17 @@ const (
 var helperUnitProperties = []string{
 	"ActiveState", "SubState", "MainPID", "NRestarts", "InvocationID", "TriggeredBy",
 	"InactiveExitTimestampMonotonic", "ExecMainStartTimestampMonotonic", "ActiveEnterTimestamp",
+	// Why a cold unit is cold: a helper that exits non-zero on SIGTERM leaves
+	// the stopped unit failed rather than inactive. Recorded, not asserted.
+	"Result", "ExecMainCode", "ExecMainStatus",
 }
 
 // TestNativeLinuxHelperColdSocketActivation proves the Linux-only claim that
 // the root helper is socket-activated (#402): a cold, inactive helper unit
 // comes up on socket activation and serves the first session. With the .socket
-// listening and the .service stopped, and no start during a cold hold, the
+// listening and the .service stopped with no process left -- inactive, or
+// failed if the helper exited non-zero on the stop, which socket activation
+// starts just the same -- and no start during a cold hold, the
 // service becomes active only after the probe begins dialing through the
 // product client, as a fresh start (NRestarts=0), and the first session the new
 // invocation admits is the probe's (generation 1, the probe's unique ids).
@@ -197,11 +202,16 @@ func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 	if mainUID != 0 {
 		t.Fatalf("socket-activated helper process %d runs as uid %d, want root", mainPID, mainUID)
 	}
-	// systemd keeps NRestarts readable after a clean stop and flushes it to
-	// zero on the next start that is not a Restart= retry; a retry increments
-	// it. Anything but zero means the running helper is not the fresh start.
+	// A stop never takes the Restart= path, so systemd marks the counter for a
+	// flush whether the unit ends inactive or failed, and the next start zeroes
+	// it; only a Restart= retry increments it. systemd v255 src/core/service.c:
+	// a pending stop forces allow_restart off (L1953), service_enter_dead then
+	// sets flush_n_restarts (L2010-2015), service_start zeroes n_restarts
+	// (L2754-2756), and service_enter_restart increments it (L2531). Anything
+	// but zero means the running helper is not the fresh start.
 	if after["NRestarts"] != "0" {
-		t.Fatalf("helper service NRestarts %s -> %s: the start was a Restart= retry, not socket activation", before["NRestarts"], after["NRestarts"])
+		t.Fatalf("helper service NRestarts %s -> %s (before: Result=%s ExecMainCode=%s ExecMainStatus=%s): the start was a Restart= retry, not socket activation",
+			before["NRestarts"], after["NRestarts"], before["Result"], before["ExecMainCode"], before["ExecMainStatus"])
 	}
 	if after["InvocationID"] == "" || after["InvocationID"] == before["InvocationID"] {
 		t.Fatalf("helper service InvocationID %q -> %q: no new invocation was started", before["InvocationID"], after["InvocationID"])
@@ -238,6 +248,8 @@ func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 		socketStopped.properties["ActiveState"], socketStopped.properties["SubState"], coldHold.Nanoseconds())
 	fmt.Fprintf(&evidence, "helper_service_is_active_after=%s\nhelper_service_state_after=%s/%s\nhelper_service_main_pid_after=%d\nhelper_service_main_uid_after=%d\nhelper_service_triggered_by=%s\n",
 		serviceAfter.isActive, after["ActiveState"], after["SubState"], mainPID, mainUID, after["TriggeredBy"])
+	fmt.Fprintf(&evidence, "helper_service_result_before=%s\nhelper_service_exec_main_code_before=%s\nhelper_service_exec_main_status_before=%s\n",
+		before["Result"], before["ExecMainCode"], before["ExecMainStatus"])
 	fmt.Fprintf(&evidence, "helper_service_active_enter_timestamp_after=%s\nhelper_service_nrestarts_before=%s\nhelper_service_nrestarts_after=%s\nhelper_service_invocation_before=%s\nhelper_service_invocation_after=%s\n",
 		after["ActiveEnterTimestamp"], before["NRestarts"], after["NRestarts"], before["InvocationID"], after["InvocationID"])
 	fmt.Fprintf(&evidence, "first_connect_dial_started_monotonic_us=%d\nfirst_connect_dial_connected_monotonic_us=%d\nhelper_service_inactive_exit_monotonic_us=%d\nhelper_service_exec_main_start_monotonic_us=%d\nfirst_connect_session_admitted_monotonic_us=%d\nfirst_connect_session_dials=%d\nfirst_connect_helper_instance=%s\nfirst_connect_session_generation=%d\n",
@@ -286,9 +298,14 @@ func readHelperUnit(t *testing.T, unit string) helperUnitReading {
 func assertColdHelperService(t *testing.T, phase string, reading helperUnitReading) {
 	t.Helper()
 	properties := reading.properties
-	if reading.isActive != "inactive" || properties["ActiveState"] != "inactive" || properties["SubState"] != "dead" || properties["MainPID"] != "0" {
-		t.Fatalf("helper service %s = is-active %q, %s/%s MainPID=%s; want a cold inactive/dead unit with no process",
-			phase, reading.isActive, properties["ActiveState"], properties["SubState"], properties["MainPID"])
+	// Cold means no helper process with only the socket left to start it. A
+	// failed unit is as cold as an inactive one: socket activation starts it on
+	// the next connect all the same.
+	state := properties["ActiveState"] + "/" + properties["SubState"]
+	if (state != "inactive/dead" && state != "failed/failed") || reading.isActive != properties["ActiveState"] || properties["MainPID"] != "0" {
+		t.Fatalf("helper service %s = is-active %q, %s MainPID=%s Result=%s ExecMainCode=%s ExecMainStatus=%s NRestarts=%s; want a cold inactive/dead or failed/failed unit with no process",
+			phase, reading.isActive, state, properties["MainPID"], properties["Result"],
+			properties["ExecMainCode"], properties["ExecMainStatus"], properties["NRestarts"])
 	}
 }
 
