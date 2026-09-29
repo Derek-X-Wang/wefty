@@ -372,19 +372,36 @@ func (e *computerStorageDestinationFullError) Error() string {
 func (e *computerStorageDestinationFullError) Unwrap() error { return e.Err }
 
 // destinationCapacityError converts ENOSPC from one exact destination
-// allocation or write into the typed capacity refusal, recording the Node
-// filesystem's available bytes while this call still owns the generation. Any
-// other error, and any failure to read that capacity fact, is returned
-// unchanged.
-func (engine *ContainerdEngine) destinationCapacityError(err error) error {
+// allocation or write into the typed capacity refusal. `before` is the Node
+// filesystem's available bytes read just before that allocation, or negative
+// when no earlier reading exists. A refused fallocate can already have taken
+// part of the extent, so a reading taken after the failure reports the
+// refusal's own debris rather than the capacity that was refused (#561); the
+// earlier reading is the fact the refusal decided against. Only a write
+// with no earlier reading measures now. Any other error, and any failure to
+// read the capacity fact, is returned unchanged.
+func (engine *ContainerdEngine) destinationCapacityError(err error, before int64) error {
 	if err == nil || soleCause(err) != unix.ENOSPC {
 		return err
 	}
-	available, availableErr := filesystemAvailableBytes(filepath.Join(engine.config.RuntimeRoot, "computer-disks"))
-	if availableErr != nil {
-		return errors.Join(err, availableErr)
+	available := before
+	if available < 0 {
+		var availableErr error
+		if available, availableErr = engine.destinationAvailableBytes(); availableErr != nil {
+			return errors.Join(err, availableErr)
+		}
 	}
 	return &computerStorageDestinationFullError{ObservedAvailableBytes: available, Err: err}
+}
+
+// destinationAvailableBytes reads the free bytes of the filesystem holding
+// Computer disks, through the same test seam a grow reservation uses.
+func (engine *ContainerdEngine) destinationAvailableBytes() (int64, error) {
+	measure := filesystemAvailableBytes
+	if engine.computerGrowAvailableBytes != nil {
+		measure = engine.computerGrowAvailableBytes
+	}
+	return measure(filepath.Join(engine.config.RuntimeRoot, "computer-disks"))
 }
 
 // computerStorageCopySourceError names a recognized source-validation failure
@@ -853,13 +870,17 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		// Only the allocation itself can be a capacity fact. Either close
 		// failure joins the outcome and keeps it an engine failure, and
 		// neither is ever discarded.
+		availableBeforeAllocation := int64(-1)
+		if measured, measureErr := engine.destinationAvailableBytes(); measureErr == nil {
+			availableBeforeAllocation = measured
+		}
 		allocationErr, allocationCloseErr := engine.allocateComputerDestination(stagingPath, request.SourceSize)
 		outerCloseErr := file.Close()
 		if allocationCloseErr != nil || outerCloseErr != nil {
 			return CopyComputerStorageResponse{}, errors.Join(allocationErr, allocationCloseErr, outerCloseErr)
 		}
 		if allocationErr != nil {
-			return CopyComputerStorageResponse{}, engine.destinationCapacityError(allocationErr)
+			return CopyComputerStorageResponse{}, engine.destinationCapacityError(allocationErr, availableBeforeAllocation)
 		}
 		manifest.Phase = computerStorageCopyAllocated
 		if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
@@ -891,7 +912,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 			return CopyComputerStorageResponse{}, errors.Join(copyErr, closeErr)
 		}
 		if copyErr != nil {
-			return CopyComputerStorageResponse{}, engine.destinationCapacityError(copyErr)
+			return CopyComputerStorageResponse{}, engine.destinationCapacityError(copyErr, -1)
 		}
 		manifest.Phase = computerStorageCopyCopied
 		if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
@@ -928,12 +949,16 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	facts := computerStorageCopyFacts{}
 	if manifest.Phase == computerStorageCopySourceVerified {
 		if request.Destination.DiskBytes > request.SourceSize {
+			availableBeforeExpansion := int64(-1)
+			if measured, measureErr := engine.destinationAvailableBytes(); measureErr == nil {
+				availableBeforeExpansion = measured
+			}
 			expansionErr, expansionCloseErr := engine.allocateComputerDestination(stagingPath, request.Destination.DiskBytes)
 			if expansionCloseErr != nil {
 				return CopyComputerStorageResponse{}, errors.Join(expansionErr, expansionCloseErr)
 			}
 			if expansionErr != nil {
-				return CopyComputerStorageResponse{}, engine.destinationCapacityError(expansionErr)
+				return CopyComputerStorageResponse{}, engine.destinationCapacityError(expansionErr, availableBeforeExpansion)
 			}
 		}
 		expanded := request.Destination.DiskBytes > request.SourceSize

@@ -537,6 +537,40 @@ func TestCloneIntegrityFailureKeepsTheDestinationAndItsQuarantine(t *testing.T) 
 	}
 }
 
+// A refused fallocate can leave part of the extent behind, so the free bytes
+// read after the failure describe the refusal's debris, not the capacity it
+// was refused against (#561, run 4 read 0 while 21.7 GB were free). The
+// receipt carries the reading taken before the allocation.
+func TestCloneCapacityRefusalCarriesTheAvailableBytesReadBeforeTheAllocation(t *testing.T) {
+	const freeBeforeRefusal = int64(21700370432)
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize+(1<<20))
+	drained := false
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerGrowAvailableBytes: func(string) (int64, error) {
+			if drained {
+				return 0, nil
+			}
+			return freeBeforeRefusal, nil
+		},
+		computerBackupAllocate: func(path string, size int64) error {
+			if size > request.SourceSize {
+				drained = true
+				return unix.ENOSPC
+			}
+			return fullyAllocateComputerDisk(path, size)
+		}, storageCopyFinalize: fakeCloneFinalize(t)}
+	response, err := engine.CopyComputerStorage(t.Context(), request)
+	if err != nil {
+		t.Fatalf("over-capacity clone error = %v, want a typed receipt", err)
+	}
+	receipt := response.Receipt
+	if receipt.FailureCode != "insufficient_disk" || receipt.ObservedAvailableBytes != freeBeforeRefusal {
+		t.Fatalf("over-capacity receipt code=%q observed=%d, want insufficient_disk observing %d",
+			receipt.FailureCode, receipt.ObservedAvailableBytes, freeBeforeRefusal)
+	}
+}
+
 func TestDelayedAttachmentRechecksRefusalAfterAcquiringGeneration(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
 	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
