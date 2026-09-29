@@ -392,7 +392,19 @@ the lifecycle does not classify the cancellation cause as a `/complete`
 response: it releases that ownership and wakes the bounded outbox reconciler.
 The reconciler survives the attempt authority context, runs at most eight
 attempt workers, and retries both spool scan failures and per-attempt failures
-after the configured injected-clock backoff. While L1 reports the attempt as
+on the injected clock: the configured retry interval, doubled per consecutive
+failure of the same work and capped at 30 seconds (or at the interval itself
+when that is configured larger), reset by the first success. A typed refusal
+no retry from this agent process can clear -- `node_session_replaced`,
+`identity_bound`, or `principal_forbidden` -- is reported once and parks that
+attempt for the rest of the process: recovery never asks for it again, and its
+durable evidence is left pending on disk, neither delivered nor sealed. The
+next agent process's recovery scans it again. For `node_session_replaced` on a
+completion L1 already accepted from an older registration, that retry is
+refused again and the row stays until something else removes it (service
+removal purges the job's spool rows; a one-shot row has no such path); for a
+completion L1 has not accepted, a replay made after the attempt's lease has
+expired at L1 lands as late evidence. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
 completion; an accepted completion closes that attempt's log stream at L1
 (`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
