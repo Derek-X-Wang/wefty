@@ -538,6 +538,14 @@ func TestLogFinalizationDeadlineRetainsSuccessfulOCIManagedVolumes(t *testing.T)
 	}
 }
 
+// The finalization budget here is the production default rather than a short
+// wall-clock bound. A healthy final flush on a loaded runner (one SQLite append,
+// one spool read, one upload, one ack) can legitimately outlast a few
+// milliseconds, and the contract then records log_evidence_incomplete by design
+// (#163). This test is about the recount, not that budget: the recount
+// checkpoint reports any bounded recount directly instead of waiting for the
+// budget to expire, so a regression fails immediately and a healthy run has no
+// deadline left to race.
 func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *testing.T) {
 	uploadedTail := make(chan contract.LogEvent, 1)
 	var boundedAppends, unboundedAppends atomic.Int64
@@ -575,7 +583,7 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 			ackResponse.Store(ackWritten)
 		}
 	})
-	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	client, stopServer := startEvidenceReplayServer(t, handler, DefaultFinalizationTimeout)
 	defer stopServer()
 	defer client.Close()
 	outbox, err := newEvidenceOutbox(t.TempDir(), "pending-count-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
@@ -589,8 +597,10 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 		if _, bounded := ctx.Deadline(); !bounded {
 			return
 		}
-		countStarted <- struct{}{}
-		<-ctx.Done()
+		select {
+		case countStarted <- struct{}{}:
+		default:
+		}
 	}
 	outbox.spool.appendCheckpoint = func(ctx context.Context) {
 		if _, bounded := ctx.Deadline(); bounded {
@@ -618,7 +628,7 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 		client: client, outbox: outbox, runtimes: testRuntimeSet(bufferedOutputRunner{}),
 		clock: systemClock{}, nodeID: "pending-count-node", bootSessionID: "pending-count-boot",
-		finalizationTimeout: 25 * time.Millisecond,
+		finalizationTimeout: DefaultFinalizationTimeout,
 		observer:            newLifecycleObserver(systemClock{}),
 		logSinkFactory: func(ctx context.Context, claim l1.Claim) (attemptLogSink, error) {
 			sink, err := outbox.newLogSink(ctx, client, claim)
@@ -685,6 +695,10 @@ func TestFinalRedactionFlushDoesNotSynchronouslyRecountPendingSpoolEvents(t *tes
 	if countWasContended {
 		logSnapshot()
 		t.Fatal("final redaction flush synchronously recounted pending spool events")
+	}
+	if snapshot.BoundedAppends != 1 || snapshot.UnboundedAppends != 0 {
+		logSnapshot()
+		t.Fatal("the only output write must reach the spool through the bounded final redaction flush")
 	}
 	select {
 	case tail := <-uploadedTail:
