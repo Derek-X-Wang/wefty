@@ -144,3 +144,45 @@ func TestProveTaskLossAttemptScopedNeedsTheEngineToAnswerForTheTask(t *testing.T
 		t.Fatal("a missing engine probe proved a runtime failure attempt-scoped")
 	}
 }
+
+// Task absence alone does not prove a shim loss: a containerd that restarted
+// and lost task state answers NotFound for every task. The answer counts only
+// when the engine identity read after it equals the one the attempt started
+// under (#560 review).
+func TestObserveTaskAbsenceOnSameEngineRequiresEngineContinuity(t *testing.T) {
+	started := engineIdentity{InstanceUUID: "containerd-uuid", PID: 100, PIDNamespace: 4026531836}
+	gone := func(context.Context) taskAbsenceObservation { return taskObservationGone }
+	identityIs := func(identity engineIdentity, err error) func(context.Context) (engineIdentity, error) {
+		return func(context.Context) (engineIdentity, error) { return identity, err }
+	}
+	restarted := started
+	restarted.PID = 200
+	otherNamespace := started
+	otherNamespace.PIDNamespace = 4026532000
+	for _, test := range []struct {
+		name     string
+		baseline engineIdentity
+		task     func(context.Context) taskAbsenceObservation
+		identity func(context.Context) (engineIdentity, error)
+		want     taskAbsenceObservation
+	}{
+		{name: "same engine answers gone", baseline: started, task: gone, identity: identityIs(started, nil), want: taskObservationGone},
+		{name: "restarted engine answers gone", baseline: started, task: gone, identity: identityIs(restarted, nil), want: taskObservationEngineChanged},
+		{name: "engine in another PID namespace answers gone", baseline: started, task: gone, identity: identityIs(otherNamespace, nil), want: taskObservationEngineChanged},
+		{name: "identity unreadable", baseline: started, task: gone, identity: identityIs(engineIdentity{}, errors.New("introspection unavailable")), want: taskObservationUnproven},
+		{name: "identity incomplete", baseline: started, task: gone, identity: identityIs(engineIdentity{InstanceUUID: "containerd-uuid"}, nil), want: taskObservationUnproven},
+		{name: "no identity at attempt start", task: gone, identity: identityIs(started, nil), want: taskObservationEngineChanged},
+		{name: "task still live", baseline: started, task: func(context.Context) taskAbsenceObservation { return taskObservationLive }, identity: identityIs(started, nil), want: taskObservationLive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := observeTaskAbsenceOnSameEngine(t.Context(), test.baseline, test.task, test.identity); got != test.want {
+				t.Fatalf("observation = %d, want %d", got, test.want)
+			}
+		})
+	}
+	calls := 0
+	changed := func(context.Context) taskAbsenceObservation { calls++; return taskObservationEngineChanged }
+	if proveTaskLossAttemptScoped(time.Second, errors.New("ttrpc: closed"), changed) || calls != 1 {
+		t.Fatalf("a changed engine scoped the failure or was re-asked (%d calls)", calls)
+	}
+}

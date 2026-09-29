@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/introspection"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -1340,6 +1341,11 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return RunResponse{}, &RuntimeSpecRejectionError{err: verifyErr}
 		}
 	}
+	// The engine process this attempt starts under, read before its Wait is
+	// registered: a later shim-loss answer counts only from this same process.
+	// An unreadable identity costs nothing here -- the attempt runs -- but any
+	// runtime failure it later reports stays unscoped engine-loss evidence.
+	startEngine := engine.captureDaemonIdentity(ctx)
 	attemptContext, attemptCancel := context.WithCancel(leases.WithLease(engineContext(context.Background()), lease.ID))
 	wait, err := task.Wait(attemptContext)
 	if err != nil {
@@ -1352,9 +1358,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return nil
 		}
 		return deleteErr
-	}, observeTaskAbsence: func(ctx context.Context) taskAbsenceObservation {
-		return observeContainerdTaskAbsence(engineContext(ctx), task)
-	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
+	}, observeTaskAbsence: engine.attemptTaskAbsenceObserver(task, startEngine), stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
 	engine.watchOOM(attempt)
 	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
 	// The durable ownership record was published before NewTask and the
@@ -1792,6 +1796,57 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 		close(attempt.terminalReady)
 	}); err != nil {
 		log.Printf("release exited OCI task %s before log sealing: %v", attempt.authority.AttemptID, err)
+	}
+}
+
+// daemonIdentityReadTimeout bounds one introspection read of the containerd
+// process identity.
+const daemonIdentityReadTimeout = 2 * time.Second
+
+// containerdDaemonIdentity reads the serving containerd process's identity
+// from the introspection service. containerd persists the UUID under its root,
+// so it survives a restart; the PID and PID namespace are what change.
+func containerdDaemonIdentity(ctx context.Context, service introspection.Service) (engineIdentity, error) {
+	if service == nil {
+		return engineIdentity{}, errors.New("containerd introspection service is unavailable")
+	}
+	response, err := service.Server(ctx)
+	if err != nil {
+		return engineIdentity{}, err
+	}
+	identity := engineIdentity{InstanceUUID: response.GetUUID(), PID: response.GetPid(), PIDNamespace: response.GetPidns()}
+	if !identity.complete() {
+		return engineIdentity{}, errors.New("containerd introspection returned no daemon process identity")
+	}
+	return identity, nil
+}
+
+// captureDaemonIdentity records the engine identity an attempt starts under.
+// A failure is logged and yields an empty identity, which can never prove a
+// runtime failure attempt-scoped.
+func (engine *ContainerdEngine) captureDaemonIdentity(ctx context.Context) engineIdentity {
+	readContext, cancel := context.WithTimeout(engineContext(ctx), daemonIdentityReadTimeout)
+	defer cancel()
+	identity, err := containerdDaemonIdentity(readContext, engine.client.IntrospectionService())
+	if err != nil {
+		log.Printf("read containerd daemon identity at attempt start; a runtime failure of this attempt stays engine-loss evidence: %v", err)
+		return engineIdentity{}
+	}
+	return identity
+}
+
+// attemptTaskAbsenceObserver is the shim-loss probe for one attempt: the
+// task's own answer, gated on the engine still being the process the attempt
+// started under.
+func (engine *ContainerdEngine) attemptTaskAbsenceObserver(task containerd.Task, startEngine engineIdentity) func(context.Context) taskAbsenceObservation {
+	return func(ctx context.Context) taskAbsenceObservation {
+		return observeTaskAbsenceOnSameEngine(ctx, startEngine,
+			func(ctx context.Context) taskAbsenceObservation {
+				return observeContainerdTaskAbsence(engineContext(ctx), task)
+			},
+			func(ctx context.Context) (engineIdentity, error) {
+				return containerdDaemonIdentity(engineContext(ctx), engine.client.IntrospectionService())
+			})
 	}
 }
 

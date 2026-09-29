@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	introspectionapi "github.com/containerd/containerd/api/services/introspection/v1"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/errdefs"
 )
@@ -492,6 +493,122 @@ func TestObserveContainerdTaskAbsenceMapsTheEngineAnswer(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := observeContainerdTaskAbsence(t.Context(), test.task); got != test.want {
 				t.Fatalf("observation = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+// fakeIntrospection answers containerd's introspection Server call from a
+// sequence, the last answer repeating.
+type fakeIntrospection struct {
+	mu        sync.Mutex
+	responses []*introspectionapi.ServerResponse
+	errs      []error
+	calls     int
+}
+
+func (service *fakeIntrospection) Server(context.Context) (*introspectionapi.ServerResponse, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	index := service.calls
+	service.calls++
+	var err error
+	if len(service.errs) > 0 {
+		err = service.errs[min(index, len(service.errs)-1)]
+	}
+	if err != nil {
+		return nil, err
+	}
+	return service.responses[min(index, len(service.responses)-1)], nil
+}
+
+func (*fakeIntrospection) Plugins(context.Context, ...string) (*introspectionapi.PluginsResponse, error) {
+	return nil, errors.New("unused")
+}
+
+func (*fakeIntrospection) PluginInfo(context.Context, string, string, any) (*introspectionapi.PluginInfoResponse, error) {
+	return nil, errors.New("unused")
+}
+
+func introspectingEngine(t *testing.T, service *fakeIntrospection) *ContainerdEngine {
+	t.Helper()
+	client, err := containerd.New("", containerd.WithServices(containerd.WithIntrospectionService(service)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &ContainerdEngine{client: client}
+}
+
+// containerd's introspection answer is the engine identity: its persistent
+// UUID plus the serving process and PID namespace. An error or an answer
+// without a process is no identity at all.
+func TestContainerdDaemonIdentityReadsIntrospection(t *testing.T) {
+	engine := introspectingEngine(t, &fakeIntrospection{responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid", Pid: 812, Pidns: 4026531836}}})
+	identity := engine.captureDaemonIdentity(t.Context())
+	if identity != (engineIdentity{InstanceUUID: "containerd-uuid", PID: 812, PIDNamespace: 4026531836}) {
+		t.Fatalf("daemon identity = %+v", identity)
+	}
+	for name, service := range map[string]*fakeIntrospection{
+		"introspection error": {errs: []error{fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}},
+		"no process":          {responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid"}}},
+		"no uuid":             {responses: []*introspectionapi.ServerResponse{{Pid: 812}}},
+	} {
+		if identity := introspectingEngine(t, service).captureDaemonIdentity(t.Context()); identity.complete() {
+			t.Fatalf("%s produced daemon identity %+v", name, identity)
+		}
+	}
+}
+
+// The shim-loss probe on a real containerd client: the task answers NotFound
+// in every case, and only the same containerd process answering scopes the
+// failure. A containerd that restarted inside the probe window -- new PID,
+// same persistent UUID -- and lost task state answers NotFound for every task,
+// so that failure stays engine loss; so does an introspection error or an
+// attempt that started without a readable identity (#560 review).
+func TestContainerdShimLossScopeRequiresTheSameDaemonProcess(t *testing.T) {
+	started := &introspectionapi.ServerResponse{UUID: "containerd-uuid", Pid: 812, Pidns: 4026531836}
+	restarted := &introspectionapi.ServerResponse{UUID: "containerd-uuid", Pid: 9731, Pidns: 4026531836}
+	reaped := statusOnlyTask{err: fmt.Errorf("task wefty-attempt not found: %w", errdefs.ErrNotFound)}
+	for _, test := range []struct {
+		name    string
+		service *fakeIntrospection
+		want    bool
+	}{
+		{name: "same daemon reaped the dead shim", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started}}, want: true},
+		{name: "daemon restarted and lost task state", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started, restarted}}},
+		{name: "introspection fails at probe time", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started}, errs: []error{nil, fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}}},
+		{name: "no identity at attempt start", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started}, errs: []error{errors.New("introspection unavailable"), nil}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			paths := emptyLogSegments(t, root)
+			authority := testAuthority()
+			engine := introspectingEngine(t, test.service)
+			engine.config = NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 2 * time.Second}
+			attempt := &containerdAttempt{
+				authority:       authority,
+				stdout:          paths["stdout"],
+				stderr:          paths["stderr"],
+				terminalReady:   make(chan struct{}),
+				logAcknowledged: make(map[string]uint64),
+				releaseTask: func(context.Context) error {
+					sealedLogSegments(t, paths)
+					return nil
+				},
+				observeTaskAbsence: engine.attemptTaskAbsenceObserver(reaped, engine.captureDaemonIdentity(t.Context())),
+			}
+			engine.attempts = map[string]*containerdAttempt{authority.key(): attempt}
+			wait := make(chan containerd.ExitStatus, 1)
+			wait <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, errors.New("rpc error: code = Unknown desc = ttrpc: closed"))
+			close(wait)
+			go attempt.cacheTerminal(wait, root, 300*time.Millisecond)
+
+			result, _ := watchTerminalEvidence(t, engine, authority)
+			if result == nil || result.RuntimeFailure == "" {
+				t.Fatalf("terminal result = %+v, want a runtime failure", result)
+			}
+			if result.RuntimeFailureAttemptScoped != test.want {
+				t.Fatalf("attempt scoped = %t, want %t", result.RuntimeFailureAttemptScoped, test.want)
 			}
 		})
 	}

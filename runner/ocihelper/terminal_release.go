@@ -116,7 +116,51 @@ const (
 	// taskObservationLive means the engine answered that the task still
 	// exists in a live state, so the broken Wait was not the task ending.
 	taskObservationLive
+	// taskObservationEngineChanged means the engine that answered is not
+	// provably the engine process the attempt started under: its identity
+	// changed, or was never captured. A restarted engine that lost task state
+	// answers NotFound for every task, so its answer proves nothing about one
+	// shim.
+	taskObservationEngineChanged
 )
+
+// engineIdentity names one running engine process: its persistent instance
+// UUID plus the process ID and PID namespace serving it. The UUID alone
+// survives a restart, so continuity rests on the process.
+type engineIdentity struct {
+	InstanceUUID string
+	PID          uint64
+	PIDNamespace uint64
+}
+
+func (identity engineIdentity) complete() bool {
+	return identity.InstanceUUID != "" && identity.PID != 0
+}
+
+// observeTaskAbsenceOnSameEngine gates a task-absence answer on engine
+// continuity. The task answer counts only if the engine identity read after it
+// equals the identity captured when the attempt started: the same process
+// answered, so it never restarted in between and its NotFound is its own
+// record of reaping this task's lost shim. A missing baseline or a changed
+// identity is final; an identity that cannot be read is retried like any other
+// unanswered question and fails closed when the bound runs out.
+func observeTaskAbsenceOnSameEngine(ctx context.Context, baseline engineIdentity, task func(context.Context) taskAbsenceObservation, identity func(context.Context) (engineIdentity, error)) taskAbsenceObservation {
+	if !baseline.complete() || task == nil || identity == nil {
+		return taskObservationEngineChanged
+	}
+	answer := task(ctx)
+	if answer != taskObservationGone {
+		return answer
+	}
+	current, err := identity(ctx)
+	if err != nil || !current.complete() {
+		return taskObservationUnproven
+	}
+	if current != baseline {
+		return taskObservationEngineChanged
+	}
+	return taskObservationGone
+}
 
 // taskLossScopeProbeInterval paces re-asking the engine about one task while
 // it cleans up after a lost shim. It is a poll cadence inside the bound the
@@ -130,13 +174,15 @@ const taskLossScopeProbeInterval = 25 * time.Millisecond
 // A killed shim breaks its task's Wait with the shim connection error, while
 // containerd itself keeps serving; containerd then reaps the dead shim and
 // drops the task. A containerd that stopped answering breaks the same Wait for
-// every attempt at once, and a restarted containerd reattaches still-running
-// tasks. Only the first is bounded by one attempt, and only the engine saying
-// so for this exact task tells them apart: the claim needs the engine to answer
-// that this task is gone or stopped inside the bound. An engine that never
-// answers, a task it still reports live, a Wait ended by this helper's own
-// cancellation, or a missing probe all leave the failure unscoped, which keeps
-// it helper/engine-loss evidence exactly as before.
+// every attempt at once, and a restarted containerd either reattaches
+// still-running tasks or, having lost their state, reports every one NotFound.
+// Only the first is bounded by one attempt. The claim therefore needs the same
+// engine process the attempt started under to answer, inside the bound, that
+// this task is gone or stopped (observeTaskAbsenceOnSameEngine). An engine
+// that never answers, a task it still reports live, an engine whose identity
+// changed or cannot be proven, a Wait ended by this helper's own cancellation,
+// or a missing probe all leave the failure unscoped, which keeps it
+// helper/engine-loss evidence exactly as before.
 func proveTaskLossAttemptScoped(timeout time.Duration, waitErr error, observe func(context.Context) taskAbsenceObservation) bool {
 	if waitErr == nil || observe == nil || errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
 		return false
@@ -150,7 +196,7 @@ func proveTaskLossAttemptScoped(timeout time.Duration, waitErr error, observe fu
 		switch observe(ctx) {
 		case taskObservationGone:
 			return true
-		case taskObservationLive:
+		case taskObservationLive, taskObservationEngineChanged:
 			return false
 		}
 		timer := time.NewTimer(taskLossScopeProbeInterval)

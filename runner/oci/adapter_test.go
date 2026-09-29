@@ -945,6 +945,7 @@ func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 type shimLossTestEngine struct {
 	*adapterTestEngine
 	lostAttemptID     string
+	unscoped          bool
 	neighbourWatching chan struct{}
 	releaseNeighbour  chan struct{}
 	reapMu            sync.Mutex
@@ -955,7 +956,7 @@ type shimLossTestEngine struct {
 func (engine *shimLossTestEngine) Watch(ctx context.Context, request ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
 	if request.Authority.AttemptID == engine.lostAttemptID {
 		return emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &ocihelper.WatchResponse{
-			RuntimeFailure: "rpc error: code = Unknown desc = ttrpc: closed", RuntimeFailureAttemptScoped: true,
+			RuntimeFailure: "rpc error: code = Unknown desc = ttrpc: closed", RuntimeFailureAttemptScoped: !engine.unscoped,
 		}})
 	}
 	close(engine.neighbourWatching)
@@ -1077,6 +1078,65 @@ func TestAdapterAttemptScopedShimLossKeepsSessionAndNeighbourAttempt(t *testing.
 	defer engine.reapMu.Unlock()
 	if engine.attemptReaps["attempt-b"] != 0 || engine.sessionReaps != 0 {
 		t.Fatalf("neighbour reaps = %d, session reaps = %d; want neither", engine.attemptReaps["attempt-b"], engine.sessionReaps)
+	}
+}
+
+// The same broken Wait without the helper's scope claim -- containerd
+// restarted inside the probe window, so its NotFound proved nothing about one
+// shim -- is engine loss: recovery runs, the session is invalidated, and the
+// neighbour on it ends as runtime loss rather than running on under an engine
+// that may have forgotten it (#560 review).
+func TestAdapterUnscopedShimLossRecoversSessionAndEndsNeighbourAsEngineLoss(t *testing.T) {
+	engine := &shimLossTestEngine{
+		adapterTestEngine: &adapterTestEngine{}, lostAttemptID: "attempt-a", unscoped: true,
+		neighbourWatching: make(chan struct{}), releaseNeighbour: make(chan struct{}),
+		attemptReaps: map[string]int{},
+	}
+	defer close(engine.releaseNeighbour)
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	var recoveryMu sync.Mutex
+	recoveries := map[string]int{}
+	request := func(jobID, attemptID string) workloadrunner.Request {
+		request := adapterTestRequest()
+		request.Authority.JobID, request.Authority.AttemptID, request.Authority.RemovalGeneration = jobID, attemptID, attemptID
+		request.InitialDeadman = time.Minute
+		request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) {
+			recoveryMu.Lock()
+			recoveries[attemptID]++
+			recoveryMu.Unlock()
+			barrier.Invalidate()
+		}
+		return request
+	}
+	sink := workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil })
+	neighbourErr := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(t.Context(), request("job-b", "attempt-b"), sink)
+		neighbourErr <- err
+	}()
+	select {
+	case <-engine.neighbourWatching:
+	case <-time.After(10 * time.Second):
+		t.Fatal("neighbour attempt never reached Watch")
+	}
+	lost, err := adapter.Run(t.Context(), request("job-a", "attempt-a"), sink)
+	if err != nil || lost.Outcome.RuntimeFailure == nil {
+		t.Fatalf("lost attempt = %+v err=%v, want its runtime failure", lost.Outcome, err)
+	}
+	select {
+	case err := <-neighbourErr:
+		var runtimeLoss *ocihelper.RuntimeLossError
+		if !errors.As(err, &runtimeLoss) {
+			t.Fatalf("neighbour ended with %v, want helper runtime loss", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("neighbour kept running on a session recovered for engine loss")
+	}
+	recoveryMu.Lock()
+	defer recoveryMu.Unlock()
+	if recoveries["attempt-a"] != 1 {
+		t.Fatalf("recoveries = %v, want the lost attempt to recover the session once", recoveries)
 	}
 }
 
