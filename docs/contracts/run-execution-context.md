@@ -289,19 +289,36 @@ A Computer pass is a distinct 256-bit bearer. L3 stores only its SHA-256
 digest and immutable issuance/revocation audit, binding it to Computer,
 attempt, current Storage generation, submit-intent revision, host Node, grant
 revision, and L3 authority generation. L3 revalidates the live L1 scope on
-every bearer request. L1 submission-intent mutation revokes older L3 grants
-before reporting success.
+every bearer request. L1 proves that scope only for a Computer that is meant
+to be running now: desired state `running`, current Job `claimed` or
+`running`, reconfiguration phase `stable`, submission enabled, and the pass's
+own attempt still live on its host. A Computer that is stopping — after stop,
+or after a restart of a running resource latch — is refused even while its old
+attempt drains, and so is one that is reset, reimaged, restoring, removed, or
+whose attempt is terminal. L1 submission-intent mutation revokes older L3
+grants before reporting success.
 
-When L1 cannot reach the run ledger to perform one of those revocations it says
-so by name: typed `run_ledger_unavailable`, HTTP 503, `retryable: true`. It is
-never reported as `internal`, because the remedy is a deployment address, not
-an L1 fix, and a scrubbed message hides the only fact that leads to it. A
-revocation that follows an authority-losing Computer mutation says in its
-message that the mutation applied, so a retry is understood as owed revocation
-rather than an unapplied verb. The node heartbeat is the one surface that does
-not refuse: a pre-restore revocation the run ledger will not take is left owed
-and re-listed next pass, and only that Computer's restore directive is
-withheld. The heartbeat asks for all owed pre-restore revocations at once and
+Every authority-losing Computer mutation (stop, restart, Storage reset,
+reimage, projection, remove, a failed grow acknowledgement, attempt
+completion) is followed by an explicit L3 revoke-all. That revocation is
+defense in depth plus audit, not the gate: the live-scope check above already
+refuses the old passes the moment the mutation commits.
+
+When L1 cannot reach the run ledger to perform a revocation it says so by
+name: typed `run_ledger_unavailable`, HTTP 503. It is never reported as
+`internal`, because the remedy is a deployment address, not an L1 fix, and a
+scrubbed message hides the only fact that leads to it. Before a submission
+enable or disable commits, the refusal is `retryable: true`: nothing applied,
+and a retry performs both. After an authority-losing Computer mutation commits,
+the refusal is `retryable: false`, and its message says that the mutation
+applied, that the explicit revocation was not recorded, that retrying the
+request is not guaranteed to perform it (an identical restart or reset
+replays without revoking; a repeated stop or remove fails its precondition),
+and that L3's live-scope check already refuses the Computer's old passes.
+No durable record keeps the lost revocation owed. The node heartbeat is the
+one surface that does not refuse: a pre-restore revocation the run ledger will
+not take is left owed and re-listed next pass, and only that Computer's restore
+directive is withheld. The heartbeat asks for all owed pre-restore revocations at once and
 waits for them at most `HeartbeatRestoreRevocationBudget` (3s), well inside the
 agent's 10s heartbeat deadline; a revocation that has not answered by then is
 owed exactly like a refused one, so a run ledger that hangs costs the same as

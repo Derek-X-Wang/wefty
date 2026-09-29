@@ -1617,8 +1617,7 @@ func (s *Server) revokeComputerAuthorityWithReceipt(ctx context.Context, compute
 		// committed. Saying so in the refusal is the difference between an
 		// operator retrying a verb that already applied and an operator
 		// fixing the run-ledger address (wefty #548).
-		return nil, runLedgerUnavailable(err,
-			"the Computer mutation applied, but the run ledger could not be reached to revoke its authority")
+		return nil, computerRevocationNotRecorded(err)
 	}
 	return &receipt, nil
 }
@@ -2450,9 +2449,14 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 	message := err.Error()
 	var details map[string]any
+	retryable := code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted ||
+		code == contract.ErrorRunLedgerUnavailable
 	var protocolErr *Error
 	if errors.As(err, &protocolErr) {
 		details = protocolErr.Details
+		if protocolErr.notRetryable {
+			retryable = false
+		}
 	}
 	if code == contract.ErrorInternal {
 		message = "internal server error"
@@ -2461,9 +2465,6 @@ func writeError(w http.ResponseWriter, err error) {
 		}
 	}
 	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{
-		Code: code, Message: message,
-		Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted ||
-			code == contract.ErrorRunLedgerUnavailable,
-		Details: details,
+		Code: code, Message: message, Retryable: retryable, Details: details,
 	}})
 }

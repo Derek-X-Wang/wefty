@@ -42,7 +42,7 @@ func (log *recordedLog) text() string {
 	return strings.Join(log.lines, "\n")
 }
 
-func assertRunLedgerUnavailable(t *testing.T, status int, body []byte, wantMessageFragment string) {
+func assertRunLedgerUnavailable(t *testing.T, status int, body []byte, wantRetryable bool, wantMessageFragments ...string) {
 	t.Helper()
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d body=%s", status, http.StatusServiceUnavailable, body)
@@ -54,14 +54,19 @@ func assertRunLedgerUnavailable(t *testing.T, status int, body []byte, wantMessa
 	if response.Error.Code != contract.ErrorRunLedgerUnavailable {
 		t.Fatalf("error code = %q, want %q body=%s", response.Error.Code, contract.ErrorRunLedgerUnavailable, body)
 	}
-	if !response.Error.Retryable {
-		t.Fatalf("an unreachable run ledger is retryable; body=%s", body)
+	if response.Error.Retryable != wantRetryable {
+		t.Fatalf("retryable = %t, want %t; body=%s", response.Error.Retryable, wantRetryable, body)
 	}
 	if response.Error.Message == "internal server error" {
 		t.Fatalf("the refusal was scrubbed instead of typed: %s", body)
 	}
-	if !strings.Contains(response.Error.Message, "run ledger") || !strings.Contains(response.Error.Message, wantMessageFragment) {
-		t.Fatalf("error message = %q, want it to name the run ledger and %q", response.Error.Message, wantMessageFragment)
+	if !strings.Contains(response.Error.Message, "run ledger") {
+		t.Fatalf("error message = %q, want it to name the run ledger", response.Error.Message)
+	}
+	for _, fragment := range wantMessageFragments {
+		if !strings.Contains(response.Error.Message, fragment) {
+			t.Fatalf("error message = %q, want it to say %q", response.Error.Message, fragment)
+		}
 	}
 }
 
@@ -70,7 +75,8 @@ func assertRunLedgerUnavailable(t *testing.T, status int, body []byte, wantMessa
 // that takes a running Computer's authority away applied its mutation and then
 // answered an untyped, scrubbed "internal server error, retryable: true",
 // which invited a retry that could only conflict. The verbs may refuse, but
-// they must refuse by name and must say that the mutation applied.
+// they must refuse by name, say that the mutation applied, and not invite a
+// retry that will not perform the revocation.
 func TestComputerAuthorityLossRefusesTypedWhenRunLedgerIsUnreachable(t *testing.T) {
 	for _, verb := range []struct {
 		name    string
@@ -119,7 +125,12 @@ func TestComputerAuthorityLossRefusesTypedWhenRunLedgerIsUnreachable(t *testing.
 				t.Fatal(err)
 			}
 			status, body := verb.mutate(t, h, client, computer)
-			assertRunLedgerUnavailable(t, status, body, "the Computer mutation applied")
+			// Post-commit: not retryable, because a retry cannot be relied on
+			// to perform the revocation, and it does not need to be, because
+			// L3's live-scope check already refuses the old tokens.
+			assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied",
+				"was not recorded", "retrying the request is not guaranteed to perform it",
+				"live-scope check already refuses")
 			after, err := h.store.GetComputer(context.Background(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)

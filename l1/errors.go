@@ -14,6 +14,9 @@ type Error struct {
 	Message string
 	Cause   error
 	Details map[string]any
+	// notRetryable overrides the code's default retryable answer when the
+	// refusal is about work that already happened and a retry cannot change.
+	notRetryable bool
 }
 
 func (e *Error) Error() string {
@@ -47,6 +50,25 @@ func runLedgerUnavailable(err error, message string) error {
 		return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: message}
 	}
 	return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: fmt.Sprintf("%s: %v", message, err), Cause: err}
+}
+
+// computerRevocationNotRecorded refuses after an authority-losing Computer
+// mutation has committed and the run ledger could not take the explicit
+// revocation that follows it. It is not retryable because a retry cannot be
+// relied on to perform it: an identical restart or reset replays without
+// revoking, and a repeated stop or remove fails its precondition. Nothing is
+// left open by that, because L3 revalidates the live L1 scope on every bearer
+// request and L1 no longer proves scope for a Computer that is not meant to be
+// running, so the old tokens are already refused. What is lost is the explicit
+// revocation's audit row, which is the follow-up to #548.
+func computerRevocationNotRecorded(err error) error {
+	message := "the Computer mutation applied, but the run ledger could not be reached, so the explicit revocation " +
+		"of its token grants was not recorded; retrying the request is not guaranteed to perform it, and L3's " +
+		"live-scope check already refuses the Computer's old tokens"
+	if err != nil {
+		message = fmt.Sprintf("%s: %v", message, err)
+	}
+	return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: message, Cause: err, notRetryable: true}
 }
 
 func errorCode(err error) contract.ErrorCode {
