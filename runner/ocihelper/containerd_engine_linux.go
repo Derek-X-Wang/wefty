@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/introspection"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -86,6 +88,12 @@ type containerdAttempt struct {
 	controlMu        sync.Mutex
 	lost             bool
 	mu               sync.Mutex
+
+	// observeTaskAbsence asks containerd about this attempt's task after its
+	// Wait broke; nil leaves every runtime failure unscoped.
+	observeTaskAbsence func(context.Context) taskAbsenceObservation
+	// terminalAttemptScoped records proveTaskLossAttemptScoped for terminalErr.
+	terminalAttemptScoped bool
 }
 
 type containerdTaskSignaler interface {
@@ -93,6 +101,10 @@ type containerdTaskSignaler interface {
 }
 
 type ContainerdEngine struct {
+	// procRoot is the procfs the containerd daemon identity is read from;
+	// empty means /proc. Tests point it at a fixture.
+	procRoot string
+
 	client                      *containerd.Client
 	imageLeaseDeletes           imageLeaseDeletionManager
 	config                      NativeEngineConfig
@@ -1334,6 +1346,11 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return RunResponse{}, &RuntimeSpecRejectionError{err: verifyErr}
 		}
 	}
+	// The engine process this attempt starts under, read before its Wait is
+	// registered: a later shim-loss answer counts only from this same process.
+	// An unreadable identity costs nothing here -- the attempt runs -- but any
+	// runtime failure it later reports stays unscoped engine-loss evidence.
+	startEngine := engine.captureDaemonIdentity(ctx)
 	attemptContext, attemptCancel := context.WithCancel(leases.WithLease(engineContext(context.Background()), lease.ID))
 	wait, err := task.Wait(attemptContext)
 	if err != nil {
@@ -1346,7 +1363,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return nil
 		}
 		return deleteErr
-	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
+	}, observeTaskAbsence: engine.attemptTaskAbsenceObserver(task, startEngine), stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
 	engine.watchOOM(attempt)
 	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
 	// The durable ownership record was published before NewTask and the
@@ -1731,6 +1748,7 @@ func (attempt *containerdAttempt) terminalResult(oom, logIncomplete bool) WatchR
 	attempt.mu.Lock()
 	sentSignal, signalCause := attempt.signal, attempt.signalCause
 	code, waitErr := attempt.terminalCode, attempt.terminalErr
+	attemptScoped := attempt.terminalAttemptScoped
 	attempt.mu.Unlock()
 	// A post-hoc free-byte sample cannot prove that this attempt observed
 	// ENOSPC. Until a positive guest/runtime event is available, retain the
@@ -1738,7 +1756,9 @@ func (attempt *containerdAttempt) terminalResult(oom, logIncomplete bool) WatchR
 	// containerd ExitStatus exposes only a numeric code. Therefore 137/143 are
 	// plain exits unless this helper independently observed successful delivery
 	// of the matching signal.
-	return terminalResultFromSignalDelivery(code, waitErr, sentSignal, signalCause, oom, logIncomplete)
+	result := terminalResultFromSignalDelivery(code, waitErr, sentSignal, signalCause, oom, logIncomplete)
+	result.RuntimeFailureAttemptScoped = result.RuntimeFailure != "" && attemptScoped
+	return result
 }
 
 func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus, cgroupRoot string, releaseTimeout time.Duration) {
@@ -1752,7 +1772,29 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	if cgroupReportedOOM(cgroupRoot, attempt.resources.CgroupID) {
 		attempt.oom = true
 	}
+	waitErr, deleting := attempt.terminalErr, attempt.deleted
 	attempt.mu.Unlock()
+	if releaseTimeout <= 0 {
+		releaseTimeout = DefaultTaskReleaseTimeout
+	}
+	// One deadline covers the scope probe and the task release together, so a
+	// broken Wait publishes its terminal within the same release budget as any
+	// other exit and the agent's post-KILL Watch budget still holds (see
+	// taskLossScopeProbeBudget for the arithmetic).
+	releaseDeadline := time.Now().Add(releaseTimeout)
+	// A broken Wait is a runtime failure either way. Before it is published,
+	// ask containerd whether it ended only this task -- a lost shim -- so the
+	// agent does not tear down every neighbour's attempt over it (#560). This
+	// runs before release, so the answer is about the task as the lost shim
+	// left it. A Wait broken because Delete already cancelled its context is
+	// this helper's own doing, not the task's, and is never scoped here; its
+	// gRPC cancellation status does not unwrap to context.Canceled.
+	if waitErr != nil && !deleting {
+		scoped := proveTaskLossAttemptScoped(scopeProbeBound(releaseTimeout), waitErr, attempt.observeTaskAbsence)
+		attempt.mu.Lock()
+		attempt.terminalAttemptScoped = scoped
+		attempt.mu.Unlock()
+	}
 	// Task.Wait was registered with the attempt lease context before Start.
 	// Release that completed wait and its lease-scoped client work before
 	// Task.Delete asks containerd to drain the shim logger. Leaving the context
@@ -1760,13 +1802,133 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	if attempt.cancel != nil {
 		attempt.cancel()
 	}
-	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, taskDeleteRefusedAsPrecondition, func(sealReason string) {
+	if err := publishTerminalAfterTaskReleaseBy(releaseDeadline, attempt.releaseTask, taskDeleteRefusedAsPrecondition, func(sealReason string) {
 		attempt.mu.Lock()
 		attempt.sealReason = sealReason
 		attempt.mu.Unlock()
 		close(attempt.terminalReady)
 	}); err != nil {
 		log.Printf("release exited OCI task %s before log sealing: %v", attempt.authority.AttemptID, err)
+	}
+}
+
+// daemonIdentityReadTimeout bounds one introspection read of the containerd
+// process identity.
+const daemonIdentityReadTimeout = 2 * time.Second
+
+// containerdDaemonIdentity reads the serving containerd process instance's
+// identity. The introspection service names the UUID, PID, and PID namespace;
+// containerd persists the UUID under its root, so it survives a restart, and a
+// restart may reuse the PID. The process start time read from procfs is what
+// makes the identity one process instance. It is read only when containerd's
+// PID namespace is the helper's own, because only then does that PID name the
+// same process in the helper's procfs; any other namespace, or an unreadable
+// start time, is no identity at all.
+func containerdDaemonIdentity(ctx context.Context, service introspection.Service, procRoot string) (engineIdentity, error) {
+	if service == nil {
+		return engineIdentity{}, errors.New("containerd introspection service is unavailable")
+	}
+	response, err := service.Server(ctx)
+	if err != nil {
+		return engineIdentity{}, err
+	}
+	identity := engineIdentity{InstanceUUID: response.GetUUID(), PID: response.GetPid(), PIDNamespace: response.GetPidns()}
+	if identity.InstanceUUID == "" || identity.PID == 0 || identity.PIDNamespace == 0 {
+		return engineIdentity{}, errors.New("containerd introspection returned no daemon process identity")
+	}
+	if procRoot == "" {
+		procRoot = "/proc"
+	}
+	// Both the helper and the process this procfs names at that PID must sit
+	// in containerd's PID namespace; otherwise the PID names someone else.
+	for _, owner := range []string{"self", strconv.FormatUint(identity.PID, 10)} {
+		namespace, err := os.Stat(filepath.Join(procRoot, owner, "ns", "pid"))
+		if err != nil {
+			return engineIdentity{}, fmt.Errorf("read PID namespace of %s: %w", owner, err)
+		}
+		namespaceStat, ok := namespace.Sys().(*syscall.Stat_t)
+		if !ok || namespaceStat.Ino != identity.PIDNamespace {
+			return engineIdentity{}, errors.New("containerd runs outside the helper PID namespace")
+		}
+	}
+	identity.StartTime, err = processStartTime(procRoot, identity.PID)
+	if err != nil {
+		return engineIdentity{}, err
+	}
+	return identity, nil
+}
+
+// processStartTime reads field 22 (starttime, clock ticks since boot) of
+// /proc/<pid>/stat. The comm field may itself hold spaces and parentheses, so
+// fields are counted from after its closing parenthesis, where field 3 begins.
+func processStartTime(procRoot string, pid uint64) (uint64, error) {
+	payload, err := os.ReadFile(filepath.Join(procRoot, strconv.FormatUint(pid, 10), "stat"))
+	if err != nil {
+		return 0, fmt.Errorf("read containerd process start time: %w", err)
+	}
+	closing := bytes.LastIndexByte(payload, ')')
+	if closing < 0 {
+		return 0, errors.New("containerd process stat has no command field")
+	}
+	fields := strings.Fields(string(payload[closing+1:]))
+	const startTimeField, firstFieldAfterComm = 22, 3
+	if len(fields) <= startTimeField-firstFieldAfterComm {
+		return 0, errors.New("containerd process stat has no start time")
+	}
+	startTime, err := strconv.ParseUint(fields[startTimeField-firstFieldAfterComm], 10, 64)
+	if err != nil || startTime == 0 {
+		return 0, errors.New("containerd process stat has an invalid start time")
+	}
+	return startTime, nil
+}
+
+// captureDaemonIdentity records the engine identity an attempt starts under.
+// A failure is logged and yields an empty identity, which can never prove a
+// runtime failure attempt-scoped.
+func (engine *ContainerdEngine) captureDaemonIdentity(ctx context.Context) engineIdentity {
+	readContext, cancel := context.WithTimeout(engineContext(ctx), daemonIdentityReadTimeout)
+	defer cancel()
+	identity, err := containerdDaemonIdentity(readContext, engine.client.IntrospectionService(), engine.procRoot)
+	if err != nil {
+		log.Printf("read containerd daemon identity at attempt start; a runtime failure of this attempt stays engine-loss evidence: %v", err)
+		return engineIdentity{}
+	}
+	return identity
+}
+
+// attemptTaskAbsenceObserver is the shim-loss probe for one attempt: the
+// task's own answer, gated on the engine still being the process the attempt
+// started under.
+func (engine *ContainerdEngine) attemptTaskAbsenceObserver(task containerd.Task, startEngine engineIdentity) func(context.Context) taskAbsenceObservation {
+	return func(ctx context.Context) taskAbsenceObservation {
+		return observeTaskAbsenceOnSameEngine(ctx, startEngine,
+			func(ctx context.Context) taskAbsenceObservation {
+				return observeContainerdTaskAbsence(engineContext(ctx), task)
+			},
+			func(ctx context.Context) (engineIdentity, error) {
+				return containerdDaemonIdentity(engineContext(ctx), engine.client.IntrospectionService(), engine.procRoot)
+			})
+	}
+}
+
+// observeContainerdTaskAbsence maps containerd's answer for one task into the
+// attempt-scope proof's vocabulary. NotFound is containerd having reaped a lost
+// shim and dropped its task; Stopped is a task whose exit containerd recorded.
+// Any other error -- the engine connection failing, or the lost shim not yet
+// reaped -- proves nothing, and neither does an Unknown status.
+func observeContainerdTaskAbsence(ctx context.Context, task containerd.Task) taskAbsenceObservation {
+	status, err := task.Status(ctx)
+	switch {
+	case errdefs.IsNotFound(err):
+		return taskObservationGone
+	case err != nil:
+		return taskObservationUnproven
+	case status.Status == containerd.Stopped:
+		return taskObservationGone
+	case status.Status == containerd.Unknown || status.Status == "":
+		return taskObservationUnproven
+	default:
+		return taskObservationLive
 	}
 }
 

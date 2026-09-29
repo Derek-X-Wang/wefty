@@ -647,6 +647,88 @@ func TestComputerBackupCreateRefusalKeepsSessionAndNeighbourAttempt(t *testing.T
 	}
 }
 
+// shimLossWatchEngine ends one attempt's Watch the way the containerd engine
+// ends it after that attempt's shim is killed and containerd reaps it: a
+// runtime-failure completion the helper proved attempt-scoped.
+type shimLossWatchEngine struct {
+	*fakeEngine
+	lostAttemptID string
+}
+
+func (engine *shimLossWatchEngine) Watch(ctx context.Context, request WatchRequest, emit func(WatchEvent) error) error {
+	if request.Authority.AttemptID != engine.lostAttemptID {
+		return engine.fakeEngine.Watch(ctx, request, emit)
+	}
+	engine.record("Watch")
+	return emit(WatchEvent{Kind: WatchComplete, Result: &WatchResponse{
+		RuntimeFailure: "rpc error: code = Unknown desc = ttrpc: closed", RuntimeFailureAttemptScoped: true,
+	}})
+}
+
+// A shim loss is a Watch result, not an RPC failure: the lost attempt's Watch
+// completes with its attempt-scoped runtime failure, the client does not read
+// it as session loss, and the neighbour attempt keeps its authority on the
+// same session generation with nothing reaped (#560).
+func TestShimLossWatchResultKeepsSessionAndNeighbourAttempt(t *testing.T) {
+	engine := &shimLossWatchEngine{fakeEngine: newFakeEngine(), lostAttemptID: "shim-lost"}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	neighbour := testAuthority()
+	lost := testAuthority()
+	lost.AttemptID = "shim-lost"
+	for _, authority := range []AttemptAuthority{neighbour, lost} {
+		if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	generation := session.Handshake().SessionGeneration
+	var result *WatchResponse
+	if err := session.Watch(t.Context(), WatchRequest{Authority: lost}, func(event WatchEvent) error {
+		if event.Kind == WatchComplete {
+			result = event.Result
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("shim-loss Watch = %v, want its completion", err)
+	}
+	if result == nil || result.RuntimeFailure == "" || !result.RuntimeFailureAttemptScoped {
+		t.Fatalf("shim-loss completion = %+v, want an attempt-scoped runtime failure", result)
+	}
+	if err := session.HealthError(); err != nil {
+		t.Fatalf("a shim loss withdrew client session authority: %v", err)
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("a shim loss marked the live helper session lost: %v", err)
+	}
+	if got := session.Handshake().SessionGeneration; got != generation {
+		t.Fatalf("session generation = %d after a shim loss, want %d", got, generation)
+	}
+	engine.mu.Lock()
+	sessionReaps, attemptReaps := len(engine.sessionReaps), len(engine.attemptReaps)
+	engine.mu.Unlock()
+	if sessionReaps != 0 || attemptReaps != 0 {
+		t.Fatalf("a shim loss reaped the session %d times and attempts %d times", sessionReaps, attemptReaps)
+	}
+	if err := session.Signal(t.Context(), SignalRequest{Authority: neighbour, Signal: SignalTERM}); err != nil {
+		t.Fatalf("the running neighbour lost its attempt authority to a shim loss: %v", err)
+	}
+}
+
+// A completion may scope only a runtime failure it actually carries.
+func TestWatchCompletionRejectsAttemptScopeWithoutRuntimeFailure(t *testing.T) {
+	exitCode := 0
+	event := WatchEvent{Kind: WatchComplete, Result: &WatchResponse{ExitCode: &exitCode, RuntimeFailureAttemptScoped: true}}
+	if err := validateWatchEvent(event); err == nil {
+		t.Fatal("a completion scoped a runtime failure it does not carry")
+	}
+}
+
 // A Run the engine refuses is attempt-scoped once the helper has positively
 // reaped that attempt while its session stayed live: the exclusive session
 // keeps the same capability, so a table of negative Run probes cannot cascade

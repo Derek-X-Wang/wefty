@@ -66,7 +66,16 @@ func publishTerminalAfterTaskRelease(timeout time.Duration, release func(context
 	if timeout <= 0 {
 		timeout = DefaultTaskReleaseTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return publishTerminalAfterTaskReleaseBy(time.Now().Add(timeout), release, stillRunning, publish)
+}
+
+// publishTerminalAfterTaskReleaseBy is publishTerminalAfterTaskRelease against
+// an absolute deadline, so work done before the release -- the shim-loss scope
+// probe -- spends the same release budget instead of extending it. A deadline
+// already passed still publishes: the release sees a finished context and the
+// terminal becomes observable at once.
+func publishTerminalAfterTaskReleaseBy(deadline time.Time, release func(context.Context) error, stillRunning func(error) bool, publish func(sealReason string)) error {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	var err error
 	if release != nil {
@@ -96,6 +105,142 @@ func releaseExitedTask(ctx context.Context, release func(context.Context) error,
 		case <-ctx.Done():
 			timer.Stop()
 			return &TaskNeverStoppedError{err: err}
+		case <-timer.C:
+		}
+	}
+}
+
+// taskAbsenceObservation is one answer to "does the engine still hold this
+// attempt's task?" asked after that task's Wait broke.
+type taskAbsenceObservation int
+
+const (
+	// taskObservationUnproven means the engine did not answer for the task:
+	// the engine connection failed, or the engine is still tearing down the
+	// task's lost shim and could not reach it. Asking again may settle it.
+	taskObservationUnproven taskAbsenceObservation = iota
+	// taskObservationGone means the engine answered that the task no longer
+	// exists or has stopped.
+	taskObservationGone
+	// taskObservationLive means the engine answered that the task still
+	// exists in a live state, so the broken Wait was not the task ending.
+	taskObservationLive
+	// taskObservationEngineChanged means the engine that answered is not
+	// provably the engine process the attempt started under: its identity
+	// changed, or was never captured. A restarted engine that lost task state
+	// answers NotFound for every task, so its answer proves nothing about one
+	// shim.
+	taskObservationEngineChanged
+)
+
+// engineIdentity names one engine process instance: its persistent instance
+// UUID, the PID and PID namespace serving it, and that process's start time.
+// The UUID survives a restart and a restart may reuse the PID, but a PID and
+// its start time together never repeat within one boot, so an equal identity
+// is the same process that never restarted.
+type engineIdentity struct {
+	InstanceUUID string
+	PID          uint64
+	PIDNamespace uint64
+	// StartTime is the process start time in clock ticks since boot
+	// (/proc/<pid>/stat field 22), read in the helper's own PID namespace.
+	StartTime uint64
+}
+
+func (identity engineIdentity) complete() bool {
+	return identity.InstanceUUID != "" && identity.PID != 0 && identity.PIDNamespace != 0 && identity.StartTime != 0
+}
+
+// observeTaskAbsenceOnSameEngine gates a task-absence answer on engine
+// continuity. The task answer counts only if the engine identity read after it
+// equals the identity captured when the attempt started: the same process
+// answered, so it never restarted in between and its NotFound is its own
+// record of reaping this task's lost shim. A missing baseline or a changed
+// identity is final; an identity that cannot be read is retried like any other
+// unanswered question and fails closed when the bound runs out.
+func observeTaskAbsenceOnSameEngine(ctx context.Context, baseline engineIdentity, task func(context.Context) taskAbsenceObservation, identity func(context.Context) (engineIdentity, error)) taskAbsenceObservation {
+	if !baseline.complete() || task == nil || identity == nil {
+		return taskObservationEngineChanged
+	}
+	answer := task(ctx)
+	if answer != taskObservationGone {
+		return answer
+	}
+	current, err := identity(ctx)
+	if err != nil || !current.complete() {
+		return taskObservationUnproven
+	}
+	if current != baseline {
+		return taskObservationEngineChanged
+	}
+	return taskObservationGone
+}
+
+// taskLossScopeProbeBudget is the most the shim-loss scope probe may spend.
+// It is carved out of the task-release budget, never added to it, because the
+// agent waits a fixed post-KILL Watch budget for terminal evidence:
+//
+//	postKillWatchBudget = DefaultTaskReleaseTimeout + DefaultLogSealTimeout + 1 s
+//	                    = 5 s + 5 s + 1 s = 11 s
+//
+// The probe and the task release share one deadline, Wait return + the task
+// release timeout (5 s), and log sealing starts only at terminal publication
+// and is bounded by the seal timeout (5 s). A broken Wait therefore reaches its
+// sealed terminal within 10 s, inside the 11 s budget, however slow the probe.
+// The probe gets at most half the release budget so the release it precedes
+// always keeps the other half: 2 s of 5 s by default.
+const taskLossScopeProbeBudget = 2 * time.Second
+
+// scopeProbeBound is the probe's share of a task release budget.
+func scopeProbeBound(releaseTimeout time.Duration) time.Duration {
+	if releaseTimeout <= 0 {
+		releaseTimeout = DefaultTaskReleaseTimeout
+	}
+	return min(taskLossScopeProbeBudget, releaseTimeout/2)
+}
+
+// taskLossScopeProbeInterval paces re-asking the engine about one task while
+// it cleans up after a lost shim. It is a poll cadence inside the bound the
+// caller passes, not an additional timeout.
+const taskLossScopeProbeInterval = 25 * time.Millisecond
+
+// proveTaskLossAttemptScoped decides whether a broken task Wait ended only
+// that attempt. It is the positive proof behind a Watch result's
+// runtime_failure_attempt_scoped claim.
+//
+// A killed shim breaks its task's Wait with the shim connection error, while
+// containerd itself keeps serving; containerd then reaps the dead shim and
+// drops the task. A containerd that stopped answering breaks the same Wait for
+// every attempt at once, and a restarted containerd either reattaches
+// still-running tasks or, having lost their state, reports every one NotFound.
+// Only the first is bounded by one attempt. The claim therefore needs the same
+// engine process the attempt started under to answer, inside the bound, that
+// this task is gone or stopped (observeTaskAbsenceOnSameEngine). An engine
+// that never answers, a task it still reports live, an engine whose identity
+// changed or cannot be proven, a Wait ended by this helper's own cancellation,
+// or a missing probe all leave the failure unscoped, which keeps it
+// helper/engine-loss evidence exactly as before.
+func proveTaskLossAttemptScoped(timeout time.Duration, waitErr error, observe func(context.Context) taskAbsenceObservation) bool {
+	if waitErr == nil || observe == nil || errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+		return false
+	}
+	if timeout <= 0 {
+		timeout = taskLossScopeProbeBudget
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		switch observe(ctx) {
+		case taskObservationGone:
+			return true
+		case taskObservationLive, taskObservationEngineChanged:
+			return false
+		}
+		timer := time.NewTimer(taskLossScopeProbeInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
 		case <-timer.C:
 		}
 	}
