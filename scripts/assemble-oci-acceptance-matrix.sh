@@ -50,7 +50,8 @@ for receipt in native-linux-oci.txt oci-service-publication-linux.txt \
   oci-service-agent-sigkill-linux.txt oci-service-heartbeat-blackhole-linux.txt \
   oci-service-removal-stopped-linux.txt oci-service-removal-offline-linux.txt \
   oci-node-capability-claims-linux.txt \
-  oci-helper-cold-socket-activation-linux.txt; do
+  oci-helper-cold-socket-activation-linux.txt \
+  oci-cgroup-limits-linux.txt; do
   if [ -f "$linux_directory/$receipt" ]; then
     cat "$linux_directory/$receipt" >> "$facts"
   fi
@@ -97,7 +98,7 @@ linux.service.removal|Full removal and residue proof from every state, crash inj
 linux.node.capability_claims|Capable and incapable claim pairs for every required capability|bullet 1|capability_claim_pair_oci_capable capability_claim_pair_oci_incapable capability_claim_pair_doctor_source=cli|
 linux.only.unprivileged_agent|The agent runs unprivileged|Linux-only list|agent_uid_nonzero|
 linux.only.socket_activated_helper|A root socket-activated helper owns every containerd call, and a cold inactive helper unit comes up on socket activation and serves the first session|Linux-only list|!helper_uid=0 !helper_socket_root_owned socket_and_service_active_after_recovery helper_service_cold_before_first_connect helper_cold_unit_activated_on_connect helper_session_admitted_on_first_connect helper_first_session_is_probe|
-linux.only.cgroup_v2_limits|Opt-in cgroup-v2 memory and CPU limits for an ordinary OCI job|Linux-only list|!oom_kill !plain_137_exit|memory_max_readback:the memory limit is proven only by an OOM kill, never by reading memory.max back;cpu_millicores_enforcement:CPUMillicores appears only in runtime-spec golden fixtures and no capped container is run
+linux.only.cgroup_v2_limits|Opt-in cgroup-v2 memory and CPU limits for an ordinary OCI job|Linux-only list|!oom_kill !plain_137_exit cgroup_memory_max_readback cgroup_cpu_max_readback cgroup_cpu_throttled|
 linux.only.no_raw_containerd|Zero raw containerd access from the agent|Linux-only list|!raw_socket_denied|
 SPECIFICATION
 }
