@@ -15,6 +15,7 @@
           "submit_intent_revision": { "type": "integer", "minimum": 0 },
           "restore_operation_revision": { "type": "integer", "minimum": 1, "description": "When present, acknowledges a committed fresh RevokeAll for this restore operation. Omitted for general or legacy revocation." },
           "computer_attempt_id": { "type": "string", "minLength": 1, "description": "When present, acknowledges a committed revocation of only this attempt's grants." },
+          "preserved_computer_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 256, "uniqueItems": true, "description": "When present, the attempts a narrowed revoke_all left untouched (#554)." },
           "revoked_grant_count": { "type": "integer", "minimum": 0 },
           "committed_at": { "type": "string", "format": "date-time", "description": "L3 audit time; never a cross-host ordering prerequisite." }
         }
@@ -522,6 +523,11 @@
           "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
           "last_grow_operation": { "$ref": "#/components/schemas/ComputerStorageGrowOutcome" },
           "last_restore_revocation": { "$ref": "#/components/schemas/ComputerRestoreRevocationReceipt" },
+          "owed_revocations": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OwedComputerRevocation" },
+            "description": "Explicit L3 revocations this Computer's authority-losing mutations committed and the run ledger has not yet taken, oldest first. Omitted when none is owed. L3's live-scope check already refuses the old passes; each settles on the host Node's heartbeat (#554)."
+          },
           "storage_cleanup_quarantines": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/ComputerStorageCleanupQuarantine" },
@@ -809,6 +815,25 @@
           "attempts": { "const": 3 }
         },
         "description": "Authority-bound terminal evidence that bounded Computer-disk cleanup exhausted three attempts. The owning operation remains pending and must not be redispatched as ordinary cleanup."
+      },
+      "OwedComputerRevocation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["revocation_id", "computer_id", "host_node_id", "verb", "reason", "scope", "created_at", "settle_failures"],
+        "properties": {
+          "revocation_id": { "type": "integer", "format": "int64", "minimum": 1 },
+          "computer_id": { "type": "string", "minLength": 1 },
+          "host_node_id": { "type": "string", "minLength": 1, "description": "The Node whose heartbeat settles this revocation." },
+          "verb": { "enum": ["stop", "restart", "reset", "project", "reimage", "remove", "grow_acknowledgement", "attempt_completion"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "scope": { "enum": ["revoke_all", "attempt"], "description": "revoke_all ends every grant the Computer held when the mutation committed and spares attempts begun later; attempt ends exactly computer_attempt_id's grants and never widens." },
+          "computer_attempt_id": { "type": "string", "minLength": 1 },
+          "created_at": { "type": "string", "format": "date-time" },
+          "settle_failures": { "type": "integer", "minimum": 0 },
+          "last_failure": { "type": "string" },
+          "last_failure_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "An explicit L3 revocation an authority-losing Computer mutation committed in its own transaction and the run ledger has not yet taken (#554)."
       },
       "ComputerRestoreRevocationReceipt": {
         "type": "object",

@@ -295,6 +295,13 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	if err != nil {
 		return Computer{}, false, internalError(err, "read reserved Computer Storage reset")
 	}
+	updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+		computerID: computerID, hostNodeID: computerHostNodeID(computer),
+		verb: ComputerRevocationVerbReset, reason: "storage_generation_advanced",
+	}, now)
+	if err != nil {
+		return Computer{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer Storage reset reservation")
 	}

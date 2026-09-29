@@ -843,6 +843,39 @@ CREATE TABLE IF NOT EXISTS computer_takeover_audit (
 );
 CREATE INDEX IF NOT EXISTS computer_takeover_audit_computer_time
   ON computer_takeover_audit(computer_id, occurred_ns, attempt_id, event_id);
+-- computer_owed_revocations keeps the explicit L3 revocation an
+-- authority-losing Computer mutation owes, written in that mutation's own
+-- transaction, until the run ledger takes it (#554). A settled row is the
+-- audit record: immutable, never deleted, carrying the run ledger's receipt.
+CREATE TABLE IF NOT EXISTS computer_owed_revocations (
+  revocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  computer_id TEXT NOT NULL,
+  host_node_id TEXT NOT NULL,
+  verb TEXT NOT NULL CHECK(verb IN ('stop', 'restart', 'reset', 'project', 'reimage', 'remove', 'grow_acknowledgement', 'attempt_completion')),
+  reason TEXT NOT NULL CHECK(reason <> ''),
+  scope TEXT NOT NULL CHECK(scope IN ('revoke_all', 'attempt')),
+  computer_attempt_id TEXT NOT NULL DEFAULT '',
+  attempts_at_commit_json BLOB NOT NULL,
+  created_ns INTEGER NOT NULL,
+  settle_failures INTEGER NOT NULL DEFAULT 0 CHECK(settle_failures >= 0),
+  last_failure TEXT NOT NULL DEFAULT '',
+  last_failure_ns INTEGER,
+  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'no_run_ledger')),
+  settled_ns INTEGER,
+  receipt_json BLOB,
+  CHECK((scope = 'attempt') = (computer_attempt_id <> '')),
+  CHECK((settlement = '') = (settled_ns IS NULL)),
+  CHECK((settlement = 'revoked') = (receipt_json IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_computer
+  ON computer_owed_revocations(computer_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_host
+  ON computer_owed_revocations(host_node_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_settled_immutable
+BEFORE UPDATE ON computer_owed_revocations WHEN OLD.settled_ns IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a settled Computer revocation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_no_delete
+BEFORE DELETE ON computer_owed_revocations BEGIN SELECT RAISE(ABORT, 'Computer revocation audit is immutable'); END;
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,
@@ -3598,6 +3631,9 @@ type CompletionOutcome struct {
 	// empty for an ordinary job. The completed attempt's Computer tokens are
 	// revoked, and only those.
 	ComputerID string
+	// owedRevocationID names the attempt-scoped revocation this completion
+	// committed as owed; zero for a replay or an ordinary job.
+	owedRevocationID int64
 }
 
 // CompleteAttemptOutcome is CompleteAttempt that additionally reports whether
@@ -3851,10 +3887,20 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err != nil {
 		return CompletionOutcome{}, err
 	}
+	var owedRevocationID int64
+	if computerID != "" {
+		owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+			computerID: computerID, hostNodeID: attempt.nodeID,
+			verb: ComputerRevocationVerbAttemptCompletion, reason: "attempt_terminal", attemptID: attemptID,
+		}, now)
+		if err != nil {
+			return CompletionOutcome{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return CompletionOutcome{}, internalError(err, "commit completion")
 	}
-	return CompletionOutcome{Job: job, ComputerID: computerID}, nil
+	return CompletionOutcome{Job: job, ComputerID: computerID, owedRevocationID: owedRevocationID}, nil
 }
 
 // computerForJob returns the Computer jobID was projected for, current or

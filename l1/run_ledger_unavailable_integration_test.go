@@ -125,17 +125,23 @@ func TestComputerAuthorityLossRefusesTypedWhenRunLedgerIsUnreachable(t *testing.
 				t.Fatal(err)
 			}
 			status, body := verb.mutate(t, h, client, computer)
-			// Post-commit: not retryable, because a retry cannot be relied on
-			// to perform the revocation, and it does not need to be, because
-			// L3's live-scope check already refuses the old tokens.
+			// Post-commit: not retryable, because nothing the caller repeats
+			// performs the revocation, and it does not need to: L1 holds it
+			// owed (#554), and L3's live-scope check already refuses the old
+			// tokens.
 			assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied",
-				"was not recorded", "retrying the request is not guaranteed to perform it",
+				"is owed", "L1 recorded it and will retry it", "do not retry the request",
 				"live-scope check already refuses")
 			after, err := h.store.GetComputer(context.Background(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			verb.applied(t, after)
+			if len(after.OwedRevocations) != 1 || after.OwedRevocations[0].Verb != ComputerRevocationVerb(verb.name) ||
+				after.OwedRevocations[0].Scope != ComputerRevocationScopeRevokeAll || after.OwedRevocations[0].SettleFailures != 1 ||
+				!strings.Contains(after.OwedRevocations[0].LastFailure, "connection refused") {
+				t.Fatalf("owed revocations after a refused %s = %#v", verb.name, after.OwedRevocations)
+			}
 			if strings.Contains(logs.text(), "event=l1_internal_error_scrubbed") {
 				t.Fatalf("a typed refusal was still logged as a scrubbed internal error: %s", logs.text())
 			}

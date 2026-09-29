@@ -1362,6 +1362,12 @@ func TestRestoreRevocationUpgradesOnlyActiveLegacyEvidence(t *testing.T) {
 			if mode == "legacy" {
 				calls := 0
 				h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+					if request.RestoreOperationRevision == 0 && request.Reason != "computer_restoring" {
+						// The fixture's stop and completion still owe their
+						// revocations (#554); the same heartbeat settles them.
+						return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+							ComputerAttemptID: request.ComputerAttemptID, CommittedAt: h.clock.Now()}, nil
+					}
 					calls++
 					if request.ComputerID != computer.ComputerID || request.RestoreOperationRevision != reserved.IntentRevision || !request.RevokeAll || request.Reason != "computer_restoring" {
 						t.Fatalf("legacy reissue request=%#v", request)

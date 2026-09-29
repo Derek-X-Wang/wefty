@@ -412,6 +412,18 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 	if err != nil {
 		return Computer{}, err
 	}
+	// The same condition the handler revokes on: a grow acknowledgement that
+	// finds the job already failed ends the attempt's authority. An online
+	// grow that fails without failing the job keeps its passes by design.
+	if updated.CurrentJob.State == contract.JobFailed {
+		updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+			computerID: computerID, hostNodeID: computerHostNodeID(computer),
+			verb: ComputerRevocationVerbGrowAcknowledgement, reason: "computer_grow_capacity_failed",
+		}, now)
+		if err != nil {
+			return Computer{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer grow acknowledgement")
 	}

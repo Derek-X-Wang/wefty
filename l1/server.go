@@ -1110,7 +1110,7 @@ func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if request.DesiredState == contract.ServiceDesiredStopped {
-		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_stopped"); err != nil {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_stopped"); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -1147,7 +1147,7 @@ func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !replayed {
-		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_restarted"); err != nil {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_restarted"); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -1174,7 +1174,7 @@ func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !replayed {
-		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "storage_generation_advanced"); err != nil {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "storage_generation_advanced"); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -1431,7 +1431,7 @@ func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Reques
 		writeError(w, err)
 		return
 	}
-	if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_reimaged"); err != nil {
+	if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1450,7 +1450,7 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_reimaged"); err != nil {
+	if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1475,7 +1475,7 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_removed"); err != nil {
+	if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_removed"); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1510,7 +1510,8 @@ func withoutUnrevokedRestores(directives []ComputerStorageCopyDirective, owed ma
 // would fail node-wide exactly as it did when the revocation refused (wefty
 // #548). Three seconds leaves the remaining seven for the heartbeat's own
 // store reads and writes and the network round trip; a healthy run ledger
-// answers a revocation in milliseconds.
+// answers a revocation in milliseconds. The owed revocations the heartbeat
+// settles (#554) share this one budget rather than adding their own.
 const HeartbeatRestoreRevocationBudget = 3 * time.Second
 
 type restoreRevocationOutcome struct {
@@ -1519,25 +1520,28 @@ type restoreRevocationOutcome struct {
 	err        error
 }
 
-// revokeBeforeRestores asks the run ledger for every owed pre-restore
-// revocation at once, under one shared budget. Concurrency is what keeps the
-// budget per pass rather than per Computer: one hanging revocation neither
-// starves the others of time nor multiplies the wait by the number of
-// restores. The call returns when every revocation has answered or the budget
-// ends, whichever is first, so a revoker that ignores its context still cannot
-// hold the heartbeat. Whatever has not answered by then is owed exactly like a
-// refusal: nothing is recorded, the restore directive is withheld, and the next
-// heartbeat lists it again. A late answer is discarded; the run ledger's
-// revoke-all is idempotent, so asking again next pass is safe. Results keep
-// input order so the store writes that follow stay sequential.
-func (s *Server) revokeBeforeRestores(ctx context.Context, revocations []ComputerRestoreRevocationDirective) []restoreRevocationOutcome {
-	outcomes := make([]restoreRevocationOutcome, len(revocations))
-	for index, revocation := range revocations {
-		outcomes[index] = restoreRevocationOutcome{revocation: revocation,
-			err: errors.New("this control plane has no run-ledger address")}
+type revocationAnswer struct {
+	receipt contract.ComputerTokenRevocationReceipt
+	err     error
+}
+
+// revokeWithinBudget asks the run ledger for every revocation at once, under
+// one shared budget. Concurrency is what keeps the budget per pass rather
+// than per Computer: one hanging revocation neither starves the others of
+// time nor multiplies the wait by the number of revocations. The call returns
+// when every revocation has answered or the budget ends, whichever is first,
+// so a revoker that ignores its context still cannot hold the heartbeat.
+// Whatever has not answered by then is owed exactly like a refusal. A late
+// answer is discarded; every revocation L1 sends is idempotent at the run
+// ledger, so asking again next pass is safe. Answers keep input order so the
+// store writes that follow stay sequential.
+func (s *Server) revokeWithinBudget(ctx context.Context, requests []ComputerTokenRevocation) []revocationAnswer {
+	answers := make([]revocationAnswer, len(requests))
+	for index := range answers {
+		answers[index].err = errors.New("this control plane has no run-ledger address")
 	}
-	if len(revocations) == 0 || s.computerTokenRevoker == nil {
-		return outcomes
+	if len(requests) == 0 || s.computerTokenRevoker == nil {
+		return answers
 	}
 	budget := s.restoreRevocationBudget
 	if budget <= 0 {
@@ -1546,48 +1550,146 @@ func (s *Server) revokeBeforeRestores(ctx context.Context, revocations []Compute
 	budgetCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	type answer struct {
-		index   int
-		receipt contract.ComputerTokenRevocationReceipt
-		err     error
+		index int
+		revocationAnswer
 	}
-	answers := make(chan answer, len(revocations))
-	for index, revocation := range revocations {
+	delivered := make(chan answer, len(requests))
+	for index, request := range requests {
 		go func() {
-			receipt, err := s.computerTokenRevoker.RevokeComputerTokens(budgetCtx, ComputerTokenRevocation{
-				ComputerID: revocation.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true,
-				Reason: "computer_restoring", RestoreOperationRevision: revocation.OperationRevision,
-			})
-			answers <- answer{index: index, receipt: receipt, err: err}
+			receipt, err := s.computerTokenRevoker.RevokeComputerTokens(budgetCtx, request)
+			delivered <- answer{index: index, revocationAnswer: revocationAnswer{receipt: receipt, err: err}}
 		}()
 	}
 	unanswered := fmt.Errorf("the run ledger did not answer within the %s heartbeat revocation budget", budget)
-	for index := range outcomes {
-		outcomes[index].err = unanswered
+	for index := range answers {
+		answers[index].err = unanswered
 	}
 	record := func(got answer) {
 		if got.err != nil && budgetCtx.Err() != nil {
 			got.err = fmt.Errorf("%w: %w", unanswered, got.err)
 		}
-		outcomes[got.index].receipt, outcomes[got.index].err = got.receipt, got.err
+		answers[got.index] = got.revocationAnswer
 	}
-	for pending := len(revocations); pending > 0; pending-- {
+	for pending := len(requests); pending > 0; pending-- {
 		select {
-		case got := <-answers:
+		case got := <-delivered:
 			record(got)
 		case <-budgetCtx.Done():
 			// Keep every answer that is already in hand; only the silent
 			// ones are owed.
 			for {
 				select {
-				case got := <-answers:
+				case got := <-delivered:
 					record(got)
 				default:
-					return outcomes
+					return answers
 				}
 			}
 		}
 	}
-	return outcomes
+	return answers
+}
+
+// revokeOnHeartbeat sends, on one node heartbeat, the node's owed pre-restore
+// revocations together with the owed revocations of Computers hosted on it:
+// one concurrent pass under the one heartbeat budget, so owed revocations
+// never lengthen a heartbeat beyond what #548 bounded. A pre-restore
+// revocation that has not answered is owed exactly like a refusal: nothing
+// is recorded, the restore directive is withheld, and the next heartbeat
+// lists it again. An owed revocation that has not answered stays owed the
+// same way.
+func (s *Server) revokeOnHeartbeat(ctx context.Context, restores []ComputerRestoreRevocationDirective,
+	owed []owedRevocationWork) ([]restoreRevocationOutcome, []revocationAnswer) {
+	requests := make([]ComputerTokenRevocation, 0, len(restores)+len(owed))
+	for _, revocation := range restores {
+		requests = append(requests, ComputerTokenRevocation{
+			ComputerID: revocation.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true,
+			Reason: "computer_restoring", RestoreOperationRevision: revocation.OperationRevision,
+		})
+	}
+	for _, work := range owed {
+		requests = append(requests, work.request)
+	}
+	answers := s.revokeWithinBudget(ctx, requests)
+	outcomes := make([]restoreRevocationOutcome, len(restores))
+	for index := range restores {
+		outcomes[index] = restoreRevocationOutcome{revocation: restores[index], receipt: answers[index].receipt, err: answers[index].err}
+	}
+	return outcomes, answers[len(restores):]
+}
+
+// settleOwedRevocationAnswers records what the run ledger said to each owed
+// revocation. A receipt settles its row, once; anything else is noted on the
+// row, which stays owed.
+func (s *Server) settleOwedRevocationAnswers(ctx context.Context, owed []owedRevocationWork, answers []revocationAnswer) {
+	for index, work := range owed {
+		if s.computerTokenRevoker == nil {
+			if _, err := s.store.SettleOwedComputerRevocationWithoutRunLedger(ctx, work.owed.RevocationID); err != nil {
+				s.logOwedRevocationDeferred(work.owed, err)
+			}
+			continue
+		}
+		s.settleOwedRevocation(ctx, work, answers[index].receipt, answers[index].err)
+	}
+}
+
+func (s *Server) settleOwedRevocation(ctx context.Context, work owedRevocationWork,
+	receipt contract.ComputerTokenRevocationReceipt, revokeErr error) bool {
+	if revokeErr == nil {
+		_, revokeErr = s.store.SettleOwedComputerRevocation(ctx, work.owed.RevocationID, work.request, receipt)
+		if revokeErr == nil {
+			return true
+		}
+	}
+	s.logOwedRevocationDeferred(work.owed, revokeErr)
+	if err := s.store.RecordOwedComputerRevocationFailure(ctx, work.owed.RevocationID, scrubbedCause(revokeErr)); err != nil {
+		s.logOwedRevocationDeferred(work.owed, err)
+	}
+	return false
+}
+
+// revokeAfterAuthorityLoss performs the explicit L3 revocation an
+// authority-losing Computer mutation owes, right after it committed. When the
+// mutation committed an owed-revocation row (owedRevocationID > 0) the
+// revocation is sent from that row and its receipt settles the row. If the
+// run ledger does not take it, the row stays owed for the host Node's
+// heartbeat and the caller is told so. A call that committed no row -- an
+// idempotent replay, or a verb that found nothing to change -- revokes
+// directly as before #554: there is no new authority loss to record.
+func (s *Server) revokeAfterAuthorityLoss(ctx context.Context, owedRevocationID int64, computerID, attemptID, reason string) error {
+	if owedRevocationID == 0 {
+		if attemptID != "" {
+			return s.revokeComputerAttemptAuthority(ctx, computerID, attemptID, reason)
+		}
+		return s.revokeComputerAuthority(ctx, computerID, reason)
+	}
+	if s.computerTokenRevoker == nil {
+		_, err := s.store.SettleOwedComputerRevocationWithoutRunLedger(ctx, owedRevocationID)
+		return err
+	}
+	work, err := s.store.owedComputerRevocationWork(ctx, owedRevocationID)
+	if err != nil {
+		return err
+	}
+	if work.settled {
+		return nil
+	}
+	receipt, revokeErr := s.computerTokenRevoker.RevokeComputerTokens(ctx, work.request)
+	if s.settleOwedRevocation(ctx, work, receipt, revokeErr) || revokeErr == nil {
+		// The run ledger took the revocation. A settlement the store could
+		// not record leaves the row owed and visible; the next heartbeat
+		// asks again, which is idempotent, and records the receipt.
+		return nil
+	}
+	return computerRevocationOwed(revokeErr)
+}
+
+func (s *Server) logOwedRevocationDeferred(owed OwedComputerRevocation, err error) {
+	if s.logf == nil {
+		return
+	}
+	s.logf("event=l1_owed_revocation_deferred revocation_id=%d computer_id=%s verb=%s scope=%s cause=%q",
+		owed.RevocationID, owed.ComputerID, owed.Verb, owed.Scope, scrubbedCause(err))
 }
 
 // logRunLedgerRevocationDeferred records a pre-restore authority revocation
@@ -1887,8 +1989,24 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	// blocked Computer, so the agent could never finish a boot pass and
 	// withdrew kind:oci while still reporting itself alive and claiming
 	// (wefty #548).
+	// Owed revocations ride the same pass (#554). Listing them is best
+	// effort: they are audit, and must never take the heartbeat down.
+	owedRevocations, unbuildable, err := s.store.listNodeOwedComputerRevocations(r.Context(), nodeID, MaxOwedRevocationsPerHeartbeat)
+	if err != nil {
+		if s.logf != nil {
+			s.logf("event=l1_owed_revocation_list_failed node_id=%s cause=%q", nodeID, scrubbedCause(err))
+		}
+		owedRevocations, unbuildable = nil, nil
+	}
+	for revocationID, cause := range unbuildable {
+		if recordErr := s.store.RecordOwedComputerRevocationFailure(r.Context(), revocationID, scrubbedCause(cause)); recordErr != nil && s.logf != nil {
+			s.logf("event=l1_owed_revocation_deferred revocation_id=%d cause=%q", revocationID, scrubbedCause(recordErr))
+		}
+	}
+	restoreOutcomes, owedAnswers := s.revokeOnHeartbeat(r.Context(), restoreRevocations, owedRevocations)
+	s.settleOwedRevocationAnswers(r.Context(), owedRevocations, owedAnswers)
 	authorityStillOwed := map[string]struct{}{}
-	for _, outcome := range s.revokeBeforeRestores(r.Context(), restoreRevocations) {
+	for _, outcome := range restoreOutcomes {
 		if outcome.err != nil {
 			authorityStillOwed[outcome.revocation.ComputerID] = struct{}{}
 			s.logRunLedgerRevocationDeferred(outcome.revocation.ComputerID, outcome.err)
@@ -2009,7 +2127,7 @@ func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.R
 		return
 	}
 	if computer.CurrentJob.State == contract.JobFailed {
-		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_grow_capacity_failed"); err != nil {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_grow_capacity_failed"); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -2323,11 +2441,11 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 	// A completion ends exactly one attempt's authority, so it revokes exactly
 	// that attempt's Computer tokens. Never Computer-wide: by the time the
 	// request reaches the run ledger a reimage or restart may already have
-	// minted the next attempt's tokens (#553 review). A replay re-drives it,
-	// which is the only retry of a revocation that failed after the completion
-	// committed (#548).
+	// minted the next attempt's tokens (#553 review). The first application
+	// committed the revocation as owed; a replay re-drives it directly, and
+	// the host Node's heartbeat settles whatever is still owed (#554).
 	if outcome.ComputerID != "" {
-		if revokeErr := s.revokeComputerAttemptAuthority(r.Context(), outcome.ComputerID,
+		if revokeErr := s.revokeAfterAuthorityLoss(r.Context(), outcome.owedRevocationID, outcome.ComputerID,
 			r.PathValue("attempt_id"), "attempt_terminal"); revokeErr != nil {
 			writeError(w, revokeErr)
 			return

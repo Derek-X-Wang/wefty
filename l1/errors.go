@@ -52,15 +52,29 @@ func runLedgerUnavailable(err error, message string) error {
 	return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: fmt.Sprintf("%s: %v", message, err), Cause: err}
 }
 
-// computerRevocationNotRecorded refuses after an authority-losing Computer
-// mutation has committed and the run ledger could not take the explicit
-// revocation that follows it. It is not retryable because a retry cannot be
-// relied on to perform it: an identical restart or reset replays without
-// revoking, and a repeated stop or remove fails its precondition. Nothing is
-// left open by that, because L3 revalidates the live L1 scope on every bearer
-// request and L1 no longer proves scope for a Computer that is not meant to be
-// running, so the old tokens are already refused. What is lost is the explicit
-// revocation's audit row, which is the follow-up to #548.
+// computerRevocationOwed refuses after an authority-losing Computer mutation
+// has committed, together with the owed revocation it now carries, and the
+// run ledger could not take that revocation. It is not retryable: nothing the
+// caller can repeat performs the revocation, and nothing needs it to. L1
+// holds the revocation durably and settles it on the host Node's heartbeat
+// once the run ledger answers (#554), and L3 already refuses the old tokens
+// because it revalidates the live L1 scope on every bearer request and L1 no
+// longer proves scope for a Computer that is not meant to be running.
+func computerRevocationOwed(err error) error {
+	message := "the Computer mutation applied, but the run ledger could not be reached, so the explicit revocation " +
+		"of its token grants is owed: L1 recorded it and will retry it until the run ledger takes it, so do not " +
+		"retry the request for it, and L3's live-scope check already refuses the Computer's old tokens"
+	if err != nil {
+		message = fmt.Sprintf("%s: %v", message, err)
+	}
+	return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: message, Cause: err, notRetryable: true}
+}
+
+// computerRevocationNotRecorded refuses when a call that committed no new
+// authority loss -- an accepted replay, or a stop or remove that found
+// nothing to change -- could not re-drive the explicit revocation. The
+// original mutation's owed revocation, if it has one, is unaffected and still
+// settles on the heartbeat.
 func computerRevocationNotRecorded(err error) error {
 	message := "the Computer mutation applied, but the run ledger could not be reached, so the explicit revocation " +
 		"of its token grants was not recorded; retrying the request is not guaranteed to perform it, and L3's " +

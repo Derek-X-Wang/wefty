@@ -119,7 +119,12 @@ type ComputerTokenRevocation struct {
 	// grants bound to that one attempt; NewSubmitIntentRevision, RevokeAll,
 	// and RestoreOperationRevision must then be zero.
 	ComputerAttemptID string `json:"computer_attempt_id,omitempty"`
-	Reason            string `json:"reason"`
+	// PreserveComputerAttemptIDs narrows a RevokeAll to leave these attempts'
+	// grants untouched. Only a late owed-revocation settlement sets it: the
+	// attempts it names began after the authority loss the revocation is for
+	// (#554).
+	PreserveComputerAttemptIDs []string `json:"preserve_computer_attempt_ids,omitempty"`
+	Reason                     string   `json:"reason"`
 }
 
 type ComputerTokenRevoker interface {

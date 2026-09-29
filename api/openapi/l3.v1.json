@@ -781,6 +781,7 @@
           "revoke_all": { "type": "boolean", "default": false },
           "restore_operation_revision": { "type": "integer", "minimum": 1, "description": "Existing L1 restore operation revision. Requires revoke_all=true and reason=computer_restoring; every request executes a fresh transaction, including retries." },
           "computer_attempt_id": { "type": "string", "minLength": 1, "maxLength": 255, "description": "Revoke only the grants bound to this one attempt of the Computer, on any host. L1 sends it when it accepts that attempt's completion. Requires submit_intent_revision=0 and excludes revoke_all and restore_operation_revision; any other combination is invalid_request. Added for #553: upgrade L3 before or together with L1, since an older L3 rejects the unknown field." },
+          "preserve_computer_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 255 }, "minItems": 1, "maxItems": 256, "uniqueItems": true, "description": "Narrows a revoke_all: grants bound to these attempts are left untouched, and the receipt echoes them. L1 sends it when it settles an owed Computer-wide revocation late, naming the attempts the Computer began after the authority loss (#554). Requires revoke_all=true and excludes restore_operation_revision and computer_attempt_id; any other combination is invalid_request. Upgrade L3 before or together with L1, since an older L3 rejects the unknown field." },
           "reason": { "type": "string", "minLength": 1 }
         }
       },

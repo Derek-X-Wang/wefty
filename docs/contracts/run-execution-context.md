@@ -318,6 +318,33 @@ revoked. That revocation is
 defense in depth plus audit, not the gate: the live-scope check above already
 refuses the old passes the moment the mutation commits.
 
+Each of those mutations writes the revocation it owes as a row in L1's
+`computer_owed_revocations`, in the mutation's own transaction (#554): the
+verb, the Computer, its host Node, the reason, and the scope — `revoke_all`, or
+`attempt` with the completed attempt's id. A `revoke_all` row also snapshots
+every attempt the Computer has at commit. After commit the handler sends the
+revocation from the row at once, and the run ledger's receipt settles the row.
+A row is settled at most once and is then immutable audit, never deleted; a
+replay, or a stop or remove that changes nothing, commits no row and revokes
+directly as before. On an installation that names no run ledger the row is
+closed as `no_run_ledger`, since such an installation mints no passes. A row
+the run ledger does not take stays owed, and `GET /v1/computers/{id}` lists it
+under `owed_revocations` (`wefty services status` shows it as
+`OWED REVOCATIONS`) with its failure count and last failure. The host Node's
+heartbeat settles owed rows, at most `MaxOwedRevocationsPerHeartbeat` (16) per
+heartbeat, in the same concurrent pass and under the same
+`HeartbeatRestoreRevocationBudget` as the pre-restore revocations below; a
+failure is noted on the row and never fails the heartbeat. An `attempt` row is
+always sent attempt-scoped and never widens. A `revoke_all` row settled late
+sends `preserve_computer_attempt_ids` naming every attempt the Computer began
+after the mutation committed: the authority loss never covered those passes,
+and a revoke-all would end them (the #553 hazard, moved to settlement time).
+L3 accepts that field only with `revoke_all` and without
+`restore_operation_revision` or `computer_attempt_id`, and the receipt echoes
+it as `preserved_computer_attempt_ids`; an L3 that predates the field rejects
+it, so such a row stays owed until L3 is upgraded. A Computer whose host Node
+never heartbeats again keeps its rows owed and visible.
+
 When L1 cannot reach the run ledger to perform a revocation it says so by
 name: typed `run_ledger_unavailable`, HTTP 503. It is never reported as
 `internal`, because the remedy is a deployment address, not an L1 fix, and a
@@ -325,12 +352,12 @@ scrubbed message hides the only fact that leads to it. Before a submission
 enable or disable commits, the refusal is `retryable: true`: nothing applied,
 and a retry performs both. After an authority-losing Computer mutation commits,
 the refusal is `retryable: false`, and its message says that the mutation
-applied, that the explicit revocation was not recorded, that retrying the
-request is not guaranteed to perform it (an identical restart or reset
-replays without revoking; a repeated stop or remove fails its precondition),
-and that L3's live-scope check already refuses the Computer's old passes.
-No durable record keeps the lost revocation owed. The node heartbeat is the
-one surface that does not refuse: a pre-restore revocation the run ledger will
+applied, that the explicit revocation is owed and L1 will retry it until the
+run ledger takes it, that the request should not be retried for it, and that
+L3's live-scope check already refuses the Computer's old passes. A replay or
+no-op that could not re-drive its revocation says instead that the revocation
+was not recorded. The owed row above is the durable record. The node
+heartbeat is the one surface that does not refuse: a pre-restore revocation the run ledger will
 not take is left owed and re-listed next pass, and only that Computer's restore
 directive is withheld. The heartbeat asks for all owed pre-restore revocations at once and
 waits for them at most `HeartbeatRestoreRevocationBudget` (3s), well inside the

@@ -271,8 +271,17 @@ type ComputerTokenRevocationRequest struct {
 	// attempt of the Computer, whichever host holds them. It excludes
 	// RevokeAll, RestoreOperationRevision, and SubmitIntentRevision.
 	ComputerAttemptID string `json:"computer_attempt_id,omitempty"`
-	Reason            string `json:"reason"`
+	// PreserveComputerAttemptIDs narrows a RevokeAll: grants bound to these
+	// attempts are left untouched. L1 sends it when it settles an owed
+	// revocation late, after the Computer may have started attempts whose
+	// passes the original authority loss never covered (#554). It requires
+	// RevokeAll and excludes RestoreOperationRevision.
+	PreserveComputerAttemptIDs []string `json:"preserve_computer_attempt_ids,omitempty"`
+	Reason                     string   `json:"reason"`
 }
+
+// MaxPreservedComputerAttempts bounds one narrowed RevokeAll.
+const MaxPreservedComputerAttempts = 256
 
 type ComputerAttemptTokenRevocationRequest struct {
 	ComputerID        string `json:"computer_id"`

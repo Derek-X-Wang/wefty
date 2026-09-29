@@ -989,3 +989,40 @@ func TestStalledServiceRemovalDoesNotExitSuccessfully(t *testing.T) {
 		t.Fatalf("verified removal reported an outcome error: %v", err)
 	}
 }
+
+// TestComputerStatusShowsOwedRevocations is #554's operator surface: a
+// Computer whose authority-losing mutation committed while its revocation is
+// still owed says so, in the JSON projection and in the human table. The stop
+// here goes straight to the store, so no handler settles its revocation.
+func TestComputerStatusShowsOwedRevocations(t *testing.T) {
+	harness := newServiceCLIHarness(t)
+	ctx := context.Background()
+	owing := createComputerCLIProjection(t, ctx, harness.clients, "owing", "owing-computer")
+	quiet := createComputerCLIProjection(t, ctx, harness.clients, "quiet", "quiet-computer")
+	if _, err := harness.store.SetComputerDesiredState(ctx, owing.ComputerID, l1.ComputerDesiredStateRequest{
+		ComputerMutationPrecondition: l1.ComputerMutationPrecondition{IntentRevision: owing.IntentRevision,
+			StorageID: owing.StorageID, StorageGeneration: owing.StorageGeneration, Actor: "operator"},
+		DesiredState: contract.ServiceDesiredStopped,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status computerOperatorProjection
+	if err := json.Unmarshal(runServiceCLI(t, ctx, harness.clients, true, "services", "status", owing.ComputerID), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.OwedRevocations) != 1 || status.OwedRevocations[0].Verb != l1.ComputerRevocationVerbStop ||
+		status.OwedRevocations[0].Scope != l1.ComputerRevocationScopeRevokeAll || status.OwedRevocations[0].ComputerID != owing.ComputerID {
+		t.Fatalf("owed revocations in the status JSON = %#v", status.OwedRevocations)
+	}
+	human := runServiceCLI(t, ctx, harness.clients, false, "services", "status", owing.ComputerID)
+	if !bytes.Contains(human, []byte("OWED REVOCATIONS")) || !bytes.Contains(human, []byte("1(stop)")) {
+		t.Fatalf("human Computer status does not show the owed revocation:\n%s", human)
+	}
+	quietJSON := runServiceCLI(t, ctx, harness.clients, true, "services", "status", quiet.ComputerID)
+	if bytes.Contains(quietJSON, []byte("owed_revocations")) {
+		t.Fatalf("a Computer with nothing owed reported owed revocations: %s", quietJSON)
+	}
+	if human := runServiceCLI(t, ctx, harness.clients, false, "services", "status", quiet.ComputerID); !bytes.Contains(human, []byte("none")) {
+		t.Fatalf("human status of a Computer with nothing owed:\n%s", human)
+	}
+}

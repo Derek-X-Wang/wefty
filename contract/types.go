@@ -15,13 +15,15 @@ const SchemaVersionV1 = 1
 // grant selected by the request was revoked before the response. A nonzero
 // RestoreOperationRevision acknowledges a fresh RevokeAll for that restore;
 // CommittedAt is L3 audit time and does not order events on other hosts.
+// PreservedComputerAttemptIDs echoes the attempts a RevokeAll left untouched.
 type ComputerTokenRevocationReceipt struct {
-	RestoreOperationRevision int64     `json:"restore_operation_revision,omitempty"`
-	ComputerID               string    `json:"computer_id"`
-	ComputerAttemptID        string    `json:"computer_attempt_id,omitempty"`
-	SubmitIntentRevision     int64     `json:"submit_intent_revision"`
-	RevokedGrantCount        int       `json:"revoked_grant_count"`
-	CommittedAt              time.Time `json:"committed_at"`
+	RestoreOperationRevision    int64     `json:"restore_operation_revision,omitempty"`
+	ComputerID                  string    `json:"computer_id"`
+	ComputerAttemptID           string    `json:"computer_attempt_id,omitempty"`
+	PreservedComputerAttemptIDs []string  `json:"preserved_computer_attempt_ids,omitempty"`
+	SubmitIntentRevision        int64     `json:"submit_intent_revision"`
+	RevokedGrantCount           int       `json:"revoked_grant_count"`
+	CommittedAt                 time.Time `json:"committed_at"`
 }
 
 // Run execution environment names are shared wire-contract vocabulary. Keep
