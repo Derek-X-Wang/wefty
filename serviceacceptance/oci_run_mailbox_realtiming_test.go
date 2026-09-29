@@ -272,7 +272,7 @@ func describeOCIMailboxRun(t *testing.T, harness *acceptanceHarness, runID, stat
 // on its first with a live attempt is wedged in the agent.
 func describeAcceptanceL1Job(t *testing.T, harness *acceptanceHarness, jobID string) string {
 	t.Helper()
-	database, err := sql.Open("sqlite", harness.l1Database+"?mode=ro")
+	database, err := sql.Open("sqlite", readOnlySQLiteDSN(harness.l1Database))
 	if err != nil {
 		return fmt.Sprintf("\n  l1 job: unreadable: %v", err)
 	}
@@ -333,7 +333,7 @@ func boundedResult(result string) string {
 // only place a failing script can say which of its own assertions failed.
 func lastAttemptOutput(t *testing.T, harness *acceptanceHarness, jobID string) string {
 	t.Helper()
-	database, err := sql.Open("sqlite", harness.l1Database+"?mode=ro")
+	database, err := sql.Open("sqlite", readOnlySQLiteDSN(harness.l1Database))
 	if err != nil {
 		return fmt.Sprintf("\n  workload output: unreadable: %v", err)
 	}
@@ -511,7 +511,7 @@ func readRunLedgerStatus(t *testing.T, harness *acceptanceHarness, runID string)
 
 func openRunLedgerDatabase(t *testing.T, harness *acceptanceHarness) *sql.DB {
 	t.Helper()
-	database, err := sql.Open("sqlite", harness.runLedgerDatabase+"?mode=ro")
+	database, err := sql.Open("sqlite", readOnlySQLiteDSN(harness.runLedgerDatabase))
 	if err != nil {
 		t.Fatal(err)
 	}

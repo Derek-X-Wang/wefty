@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -218,7 +219,7 @@ func readOCICgroupLimitsLines(t *testing.T, harness *acceptanceHarness, jobID st
 // returns for the receipt.
 func ociCgroupLimitsStdout(t *testing.T, harness *acceptanceHarness, jobID string) (string, string) {
 	t.Helper()
-	database, err := sql.Open("sqlite", harness.l1Database+"?mode=ro")
+	database, err := sql.Open("sqlite", readOnlySQLiteDSN(harness.l1Database))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,4 +255,12 @@ func parseCgroupCPUMax(value string) (quota int64, period uint64, ok bool) {
 	quota, quotaErr := strconv.ParseInt(fields[0], 10, 64)
 	period, periodErr := strconv.ParseUint(fields[1], 10, 64)
 	return quota, period, quotaErr == nil && periodErr == nil
+}
+
+// readOnlySQLiteDSN opens a database file read-only. The driver honours
+// mode=ro only in a file: URI; appended to a bare path it is dropped and the
+// file is opened read-write, which a test must never do to a live L1 or L3
+// database.
+func readOnlySQLiteDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
 }
