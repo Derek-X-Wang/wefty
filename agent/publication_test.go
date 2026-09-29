@@ -388,3 +388,42 @@ func TestPublicationControllerStopKeepsCurrentFalseAcknowledgement(t *testing.T)
 	default:
 	}
 }
+
+// A Reassert after L1 dropped an acknowledged publication on its own authority
+// sends the current readiness again; an unready controller stays silent
+// (wefty #559).
+func TestPublicationControllerReassertRepublishesOnlyCurrentReadiness(t *testing.T) {
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	actions := make(chan string, 16)
+	controller := newPublicationController(clock, DefaultPublicationRecoveryWindow, DefaultPublicationRetryInterval,
+		func(_ context.Context, ready bool) error {
+			actions <- "publish:" + boolString(ready)
+			return nil
+		},
+		func(ready bool) { actions <- "forward:" + boolString(ready) },
+	)
+	done := make(chan error, 1)
+	go func() { done <- controller.Run(context.Background()) }()
+
+	controller.Reassert()
+	wantNoPublicationAction(t, actions)
+
+	controller.Observe(true)
+	wantPublicationAction(t, actions, "publish:true")
+	wantPublicationAction(t, actions, "forward:true")
+	controller.Reassert()
+	wantPublicationAction(t, actions, "publish:true")
+	wantPublicationAction(t, actions, "forward:true")
+	wantNoPublicationAction(t, actions)
+
+	controller.Observe(false)
+	wantPublicationAction(t, actions, "forward:false")
+	wantPublicationAction(t, actions, "publish:false")
+	controller.Reassert()
+	wantNoPublicationAction(t, actions)
+
+	controller.Stop()
+	if err := waitPublicationDone(t, done); err != nil {
+		t.Fatalf("publication controller stop: %v", err)
+	}
+}

@@ -136,6 +136,19 @@ whether L3 committed the request before revocation. The files remain
 attempt-local tmpfs and never enter `/wefty/service`, a JobSpec, logs,
 inspection, or removal evidence.
 
+Committing a submission change (enable, disable, or an inflight resize) clears
+the Computer's published readiness and `display_endpoint` in the same L1
+transaction, so readiness is earned again under the new authority. The running
+attempt keeps running. Once the agent has installed the change (a pass minted
+and verified at the new revision with both files published, or the transport
+closed and both files removed), it republishes that same attempt's current
+readiness without waiting for a backend transition or a fresh attempt. The
+screen is therefore absent from the commit until the agent's next policy
+delivery, one mint, and one publication round trip; if both backends are not
+ready at that point, the ordinary atomic readiness rules below decide when it
+returns. A re-mint that fails ends the attempt, and the replacement attempt
+publishes as usual.
+
 `/wefty/service`, `/wefty/control`, and `/wefty/handoff` are non-shadowable.
 Operator mount targets equal to, above, or below any of them are rejected after
 normalization. Image filesystem content at a reserved target is hidden by the

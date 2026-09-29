@@ -42,7 +42,7 @@ func TestComputerSubmissionPolicyChangeRotatesAttemptTokenFile(t *testing.T) {
 	}, contract.JobKindOCI, contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}})
 	go func() {
 		done <- syncComputerTokenFile(ctx, runtime, workloadrunner.AttemptAuthority{}, systemClock{}, minter,
-			controller, "computer-1", "attempt-1", disabled, disabled, updates)
+			controller, "computer-1", "attempt-1", disabled, disabled, updates, nil)
 	}()
 	updates <- ComputerSubmissionAuthority{ComputerID: "computer-1", Enabled: true, SubmitIntentRevision: 2, SubmitMaxInflight: 7}
 	assertTokenFileWrite(t, runtime.writes, "", "")

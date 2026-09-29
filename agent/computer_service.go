@@ -314,7 +314,8 @@ func runComputerService(
 			case <-runtimeStarted:
 			}
 			tokenSyncErrors <- syncComputerTokenFile(runContext, controlRuntime, request.Authority,
-				clock, config.computerTokens, config.computerBridge, config.computerID, config.attemptID, config.submission, initial, updates)
+				clock, config.computerTokens, config.computerBridge, config.computerID, config.attemptID, config.submission, initial, updates,
+				publication.Reassert)
 		}()
 	}
 	defer stopTokenSync()
@@ -417,6 +418,13 @@ func runComputerService(
 	}
 }
 
+// syncComputerTokenFile makes the attempt's submission transport and files
+// follow the revisioned submission authority. L1 clears the Computer's
+// published readiness and display endpoint when it commits a submission
+// change, so readiness is earned again only under the new authority: installed
+// runs after a change is fully in place (a pass minted and verified at the new
+// revision and published, or the transport and files removed), and the caller
+// republishes the same attempt's current readiness from there (wefty #559).
 func syncComputerTokenFile(
 	ctx context.Context,
 	runtime workloadrunner.OCIComputerControlRuntime,
@@ -428,7 +436,11 @@ func syncComputerTokenFile(
 	last ComputerSubmissionAuthority,
 	initial ComputerSubmissionAuthority,
 	updates <-chan ComputerSubmissionAuthority,
+	installed func(),
 ) error {
+	if installed == nil {
+		installed = func() {}
+	}
 	apply := func(next ComputerSubmissionAuthority) error {
 		if next.Enabled == last.Enabled && next.SubmitIntentRevision == last.SubmitIntentRevision &&
 			next.SubmitMaxInflight == last.SubmitMaxInflight {
@@ -445,6 +457,7 @@ func syncComputerTokenFile(
 		}
 		last = next
 		if !next.Enabled {
+			installed()
 			return nil
 		}
 		var grant l3.ComputerTokenGrant
@@ -477,6 +490,7 @@ func syncComputerTokenFile(
 			_ = bridge.disable(errComputerAttemptClosed)
 			return fmt.Errorf("publish re-minted Computer submission files: %w", err)
 		}
+		installed()
 		return nil
 	}
 	if err := apply(initial); err != nil {

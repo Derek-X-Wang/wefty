@@ -612,7 +612,7 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	enabled := ComputerSubmissionAuthority{ComputerID: "computer-1", Enabled: true, SubmitIntentRevision: 2, SubmitMaxInflight: 20}
 	go func() {
 		syncDone <- syncComputerTokenFile(ctx, runtime, workloadrunner.AttemptAuthority{}, systemClock{}, minter,
-			controller, "computer-1", "attempt-1", enabled, enabled, updates)
+			controller, "computer-1", "attempt-1", enabled, enabled, updates, nil)
 	}()
 	type bridgeResponse struct {
 		status int

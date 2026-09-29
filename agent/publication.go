@@ -34,6 +34,9 @@ type publicationController struct {
 	clearPending bool
 	stopping     bool
 	revision     uint64
+	// reassert records that L1 dropped an acknowledged publication on its
+	// own authority, so the current readiness must be sent again.
+	reassert bool
 }
 
 func newPublicationController(
@@ -83,6 +86,23 @@ func (controller *publicationController) Observe(ready bool) {
 	controller.mu.Unlock()
 }
 
+// Reassert tells the controller that L1 has cleared this attempt's
+// publication without the controller asking. A Computer submission-authority
+// change does that (wefty #559): the readiness it cleared must be earned again
+// under the new authority, and the agent calls Reassert once it has installed
+// that authority. An acknowledged true is then stale, so Run publishes the
+// current readiness again for the same attempt. Local readiness, forwarding,
+// and open sessions are untouched; a withdrawn or unready controller keeps
+// its ordinary recovery rules.
+func (controller *publicationController) Reassert() {
+	controller.mu.Lock()
+	if !controller.stopping {
+		controller.reassert = true
+		controller.signalLocked()
+	}
+	controller.mu.Unlock()
+}
+
 // Stop withdraws forwarding synchronously and asks Run to drain the final
 // absolute false mutation before returning. It is safe to call more than once.
 func (controller *publicationController) Stop() {
@@ -103,6 +123,9 @@ func (controller *publicationController) Run(ctx context.Context) error {
 	requestedTrue := false
 	for {
 		snapshot := controller.snapshot()
+		if controller.takeReassert() && acknowledged != nil && *acknowledged {
+			acknowledged = nil
+		}
 		if snapshot.clearPending && acknowledged != nil && !*acknowledged {
 			controller.markClearAcknowledged()
 			snapshot.clearPending = false
@@ -228,6 +251,14 @@ func (controller *publicationController) enableForwardingIfCurrent(revision uint
 	if !controller.stopping && controller.ready && controller.revision == revision {
 		controller.forward(true)
 	}
+}
+
+func (controller *publicationController) takeReassert() bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	reassert := controller.reassert
+	controller.reassert = false
+	return reassert
 }
 
 func (controller *publicationController) markClearAcknowledged() {
