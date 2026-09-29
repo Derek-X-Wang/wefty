@@ -221,8 +221,12 @@ func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 		t.Fatalf("helper service left inactive at monotonic %dus, outside the first connect window [%dus, %dus]",
 			inactiveExit, firstDialStarted, admitted)
 	}
-	if execStart < inactiveExit || execStart > admitted {
-		t.Fatalf("helper main process started at monotonic %dus, outside [%dus, %dus]", execStart, inactiveExit, admitted)
+	// For a Type=simple unit systemd stamps ExecMainStart when it spawns the
+	// main process, while the unit is still dead, and InactiveExit only when it
+	// then enters running, so the exec stamp precedes the inactive-exit stamp by
+	// microseconds. Bound it by the connect window, not by InactiveExit.
+	if execStart < firstDialStarted || execStart > admitted {
+		t.Fatalf("helper main process started at monotonic %dus, outside the first connect window [%dus, %dus]", execStart, firstDialStarted, admitted)
 	}
 
 	var evidence strings.Builder

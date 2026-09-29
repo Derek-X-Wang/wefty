@@ -130,11 +130,16 @@ MANIFEST
         fi
         ;;
       start-helper-topology)
-        systemctl start wefty-oci-helper-realtiming.socket
-        systemctl start wefty-oci-helper-realtiming.service
-        systemctl is-active --quiet wefty-oci-helper-realtiming.socket
-        systemctl is-active --quiet wefty-oci-helper-realtiming.service
-        test -S /run/wefty-oci-helper/helper.sock
+        # Recorded, not fatal: under set -e a failed start would take the
+        # shared supervisor down and strand every later fault request.
+        if ! systemctl start wefty-oci-helper-realtiming.socket || ! systemctl start wefty-oci-helper-realtiming.service; then
+          record_action_failure 'systemctl start of the helper topology failed'
+          continue
+        fi
+        if ! systemctl is-active --quiet wefty-oci-helper-realtiming.socket || ! systemctl is-active --quiet wefty-oci-helper-realtiming.service || ! test -S /run/wefty-oci-helper/helper.sock; then
+          record_action_failure 'helper topology not active after start'
+          continue
+        fi
         ;;
       reset-containerd)
         systemctl stop wefty-test-containerd.service
