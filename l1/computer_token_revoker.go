@@ -40,8 +40,10 @@ func (c *ComputerTokenRevocationClient) RevokeComputerTokens(ctx context.Context
 		ComputerID               string `json:"computer_id"`
 		SubmitIntentRevision     int64  `json:"submit_intent_revision"`
 		RevokeAll                bool   `json:"revoke_all,omitempty"`
+		ComputerAttemptID        string `json:"computer_attempt_id,omitempty"`
 		Reason                   string `json:"reason"`
-	}{revocation.RestoreOperationRevision, revocation.ComputerID, revocation.NewSubmitIntentRevision, revocation.RevokeAll, revocation.Reason})
+	}{revocation.RestoreOperationRevision, revocation.ComputerID, revocation.NewSubmitIntentRevision, revocation.RevokeAll,
+		revocation.ComputerAttemptID, revocation.Reason})
 	if err != nil {
 		return contract.ComputerTokenRevocationReceipt{}, fmt.Errorf("l1: encode Computer token revocation: %w", err)
 	}

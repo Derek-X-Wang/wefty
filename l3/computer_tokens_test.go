@@ -272,3 +272,94 @@ func TestComputerAttemptAndHostRevocationsAreIdentityScoped(t *testing.T) {
 		t.Fatal("host restart revocation left grant active")
 	}
 }
+
+// #553 review: L1 ends exactly one attempt's authority when it accepts that
+// attempt's completion, so it asks for exactly that attempt's grants to be
+// revoked. The request may arrive after the next attempt was minted; that
+// grant, and every other Computer's grant, is untouched.
+func TestControlPlaneAttemptScopedRevocationRevokesOnlyThatAttempt(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "computer-attempt-scoped.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldProof := testComputerScope()
+	if _, err := store.MintComputerToken(ctx, oldProof); err != nil {
+		t.Fatal(err)
+	}
+	replacementProof := testComputerScope()
+	replacementProof.ComputerAttemptID = "attempt-2"
+	replacement, err := store.MintComputerToken(ctx, replacementProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherProof := testComputerScope()
+	otherProof.ComputerID = "computer-2"
+	otherProof.HostNodeID = "node-2"
+	other, err := store.MintComputerToken(ctx, otherProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertActive := func(stage string, tokens ...string) {
+		t.Helper()
+		for _, token := range tokens {
+			if _, err := store.AuthenticateComputerToken(ctx, token); err != nil {
+				t.Fatalf("%s: a grant outside the revoked attempt was revoked: %v", stage, err)
+			}
+		}
+	}
+	activeGrants := func() int {
+		t.Helper()
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_token_grants WHERE revoked_ns IS NULL`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	for name, invalid := range map[string]ComputerTokenRevocationRequest{
+		"with_revoke_all":       {ComputerID: "computer-1", ComputerAttemptID: "attempt-2", RevokeAll: true, Reason: "attempt_terminal"},
+		"with_submit_revision":  {ComputerID: "computer-1", ComputerAttemptID: "attempt-2", SubmitIntentRevision: 99, Reason: "attempt_terminal"},
+		"with_restore_revision": {ComputerID: "computer-1", ComputerAttemptID: "attempt-2", RevokeAll: true, RestoreOperationRevision: 4, Reason: "computer_restoring"},
+		"blank_attempt":         {ComputerID: "computer-1", ComputerAttemptID: " ", RevokeAll: true, SubmitIntentRevision: 1, Reason: "attempt_terminal"},
+		"padded_attempt":        {ComputerID: "computer-1", ComputerAttemptID: " attempt-2", Reason: "attempt_terminal"},
+		"oversized_attempt":     {ComputerID: "computer-1", ComputerAttemptID: strings.Repeat("a", 256), Reason: "attempt_terminal"},
+		"missing_computer":      {ComputerAttemptID: "attempt-2", Reason: "attempt_terminal"},
+		"missing_reason":        {ComputerID: "computer-1", ComputerAttemptID: "attempt-2"},
+	} {
+		receipt, err := store.RevokeComputerTokens(ctx, invalid)
+		var protocolErr *Error
+		if !errors.As(err, &protocolErr) || protocolErr.Code != contract.ErrorInvalidRequest || receipt.RevokedGrantCount != 0 {
+			t.Fatalf("%s: receipt=%#v err=%v, want invalid_request", name, receipt, err)
+		}
+	}
+	if got := activeGrants(); got != 2 {
+		t.Fatalf("refused requests changed the grant table: %d active, want 2", got)
+	}
+
+	// The completed attempt's revocation arrives after the replacement mint.
+	receipt, err := store.RevokeComputerTokens(ctx, ComputerTokenRevocationRequest{
+		ComputerID: oldProof.ComputerID, ComputerAttemptID: oldProof.ComputerAttemptID, Reason: "attempt_terminal"})
+	if err != nil || receipt.ComputerID != oldProof.ComputerID || receipt.ComputerAttemptID != oldProof.ComputerAttemptID ||
+		receipt.RevokedGrantCount != 0 || receipt.SubmitIntentRevision != 0 || receipt.CommittedAt.IsZero() {
+		t.Fatalf("late attempt-scoped receipt = %#v err=%v", receipt, err)
+	}
+	assertActive("late revocation of the completed attempt", replacement.Token, other.Token)
+
+	// Scoped to the replacement attempt, whichever host holds it: only it.
+	receipt, err = store.RevokeComputerTokens(ctx, ComputerTokenRevocationRequest{
+		ComputerID: "computer-1", ComputerAttemptID: "attempt-2", Reason: "attempt_terminal"})
+	if err != nil || receipt.RevokedGrantCount != 1 || receipt.ComputerAttemptID != "attempt-2" {
+		t.Fatalf("attempt-scoped receipt = %#v err=%v", receipt, err)
+	}
+	if _, err := store.AuthenticateComputerToken(ctx, replacement.Token); err == nil {
+		t.Fatal("attempt-scoped revocation left the attempt's grant active")
+	}
+	assertActive("revocation of attempt-2 of computer-1", other.Token)
+	var audited int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_token_audit WHERE operation='revoked'
+		AND computer_id='computer-1' AND computer_attempt_id='attempt-2' AND reason='attempt_terminal'`).Scan(&audited); err != nil || audited != 1 {
+		t.Fatalf("attempt-scoped revocation audit rows = %d err=%v, want 1", audited, err)
+	}
+}

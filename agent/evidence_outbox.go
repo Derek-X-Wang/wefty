@@ -666,11 +666,12 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 		return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts completion evidence", code)
 	case errorDestinationNodeSession:
 		// node_session_replaced: the attempt belongs to an older registration
-		// of this node. For a completion L1 already accepted (the #549 storm)
-		// that never clears, because the generation only advances. For one it
-		// has not, it clears only when the attempt's lease expires at L1, after
-		// which the replay is answered lease_expired and lands as late
-		// evidence -- what the slow re-checks are for.
+		// of this node and L1 has not accepted this completion. (One it had
+		// accepted -- the #549 storm -- is answered as an already-recorded
+		// replay and was delivered above, #553.) It clears only when the
+		// attempt's lease expires at L1, after which the replay is answered
+		// lease_expired and lands as late evidence -- what the slow re-checks
+		// are for.
 		return recoveryRefusal(err, code, classification)
 	default:
 		return err

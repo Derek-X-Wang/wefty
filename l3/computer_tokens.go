@@ -128,6 +128,9 @@ func (s *Store) MintComputerToken(ctx context.Context, proof ComputerTokenScopeP
 func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenRevocationRequest) (contract.ComputerTokenRevocationReceipt, error) {
 	request.ComputerID = strings.TrimSpace(request.ComputerID)
 	request.Reason = strings.TrimSpace(request.Reason)
+	if request.ComputerAttemptID != "" {
+		return s.revokeComputerAttemptTokensAsControlPlane(ctx, request)
+	}
 	if request.RestoreOperationRevision < 0 ||
 		(request.RestoreOperationRevision > 0 && (!request.RevokeAll || request.Reason != "computer_restoring")) ||
 		request.ComputerID == "" || len(request.ComputerID) > 255 ||
@@ -155,6 +158,38 @@ func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenR
 	}
 	return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
 		SubmitIntentRevision: request.SubmitIntentRevision, RestoreOperationRevision: request.RestoreOperationRevision, RevokedGrantCount: revoked, CommittedAt: now}, nil
+}
+
+// revokeComputerAttemptTokensAsControlPlane revokes exactly one attempt's
+// grants for L1, which ends that attempt's authority when it accepts its
+// completion. Unlike RevokeComputerAttemptTokens it is not bound to a host:
+// the caller is the control plane, the authority for every attempt. A
+// Computer-wide or revision-bound field in the same request is refused rather
+// than guessed at, so an attempt-scoped revocation can never widen.
+func (s *Store) revokeComputerAttemptTokensAsControlPlane(ctx context.Context, request ComputerTokenRevocationRequest) (contract.ComputerTokenRevocationReceipt, error) {
+	if request.ComputerID == "" || len(request.ComputerID) > 255 ||
+		request.ComputerAttemptID != strings.TrimSpace(request.ComputerAttemptID) || len(request.ComputerAttemptID) > 255 ||
+		request.RevokeAll || request.RestoreOperationRevision != 0 || request.SubmitIntentRevision != 0 ||
+		request.Reason == "" || len(request.Reason) > 255 {
+		return contract.ComputerTokenRevocationReceipt{}, protocolError(contract.ErrorInvalidRequest,
+			"attempt-scoped Computer token revocation names one Computer attempt and nothing broader")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return contract.ComputerTokenRevocationReceipt{}, internalError(err, "begin attempt-scoped Computer token revocation")
+	}
+	defer tx.Rollback()
+	now := canonicalTime(s.clock.Now())
+	revoked, err := revokeComputerGrantRowsWithCount(ctx, tx, `computer_id=? AND computer_attempt_id=? AND revoked_ns IS NULL`,
+		[]any{request.ComputerID, request.ComputerAttemptID}, now.UnixNano(), request.Reason)
+	if err != nil {
+		return contract.ComputerTokenRevocationReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return contract.ComputerTokenRevocationReceipt{}, internalError(err, "commit attempt-scoped Computer token revocation")
+	}
+	return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID, ComputerAttemptID: request.ComputerAttemptID,
+		RevokedGrantCount: revoked, CommittedAt: now}, nil
 }
 
 func (s *Store) RevokeComputerTokenScope(ctx context.Context, scope ComputerTokenScope, reason string) error {

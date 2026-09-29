@@ -300,7 +300,18 @@ grants before reporting success.
 
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
-already failed, attempt completion) is followed by an explicit L3 revoke-all.
+already failed) is followed by an explicit L3 revoke-all. Attempt completion,
+including an accepted completion replay, is followed instead by an L3
+revocation scoped to exactly the completed attempt: the request carries
+`computer_attempt_id` and revokes only that attempt's grants on any host. It
+reaches L3 after the completion has committed, when a reimage or restart may
+already have minted the next attempt's pass, and a revoke-all there would end
+that live pass (#553). L3 accepts `computer_attempt_id` only from the control
+plane, with `submit_intent_revision` 0 and without `revoke_all` or
+`restore_operation_revision`; the receipt echoes it. Upgrade L3 before or
+together with L1: an L3 that predates the field rejects it as an unknown
+request field, so a newer L1's Computer completion is answered
+`run_ledger_unavailable` and retried until L3 is upgraded.
 An online grow that fails without failing the job keeps its running attempt
 and returns to `stable`, so its passes stay valid by design and nothing is
 revoked. That revocation is
