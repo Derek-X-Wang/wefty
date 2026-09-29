@@ -159,9 +159,12 @@ func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 	if sessionDials != 1 || firstDialErr != nil {
 		t.Fatalf("session admission took %d dial(s), first dial err=%v; want exactly one successful connect", sessionDials, firstDialErr)
 	}
+	// Handshake() withholds the session capability by design, so admission is
+	// proven by OpenSession succeeding and, below, by the session serving a
+	// request; the handshake still names the helper instance and generation.
 	handshake := session.Handshake()
-	if handshake.SessionCapability == "" || handshake.HelperInstanceID == "" {
-		t.Fatalf("first-connect session carries no admitted capability: %+v", handshake)
+	if handshake.HelperInstanceID == "" {
+		t.Fatalf("first-connect session names no helper instance: %+v", handshake)
 	}
 	if handshake.SessionGeneration != 1 {
 		t.Fatalf("first-connect session generation = %d on helper instance %s, want 1: another session was admitted by this helper first",
