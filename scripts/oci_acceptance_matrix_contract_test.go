@@ -479,7 +479,7 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"capability_revision_before=4", "capability_revision_after=6")
 	write("oci-helper-cold-socket-activation-linux.txt",
 		"helper_service_cold_before_first_connect=true", "helper_service_started_by_first_connect=true",
-		"helper_session_admitted_on_first_connect=true",
+		"helper_session_admitted_on_first_connect=true", "helper_first_session_is_probe=true",
 		"helper_service_state_before=inactive/dead", "helper_socket_state_before=active/listening",
 		"helper_service_state_after=active/running", "first_connect_session_dials=1")
 	if err := os.WriteFile(filepath.Join(directory, "provenance-receipt.json"), []byte(
@@ -531,8 +531,9 @@ func conformantMacMatrixFragment(t *testing.T) string {
 
 // #402: the socket-activated helper cell passes only on the live proof that a
 // cold, stopped service was started by the first connect to its listening
-// socket and admitted that connect as a session. Root ownership alone no longer
-// carries the row, and a lane that never wrote the receipt has no proof.
+// socket, admitted that connect as a session, and admitted it before any other
+// session. Root ownership alone no longer carries the row, and a lane that
+// never wrote the receipt has no proof.
 func TestOCIAcceptanceMatrixSocketActivatedHelperNeedsColdActivation(t *testing.T) {
 	const row = "linux.only.socket_activated_helper"
 	const receipt = "oci-helper-cold-socket-activation-linux.txt"
@@ -540,6 +541,7 @@ func TestOCIAcceptanceMatrixSocketActivatedHelperNeedsColdActivation(t *testing.
 		"helper_service_cold_before_first_connect",
 		"helper_service_started_by_first_connect",
 		"helper_session_admitted_on_first_connect",
+		"helper_first_session_is_probe",
 	}
 	for _, shell := range []string{"/bin/sh", "/bin/bash"} {
 		t.Run(filepath.Base(shell), func(t *testing.T) {

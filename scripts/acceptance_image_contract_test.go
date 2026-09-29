@@ -396,7 +396,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"assert-helper-units-active",
 			"stop-helper-topology",
 			"stop-helper-service-keep-socket",
-			"systemctl stop wefty-oci-helper-realtiming.service\n",
+			"if ! systemctl stop wefty-oci-helper-realtiming.service; then",
 			`"/tmp/wefty-oci-faults/$action.failed"`,
 			"start-helper-topology",
 		} {

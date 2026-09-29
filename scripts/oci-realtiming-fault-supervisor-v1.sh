@@ -113,8 +113,13 @@ MANIFEST
         ;;
       stop-helper-service-keep-socket)
         # Only the service stops. The socket keeps listening, so the next
-        # client connect is the only thing that may start the helper again.
-        systemctl stop wefty-oci-helper-realtiming.service
+        # client connect is the only thing that may start the helper again. A
+        # failed stop is recorded, not fatal: under set -e it would take the
+        # shared supervisor down with it.
+        if ! systemctl stop wefty-oci-helper-realtiming.service; then
+          record_action_failure 'systemctl stop of the helper service failed'
+          continue
+        fi
         if systemctl is-active --quiet wefty-oci-helper-realtiming.service; then
           record_action_failure 'helper service remained active after a service-only stop'
           continue
