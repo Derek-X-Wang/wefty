@@ -57,8 +57,11 @@ const WEFTY_MAX_RESULT_BYTES = 64 << 20;
 const WEFTY_MAX_PARAMS_BYTES = 64 << 10;
 const WEFTY_MAX_EVENT_NAME_BYTES = 128;
 const WEFTY_MAX_SLUG_BYTES = 32;
+// The marker is `wefty run`'s, word for word: an oversize payload is cut at
+// the same byte and marked the same way, so the two producers still write the
+// same bytes. It is a byte cut, not a character cut, exactly as in Go.
 const WEFTY_TRUNCATION_NOTICE =
-  "\n[truncated by the inline run-mailbox writer: the payload exceeded the run mailbox event bound]\n";
+  "\n[truncated by wefty run: the payload exceeded the run mailbox event bound]\n";
 
 const WEFTY_KINDS: readonly string[] = ["envelope", "step", "gate", "result"];
 const WEFTY_ENVELOPE_STATUSES: readonly string[] = ["succeeded", "failed", "partial"];
@@ -424,31 +427,103 @@ function reportResult(document: unknown, status: EnvelopeStatus, options: Report
   );
 }
 
-// runParams returns the params the run was submitted with. A job never
-// receives them in the environment: the agent writes params.json into the
-// mailbox. A run submitted without params has none, which is not an error.
-function runParams(): Record<string, unknown> {
+// weftyReadParams reads params.json. A run submitted without params has none,
+// which is not an error. It returns the document's text, already checked to
+// be one JSON object.
+function weftyReadParams(): string {
   let raw: Buffer;
   try {
     raw = readFileSync(join(weftyRunDir(), "params.json"));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "{}";
     throw error;
   }
   if (raw.length > WEFTY_MAX_PARAMS_BYTES) {
     throw new Error(`params.json is larger than the ${WEFTY_MAX_PARAMS_BYTES} byte params bound`);
   }
-  const params: unknown = JSON.parse(raw.toString("utf8"));
+  const text = raw.toString("utf8");
+  const params: unknown = JSON.parse(text);
   if (params === null || typeof params !== "object" || Array.isArray(params)) {
     throw new Error("params.json is not a JSON object");
   }
-  return params as Record<string, unknown>;
+  return text;
 }
 
-// runParam reads one param the way `wefty run params NAME` prints it: a string
-// as its text, anything else as its JSON, and an absent param as "".
+// weftyRawParams maps each top-level param to the exact JSON text it was
+// submitted as, the way `wefty run params` keeps it: 1.50 stays 1.50 and a
+// nested object keeps its spacing. A Map, so a param called __proto__ or
+// constructor is a key like any other and never a property of every object.
+// The text is already valid JSON, so this only has to find where values end.
+function weftyRawParams(text: string): Map<string, string> {
+  const values = new Map<string, string>();
+  let index = text.indexOf("{") + 1;
+  const skipSpace = (): void => {
+    while (index < text.length && " \t\n\r".includes(text.charAt(index))) index++;
+  };
+  const skipString = (): void => {
+    index++;
+    while (text.charAt(index) !== '"') index += text.charAt(index) === "\\" ? 2 : 1;
+    index++;
+  };
+  const skipValue = (): void => {
+    const first = text.charAt(index);
+    if (first === '"') {
+      skipString();
+      return;
+    }
+    if (first === "{" || first === "[") {
+      let depth = 0;
+      do {
+        const character = text.charAt(index);
+        if (character === '"') {
+          skipString();
+          continue;
+        }
+        if (character === "{" || character === "[") depth++;
+        if (character === "}" || character === "]") depth--;
+        index++;
+      } while (depth > 0);
+      return;
+    }
+    while (index < text.length && !",}] \t\n\r".includes(text.charAt(index))) index++;
+  };
+  for (;;) {
+    skipSpace();
+    if (text.charAt(index) !== '"') break;
+    const keyStart = index;
+    skipString();
+    const key = JSON.parse(text.slice(keyStart, index)) as string;
+    skipSpace();
+    index++; // the colon
+    skipSpace();
+    const valueStart = index;
+    skipValue();
+    // A repeated key keeps its last value, as JSON.parse and Go both do.
+    values.set(key, text.slice(valueStart, index));
+    skipSpace();
+    if (text.charAt(index) !== ",") break;
+    index++;
+  }
+  return values;
+}
+
+// runParams returns every param the run was submitted with, decoded, on an
+// object with no prototype -- so params["constructor"] is a submitted param or
+// undefined, never Object's own. A job never receives its params in the
+// environment: the agent writes params.json into the mailbox.
+function runParams(): Record<string, unknown> {
+  const params = Object.create(null) as Record<string, unknown>;
+  for (const [name, value] of weftyRawParams(weftyReadParams())) {
+    params[name] = JSON.parse(value) as unknown;
+  }
+  return params;
+}
+
+// runParam reads one param exactly as `wefty run params NAME` prints it: a
+// string as its text, null and an absent param as "", and anything else as
+// the JSON it was submitted as. It always returns a string.
 function runParam(name: string): string {
-  const value = runParams()[name];
-  if (value === undefined) return "";
-  return typeof value === "string" ? value : JSON.stringify(value);
+  const value = weftyRawParams(weftyReadParams()).get(name);
+  if (value === undefined || value === "null") return "";
+  return value.startsWith('"') ? (JSON.parse(value) as string) : value;
 }

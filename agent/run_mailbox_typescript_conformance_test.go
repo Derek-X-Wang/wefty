@@ -42,7 +42,12 @@ switch (spec.call) {
   case "envelope": reportEnvelope(spec.step, spec.status, options); break;
   case "gate": reportGate(spec.name, spec.outcome, options); break;
   case "result": reportResult(spec.document, spec.status, options); break;
-  case "param": process.stdout.write(runParam(spec.name)); break;
+  case "param": {
+    const value = runParam(spec.name);
+    if (typeof value !== "string") throw new Error("runParam returned " + typeof value);
+    process.stdout.write(value);
+    break;
+  }
   default: throw new Error("unknown call " + spec.call);
 }
 `
@@ -183,6 +188,19 @@ func TestInlineTypeScriptWriterMatchesRunByteForByte(t *testing.T) {
 	if err := os.WriteFile(jsonDetail, []byte(`{"built":12,"packages":["a","b"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	oversizeASCII := filepath.Join(directory, "oversize-ascii.txt")
+	if err := os.WriteFile(oversizeASCII, []byte(strings.Repeat("0123456789abcdef\n", 6<<10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oversizeMultiByte := filepath.Join(directory, "oversize-multibyte.txt")
+	if err := os.WriteFile(oversizeMultiByte, []byte(strings.Repeat("—", 30<<10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oversizeResultDocument := `{"schema_version":1,"detail":"` + strings.Repeat("é—", 20<<10) + `"}`
+	oversizeResult := filepath.Join(directory, "oversize-result.json")
+	if err := os.WriteFile(oversizeResult, []byte(oversizeResultDocument), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	result := filepath.Join(directory, "result.json")
 	if err := os.WriteFile(result, []byte(`{"schema_version":1,"passed":false}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -228,6 +246,26 @@ func TestInlineTypeScriptWriterMatchesRunByteForByte(t *testing.T) {
 			typescript: map[string]any{"call": "envelope", "step": "test", "status": "succeeded", "summary": "  two\tfailures\x01 — café\nsee the log  ", "key": "test.1"},
 		},
 		{
+			// Past the event bound both producers cut the payload at the same
+			// byte and append the same marker, so the verdict lands and the
+			// bytes still agree.
+			name:       "oversize ASCII detail",
+			command:    []string{"envelope", "--step", "build", "--summary", "long log", "--payload-file", oversizeASCII},
+			typescript: map[string]any{"call": "envelope", "step": "build", "status": "succeeded", "summary": "long log", "detailFile": oversizeASCII},
+		},
+		{
+			// 57344 is not a multiple of three, so the cut lands inside a
+			// UTF-8 sequence: it is a byte cut in both, not a character cut.
+			name:       "oversize multi-byte evidence",
+			command:    []string{"gate", "--name", "vet", "--outcome", "fail", "--evidence-file", oversizeMultiByte},
+			typescript: map[string]any{"call": "gate", "name": "vet", "outcome": "fail", "evidenceFile": oversizeMultiByte},
+		},
+		{
+			name:       "oversize result",
+			command:    []string{"result", "--file", oversizeResult, "--status", "partial"},
+			typescript: map[string]any{"call": "result", "document": json.RawMessage(oversizeResultDocument), "status": "partial"},
+		},
+		{
 			name:       "result",
 			command:    []string{"result", "--file", result, "--status", "failed", "--summary", "one gate failed"},
 			typescript: map[string]any{"call": "result", "document": json.RawMessage(`{"schema_version":1,"passed":false}`), "status": "failed", "summary": "one gate failed"},
@@ -248,8 +286,9 @@ func TestInlineTypeScriptWriterMatchesRunByteForByte(t *testing.T) {
 			if test.typescript["call"] != "result" {
 				return
 			}
-			if !event.payloadJSON {
-				t.Fatal("the TypeScript writer did not mark a JSON result document as a json payload")
+			// A whole JSON document is a json payload; a truncated one is text.
+			if wantJSON := test.name == "result"; event.payloadJSON != wantJSON {
+				t.Fatalf("result payload json=%v, want %v", event.payloadJSON, wantJSON)
 			}
 			fromCommandCopy, err := os.ReadFile(filepath.Join(commandHandoff, workflowhelper.ResultFileName))
 			if err != nil {
@@ -302,7 +341,7 @@ func TestInlineTypeScriptWriterBoundsLikeRun(t *testing.T) {
 			t.Fatalf("the TypeScript writer produced a %d byte event", len(raw))
 		}
 		event := assertAgentAcceptsEvent(t, raw)
-		if event.outcome != "fail" || !bytes.Contains(event.body, []byte("truncated by the inline run-mailbox writer")) {
+		if event.outcome != "fail" || !bytes.Contains(event.body, []byte("truncated by wefty run")) {
 			t.Fatalf("the truncated gate is %+v", event)
 		}
 	})
@@ -339,35 +378,68 @@ func TestInlineTypeScriptWriterBoundsLikeRun(t *testing.T) {
 }
 
 // TestInlineTypeScriptWriterReadsParamsLikeRun keeps `runParam` and
-// `wefty run params NAME` answering the same question the same way.
+// `wefty run params NAME` answering the same question the same way: a string
+// as its text, any other value as the JSON it was submitted as (spacing and
+// number spelling included), null and an absent param as nothing. The names
+// that are properties of every JavaScript object are the regression: a lookup
+// that walked the prototype answered "{}" for __proto__ and a function for
+// constructor, with no params submitted at all.
 func TestInlineTypeScriptWriterReadsParamsLikeRun(t *testing.T) {
 	node := typeScriptNode(t)
 	harness := filepath.Join(t.TempDir(), "harness.mts")
 	if err := os.WriteFile(harness, []byte(workflowhelper.InlineTypeScriptWriter()+typeScriptHarness), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runDir := t.TempDir()
-	params := `{"ref":"feature/x \"quoted\"","count":3,"nested":{"ref":"no"}}`
-	if err := os.WriteFile(filepath.Join(runDir, "params.json"), []byte(params), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"ref", "count", "nested", "absent"} {
-		command := exec.Command(node[0], append(node[1:], harness, `{"call":"param","name":"`+name+`"}`)...)
-		command.Env = append(os.Environ(), workflowhelper.RunDirEnv+"="+runDir)
-		fromTypeScript, err := command.Output()
-		if err != nil {
-			t.Fatalf("runParam(%q): %v", name, err)
-		}
-		helper := exec.Command(weftyBinary(t), "run", "params", name)
-		helper.Env = append(os.Environ(), workflowhelper.RunDirEnv+"="+runDir)
-		fromCommand, err := helper.Output()
-		if err != nil {
-			t.Fatalf("wefty run params %s: %v", name, err)
-		}
-		// The CLI ends its line; the function returns the value.
-		if string(fromTypeScript) != strings.TrimSuffix(string(fromCommand), "\n") {
-			t.Fatalf("param %s: runParam gave %q, wefty run params gave %q", name, fromTypeScript, fromCommand)
-		}
+	names := []string{"ref", "count", "ratio", "nested", "nothing", "absent",
+		"__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"}
+	for _, test := range []struct {
+		name   string
+		params string
+	}{
+		{name: "no params submitted"},
+		{name: "an empty params object", params: `{}`},
+		{name: "params that shadow object properties", params: `{
+  "ref": "feature/x \"quoted\" \u00e9",
+  "count": 3,
+  "ratio": 1.50,
+  "nested": { "ref" : "no", "list": [1, "}"] },
+  "nothing": null,
+  "__proto__": "p",
+  "constructor": "c",
+  "toString": {"x": 1},
+  "hasOwnProperty": [1, 2]
+}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			if test.params != "" {
+				if err := os.WriteFile(filepath.Join(runDir, "params.json"), []byte(test.params), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range names {
+				spec, err := json.Marshal(map[string]string{"call": "param", "name": name})
+				if err != nil {
+					t.Fatal(err)
+				}
+				command := exec.Command(node[0], append(node[1:], harness, string(spec))...)
+				command.Env = append(os.Environ(), workflowhelper.RunDirEnv+"="+runDir)
+				fromTypeScript, err := command.Output()
+				if err != nil {
+					t.Fatalf("runParam(%q): %v", name, err)
+				}
+				helper := exec.Command(weftyBinary(t), "run", "params", name)
+				helper.Env = append(os.Environ(), workflowhelper.RunDirEnv+"="+runDir)
+				fromCommand, err := helper.Output()
+				if err != nil {
+					t.Fatalf("wefty run params %s: %v", name, err)
+				}
+				// The CLI ends its line; the function returns the value.
+				if string(fromTypeScript) != strings.TrimSuffix(string(fromCommand), "\n") {
+					t.Fatalf("param %s: runParam gave %q, wefty run params gave %q", name, fromTypeScript, fromCommand)
+				}
+			}
+		})
 	}
 }
 
