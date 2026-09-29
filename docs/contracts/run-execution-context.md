@@ -299,8 +299,11 @@ whose attempt is terminal. L1 submission-intent mutation revokes older L3
 grants before reporting success.
 
 Every authority-losing Computer mutation (stop, restart, Storage reset,
-reimage, projection, remove, a failed grow acknowledgement, attempt
-completion) is followed by an explicit L3 revoke-all. That revocation is
+reimage, projection, remove, a grow acknowledgement that finds the job
+already failed, attempt completion) is followed by an explicit L3 revoke-all.
+An online grow that fails without failing the job keeps its running attempt
+and returns to `stable`, so its passes stay valid by design and nothing is
+revoked. That revocation is
 defense in depth plus audit, not the gate: the live-scope check above already
 refuses the old passes the moment the mutation commits.
 
