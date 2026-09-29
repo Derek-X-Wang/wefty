@@ -729,6 +729,17 @@ so an identical replay of a labelled job stored before L1 checked still returns
 the stored job, and it runs before that refusal, so an OCI one-shot naming a run
 it may not is refused for the claim, not for what it lacks.
 
+A Computer never belongs to a run, so no submitter — the run ledger included —
+may name one in a Computer specification. `POST /v1/computers`, a projection
+install (`POST /v1/computers/{computer_id}/projections`) and a Custody import
+(whose manifest, digest and all, is the caller's) refuse a spec with a non-blank
+`run_id` or `handoff_owner_run_id` with the same HTTP 403
+`run_identity_not_entitled`, and store or reserve nothing. Each check follows
+that route's replay resolution, so an identical replay of a Computer stored
+before L1 checked still returns it. Reimage and clone copy the stored Computer's
+own specification, so they can introduce no run the Computer did not already
+name.
+
 Neither form is removed at completion. Both are retained on every outcome and
 expire on the retention window below. Agent startup removes expired marked
 process directories; the helper boot sweep removes expired deterministic OCI

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -261,5 +262,147 @@ VALUES(?, ?, ?, ?, ?, NULL, NULL, 'operator-laptop', 0, 0, ?, ?)`, storedJobID, 
 	requireNotEntitled(t, h, status, body, fresh.DispatchKey)
 	if !strings.Contains(string(body), contract.LabelRunID) {
 		t.Fatalf("refusal %s does not name the label it refused", body)
+	}
+}
+
+func storedComputerCount(t *testing.T, h *integrationHarness, name string) int {
+	t.Helper()
+	var count int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computers WHERE name=?`, name).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+// TestAComputerMayNameNoRun closes the /v1/computers side of #583. A Computer
+// is a service and never belongs to a run, so a Computer specification naming
+// one -- from any submitter, the ledger included -- is refused and nothing is
+// stored; one naming none is created exactly as before; and an identical
+// replay of a labelled Computer stored before L1 checked still returns it.
+func TestAComputerMayNameNoRun(t *testing.T) {
+	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
+	for _, submitter := range []string{"computer-client", "run-ledger"} {
+		client := h.client(fabric.Identity{NodeID: submitter, Tags: []string{DefaultClientPrincipalTag}})
+		for _, labels := range []map[string]string{
+			{contract.LabelRunID: "run-any"},
+			{contract.LabelHandoffOwnerRunID: "run-any"},
+			{contract.LabelRunID: "run-any", contract.LabelHandoffOwnerRunID: "run-other"},
+		} {
+			name := fmt.Sprintf("labelled-%s-%d", submitter, len(labels))
+			if _, found := labels[contract.LabelRunID]; !found {
+				name += "-owner"
+			}
+			spec := computerCapabilityJobSpec("computer:" + name)
+			spec.Labels = labels
+			status, _, body := h.do(client, http.MethodPost, "/v1/computers", CreateComputerRequest{Name: name, Spec: spec})
+			requireNotEntitled(t, h, status, body, spec.DispatchKey)
+			if stored := storedComputerCount(t, h, name); stored != 0 {
+				t.Fatalf("a refused Computer creation stored %d Computers", stored)
+			}
+		}
+	}
+
+	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
+	plain := computerCapabilityJobSpec("computer:plain")
+	plain.Labels = map[string]string{"team": "infra", contract.LabelRunID: "  "}
+	status, _, body := h.do(client, http.MethodPost, "/v1/computers", CreateComputerRequest{Name: "plain", Spec: plain})
+	if status != http.StatusCreated {
+		t.Fatalf("unlabelled Computer status = %d body=%s, want 201", status, body)
+	}
+
+	// A labelled Computer stored before the check: create it plain, then give
+	// its Job row the labelled specification and request hash a pre-#583 L1
+	// would have stored. The identical replay must still return it.
+	legacy := computerCapabilityJobSpec("computer:legacy")
+	created, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "legacy", Spec: legacy, Actor: "computer-client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.Labels = map[string]string{contract.LabelRunID: "run-someone-elses"}
+	stored := legacy
+	stored.RoutingTags = NormalizeTags(stored.RoutingTags)
+	if err := contract.ValidateJobSpec(&stored); err != nil {
+		t.Fatal(err)
+	}
+	specJSON, requestHash, err := encodeJobSpec(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE jobs SET spec_json=?, request_hash=? WHERE job_id=?`, specJSON, requestHash, created.CurrentJobID); err != nil {
+		t.Fatal(err)
+	}
+	status, headers, body := h.do(client, http.MethodPost, "/v1/computers", CreateComputerRequest{Name: "legacy", Spec: legacy})
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("identical Computer replay status = %d replay %q body=%s, want 200 replay", status, headers.Get("Idempotent-Replay"), body)
+	}
+	var replayed Computer
+	if err := json.Unmarshal(body, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ComputerID != created.ComputerID {
+		t.Fatalf("identical Computer replay returned %q, want the stored %q", replayed.ComputerID, created.ComputerID)
+	}
+}
+
+// TestAComputerProjectionMayNameNoRun: a projection installs a caller-supplied
+// specification as the Computer's next Job, so it is held to the same rule as
+// creation. The refusal comes before any revision is reserved.
+func TestAComputerProjectionMayNameNoRun(t *testing.T) {
+	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "projected", Spec: computerCapabilityJobSpec("computer:projected:v1"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := computerCapabilityJobSpec("computer:projected:v2")
+	next.Labels = map[string]string{contract.LabelHandoffOwnerRunID: "run-any"}
+	_, err = h.store.InstallComputerProjection(t.Context(), computer.ComputerID, ComputerProjectionRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "reconfigure"), Spec: next,
+	})
+	if errorCode(err) != contract.ErrorRunIdentityNotEntitled {
+		t.Fatalf("labelled projection error = %v, want %s", err, contract.ErrorRunIdentityNotEntitled)
+	}
+	after, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+	if err != nil || after.IntentRevision != computer.IntentRevision || after.CurrentJobID != computer.CurrentJobID {
+		t.Fatalf("a refused projection changed the Computer: %#v err=%v", after, err)
+	}
+	if stored := storedJobCount(t, h, next.DispatchKey); stored != 0 {
+		t.Fatalf("a refused projection stored %d jobs", stored)
+	}
+}
+
+// TestACustodyImportMayNameNoRun: an import's manifest is the caller's, digest
+// and all, so the Computer specification it carries is held to the creation
+// rule too, after idempotency replay and before anything is reserved.
+func TestACustodyImportMayNameNoRun(t *testing.T) {
+	h, node, source, backup, _ := publishedBackupForStorageCopy(t, 3)
+	export, directive := beginCustodyExport(t, h, node, source, backup, "import")
+	exportReceipt := successfulCustodyExportReceipt(directive)
+	if _, err := h.store.AcknowledgeComputerCustodyExport(t.Context(), "fabric-computer-node",
+		source.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: exportReceipt.ReceiptID, Receipt: exportReceipt}); err != nil {
+		t.Fatal(err)
+	}
+	manifest := custodyManifest(directive)
+	manifest.JobSpec.Labels = map[string]string{contract.LabelRunID: "run-any"}
+	_, specHash, err := encodeJobSpec(manifest.JobSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.JobSpecHash = specHash
+	digest, err := contract.DigestComputerCustodyManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = h.store.BeginComputerCustodyImport(t.Context(), export.ExportID,
+		ComputerCustodyImportRequest{Name: "labelled-import", DiskBytes: backup.AllocatedSize,
+			NodeID: node.NodeID, ExternalPath: directive.ExternalPath, Manifest: manifest,
+			ManifestDigest: digest, IdempotencyKey: "labelled-import", Actor: "operator"})
+	if errorCode(err) != contract.ErrorRunIdentityNotEntitled {
+		t.Fatalf("labelled Custody import error = %v, want %s", err, contract.ErrorRunIdentityNotEntitled)
+	}
+	if stored := storedComputerCount(t, h, "labelled-import"); stored != 0 {
+		t.Fatalf("a refused Custody import reserved %d Computers", stored)
 	}
 }
