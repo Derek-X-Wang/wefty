@@ -174,7 +174,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 			computerID: computer.ComputerID, jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID,
 			storageID: computer.StorageID, storageGeneration: computer.StorageGeneration, fencingToken: claim.Lease.FencingToken,
 			dial: func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
-			publish: func(publishContext context.Context, ready bool, endpoint string) error {
+			publish: func(publishContext context.Context, ready bool, endpoint string, _ int64) error {
 				request := l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}
 				if ready {
 					trueCalls++

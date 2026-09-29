@@ -39,7 +39,11 @@ func RunComputerServiceRealtiming(
 		},
 		computerID: "reference-computer", jobID: request.Authority.JobID, attemptID: request.Authority.AttemptID,
 		storageID: storageID, storageGeneration: storageGeneration,
-		fencingToken: request.Authority.FencingToken, dial: dial, publish: publish,
+		fencingToken: request.Authority.FencingToken, dial: dial,
+		// The reference lane has no L1 and no submission authority to fence.
+		publish: func(ctx context.Context, ready bool, endpoint string, _ int64) error {
+			return publish(ctx, ready, endpoint)
+		},
 	})
 }
 

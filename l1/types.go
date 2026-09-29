@@ -572,11 +572,15 @@ type RenewalRequest struct {
 
 // PublicationRequest carries an absolute publication state for one service
 // attempt. Computer display endpoints are private Fabric front doors and are
-// present only while ready is true.
+// present only while ready is true. SubmitIntentRevision is the Computer
+// submission-intent revision the agent's readiness was earned under; when a
+// ready Computer publication carries it, L1 accepts only the current revision
+// (wefty #559). Omitted, the publication is unfenced as before.
 type PublicationRequest struct {
-	FencingToken    string  `json:"fencing_token"`
-	Ready           *bool   `json:"ready"`
-	DisplayEndpoint *string `json:"display_endpoint,omitempty"`
+	FencingToken         string  `json:"fencing_token"`
+	Ready                *bool   `json:"ready"`
+	DisplayEndpoint      *string `json:"display_endpoint,omitempty"`
+	SubmitIntentRevision *int64  `json:"submit_intent_revision,omitempty"`
 }
 
 // ComputerTakeoverAuditEventKind is the closed, immutable take-over evidence

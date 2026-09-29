@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const (
@@ -122,6 +124,13 @@ func (controller *publicationController) Run(ctx context.Context) error {
 	var acknowledged *bool
 	requestedTrue := false
 	for {
+		// Everything a pending signal announces is visible in the snapshot
+		// below, so it is consumed here; a stale refusal then parks until a
+		// signal sent after this publication began.
+		select {
+		case <-controller.notify:
+		default:
+		}
 		snapshot := controller.snapshot()
 		if controller.takeReassert() && acknowledged != nil && *acknowledged {
 			acknowledged = nil
@@ -159,6 +168,18 @@ func (controller *publicationController) Run(ctx context.Context) error {
 			acknowledged = nil
 		}
 		err := controller.publish(ctx, *desired)
+		if err != nil && *desired && protocolErrorCode(err) == contract.ErrorStalePolicyRevision {
+			// L1 committed a newer Computer submission authority than this
+			// readiness was earned under, and that commit cleared the
+			// publication. Nothing is published; wait for the agent to install
+			// the newer authority (Reassert) or for readiness to change
+			// (wefty #559). This is neither a failure nor a retry loop.
+			if !controller.waitForSignal(ctx) {
+				controller.forward(false)
+				return nil
+			}
+			continue
+		}
 		if err != nil {
 			classification := classifyAgentProtocolError(err)
 			if classification.destination != errorDestinationTransient {
@@ -281,6 +302,15 @@ func (controller *publicationController) wait(ctx context.Context, duration time
 		case <-timer.C():
 			return true
 		}
+	}
+}
+
+func (controller *publicationController) waitForSignal(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-controller.notify:
+		return true
 	}
 }
 

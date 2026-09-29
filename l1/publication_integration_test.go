@@ -125,6 +125,13 @@ func assertAttemptPublicationFencedMutationAndTrueNoOps(t *testing.T) {
 		"published_port": 9090,
 	})
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	// The Computer submission fence is not an ordinary service field.
+	status, _, body = fixture.h.do(fixture.agent, http.MethodPut, fixture.path(), map[string]any{
+		"fencing_token":          fixture.claim.Lease.FencingToken,
+		"ready":                  true,
+		"submit_intent_revision": 0,
+	})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
 	status, _, body = fixture.h.do(fixture.agent, http.MethodPut, fixture.path(), PublicationRequest{
 		FencingToken: fixture.claim.Lease.FencingToken + "-stale", Ready: boolPointer(true),
 	})

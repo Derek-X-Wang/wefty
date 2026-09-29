@@ -1455,10 +1455,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			dial: func(dialContext context.Context, endpointName string) (net.Conn, error) {
 				return ociEndpointLatch.endpoint(endpointName).dial(dialContext)
 			},
-			publish: func(publishContext context.Context, ready bool, endpoint string) error {
+			publish: func(publishContext context.Context, ready bool, endpoint string, submitIntentRevision int64) error {
 				request := l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}
 				if ready {
 					request.DisplayEndpoint = &endpoint
+					request.SubmitIntentRevision = &submitIntentRevision
 				}
 				_, err := lifecycle.dependencies.client.SetAttemptPublication(publishContext, claim.Job.JobID, claim.Lease.AttemptID, request)
 				return err
