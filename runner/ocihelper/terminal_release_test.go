@@ -3,6 +3,7 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -102,5 +103,44 @@ func TestTerminalPublicationRecordsTypedReasonWhenTaskNeverStops(t *testing.T) {
 	}
 	if recorded != TaskNeverStoppedSealReason {
 		t.Fatalf("recorded seal reason = %q, want %q", recorded, TaskNeverStoppedSealReason)
+	}
+}
+
+// A broken task Wait is attempt-scoped only when the engine answers, for that
+// exact task, that it is gone or stopped -- what containerd says after it reaps
+// a killed shim. Silence, a task still live, or a Wait this helper cancelled
+// leave the failure unscoped, so it stays engine-loss evidence (#560).
+func TestProveTaskLossAttemptScopedNeedsTheEngineToAnswerForTheTask(t *testing.T) {
+	shimClosed := errors.New("rpc error: code = Unknown desc = ttrpc: closed")
+	sequence := func(answers ...taskAbsenceObservation) (func(context.Context) taskAbsenceObservation, *int) {
+		calls := 0
+		return func(context.Context) taskAbsenceObservation {
+			answer := answers[min(calls, len(answers)-1)]
+			calls++
+			return answer
+		}, &calls
+	}
+	for _, test := range []struct {
+		name    string
+		waitErr error
+		answers []taskAbsenceObservation
+		want    bool
+	}{
+		{name: "shim reaped after its cleanup window", waitErr: shimClosed, answers: []taskAbsenceObservation{taskObservationUnproven, taskObservationUnproven, taskObservationGone}, want: true},
+		{name: "task gone at once", waitErr: shimClosed, answers: []taskAbsenceObservation{taskObservationGone}, want: true},
+		{name: "engine never answers", waitErr: errors.New("rpc error: code = Unavailable desc = connection refused"), answers: []taskAbsenceObservation{taskObservationUnproven}},
+		{name: "task still live", waitErr: shimClosed, answers: []taskAbsenceObservation{taskObservationLive, taskObservationGone}},
+		{name: "wait cancelled by this helper", waitErr: fmt.Errorf("wait: %w", context.Canceled), answers: []taskAbsenceObservation{taskObservationGone}},
+		{name: "no wait failure", answers: []taskAbsenceObservation{taskObservationGone}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observe, calls := sequence(test.answers...)
+			if got := proveTaskLossAttemptScoped(200*time.Millisecond, test.waitErr, observe); got != test.want {
+				t.Fatalf("attempt scoped = %t after %d observations, want %t", got, *calls, test.want)
+			}
+		})
+	}
+	if proveTaskLossAttemptScoped(time.Second, shimClosed, nil) {
+		t.Fatal("a missing engine probe proved a runtime failure attempt-scoped")
 	}
 }

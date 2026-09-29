@@ -100,3 +100,65 @@ func releaseExitedTask(ctx context.Context, release func(context.Context) error,
 		}
 	}
 }
+
+// taskAbsenceObservation is one answer to "does the engine still hold this
+// attempt's task?" asked after that task's Wait broke.
+type taskAbsenceObservation int
+
+const (
+	// taskObservationUnproven means the engine did not answer for the task:
+	// the engine connection failed, or the engine is still tearing down the
+	// task's lost shim and could not reach it. Asking again may settle it.
+	taskObservationUnproven taskAbsenceObservation = iota
+	// taskObservationGone means the engine answered that the task no longer
+	// exists or has stopped.
+	taskObservationGone
+	// taskObservationLive means the engine answered that the task still
+	// exists in a live state, so the broken Wait was not the task ending.
+	taskObservationLive
+)
+
+// taskLossScopeProbeInterval paces re-asking the engine about one task while
+// it cleans up after a lost shim. It is a poll cadence inside the bound the
+// caller passes, not an additional timeout.
+const taskLossScopeProbeInterval = 25 * time.Millisecond
+
+// proveTaskLossAttemptScoped decides whether a broken task Wait ended only
+// that attempt. It is the positive proof behind a Watch result's
+// runtime_failure_attempt_scoped claim.
+//
+// A killed shim breaks its task's Wait with the shim connection error, while
+// containerd itself keeps serving; containerd then reaps the dead shim and
+// drops the task. A containerd that stopped answering breaks the same Wait for
+// every attempt at once, and a restarted containerd reattaches still-running
+// tasks. Only the first is bounded by one attempt, and only the engine saying
+// so for this exact task tells them apart: the claim needs the engine to answer
+// that this task is gone or stopped inside the bound. An engine that never
+// answers, a task it still reports live, a Wait ended by this helper's own
+// cancellation, or a missing probe all leave the failure unscoped, which keeps
+// it helper/engine-loss evidence exactly as before.
+func proveTaskLossAttemptScoped(timeout time.Duration, waitErr error, observe func(context.Context) taskAbsenceObservation) bool {
+	if waitErr == nil || observe == nil || errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+		return false
+	}
+	if timeout <= 0 {
+		timeout = DefaultTaskReleaseTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		switch observe(ctx) {
+		case taskObservationGone:
+			return true
+		case taskObservationLive:
+			return false
+		}
+		timer := time.NewTimer(taskLossScopeProbeInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}

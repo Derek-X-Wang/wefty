@@ -1123,6 +1123,15 @@ type WatchResponse struct {
 	DiskExhausted         bool   `json:"disk_exhausted,omitempty"`
 	RuntimeFailure        string `json:"runtime_failure,omitempty"`
 	LogEvidenceIncomplete bool   `json:"log_evidence_incomplete,omitempty"`
+
+	// RuntimeFailureAttemptScoped is the helper's positive claim that the
+	// runtime failure ended this one attempt and nothing wider: the task's
+	// Wait broke, and containerd then answered for that exact task that it is
+	// gone or stopped. That is what a lost shim looks like, and it proves the
+	// engine serving every other attempt on the session is still there.
+	// Absent the claim a runtime failure stays helper/engine-loss evidence, so
+	// an engine that stopped answering still invalidates the session.
+	RuntimeFailureAttemptScoped bool `json:"runtime_failure_attempt_scoped,omitempty"`
 }
 
 // LogFrame is one checksum-protected frame emitted from the shim-side

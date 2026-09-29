@@ -86,6 +86,12 @@ type containerdAttempt struct {
 	controlMu        sync.Mutex
 	lost             bool
 	mu               sync.Mutex
+
+	// observeTaskAbsence asks containerd about this attempt's task after its
+	// Wait broke; nil leaves every runtime failure unscoped.
+	observeTaskAbsence func(context.Context) taskAbsenceObservation
+	// terminalAttemptScoped records proveTaskLossAttemptScoped for terminalErr.
+	terminalAttemptScoped bool
 }
 
 type containerdTaskSignaler interface {
@@ -1346,6 +1352,8 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return nil
 		}
 		return deleteErr
+	}, observeTaskAbsence: func(ctx context.Context) taskAbsenceObservation {
+		return observeContainerdTaskAbsence(engineContext(ctx), task)
 	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
 	engine.watchOOM(attempt)
 	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
@@ -1731,6 +1739,7 @@ func (attempt *containerdAttempt) terminalResult(oom, logIncomplete bool) WatchR
 	attempt.mu.Lock()
 	sentSignal, signalCause := attempt.signal, attempt.signalCause
 	code, waitErr := attempt.terminalCode, attempt.terminalErr
+	attemptScoped := attempt.terminalAttemptScoped
 	attempt.mu.Unlock()
 	// A post-hoc free-byte sample cannot prove that this attempt observed
 	// ENOSPC. Until a positive guest/runtime event is available, retain the
@@ -1738,7 +1747,9 @@ func (attempt *containerdAttempt) terminalResult(oom, logIncomplete bool) WatchR
 	// containerd ExitStatus exposes only a numeric code. Therefore 137/143 are
 	// plain exits unless this helper independently observed successful delivery
 	// of the matching signal.
-	return terminalResultFromSignalDelivery(code, waitErr, sentSignal, signalCause, oom, logIncomplete)
+	result := terminalResultFromSignalDelivery(code, waitErr, sentSignal, signalCause, oom, logIncomplete)
+	result.RuntimeFailureAttemptScoped = result.RuntimeFailure != "" && attemptScoped
+	return result
 }
 
 func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus, cgroupRoot string, releaseTimeout time.Duration) {
@@ -1752,7 +1763,21 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	if cgroupReportedOOM(cgroupRoot, attempt.resources.CgroupID) {
 		attempt.oom = true
 	}
+	waitErr, deleting := attempt.terminalErr, attempt.deleted
 	attempt.mu.Unlock()
+	// A broken Wait is a runtime failure either way. Before it is published,
+	// ask containerd whether it ended only this task -- a lost shim -- so the
+	// agent does not tear down every neighbour's attempt over it (#560). This
+	// runs before release, so the answer is about the task as the lost shim
+	// left it. A Wait broken because Delete already cancelled its context is
+	// this helper's own doing, not the task's, and is never scoped here; its
+	// gRPC cancellation status does not unwrap to context.Canceled.
+	if waitErr != nil && !deleting {
+		scoped := proveTaskLossAttemptScoped(releaseTimeout, waitErr, attempt.observeTaskAbsence)
+		attempt.mu.Lock()
+		attempt.terminalAttemptScoped = scoped
+		attempt.mu.Unlock()
+	}
 	// Task.Wait was registered with the attempt lease context before Start.
 	// Release that completed wait and its lease-scoped client work before
 	// Task.Delete asks containerd to drain the shim logger. Leaving the context
@@ -1767,6 +1792,27 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 		close(attempt.terminalReady)
 	}); err != nil {
 		log.Printf("release exited OCI task %s before log sealing: %v", attempt.authority.AttemptID, err)
+	}
+}
+
+// observeContainerdTaskAbsence maps containerd's answer for one task into the
+// attempt-scope proof's vocabulary. NotFound is containerd having reaped a lost
+// shim and dropped its task; Stopped is a task whose exit containerd recorded.
+// Any other error -- the engine connection failing, or the lost shim not yet
+// reaped -- proves nothing, and neither does an Unknown status.
+func observeContainerdTaskAbsence(ctx context.Context, task containerd.Task) taskAbsenceObservation {
+	status, err := task.Status(ctx)
+	switch {
+	case errdefs.IsNotFound(err):
+		return taskObservationGone
+	case err != nil:
+		return taskObservationUnproven
+	case status.Status == containerd.Stopped:
+		return taskObservationGone
+	case status.Status == containerd.Unknown || status.Status == "":
+		return taskObservationUnproven
+	default:
+		return taskObservationLive
 	}
 }
 

@@ -386,6 +386,9 @@ func validateWatchEvent(event WatchEvent) error {
 		if primary != 1 || (result.Signal == "") != (result.TerminationCause == "") {
 			return errors.New("watch completion must contain exactly one result arm")
 		}
+		if result.RuntimeFailureAttemptScoped && result.RuntimeFailure == "" {
+			return errors.New("watch completion scopes a runtime failure it does not carry")
+		}
 	default:
 		return errors.New("unknown watch event kind")
 	}

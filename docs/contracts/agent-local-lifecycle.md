@@ -499,7 +499,10 @@ observed/residue/retained partition before accepting that absence.
 
 Helper/session or engine loss takes a different positive-proof path. The OCI
 adapter invokes the agent recovery hook only for helper/engine evidence, never
-for an L1 image-observation transport failure. Recovery immediately suppresses
+for an L1 image-observation transport failure, and never for a `Watch` runtime
+failure the helper marked `runtime_failure_attempt_scoped` (one attempt's lost
+shim): that fails the one attempt and leaves the session and its neighbours
+running (#560). Recovery immediately suppresses
 OCI admission, publishes the restrictive capability observation, invalidates
 the helper generation, and completes the boot sweep before the attempt can
 finish. `ReapAndVerify` may consume that same-boot sweep once only when its

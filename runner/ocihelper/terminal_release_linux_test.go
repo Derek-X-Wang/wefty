@@ -397,3 +397,102 @@ func TestContainerdNamesTheCauseWhenExitedTaskNeverStops(t *testing.T) {
 		}
 	}
 }
+
+// A killed shim breaks its task's Wait with the shim connection error while
+// containerd keeps serving; containerd then reaps the dead shim and drops the
+// task. The engine publishes that as a runtime failure it proved scoped to the
+// one attempt, so the agent fails only that attempt. When containerd never
+// answers for the task, or still reports it live, the same broken Wait stays an
+// unscoped runtime failure and remains engine-loss evidence (#560).
+func TestContainerdShimLossPublishesAttemptScopedRuntimeFailureOnlyOnEngineAnswer(t *testing.T) {
+	shimClosed := errors.New("rpc error: code = Unknown desc = ttrpc: closed")
+	for _, test := range []struct {
+		name     string
+		answers  []taskAbsenceObservation
+		deleting bool
+		want     bool
+	}{
+		{name: "containerd reaps the dead shim", answers: []taskAbsenceObservation{taskObservationUnproven, taskObservationUnproven, taskObservationGone}, want: true},
+		{name: "containerd never answers", answers: []taskAbsenceObservation{taskObservationUnproven}},
+		{name: "containerd still reports the task live", answers: []taskAbsenceObservation{taskObservationLive}},
+		{name: "Wait cancelled by this helper's Delete", answers: []taskAbsenceObservation{taskObservationGone}, deleting: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			paths := emptyLogSegments(t, root)
+			authority := testAuthority()
+			var observations atomic.Int64
+			attempt := &containerdAttempt{
+				authority:       authority,
+				stdout:          paths["stdout"],
+				stderr:          paths["stderr"],
+				terminalReady:   make(chan struct{}),
+				logAcknowledged: make(map[string]uint64),
+				deleted:         test.deleting,
+				releaseTask: func(context.Context) error {
+					sealedLogSegments(t, paths)
+					return nil
+				},
+				observeTaskAbsence: func(context.Context) taskAbsenceObservation {
+					call := observations.Add(1) - 1
+					return test.answers[min(int(call), len(test.answers)-1)]
+				},
+			}
+			engine := &ContainerdEngine{
+				config:   NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 2 * time.Second},
+				attempts: map[string]*containerdAttempt{authority.key(): attempt},
+			}
+			wait := make(chan containerd.ExitStatus, 1)
+			wait <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, shimClosed)
+			close(wait)
+			go attempt.cacheTerminal(wait, root, 300*time.Millisecond)
+
+			result, _ := watchTerminalEvidence(t, engine, authority)
+			if result == nil || result.RuntimeFailure != shimClosed.Error() || result.ExitCode != nil {
+				t.Fatalf("terminal result = %+v, want the shim-loss runtime failure", result)
+			}
+			if result.RuntimeFailureAttemptScoped != test.want {
+				t.Fatalf("attempt scoped = %t after %d engine observations, want %t", result.RuntimeFailureAttemptScoped, observations.Load(), test.want)
+			}
+			if err := validateWatchEvent(WatchEvent{Kind: WatchComplete, Result: result}); err != nil {
+				t.Fatalf("terminal result does not validate: %v", err)
+			}
+		})
+	}
+}
+
+type statusOnlyTask struct {
+	containerd.Task
+	status containerd.Status
+	err    error
+}
+
+func (task statusOnlyTask) Status(context.Context) (containerd.Status, error) {
+	return task.status, task.err
+}
+
+// Only containerd answering for the exact task counts: NotFound is a reaped
+// lost shim and Stopped a recorded exit. A transport failure, a shim still
+// being torn down, or an Unknown status proves nothing; a live state proves
+// the broken Wait was not the task ending.
+func TestObserveContainerdTaskAbsenceMapsTheEngineAnswer(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		task statusOnlyTask
+		want taskAbsenceObservation
+	}{
+		{name: "reaped", task: statusOnlyTask{err: fmt.Errorf("task wefty-attempt not found: %w", errdefs.ErrNotFound)}, want: taskObservationGone},
+		{name: "stopped", task: statusOnlyTask{status: containerd.Status{Status: containerd.Stopped}}, want: taskObservationGone},
+		{name: "engine unavailable", task: statusOnlyTask{err: fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}, want: taskObservationUnproven},
+		{name: "shim not yet reaped", task: statusOnlyTask{err: errors.New("ttrpc: closed")}, want: taskObservationUnproven},
+		{name: "unknown", task: statusOnlyTask{status: containerd.Status{Status: containerd.Unknown}}, want: taskObservationUnproven},
+		{name: "running", task: statusOnlyTask{status: containerd.Status{Status: containerd.Running}}, want: taskObservationLive},
+		{name: "paused", task: statusOnlyTask{status: containerd.Status{Status: containerd.Paused}}, want: taskObservationLive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := observeContainerdTaskAbsence(t.Context(), test.task); got != test.want {
+				t.Fatalf("observation = %d, want %d", got, test.want)
+			}
+		})
+	}
+}

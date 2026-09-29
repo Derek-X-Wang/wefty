@@ -1272,7 +1272,13 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		return runtimeFailure(err), err
 	}
 	result = workloadrunner.Result{Outcome: processResult(*completion)}
-	if completion.RuntimeFailure != "" {
+	// A runtime failure the helper proved ended only this attempt -- one
+	// Computer's lost shim, with containerd still answering for its task --
+	// fails this attempt and nothing else. Recovering from it invalidated the
+	// exclusive helper session, which ended every neighbour attempt on the
+	// Node with it (#560). An unscoped runtime failure is still engine-loss
+	// evidence and still takes the embargo-and-sweep path.
+	if completion.RuntimeFailure != "" && !completion.RuntimeFailureAttemptScoped {
 		reportOCIRuntimeUnavailable(request, runtimeGeneration)
 	}
 	return result, nil
