@@ -2300,27 +2300,28 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	job, replayed, err := s.store.CompleteAttemptWithReplay(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	outcome, err := s.store.CompleteAttemptOutcome(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	// A replay still re-drives the Computer revocation: it is the only retry
-	// of a revocation that failed after the completion committed (#548), and
-	// revoking a terminal attempt's Computer authority again only narrows it.
-	if computerID, lookupErr := s.store.ComputerIDForJob(r.Context(), job.JobID); lookupErr != nil {
-		writeError(w, lookupErr)
-		return
-	} else if computerID != "" {
-		if revokeErr := s.revokeComputerAuthority(r.Context(), computerID, "attempt_terminal"); revokeErr != nil {
+	// The Computer-wide revocation is sent only while the completed Job is
+	// still the Computer's current Job, as read by the completion itself;
+	// otherwise it would revoke a newer Job's live tokens. A replay re-drives
+	// it under the same rule: it is the only retry of a revocation that failed
+	// after the completion committed (#548). A superseded attempt's tokens need
+	// no revocation, since L3 refuses a token whose attempt is no longer live
+	// (#551).
+	if outcome.RevokeComputerID != "" {
+		if revokeErr := s.revokeComputerAuthority(r.Context(), outcome.RevokeComputerID, "attempt_terminal"); revokeErr != nil {
 			writeError(w, revokeErr)
 			return
 		}
 	}
-	if replayed {
+	if outcome.Replayed {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	writeJSON(w, http.StatusOK, redactJob(job))
+	writeJSON(w, http.StatusOK, redactJob(outcome.Job))
 }
 
 func (s *Server) acknowledgeServiceRemoval(w http.ResponseWriter, r *http.Request) {

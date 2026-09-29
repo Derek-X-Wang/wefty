@@ -406,9 +406,19 @@ differs in any of those fields is `idempotency_conflict`; a first completion
 from a replaced registration is `node_session_replaced` for as long as the
 attempt's lease runs, then `lease_expired` with late evidence; an attempt that
 is no longer the job's current or retained replay attempt is `attempt_mismatch`
-(#553). For a Computer job, L1 re-drives the attempt-terminal token revocation
-on every accepted replay: it is the retry path for a revocation that failed
-after the completion committed, and it only narrows authority.
+(#553).
+
+An accepted completion of a Computer Job is followed by a Computer-wide
+`attempt_terminal` token revocation at the run ledger only while that Job is
+still the Computer's current Job, read in the completion's own transaction
+together with the attempt binding above. A replay re-drives it under the same
+rule, since the replay is the retry path for a revocation that failed after
+the completion committed. Once a reimage has installed a newer current Job,
+the old Job keeps its completion replay binding and its identical replay is
+still answered as recorded, but no revocation is sent: a Computer-wide
+revocation would end the replacement attempt's live tokens, and the old
+attempt's own tokens already fail the scope proof, which admits only a claimed
+or running attempt of the Computer's current Job.
 
 An accepted completion writes the exact `ProcessResult` into
 `attempts.result_json` in the same transaction that finalizes the attempt and

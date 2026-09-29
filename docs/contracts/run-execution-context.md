@@ -301,6 +301,10 @@ grants before reporting success.
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
 already failed, attempt completion) is followed by an explicit L3 revoke-all.
+For attempt completion, including an accepted completion replay, the revoke-all
+is sent only while the completed Job is still the Computer's current Job; a
+replay of a Job a reimage has superseded sends none, so it cannot end the
+replacement attempt's passes (see `lease-fencing-dispatch.md`).
 An online grow that fails without failing the job keeps its running attempt
 and returns to `stable`, so its passes stay valid by design and nothing is
 revoked. That revocation is
