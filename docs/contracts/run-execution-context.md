@@ -675,6 +675,22 @@ managed volume keyed by the job's stable run ID or `handoff_owner_run_id`; the
 helper hashes that opaque key and mounts the resulting source at
 `/wefty/handoff`. Attempt IDs never enter the OCI handoff identity.
 
+That key is not optional for an OCI one-shot, as the directory's run identity
+is for a process one: the volume has no name without it, and the helper refuses
+to create one. The owner key is `handoff_owner_run_id` when it is non-blank,
+else `run_id`, trimmed; it must be non-empty, at most 255 bytes and free of NUL
+(`contract.ValidateHandoffOwner`). Both labels are immutable after submission,
+so a job without a usable key could never run. L1 therefore refuses it at
+`POST /v1/jobs` — root or child submission alike — with HTTP 409
+`run_identity_required`, `retryable: false`, and stores nothing. Every run the
+ledger dispatches names its run and is unaffected; a direct submitter supplies
+`run_id` itself. Process one-shots and services (whose data is keyed by their
+job ID, Computers included) need no run identity and are not checked. A node
+that claims such a job anyway — one stored before L1 refused them — completes
+the attempt once with the terminal spawn failure `handoff_preparation_failed`
+before asking the runtime, instead of letting the helper's refusal read as
+`runtime_unavailable`, which L1 requeues (wefty #578).
+
 Neither form is removed at completion. Both are retained on every outcome and
 expire on the retention window below. Agent startup removes expired marked
 process directories; the helper boot sweep removes expired deterministic OCI

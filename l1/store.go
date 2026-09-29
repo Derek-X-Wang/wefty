@@ -1875,6 +1875,16 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 		return Job{}, false, protocolError(contract.ErrorComputerResourceRequired,
 			"Computer trait Jobs must be created through the durable Computer resource")
 	}
+	// An OCI one-shot's handoff volume is named from its run identity, which
+	// only its immutable labels carry. One that names none would be refused by
+	// the node's helper on every attempt, and requeued each time as runtime
+	// unavailability, so it is refused here, once, in terms the submitter can
+	// act on (wefty #578).
+	if err := contract.ValidateHandoffOwner(spec); err != nil {
+		return Job{}, false, protocolErrorWithDetails(contract.ErrorRunIdentityRequired,
+			map[string]any{"kind": spec.Kind, "class": spec.Class},
+			"%v", err)
+	}
 	requiredCapabilities := RequiredCapabilities(spec)
 	specJSON, err := json.Marshal(spec)
 	if err != nil {

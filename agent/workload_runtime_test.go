@@ -100,7 +100,7 @@ func TestOCIImageDeliveryUsesLocalPullingStateBeforeStartedCallback(t *testing.T
 		clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
 	})
 	claim := l1.Claim{
-		Job:   l1.Job{JobID: "oci-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+		Job:   l1.Job{JobID: "oci-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-oci-job"}}},
 		Lease: l1.AttemptLease{AttemptID: "oci-attempt", FencingToken: "fence-1"},
 	}
 	deadline := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
@@ -141,7 +141,7 @@ func TestOCIImageFailuresSurviveFullLifecycleFinalization(t *testing.T) {
 				clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
 			})
 			claim := l1.Claim{
-				Job:   l1.Job{JobID: "oci-failure", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+				Job:   l1.Job{JobID: "oci-failure", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-oci-failure"}}},
 				Lease: l1.AttemptLease{AttemptID: "attempt-failure", FencingToken: "fence-1"},
 			}
 			result, err := lifecycle.runWorkload(t.Context(), claim)
@@ -149,6 +149,41 @@ func TestOCIImageFailuresSurviveFullLifecycleFinalization(t *testing.T) {
 				t.Fatalf("full lifecycle outcome = (%+v, %v), want %s without output_error", result, err, code)
 			}
 		})
+	}
+}
+
+// TestAnOCIOneShotWithNoHandoffOwnerEndsItsAttemptBeforeTheRuntime is the
+// node's half of wefty #578, for a job L1 stored before it refused them. The
+// helper cannot name a handoff volume without an owner key and refuses the
+// Run, and that refusal reached L1 as runtime_unavailable -- which L1 requeues.
+// The node now refuses first, with handoff_preparation_failed, which L1 treats
+// as terminal, and never asks the runtime at all.
+func TestAnOCIOneShotWithNoHandoffOwnerEndsItsAttemptBeforeTheRuntime(t *testing.T) {
+	for _, labels := range []map[string]string{
+		nil,
+		{contract.LabelRunID: "   "},
+		{contract.LabelRunID: strings.Repeat("r", contract.MaxHandoffOwnerKeyBytes+1)},
+	} {
+		runtime := &captureRuntime{}
+		lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+			runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, observer: newLifecycleObserver(systemClock{}),
+			clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+		})
+		claim := l1.Claim{
+			Job: l1.Job{JobID: "ownerless-oci", Spec: contract.JobSpec{
+				Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: labels,
+				Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/echo:latest"}}},
+			}},
+			Lease: l1.AttemptLease{AttemptID: "ownerless-attempt", FencingToken: "fence-1", LeaseTTL: time.Minute},
+		}
+		result, err := lifecycle.runWorkload(t.Context(), claim)
+		if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureHandoffPreparation ||
+			!strings.Contains(result.SpawnError.Message, "run identity") && !strings.Contains(result.SpawnError.Message, "owner key") {
+			t.Fatalf("labels %q: attempt result = (%+v, %v), want a named %s", labels, result, err, contract.SpawnFailureHandoffPreparation)
+		}
+		if runtime.preflights != 0 || runtime.request.Authority.AttemptID != "" {
+			t.Fatalf("labels %q: the runtime was asked to run a job that names no handoff owner", labels)
+		}
 	}
 }
 
@@ -208,7 +243,7 @@ func TestOCIRuntimeLossRecoversSweepBeforeReap(t *testing.T) {
 				},
 			})
 			claim := l1.Claim{
-				Job:   l1.Job{JobID: "oci-runtime-loss", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+				Job:   l1.Job{JobID: "oci-runtime-loss", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-oci-runtime-loss"}}},
 				Lease: l1.AttemptLease{AttemptID: "attempt-runtime-loss", FencingToken: "fence-1"},
 			}
 			result, err := lifecycle.runWorkload(t.Context(), claim)
@@ -254,7 +289,7 @@ func TestOCIRuntimeLossEmbargoesSiblingBeforeRunReturns(t *testing.T) {
 	})
 	claim := l1.Claim{
 		Job: l1.Job{JobID: "oci-loss-embargo", Spec: contract.JobSpec{
-			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-oci-loss-embargo"},
 			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/image"}}},
 		}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-loss-embargo", FencingToken: "fence-1"},
@@ -292,7 +327,7 @@ func TestOCIReapRuntimeLossEmbargoesBeforeRecoveryAndRetries(t *testing.T) {
 	})
 	claim := l1.Claim{
 		Job: l1.Job{JobID: "oci-reap-loss", Spec: contract.JobSpec{
-			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-oci-reap-loss"},
 			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/image"}}},
 		}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-reap-loss", FencingToken: "fence-1"},
@@ -342,7 +377,7 @@ func TestOCIRuntimeFailureArmSurvivesRecoveryFailure(t *testing.T) {
 		},
 	})
 	claim := l1.Claim{
-		Job:   l1.Job{JobID: "oci-runtime-failure-arm", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+		Job:   l1.Job{JobID: "oci-runtime-failure-arm", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-oci-runtime-failure-arm"}}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-runtime-failure-arm", FencingToken: "fence-1"},
 	}
 	result, err := lifecycle.runWorkload(t.Context(), claim)
@@ -549,10 +584,12 @@ type reapRefusingRuntime struct {
 }
 
 type captureRuntime struct {
-	request workloadrunner.Request
+	request    workloadrunner.Request
+	preflights int
 }
 
 func (runtime *captureRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	runtime.preflights++
 	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
 }
 

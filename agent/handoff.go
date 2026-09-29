@@ -1176,10 +1176,7 @@ func measureEntry(run *os.Root, name string, info os.FileInfo) (int64, error) {
 }
 
 func handoffOwnerRunID(spec contract.JobSpec) string {
-	if owner := strings.TrimSpace(spec.Labels["handoff_owner_run_id"]); owner != "" {
-		return owner
-	}
-	return strings.TrimSpace(spec.Labels["run_id"])
+	return contract.HandoffOwnerKey(spec)
 }
 
 func handoffHasFiles(run *os.Root) (bool, error) {
