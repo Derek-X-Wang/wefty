@@ -20,23 +20,32 @@ const (
 	// often, so an L1 that answers every replay with a transient error sees one
 	// request per attempt per ceiling rather than one per retry interval.
 	maxEvidenceRecoveryBackoff = 30 * time.Second
+	// evidenceRecoveryRefusalRecheck is how long a refused attempt waits for
+	// its one re-check. node_session_replaced also answers a completion L1 has
+	// not accepted while the old registration's lease is still running, and
+	// that refusal turns into lease_expired (late evidence) once the lease
+	// runs out. The lease a recovered attempt was claimed with is not in the
+	// spool, so this is a fixed bound: four times L1's 30 s default lease
+	// (l1.DefaultLeaseDuration), and the lease was last renewed before the
+	// refusal, never after. An L1 configured with leases longer than this
+	// leaves such an attempt to the next agent start instead.
+	evidenceRecoveryRefusalRecheck = 2 * time.Minute
 )
 
-// evidenceRecoveryRefusal is a typed L1 refusal of a replay that cannot
-// succeed however often this agent process repeats it: the node session the
-// request speaks for has been replaced, or the node's identity is refused.
-// Recovery stops asking for that attempt for the rest of the process and
-// leaves its durable evidence exactly as it is on disk; nothing about the
-// refusal says the evidence is wrong, only that this session cannot deliver
-// it. The next agent process scans the spool again and owns it from there.
+// evidenceRecoveryRefusal is a typed L1 refusal of a replay that repeating
+// on a retry interval cannot clear: the node session the request speaks for
+// has been replaced, or the node's identity is refused. Recovery re-checks the
+// attempt once, after evidenceRecoveryRefusalRecheck, and a second refusal
+// parks it for the rest of the process. Either way its durable evidence stays
+// exactly as it is on disk; nothing about the refusal says the evidence is
+// wrong, only that this session cannot deliver it. The next agent process
+// scans the spool again and owns it from there.
 type evidenceRecoveryRefusal struct {
 	code contract.ErrorCode
 	err  error
 }
 
-func (refusal *evidenceRecoveryRefusal) Error() string {
-	return fmt.Sprintf("refused for the rest of this agent session (%s), durable evidence left on disk for the next agent start: %v", refusal.code, refusal.err)
-}
+func (refusal *evidenceRecoveryRefusal) Error() string { return refusal.err.Error() }
 
 func (refusal *evidenceRecoveryRefusal) Unwrap() error { return refusal.err }
 
@@ -256,9 +265,12 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		active := make(map[string]struct{})
 		retryAt := make(map[string]time.Time)
 		// failures counts consecutive failed passes per attempt and drives its
-		// backoff; refused holds attempts L1 refused for good for this session.
-		// Neither survives the process: a restarted agent starts both empty.
+		// backoff. rechecked holds attempts refused once and waiting for, or
+		// past, their one re-check; refused holds attempts refused twice, which
+		// this session never asks for again. None of it survives the process:
+		// a restarted agent starts all three empty.
 		failures := make(map[string]int)
+		rechecked := make(map[string]struct{})
 		refused := make(map[string]struct{})
 		var scanRetryAt time.Time
 		var scanFailures int
@@ -324,6 +336,11 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 					delete(refused, attemptID)
 				}
 			}
+			for attemptID := range rechecked {
+				if _, present := pending[attemptID]; !present {
+					delete(rechecked, attemptID)
+				}
+			}
 			for _, attempt := range attempts {
 				if _, running := active[attempt.attemptID]; running {
 					continue
@@ -374,24 +391,31 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				launchPending()
 			case result := <-finished:
 				delete(active, result.attemptID)
-				if result.err != nil && recoveryContext.Err() == nil && report != nil {
-					report(fmt.Errorf("attempt %s: %w", result.attemptID, result.err))
-				}
+				reportErr := result.err
 				var refusal *evidenceRecoveryRefusal
 				switch {
 				case result.err == nil:
 					delete(retryAt, result.attemptID)
 					delete(failures, result.attemptID)
 				case errors.As(result.err, &refusal):
-					// Reported once above and never asked again by this
-					// process. Its evidence stays pending on disk.
-					refused[result.attemptID] = struct{}{}
-					delete(retryAt, result.attemptID)
 					delete(failures, result.attemptID)
+					if _, again := rechecked[result.attemptID]; again {
+						// Never asked again by this process.
+						delete(retryAt, result.attemptID)
+						refused[result.attemptID] = struct{}{}
+						reportErr = fmt.Errorf("%w; refused again on re-check, not retried until the agent restarts; durable evidence left on disk", result.err)
+					} else {
+						rechecked[result.attemptID] = struct{}{}
+						retryAt[result.attemptID] = outbox.clock.Now().Add(evidenceRecoveryRefusalRecheck)
+						reportErr = fmt.Errorf("%w; one re-check in %s; durable evidence left on disk", result.err, evidenceRecoveryRefusalRecheck)
+					}
 				default:
 					failures[result.attemptID]++
 					retryAt[result.attemptID] = outbox.clock.Now().Add(
 						evidenceRecoveryBackoff(outbox.retryInterval, failures[result.attemptID]))
+				}
+				if reportErr != nil && recoveryContext.Err() == nil && report != nil {
+					report(fmt.Errorf("attempt %s: %w", result.attemptID, reportErr))
 				}
 				// Fill the released worker slot immediately. A failed attempt is
 				// skipped until its own injected-clock backoff expires, and a
@@ -618,9 +642,9 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 		// node_session_replaced: the attempt belongs to an older registration
 		// of this node. For a completion L1 already accepted (the #549 storm)
 		// that never clears, because the generation only advances. For one it
-		// has not, it clears only when the attempt's lease expires at L1, which
-		// the next agent start sees as lease_expired and delivers as late
-		// evidence. Either way this session stops asking.
+		// has not, it clears only when the attempt's lease expires at L1, after
+		// which the replay is answered lease_expired and lands as late
+		// evidence -- what the one delayed re-check is for.
 		return recoveryRefusal(err, code, classification)
 	default:
 		return err
