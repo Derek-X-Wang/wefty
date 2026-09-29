@@ -75,6 +75,7 @@ type Server struct {
 	fatalErr                error
 	fatalOnce               sync.Once
 	startupDone             chan struct{}
+	startupWork             sync.WaitGroup
 	startupErr              error
 	nextSessionGeneration   uint64
 	startupSweep            *SweepResponse
@@ -272,6 +273,13 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if listener == nil {
 		return errors.New("OCI helper listener is required")
 	}
+	// Serve owns the startup barrier and its re-attempts: it does not return
+	// until they have stopped, so nothing writes the startup-failure ledger
+	// after Serve has returned. Cancelling first bounds that wait by the
+	// in-flight sweep's own context.
+	ctx, cancel := context.WithCancel(ctx)
+	defer server.startupWork.Wait()
+	defer cancel()
 	server.sessionMu.Lock()
 	server.listener = listener
 	server.serveCtx = ctx
@@ -332,7 +340,9 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 // the helper's configured reap bound, but do not mint session authority until
 // the complete startup Sweep+Verify succeeds.
 func (server *Server) startStartupBarrier(ctx context.Context) {
+	server.startupWork.Add(1)
 	go func() {
+		defer server.startupWork.Done()
 		err := server.sweepAndVerifyStartup(ctx)
 		if err == nil {
 			server.clearStartupBarrierFailures()
@@ -360,7 +370,9 @@ func (server *Server) startStartupBarrier(ctx context.Context) {
 // the only thing that recovers a cleared denial: nothing there restarts the
 // helper unit for us.
 func (server *Server) superviseTrippedStartupBound(ctx context.Context, tripped *StartupBoundTrippedError) {
+	server.startupWork.Add(1)
 	go func() {
+		defer server.startupWork.Done()
 		published := false
 		publish := func(err error) {
 			server.sessionMu.Lock()
