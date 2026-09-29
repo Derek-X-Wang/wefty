@@ -877,6 +877,15 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		err := errors.New("Computer claim is missing its durable Storage identity")
 		return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
 	}
+	// A job that needs a handoff owner and names none the helper would accept
+	// is refused before the runtime is asked, with a code L1 treats as
+	// terminal: its labels cannot change, so every attempt would be refused
+	// the same way, and the helper's refusal would read as runtime
+	// unavailability, which L1 requeues (wefty #578). L1 refuses such a job at
+	// submission; this covers one it stored before it did.
+	if err := contract.ValidateHandoffOwner(claim.Job.Spec); err != nil {
+		return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
+	}
 	authority := workloadAuthority(lifecycle.dependencies.nodeID, lifecycle.dependencies.bootSessionID, claim)
 	idlePolicy := workloadrunner.MonitorIdle
 	if claim.Job.Spec.Class == contract.JobClassService {

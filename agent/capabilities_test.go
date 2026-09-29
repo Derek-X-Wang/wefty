@@ -305,7 +305,7 @@ func TestLocalCapabilityAdmissionPreventsRunnerStart(t *testing.T) {
 		runtimes: testRuntimeSet(runner), clock: systemClock{}, allowsStart: state.allows,
 	})
 	claim := l1.Claim{Job: l1.Job{Spec: contract.JobSpec{
-		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-probe"},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example/probe"}}},
 	}}}
 	result, err := lifecycle.runWorkload(context.Background(), claim)
@@ -1065,6 +1065,7 @@ func waitForAgentNode(t *testing.T, store *l1.Store, nodeID string, predicate fu
 func testOCIJobSpec(dispatchKey string) contract.JobSpec {
 	return contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		Labels:    map[string]string{contract.LabelRunID: "run-" + dispatchKey},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example/probe:latest"}}},
 	}
 }

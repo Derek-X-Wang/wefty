@@ -36,6 +36,7 @@ const (
 	ErrorStorageReferenceConflict    ErrorCode = "storage_reference_conflict"
 	ErrorComputerResourceRequired    ErrorCode = "computer_resource_required"
 	ErrorComputerTraitRequired       ErrorCode = "computer_trait_required"
+	ErrorRunIdentityRequired         ErrorCode = "run_identity_required"
 	ErrorPersonIdentityRequired      ErrorCode = "person_identity_required"
 	ErrorAdminRequired               ErrorCode = "admin_required"
 	ErrorAdminBootstrapInvalid       ErrorCode = "admin_bootstrap_invalid"

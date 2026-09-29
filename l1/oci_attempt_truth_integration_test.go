@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -311,6 +312,39 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	}
 }
 
+// TestOCIHandoffPreparationFailureIsTerminalNotRequeued pins the classification
+// the node relies on for wefty #578: an OCI one-shot whose attempt ends with
+// handoff_preparation_failed -- as one naming no handoff owner now does, before
+// the runtime is asked -- fails once instead of entering the pre-start retry
+// loop that runtime_unavailable does.
+func TestOCIHandoffPreparationFailureIsTerminalNotRequeued(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {}})
+	registerOCIFixtureNode(t, h)
+	job := createOCIFixtureJob(t, h, "oci-handoff-preparation", contract.JobClassOneShot)
+	claim := claimOCIFixture(t, h, contract.JobClassOneShot)
+	completed, err := h.store.CompleteAttempt(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "handoff-preparation",
+		Result: ProcessResult{SpawnError: &contract.SpawnFailure{
+			Code: contract.SpawnFailureHandoffPreparation, Message: "a kind=oci one-shot job needs a run identity to own its handoff volume",
+		}},
+	})
+	if err != nil || completed.State != contract.JobFailed {
+		t.Fatalf("completion = job %#v err %v, want failed", completed, err)
+	}
+	var retryCount int
+	var nextRetryNS sql.NullInt64
+	if err := h.store.db.QueryRow(`SELECT prestart_retry_count, prestart_next_retry_at_ns FROM jobs WHERE job_id=?`, job.JobID).
+		Scan(&retryCount, &nextRetryNS); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 0 || nextRetryNS.Valid {
+		t.Fatalf("pre-start retry = count %d next %v, want none scheduled", retryCount, nextRetryNS)
+	}
+	if again, err := h.store.ClaimJob(context.Background(), "agent", "node-1", "boot-node-1", contract.JobClassOneShot); err != nil || again != nil {
+		t.Fatalf("claim after a terminal handoff refusal = %#v err %v, want none", again, err)
+	}
+}
+
 func TestOCIPrestartBudgetExpiryTerminalizesWithoutDeadClaim(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{
 		PrestartInfrastructureBudget: 2 * time.Second,
@@ -452,6 +486,8 @@ func createOCIFixtureJob(t *testing.T, h *integrationHarness, dispatchKey, class
 	}
 	if class == contract.JobClassService {
 		ociSpec.Restart = contract.RestartAlways
+	} else {
+		ociSpec.Labels = map[string]string{contract.LabelRunID: "run-" + dispatchKey}
 	}
 	if err := contract.ValidateJobSpec(&ociSpec); err != nil {
 		t.Fatalf("OCI fixture does not satisfy the public contract: %v", err)

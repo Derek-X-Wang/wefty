@@ -448,7 +448,10 @@ The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat
 `execution.handoff_directory`: after `kind=oci` selects the adapter, the
 agent puts exactly one `handoff` requirement on the runtime request, keyed by
-the stable job or `handoff_owner_run_id`. The adapter passes that key opaquely
+the job's `handoff_owner_run_id`, else its `run_id`. A job naming no key the
+helper accepts ends its attempt with `handoff_preparation_failed` before the
+runtime is asked (`run-execution-context.md`, "Node-local handoff lifecycle");
+L1 refuses one at submission. The adapter passes that key opaquely
 to the helper and unconditionally makes `/wefty/handoff` the reserved guest
 value. Attempt reap preserves this helper-owned volume on every outcome and refreshes
 its retention window when another attempt or rerun reuses it. The agent no

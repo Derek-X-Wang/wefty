@@ -435,6 +435,12 @@ func capabilityJobSpec(dispatchKey, kind, class, runtimeHandler string, limits *
 	if class == contract.JobClassService {
 		restart = contract.RestartAlways
 	}
+	var labels map[string]string
+	if class == contract.JobClassOneShot {
+		// An OCI one-shot's handoff volume is keyed by its run, so it is
+		// submitted as the ledger dispatches it: naming one (wefty #578).
+		labels = map[string]string{contract.LabelRunID: "run-" + dispatchKey}
+	}
 	return contract.JobSpec{
 		SchemaVersion:  contract.SchemaVersionV1,
 		DispatchKey:    dispatchKey,
@@ -442,6 +448,7 @@ func capabilityJobSpec(dispatchKey, kind, class, runtimeHandler string, limits *
 		Class:          class,
 		Restart:        restart,
 		RuntimeHandler: runtimeHandler,
+		Labels:         labels,
 		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: image, Limits: limits}},
 	}
 }

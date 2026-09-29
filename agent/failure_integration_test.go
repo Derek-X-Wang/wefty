@@ -355,7 +355,7 @@ func TestPreStartedOCIRuntimeLossReturnsAllDiagnostics(t *testing.T) {
 	})
 	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
 		Job: l1.Job{JobID: "prestarted-diagnostics", Spec: contract.JobSpec{
-			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-prestarted"},
 			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 				Image: contract.OCIImageSpec{Reference: "example.invalid/prestarted-diagnostics:v1"},
 			}},
@@ -1176,7 +1176,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-stop-oneshot",
-		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-intent-stop"},
 		RoutingTags: []string{"intent-oneshot"}, RuntimeHandler: "io.containerd.runc.v2",
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-stop:v1", Digest: &digest}, Argv: []string{"/payload"},
@@ -2354,6 +2354,7 @@ func TestOCIPreStartSpawnFailureIgnoresExpiredLogFinalization(t *testing.T) {
 	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "pre-start-expired-log-finalization",
 		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, RuntimeHandler: "io.containerd.runc.v2",
+		Labels: map[string]string{contract.LabelRunID: "run-pre-start"},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: "example.invalid/pre-start:v1"}, Argv: []string{"/payload"},
 		}},
