@@ -419,10 +419,13 @@ it: every wait equals the time already waited plus 10 seconds, so the first
 re-check after the lease runs out comes at most the lease's remainder plus 10
 seconds later, and never more than an hour later. The result therefore lands
 as itself on any L1 whose late-evidence window is longer than its lease plus 10
-seconds; the cost is a few silent requests in the first minutes. For a completion L1 already accepted from an older
-registration, every replay is refused and the row stays until something else
-removes it (service removal purges the job's spool rows; a one-shot row has no
-such path). While L1 reports the attempt as
+seconds; the cost is a few silent requests in the first minutes. A completion
+L1 already accepted from an older registration is not refused: the agent always
+replays the exact request it spooled, and L1 answers a byte-identical replay
+from the owning node identity as an already-recorded success
+(`Idempotent-Replay: true`, see `lease-fencing-dispatch.md`), which recovery
+treats like any accepted completion -- the row is marked delivered and retired,
+with no further requests or log lines. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
 completion; an accepted completion closes that attempt's log stream at L1
 (`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the

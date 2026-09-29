@@ -638,18 +638,6 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 	return page, nil
 }
 
-func (s *Store) ComputerIDForJob(ctx context.Context, jobID string) (string, error) {
-	var computerID string
-	err := s.db.QueryRowContext(ctx, `SELECT computer_id FROM computer_job_projections WHERE job_id=?`, jobID).Scan(&computerID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	if err != nil {
-		return "", internalError(err, "resolve Computer for Job")
-	}
-	return computerID, nil
-}
-
 func readComputerByJobID(ctx context.Context, q queryer, jobID string, now time.Time) (Computer, error) {
 	var computerID string
 	if err := q.QueryRowContext(ctx, `SELECT computer_id FROM computer_job_projections WHERE job_id=?`, jobID).Scan(&computerID); err != nil {

@@ -1469,3 +1469,91 @@ func TestDoctorAcceptsANewerAgentsFinding(t *testing.T) {
 		t.Fatalf("a known finding was rewritten: %q", known.Detail)
 	}
 }
+
+// TestDoctorReportsNodeWideRetainedFigure: the budget is enforced on charged
+// bytes across both roots, and until this the only readers of that figure were
+// the agent log and the status projection.
+func TestDoctorReportsNodeWideRetainedFigure(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	measured := now.Add(-time.Minute)
+	node := int64(700 << 20)
+	config := healthyDoctorConfig(now, "")
+	config.RetainedResults = func() (RetainedResultsFacts, bool) {
+		return RetainedResultsFacts{
+			MeasuredAt: &measured, Runs: 3, ChargedBytes: 200 << 20, LogicalBytes: 100 << 20,
+			Unrecorded: 1, Replaced: 2, Truncated: 3,
+			NodeBudgetBytes: contract.MaxRetainedResultNodeBytes, NodeChargedBytes: &node,
+			OCIRoot: RetainedOCIRootMeasured,
+			OCI: &RetainedOCIFacts{Volumes: 4, Live: 1, Unattributable: 2, Entries: 90,
+				LogicalBytes: 300 << 20, ChargedBytes: 500 << 20, Truncated: 1, Complete: false},
+		}, true
+	}
+	report := BuildDoctor(t.Context(), config)
+	if report.RetainedResults.NodeChargedBytes == nil || *report.RetainedResults.NodeChargedBytes != node {
+		t.Fatalf("node figure lost: %#v", report.RetainedResults)
+	}
+	var human bytes.Buffer
+	if err := WriteDoctorHuman(&human, report); err != nil {
+		t.Fatal(err)
+	}
+	want := "RETAINED RESULTS NODE\tmeasured node_charged_bytes=734003200 budget_bytes=1073741824 oci_root=measured oci_volumes=4 oci_live=1 oci_entries=90 oci_logical_bytes=314572800 oci_charged_bytes=524288000 oci_unattributable=2 oci_truncated=1 oci_complete=false floor=true"
+	if !strings.Contains(human.String(), want) {
+		t.Fatalf("human report lacks the node line:\n%s", human.String())
+	}
+	if !strings.Contains(human.String(), "unrecorded=1 replaced=2 truncated=3") {
+		t.Fatalf("process gaps lost:\n%s", human.String())
+	}
+	encoded, err := json.Marshal(report.RetainedResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"node_charged_bytes":734003200`, `"node_budget_bytes":1073741824`, `"oci_root":"measured"`, `"oci":{`} {
+		if !strings.Contains(string(encoded), key) {
+			t.Fatalf("json lacks %s: %s", key, encoded)
+		}
+	}
+}
+
+// TestDoctorSaysNodeWideRetainedFigureIsUnmeasuredNotZero: an agent that
+// predates the figure, and a node whose OCI root was unreadable, must both
+// read as unmeasured; and a response from an older agent must still decode.
+func TestDoctorSaysNodeWideRetainedFigureIsUnmeasuredNotZero(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	measured := now.Add(-time.Minute)
+	for name, facts := range map[string]RetainedResultsFacts{
+		"older agent":     {MeasuredAt: &measured, Runs: 1},
+		"unreadable root": {MeasuredAt: &measured, Runs: 1, NodeBudgetBytes: contract.MaxRetainedResultNodeBytes, OCIRoot: RetainedOCIRootUnread},
+	} {
+		facts := facts
+		config := healthyDoctorConfig(now, "")
+		config.RetainedResults = func() (RetainedResultsFacts, bool) { return facts, true }
+		report := BuildDoctor(t.Context(), config)
+		var human bytes.Buffer
+		if err := WriteDoctorHuman(&human, report); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(human.String(), "RETAINED RESULTS NODE\tunmeasured node_charged_bytes=unmeasured") ||
+			strings.Contains(human.String(), "node_charged_bytes=0") {
+			t.Fatalf("%s: unmeasured node figure not shown as unmeasured:\n%s", name, human.String())
+		}
+	}
+	// Older agent JSON, no node fields at all.
+	var old RetainedResultsFacts
+	if err := json.Unmarshal([]byte(`{"outcome":"ok","runs":2,"charged_bytes":5}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.NodeChargedBytes != nil || old.OCI != nil {
+		t.Fatalf("absent fields decoded as measured: %#v", old)
+	}
+	// Older reader: the new fields are ignorable by a lenient decoder.
+	type olderShape struct {
+		Runs         int   `json:"runs"`
+		ChargedBytes int64 `json:"charged_bytes"`
+	}
+	node := int64(9)
+	encoded, _ := json.Marshal(RetainedResultsFacts{Runs: 2, ChargedBytes: 5, NodeChargedBytes: &node, OCIRoot: RetainedOCIRootAbsent})
+	var reader olderShape
+	if err := json.Unmarshal(encoded, &reader); err != nil || reader.Runs != 2 || reader.ChargedBytes != 5 {
+		t.Fatalf("older reader broke: %v %#v", err, reader)
+	}
+}

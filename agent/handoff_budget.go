@@ -246,6 +246,17 @@ func nodeChargedBytes(status RetainedResultsStatus) int64 {
 	return total
 }
 
+// NodeChargedBytes is the figure the budget is enforced on, for a reader
+// outside the package. It reports false when the node has an OCI helper whose
+// root could not be read: that sum would be a process-root figure standing in
+// for the node, and an unread root is not an empty one.
+func (status RetainedResultsStatus) NodeChargedBytes() (int64, bool) {
+	if status.OCIInventoryFailed {
+		return 0, false
+	}
+	return nodeChargedBytes(status), true
+}
+
 func (m *handoffManager) remeasureNode(ctx context.Context, root *os.Root) RetainedResultsStatus {
 	status := m.measureNode(ctx, root, m.now().UTC())
 	status.OCI, status.OCIInventoryFailed = m.measureOCIHandoffs(ctx)

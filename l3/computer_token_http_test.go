@@ -665,6 +665,55 @@ func TestRunTokenLineageFilterErrorNeverReturnsUnfilteredDescendants(t *testing.
 
 var _ ComputerGrantVerifier = (*controlledComputerGrantVerifier)(nil)
 
+// The L1 client carries an attempt-scoped revocation to the control-plane
+// route: the completed attempt's pass is revoked even though it arrives after
+// the replacement attempt's pass was minted, and the replacement's survives.
+// Only the control plane may send it.
+func TestAttemptScopedRevocationClientSparesTheReplacementPass(t *testing.T) {
+	h := newComputerHTTPHarness(t, nil)
+	ctx := context.Background()
+	client, err := l1.NewComputerTokenRevocationClient(h.network.NewFabric(fabric.Identity{NodeID: h.server.controlPlaneNodeID}), h.address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.CloseIdleConnections)
+	oldProof := testComputerScope()
+	if _, err := h.store.MintComputerToken(ctx, oldProof); err != nil {
+		t.Fatal(err)
+	}
+	replacementProof := testComputerScope()
+	replacementProof.ComputerAttemptID = "attempt-2"
+	replacement, err := h.store.MintComputerToken(ctx, replacementProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := l1.ComputerTokenRevocation{ComputerID: oldProof.ComputerID, ComputerAttemptID: oldProof.ComputerAttemptID, Reason: "attempt_terminal"}
+	unauthorized, err := l1.NewComputerTokenRevocationClient(h.network.NewFabric(fabric.Identity{NodeID: "not-control-plane"}), h.address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(unauthorized.CloseIdleConnections)
+	if _, err := unauthorized.RevokeComputerTokens(ctx, l1.ComputerTokenRevocation{ComputerID: "computer-1",
+		ComputerAttemptID: "attempt-2", Reason: "attempt_terminal"}); err == nil {
+		t.Fatal("a non-control-plane identity sent an attempt-scoped revocation")
+	}
+	receipt, err := client.RevokeComputerTokens(ctx, request)
+	if err != nil || receipt.ComputerID != request.ComputerID || receipt.ComputerAttemptID != request.ComputerAttemptID ||
+		receipt.RevokedGrantCount != 0 || receipt.CommittedAt.IsZero() {
+		t.Fatalf("attempt-scoped receipt = %#v err=%v", receipt, err)
+	}
+	if _, err := h.store.AuthenticateComputerToken(ctx, replacement.Token); err != nil {
+		t.Fatalf("the completed attempt's revocation revoked the replacement pass: %v", err)
+	}
+	if _, err := client.RevokeComputerTokens(ctx, l1.ComputerTokenRevocation{ComputerID: "computer-1",
+		ComputerAttemptID: "attempt-2", RevokeAll: true, Reason: "attempt_terminal"}); err == nil {
+		t.Fatal("an attempt-scoped revocation that also asks for revoke_all was accepted")
+	}
+	if _, err := h.store.AuthenticateComputerToken(ctx, replacement.Token); err != nil {
+		t.Fatalf("a refused request revoked the replacement pass: %v", err)
+	}
+}
+
 func TestRestoreRevocationClientBindsFreshCommittedTransactions(t *testing.T) {
 	h := newComputerHTTPHarness(t, nil)
 	ctx := context.Background()

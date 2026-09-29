@@ -349,7 +349,7 @@ visible with claims disabled.
 | Attempt ID is not the job's current attempt | 409 | `attempt_mismatch` | false | No mutation. |
 | Fence is not current | 409 | `stale_fence` | false | No mutation. The stale worker must stop writing. |
 | Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` exactly once. A one-shot job fails; a desired-running service job requeues without incrementing its restart streak or lifetime restart count, increments `lease_loss_count`, and receives lease-loss backoff. |
-| Same idempotency identity and same body is replayed | original success | none | n/a | Return the original result; do not duplicate logs or completion. |
+| Same idempotency identity and same body is replayed | original success | none | n/a | Return the original result; do not duplicate logs or completion. A completion replay is also marked `Idempotent-Replay: true`. |
 | Same idempotency identity has a different body | 409 | `idempotency_conflict` | false | No mutation. |
 
 A request that mutates nothing carries no idempotency binding. The
@@ -389,6 +389,34 @@ timestamp are replay-safe; a different event at an existing key is an
 `stderr`; a declared gap advances only its own stream through its inclusive end
 sequence. A completion replay is safe only when its process result and protocol
 output digest match the accepted completion.
+
+Completion replay follows the image-observation rule above: immutable attempt
+ownership and fence are authenticated first -- the caller must be the Fabric
+identity bound to the attempt's stable node (`attempt_not_owned` otherwise;
+that binding never changes, since a different identity registering the same
+stable node is `identity_bound`) and must present the attempt's fence
+(`stale_fence`). A request whose idempotency key and SHA-256 over the whole
+canonical request -- fence, key, process result, runtime-quiescence evidence,
+and protocol output digest -- equal the ones stored with the accepted
+completion is then answered with the job projection, HTTP 200, and
+`Idempotent-Replay: true`, and writes nothing, even after the node has
+re-registered and its boot session or authority generation has moved on. The
+current registration gates only the first completion write. A replay that
+differs in any of those fields is `idempotency_conflict`; a first completion
+from a replaced registration is `node_session_replaced` for as long as the
+attempt's lease runs, then `lease_expired` with late evidence; an attempt that
+is no longer the job's current or retained replay attempt is `attempt_mismatch`
+(#553).
+
+An accepted completion of a Computer Job -- first write or replay, of the
+Computer's current Job or of one a reimage has since superseded -- is followed
+by an `attempt_terminal` revocation at the run ledger scoped to exactly the
+completed attempt (`computer_attempt_id`), never a Computer-wide revoke-all.
+The request leaves L1 after the completion transaction ends, so a reimage or
+restart may already have minted the next attempt's pass by the time it lands;
+an attempt-scoped revocation cannot touch that pass. A replay re-drives the
+same request, which is the retry path for a revocation that failed after the
+completion committed (#548).
 
 An accepted completion writes the exact `ProcessResult` into
 `attempts.result_json` in the same transaction that finalizes the attempt and

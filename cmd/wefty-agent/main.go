@@ -724,13 +724,32 @@ func run() error {
 							return ocicontrol.RetainedResultsFacts{}, false
 						}
 						measuredAt := status.MeasuredAt
-						return ocicontrol.RetainedResultsFacts{
-							MeasuredAt: &measuredAt, Runs: status.Runs, InFlight: status.InFlight,
+						facts := ocicontrol.RetainedResultsFacts{
+							NodeBudgetBytes: contract.MaxRetainedResultNodeBytes,
+							MeasuredAt:      &measuredAt, Runs: status.Runs, InFlight: status.InFlight,
 							Entries: status.Entries, LogicalBytes: status.LogicalBytes,
 							ChargedBytes: status.ChargedBytes, QuarantinedRecords: status.QuarantinedRecords,
 							Unrecorded: status.Unrecorded, Replaced: status.Replaced,
 							Truncated: status.Truncated,
-						}, true
+						}
+						if total, known := status.NodeChargedBytes(); known {
+							facts.NodeChargedBytes = &total
+						}
+						switch {
+						case status.OCIInventoryFailed:
+							facts.OCIRoot = ocicontrol.RetainedOCIRootUnread
+						case status.OCI != nil:
+							facts.OCIRoot = ocicontrol.RetainedOCIRootMeasured
+							facts.OCI = &ocicontrol.RetainedOCIFacts{
+								Volumes: status.OCI.Volumes, Live: status.OCI.Live,
+								Unattributable: status.OCI.Unattributable, Entries: status.OCI.Entries,
+								LogicalBytes: status.OCI.LogicalBytes, ChargedBytes: status.OCI.ChargedBytes,
+								Truncated: status.OCI.Truncated, Complete: status.OCI.Complete,
+							}
+						default:
+							facts.OCIRoot = ocicontrol.RetainedOCIRootAbsent
+						}
+						return facts, true
 					},
 					Intent:                        (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
 					LimaFacts:                     limaFacts,
