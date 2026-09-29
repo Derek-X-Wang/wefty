@@ -301,8 +301,12 @@ message that the mutation applied, so a retry is understood as owed revocation
 rather than an unapplied verb. The node heartbeat is the one surface that does
 not refuse: a pre-restore revocation the run ledger will not take is left owed
 and re-listed next pass, and only that Computer's restore directive is
-withheld. A blocked restore must never take a Node's whole convergence surface
-— and with it the capabilities the Node advertises — out of service.
+withheld. The heartbeat asks for all owed pre-restore revocations at once and
+waits for them at most `HeartbeatRestoreRevocationBudget` (3s), well inside the
+agent's 10s heartbeat deadline; a revocation that has not answered by then is
+owed exactly like a refused one, so a run ledger that hangs costs the same as
+one that refuses. A blocked restore must never take a Node's whole convergence
+surface — and with it the capabilities the Node advertises — out of service.
 
 L1 logs the cause of every response it scrubs, as one
 `event=l1_internal_error_scrubbed` line naming the method, the path, the error

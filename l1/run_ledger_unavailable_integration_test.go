@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -217,5 +218,140 @@ func TestTypedErrorsAreNotLoggedAsScrubbedCauses(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v1/computers/computer-1/desired-state", nil))
 	if logs.text() != "" {
 		t.Fatalf("a typed refusal was logged as a scrubbed cause: %s", logs.text())
+	}
+}
+
+// stoppedComputerWithPublishedBackup adds a second restorable Computer to a
+// harness built by publishedBackupForStorageCopy, on the same Node.
+func stoppedComputerWithPublishedBackup(t *testing.T, h *integrationHarness, node Node, name string) (Computer, Backup) {
+	t.Helper()
+	ctx := context.Background()
+	computer, _, err := h.store.CreateComputer(ctx, CreateComputerRequest{
+		Name: name, Spec: computerCapabilityJobSpec("computer:" + name), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, claim := startBackupComputer(t, h, node, computer)
+	if _, _, err := h.store.BeginComputerBackup(ctx, computer.ComputerID, ComputerBackupCreateRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: name + "-source", AllowPowerOff: true}); err != nil {
+		t.Fatal(err)
+	}
+	finishBackupQuiescence(t, h, claim, name+"-stop")
+	directives, err := h.store.ListNodeComputerBackupDirectives(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var directive *ComputerBackupDirective
+	for index := range directives {
+		if directives[index].ComputerID == computer.ComputerID {
+			directive = &directives[index]
+		}
+	}
+	if directive == nil {
+		t.Fatalf("no Backup directive for %s in %#v", computer.ComputerID, directives)
+	}
+	backup, resumed := acknowledgeBackup(t, h, node, *directive, successfulBackupReceipt(*directive))
+	stopped, err := h.store.SetComputerDesiredState(ctx, resumed.ComputerID, ComputerDesiredStateRequest{
+		ComputerMutationPrecondition: computerPrecondition(resumed, "operator"), DesiredState: contract.ServiceDesiredStopped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stopped, backup
+}
+
+// TestHeartbeatBoundsAStalledRunLedger is the review finding on the first
+// #548 fix: a run ledger that hangs instead of refusing held the heartbeat for
+// the run-ledger client's full 10s, which is also the agent's whole heartbeat
+// deadline, so the node failed exactly as before. The heartbeat must answer
+// within its revocation budget and withhold only the stalled Computer's
+// restore; a Computer whose revocation did answer gets its directive in the
+// same pass.
+func TestHeartbeatBoundsAStalledRunLedger(t *testing.T) {
+	h, node, stalled, stalledBackup, _ := publishedBackupForStorageCopy(t, 2)
+	healthy, healthyBackup := stoppedComputerWithPublishedBackup(t, h, node, "healthy-restore")
+	ctx := context.Background()
+	for _, restore := range []struct {
+		computer Computer
+		backup   Backup
+	}{{stalled, stalledBackup}, {healthy, healthyBackup}} {
+		if _, _, err := h.store.BeginComputerRestore(ctx, restore.computer.ComputerID, ComputerRestoreRequest{
+			ComputerMutationPrecondition: computerPrecondition(restore.computer, "operator"),
+			BackupID:                     restore.backup.BackupID, IdempotencyKey: "stall-" + restore.computer.ComputerID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const budget = 300 * time.Millisecond
+	h.server.restoreRevocationBudget = budget
+	logs := &recordedLog{}
+	h.server.logf = logs.record
+	var stallMu sync.Mutex
+	stall := true
+	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+		stallMu.Lock()
+		stalling := stall && request.ComputerID == stalled.ComputerID
+		stallMu.Unlock()
+		if stalling {
+			// A run ledger that accepted the connection and never answers.
+			<-ctx.Done()
+			return contract.ComputerTokenRevocationReceipt{}, ctx.Err()
+		}
+		return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+			RestoreOperationRevision: request.RestoreOperationRevision, SubmitIntentRevision: request.NewSubmitIntentRevision,
+			CommittedAt: h.clock.Now()}, nil
+	}}
+	agentClient := h.client(fabric.Identity{NodeID: "fabric-computer-node", Tags: []string{DefaultAgentPrincipalTag}})
+	heartbeat := func() HeartbeatResponse {
+		t.Helper()
+		started := time.Now()
+		status, _, body := h.do(agentClient, http.MethodPost, "/v1/agent/nodes/"+node.NodeID+"/heartbeat", heartbeatRequestForNode(node))
+		elapsed := time.Since(started)
+		var response HeartbeatResponse
+		if status != http.StatusOK || json.Unmarshal(body, &response) != nil {
+			t.Fatalf("heartbeat status=%d body=%s", status, body)
+		}
+		// Generous against a loaded runner, and still far inside the agent's
+		// deadline, which is what the budget exists to protect.
+		if elapsed > budget+2*time.Second || elapsed >= ComputerPolicyClientTimeout {
+			t.Fatalf("heartbeat took %s against a %s revocation budget", elapsed, budget)
+		}
+		return response
+	}
+	restoresFor := func(response HeartbeatResponse) map[string]int {
+		byComputer := map[string]int{}
+		for _, directive := range response.StorageCopyDirectives {
+			if directive.Operation == "restore" {
+				byComputer[directive.DestinationComputerID]++
+			}
+		}
+		return byComputer
+	}
+
+	first := restoresFor(heartbeat())
+	if first[stalled.ComputerID] != 0 {
+		t.Fatalf("a restore whose revocation never answered was handed out: %#v", first)
+	}
+	if first[healthy.ComputerID] != 1 {
+		t.Fatalf("the healthy Computer's restore was withheld with the stalled one: %#v", first)
+	}
+	if text := logs.text(); !strings.Contains(text, "event=l1_restore_revocation_deferred") ||
+		!strings.Contains(text, stalled.ComputerID) || !strings.Contains(text, "heartbeat revocation budget") {
+		t.Fatalf("the stalled revocation was not named as a budget deferral: %s", text)
+	}
+	owed, err := h.store.GetComputer(ctx, stalled.ComputerID)
+	if err != nil || owed.LastRestoreRevocation != nil {
+		t.Fatalf("a stalled revocation was recorded as done = %#v err=%v", owed.LastRestoreRevocation, err)
+	}
+
+	stallMu.Lock()
+	stall = false
+	stallMu.Unlock()
+	second := restoresFor(heartbeat())
+	if second[stalled.ComputerID] != 1 || second[healthy.ComputerID] != 1 {
+		t.Fatalf("the owed revocation was not re-driven on the next pass: %#v", second)
+	}
+	settled, err := h.store.GetComputer(ctx, stalled.ComputerID)
+	if err != nil || settled.LastRestoreRevocation == nil {
+		t.Fatalf("the re-driven revocation was not recorded = %#v err=%v", settled.LastRestoreRevocation, err)
 	}
 }
