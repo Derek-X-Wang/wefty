@@ -28,6 +28,9 @@ type backupController struct {
 	// clear is retried at whatever rate those passes arrive (#558).
 	now           func() time.Time
 	createRetries map[string]backupCreateRetry
+	// beforeCreateReservation is a test seam: it runs after a pass has decided
+	// to dispatch a creation and before that creation is reserved.
+	beforeCreateReservation func()
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -140,14 +143,19 @@ func (controller *backupController) enqueueCreate(ctx context.Context, directive
 		return
 	}
 	key := "create\x00" + directive.CopyID
-	if !controller.createDue(key) {
-		return
+	if controller.beforeCreateReservation != nil {
+		controller.beforeCreateReservation()
 	}
-	controller.enqueue(ctx, key, func(runContext context.Context) error {
-		err := controller.processCreate(runContext, directive)
-		controller.recordCreateOutcome(runContext, key, err)
-		return err
-	}, failures)
+	// The retry deadline is read in the same critical section that reserves
+	// the copy. Checked beforehand, a creation still in flight could fail and
+	// release its reservation between the check and the reservation, and this
+	// pass would redispatch it with its new deadline unread.
+	controller.enqueueWhen(ctx, key, func() bool { return controller.createDueLocked(key) },
+		func(runContext context.Context) error {
+			err := controller.processCreate(runContext, directive)
+			controller.recordCreateOutcome(runContext, key, err)
+			return err
+		}, failures)
 }
 
 func (controller *backupController) clockNow() time.Time {
@@ -157,9 +165,8 @@ func (controller *backupController) clockNow() time.Time {
 	return controller.now()
 }
 
-func (controller *backupController) createDue(key string) bool {
-	controller.mu.Lock()
-	defer controller.mu.Unlock()
+// createDueLocked requires controller.mu.
+func (controller *backupController) createDueLocked(key string) bool {
 	retry, failed := controller.createRetries[key]
 	return !failed || !controller.clockNow().Before(retry.notBefore)
 }
@@ -185,11 +192,22 @@ func (controller *backupController) recordCreateOutcome(ctx context.Context, key
 }
 
 func (controller *backupController) enqueue(ctx context.Context, key string, run func(context.Context) error, failures chan<- destinationError) {
+	controller.enqueueWhen(ctx, key, nil, run, failures)
+}
+
+// enqueueWhen reserves key and runs it unless it is already in flight or due,
+// evaluated under controller.mu together with the reservation, says it is not
+// yet time.
+func (controller *backupController) enqueueWhen(ctx context.Context, key string, due func() bool, run func(context.Context) error, failures chan<- destinationError) {
 	if controller == nil {
 		return
 	}
 	controller.mu.Lock()
 	if _, exists := controller.inflight[key]; exists {
+		controller.mu.Unlock()
+		return
+	}
+	if due != nil && !due() {
 		controller.mu.Unlock()
 		return
 	}

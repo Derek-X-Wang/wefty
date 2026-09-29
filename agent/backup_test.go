@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -238,5 +239,89 @@ func TestStaleDirectiveReplaySkipsAnAcknowledgedBackupCopy(t *testing.T) {
 	// contributed nothing to it, and the completed removal released its record.
 	if _, found, err := spool.runtimeRemoval(t.Context(), removal.jobID); err != nil || found {
 		t.Fatalf("completed removal kept its durable record: found=%t err=%v", found, err)
+	}
+}
+
+// gatedBackupCreator refuses every Backup creation untyped. The call numbered
+// hold waits for release, so a test can keep one creation in flight.
+type gatedBackupCreator struct {
+	mu      sync.Mutex
+	creates int
+	hold    int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (creator *gatedBackupCreator) CreateComputerBackup(context.Context, workloadrunner.ComputerBackupRequest) (workloadrunner.ComputerBackupCopyReceipt, error) {
+	creator.mu.Lock()
+	creator.creates++
+	held := creator.creates == creator.hold
+	creator.mu.Unlock()
+	if held {
+		close(creator.entered)
+		<-creator.release
+	}
+	return workloadrunner.ComputerBackupCopyReceipt{}, errors.New("Computer Backup lacks exact detached source-generation evidence")
+}
+
+func (*gatedBackupCreator) DeleteComputerBackupCopy(context.Context, workloadrunner.ComputerBackupCopyRemovalRequest) (workloadrunner.ComputerBackupCopyRemovalReceipt, error) {
+	return workloadrunner.ComputerBackupCopyRemovalReceipt{}, errors.New("gatedBackupCreator deletes no Backup copy")
+}
+
+func (creator *gatedBackupCreator) count() int {
+	creator.mu.Lock()
+	defer creator.mu.Unlock()
+	return creator.creates
+}
+
+// TestBackupCreateFailureRecordedMidPassIsHonouredByThatPass forces the one
+// interleaving a check-then-reserve gate misses (#558 review): a heartbeat
+// decides to dispatch a copy while its previous creation is still in flight,
+// that creation then fails -- recording a fresh backoff deadline and releasing
+// its reservation -- and only then does the heartbeat reserve. The pass must
+// read the deadline that exists when it reserves, not the one it saw before.
+func TestBackupCreateFailureRecordedMidPassIsHonouredByThatPass(t *testing.T) {
+	creator := &gatedBackupCreator{hold: 2, entered: make(chan struct{}), release: make(chan struct{})}
+	now := time.Date(2026, 9, 28, 21, 12, 45, 0, time.UTC)
+	controller := newBackupController(nil, nil, creator, "node-1", "boot-1", "root-1", t.Logf)
+	controller.now = func() time.Time { return now }
+	directive := l1.ComputerBackupDirective{BackupID: "backup-of-clone", CopyID: "copy-of-clone",
+		ComputerID: "clone", StorageID: "clone-storage", StorageGeneration: 1, AllocatedSize: 128 << 20,
+		BoundNodeID: "node-1", RootInstanceID: "root-1", JobID: "clone-job", OperationRevision: 2,
+		CleanupFence: "backup-fence"}
+
+	// First failure: the next creation is due one base interval later.
+	controller.enqueueCreate(t.Context(), directive, nil)
+	controller.wait()
+	now = now.Add(backupCreateRetryBase)
+	// The retry is due and stays in flight.
+	controller.enqueueCreate(t.Context(), directive, nil)
+	<-creator.entered
+
+	// The next heartbeat has decided to dispatch. Before it reserves, the
+	// in-flight retry fails and releases its reservation.
+	controller.beforeCreateReservation = func() {
+		controller.beforeCreateReservation = nil
+		close(creator.release)
+		controller.wg.Wait()
+	}
+	controller.enqueueCreate(t.Context(), directive, nil)
+	controller.wait()
+	if creates := creator.count(); creates != 2 {
+		t.Fatalf("Backup creations = %d, want 2: a failure recorded mid-pass was redispatched before its deadline", creates)
+	}
+
+	// The deadline the failure recorded is the gate, not a permanent block.
+	now = now.Add(2*backupCreateRetryBase - time.Nanosecond)
+	controller.enqueueCreate(t.Context(), directive, nil)
+	controller.wait()
+	if creates := creator.count(); creates != 2 {
+		t.Fatalf("Backup creations before the doubled deadline = %d, want 2", creates)
+	}
+	now = now.Add(time.Nanosecond)
+	controller.enqueueCreate(t.Context(), directive, nil)
+	controller.wait()
+	if creates := creator.count(); creates != 3 {
+		t.Fatalf("Backup creations at the doubled deadline = %d, want 3", creates)
 	}
 }
