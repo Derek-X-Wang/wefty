@@ -396,8 +396,8 @@ on the injected clock: the configured retry interval, doubled per consecutive
 failure of the same work and capped at 30 seconds (or at the interval itself
 when that is configured larger), reset by the first success. A typed refusal
 that repeating on a retry interval cannot clear -- `node_session_replaced`,
-`identity_bound`, or `principal_forbidden` -- moves the attempt onto a slow
-re-check schedule instead: two minutes, doubling per consecutive refusal, capped
+`identity_bound`, or `principal_forbidden` -- moves the attempt onto a
+re-check schedule instead: 10 seconds, doubling per consecutive refusal, capped
 at one hour, and never abandoned while the evidence is pending. Only the first
 refusal of a run is logged (a different refusal code is logged once as well);
 identical repeats are silent, and one line records the attempt's recovery when
@@ -408,11 +408,14 @@ starts the schedule again. The re-checks exist because `node_session_replaced`
 also answers a completion L1 has not accepted while the replaced registration's
 lease is still running; once that lease has expired the replay is answered
 `lease_expired` and the result is kept as late evidence, but only within L1's
-late-evidence window (48 hours by default; after it L1 keeps a gap instead).
-The spool does not keep the lease a recovered attempt was claimed with, so the
-bounds are fixed: the first re-check is four times L1's 30-second default
-lease, and the one-hour cap sits above any sensible lease and far inside the
-late-evidence window. For a completion L1 already accepted from an older
+late-evidence window (48 hours by default, configurable down to minutes; after
+it L1 keeps a gap instead). The spool does not keep the lease a recovered
+attempt was claimed with, so the schedule starts short and lets doubling find
+it: every wait equals the time already waited plus 10 seconds, so the first
+re-check after the lease runs out comes at most the lease's remainder plus 10
+seconds later, and never more than an hour later. The result therefore lands
+as itself on any L1 whose late-evidence window is longer than its lease plus 10
+seconds; the cost is a few silent requests in the first minutes. For a completion L1 already accepted from an older
 registration, every replay is refused and the row stays until something else
 removes it (service removal purges the job's spool rows; a one-shot row has no
 such path). While L1 reports the attempt as

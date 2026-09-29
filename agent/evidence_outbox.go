@@ -20,21 +20,24 @@ const (
 	// often, so an L1 that answers every replay with a transient error sees one
 	// request per attempt per ceiling rather than one per retry interval.
 	maxEvidenceRecoveryBackoff = 30 * time.Second
-	// A refused attempt is re-checked on its own slower schedule, starting at
+	// A refused attempt is re-checked on its own schedule, starting at
 	// evidenceRecoveryRefusalRecheck and doubling to
 	// maxEvidenceRecoveryRefusalRecheck, for as long as the evidence is
 	// pending. It never stops: node_session_replaced also answers a
 	// completion L1 has not accepted while the replaced registration's lease
 	// is still running, and that turns into lease_expired -- the result kept
-	// as late evidence -- only once the lease runs out, and only for L1's
-	// late-evidence window (48 h by default; after it L1 keeps a gap in place
-	// of the result). The lease a recovered attempt was claimed with is not in
-	// the spool, so neither bound can be derived from it. The first re-check
-	// is four times L1's 30 s default lease; the cap is above any lease worth
-	// configuring and far inside the late-evidence window, so a result whose
-	// lease has run out still lands as itself, and an attempt that can never
-	// land costs L1 one request an hour.
-	evidenceRecoveryRefusalRecheck    = 2 * time.Minute
+	// as late evidence -- only once the lease runs out, and only within L1's
+	// late-evidence window (48 h by default, configurable down to minutes;
+	// after it L1 keeps a gap in place of the result). The spool does not keep
+	// the lease an attempt was claimed with, so the schedule cannot be derived
+	// from it. It starts short and doubles instead: every wait is the time
+	// already waited plus the first step, so the first re-check after the
+	// lease runs out comes at most the lease's remainder plus 10 s later, and
+	// never more than the hourly cap later. That lands the result as itself on
+	// any L1 whose late-evidence window is longer than its lease plus 10 s. The price is a
+	// few silent requests in the first minutes; the cap keeps a completion
+	// that can never land to one request an hour.
+	evidenceRecoveryRefusalRecheck    = 10 * time.Second
 	maxEvidenceRecoveryRefusalRecheck = time.Hour
 )
 
