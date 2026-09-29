@@ -45,6 +45,7 @@ rows="$work_directory/rows.json"
 
 : > "$facts"
 for receipt in native-linux-oci.txt oci-service-publication-linux.txt \
+  oci-rerun-tag-movement-linux.txt \
   oci-service-l1-agent-linux.txt helper-restart-timeline.txt lost-attempt-sweep.txt \
   oci-service-agent-sigkill-linux.txt oci-service-heartbeat-blackhole-linux.txt \
   oci-service-removal-stopped-linux.txt oci-service-removal-offline-linux.txt \
@@ -83,7 +84,7 @@ has_fact() {
 #   declared gap: NAME:REASON, several joined by ";". Reasons carry no ";".
 row_specification() {
   cat <<'SPECIFICATION'
-linux.oneshot.image_identity|Public digest pull and offline tar import with identical top-level and platform digests, tag movement leaves every retry on the original job digest, cache repull after wipe|table Linux/one-shot + bullets 2,3,4|!pull_from_empty !pull_import_digest_equal registry_disabled_pull_rejected !registry_disabled_import !import_run !node_load_image !archive_platform_filtered !public_acceptance_image !tag_refloat_resolved_once binding_repull_reconciliation|cache_intact_after_reboot:no Linux reboot harness exists, and the only reboot test writes a permanent systemd_reboot_harness NOT-RUN receipt;rerun_under_tag_movement:frozen rerun identity is proven, but never with the tag floated between run and rerun
+linux.oneshot.image_identity|Public digest pull and offline tar import with identical top-level and platform digests, tag movement leaves every retry and rerun on the original job digest, cache repull after wipe|table Linux/one-shot + bullets 2,3,4|!pull_from_empty !pull_import_digest_equal registry_disabled_pull_rejected !registry_disabled_import !import_run !node_load_image !archive_platform_filtered !public_acceptance_image !tag_refloat_resolved_once rerun_under_tag_movement_original_digest rerun_under_tag_movement_tag_not_refloated binding_repull_reconciliation|cache_intact_after_reboot:no Linux reboot harness exists, and the only reboot test writes a permanent systemd_reboot_harness NOT-RUN receipt
 linux.oneshot.delivery|Handoff write, one authenticated bridge request, split stdout and stderr markers, exit 0|table Linux/one-shot|oneshot_handoff_marker_bytes !oneshot_bridge_once !oneshot_split_streams !oneshot_digest_evidence !ordinary_l3_oci_submission !ordinary_l3_frozen_rerun !live_log_delivery !stdout_log !stderr_log|
 linux.oneshot.engine_loss|Pre-start engine loss requeues on the pinned digest, mid-run loss is terminal|table Linux/one-shot + bullet 5|!prestart_requeue_pinned !wait_before_start !shim_loss=runtime_failure !containerd_stop=runtime_failure|
 linux.service.publication|Publish health and echo through Fabric on a helper-allocated loopback port, refuse a colliding port, and fail a payload that never reaches its startup readiness deadline|table Linux/service|!service_echo_health !service_echo_body health echo helper_tunnel portless_started port_collision_avoided startup_timeout|

@@ -753,7 +753,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	exerciseOrdinaryL3OCIOneshot(t, ctx, barrier, adapter, echoReference, echoImage.TopLevelDigest, reference, digest)
+	exerciseOrdinaryL3OCIOneshot(t, ctx, barrier, adapter, echoReference, echoImage.TopLevelDigest, reference, digest, newRefloatRegistry(t, echoArchivePath))
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -2359,6 +2359,7 @@ func exerciseOrdinaryL3OCIOneshot(
 	barrier *ocihelper.BootBarrier,
 	adapter *ocirunner.Adapter,
 	echoReference, echoDigest, probeReference, probeDigest string,
+	rerunRegistry *refloatRegistry,
 ) {
 	t.Helper()
 	network := plain.NewNetwork()
@@ -2479,6 +2480,7 @@ func exerciseOrdinaryL3OCIOneshot(
 		t.Fatalf("ordinary OCI rerun omitted L1 job identity: %+v", rerunRecord)
 	}
 	assertNativeRunLogs(t, caller, rerun.RunID)
+	exerciseOrdinaryL3OCIRerunUnderTagMovement(t, ctx, caller, l1Store, rerunRegistry)
 
 	cancelRun()
 	if err := <-agentDone; err != nil {

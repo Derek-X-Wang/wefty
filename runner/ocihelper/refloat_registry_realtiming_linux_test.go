@@ -126,6 +126,20 @@ func (registry *refloatRegistry) moveTag() {
 	registry.mu.Unlock()
 }
 
+// moveTagTo repoints the tag at an image the registry already serves, such as
+// an addVariant digest. Unlike moveTag, whose target cannot run, a caller that
+// wrongly re-floats the tag after this still gets a runnable image, so only the
+// digest it ran can tell the two apart.
+func (registry *refloatRegistry) moveTagTo(t *testing.T, digest string) {
+	t.Helper()
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, ok := registry.blobs[digest]; !ok {
+		t.Fatalf("refloat registry cannot move its tag to unserved digest %s", digest)
+	}
+	registry.currentTag = digest
+}
+
 func (registry *refloatRegistry) observedTagRequests() int {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
