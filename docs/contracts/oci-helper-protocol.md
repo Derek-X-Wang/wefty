@@ -236,7 +236,8 @@ The client boundary exposes runtime loss as a typed error only for an active
 session's transport disappearance, `session_stale`, an explicit image
 `engine_loss` fact, or an `engine_failure` that is none of the following: an
 `attempt_scoped` `Run` refusal, a bounded `Delete` cancellation or deadline, or
-any `DeleteManagedVolume` or `DeleteComputerBackupCopy` failure. The
+any `DeleteManagedVolume`, `DeleteComputerBackupCopy`, or
+`CreateComputerBackup` failure. The
 `attempt_scoped` claim is written and
 read only for `Run`; the client ignores it on every other operation. A typed
 `Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
@@ -249,6 +250,11 @@ proves nothing about namespace authority. Reading that refusal as node-wide
 loss let one Backup copy the node could not delete invalidate the exclusive
 session on every retry, so the node withdrew `kind:oci` and could place nothing
 while the stalled removal holding that copy had already released its Slot.
+`CreateComputerBackup` is the same scope for the same one copy: file-level
+mechanics on one detached Storage generation that never touch the engine
+namespace, accepted only against a receipt derived from the copy. Reading its
+refusal as loss let a Backup of a never-started clone close the session, reap
+the running neighbours' attempts, and do it again on every redispatch (#558).
 An `operation_failed`
 Computer-disk deletion is retried at most three times with 100 ms between
 attempts. If the third attempt still fails, the helper durably writes an
@@ -1578,7 +1584,14 @@ publishes by rename, and records `encryption=none`. Durable phases cover
 reserve, allocate, copy, digest, manifest, and publish so every injected crash
 resumes from a tracked manifest. ENOSPC or digest mismatch removes the copy
 root, positively checks absence, and returns only the corresponding failure
-receipt; it never modifies the source.
+receipt; it never modifies the source. A source generation whose manifest has
+no attachment history at all -- no attachment, no pending attachment, no
+retirement, and no detach receipt, which is a clone, restore, or import whose
+Computer has never started -- has nothing detached to copy. The helper answers
+it with a `computer_backup_copy_failed_absent` receipt carrying
+`failure_code=source_never_detached`, minted only when no copy root exists for
+that copy, and reads nothing. The detachment rule is unchanged: a generation
+whose detach receipt exists but names another Job is still refused untyped.
 
 `DeleteComputerBackupCopy` accepts new prune or composite-removal authority but
 requires any present manifest to match the exact copy, source Storage identity,

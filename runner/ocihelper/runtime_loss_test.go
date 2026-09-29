@@ -2,7 +2,7 @@ package ocihelper
 
 import "testing"
 
-// TestPerResourceDeletionRefusalsAreNotRuntimeLoss pins the narrow set of
+// TestPerResourceRefusalsAreNotRuntimeLoss pins the narrow set of
 // engine refusals that are scoped to the one durable resource they name.
 // Deleting a Backup copy is authorized on its own, deletes only that copy, and
 // is accepted by the caller only against an independently verified
@@ -12,8 +12,11 @@ import "testing"
 // Reading it as node-wide loss is what turned one immutable Backup copy into a
 // node that dropped kind:oci and could place nothing, while the removal holding
 // that copy had already been declared stalled and had released its Slot (#513).
-func TestPerResourceDeletionRefusalsAreNotRuntimeLoss(t *testing.T) {
-	scoped := []Method{MethodDeleteVolume, MethodDeleteBackup}
+// Creating a Backup copy is the same shape for the same one copy; reading its
+// refusal as loss let a Backup of a never-started clone tear the session down
+// on every redispatch (#558).
+func TestPerResourceRefusalsAreNotRuntimeLoss(t *testing.T) {
+	scoped := []Method{MethodDeleteVolume, MethodDeleteBackup, MethodCreateBackup}
 	for _, operation := range scoped {
 		refusal := &RPCError{
 			Code: CodeEngineFailure, Message: "OCI engine operation failed",

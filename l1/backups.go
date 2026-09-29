@@ -73,7 +73,21 @@ type ComputerBackupFailureCode string
 const (
 	ComputerBackupFailureInsufficientDisk ComputerBackupFailureCode = "insufficient_disk"
 	ComputerBackupFailureDigestMismatch   ComputerBackupFailureCode = "digest_mismatch"
+	// ComputerBackupFailureSourceNeverDetached is a Backup of a Storage
+	// generation no consumer has ever detached from -- a clone, restore, or
+	// import that has never started. There is no detached source to copy, so
+	// the operation fails with positive copy absence like the other two (#558).
+	ComputerBackupFailureSourceNeverDetached ComputerBackupFailureCode = "source_never_detached"
 )
+
+func validComputerBackupFailureCode(code string) bool {
+	switch ComputerBackupFailureCode(code) {
+	case ComputerBackupFailureInsufficientDisk, ComputerBackupFailureDigestMismatch, ComputerBackupFailureSourceNeverDetached:
+		return true
+	default:
+		return false
+	}
+}
 
 type ComputerBackupOperationOutcome struct {
 	OperationRevision int64                     `json:"operation_revision"`
@@ -392,7 +406,7 @@ func validateBackupReceipt(row computerBackupOperationRow, receipt ComputerBacku
 		}
 	case computerBackupFailureReceiptKind:
 		if receipt.ContentDigest != "" || !receipt.CopyAbsent ||
-			(receipt.FailureCode != "insufficient_disk" && receipt.FailureCode != "digest_mismatch") {
+			!validComputerBackupFailureCode(receipt.FailureCode) {
 			return protocolError(contract.ErrorInvalidRequest, "failed Computer Backup receipt lacks positive copy absence")
 		}
 	default:

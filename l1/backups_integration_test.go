@@ -257,6 +257,45 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		}
 	})
 
+	// A Backup of a generation nothing has detached from yet -- a clone that
+	// has never started -- is a failed Backup with its reason, settled once:
+	// the Computer leaves backing_up and the directive stops arriving (#558).
+	t.Run("never-detached source settles failed and stops redispatch", func(t *testing.T) {
+		h, node, computer := backupHarness(t, 2, nil)
+		computer, claim := startBackupComputer(t, h, node, computer)
+		_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-never-detached", AllowPowerOff: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		finishBackupQuiescence(t, h, claim, "backup-never-detached-quiescence")
+		directives, _ := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if len(directives) != 1 {
+			t.Fatalf("never-detached Backup directives = %#v", directives)
+		}
+		receipt := successfulBackupReceipt(directives[0])
+		receipt.Kind = computerBackupFailureReceiptKind
+		receipt.ContentDigest = ""
+		receipt.CopyAbsent = true
+		receipt.FailureCode = "not_a_backup_failure"
+		if _, _, err := h.store.AcknowledgeComputerBackup(context.Background(), "fabric-computer-node", directives[0].ComputerID,
+			ComputerBackupAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: receipt.ReceiptID, Receipt: receipt}); err == nil {
+			t.Fatal("an unknown Backup failure code settled the operation")
+		}
+		receipt.FailureCode = string(ComputerBackupFailureSourceNeverDetached)
+		backup, settled := acknowledgeBackup(t, h, node, directives[0], receipt)
+		if backup.BackupID != "" || settled.ReconfigurationPhase != ComputerReconfigurationStable ||
+			settled.LastBackupOperation == nil || settled.LastBackupOperation.Status != "failed" ||
+			settled.LastBackupOperation.FailureCode != ComputerBackupFailureSourceNeverDetached {
+			t.Fatalf("never-detached Backup result = backup=%#v Computer=%#v", backup, settled)
+		}
+		remaining, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(remaining) != 0 {
+			t.Fatalf("settled never-detached Backup is still dispatched: %#v err=%v", remaining, err)
+		}
+	})
+
 	t.Run("latched failure stays failed", func(t *testing.T) {
 		h, node, computer := backupHarness(t, 2, nil)
 		computer, claim := startBackupComputer(t, h, node, computer)

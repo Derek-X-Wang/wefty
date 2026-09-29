@@ -313,6 +313,11 @@ Job is positively quiesced may the agent prove the source unmounted and
 loop-detached, fully allocate the copy, copy it under the Storage attachment
 fence, and compare source and copy SHA-256 digests. Publication atomically
 records Backup, Backup copy, and Storage provenance with `encryption=none`.
+A helper failure receipt with positive copy absence settles the operation
+`failed` with its code -- `insufficient_disk`, `digest_mismatch`, or
+`source_never_detached` for a source generation nothing has ever detached
+from -- publishes nothing, and returns the Computer to `stable`; the directive
+is not dispatched again.
 The Job resumes only when desired-running intent and the exact operation
 revision are unchanged; an intervening stop or remove wins.
 

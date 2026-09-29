@@ -389,3 +389,97 @@ func TestComputerBackupRequiresDetachmentAndPruneBindsAbsence(t *testing.T) {
 		t.Fatalf("pruned Backup remains: %v", err)
 	}
 }
+
+// prepareNeverDetachedBackupSource leaves the Storage generation exactly as a
+// clone, restore, or import leaves it before its Computer first starts: a
+// prepared, fully allocated image whose manifest has no attachment history at
+// all -- no previous_detachment, because nothing has ever detached from it.
+func prepareNeverDetachedBackupSource(t *testing.T) (string, *fakeComputerDiskSystem, ComputerStorageReference) {
+	t.Helper()
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	storage := testComputerStorage()
+	name, err := deterministicComputerDiskName(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(diskRoot, "disk.ext4")
+	if err := os.WriteFile(imagePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.allocateAndFormat(t.Context(), imagePath, storage.DiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeComputerDiskManifest(diskRoot, computerDiskManifest{Version: computerDiskManifestVersion,
+		Storage: storage, DiskImage: "disk.ext4", MountDirectory: name, Prepared: true}); err != nil {
+		t.Fatal(err)
+	}
+	return root, system, storage
+}
+
+// A Backup of a never-started clone is refused as the precondition it is: the
+// helper answers with a typed positive-absence failure receipt L1 settles, not
+// an engine failure the agent reads as runtime loss (#558). The detachment rule
+// itself is unchanged -- nothing is copied and the source is untouched.
+func TestComputerBackupOfNeverDetachedGenerationIsATypedPositiveAbsenceFailure(t *testing.T) {
+	root, system, storage := prepareNeverDetachedBackupSource(t)
+	request := backupTestRequest(storage, testComputerAuthority("clone-job", "clone-fence", "boot-a"))
+	diskName, _ := deterministicComputerDiskName(storage)
+	sourcePath := filepath.Join(root, "computer-disks", diskName, "disk.ext4")
+	manifestPath := filepath.Join(root, "computer-disks", diskName, "attachment.json")
+	before, err := digestFile(t.Context(), sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBefore, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	response, err := engine.CreateComputerBackup(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_backup_copy_failed_absent" ||
+		response.Receipt.FailureCode != computerBackupFailureSourceNeverDetached || !response.Receipt.CopyAbsent ||
+		response.Receipt.ContentDigest != "" || response.Receipt.ReceiptID == "" ||
+		response.Receipt.CopyID != request.CopyID || response.Receipt.HelperGeneration != request.Authority.HelperGeneration {
+		t.Fatalf("never-detached Backup = %+v err=%v, want a typed source_never_detached failure receipt", response, err)
+	}
+	copyName, _ := deterministicComputerBackupCopyName(request.CopyID)
+	if _, err := os.Lstat(filepath.Join(root, "computer-backups", copyName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused Backup left a copy root: %v", err)
+	}
+	after, err := digestFile(t.Context(), sourcePath)
+	if err != nil || after != before {
+		t.Fatalf("refused Backup mutated the source: before=%s after=%s err=%v", before, after, err)
+	}
+	manifestAfter, err := os.ReadFile(manifestPath)
+	if err != nil || !bytes.Equal(manifestAfter, manifestBefore) {
+		t.Fatalf("refused Backup rewrote the source manifest: err=%v", err)
+	}
+
+	// The receipt claims copy absence, so a copy root that already exists for
+	// this copy is never answered with it.
+	if err := os.MkdirAll(filepath.Join(root, "computer-backups", copyName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if response, err := engine.CreateComputerBackup(t.Context(), request); err == nil {
+		t.Fatalf("never-detached Backup with a present copy root claimed absence: %+v", response)
+	}
+}
+
+// Detachment evidence that exists but names another prior Job is still the
+// untyped refusal: only a generation with no detachment history at all is
+// source_never_detached.
+func TestComputerBackupWithForeignDetachmentEvidenceIsNotNeverDetached(t *testing.T) {
+	root, system, storage, sourceAuthority := prepareDetachedBackupSource(t)
+	request := backupTestRequest(storage, sourceAuthority)
+	request.Authority.PriorJobID = "some-other-job"
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	response, err := engine.CreateComputerBackup(t.Context(), request)
+	if err == nil || errors.Is(err, errComputerBackupSourceNeverDetached) {
+		t.Fatalf("foreign detachment evidence = %+v err=%v, want the untyped refusal", response, err)
+	}
+}
