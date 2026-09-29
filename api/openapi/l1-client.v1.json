@@ -155,7 +155,7 @@
       "post": {
         "operationId": "createJob",
         "summary": "Create a job idempotently by dispatch key",
-        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict. A Computer-trait spec must use /v1/computers so the durable authority and first immutable Job are committed together; bare creation returns computer_resource_required. A kind=oci one-shot must carry a run identity, because its handoff volume is keyed by it: handoff_owner_run_id when non-blank, else run_id, at most 255 bytes and without NUL. Without one a new job is refused with 409 run_identity_required (retryable false) and nothing is stored; an identical replay of such a job already stored still returns it; a run dispatched by the L3 ledger always carries it. A request carrying Authorization: Bearer <attempt credential> submits a child job instead: L1 derives parent_job_id, parent_attempt_id, originating_submitter, and spawn_depth from the credential rather than the body, refuses a spec the originating submitter could not have posted itself, and refuses a spawn depth above the fixed cap of 8 with spawn_depth_exceeded. The credential is accepted only while its attempt is the job's live attempt and only from the Fabric identity of the node holding that attempt.",
+        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict. A Computer-trait spec must use /v1/computers so the durable authority and first immutable Job are committed together; bare creation returns computer_resource_required. A kind=oci one-shot must carry a run identity, because its handoff volume is keyed by it: handoff_owner_run_id when non-blank, else run_id, at most 255 bytes and without NUL. Without one a new job is refused with 409 run_identity_required (retryable false) and nothing is stored; an identical replay of such a job already stored still returns it; a run dispatched by the L3 ledger always carries it. Only a submitter entitled to a run may set run_id or handoff_owner_run_id, on any kind or class: the trusted run ledger may name any run; a child submitted with an attempt credential may set run_id only to its parent job's run_id and handoff_owner_run_id only to the parent's run_id or the parent's own owner key; any other submitter may name none. A label blank after trimming names nothing. Otherwise a new job is refused with 403 run_identity_not_entitled (retryable false) and nothing is stored; the check follows dispatch-key resolution, so an identical replay of a labelled job already stored still returns it. A request carrying Authorization: Bearer <attempt credential> submits a child job instead: L1 derives parent_job_id, parent_attempt_id, originating_submitter, and spawn_depth from the credential rather than the body, refuses a spec the originating submitter could not have posted itself, and refuses a spawn depth above the fixed cap of 8 with spawn_depth_exceeded. The credential is accepted only while its attempt is the job's live attempt and only from the Fabric identity of the node holding that attempt.",
         "security": [
           { "fabricIdentity": [] },
           { "fabricIdentity": [], "attemptCredential": [] }
@@ -190,7 +190,14 @@
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
-          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "403": {
+            "description": "The authenticated principal is outside its scope, or run_identity_not_entitled when the spec names a run in run_id or handoff_owner_run_id that the submitter is not entitled to. Not retryable.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
           "409": {
             "description": "dispatch_key_conflict when the key was already used with a different canonical request, or when an attempt credential presents a key belonging to another parent. spawn_depth_exceeded when the credential's job already sits at the fixed spawn-depth cap of 8. Neither is retryable.",
             "content": {

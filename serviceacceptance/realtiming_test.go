@@ -49,11 +49,14 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 	ociSpec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "realtime-oci-prestart", Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		RuntimeHandler: "io.containerd.runc.v2",
-		// An OCI one-shot names the run that owns its handoff volume (#578).
+		// An OCI one-shot names the run that owns its handoff volume (#578),
+		// and only the run ledger may name one, so it is created as the ledger
+		// dispatches it (#583).
 		Labels:    map[string]string{contract.LabelRunID: "run-realtime-oci-prestart"},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"}}},
 	}
-	job, _, err := store.CreateJob(context.Background(), ociSpec)
+	job, _, err := store.CreateJobAs(context.Background(), ociSpec,
+		l1.JobOrigin{OriginatingSubmitter: "run-ledger", SubmittedByRunLedger: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -91,11 +91,11 @@ func TestARequestBodyCannotClaimRunLedgerProvenance(t *testing.T) {
 		t.Fatalf("a JobSpec carrying submitted_by_run_ledger was accepted: %s", response)
 	}
 
-	// Everything a submitter *can* write, written to look like the ledger.
+	// Everything a submitter *can* write, written to look like the ledger. A
+	// run_id is no longer among it: only the ledger may name a run, and the
+	// refusal is pinned in TestOnlyTheRunLedgerMayNameARunOnARootSubmission.
 	spec = validJobSpec("dressed-up-provenance", []string{"linux"})
-	spec.Labels = map[string]string{
-		"run_id": "run_forged", contract.LabelDispatchAuthority: contract.LabelTrue,
-	}
+	spec.Labels = map[string]string{contract.LabelDispatchAuthority: contract.LabelTrue}
 	if spec.Execution.Env == nil {
 		spec.Execution.Env = map[string]string{}
 	}

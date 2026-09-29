@@ -137,7 +137,7 @@ func TestCreateJobPersistsNormalizedExecutionIdentifiers(t *testing.T) {
 	})
 	spec := capabilityJobSpec("normalized-oci", contract.JobKindOCI, contract.JobClassOneShot, " IO.CONTAINERD.RUNSC.V1 ", nil)
 	spec.Kind = " OCI "
-	job, _, err := h.store.CreateJob(context.Background(), spec)
+	job, _, err := h.store.CreateJobAs(context.Background(), spec, runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func assertClaimRequiresAdvertisedCapabilities(t *testing.T) {
 				}
 				job = computer.CurrentJob
 			} else {
-				created, _, err := h.store.CreateJob(context.Background(), test.spec)
+				created, _, err := h.store.CreateJobAs(context.Background(), test.spec, runLedgerOrigin)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -338,7 +338,7 @@ func assertConcurrentClaimsCannotBypassCapabilities(t *testing.T) {
 			})
 			incapable := registerCapabilityNode(t, h, "incapable", map[string]bool{"kind:process": true})
 			capable := registerCapabilityNode(t, h, "capable", map[string]bool{"kind:oci": true})
-			job, _, err := h.store.CreateJob(context.Background(), capabilityJobSpec("concurrent-"+class, contract.JobKindOCI, class, "", nil))
+			job, _, err := h.store.CreateJobAs(context.Background(), capabilityJobSpec("concurrent-"+class, contract.JobKindOCI, class, "", nil), runLedgerOrigin)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -438,7 +438,8 @@ func capabilityJobSpec(dispatchKey, kind, class, runtimeHandler string, limits *
 	var labels map[string]string
 	if class == contract.JobClassOneShot {
 		// An OCI one-shot's handoff volume is keyed by its run, so it is
-		// submitted as the ledger dispatches it: naming one (wefty #578).
+		// submitted as the ledger dispatches it: naming one (wefty #578), and
+		// created with runLedgerOrigin, the submitter entitled to name it (#583).
 		labels = map[string]string{contract.LabelRunID: "run-" + dispatchKey}
 	}
 	return contract.JobSpec{

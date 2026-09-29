@@ -2456,7 +2456,7 @@ func writeError(w http.ResponseWriter, err error) {
 	case contract.ErrorUnauthorized, contract.ErrorPersonIdentityRequired:
 		status = http.StatusUnauthorized
 	case contract.ErrorForbidden, contract.ErrorPrincipalForbidden, contract.ErrorIdentityBound, contract.ErrorAttemptNotOwned,
-		contract.ErrorAdminRequired, contract.ErrorAdminBootstrapInvalid:
+		contract.ErrorAdminRequired, contract.ErrorAdminBootstrapInvalid, contract.ErrorRunIdentityNotEntitled:
 		status = http.StatusForbidden
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound:
 		status = http.StatusNotFound
