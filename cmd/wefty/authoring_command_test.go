@@ -49,6 +49,17 @@ func TestAuthoringCommandsRunWithoutAFabric(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(workspace, "workflows", "demo", "demo.sh")); err != nil {
 		t.Fatalf("the scaffold wrote no starter: %v", err)
 	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err = run(context.Background(),
+		[]string{"workflow", "init", "typed", "--lang", "ts", "--dir", filepath.Join(workspace, "workflows")}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("wefty workflow init --lang ts: %v\n%s", err, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "workflows", "typed", "src", "typed.ts")); err != nil {
+		t.Fatalf("the TypeScript scaffold wrote no source: %v", err)
+	}
 }
 
 // TestAuthoringCommandsReportUsageMistakes keeps an authoring error readable:
@@ -67,8 +78,7 @@ func TestAuthoringCommandsReportUsageMistakes(t *testing.T) {
 		{[]string{"run", "envelope"}, "requires --step"},
 		{[]string{"run", "nonsense"}, "unknown wefty run subcommand"},
 		{[]string{"workflow", "init"}, "usage: wefty workflow init"},
-		{[]string{"workflow", "init", "demo", "--lang", "ts"}, "needs a bundle step"},
-		{[]string{"workflow", "init", "demo", "--lang", "perl"}, "is not bash"},
+		{[]string{"workflow", "init", "demo", "--lang", "perl"}, "use bash or ts"},
 		{[]string{"workflow", "init", "9lives"}, "must start with a letter"},
 	}
 	for _, test := range cases {

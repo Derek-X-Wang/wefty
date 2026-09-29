@@ -24,14 +24,49 @@ var readmeTemplate string
 //go:embed templates/integration_test.go.tmpl
 var integrationTestTemplate string
 
+//go:embed templates/inline-writer.ts
+var inlineTypeScriptWriter string
+
+//go:embed templates/starter.ts.tmpl
+var typeScriptStarterTemplate string
+
+//go:embed templates/README.ts.md.tmpl
+var typeScriptReadmeTemplate string
+
+//go:embed templates/integration_test_ts.go.tmpl
+var typeScriptIntegrationTestTemplate string
+
+//go:embed templates/package.json.tmpl
+var packageJSONTemplate string
+
+//go:embed templates/package-lock.json.tmpl
+var packageLockTemplate string
+
+//go:embed templates/tsconfig.json
+var tsconfigTemplate string
+
+//go:embed templates/gitignore
+var typeScriptGitignore string
+
+// The languages the scaffold writes. bash is the default; ts is the dogfood
+// shape -- src/NAME.ts bundled by esbuild into one dist/NAME.mjs, which is what
+// gets submitted.
+const (
+	LanguageBash       = "bash"
+	LanguageTypeScript = "ts"
+)
+
 // WorkflowUsage is the scaffold's whole surface.
-const WorkflowUsage = `Usage: wefty workflow init NAME [--lang bash] [--dir DIR]
+const WorkflowUsage = `Usage: wefty workflow init NAME [--lang bash|ts] [--dir DIR]
 
 Write a runnable workflow starter that reports through the run mailbox: one
 step, one envelope, one gate and one result, plus a README and a test that
 exercises it without a cluster.
 
-  --lang bash      the starter's language; bash is the only one for now
+  --lang bash      a bash script, submitted as it is (the default)
+  --lang ts        TypeScript: src/NAME.ts plus a package.json whose
+                   npm run build bundles it into dist/NAME.mjs, which is
+                   what gets submitted (Node.js 22.7 or later)
   --dir DIR        the parent directory (default: workflows)
   --json           print the written paths as JSON
 `
@@ -42,11 +77,19 @@ exercises it without a cluster.
 // wefty binary must not become a second, subtly different protocol.
 func InlineBashWriter() string { return inlineWriter }
 
+// InlineTypeScriptWriter is the writer the TypeScript scaffold inlines into
+// src/NAME.ts, verbatim. It is exported for the same reason as the bash one:
+// the conformance test runs it and proves it writes the bytes `wefty run`
+// writes, so a TypeScript workflow is not a second protocol either.
+func InlineTypeScriptWriter() string { return inlineTypeScriptWriter }
+
 // scaffold is what every template is rendered against.
 type scaffold struct {
 	Name       string
 	ScriptName string
 	TestFile   string
+	// PackageName is Name as an npm package name, which must be lowercase.
+	PackageName string
 	// GoPackage and TestPrefix are the sanitized forms of Name: a workflow may
 	// be called branch-gates, a Go package may not.
 	GoPackage    string
@@ -82,29 +125,22 @@ func ExecuteWorkflow(args []string, jsonOutput bool, stdout io.Writer) error {
 
 func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 	flags := newFlagSet("init")
-	lang := flags.String("lang", "bash", "the starter's language; bash is the only one for now")
+	lang := flags.String("lang", LanguageBash, "the starter's language: bash or ts")
 	directory := flags.String("dir", "workflows", "the parent directory to write the workflow into")
 	flags.BoolVar(&jsonOutput, "json", jsonOutput, "print the written paths as JSON")
 	name, err := parseWithPositional(flags, args, false)
 	if err != nil {
-		return UsageError("usage: wefty workflow init NAME [--lang bash] [--dir DIR]")
+		return UsageError("usage: wefty workflow init NAME [--lang bash|ts] [--dir DIR]")
 	}
 	if err := validWorkflowName(name); err != nil {
 		return err
 	}
-	if *lang != "bash" {
-		// A TypeScript starter needs a bundle step, and this scaffold has no
-		// place to put one. A submission carries one inline script, which the
-		// node materializes as a file with no extension, and every TypeScript
-		// runtime decides whether to strip types from that extension. The lane
-		// that works is the dogfood shape -- src/NAME.ts plus a package.json,
-		// bundled to a single dist/NAME.mjs and submitted -- and that is
-		// #487, not something to fake here.
-		if *lang == "ts" || *lang == "typescript" {
-			return UsageError(
-				"--lang ts is not available: a TypeScript workflow needs a bundle step -- src/NAME.ts and a package.json bundled to one dist/NAME.mjs, which is what gets submitted -- and that lane is #487. The scaffold writes bash")
-		}
-		return UsageError(fmt.Sprintf("--lang %q is not bash; bash is the only language the scaffold writes", *lang))
+	language := *lang
+	if language == "typescript" {
+		language = LanguageTypeScript
+	}
+	if language != LanguageBash && language != LanguageTypeScript {
+		return UsageError(fmt.Sprintf("--lang %q is not one the scaffold writes; use bash or ts", *lang))
 	}
 	target := filepath.Join(*directory, name)
 	if _, err := os.Stat(target); err == nil {
@@ -112,29 +148,55 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 	}
 
 	data := scaffold{
-		Name:         name,
-		GoPackage:    goIdentifier(name) + "_test",
-		TestPrefix:   exportedIdentifier(name),
-		InlineWriter: inlineWriter,
+		Name:        name,
+		PackageName: strings.ToLower(name),
+		GoPackage:   goIdentifier(name) + "_test",
+		TestPrefix:  exportedIdentifier(name),
+		TestFile:    goIdentifier(name) + "_integration_test.go",
 	}
-	data.TestFile = goIdentifier(name) + "_integration_test.go"
-	data.ScriptName = name + ".sh"
+	var files []scaffoldFile
+	var submit string
+	switch language {
+	case LanguageTypeScript:
+		// The source is not what gets submitted. A submission carries one
+		// inline script, which the node materializes as a file with no
+		// extension (runner/process), and no TypeScript runtime strips types
+		// from that. So the starter is the dogfood shape: src/NAME.ts bundled
+		// by the author's own `npm run build` into one dist/NAME.mjs.
+		data.InlineWriter = inlineTypeScriptWriter
+		data.ScriptName = filepath.Join("dist", name+".mjs")
+		files = []scaffoldFile{
+			{filepath.Join("src", name+".ts"), typeScriptStarterTemplate, 0o644},
+			{"package.json", packageJSONTemplate, 0o644},
+			{"package-lock.json", packageLockTemplate, 0o644},
+			{"tsconfig.json", tsconfigTemplate, 0o644},
+			{".gitignore", typeScriptGitignore, 0o644},
+			{"README.md", typeScriptReadmeTemplate, 0o644},
+			{data.TestFile, typeScriptIntegrationTestTemplate, 0o644},
+		}
+		submit = fmt.Sprintf("build it, then submit the bundle:\n  (cd %s && npm ci && npm run build)\n  wefty --json submit --script=%s --interpreter=node --required-envelope --tag=<routing-tag>\n",
+			target, filepath.Join(target, data.ScriptName))
+	default:
+		data.InlineWriter = inlineWriter
+		data.ScriptName = name + ".sh"
+		files = []scaffoldFile{
+			{data.ScriptName, bashStarterTemplate, 0o755},
+			{"README.md", readmeTemplate, 0o644},
+			{data.TestFile, integrationTestTemplate, 0o644},
+		}
+		submit = fmt.Sprintf("submit with\n  wefty --json submit --script=%s --interpreter=bash --required-envelope --tag=<routing-tag>\n",
+			filepath.Join(target, data.ScriptName))
+	}
 
-	files := []scaffoldFile{
-		{data.ScriptName, bashStarterTemplate, 0o755},
-		{"README.md", readmeTemplate, 0o644},
-		{data.TestFile, integrationTestTemplate, 0o644},
-	}
-
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", target, err)
-	}
 	written := make([]string, 0, len(files))
 	for _, file := range files {
 		path := filepath.Join(target, file.name)
 		rendered, err := render(file.name, file.template, data)
 		if err != nil {
 			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 		}
 		if err := os.WriteFile(path, rendered, file.mode); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
@@ -147,7 +209,7 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 			Workflow string   `json:"workflow"`
 			Language string   `json:"language"`
 			Files    []string `json:"files"`
-		}{Workflow: name, Language: *lang, Files: written})
+		}{Workflow: name, Language: language, Files: written})
 		if err != nil {
 			return err
 		}
@@ -159,9 +221,7 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(stdout,
-		"\nNext: read %s, then submit with\n  wefty --json submit --script=%s --interpreter=bash --required-envelope --tag=<routing-tag>\n",
-		filepath.Join(target, "README.md"), filepath.Join(target, data.ScriptName))
+	_, err = fmt.Fprintf(stdout, "\nNext: read %s, then %s", filepath.Join(target, "README.md"), submit)
 	return err
 }
 

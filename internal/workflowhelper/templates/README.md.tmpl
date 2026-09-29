@@ -14,8 +14,8 @@ the cluster, so do not build on this workflow being able to dispatch a child
 run, read another run, or act on any other job.
 
 The protocol is `docs/contracts/run-execution-context.md`, "Run mailbox". The
-mailbox is delivered to process one-shots that L3 dispatched; an OCI attempt
-does not receive one yet.
+mailbox is delivered to every one-shot L3 dispatched, `kind=process` and
+`kind=oci` alike.
 
 ## Files
 

@@ -1,0 +1,66 @@
+// {{.Name}}: a wefty workflow, scaffolded by `wefty workflow init --lang ts`.
+//
+// What this workflow may do
+// -------------------------
+// It reports, and it uses no credential to do it. Everything below writes files
+// into $WEFTY_RUN_DIR, the run mailbox; the node agent, which already holds
+// authority, publishes them to the run ledger. A mailbox write is a claim about
+// this run and nothing else -- it confers no authority over the cluster, so do
+// not build on this workflow being able to dispatch a child run, read another
+// run, or act on any other job.
+//
+// Contract: docs/contracts/run-execution-context.md, "Run mailbox".
+//
+// `npm run build` bundles this file into dist/{{.Name}}.mjs, one self-contained
+// ES module, and that bundle is what gets submitted. A submission carries one
+// inline script, which the node writes to a file with no extension, so the
+// source cannot be submitted as it is: Node would not strip its types, and it
+// could not resolve an import from that file.
+//
+// Replace the "do the work" section. Keep the reporting shape: one step
+// bracketing the work, one envelope per unit of work, one gate carrying the
+// verdict, one result document. Every report* call throws when it cannot
+// report, and an uncaught throw exits non-zero: a workflow that could not
+// report must not exit 0, because an exit code alone is not evidence.
+
+{{.InlineWriter}}
+// --------------------------------------------------------------------------
+// Do the work
+// --------------------------------------------------------------------------
+
+const WORKFLOW = "{{.Name}}";
+
+// The result document. Give it a schema_version so a reader can tell a later
+// shape from this one.
+interface WorkflowResult {
+  schema_version: 1;
+  workflow: string;
+  subject: string;
+  passed: boolean;
+}
+
+function log(message: string): void {
+  console.log(`${WORKFLOW}: ${message}`);
+}
+
+function main(): number {
+  const subject = runParam("subject") || "world";
+  log(`greeting ${subject}`);
+
+  reportStep("work", "started", { summary: `greeting ${subject}` });
+  const detail = `hello, ${subject}\n`;
+  const passed = detail.includes(subject);
+  const status: EnvelopeStatus = passed ? "succeeded" : "failed";
+  const outcome: GateOutcome = passed ? "pass" : "fail";
+  reportEnvelope("work", status, { summary: `greeted ${subject}`, detail });
+  reportStep("work", "ended", { summary: `greeting ${subject}` });
+  reportGate(WORKFLOW, outcome, { summary: `the greeting is ${outcome}` });
+
+  const result: WorkflowResult = { schema_version: 1, workflow: WORKFLOW, subject, passed };
+  reportResult(result, status, { summary: `${WORKFLOW} finished: ${outcome}` });
+
+  log(`done: ${outcome}`);
+  return passed ? 0 : 1;
+}
+
+process.exitCode = main();

@@ -144,6 +144,17 @@ jobs:
       - name: Build and run dogfood contract smoke
         working-directory: workflows/dogfood
         run: npm test
+      # `wefty workflow init NAME --lang ts` end to end on the Node the scaffold
+      # README states: the inline mailbox writer against `wefty run` byte for
+      # byte, then a scaffold built with npm ci/npm test and its bundle
+      # submitted to a real stack. WEFTY_REQUIRE_NODE turns the writer tests'
+      # missing-Node skip into a failure, so this lane cannot go green without
+      # running them.
+      - name: Exercise the TypeScript workflow scaffold
+        env:
+          WEFTY_TS_SCAFFOLD_EXERCISE: "1"
+          WEFTY_REQUIRE_NODE: "1"
+        run: go test ./agent/ ./cmd/wefty/ -run 'TypeScript' -count=1
 
   branch-gates-workflow:
     name: branch-gates-workflow

@@ -11,9 +11,10 @@
 // about the writer's own run and nothing else.
 //
 // The file protocol is the contract; this package is only the recommended
-// producer of it. The inline POSIX writer the scaffold emits for an image
-// without the wefty binary produces byte-identical event files, and
-// TestInlineBashWriterProducesByteIdenticalEvents holds that.
+// producer of it. The inline POSIX writer the bash scaffold emits for an image
+// without the wefty binary produces byte-identical text events, and the
+// inline writer the TypeScript scaffold emits produces byte-identical events
+// of every kind; the conformance tests in agent/ hold both.
 package workflowhelper
 
 import (
@@ -112,9 +113,10 @@ func (e UsageError) Error() string { return string(e) }
 
 // ErrNoRunDir is what every `wefty run` subcommand returns when the job has no
 // mailbox. It names the reason rather than the variable alone, because the
-// common case is a job kind that does not receive one yet.
+// common case is a job that was not dispatched as an L3 run.
 var ErrNoRunDir = errors.New(RunDirEnv + " is not set: this job has no run mailbox to report through. " +
-	"The mailbox is delivered to process one-shots that L3 dispatched; an OCI job does not receive one today. " +
+	"The mailbox is delivered to every one-shot L3 dispatched, kind=process and kind=oci alike; " +
+	"a job submitted straight to L1 does not receive one. " +
 	"See docs/contracts/run-execution-context.md, \"Run mailbox\"")
 
 // Event is one run-mailbox event before it is encoded. Every field is the

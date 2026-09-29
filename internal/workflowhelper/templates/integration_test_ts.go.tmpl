@@ -1,0 +1,119 @@
+//go:build darwin || linux
+
+// Package {{.GoPackage}} exercises dist/{{.Name}}.mjs, the bundle `npm run build`
+// writes, the way the node agent runs it: the bundle runs against a
+// run-mailbox directory and the test reads the event files it wrote.
+//
+// No cluster is involved. That is deliberate — a workflow's reporting is a
+// file protocol (docs/contracts/run-execution-context.md, "Run mailbox"), so
+// the part a workflow author gets wrong is testable without L1, L3 or an
+// agent. `npm test` builds the bundle and then runs this.
+package {{.GoPackage}}
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// Test{{.TestPrefix}}BundleReportsThroughTheRunMailbox runs the bundle against a
+// mailbox directory and asserts it reported a step, an envelope, a gate and a
+// result — the four events an operator reads back with `wefty inspect`.
+func Test{{.TestPrefix}}BundleReportsThroughTheRunMailbox(t *testing.T) {
+	bundle, err := os.ReadFile(filepath.Join("dist", "{{.Name}}.mjs"))
+	if os.IsNotExist(err) {
+		t.Skip("run npm test: it bundles src/{{.Name}}.ts into dist/{{.Name}}.mjs before running this")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Fatalf("node is required to run the bundle: %v", err)
+	}
+
+	// The node writes a submitted script to a file with no extension and runs
+	// the interpreter on it. Running the bundle the same way means a bundle
+	// that only works under its .mjs name fails here, not on the cluster.
+	workflow := filepath.Join(t.TempDir(), "workflow")
+	if err := os.WriteFile(workflow, bundle, 0o700); err != nil {
+		t.Fatalf("materialize the bundle: %v", err)
+	}
+	runDir := t.TempDir()
+	handoffDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runDir, "params.json"), []byte(`{"subject":"wefty"}`), 0o600); err != nil {
+		t.Fatalf("write params.json: %v", err)
+	}
+
+	command := exec.Command(nodePath, workflow)
+	command.Env = append(os.Environ(),
+		"WEFTY_RUN_DIR="+runDir,
+		"WEFTY_HANDOFF_DIR="+handoffDir,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run the {{.Name}} bundle: %v\n%s", err, output)
+	}
+
+	kinds := eventKinds(t, filepath.Join(runDir, "events"))
+	want := []string{"envelope", "gate", "result", "step", "step"}
+	if strings.Join(kinds, ",") != strings.Join(want, ",") {
+		t.Fatalf("events %v, want %v\n%s", kinds, want, output)
+	}
+	raw, err := os.ReadFile(filepath.Join(handoffDir, "result.json"))
+	if err != nil {
+		t.Fatalf("the workflow left no result.json in the handoff directory: %v", err)
+	}
+	var result struct {
+		Subject string `json:"subject"`
+		Passed  bool   `json:"passed"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("result.json is not a JSON document: %v\n%s", err, raw)
+	}
+	// The workflow read its params rather than guessing.
+	if result.Subject != "wefty" || !result.Passed {
+		t.Fatalf("result.json is %s, want the submitted subject and a pass", raw)
+	}
+}
+
+// eventKinds reads every published event, checks it is a well-formed protocol
+// document, and returns the kinds in sorted order.
+func eventKinds(t *testing.T, events string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(events)
+	if err != nil {
+		t.Fatalf("read %s: %v", events, err)
+	}
+	kinds := []string{}
+	for _, entry := range entries {
+		raw, err := os.ReadFile(filepath.Join(events, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		document := string(raw)
+		if !strings.HasPrefix(document, "wefty-protocol: 1\n") {
+			t.Fatalf("%s does not start with the protocol header:\n%s", entry.Name(), document)
+		}
+		headers, _, separated := strings.Cut(document, "\n--\n")
+		if !separated {
+			t.Fatalf("%s has no payload separator:\n%s", entry.Name(), document)
+		}
+		kind := ""
+		for _, line := range strings.Split(headers, "\n") {
+			if value, found := strings.CutPrefix(line, "kind: "); found {
+				kind = value
+			}
+		}
+		if kind == "" {
+			t.Fatalf("%s carries no kind:\n%s", entry.Name(), document)
+		}
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}

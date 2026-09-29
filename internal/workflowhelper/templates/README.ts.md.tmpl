@@ -1,0 +1,116 @@
+# {{.Name}}
+
+A TypeScript wefty workflow scaffolded by `wefty workflow init {{.Name}} --lang ts`.
+It greets a subject, reports one step, one envelope and one gate, and hands
+back a result document. Replace the work; keep the reporting shape.
+
+## What this workflow may do
+
+It reports, and it uses no credential to do it. Reporting goes through the
+**run mailbox** — files written into `$WEFTY_RUN_DIR`, which the node agent
+publishes to the run ledger with the credential it already holds. A mailbox
+write is a claim about this run and nothing else: it confers no authority over
+the cluster, so do not build on this workflow being able to dispatch a child
+run, read another run, or act on any other job.
+
+The protocol is `docs/contracts/run-execution-context.md`, "Run mailbox". The
+mailbox is delivered to every one-shot L3 dispatched, `kind=process` and
+`kind=oci` alike.
+
+## Node version
+
+**Node.js 22.7 or later**, both where you build and on the node that runs the
+workflow. The bundle targets `node22`, and the node runs it as a file with no
+extension: Node reads that file as an ES module only because of module syntax
+detection, which is on by default from 22.7. An older Node fails with
+`SyntaxError: Cannot use import statement outside a module`.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `src/{{.Name}}.ts` | the workflow, including an inline run-mailbox writer |
+| `package.json` | the build: esbuild bundles `src/{{.Name}}.ts` to `dist/{{.Name}}.mjs` |
+| `package-lock.json` | the pinned toolchain (esbuild, TypeScript, Node types) |
+| `tsconfig.json` | strict type checking; `npm run typecheck` |
+| `{{.TestFile}}` | runs the built bundle the way a node does and asserts the four events |
+
+The workflow depends on no package at run time. The writer at the top of
+`src/{{.Name}}.ts` writes the same event bytes as `wefty run`, which wefty's
+conformance tests hold, so the workflow reports the same way whether or not
+the image it runs in ships the `wefty` binary. It refuses what the agent would
+refuse, creates each event file exclusively with mode 0600 and flushes it
+before the rename. The one thing it cannot do that `wefty run` does is resolve
+every path under a single opened directory, so a directory swapped inside the
+mailbox between its check and its write is not caught; the exact limits are
+documented above the writer.
+
+One ordering limit applies to every producer: the agent publishes a sweep in
+the lexical order of the event file names, and a name carries a nanosecond
+stamp plus a per-process sequence. Node's clock reads milliseconds, so this
+writer forces its own stamps to increase. Sequential reporting from this
+process is ordered; two concurrent writers are not.
+
+## Build
+
+The build step is yours: a submission carries one inline script, so the
+workflow is bundled into one self-contained file before it is submitted.
+
+```sh
+npm ci
+npm run build        # dist/{{.Name}}.mjs
+npm test             # typecheck, build, then go test (below)
+```
+
+Rebuild after every change to `src/`: the cluster runs the bundle, not the
+source.
+
+## Run it
+
+Submit the built bundle, follow it, then read what it reported:
+
+```sh
+wefty --json submit \
+  --script=dist/{{.Name}}.mjs \
+  --interpreter=node \
+  --params-file=params.json \
+  --tag=<routing-tag> \
+  --required-envelope \
+  --idempotency-key=<stable-unique-key>
+
+wefty logs <run_id> --follow      # wait for it, live
+wefty --json inspect <run_id>     # the envelopes, gates and lineage it produced
+wefty results <run_id>            # the result document
+```
+
+`--interpreter=node` is resolved on the node's `PATH`, so the node needs Node.js
+22.7 or later installed. `--required-envelope` is not optional advice: without
+it a job that exits 0 having reported nothing still looks like a success, which
+is the one failure this whole reporting shape exists to prevent.
+
+`params.json` is an ordinary JSON object; this starter reads `subject`:
+
+```json
+{"subject": "wefty"}
+```
+
+A job never receives its own params in the environment. The agent delivers them
+to `$WEFTY_RUN_DIR/params.json`, which is what `runParam("subject")` reads.
+
+## Local exercise
+
+The workflow does not need a cluster to be exercised: point `WEFTY_RUN_DIR` at
+an empty directory, run the bundle, then read `events/`.
+
+```sh
+npm run build
+export WEFTY_RUN_DIR=$(mktemp -d)
+export WEFTY_HANDOFF_DIR=$(mktemp -d)
+node dist/{{.Name}}.mjs
+ls "$WEFTY_RUN_DIR/events"
+```
+
+`{{.TestFile}}` does exactly that, from a copy of the bundle written without an
+extension the way the node writes it. `npm test` runs it with `go test`, which
+needs the workflow to sit inside a Go module — in the wefty repository it
+does.

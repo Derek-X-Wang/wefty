@@ -466,7 +466,11 @@ event this section would reject, writes each file exclusively through an opened
 mailbox root, and flushes it before the rename. `wefty workflow init NAME`
 scaffolds a starter that uses it, and, for the image that does not ship the
 binary, an inline POSIX writer that is parser-compatible but neither hardened
-nor durable; prefer the CLI wherever the binary exists.
+nor durable; prefer the CLI wherever the binary exists. `wefty workflow init
+NAME --lang ts` scaffolds a TypeScript starter with its own inline writer,
+which writes the same bytes as the CLI, refuses the same events and flushes
+before the rename, but checks the mailbox directories by path rather than
+through an opened root.
 
 Publication order within a sweep is the file name's, and a producer that writes
 two events at the same clock reading has no way to order them: names carry a
