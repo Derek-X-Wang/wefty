@@ -157,6 +157,10 @@ func expectedOCICgroupLimits(t *testing.T) (memory, quota int64, period uint64) 
 		t.Fatalf("the runtime profile sets no CPU quota for %d millicores: %+v", ociCgroupLimitsCPUMillicores, resources.CPU)
 	}
 	memory, quota, period = *resources.Memory.Limit, *resources.CPU.Quota, *resources.CPU.Period
+	if memory != ociCgroupLimitsMemoryBytes {
+		t.Fatalf("the runtime profile maps a %d-byte request to a %d-byte limit; the kernel must hold exactly what was asked for",
+			ociCgroupLimitsMemoryBytes, memory)
+	}
 	if pageSize := int64(os.Getpagesize()); memory%pageSize != 0 {
 		t.Fatalf("memory limit %d is not a multiple of the %d-byte page; the kernel would round memory.max down", memory, pageSize)
 	}
