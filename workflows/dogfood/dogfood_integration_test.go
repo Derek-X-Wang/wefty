@@ -54,7 +54,11 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l1Store.Close()
+	// The stores, and the agent below, close in cleanups registered before
+	// the one that stops the servers. Cleanups run last-in first-out and only
+	// after every defer, so a deferred close would shut the database under a
+	// still-serving L1 whose next reconcile tick then fails the server.
+	t.Cleanup(func() { _ = l1Store.Close() })
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"dogfood-node": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"dogfood-node"),
 	}})
@@ -70,7 +74,7 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l3Store.Close()
+	t.Cleanup(func() { _ = l3Store.Close() })
 	ledgerL1Client, err := l3.NewL1Client(ledgerFabric, l3.DefaultL1Address)
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +118,7 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 		cancel()
 		t.Fatal(err)
 	}
-	defer nodeAgent.Close()
+	t.Cleanup(nodeAgent.Close)
 	agentDone := serve(ctx, func() error { return nodeAgent.Run(ctx) })
 	t.Cleanup(func() {
 		cancel()
