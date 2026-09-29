@@ -25,8 +25,8 @@ grep -Fq 'runc 1.5.1 already satisfies' <<<"$rerun_linux" || fail "rerun did not
 grep -Fq 'preserve packaged containerd unit at /usr/lib/systemd/system/containerd.service' <<<"$rerun_linux" || fail "distro unit was not preserved"
 grep -Fq '1. sudo wefty node setup-oci' <<<"$rerun_linux" || fail "Linux next-command order is wrong"
 
-rerun_tested_linux="$(run_case rerun-tested-linux 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=debian WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=13 WEFTY_OCI_INSTALL_TEST_ARCH=amd64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION=2.3.5 WEFTY_OCI_INSTALL_TEST_RUNC_VERSION=1.5.1 WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=/usr/lib/systemd/system/containerd.service)"
-grep -Fq 'containerd 2.3.5 already satisfies' <<<"$rerun_tested_linux" || fail "rerun did not preserve tested containerd"
+rerun_tested_linux="$(run_case rerun-tested-linux 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=debian WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=13 WEFTY_OCI_INSTALL_TEST_ARCH=amd64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION=2.3.6 WEFTY_OCI_INSTALL_TEST_RUNC_VERSION=1.5.1 WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=/usr/lib/systemd/system/containerd.service)"
+grep -Fq 'containerd 2.3.6 already satisfies' <<<"$rerun_tested_linux" || fail "rerun did not preserve tested containerd"
 grep -Fq 'runc 1.5.1 already satisfies' <<<"$rerun_tested_linux" || fail "tested rerun did not preserve runc"
 grep -Fq 'preserve packaged containerd unit at /usr/lib/systemd/system/containerd.service' <<<"$rerun_tested_linux" || fail "tested rerun did not preserve distro unit"
 
@@ -38,11 +38,11 @@ grep -Fq 'below the supported minimum 2.0.0' <<<"$below_minimum" || fail "below-
 
 supported_linux="$(run_case supported-linux 0 WEFTY_OCI_INSTALL_TEST_PLATFORM=linux WEFTY_OCI_INSTALL_TEST_DISTRO_ID=fedora WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION=44 WEFTY_OCI_INSTALL_TEST_ARCH=arm64 WEFTY_OCI_INSTALL_TEST_OVERLAYFS=yes WEFTY_OCI_INSTALL_TEST_CONTAINERD_VERSION= WEFTY_OCI_INSTALL_TEST_RUNC_VERSION= WEFTY_OCI_INSTALL_TEST_PACKAGED_UNIT=none)"
 for expected in \
-  'containerd-2.3.5-linux-arm64.tar.gz' \
-  '/usr/local/lib/wefty/oci-runtime/containerd-2.3.5' \
+  'containerd-2.3.6-linux-arm64.tar.gz' \
+  '/usr/local/lib/wefty/oci-runtime/containerd-2.3.6' \
   '/usr/local/lib/wefty/oci-runtime/runc-1.5.1/runc' \
   'root:root 0644' \
-  'ExecStart=/usr/local/lib/wefty/oci-runtime/containerd-2.3.5/bin/containerd; Type=notify; Restart=always' \
+  'ExecStart=/usr/local/lib/wefty/oci-runtime/containerd-2.3.6/bin/containerd; Type=notify; Restart=always' \
   'No services were started'; do
   grep -Fq "$expected" <<<"$supported_linux" || fail "supported Linux plan omitted $expected"
 done
