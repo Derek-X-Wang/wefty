@@ -2300,11 +2300,14 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	job, err := s.store.CompleteAttempt(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	job, replayed, err := s.store.CompleteAttemptWithReplay(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	// A replay still re-drives the Computer revocation: it is the only retry
+	// of a revocation that failed after the completion committed (#548), and
+	// revoking a terminal attempt's Computer authority again only narrows it.
 	if computerID, lookupErr := s.store.ComputerIDForJob(r.Context(), job.JobID); lookupErr != nil {
 		writeError(w, lookupErr)
 		return
@@ -2313,6 +2316,9 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, revokeErr)
 			return
 		}
+	}
+	if replayed {
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, redactJob(job))
 }

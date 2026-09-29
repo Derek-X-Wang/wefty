@@ -3572,59 +3572,67 @@ func decodeLogCursor(cursor string) (int64, error) {
 }
 
 func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, attemptID string, request CompletionRequest) (Job, error) {
+	job, _, err := s.CompleteAttemptWithReplay(ctx, identityNodeID, jobID, attemptID, request)
+	return job, err
+}
+
+// CompleteAttemptWithReplay additionally reports whether the call was an
+// identical replay of the completion this attempt already recorded, which
+// writes nothing.
+func (s *Store) CompleteAttemptWithReplay(ctx context.Context, identityNodeID, jobID, attemptID string, request CompletionRequest) (Job, bool, error) {
 	if request.FencingToken == "" || request.IdempotencyKey == "" {
-		return Job{}, protocolError(contract.ErrorInvalidRequest, "fencing_token and idempotency_key are required")
+		return Job{}, false, protocolError(contract.ErrorInvalidRequest, "fencing_token and idempotency_key are required")
 	}
 	if err := validateProcessResult(request.Result); err != nil {
-		return Job{}, err
+		return Job{}, false, err
 	}
 	if request.RuntimeQuiescenceEvidence != "" && !validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence) {
-		return Job{}, protocolError(contract.ErrorInvalidRequest, "runtime_quiescence_evidence is not recognized")
+		return Job{}, false, protocolError(contract.ErrorInvalidRequest, "runtime_quiescence_evidence is not recognized")
 	}
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
-		return Job{}, internalError(err, "encode completion")
+		return Job{}, false, internalError(err, "encode completion")
 	}
 	hash := sha256.Sum256(requestJSON)
 	completionHash := hex.EncodeToString(hash[:])
 	resultJSON, err := json.Marshal(request.Result)
 	if err != nil {
-		return Job{}, internalError(err, "encode process result")
+		return Job{}, false, internalError(err, "encode process result")
 	}
 	lastFailureJSON := resultJSON
 	if request.Result.SpawnError != nil {
 		lastFailureJSON, err = json.Marshal(request.Result.SpawnError)
 		if err != nil {
-			return Job{}, internalError(err, "encode service spawn failure")
+			return Job{}, false, internalError(err, "encode service spawn failure")
 		}
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Job{}, internalError(err, "begin completion")
+		return Job{}, false, internalError(err, "begin completion")
 	}
 	defer tx.Rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
-		return Job{}, err
+		return Job{}, false, err
 	}
 	var removalExists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM service_removals WHERE job_id=?)`, jobID).Scan(&removalExists); err != nil {
-		return Job{}, internalError(err, "read service removal before completion")
+		return Job{}, false, internalError(err, "read service removal before completion")
 	}
 	if removalExists {
-		return Job{}, protocolError(contract.ErrorConflict, "service removal has revoked completion authority")
+		return Job{}, false, protocolError(contract.ErrorConflict, "service removal has revoked completion authority")
 	}
 	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
-		return Job{}, err
+		return Job{}, false, err
 	}
 	if err := validateOCICompletionPhase(attempt, request.Result); err != nil {
-		return Job{}, err
+		return Job{}, false, err
 	}
 	now := canonicalTime(s.clock.Now())
 	if !now.Before(attempt.leaseExpires) && attempt.state != contract.AttemptLost {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
-			return Job{}, err
+			return Job{}, false, err
 		}
 		if attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput {
 			attempt.state = contract.AttemptLost
@@ -3633,19 +3641,28 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	}
 	if attempt.completionKey.Valid {
 		if attempt.completionKey.String != request.IdempotencyKey || attempt.completionHash.String != completionHash {
-			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "completion idempotency key or body conflicts with the accepted completion")
+			return Job{}, false, protocolError(contract.ErrorIdempotencyConflict, "completion idempotency key or body conflicts with the accepted completion")
 		}
 		if attempt.state == contract.AttemptLost {
-			return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+			return Job{}, false, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 		}
-		if err := validateCompletionReplayAuthority(attemptID, attempt); err != nil {
-			return Job{}, err
+		// An identical replay of the completion this attempt recorded. The
+		// caller already proved above that it is the Fabric identity bound to
+		// the attempt's stable node and holds the attempt's fence, and the
+		// hash proves every request byte matches what that node's then-current
+		// registration had accepted. Nothing is written (the transaction is
+		// never committed), so the registration that has since replaced the
+		// one that claimed the attempt is not consulted: node registration only
+		// advances, and fencing a replay against it only strands the node's
+		// spooled copy of a completion L1 already holds (#553).
+		if err := validateCompletionReplayBinding(attemptID, attempt); err != nil {
+			return Job{}, false, err
 		}
 		job, err := getJobByID(ctx, tx, jobID, now)
 		if err != nil {
-			return Job{}, internalError(err, "read completed job replay")
+			return Job{}, false, internalError(err, "read completed job replay")
 		}
-		return job, nil
+		return job, true, nil
 	}
 	if attempt.state == contract.AttemptLost {
 		lateEvidence := LateResultEvidence{
@@ -3659,44 +3676,44 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		}
 		lateResultJSON, err := json.Marshal(lateEvidence)
 		if err != nil {
-			return Job{}, internalError(err, "encode late result evidence")
+			return Job{}, false, internalError(err, "encode late result evidence")
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE attempts SET completion_key=?, completion_hash=?, late_result_json=?,
 			late_result_observed_ns=?, late_result_authority_lost_ns=?, late_result_is_late=1 WHERE attempt_id=?`,
 			request.IdempotencyKey, completionHash, lateResultJSON, now.UnixNano(), attempt.updatedAt.UnixNano(), attemptID)
 		if err != nil {
-			return Job{}, internalError(err, "record late completion evidence")
+			return Job{}, false, internalError(err, "record late completion evidence")
 		}
 		if err := tx.Commit(); err != nil {
-			return Job{}, internalError(err, "commit late completion evidence")
+			return Job{}, false, internalError(err, "commit late completion evidence")
 		}
-		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+		return Job{}, false, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
-		return Job{}, err
+		return Job{}, false, err
 	}
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
-			return Job{}, err
+			return Job{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
-			return Job{}, internalError(err, "commit completion lease expiry")
+			return Job{}, false, internalError(err, "commit completion lease expiry")
 		}
-		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+		return Job{}, false, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
 	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
-		return Job{}, protocolError(contract.ErrorConflict, "attempt is terminal")
+		return Job{}, false, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
 
 	jobBeforeCompletion, err := getJobByID(ctx, tx, jobID, now)
 	if err != nil {
-		return Job{}, internalError(err, "read completing job policy")
+		return Job{}, false, internalError(err, "read completing job policy")
 	}
 	runtimeResourceFailure := terminalResourceFailure(jobBeforeCompletion, request.Result, attempt.nodeID)
 	if runtimeResourceFailure != nil {
 		lastFailureJSON, err = json.Marshal(runtimeResourceFailure)
 		if err != nil {
-			return Job{}, internalError(err, "encode runtime resource failure")
+			return Job{}, false, internalError(err, "encode runtime resource failure")
 		}
 	}
 	finalJobState, finalAttemptState := completionStates(request.Result)
@@ -3715,7 +3732,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		var deadlineNS sql.NullInt64
 		if err := tx.QueryRowContext(ctx, `SELECT prestart_retry_count, prestart_budget_deadline_ns FROM jobs WHERE job_id=?`, jobID).
 			Scan(&retryCount, &deadlineNS); err != nil {
-			return Job{}, internalError(err, "read pre-start retry budget")
+			return Job{}, false, internalError(err, "read pre-start retry budget")
 		}
 		retryCount++
 		delay := prestartRetryDelay(retryCount, s.restartJitter)
@@ -3723,28 +3740,28 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 			finalJobState = contract.JobQueued
 			nextRetryNS := now.Add(delay).UnixNano()
 			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET prestart_retry_count=?, prestart_next_retry_at_ns=? WHERE job_id=?`, retryCount, nextRetryNS, jobID); err != nil {
-				return Job{}, internalError(err, "persist pre-start retry backoff")
+				return Job{}, false, internalError(err, "persist pre-start retry backoff")
 			}
 		} else if _, err := tx.ExecContext(ctx, `UPDATE jobs SET prestart_retry_count=?, prestart_next_retry_at_ns=NULL,
 			prestart_terminal_reason=? WHERE job_id=?`, retryCount,
 			"pre-start infrastructure budget exhausted after runtime loss", jobID); err != nil {
-			return Job{}, internalError(err, "persist exhausted pre-start retry budget")
+			return Job{}, false, internalError(err, "persist exhausted pre-start retry budget")
 		}
 	}
 	// Successful completion passes through running inside the same transaction
 	// so it respects the M0 state table without exposing an extra protocol verb.
 	if finalAttemptState == contract.AttemptSucceeded && attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=? WHERE attempt_id=?", contract.AttemptRunning, attemptID); err != nil {
-			return Job{}, internalError(err, "acknowledge attempt execution")
+			return Job{}, false, internalError(err, "acknowledge attempt execution")
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=? WHERE job_id=?", contract.JobRunning, jobID); err != nil {
-			return Job{}, internalError(err, "acknowledge job execution")
+			return Job{}, false, internalError(err, "acknowledge job execution")
 		}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, result_json=?, updated_ns=? WHERE attempt_id=?`,
 		finalAttemptState, request.IdempotencyKey, completionHash, resultJSON, now.UnixNano(), attemptID)
 	if err != nil {
-		return Job{}, internalError(err, "complete attempt")
+		return Job{}, false, internalError(err, "complete attempt")
 	}
 	jobUpdate := "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?"
 	jobUpdateArgs := []any{finalJobState, now.UnixNano(), jobID}
@@ -3761,7 +3778,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	}
 	_, err = tx.ExecContext(ctx, jobUpdate, jobUpdateArgs...)
 	if err != nil {
-		return Job{}, internalError(err, "complete job")
+		return Job{}, false, internalError(err, "complete job")
 	}
 	if servicePolicy != nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
@@ -3770,12 +3787,12 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 				healthy_since_ns=NULL, published_attempt_id=NULL
 			WHERE job_id=?`, servicePolicy.restartStreak, servicePolicy.lifetimeRestartCount,
 			servicePolicy.nextRestartNS, servicePolicy.updateLastFailure, servicePolicy.lastFailure, jobID); err != nil {
-			return Job{}, internalError(err, "apply service completion policy")
+			return Job{}, false, internalError(err, "apply service completion policy")
 		}
 	}
 	if request.Result.SpawnError != nil && request.Result.SpawnError.Code == contract.SpawnFailurePublishedPortOccupied {
 		if err := recordPublishedPortOccupied(ctx, tx, jobID, attempt.nodeID, *request.Result.SpawnError); err != nil {
-			return Job{}, err
+			return Job{}, false, err
 		}
 	}
 	if request.Result.SpawnError != nil && (request.Result.SpawnError.Code == contract.SpawnFailureInsufficientMemory ||
@@ -3784,28 +3801,28 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		failure.NodeID = attempt.nodeID
 		lastFailure, marshalErr := json.Marshal(failure)
 		if marshalErr != nil {
-			return Job{}, internalError(marshalErr, "encode insufficient resource failure")
+			return Job{}, false, internalError(marshalErr, "encode insufficient resource failure")
 		}
 		if _, updateErr := tx.ExecContext(ctx, `UPDATE service_jobs SET last_failure=?, next_restart_at=NULL WHERE job_id=?`, lastFailure, jobID); updateErr != nil {
-			return Job{}, internalError(updateErr, "record insufficient resource failure")
+			return Job{}, false, internalError(updateErr, "record insufficient resource failure")
 		}
 	}
 	if runtimeResourceFailure != nil {
 		if _, updateErr := tx.ExecContext(ctx, `UPDATE service_jobs SET last_failure=?, next_restart_at=NULL WHERE job_id=?`, lastFailureJSON, jobID); updateErr != nil {
-			return Job{}, internalError(updateErr, "record runtime resource failure")
+			return Job{}, false, internalError(updateErr, "record runtime resource failure")
 		}
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
-		return Job{}, err
+		return Job{}, false, err
 	}
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if err != nil {
-		return Job{}, internalError(err, "read completed job")
+		return Job{}, false, internalError(err, "read completed job")
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, internalError(err, "commit completion")
+		return Job{}, false, internalError(err, "commit completion")
 	}
-	return job, nil
+	return job, false, nil
 }
 
 func recordPublishedPortOccupied(
@@ -3935,10 +3952,12 @@ func validateAttemptEvidence(identityNodeID, jobID, attemptID, fencingToken stri
 	return nil
 }
 
-func validateCompletionReplayAuthority(attemptID string, a attemptAuthority) error {
-	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
-		return protocolError(contract.ErrorNodeSessionReplaced, "attempt authority belongs to a replaced node registration")
-	}
+// validateCompletionReplayBinding checks that the job still binds attemptID
+// for completion replay. It deliberately does not check the node's current
+// registration: it gates only an identical replay, which writes nothing, and a
+// completion accepted under one registration stays accepted under the next.
+// Identity, path, and fence are checked by validateAttemptEvidence first.
+func validateCompletionReplayBinding(attemptID string, a attemptAuthority) error {
 	if a.currentAttempt.Valid && a.currentAttempt.String != attemptID {
 		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
 	}
