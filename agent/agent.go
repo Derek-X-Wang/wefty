@@ -432,6 +432,7 @@ func New(config Config) (*Agent, error) {
 	session.backups = newBackupController(client, outbox, computerBackupper, config.NodeID, config.BootSessionID,
 		registration.RootInstanceID, logf)
 	if session.backups != nil {
+		session.backups.now = clock.Now
 		session.removals.removeBackupCopies = func(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {
 			for _, directive := range directives {
 				if err := session.backups.processPrune(ctx, directive); err != nil {

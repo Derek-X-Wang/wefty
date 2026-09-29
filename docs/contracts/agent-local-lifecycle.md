@@ -101,7 +101,11 @@ has stopped the current Job. The agent passes the exact Computer revision and
 `storage_id@generation` to the helper; it never fabricates a resume. The helper
 holds the Storage attachment fence while proving mount and loop absence,
 copying, and digesting. Only helper-derived success or positive-absence failure
-receipts reach L1. Prune removes only the deterministic Wefty-owned copy root
+receipts reach L1. A create that ends in an error instead of a receipt is
+retried on its own per-copy backoff -- the first retry one default heartbeat
+later, doubling to a five-minute ceiling -- so neither the heartbeat nor an OCI
+recovery pass redispatches it faster; a receipt of either kind clears it
+(#558). Prune removes only the deterministic Wefty-owned copy root
 and likewise requires a positive absence receipt. Composite Computer removal
 executes these copy directives before managed-root and disk cleanup, so a
 superseded staged copy cannot be stranded outside L1 tracking.

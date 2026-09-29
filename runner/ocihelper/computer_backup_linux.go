@@ -52,6 +52,19 @@ type computerBackupSupersession struct {
 	L1OperationState  string                   `json:"l1_operation_state"`
 }
 
+// computerBackupFailureSourceNeverDetached is the failure receipt code for a
+// Backup of a Storage generation no consumer has ever detached from -- a
+// clone, restore, or import that has never started. A cold Backup copies only
+// a generation whose exact detach receipt names the prior Job; this one has no
+// detach receipt at all, so there is nothing detached to copy. That is a
+// precondition of this one Backup, not a fault of the helper: answering it as
+// an engine failure let the agent read it as runtime loss, tear the exclusive
+// session down, and redispatch it, which took every running neighbour's
+// attempt with it (#558).
+const computerBackupFailureSourceNeverDetached = "source_never_detached"
+
+var errComputerBackupSourceNeverDetached = errors.New("Computer Backup source generation has never been detached")
+
 func (engine *ContainerdEngine) computerBackupCheckpoint(checkpoint computerBackupCheckpoint) error {
 	if engine.computerBackupHook == nil {
 		return nil
@@ -124,6 +137,12 @@ func (engine *ContainerdEngine) lockDetachedBackupSource(ctx context.Context, st
 	if err != nil {
 		release()
 		return "", nil, err
+	}
+	if present && sameComputerStorageIdentity(manifest.Storage, storage) && manifest.DiskImage == "disk.ext4" &&
+		manifest.MountDirectory == name && manifest.Attached == nil && manifest.Pending == nil &&
+		manifest.Retirement == nil && manifest.PreviousDetachment == nil {
+		release()
+		return "", nil, errComputerBackupSourceNeverDetached
 	}
 	if !present || !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.DiskImage != "disk.ext4" ||
 		manifest.MountDirectory != name || manifest.Attached != nil || manifest.Pending != nil || manifest.Retirement != nil ||
@@ -370,8 +389,30 @@ func backupFailureReceipt(request CreateComputerBackupRequest, helperGeneration 
 	}}, nil
 }
 
+// refuseNeverDetachedComputerBackup answers a Backup of a never-detached
+// generation with the same positive-absence failure receipt ENOSPC and digest
+// mismatch return, so L1 settles the operation failed instead of the agent
+// retrying it. The receipt claims copy absence, so it is minted only when no
+// copy root exists for this copy; a root that does exist predates this refusal
+// and is left for the ordinary create or prune path to account for.
+func refuseNeverDetachedComputerBackup(runtimeRoot string, request CreateComputerBackupRequest, cause error) (CreateComputerBackupResponse, error) {
+	copyName, err := deterministicComputerBackupCopyName(request.CopyID)
+	if err != nil {
+		return CreateComputerBackupResponse{}, err
+	}
+	if _, err := os.Lstat(filepath.Join(runtimeRoot, "computer-backups", copyName)); err == nil {
+		return CreateComputerBackupResponse{}, errors.Join(cause, errors.New("Computer Backup copy root exists"))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return CreateComputerBackupResponse{}, errors.Join(cause, err)
+	}
+	return backupFailureReceipt(request, request.Authority.HelperGeneration, computerBackupFailureSourceNeverDetached)
+}
+
 func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
 	sourcePath, releaseSource, err := engine.lockDetachedBackupSource(ctx, request.Storage, request.Authority)
+	if errors.Is(err, errComputerBackupSourceNeverDetached) {
+		return refuseNeverDetachedComputerBackup(engine.config.RuntimeRoot, request, err)
+	}
 	if err != nil {
 		return CreateComputerBackupResponse{}, err
 	}

@@ -1002,6 +1002,17 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteBackup {
 			return false
 		}
+		// Creating a Backup copy is the other half of that shape: one copy of
+		// one detached Storage generation, separately authorized, file-level
+		// mechanics that never touch the engine namespace, and accepted only
+		// against a receipt the helper derives from the copy itself. A refusal
+		// answered on this session proves the session answered. Reading it as
+		// loss made a Backup of a never-started clone tear the session down on
+		// every retry, withdraw kind:oci, and take running neighbours' attempts
+		// with it (#558). Transport loss and session_stale still prove loss.
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodCreateBackup {
+			return false
+		}
 		// The retained-handoff inventory is a read. It mutates nothing, holds
 		// no authority over any attempt, and a node whose accounting pass
 		// failed is still a node that can place work -- so reading its

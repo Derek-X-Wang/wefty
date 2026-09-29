@@ -423,9 +423,7 @@ func (session *agentSession) processBackupDirectives(ctx context.Context, direct
 		return nil
 	}
 	for _, directive := range directives {
-		directive := directive
-		session.backups.enqueue(ctx, "create\x00"+directive.CopyID,
-			func(runContext context.Context) error { return session.backups.processCreate(runContext, directive) }, nil)
+		session.backups.enqueueCreate(ctx, directive, nil)
 	}
 	return nil
 }
@@ -1329,9 +1327,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			}
 			if session.backups != nil {
 				for _, directive := range response.BackupDirectives {
-					directive := directive
-					session.backups.enqueue(ctx, "create\x00"+directive.CopyID,
-						func(runContext context.Context) error { return session.backups.processCreate(runContext, directive) }, failures)
+					session.backups.enqueueCreate(ctx, directive, failures)
 				}
 				for _, directive := range retention.excludeBackupPrunes(response.BackupPruneDirectives) {
 					directive := directive

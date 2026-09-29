@@ -587,6 +587,66 @@ func TestManagedVolumeEngineFailureDoesNotInvalidateSession(t *testing.T) {
 	}
 }
 
+// A Backup the helper refuses on a live session is that one Backup's answer.
+// Run 4 of the Mac Computer lane backed up a clone that had never started: the
+// helper refused it, the client read the refusal as runtime loss and closed its
+// control connection, the helper reaped the session -- and the running
+// neighbour's attempt with it -- and every heartbeat's redispatch did it again,
+// about a hundred session generations in six minutes (#558).
+func TestComputerBackupCreateRefusalKeepsSessionAndNeighbourAttempt(t *testing.T) {
+	engine := newFakeEngine()
+	engine.createBackupErr = errors.New("Computer Backup lacks exact detached source-generation evidence")
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	neighbour := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(neighbour, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	generation := session.Handshake().SessionGeneration
+	request := CreateComputerBackupRequest{BackupID: "backup-1", CopyID: "copy-1",
+		Storage: ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1",
+			StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
+		Authority: ComputerBackupAuthority{NodeID: "node-1", BootSessionID: "boot-1",
+			HelperGeneration: generation, RootInstanceID: "managed-root-1",
+			JobID: "clone-job", PriorJobID: "clone-job", OperationRevision: 2, CleanupFence: "backup-fence"}}
+	for retry := range 3 {
+		_, err := session.CreateComputerBackup(t.Context(), request)
+		var rpcErr *RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil ||
+			rpcErr.EngineFailure.Operation != MethodCreateBackup {
+			t.Fatalf("retry %d: refused Backup mechanics = %#v err=%v", retry, rpcErr, err)
+		}
+		var runtimeLoss *RuntimeLossError
+		if errors.As(err, &runtimeLoss) {
+			t.Fatalf("retry %d: a refused Backup became runtime loss: %v", retry, err)
+		}
+		if healthErr := session.HealthError(); healthErr != nil {
+			t.Fatalf("retry %d: a refused Backup withdrew client session authority: %v", retry, healthErr)
+		}
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("a refused Backup marked the live helper session lost: %v", err)
+	}
+	if got := session.Handshake().SessionGeneration; got != generation {
+		t.Fatalf("session generation = %d after refused Backups, want %d", got, generation)
+	}
+	engine.mu.Lock()
+	sessionReaps, attemptReaps := len(engine.sessionReaps), len(engine.attemptReaps)
+	engine.mu.Unlock()
+	if sessionReaps != 0 || attemptReaps != 0 {
+		t.Fatalf("refused Backups reaped the session %d times and attempts %d times", sessionReaps, attemptReaps)
+	}
+	if err := session.Signal(t.Context(), SignalRequest{Authority: neighbour, Signal: SignalTERM}); err != nil {
+		t.Fatalf("the running neighbour lost its attempt authority to a refused Backup: %v", err)
+	}
+}
+
 // A Run the engine refuses is attempt-scoped once the helper has positively
 // reaped that attempt while its session stayed live: the exclusive session
 // keeps the same capability, so a table of negative Run probes cannot cascade
@@ -4809,6 +4869,7 @@ type fakeEngine struct {
 	lastDialAttemptRequest      DialAttemptPortRequest
 	controlWrites               []SetComputerControlStateRequest
 	createBackupResponse        CreateComputerBackupResponse
+	createBackupErr             error
 	deleteBackupResponse        DeleteComputerBackupCopyResponse
 	copyStorageResponse         CopyComputerStorageResponse
 	copyStorageErr              error
@@ -5436,7 +5497,10 @@ func (*fakeEngine) ResetComputerStorage(_ context.Context, request ResetComputer
 	}}, nil
 }
 func (engine *fakeEngine) CreateComputerBackup(_ context.Context, _ CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
-	return engine.createBackupResponse, nil
+	engine.record("CreateComputerBackup")
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return engine.createBackupResponse, engine.createBackupErr
 }
 func (engine *fakeEngine) DeleteComputerBackupCopy(_ context.Context, _ DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
 	return engine.deleteBackupResponse, nil
