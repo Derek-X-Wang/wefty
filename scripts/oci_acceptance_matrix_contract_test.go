@@ -478,7 +478,7 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"capability_claim_pair_doctor_source=cli",
 		"capability_revision_before=4", "capability_revision_after=6")
 	write("oci-helper-cold-socket-activation-linux.txt",
-		"helper_service_cold_before_first_connect=true", "helper_service_started_by_first_connect=true",
+		"helper_service_cold_before_first_connect=true", "helper_cold_unit_activated_on_connect=true",
 		"helper_session_admitted_on_first_connect=true", "helper_first_session_is_probe=true",
 		"helper_service_state_before=inactive/dead", "helper_socket_state_before=active/listening",
 		"helper_service_state_after=active/running", "first_connect_session_dials=1")
@@ -530,16 +530,18 @@ func conformantMacMatrixFragment(t *testing.T) string {
 }
 
 // #402: the socket-activated helper cell passes only on the live proof that a
-// cold, stopped service was started by the first connect to its listening
-// socket, admitted that connect as a session, and admitted it before any other
-// session. Root ownership alone no longer carries the row, and a lane that
-// never wrote the receipt has no proof.
+// cold, stopped helper unit came up on socket activation after the probe began
+// dialing, as a fresh start, and admitted the probe's session before any other.
+// Root ownership alone no longer carries the row, and a lane that never wrote
+// the receipt has no proof. Accepted residual: the cell does not claim the
+// probe's connect caused the start -- an out-of-band start between the dial and
+// admission is not excluded, and nothing in the lane issues one.
 func TestOCIAcceptanceMatrixSocketActivatedHelperNeedsColdActivation(t *testing.T) {
 	const row = "linux.only.socket_activated_helper"
 	const receipt = "oci-helper-cold-socket-activation-linux.txt"
 	facts := []string{
 		"helper_service_cold_before_first_connect",
-		"helper_service_started_by_first_connect",
+		"helper_cold_unit_activated_on_connect",
 		"helper_session_admitted_on_first_connect",
 		"helper_first_session_is_probe",
 	}

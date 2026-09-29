@@ -50,11 +50,19 @@ var helperUnitProperties = []string{
 }
 
 // TestNativeLinuxHelperColdSocketActivation proves the Linux-only claim that
-// the root helper is socket-activated (#402): with the .socket listening and
-// the .service stopped, the first connect made through the product client is
-// what makes systemd start the service, and that one connect is admitted as a
-// session -- the first session the new helper admits at all. Root ownership is
-// proven by TestNativeLinuxOCIAdapterLifecycle; this proves the activation.
+// the root helper is socket-activated (#402): a cold, inactive helper unit
+// comes up on socket activation and serves the first session. With the .socket
+// listening and the .service stopped, and no start during a cold hold, the
+// service becomes active only after the probe begins dialing through the
+// product client, as a fresh start (NRestarts=0), and the first session the new
+// invocation admits is the probe's (generation 1, the probe's unique ids).
+// Root ownership is proven by TestNativeLinuxOCIAdapterLifecycle.
+//
+// Accepted residual: this does not prove that the probe's own connect, rather
+// than something coincident with it, is what started the unit. An out-of-band
+// start (a root `systemctl start`, say) in the milliseconds between the dial
+// and admission is not excluded. Nothing in the lane issues one: the root
+// supervisor acts only on a request, and the tests run serially.
 func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
 	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
@@ -196,15 +204,16 @@ func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 		t.Fatalf("helper service InvocationID %q -> %q: no new invocation was started", before["InvocationID"], after["InvocationID"])
 	}
 	// TriggeredBy is configuration, not causation: it is checked only so the
-	// receipt shows the unit is wired to this socket. Causation is the timing
-	// window below plus the probe being the first session admitted.
+	// receipt shows the unit is wired to this socket. The claim is the timing
+	// window below plus the probe being the first session admitted, and it
+	// stops short of causation; see the accepted residual above.
 	if !slices.Contains(strings.Fields(after["TriggeredBy"]), realtimingHelperSocketUnit) {
 		t.Fatalf("helper service TriggeredBy = %q, want %s", after["TriggeredBy"], realtimingHelperSocketUnit)
 	}
 	inactiveExit := parseMonotonicProperty(t, "InactiveExitTimestampMonotonic", after["InactiveExitTimestampMonotonic"])
 	execStart := parseMonotonicProperty(t, "ExecMainStartTimestampMonotonic", after["ExecMainStartTimestampMonotonic"])
-	// The ordering is the proof: systemd began starting the service only after
-	// the probe began its connect, and before that connect was admitted.
+	// systemd began starting the service after the probe began dialing and
+	// before the probe's session was admitted.
 	if inactiveExit < firstDialStarted || inactiveExit > admitted {
 		t.Fatalf("helper service left inactive at monotonic %dus, outside the first connect window [%dus, %dus]",
 			inactiveExit, firstDialStarted, admitted)
@@ -214,8 +223,9 @@ func TestNativeLinuxHelperColdSocketActivation(t *testing.T) {
 	}
 
 	var evidence strings.Builder
-	fmt.Fprintf(&evidence, "helper_service_cold_before_first_connect=true\nhelper_service_started_by_first_connect=true\nhelper_session_admitted_on_first_connect=true\nhelper_first_session_is_probe=true\n")
+	fmt.Fprintf(&evidence, "helper_service_cold_before_first_connect=true\nhelper_cold_unit_activated_on_connect=true\nhelper_session_admitted_on_first_connect=true\nhelper_first_session_is_probe=true\n")
 	fmt.Fprintf(&evidence, "helper_service_unit=%s\nhelper_socket_unit=%s\n", realtimingHelperServiceUnit, realtimingHelperSocketUnit)
+	fmt.Fprintf(&evidence, "helper_cold_activation_accepted_residual=an out-of-band start between the probe's dial and its admission is not excluded; the lane issues none\n")
 	fmt.Fprintf(&evidence, "helper_service_is_active_before=%s\nhelper_service_state_before=%s/%s\nhelper_service_main_pid_before=%s\nhelper_socket_state_before=%s/%s\nhelper_service_cold_hold_ns=%d\n",
 		serviceBefore.isActive, before["ActiveState"], before["SubState"], before["MainPID"],
 		socketStopped.properties["ActiveState"], socketStopped.properties["SubState"], coldHold.Nanoseconds())
