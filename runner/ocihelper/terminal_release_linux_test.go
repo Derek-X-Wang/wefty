@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -499,11 +501,13 @@ func TestObserveContainerdTaskAbsenceMapsTheEngineAnswer(t *testing.T) {
 }
 
 // fakeIntrospection answers containerd's introspection Server call from a
-// sequence, the last answer repeating.
+// sequence, the last answer repeating. onServer runs before each answer, so a
+// test can change the process behind an unchanged answer.
 type fakeIntrospection struct {
 	mu        sync.Mutex
 	responses []*introspectionapi.ServerResponse
 	errs      []error
+	onServer  func(call int)
 	calls     int
 }
 
@@ -512,6 +516,9 @@ func (service *fakeIntrospection) Server(context.Context) (*introspectionapi.Ser
 	defer service.mu.Unlock()
 	index := service.calls
 	service.calls++
+	if service.onServer != nil {
+		service.onServer(index)
+	}
 	var err error
 	if len(service.errs) > 0 {
 		err = service.errs[min(index, len(service.errs)-1)]
@@ -530,60 +537,167 @@ func (*fakeIntrospection) PluginInfo(context.Context, string, string, any) (*int
 	return nil, errors.New("unused")
 }
 
-func introspectingEngine(t *testing.T, service *fakeIntrospection) *ContainerdEngine {
+// procFixture is a procfs stand-in: self/ns/pid is a file whose inode plays
+// the helper's PID namespace, and <pid>/stat carries a start time.
+type procFixture struct {
+	root      string
+	namespace uint64
+}
+
+func newProcFixture(t *testing.T) procFixture {
+	t.Helper()
+	root := t.TempDir()
+	path := filepath.Join(root, "self", "ns", "pid")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return procFixture{root: root, namespace: info.Sys().(*syscall.Stat_t).Ino}
+}
+
+// setStartTime writes a /proc/<pid>/stat whose comm holds spaces and a
+// parenthesis, so the start time is only found by counting from the last ')'.
+func (fixture procFixture) setStartTime(t *testing.T, pid, startTime uint64) {
+	t.Helper()
+	directory := filepath.Join(fixture.root, strconv.FormatUint(pid, 10))
+	if err := os.MkdirAll(filepath.Join(directory, "ns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The process shares the helper's PID namespace: same namespace inode.
+	if err := os.Link(filepath.Join(fixture.root, "self", "ns", "pid"), filepath.Join(directory, "ns", "pid")); err != nil && !errors.Is(err, os.ErrExist) {
+		t.Fatal(err)
+	}
+	// Fields 3..21 are placeholders; field 22 is the start time.
+	fields := []string{"S"}
+	for field := 4; field <= 21; field++ {
+		fields = append(fields, strconv.Itoa(field))
+	}
+	fields = append(fields, strconv.FormatUint(startTime, 10), "23", "24")
+	line := fmt.Sprintf("%d (containerd) x) %s\n", pid, strings.Join(fields, " "))
+	if err := os.WriteFile(filepath.Join(directory, "stat"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (fixture procFixture) server(pid uint64) *introspectionapi.ServerResponse {
+	return &introspectionapi.ServerResponse{UUID: "containerd-uuid", Pid: pid, Pidns: fixture.namespace}
+}
+
+func introspectingEngine(t *testing.T, service *fakeIntrospection, procRoot string) *ContainerdEngine {
 	t.Helper()
 	client, err := containerd.New("", containerd.WithServices(containerd.WithIntrospectionService(service)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &ContainerdEngine{client: client}
+	return &ContainerdEngine{client: client, procRoot: procRoot}
 }
 
-// containerd's introspection answer is the engine identity: its persistent
-// UUID plus the serving process and PID namespace. An error or an answer
-// without a process is no identity at all.
-func TestContainerdDaemonIdentityReadsIntrospection(t *testing.T) {
-	engine := introspectingEngine(t, &fakeIntrospection{responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid", Pid: 812, Pidns: 4026531836}}})
-	identity := engine.captureDaemonIdentity(t.Context())
-	if identity != (engineIdentity{InstanceUUID: "containerd-uuid", PID: 812, PIDNamespace: 4026531836}) {
+// The engine identity is one containerd process instance: introspection's
+// UUID, PID, and PID namespace plus that process's start time from the
+// helper's own procfs. An introspection error, a missing field, containerd in
+// another PID namespace, or an unreadable or malformed stat is no identity.
+func TestContainerdDaemonIdentityReadsOneProcessInstance(t *testing.T) {
+	fixture := newProcFixture(t)
+	fixture.setStartTime(t, 812, 5821)
+	identity := introspectingEngine(t, &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}}, fixture.root).captureDaemonIdentity(t.Context())
+	if identity != (engineIdentity{InstanceUUID: "containerd-uuid", PID: 812, PIDNamespace: fixture.namespace, StartTime: 5821}) {
 		t.Fatalf("daemon identity = %+v", identity)
 	}
-	for name, service := range map[string]*fakeIntrospection{
-		"introspection error": {errs: []error{fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}},
-		"no process":          {responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid"}}},
-		"no uuid":             {responses: []*introspectionapi.ServerResponse{{Pid: 812}}},
+	malformed := newProcFixture(t)
+	malformed.setStartTime(t, 812, 5821)
+	if err := os.WriteFile(filepath.Join(malformed.root, "812", "stat"), []byte("812 (containerd) S 1 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A procfs whose PID 813 lives in some other namespace: its ns/pid is a
+	// different inode from the helper's.
+	foreign := newProcFixture(t)
+	foreign.setStartTime(t, 813, 5821)
+	foreignNamespace := filepath.Join(foreign.root, "813", "ns", "pid")
+	if err := os.Remove(foreignNamespace); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(foreignNamespace, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, test := range map[string]struct {
+		service  *fakeIntrospection
+		procRoot string
+	}{
+		"PID names a process in another namespace": {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{foreign.server(813)}}, procRoot: foreign.root},
+		"introspection error":                      {service: &fakeIntrospection{errs: []error{fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}}, procRoot: fixture.root},
+		"no process":                               {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid", Pidns: fixture.namespace}}}, procRoot: fixture.root},
+		"no uuid":                                  {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{{Pid: 812, Pidns: fixture.namespace}}}, procRoot: fixture.root},
+		"another PID namespace":                    {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid", Pid: 812, Pidns: fixture.namespace + 1}}}, procRoot: fixture.root},
+		"helper namespace unreadable":              {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}}, procRoot: filepath.Join(fixture.root, "missing")},
+		"process stat unreadable":                  {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(4242)}}, procRoot: fixture.root},
+		"process stat malformed":                   {service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{malformed.server(812)}}, procRoot: malformed.root},
 	} {
-		if identity := introspectingEngine(t, service).captureDaemonIdentity(t.Context()); identity.complete() {
+		if identity := introspectingEngine(t, test.service, test.procRoot).captureDaemonIdentity(t.Context()); identity.complete() {
 			t.Fatalf("%s produced daemon identity %+v", name, identity)
 		}
 	}
 }
 
 // The shim-loss probe on a real containerd client: the task answers NotFound
-// in every case, and only the same containerd process answering scopes the
-// failure. A containerd that restarted inside the probe window -- new PID,
-// same persistent UUID -- and lost task state answers NotFound for every task,
-// so that failure stays engine loss; so does an introspection error or an
-// attempt that started without a readable identity (#560 review).
+// in every case, and only the same containerd process instance answering
+// scopes the failure. A containerd that restarted inside the probe window and
+// lost task state answers NotFound for every task -- including one that got
+// its old PID back, which only the start time exposes -- so that failure
+// stays engine loss; so does an unreadable identity at either end (#560
+// review).
 func TestContainerdShimLossScopeRequiresTheSameDaemonProcess(t *testing.T) {
-	started := &introspectionapi.ServerResponse{UUID: "containerd-uuid", Pid: 812, Pidns: 4026531836}
-	restarted := &introspectionapi.ServerResponse{UUID: "containerd-uuid", Pid: 9731, Pidns: 4026531836}
 	reaped := statusOnlyTask{err: fmt.Errorf("task wefty-attempt not found: %w", errdefs.ErrNotFound)}
 	for _, test := range []struct {
-		name    string
-		service *fakeIntrospection
-		want    bool
+		name  string
+		setup func(t *testing.T, fixture procFixture) *fakeIntrospection
+		want  bool
 	}{
-		{name: "same daemon reaped the dead shim", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started}}, want: true},
-		{name: "daemon restarted and lost task state", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started, restarted}}},
-		{name: "introspection fails at probe time", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started}, errs: []error{nil, fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}}},
-		{name: "no identity at attempt start", service: &fakeIntrospection{responses: []*introspectionapi.ServerResponse{started}, errs: []error{errors.New("introspection unavailable"), nil}}},
+		{name: "same daemon reaped the dead shim", want: true, setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}}
+		}},
+		{name: "daemon restarted under a new PID", setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			fixture.setStartTime(t, 9731, 9120)
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812), fixture.server(9731)}}
+		}},
+		{name: "daemon restarted and reused its PID", setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}, onServer: func(call int) {
+				if call == 1 {
+					fixture.setStartTime(t, 812, 9120)
+				}
+			}}
+		}},
+		{name: "containerd in another PID namespace", setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			other := fixture.server(812)
+			other.Pidns++
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{other}}
+		}},
+		{name: "process stat unreadable at probe time", setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}, onServer: func(call int) {
+				if call == 1 {
+					_ = os.Remove(filepath.Join(fixture.root, "812", "stat"))
+				}
+			}}
+		}},
+		{name: "introspection fails at probe time", setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}, errs: []error{nil, fmt.Errorf("connection refused: %w", errdefs.ErrUnavailable)}}
+		}},
+		{name: "no identity at attempt start", setup: func(t *testing.T, fixture procFixture) *fakeIntrospection {
+			return &fakeIntrospection{responses: []*introspectionapi.ServerResponse{fixture.server(812)}, errs: []error{errors.New("introspection unavailable"), nil}}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			fixture := newProcFixture(t)
+			fixture.setStartTime(t, 812, 5821)
 			root := t.TempDir()
 			paths := emptyLogSegments(t, root)
 			authority := testAuthority()
-			engine := introspectingEngine(t, test.service)
+			engine := introspectingEngine(t, test.setup(t, fixture), fixture.root)
 			engine.config = NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 2 * time.Second}
 			attempt := &containerdAttempt{
 				authority:       authority,
@@ -601,7 +715,7 @@ func TestContainerdShimLossScopeRequiresTheSameDaemonProcess(t *testing.T) {
 			wait := make(chan containerd.ExitStatus, 1)
 			wait <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, errors.New("rpc error: code = Unknown desc = ttrpc: closed"))
 			close(wait)
-			go attempt.cacheTerminal(wait, root, 300*time.Millisecond)
+			go attempt.cacheTerminal(wait, root, 600*time.Millisecond)
 
 			result, _ := watchTerminalEvidence(t, engine, authority)
 			if result == nil || result.RuntimeFailure == "" {
@@ -611,5 +725,108 @@ func TestContainerdShimLossScopeRequiresTheSameDaemonProcess(t *testing.T) {
 				t.Fatalf("attempt scoped = %t, want %t", result.RuntimeFailureAttemptScoped, test.want)
 			}
 		})
+	}
+}
+
+// The slowest broken-Wait path -- a probe that never gets an answer and a
+// task release that never finishes -- still publishes inside one release
+// budget, because the probe spends that budget instead of adding to it. The
+// hooks record the deadlines each phase was given, so the check does not
+// depend on scheduling: the probe gets at most its share, the release ends at
+// the same deadline, and log sealing (bounded separately) starts only then.
+// With the defaults that is 5 s + 5 s, inside the agent's 11 s post-KILL Watch
+// budget (#560 review).
+func TestContainerdBrokenWaitPublishesWithinOneReleaseBudget(t *testing.T) {
+	const releaseTimeout = 400 * time.Millisecond
+	root := t.TempDir()
+	paths := emptyLogSegments(t, root)
+	authority := testAuthority()
+	var mu sync.Mutex
+	var firstProbe, probeDeadline, releaseDeadline, published time.Time
+	attempt := &containerdAttempt{
+		authority:       authority,
+		stdout:          paths["stdout"],
+		stderr:          paths["stderr"],
+		terminalReady:   make(chan struct{}),
+		logAcknowledged: make(map[string]uint64),
+		observeTaskAbsence: func(ctx context.Context) taskAbsenceObservation {
+			mu.Lock()
+			if firstProbe.IsZero() {
+				firstProbe = time.Now()
+				probeDeadline, _ = ctx.Deadline()
+			}
+			mu.Unlock()
+			<-ctx.Done()
+			return taskObservationUnproven
+		},
+		releaseTask: func(ctx context.Context) error {
+			mu.Lock()
+			releaseDeadline, _ = ctx.Deadline()
+			mu.Unlock()
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	engine := &ContainerdEngine{
+		config:   NativeEngineConfig{CgroupRoot: root, LogSealTimeout: 100 * time.Millisecond},
+		attempts: map[string]*containerdAttempt{authority.key(): attempt},
+	}
+	wait := make(chan containerd.ExitStatus, 1)
+	wait <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, errors.New("rpc error: code = Unknown desc = ttrpc: closed"))
+	close(wait)
+	go func() {
+		<-attempt.terminalReady
+		mu.Lock()
+		published = time.Now()
+		mu.Unlock()
+	}()
+	go attempt.cacheTerminal(wait, root, releaseTimeout)
+
+	result, _ := watchTerminalEvidence(t, engine, authority)
+	if result == nil || result.RuntimeFailure == "" || result.RuntimeFailureAttemptScoped {
+		t.Fatalf("terminal result = %+v, want an unscoped runtime failure", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if firstProbe.IsZero() || probeDeadline.IsZero() || releaseDeadline.IsZero() || published.IsZero() {
+		t.Fatalf("phases not observed: probe=%v probeDeadline=%v releaseDeadline=%v published=%v", firstProbe, probeDeadline, releaseDeadline, published)
+	}
+	// cacheTerminal fixed both deadlines before the first probe call, so each
+	// is bounded from that call without any timing assumption. The probe's
+	// share is half this release budget (min(2 s, release/2)).
+	if probeDeadline.After(firstProbe.Add(releaseTimeout / 2)) {
+		t.Fatalf("probe deadline %s after the first probe, want at most %s", probeDeadline.Sub(firstProbe), releaseTimeout/2)
+	}
+	if releaseDeadline.After(firstProbe.Add(releaseTimeout)) {
+		t.Fatalf("release deadline %s after the first probe, want at most the %s release budget", releaseDeadline.Sub(firstProbe), releaseTimeout)
+	}
+	// The release, not a later timer, is what publishes: it returned only once
+	// its context reached that shared deadline.
+	if published.Before(releaseDeadline) {
+		t.Fatalf("terminal published %s before the release deadline", releaseDeadline.Sub(published))
+	}
+}
+
+// The start-time read against the real procfs: this test process has one, it
+// is stable across reads, and its PID namespace inode is what containerd's
+// introspection reports for a daemon in the same namespace.
+func TestProcessStartTimeReadsTheRealProcfs(t *testing.T) {
+	pid := uint64(os.Getpid())
+	first, err := processStartTime("/proc", pid)
+	if err != nil || first == 0 {
+		t.Fatalf("start time = %d, %v", first, err)
+	}
+	second, err := processStartTime("/proc", pid)
+	if err != nil || second != first {
+		t.Fatalf("start time changed across reads: %d then %d (%v)", first, second, err)
+	}
+	info, err := os.Stat("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := info.Sys().(*syscall.Stat_t).Ino
+	identity, err := containerdDaemonIdentity(t.Context(), &fakeIntrospection{responses: []*introspectionapi.ServerResponse{{UUID: "containerd-uuid", Pid: pid, Pidns: namespace}}}, "")
+	if err != nil || identity.StartTime != first || identity.PIDNamespace != namespace {
+		t.Fatalf("identity over the real procfs = %+v, %v", identity, err)
 	}
 }

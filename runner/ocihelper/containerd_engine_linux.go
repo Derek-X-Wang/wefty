@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -100,6 +101,10 @@ type containerdTaskSignaler interface {
 }
 
 type ContainerdEngine struct {
+	// procRoot is the procfs the containerd daemon identity is read from;
+	// empty means /proc. Tests point it at a fixture.
+	procRoot string
+
 	client                      *containerd.Client
 	imageLeaseDeletes           imageLeaseDeletionManager
 	config                      NativeEngineConfig
@@ -1769,6 +1774,14 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	}
 	waitErr, deleting := attempt.terminalErr, attempt.deleted
 	attempt.mu.Unlock()
+	if releaseTimeout <= 0 {
+		releaseTimeout = DefaultTaskReleaseTimeout
+	}
+	// One deadline covers the scope probe and the task release together, so a
+	// broken Wait publishes its terminal within the same release budget as any
+	// other exit and the agent's post-KILL Watch budget still holds (see
+	// taskLossScopeProbeBudget for the arithmetic).
+	releaseDeadline := time.Now().Add(releaseTimeout)
 	// A broken Wait is a runtime failure either way. Before it is published,
 	// ask containerd whether it ended only this task -- a lost shim -- so the
 	// agent does not tear down every neighbour's attempt over it (#560). This
@@ -1777,7 +1790,7 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	// this helper's own doing, not the task's, and is never scoped here; its
 	// gRPC cancellation status does not unwrap to context.Canceled.
 	if waitErr != nil && !deleting {
-		scoped := proveTaskLossAttemptScoped(releaseTimeout, waitErr, attempt.observeTaskAbsence)
+		scoped := proveTaskLossAttemptScoped(scopeProbeBound(releaseTimeout), waitErr, attempt.observeTaskAbsence)
 		attempt.mu.Lock()
 		attempt.terminalAttemptScoped = scoped
 		attempt.mu.Unlock()
@@ -1789,7 +1802,7 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	if attempt.cancel != nil {
 		attempt.cancel()
 	}
-	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, taskDeleteRefusedAsPrecondition, func(sealReason string) {
+	if err := publishTerminalAfterTaskReleaseBy(releaseDeadline, attempt.releaseTask, taskDeleteRefusedAsPrecondition, func(sealReason string) {
 		attempt.mu.Lock()
 		attempt.sealReason = sealReason
 		attempt.mu.Unlock()
@@ -1803,10 +1816,15 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 // process identity.
 const daemonIdentityReadTimeout = 2 * time.Second
 
-// containerdDaemonIdentity reads the serving containerd process's identity
-// from the introspection service. containerd persists the UUID under its root,
-// so it survives a restart; the PID and PID namespace are what change.
-func containerdDaemonIdentity(ctx context.Context, service introspection.Service) (engineIdentity, error) {
+// containerdDaemonIdentity reads the serving containerd process instance's
+// identity. The introspection service names the UUID, PID, and PID namespace;
+// containerd persists the UUID under its root, so it survives a restart, and a
+// restart may reuse the PID. The process start time read from procfs is what
+// makes the identity one process instance. It is read only when containerd's
+// PID namespace is the helper's own, because only then does that PID name the
+// same process in the helper's procfs; any other namespace, or an unreadable
+// start time, is no identity at all.
+func containerdDaemonIdentity(ctx context.Context, service introspection.Service, procRoot string) (engineIdentity, error) {
 	if service == nil {
 		return engineIdentity{}, errors.New("containerd introspection service is unavailable")
 	}
@@ -1815,10 +1833,53 @@ func containerdDaemonIdentity(ctx context.Context, service introspection.Service
 		return engineIdentity{}, err
 	}
 	identity := engineIdentity{InstanceUUID: response.GetUUID(), PID: response.GetPid(), PIDNamespace: response.GetPidns()}
-	if !identity.complete() {
+	if identity.InstanceUUID == "" || identity.PID == 0 || identity.PIDNamespace == 0 {
 		return engineIdentity{}, errors.New("containerd introspection returned no daemon process identity")
 	}
+	if procRoot == "" {
+		procRoot = "/proc"
+	}
+	// Both the helper and the process this procfs names at that PID must sit
+	// in containerd's PID namespace; otherwise the PID names someone else.
+	for _, owner := range []string{"self", strconv.FormatUint(identity.PID, 10)} {
+		namespace, err := os.Stat(filepath.Join(procRoot, owner, "ns", "pid"))
+		if err != nil {
+			return engineIdentity{}, fmt.Errorf("read PID namespace of %s: %w", owner, err)
+		}
+		namespaceStat, ok := namespace.Sys().(*syscall.Stat_t)
+		if !ok || namespaceStat.Ino != identity.PIDNamespace {
+			return engineIdentity{}, errors.New("containerd runs outside the helper PID namespace")
+		}
+	}
+	identity.StartTime, err = processStartTime(procRoot, identity.PID)
+	if err != nil {
+		return engineIdentity{}, err
+	}
 	return identity, nil
+}
+
+// processStartTime reads field 22 (starttime, clock ticks since boot) of
+// /proc/<pid>/stat. The comm field may itself hold spaces and parentheses, so
+// fields are counted from after its closing parenthesis, where field 3 begins.
+func processStartTime(procRoot string, pid uint64) (uint64, error) {
+	payload, err := os.ReadFile(filepath.Join(procRoot, strconv.FormatUint(pid, 10), "stat"))
+	if err != nil {
+		return 0, fmt.Errorf("read containerd process start time: %w", err)
+	}
+	closing := bytes.LastIndexByte(payload, ')')
+	if closing < 0 {
+		return 0, errors.New("containerd process stat has no command field")
+	}
+	fields := strings.Fields(string(payload[closing+1:]))
+	const startTimeField, firstFieldAfterComm = 22, 3
+	if len(fields) <= startTimeField-firstFieldAfterComm {
+		return 0, errors.New("containerd process stat has no start time")
+	}
+	startTime, err := strconv.ParseUint(fields[startTimeField-firstFieldAfterComm], 10, 64)
+	if err != nil || startTime == 0 {
+		return 0, errors.New("containerd process stat has an invalid start time")
+	}
+	return startTime, nil
 }
 
 // captureDaemonIdentity records the engine identity an attempt starts under.
@@ -1827,7 +1888,7 @@ func containerdDaemonIdentity(ctx context.Context, service introspection.Service
 func (engine *ContainerdEngine) captureDaemonIdentity(ctx context.Context) engineIdentity {
 	readContext, cancel := context.WithTimeout(engineContext(ctx), daemonIdentityReadTimeout)
 	defer cancel()
-	identity, err := containerdDaemonIdentity(readContext, engine.client.IntrospectionService())
+	identity, err := containerdDaemonIdentity(readContext, engine.client.IntrospectionService(), engine.procRoot)
 	if err != nil {
 		log.Printf("read containerd daemon identity at attempt start; a runtime failure of this attempt stays engine-loss evidence: %v", err)
 		return engineIdentity{}
@@ -1845,7 +1906,7 @@ func (engine *ContainerdEngine) attemptTaskAbsenceObserver(task containerd.Task,
 				return observeContainerdTaskAbsence(engineContext(ctx), task)
 			},
 			func(ctx context.Context) (engineIdentity, error) {
-				return containerdDaemonIdentity(engineContext(ctx), engine.client.IntrospectionService())
+				return containerdDaemonIdentity(engineContext(ctx), engine.client.IntrospectionService(), engine.procRoot)
 			})
 	}
 }

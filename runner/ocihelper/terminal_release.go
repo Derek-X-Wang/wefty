@@ -66,7 +66,16 @@ func publishTerminalAfterTaskRelease(timeout time.Duration, release func(context
 	if timeout <= 0 {
 		timeout = DefaultTaskReleaseTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return publishTerminalAfterTaskReleaseBy(time.Now().Add(timeout), release, stillRunning, publish)
+}
+
+// publishTerminalAfterTaskReleaseBy is publishTerminalAfterTaskRelease against
+// an absolute deadline, so work done before the release -- the shim-loss scope
+// probe -- spends the same release budget instead of extending it. A deadline
+// already passed still publishes: the release sees a finished context and the
+// terminal becomes observable at once.
+func publishTerminalAfterTaskReleaseBy(deadline time.Time, release func(context.Context) error, stillRunning func(error) bool, publish func(sealReason string)) error {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	var err error
 	if release != nil {
@@ -124,17 +133,22 @@ const (
 	taskObservationEngineChanged
 )
 
-// engineIdentity names one running engine process: its persistent instance
-// UUID plus the process ID and PID namespace serving it. The UUID alone
-// survives a restart, so continuity rests on the process.
+// engineIdentity names one engine process instance: its persistent instance
+// UUID, the PID and PID namespace serving it, and that process's start time.
+// The UUID survives a restart and a restart may reuse the PID, but a PID and
+// its start time together never repeat within one boot, so an equal identity
+// is the same process that never restarted.
 type engineIdentity struct {
 	InstanceUUID string
 	PID          uint64
 	PIDNamespace uint64
+	// StartTime is the process start time in clock ticks since boot
+	// (/proc/<pid>/stat field 22), read in the helper's own PID namespace.
+	StartTime uint64
 }
 
 func (identity engineIdentity) complete() bool {
-	return identity.InstanceUUID != "" && identity.PID != 0
+	return identity.InstanceUUID != "" && identity.PID != 0 && identity.PIDNamespace != 0 && identity.StartTime != 0
 }
 
 // observeTaskAbsenceOnSameEngine gates a task-absence answer on engine
@@ -160,6 +174,29 @@ func observeTaskAbsenceOnSameEngine(ctx context.Context, baseline engineIdentity
 		return taskObservationEngineChanged
 	}
 	return taskObservationGone
+}
+
+// taskLossScopeProbeBudget is the most the shim-loss scope probe may spend.
+// It is carved out of the task-release budget, never added to it, because the
+// agent waits a fixed post-KILL Watch budget for terminal evidence:
+//
+//	postKillWatchBudget = DefaultTaskReleaseTimeout + DefaultLogSealTimeout + 1 s
+//	                    = 5 s + 5 s + 1 s = 11 s
+//
+// The probe and the task release share one deadline, Wait return + the task
+// release timeout (5 s), and log sealing starts only at terminal publication
+// and is bounded by the seal timeout (5 s). A broken Wait therefore reaches its
+// sealed terminal within 10 s, inside the 11 s budget, however slow the probe.
+// The probe gets at most half the release budget so the release it precedes
+// always keeps the other half: 2 s of 5 s by default.
+const taskLossScopeProbeBudget = 2 * time.Second
+
+// scopeProbeBound is the probe's share of a task release budget.
+func scopeProbeBound(releaseTimeout time.Duration) time.Duration {
+	if releaseTimeout <= 0 {
+		releaseTimeout = DefaultTaskReleaseTimeout
+	}
+	return min(taskLossScopeProbeBudget, releaseTimeout/2)
 }
 
 // taskLossScopeProbeInterval paces re-asking the engine about one task while
@@ -188,7 +225,7 @@ func proveTaskLossAttemptScoped(timeout time.Duration, waitErr error, observe fu
 		return false
 	}
 	if timeout <= 0 {
-		timeout = DefaultTaskReleaseTimeout
+		timeout = taskLossScopeProbeBudget
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

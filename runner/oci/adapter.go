@@ -1316,7 +1316,9 @@ const (
 	postKillReleaseMargin    = time.Second
 	// postKillWatchBudget covers the helper's serial task-release and
 	// log-sealing bounds plus one margin, so Watch is given the time the helper
-	// contract actually needs to publish terminal evidence after a KILL.
+	// contract actually needs to publish terminal evidence after a KILL. A
+	// broken Wait's shim-loss scope probe spends the release bound rather
+	// than adding to it, so this budget covers that path too (#560).
 	postKillWatchBudget = ocihelper.DefaultTaskReleaseTimeout + ocihelper.DefaultLogSealTimeout + postKillReleaseMargin
 )
 

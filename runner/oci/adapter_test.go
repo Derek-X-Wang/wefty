@@ -1168,6 +1168,17 @@ func TestAdapterUnscopedRuntimeFailureStillRecoversTheSession(t *testing.T) {
 	}
 }
 
+// The helper publishes a broken Wait's terminal within one task-release
+// bound (its shim-loss probe spends that bound) and seals logs within one
+// seal bound after it, so the post-KILL Watch budget must cover both with a
+// margin left over (#560 review).
+func TestPostKillWatchBudgetCoversTheHelperReleaseAndSealBounds(t *testing.T) {
+	if postKillWatchBudget <= ocihelper.DefaultTaskReleaseTimeout+ocihelper.DefaultLogSealTimeout {
+		t.Fatalf("post-KILL Watch budget %s leaves no margin over release %s + seal %s",
+			postKillWatchBudget, ocihelper.DefaultTaskReleaseTimeout, ocihelper.DefaultLogSealTimeout)
+	}
+}
+
 func TestAdapterServiceCancellationUsesTermBeforeKill(t *testing.T) {
 	type runOutcome struct {
 		result workloadrunner.Result
