@@ -3,7 +3,9 @@ package l1
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -532,6 +534,79 @@ func TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission(t *testing.T) {
 				t.Fatalf("submit status = %d body=%s, want 201", status, body)
 			}
 		})
+	}
+}
+
+// TestAnOwnerlessOCIOneShotStoredBeforeTheRefusalStillReplays keeps #578's
+// refusal from breaking dispatch-key replay. A job accepted before L1 refused
+// ownerless OCI one-shots is still stored; an identical replay returns it, as
+// every replay does, and only a genuinely new job of that shape is refused.
+func TestAnOwnerlessOCIOneShotStoredBeforeTheRefusalStillReplays(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	spec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "ownerless-before-upgrade",
+		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"},
+		}},
+	}
+
+	// Store it the way CreateJobAs did before the refusal existed: the same
+	// normalized spec, the same request hash, the same rows.
+	stored := spec
+	stored.RoutingTags = NormalizeTags(stored.RoutingTags)
+	if err := contract.ValidateJobSpec(&stored); err != nil {
+		t.Fatal(err)
+	}
+	specJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(specJSON)
+	now := h.clock.Now().UnixNano()
+	const storedJobID = "job_ownerless_before_upgrade"
+	if _, err := h.store.db.Exec(`
+INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state,
+                 parent_job_id, parent_attempt_id, originating_submitter, submitted_by_run_ledger, spawn_depth, created_ns, updated_ns)
+VALUES(?, ?, ?, ?, ?, NULL, NULL, 'caller', 0, 0, ?, ?)`, storedJobID, stored.DispatchKey, hex.EncodeToString(hash[:]), specJSON,
+		contract.JobQueued, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)`, storedJobID, []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, capability := range RequiredCapabilities(stored) {
+		if _, err := h.store.db.Exec(`INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)`, storedJobID, capability); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	status, headers, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("identical replay status = %d replay header %q body=%s, want 200 replay", status, headers.Get("Idempotent-Replay"), body)
+	}
+	var replayed Job
+	if err := json.Unmarshal(body, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.JobID != storedJobID {
+		t.Fatalf("identical replay returned job %q, want the stored %q", replayed.JobID, storedJobID)
+	}
+
+	fresh := spec
+	fresh.DispatchKey = "ownerless-after-upgrade"
+	status, _, body = h.do(client, http.MethodPost, "/v1/jobs", fresh)
+	var refusal contract.ErrorResponse
+	if err := json.Unmarshal(body, &refusal); err != nil {
+		t.Fatalf("decode new submission response %s: %v", body, err)
+	}
+	if status != http.StatusConflict || refusal.Error.Code != contract.ErrorRunIdentityRequired {
+		t.Fatalf("new ownerless submission status = %d body=%s, want 409 %s", status, body, contract.ErrorRunIdentityRequired)
+	}
+	var count int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE dispatch_key=?`, fresh.DispatchKey).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("a refused new submission stored %d jobs (err %v)", count, err)
 	}
 }
 

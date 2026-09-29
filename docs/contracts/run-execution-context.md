@@ -682,9 +682,11 @@ else `run_id`, trimmed; it must be non-empty, at most 255 bytes and free of NUL
 (`contract.ValidateHandoffOwner`). Both labels are immutable after submission,
 so a job without a usable key could never run. L1 therefore refuses it at
 `POST /v1/jobs` — root or child submission alike — with HTTP 409
-`run_identity_required`, `retryable: false`, and stores nothing. Every run the
-ledger dispatches names its run and is unaffected; a direct submitter supplies
-`run_id` itself. Process one-shots and services (whose data is keyed by their
+`run_identity_required`, `retryable: false`, and stores nothing. The refusal
+applies to a new job only: it follows dispatch-key resolution, so an identical
+replay of such a job stored before L1 refused them returns the stored job, as
+every replay does. Every run the ledger dispatches names its run and is
+unaffected; a direct submitter supplies `run_id` itself. Process one-shots and services (whose data is keyed by their
 job ID, Computers included) need no run identity and are not checked. A node
 that claims such a job anyway — one stored before L1 refused them — completes
 the attempt once with the terminal spawn failure `handoff_preparation_failed`
