@@ -131,10 +131,6 @@ func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenR
 	if request.ComputerAttemptID != "" {
 		return s.revokeComputerAttemptTokensAsControlPlane(ctx, request)
 	}
-	preserved, err := preservedComputerAttempts(request)
-	if err != nil {
-		return contract.ComputerTokenRevocationReceipt{}, err
-	}
 	if request.RestoreOperationRevision < 0 ||
 		(request.RestoreOperationRevision > 0 && (!request.RevokeAll || request.Reason != "computer_restoring")) ||
 		request.ComputerID == "" || len(request.ComputerID) > 255 ||
@@ -152,12 +148,6 @@ func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenR
 	if request.RevokeAll {
 		predicate = `computer_id=? AND revoked_ns IS NULL`
 		args = []any{request.ComputerID}
-		if len(preserved) > 0 {
-			predicate += ` AND computer_attempt_id NOT IN (?` + strings.Repeat(`, ?`, len(preserved)-1) + `)`
-			for _, attemptID := range preserved {
-				args = append(args, attemptID)
-			}
-		}
 	}
 	revoked, err := revokeComputerGrantRowsWithCount(ctx, tx, predicate, args, now.UnixNano(), request.Reason)
 	if err != nil {
@@ -167,38 +157,7 @@ func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenR
 		return contract.ComputerTokenRevocationReceipt{}, internalError(err, "commit Computer token revocation")
 	}
 	return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
-		SubmitIntentRevision: request.SubmitIntentRevision, RestoreOperationRevision: request.RestoreOperationRevision,
-		PreservedComputerAttemptIDs: preserved, RevokedGrantCount: revoked, CommittedAt: now}, nil
-}
-
-// preservedComputerAttempts validates the attempts a narrowed RevokeAll must
-// leave untouched. The list only ever narrows a Computer-wide revocation, so
-// it is refused anywhere it could be read as widening or retargeting one: on
-// a revision-bound request, on a pre-restore revocation, or on an
-// attempt-scoped one.
-func preservedComputerAttempts(request ComputerTokenRevocationRequest) ([]string, error) {
-	if len(request.PreserveComputerAttemptIDs) == 0 {
-		return nil, nil
-	}
-	if !request.RevokeAll || request.RestoreOperationRevision != 0 || request.ComputerAttemptID != "" ||
-		len(request.PreserveComputerAttemptIDs) > MaxPreservedComputerAttempts {
-		return nil, protocolError(contract.ErrorInvalidRequest,
-			"preserve_computer_attempt_ids narrows only a revoke_all without restore_operation_revision, to at most %d attempts",
-			MaxPreservedComputerAttempts)
-	}
-	seen := make(map[string]struct{}, len(request.PreserveComputerAttemptIDs))
-	preserved := make([]string, 0, len(request.PreserveComputerAttemptIDs))
-	for _, attemptID := range request.PreserveComputerAttemptIDs {
-		if attemptID == "" || attemptID != strings.TrimSpace(attemptID) || len(attemptID) > 255 {
-			return nil, protocolError(contract.ErrorInvalidRequest, "preserved Computer attempt IDs must be non-empty and trimmed")
-		}
-		if _, duplicate := seen[attemptID]; duplicate {
-			return nil, protocolError(contract.ErrorInvalidRequest, "preserved Computer attempt ID %q is repeated", attemptID)
-		}
-		seen[attemptID] = struct{}{}
-		preserved = append(preserved, attemptID)
-	}
-	return preserved, nil
+		SubmitIntentRevision: request.SubmitIntentRevision, RestoreOperationRevision: request.RestoreOperationRevision, RevokedGrantCount: revoked, CommittedAt: now}, nil
 }
 
 // revokeComputerAttemptTokensAsControlPlane revokes exactly one attempt's
@@ -211,7 +170,7 @@ func (s *Store) revokeComputerAttemptTokensAsControlPlane(ctx context.Context, r
 	if request.ComputerID == "" || len(request.ComputerID) > 255 ||
 		request.ComputerAttemptID != strings.TrimSpace(request.ComputerAttemptID) || len(request.ComputerAttemptID) > 255 ||
 		request.RevokeAll || request.RestoreOperationRevision != 0 || request.SubmitIntentRevision != 0 ||
-		len(request.PreserveComputerAttemptIDs) != 0 || request.Reason == "" || len(request.Reason) > 255 {
+		request.Reason == "" || len(request.Reason) > 255 {
 		return contract.ComputerTokenRevocationReceipt{}, protocolError(contract.ErrorInvalidRequest,
 			"attempt-scoped Computer token revocation names one Computer attempt and nothing broader")
 	}

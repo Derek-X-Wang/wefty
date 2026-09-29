@@ -17,14 +17,17 @@ import (
 )
 
 // outageLedger is a run ledger for one Computer that can be taken down (it
-// refuses), hung (it never answers), and brought back. Up, it applies L3's
-// revocation rules to its grants (l3/computer_tokens.go): an attempt-scoped
-// request ends only that attempt, a revoke-all ends every grant except the
-// attempts it preserves, and every request is idempotent.
+// refuses), hung (it never answers), held (each request waits for release),
+// and brought back. Up, it applies L3's revocation rules to its grants
+// (l3/computer_tokens.go): an attempt-scoped request ends only that attempt,
+// a revoke-all ends every grant, and every request is idempotent.
 type outageLedger struct {
 	mu       sync.Mutex
 	down     bool
 	hang     bool
+	hold     chan struct{}
+	arrived  chan struct{}
+	onAnswer func()
 	grants   map[string]bool
 	requests []ComputerTokenRevocation
 }
@@ -39,6 +42,21 @@ func (ledger *outageLedger) set(down, hang bool) {
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
 	ledger.down, ledger.hang = down, hang
+}
+
+// holdRequests parks every request until the returned release is called;
+// arrived closes when the first one is parked.
+func (ledger *outageLedger) holdRequests() (arrived <-chan struct{}, release func()) {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	ledger.hold, ledger.arrived = make(chan struct{}), make(chan struct{})
+	hold := ledger.hold
+	return ledger.arrived, func() {
+		ledger.mu.Lock()
+		ledger.hold = nil
+		ledger.mu.Unlock()
+		close(hold)
+	}
 }
 
 func (ledger *outageLedger) mint(attemptID string) {
@@ -62,7 +80,11 @@ func (ledger *outageLedger) taken() []ComputerTokenRevocation {
 
 func (ledger *outageLedger) revoke(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 	ledger.mu.Lock()
-	down, hang := ledger.down, ledger.hang
+	down, hang, hold, arrived, onAnswer := ledger.down, ledger.hang, ledger.hold, ledger.arrived, ledger.onAnswer
+	if hold != nil && arrived != nil {
+		close(arrived)
+		ledger.arrived = nil
+	}
 	ledger.mu.Unlock()
 	if hang {
 		<-ctx.Done()
@@ -72,47 +94,41 @@ func (ledger *outageLedger) revoke(ctx context.Context, request ComputerTokenRev
 		return contract.ComputerTokenRevocationReceipt{}, errors.New(
 			`l1: revoke Computer tokens: Post "http://run-ledger.invalid/v1/computer-token/revoke": dial: connection refused`)
 	}
+	if hold != nil {
+		<-hold
+	}
 	ledger.mu.Lock()
-	defer ledger.mu.Unlock()
 	ledger.requests = append(ledger.requests, request)
 	count := 0
 	for attemptID, revoked := range ledger.grants {
-		if revoked {
-			continue
-		}
-		switch {
-		case request.ComputerAttemptID != "":
-			if attemptID != request.ComputerAttemptID {
-				continue
-			}
-		case request.RevokeAll:
-			if slices.Contains(request.PreserveComputerAttemptIDs, attemptID) {
-				continue
-			}
-		default:
+		if revoked || (request.ComputerAttemptID != "" && attemptID != request.ComputerAttemptID) ||
+			(request.ComputerAttemptID == "" && !request.RevokeAll) {
 			continue
 		}
 		ledger.grants[attemptID] = true
 		count++
 	}
+	ledger.mu.Unlock()
+	if onAnswer != nil {
+		onAnswer()
+	}
 	return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID, ComputerAttemptID: request.ComputerAttemptID,
-		PreservedComputerAttemptIDs: request.PreserveComputerAttemptIDs, SubmitIntentRevision: request.NewSubmitIntentRevision,
-		RevokedGrantCount: count, CommittedAt: time.Now()}, nil
+		SubmitIntentRevision: request.NewSubmitIntentRevision, RevokedGrantCount: count, CommittedAt: time.Now()}, nil
 }
 
 type owedRevocationAudit struct {
 	revocationID int64
 	verb         ComputerRevocationVerb
 	scope        ComputerRevocationScope
-	attemptID    string
+	recorded     []string
 	settlement   string
-	receipt      *contract.ComputerTokenRevocationReceipt
-	rawReceipt   string
+	record       *ComputerRevocationSettlement
+	rawRecord    string
 }
 
 func owedRevocationAuditRows(t *testing.T, h *integrationHarness, computerID string) []owedRevocationAudit {
 	t.Helper()
-	rows, err := h.store.db.Query(`SELECT revocation_id, verb, scope, computer_attempt_id, settlement, receipt_json
+	rows, err := h.store.db.Query(`SELECT revocation_id, verb, scope, recorded_attempt_ids_json, settlement, receipt_json
 		FROM computer_owed_revocations WHERE computer_id=? ORDER BY revocation_id`, computerID)
 	if err != nil {
 		t.Fatal(err)
@@ -121,14 +137,17 @@ func owedRevocationAuditRows(t *testing.T, h *integrationHarness, computerID str
 	var audit []owedRevocationAudit
 	for rows.Next() {
 		var row owedRevocationAudit
-		var payload []byte
-		if err := rows.Scan(&row.revocationID, &row.verb, &row.scope, &row.attemptID, &row.settlement, &payload); err != nil {
+		var recorded, payload []byte
+		if err := rows.Scan(&row.revocationID, &row.verb, &row.scope, &recorded, &row.settlement, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(recorded, &row.recorded); err != nil {
 			t.Fatal(err)
 		}
 		if payload != nil {
-			row.rawReceipt = string(payload)
-			row.receipt = &contract.ComputerTokenRevocationReceipt{}
-			if err := json.Unmarshal(payload, row.receipt); err != nil {
+			row.rawRecord = string(payload)
+			row.record = &ComputerRevocationSettlement{}
+			if err := json.Unmarshal(payload, row.record); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -160,20 +179,17 @@ func mustGetComputer(t *testing.T, h *integrationHarness, computerID string) Com
 	return computer
 }
 
-// TestOwedRevocationsSettleOnHeartbeatAfterRunLedgerOutage is the #554
-// acceptance: with the run ledger down, a stop, the completion that stop
-// drives, and a restart each commit, answer exactly as #548 made them answer,
-// and leave their revocation owed on the Computer. Meanwhile the restart's
-// next attempt is minted a pass. When the run ledger returns, the host Node's
-// heartbeat settles every owed revocation once, with a receipt: the
-// completion's stays scoped to its attempt, and the Computer-wide ones spare
-// the attempt that began after they were owed.
-func TestOwedRevocationsSettleOnHeartbeatAfterRunLedgerOutage(t *testing.T) {
+// owedOutage drives a running Computer through a run-ledger outage: a stop
+// and the completion it drives each commit, answer as #548 made them, and
+// owe a revocation of the running attempt; the restart that follows owes
+// nothing, because no attempt could hold a pass when it began.
+func owedOutage(t *testing.T, name string) (*integrationHarness, *outageLedger, Node, Computer, *Claim) {
+	t.Helper()
 	h, _, node, agent := computerCompletionHarness(t)
 	ledger := newOutageLedger(h)
 	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
-	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "owed-outage",
-		Spec: computerCapabilityJobSpec("computer:owed-outage:v1"), Actor: "operator"})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: name,
+		Spec: computerCapabilityJobSpec("computer:" + name + ":v1"), Actor: "operator"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,114 +211,296 @@ func TestOwedRevocationsSettleOnHeartbeatAfterRunLedgerOutage(t *testing.T) {
 		t.Fatalf("completion refused but did not apply: job state = %q", computer.CurrentJob.State)
 	}
 	status, _, body = h.do(client, http.MethodPost, "/v1/computers/"+computer.ComputerID+"/restart",
-		ComputerRestartRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "owed-outage-restart"})
-	assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied", "is owed")
+		ComputerRestartRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: name + "-restart"})
+	assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied", "nothing is owed")
+	return h, ledger, node, mustGetComputer(t, h, computer.ComputerID), first
+}
+
+// TestOwedRevocationsSettleOnHeartbeatAfterRunLedgerOutage is the #554
+// acceptance: every revocation owed through a run-ledger outage lands, once,
+// with a receipt, when the run ledger returns, and a late settlement is
+// always attempt-scoped: it never sends a revoke-all.
+func TestOwedRevocationsSettleOnHeartbeatAfterRunLedgerOutage(t *testing.T) {
+	h, ledger, node, computer, first := owedOutage(t, "owed-outage")
 	second := startComputerAttempt(t, h, node, nil)
 	ledger.mint(second.Lease.AttemptID)
 
 	// Down: the heartbeat still answers, and everything stays owed.
 	heartbeatComputerNode(t, h, node)
-	computer = mustGetComputer(t, h, computer.ComputerID)
-	wantOwed := []struct {
-		verb      ComputerRevocationVerb
-		scope     ComputerRevocationScope
-		attemptID string
-	}{
-		{ComputerRevocationVerbStop, ComputerRevocationScopeRevokeAll, ""},
-		{ComputerRevocationVerbAttemptCompletion, ComputerRevocationScopeAttempt, first.Lease.AttemptID},
-		{ComputerRevocationVerbRestart, ComputerRevocationScopeRevokeAll, ""},
+	owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations
+	if len(owed) != 2 || owed[0].Verb != ComputerRevocationVerbStop || owed[0].Scope != ComputerRevocationScopeRevokeAll ||
+		owed[1].Verb != ComputerRevocationVerbAttemptCompletion || owed[1].Scope != ComputerRevocationScopeAttempt ||
+		owed[1].ComputerAttemptID != first.Lease.AttemptID {
+		t.Fatalf("owed revocations during the outage = %#v", owed)
 	}
-	if len(computer.OwedRevocations) != len(wantOwed) {
-		t.Fatalf("owed revocations during the outage = %#v", computer.OwedRevocations)
-	}
-	for index, want := range wantOwed {
-		owed := computer.OwedRevocations[index]
-		if owed.Verb != want.verb || owed.Scope != want.scope || owed.ComputerAttemptID != want.attemptID ||
-			owed.HostNodeID != node.NodeID || owed.SettleFailures != 2 || !strings.Contains(owed.LastFailure, "connection refused") {
-			t.Fatalf("owed revocation %d = %#v, want %s/%s/%q failed by the handler and one heartbeat", index, owed,
-				want.verb, want.scope, want.attemptID)
+	for _, revocation := range owed {
+		if !slices.Equal(revocation.RecordedAttemptIDs, []string{first.Lease.AttemptID}) || revocation.HostNodeID != node.NodeID ||
+			revocation.SettleFailures != 2 || !strings.Contains(revocation.LastFailure, "connection refused") {
+			t.Fatalf("owed revocation = %#v, want the running attempt recorded and failed by the handler and one heartbeat", revocation)
 		}
 	}
 	if len(ledger.taken()) != 0 || !ledger.active(first.Lease.AttemptID) {
 		t.Fatalf("a down run ledger took revocations: %#v", ledger.taken())
 	}
 
-	// Back: one heartbeat settles every row, each with its receipt.
+	// Back: one heartbeat settles every row with its receipts.
 	ledger.set(false, false)
 	heartbeatComputerNode(t, h, node)
 	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
 		t.Fatalf("owed revocations after recovery = %#v", owed)
 	}
 	audit := owedRevocationAuditRows(t, h, computer.ComputerID)
-	if len(audit) != len(wantOwed) {
+	wantSettlements := []string{owedRevocationSettledRevoked, owedRevocationSettledRevoked, owedRevocationSettledNothingToRevoke}
+	if len(audit) != len(wantSettlements) {
 		t.Fatalf("audit rows = %#v", audit)
 	}
 	for index, row := range audit {
-		if row.settlement != owedRevocationSettledRevoked || row.receipt == nil || row.receipt.ComputerID != computer.ComputerID ||
-			row.receipt.CommittedAt.IsZero() {
-			t.Fatalf("audit row %d = %#v, want a revoked settlement with a receipt", index, row)
+		if row.settlement != wantSettlements[index] {
+			t.Fatalf("audit row %d settlement = %q, want %q", index, row.settlement, wantSettlements[index])
 		}
-		switch row.scope {
-		case ComputerRevocationScopeAttempt:
-			if row.receipt.ComputerAttemptID != first.Lease.AttemptID || len(row.receipt.PreservedComputerAttemptIDs) != 0 {
-				t.Fatalf("attempt-scoped settlement receipt = %#v", row.receipt)
-			}
-		case ComputerRevocationScopeRevokeAll:
-			if row.receipt.ComputerAttemptID != "" ||
-				!slices.Equal(row.receipt.PreservedComputerAttemptIDs, []string{second.Lease.AttemptID}) {
-				t.Fatalf("late Computer-wide settlement receipt = %#v, want it to preserve %s", row.receipt, second.Lease.AttemptID)
-			}
+		if row.settlement != owedRevocationSettledRevoked {
+			continue
+		}
+		if row.record == nil || row.record.RevokeAll != nil || len(row.record.Attempts) != 1 ||
+			row.record.Attempts[0].ComputerAttemptID != first.Lease.AttemptID || row.record.Attempts[0].CommittedAt.IsZero() {
+			t.Fatalf("late settlement record %d = %#v, want one receipt for %s", index, row.record, first.Lease.AttemptID)
 		}
 	}
-	taken := ledger.taken()
-	if len(taken) != len(wantOwed) {
-		t.Fatalf("run ledger took %d revocations, want %d: %#v", len(taken), len(wantOwed), taken)
-	}
-	for _, request := range taken {
-		if request.ComputerAttemptID != "" && (request.RevokeAll || request.ComputerAttemptID != first.Lease.AttemptID ||
-			len(request.PreserveComputerAttemptIDs) != 0 || request.Reason != "attempt_terminal") {
-			t.Fatalf("attempt-scoped settlement widened: %#v", request)
+	for _, request := range ledger.taken() {
+		if request.RevokeAll || request.ComputerAttemptID != first.Lease.AttemptID || request.NewSubmitIntentRevision != 0 {
+			t.Fatalf("a late settlement sent %#v, want only attempt-scoped revocations of %s", request, first.Lease.AttemptID)
 		}
+	}
+	if taken := len(ledger.taken()); taken != 2 {
+		t.Fatalf("run ledger took %d revocations, want 2", taken)
 	}
 	if ledger.active(first.Lease.AttemptID) || !ledger.active(second.Lease.AttemptID) {
-		t.Fatalf("after settlement first active=%t second active=%t, want the completed attempt revoked and the new one live",
-			ledger.active(first.Lease.AttemptID), ledger.active(second.Lease.AttemptID))
+		t.Fatalf("after settlement first active=%t second active=%t", ledger.active(first.Lease.AttemptID), ledger.active(second.Lease.AttemptID))
 	}
 
-	// Settled rows are settled once: the next heartbeat asks for nothing
-	// and rewrites no receipt.
+	// Settled once: the next heartbeat asks for nothing and rewrites nothing.
 	heartbeatComputerNode(t, h, node)
-	if len(ledger.taken()) != len(wantOwed) {
+	if len(ledger.taken()) != 2 {
 		t.Fatalf("a settled revocation was sent again: %#v", ledger.taken())
 	}
 	for index, row := range owedRevocationAuditRows(t, h, computer.ComputerID) {
-		if row.rawReceipt != audit[index].rawReceipt {
-			t.Fatalf("audit row %d receipt changed from %s to %s", index, audit[index].rawReceipt, row.rawReceipt)
+		if row.rawRecord != audit[index].rawRecord {
+			t.Fatalf("audit row %d changed from %s to %s", index, audit[index].rawRecord, row.rawRecord)
 		}
 	}
 
-	// Healthy, a stop settles its own row before answering, and now it
-	// covers the running attempt.
+	// Healthy, a stop still sends its revoke-all right after it commits and
+	// settles with that receipt.
 	computer = mustGetComputer(t, h, computer.ComputerID)
-	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state",
+	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
+	status, _, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state",
 		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
 	if status != http.StatusAccepted {
 		t.Fatalf("healthy stop status=%d body=%s", status, body)
 	}
-	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
-		t.Fatalf("a healthy stop left its revocation owed: %#v", owed)
-	}
 	audit = owedRevocationAuditRows(t, h, computer.ComputerID)
 	last := audit[len(audit)-1]
-	if len(audit) != len(wantOwed)+1 || last.verb != ComputerRevocationVerbStop || last.settlement != owedRevocationSettledRevoked ||
-		last.receipt == nil || len(last.receipt.PreservedComputerAttemptIDs) != 0 || ledger.active(second.Lease.AttemptID) {
+	if len(audit) != 4 || last.verb != ComputerRevocationVerbStop || last.settlement != owedRevocationSettledRevoked ||
+		last.record == nil || last.record.RevokeAll == nil || !slices.Equal(last.recorded, []string{second.Lease.AttemptID}) ||
+		ledger.active(second.Lease.AttemptID) {
 		t.Fatalf("healthy stop audit = %#v, second active=%t", audit, ledger.active(second.Lease.AttemptID))
+	}
+}
+
+// TestLateSettlementSparesAnAttemptMintedWhileItIsInFlight is the round-1
+// review race made deterministic: the late settlement is in flight at the run
+// ledger when the Computer's next attempt is claimed and minted a pass, and
+// only then does the settlement complete. The next attempt's pass survives,
+// because a late settlement names the attempts it revokes and that attempt
+// was never one of them.
+func TestLateSettlementSparesAnAttemptMintedWhileItIsInFlight(t *testing.T) {
+	h, ledger, node, computer, first := owedOutage(t, "owed-race")
+	ledger.set(false, false)
+	arrived, release := ledger.holdRequests()
+	agent := h.client(fabric.Identity{NodeID: "fabric-computer-node", Tags: []string{DefaultAgentPrincipalTag}})
+	heartbeat := make(chan error, 1)
+	go func() {
+		status, _, body, err := doRequest(agent, http.MethodPost, "/v1/agent/nodes/"+node.NodeID+"/heartbeat", heartbeatRequestForNode(node))
+		if err == nil && status != http.StatusOK {
+			err = fmt.Errorf("heartbeat status=%d body=%s", status, body)
+		}
+		heartbeat <- err
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the late settlement never reached the run ledger")
+	}
+	// In flight: the next attempt is claimed and minted its pass.
+	second := startComputerAttempt(t, h, node, nil)
+	ledger.mint(second.Lease.AttemptID)
+	release()
+	if err := <-heartbeat; err != nil {
+		t.Fatal(err)
+	}
+
+	if !ledger.active(second.Lease.AttemptID) {
+		t.Fatalf("the late settlement revoked the pass of attempt %s, minted while it was in flight: %#v",
+			second.Lease.AttemptID, ledger.taken())
+	}
+	if ledger.active(first.Lease.AttemptID) {
+		t.Fatal("the late settlement left the stopped attempt's pass active")
+	}
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
+		t.Fatalf("owed revocations after the race = %#v", owed)
+	}
+}
+
+// TestManyHistoricalAttemptsNeverBlockOtherOwedRevocations: a Computer with
+// hundreds of past attempts records only the attempts that could hold a pass,
+// so its row settles with one request, and rows beyond one heartbeat's share
+// settle on the next.
+func TestManyHistoricalAttemptsNeverBlockOtherOwedRevocations(t *testing.T) {
+	h, _, node, _ := computerCompletionHarness(t)
+	ledger := newOutageLedger(h)
+	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
+	ctx := t.Context()
+	computer, _, err := h.store.CreateComputer(ctx, CreateComputerRequest{Name: "owed-history",
+		Spec: computerCapabilityJobSpec("computer:owed-history:v1"), Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := startComputerAttempt(t, h, node, nil)
+	ledger.mint(live.Lease.AttemptID)
+	for index := range 300 {
+		if _, err := h.store.db.Exec(`INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token,
+			lease_expires_ns, created_ns, updated_ns) VALUES(?, ?, ?, ?, ?, '1', 0, 0, 0)`,
+			fmt.Sprintf("attempt-history-%03d", index), live.Job.JobID, node.NodeID, node.BootSessionID, contract.AttemptLost); err != nil {
+			t.Fatal(err)
+		}
+	}
+	computer = mustGetComputer(t, h, computer.ComputerID)
+	ledger.set(true, false)
+	status, _, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state",
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+	assertRunLedgerUnavailable(t, status, body, false, "is owed")
+	owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations
+	if len(owed) != 1 || !slices.Equal(owed[0].RecordedAttemptIDs, []string{live.Lease.AttemptID}) {
+		t.Fatalf("owed revocation over 300 past attempts = %#v, want only the live attempt recorded", owed)
+	}
+	// Twenty more owed rows on the same host, more than one heartbeat's share.
+	tx, err := h.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range 20 {
+		if _, err := recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{computerID: fmt.Sprintf("computer-other-%02d", index),
+			hostNodeID: node.NodeID, verb: ComputerRevocationVerbStop, reason: "computer_stopped",
+			holdingAttempts: []string{fmt.Sprintf("attempt-other-%02d", index)}}, h.clock.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	ledger.set(false, false)
+	heartbeatComputerNode(t, h, node)
+	if taken := ledger.taken(); len(taken) != MaxOwedRevocationsPerHeartbeat || taken[0].ComputerID == "" {
+		t.Fatalf("first heartbeat sent %d revocations, want %d", len(taken), MaxOwedRevocationsPerHeartbeat)
+	}
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
+		t.Fatalf("the oldest row, over 300 past attempts, is still owed: %#v", owed)
+	}
+	heartbeatComputerNode(t, h, node)
+	var remaining int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_owed_revocations WHERE settled_ns IS NULL`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 || len(ledger.taken()) != 21 {
+		t.Fatalf("after two heartbeats %d rows owed and %d revocations sent, want 0 and 21", remaining, len(ledger.taken()))
+	}
+}
+
+// TestHeartbeatAnswersInTimeWhileSettlementWritesAreLocked: the run ledger
+// answers, and SQLite is write-locked from that moment until well past the
+// heartbeat's revocation budget, across the owed-revocation writes. The
+// driver does not interrupt a lock wait when a context ends, so without a
+// bounded wait the writes would sit on SQLite's 5s busy timeout. They are
+// skipped at the budget instead: the row stays owed, the heartbeat answers,
+// and the next heartbeat records the settlement.
+func TestHeartbeatAnswersInTimeWhileSettlementWritesAreLocked(t *testing.T) {
+	h, _, node, _ := computerCompletionHarness(t)
+	ledger := newOutageLedger(h)
+	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "owed-locked",
+		Spec: computerCapabilityJobSpec("computer:owed-locked:v1"), Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := startComputerAttempt(t, h, node, nil)
+	ledger.mint(live.Lease.AttemptID)
+	computer = mustGetComputer(t, h, computer.ComputerID)
+	ledger.set(true, false)
+	status, _, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state",
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+	assertRunLedgerUnavailable(t, status, body, false, "is owed")
+
+	const budget = 600 * time.Millisecond
+	const lockHeld = budget + 400*time.Millisecond
+	h.server.restoreRevocationBudget = budget
+	locked, released := make(chan struct{}), make(chan error, 1)
+	var once sync.Once
+	ledger.mu.Lock()
+	ledger.onAnswer = func() {
+		once.Do(func() {
+			conn, err := h.store.db.Conn(context.Background())
+			if err == nil {
+				_, err = conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`)
+			}
+			if err != nil {
+				released <- err
+				close(locked)
+				return
+			}
+			close(locked)
+			go func() {
+				time.Sleep(lockHeld)
+				_, err := conn.ExecContext(context.Background(), `ROLLBACK`)
+				conn.Close()
+				released <- err
+			}()
+		})
+	}
+	ledger.down = false
+	ledger.mu.Unlock()
+
+	elapsed := heartbeatComputerNode(t, h, node)
+	select {
+	case <-locked:
+	default:
+		t.Fatal("the run ledger never answered, so SQLite was never locked")
+	}
+	if err := <-released; err != nil {
+		t.Fatal(err)
+	}
+	// The rest of the heartbeat writes too, so it can finish only once the
+	// lock is gone; what must not happen is a wait on the busy timeout.
+	if elapsed > lockHeld+time.Second || elapsed >= ComputerPolicyClientTimeout {
+		t.Fatalf("heartbeat took %s with SQLite locked for %s against a %s budget", elapsed, lockHeld, budget)
+	}
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 1 {
+		t.Fatalf("owed revocations after a locked settlement = %#v, want the writes skipped and the row still owed", owed)
+	}
+	ledger.mu.Lock()
+	ledger.onAnswer = nil
+	ledger.mu.Unlock()
+	heartbeatComputerNode(t, h, node)
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
+		t.Fatalf("owed revocations after the lock cleared = %#v", owed)
+	}
+	if ledger.active(live.Lease.AttemptID) {
+		t.Fatal("the stopped attempt's pass is still active")
 	}
 }
 
 // TestHungRunLedgerKeepsOwedRevocationsWithinHeartbeatBudget: a run ledger
 // that accepts the connection and never answers costs a heartbeat no more
-// than the revocation budget #548 set, and the revocation stays owed.
+// than its revocation budget, and the revocation stays owed.
 func TestHungRunLedgerKeepsOwedRevocationsWithinHeartbeatBudget(t *testing.T) {
 	h, _, node, _ := computerCompletionHarness(t)
 	ledger := newOutageLedger(h)
@@ -312,6 +510,9 @@ func TestHungRunLedgerKeepsOwedRevocationsWithinHeartbeatBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	live := startComputerAttempt(t, h, node, nil)
+	ledger.mint(live.Lease.AttemptID)
+	computer = mustGetComputer(t, h, computer.ComputerID)
 	ledger.set(true, false)
 	status, _, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state",
 		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
@@ -327,7 +528,6 @@ func TestHungRunLedgerKeepsOwedRevocationsWithinHeartbeatBudget(t *testing.T) {
 	if len(owed) != 1 || owed[0].SettleFailures != 2 || !strings.Contains(owed[0].LastFailure, "heartbeat revocation budget") {
 		t.Fatalf("owed revocations after a hung run ledger = %#v", owed)
 	}
-
 	ledger.set(false, false)
 	heartbeatComputerNode(t, h, node)
 	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
@@ -335,10 +535,51 @@ func TestHungRunLedgerKeepsOwedRevocationsWithinHeartbeatBudget(t *testing.T) {
 	}
 }
 
+// TestOwedRevocationRecordsAttemptsBeforeTheMutation: removal marks the
+// running attempt lost in its own transaction, so the attempts it owes a
+// revocation for must be read before that; so must a stop's.
+func TestOwedRevocationRecordsAttemptsBeforeTheMutation(t *testing.T) {
+	for _, verb := range []ComputerRevocationVerb{ComputerRevocationVerbStop, ComputerRevocationVerbRemove} {
+		t.Run(string(verb), func(t *testing.T) {
+			h, _, node, _ := computerCompletionHarness(t)
+			ctx := t.Context()
+			computer, _, err := h.store.CreateComputer(ctx, CreateComputerRequest{Name: "owed-before-" + string(verb),
+				Spec: computerCapabilityJobSpec("computer:owed-before-" + string(verb) + ":v1"), Actor: "operator"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			live := startComputerAttempt(t, h, node, nil)
+			computer = mustGetComputer(t, h, computer.ComputerID)
+			var mutated Computer
+			if verb == ComputerRevocationVerbStop {
+				mutated, err = h.store.SetComputerDesiredState(ctx, computer.ComputerID,
+					computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+			} else {
+				mutated, err = h.store.RemoveComputer(ctx, computer.ComputerID,
+					ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator")})
+			}
+			if err != nil || mutated.owedRevocationID == 0 {
+				t.Fatalf("%s = owed %d err=%v", verb, mutated.owedRevocationID, err)
+			}
+			var state contract.AttemptState
+			if err := h.store.db.QueryRow(`SELECT state FROM attempts WHERE attempt_id=?`, live.Lease.AttemptID).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if verb == ComputerRevocationVerbRemove && state != contract.AttemptLost {
+				t.Fatalf("removal left the attempt %q, so this test no longer proves the read comes first", state)
+			}
+			audit := owedRevocationAuditRows(t, h, computer.ComputerID)
+			if len(audit) != 1 || audit[0].verb != verb || !slices.Equal(audit[0].recorded, []string{live.Lease.AttemptID}) {
+				t.Fatalf("%s audit = %#v, want the attempt that was running before it recorded", verb, audit)
+			}
+		})
+	}
+}
+
 // TestOwedRevocationSettlementIsExactlyOnceAndNeverWidens covers the store
-// half: a row settles once and its receipt is then immutable, a replayed
-// settlement is a no-op, and a receipt that does not match the row's scope is
-// refused rather than recorded.
+// half: a row settles once and is then immutable, a replayed settlement is a
+// no-op, receipts accumulate until every recorded attempt has one, and a
+// receipt for an attempt the row did not record is refused.
 func TestOwedRevocationSettlementIsExactlyOnceAndNeverWidens(t *testing.T) {
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
 	ctx := t.Context()
@@ -357,28 +598,23 @@ func TestOwedRevocationSettlementIsExactlyOnceAndNeverWidens(t *testing.T) {
 		computerDesiredRequest(stopped, contract.ServiceDesiredStopped, "operator")); err != nil || again.owedRevocationID != 0 {
 		t.Fatalf("no-op stop = owed %d err=%v", again.owedRevocationID, err)
 	}
-	work, err := h.store.owedComputerRevocationWork(ctx, stopped.owedRevocationID)
-	if err != nil || work.settled || !work.request.RevokeAll || work.request.ComputerAttemptID != "" ||
-		len(work.request.PreserveComputerAttemptIDs) != 0 || work.request.Reason != "computer_stopped" {
-		t.Fatalf("stop settlement work = %#v err=%v", work, err)
-	}
 	receipt := contract.ComputerTokenRevocationReceipt{ComputerID: computer.ComputerID, SubmitIntentRevision: 1,
 		RevokedGrantCount: 1, CommittedAt: h.clock.Now()}
 	wrongScope := receipt
 	wrongScope.ComputerAttemptID = "attempt-elsewhere"
-	if settled, err := h.store.SettleOwedComputerRevocation(ctx, stopped.owedRevocationID, work.request, wrongScope); err == nil || settled {
-		t.Fatalf("an attempt-scoped receipt settled a Computer-wide row: settled=%t err=%v", settled, err)
+	if settled, err := h.store.SettleOwedComputerRevocationRevokeAll(ctx, stopped.owedRevocationID, wrongScope); err == nil || settled {
+		t.Fatalf("an attempt-scoped receipt settled a revoke-all: settled=%t err=%v", settled, err)
 	}
-	if settled, err := h.store.SettleOwedComputerRevocation(ctx, stopped.owedRevocationID, work.request, receipt); err != nil || !settled {
+	if settled, err := h.store.SettleOwedComputerRevocationRevokeAll(ctx, stopped.owedRevocationID, receipt); err != nil || !settled {
 		t.Fatalf("first settlement = %t err=%v", settled, err)
 	}
 	replayed := receipt
 	replayed.RevokedGrantCount, replayed.CommittedAt = 0, h.clock.Now().Add(time.Minute)
-	if settled, err := h.store.SettleOwedComputerRevocation(ctx, stopped.owedRevocationID, work.request, replayed); err != nil || settled {
+	if settled, err := h.store.SettleOwedComputerRevocationRevokeAll(ctx, stopped.owedRevocationID, replayed); err != nil || settled {
 		t.Fatalf("replayed settlement = %t err=%v, want a no-op", settled, err)
 	}
 	audit := owedRevocationAuditRows(t, h, computer.ComputerID)
-	if len(audit) != 1 || audit[0].receipt == nil || audit[0].receipt.RevokedGrantCount != 1 {
+	if len(audit) != 1 || audit[0].record == nil || audit[0].record.RevokeAll == nil || audit[0].record.RevokeAll.RevokedGrantCount != 1 {
 		t.Fatalf("audit after a replayed settlement = %#v", audit)
 	}
 	if _, err := h.store.db.Exec(`UPDATE computer_owed_revocations SET receipt_json=X'7B7D' WHERE revocation_id=?`,
@@ -392,34 +628,44 @@ func TestOwedRevocationSettlementIsExactlyOnceAndNeverWidens(t *testing.T) {
 		t.Fatalf("a failure note on a settled row = %v, want a silent no-op", err)
 	}
 
-	// An attempt-scoped row asks for exactly its attempt, and only an
-	// exactly matching receipt settles it.
+	// Two recorded attempts: receipts accumulate, only recorded attempts
+	// count, and the row settles when both are in.
 	tx, err := h.store.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	attemptRow, err := recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{computerID: computer.ComputerID,
-		hostNodeID: "computer-node", verb: ComputerRevocationVerbAttemptCompletion, reason: "attempt_terminal",
-		attemptID: "attempt-done"}, h.clock.Now())
+	twoAttempts, err := recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{computerID: computer.ComputerID,
+		hostNodeID: "computer-node", verb: ComputerRevocationVerbReimage, reason: "computer_reimaged",
+		holdingAttempts: []string{"attempt-a", "attempt-b"}}, h.clock.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	work, err = h.store.owedComputerRevocationWork(ctx, attemptRow)
-	if err != nil || work.request.RevokeAll || work.request.ComputerAttemptID != "attempt-done" ||
-		work.request.NewSubmitIntentRevision != 0 || len(work.request.PreserveComputerAttemptIDs) != 0 {
-		t.Fatalf("attempt settlement work = %#v err=%v", work, err)
+	attemptReceipt := func(attemptID string) contract.ComputerTokenRevocationReceipt {
+		return contract.ComputerTokenRevocationReceipt{ComputerID: computer.ComputerID, ComputerAttemptID: attemptID, CommittedAt: h.clock.Now()}
 	}
-	widened := ComputerTokenRevocation{ComputerID: computer.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true, Reason: "attempt_terminal"}
-	if settled, err := h.store.SettleOwedComputerRevocation(ctx, attemptRow, widened, receipt); err == nil || settled {
-		t.Fatalf("a revoke-all settled an attempt-scoped row: settled=%t err=%v", settled, err)
+	if settled, err := h.store.RecordOwedComputerAttemptRevocations(ctx, twoAttempts,
+		[]contract.ComputerTokenRevocationReceipt{attemptReceipt("attempt-successor")}); err == nil || settled {
+		t.Fatalf("a receipt for an unrecorded attempt was recorded: settled=%t err=%v", settled, err)
 	}
-	attemptReceipt := contract.ComputerTokenRevocationReceipt{ComputerID: computer.ComputerID, ComputerAttemptID: "attempt-done",
-		CommittedAt: h.clock.Now()}
-	if settled, err := h.store.SettleOwedComputerRevocation(ctx, attemptRow, work.request, attemptReceipt); err != nil || !settled {
-		t.Fatalf("attempt settlement = %t err=%v", settled, err)
+	if settled, err := h.store.RecordOwedComputerAttemptRevocations(ctx, twoAttempts,
+		[]contract.ComputerTokenRevocationReceipt{attemptReceipt("attempt-b")}); err != nil || settled {
+		t.Fatalf("one of two receipts = settled %t err=%v, want recorded and still owed", settled, err)
+	}
+	owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations
+	if len(owed) != 1 || !slices.Equal(owed[0].RevokedAttemptIDs, []string{"attempt-b"}) {
+		t.Fatalf("partially settled revocation = %#v", owed)
+	}
+	if settled, err := h.store.RecordOwedComputerAttemptRevocations(ctx, twoAttempts,
+		[]contract.ComputerTokenRevocationReceipt{attemptReceipt("attempt-b"), attemptReceipt("attempt-a")}); err != nil || !settled {
+		t.Fatalf("both receipts = settled %t err=%v", settled, err)
+	}
+	audit = owedRevocationAuditRows(t, h, computer.ComputerID)
+	if last := audit[len(audit)-1]; last.record == nil || len(last.record.Attempts) != 2 ||
+		last.record.Attempts[0].ComputerAttemptID != "attempt-a" || last.record.Attempts[1].ComputerAttemptID != "attempt-b" {
+		t.Fatalf("two-attempt settlement = %#v", last)
 	}
 }
 
@@ -443,7 +689,7 @@ func TestOwedRevocationWithoutRunLedgerIsClosedNotOwed(t *testing.T) {
 		t.Fatalf("owed revocations without a run ledger = %#v", owed)
 	}
 	audit := owedRevocationAuditRows(t, h, computer.ComputerID)
-	if len(audit) != 1 || audit[0].settlement != owedRevocationSettledNoRunLedger || audit[0].receipt != nil {
+	if len(audit) != 1 || audit[0].settlement != owedRevocationSettledNoRunLedger || audit[0].record != nil {
 		t.Fatalf("audit without a run ledger = %#v", audit)
 	}
 }

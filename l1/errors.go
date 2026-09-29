@@ -70,6 +70,21 @@ func computerRevocationOwed(err error) error {
 	return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: message, Cause: err, notRetryable: true}
 }
 
+// computerRevocationNothingOwed refuses after an authority-losing Computer
+// mutation committed while the run ledger could not take its revoke-all, and
+// no attempt of the Computer could hold a pass when the mutation began. The
+// owed row is closed as nothing to revoke: L3 mints a pass only for a claimed
+// or running attempt, and re-proves that scope on every use.
+func computerRevocationNothingOwed(err error) error {
+	message := "the Computer mutation applied, but the run ledger could not be reached, so the explicit revocation " +
+		"of its token grants was not recorded; no attempt could hold a token when the mutation began, so nothing " +
+		"is owed, and L3's live-scope check already refuses the Computer's old tokens"
+	if err != nil {
+		message = fmt.Sprintf("%s: %v", message, err)
+	}
+	return &Error{Code: contract.ErrorRunLedgerUnavailable, Message: message, Cause: err, notRetryable: true}
+}
+
 // computerRevocationNotRecorded refuses when a call that committed no new
 // authority loss -- an accepted replay, or a stop or remove that found
 // nothing to change -- could not re-drive the explicit revocation. The

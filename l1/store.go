@@ -167,7 +167,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 
 	query := make(url.Values)
-	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeout.Milliseconds()))
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", "secure_delete(1)")
 	query.Set("_txlock", "immediate")
@@ -845,8 +845,11 @@ CREATE INDEX IF NOT EXISTS computer_takeover_audit_computer_time
   ON computer_takeover_audit(computer_id, occurred_ns, attempt_id, event_id);
 -- computer_owed_revocations keeps the explicit L3 revocation an
 -- authority-losing Computer mutation owes, written in that mutation's own
--- transaction, until the run ledger takes it (#554). A settled row is the
--- audit record: immutable, never deleted, carrying the run ledger's receipt.
+-- transaction, until the run ledger takes it (#554). recorded_attempt_ids_json
+-- names the attempts whose passes it ends: those that could hold one when the
+-- mutation began. A late settlement revokes exactly those, one attempt-scoped
+-- request each, and gathers their receipts in attempt_receipts_json. A settled
+-- row is the audit record: immutable, never deleted.
 CREATE TABLE IF NOT EXISTS computer_owed_revocations (
   revocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
   computer_id TEXT NOT NULL,
@@ -855,12 +858,13 @@ CREATE TABLE IF NOT EXISTS computer_owed_revocations (
   reason TEXT NOT NULL CHECK(reason <> ''),
   scope TEXT NOT NULL CHECK(scope IN ('revoke_all', 'attempt')),
   computer_attempt_id TEXT NOT NULL DEFAULT '',
-  attempts_at_commit_json BLOB NOT NULL,
+  recorded_attempt_ids_json BLOB NOT NULL,
+  attempt_receipts_json BLOB NOT NULL DEFAULT X'5B5D',
   created_ns INTEGER NOT NULL,
   settle_failures INTEGER NOT NULL DEFAULT 0 CHECK(settle_failures >= 0),
   last_failure TEXT NOT NULL DEFAULT '',
   last_failure_ns INTEGER,
-  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'no_run_ledger')),
+  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'nothing_to_revoke', 'no_run_ledger')),
   settled_ns INTEGER,
   receipt_json BLOB,
   CHECK((scope = 'attempt') = (computer_attempt_id <> '')),

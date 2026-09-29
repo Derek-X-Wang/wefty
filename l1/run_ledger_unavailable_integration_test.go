@@ -126,21 +126,23 @@ func TestComputerAuthorityLossRefusesTypedWhenRunLedgerIsUnreachable(t *testing.
 			}
 			status, body := verb.mutate(t, h, client, computer)
 			// Post-commit: not retryable, because nothing the caller repeats
-			// performs the revocation, and it does not need to: L1 holds it
-			// owed (#554), and L3's live-scope check already refuses the old
-			// tokens.
+			// performs the revocation, and it does not need to: L3's
+			// live-scope check already refuses the old tokens. This Computer
+			// never ran, so no attempt could hold a pass and nothing is owed
+			// (#554); a running one's revocation stays owed instead (see
+			// owed_revocation_integration_test.go).
 			assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied",
-				"is owed", "L1 recorded it and will retry it", "do not retry the request",
-				"live-scope check already refuses")
+				"was not recorded", "nothing is owed", "live-scope check already refuses")
 			after, err := h.store.GetComputer(context.Background(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			verb.applied(t, after)
-			if len(after.OwedRevocations) != 1 || after.OwedRevocations[0].Verb != ComputerRevocationVerb(verb.name) ||
-				after.OwedRevocations[0].Scope != ComputerRevocationScopeRevokeAll || after.OwedRevocations[0].SettleFailures != 1 ||
-				!strings.Contains(after.OwedRevocations[0].LastFailure, "connection refused") {
-				t.Fatalf("owed revocations after a refused %s = %#v", verb.name, after.OwedRevocations)
+			var settlement string
+			if err := h.store.db.QueryRow(`SELECT settlement FROM computer_owed_revocations WHERE computer_id=? AND verb=?`,
+				computer.ComputerID, verb.name).Scan(&settlement); err != nil || len(after.OwedRevocations) != 0 ||
+				settlement != owedRevocationSettledNothingToRevoke {
+				t.Fatalf("after a refused %s: settlement=%q err=%v owed=%#v", verb.name, settlement, err, after.OwedRevocations)
 			}
 			if strings.Contains(logs.text(), "event=l1_internal_error_scrubbed") {
 				t.Fatalf("a typed refusal was still logged as a scrubbed internal error: %s", logs.text())

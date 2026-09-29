@@ -1042,6 +1042,11 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if computer.DesiredState == request.DesiredState {
 		return computer, nil
 	}
+	// Read before the stop moves the Job or clears its current attempt.
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
+	}
 	nextRevision := computer.IntentRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?, updated_ns=?
 		WHERE computer_id=? AND intent_revision=?`, request.DesiredState, nextRevision, now.UnixNano(), computerID,
@@ -1076,7 +1081,7 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if request.DesiredState == contract.ServiceDesiredStopped {
 		updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
 			computerID: computerID, hostNodeID: computerHostNodeID(computer),
-			verb: ComputerRevocationVerbStop, reason: "computer_stopped",
+			verb: ComputerRevocationVerbStop, reason: "computer_stopped", holdingAttempts: holding,
 		}, now)
 		if err != nil {
 			return Computer{}, err
@@ -1226,6 +1231,10 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err := requireCurrentComputerStorage(ctx, tx, computer, "restart"); err != nil {
 		return Computer{}, false, err
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, false, err
+	}
 	var latchedFailure contract.SpawnFailure
 	activeResourceRestart := (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning) &&
 		json.Unmarshal(computer.CurrentJob.LastFailure, &latchedFailure) == nil &&
@@ -1292,7 +1301,7 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	}
 	updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
 		computerID: computerID, hostNodeID: computerHostNodeID(computer),
-		verb: ComputerRevocationVerbRestart, reason: "computer_restarted",
+		verb: ComputerRevocationVerbRestart, reason: "computer_restarted", holdingAttempts: holding,
 	}, now)
 	if err != nil {
 		return Computer{}, false, err
@@ -1337,6 +1346,11 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		computer.ReconfigurationPhase != ComputerReconfigurationGrowing {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	}
+	// Read before the removal marks these attempts lost.
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
 	}
 	nextRevision := computer.IntentRevision + 1
 	if computer.ReconfigurationPhase == ComputerReconfigurationResetting {
@@ -1490,7 +1504,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	removed.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
 		computerID: computerID, hostNodeID: computerHostNodeID(computer),
-		verb: ComputerRevocationVerbRemove, reason: "computer_removed",
+		verb: ComputerRevocationVerbRemove, reason: "computer_removed", holdingAttempts: holding,
 	}, now)
 	if err != nil {
 		return Computer{}, err
@@ -1738,6 +1752,10 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
+	}
 	if _, _, dispatchErr := getJobByDispatchKey(ctx, tx, request.Spec.DispatchKey, now); dispatchErr == nil {
 		return Computer{}, protocolError(contract.ErrorDispatchKeyConflict,
 			"dispatch key %q is already in use", request.Spec.DispatchKey)
@@ -1829,6 +1847,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	}
 	updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
 		computerID: computerID, hostNodeID: computerHostNodeID(computer), verb: verb, reason: "computer_reimaged",
+		holdingAttempts: holding,
 	}, now)
 	if err != nil {
 		return Computer{}, err

@@ -7,10 +7,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -363,83 +361,5 @@ func TestControlPlaneAttemptScopedRevocationRevokesOnlyThatAttempt(t *testing.T)
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_token_audit WHERE operation='revoked'
 		AND computer_id='computer-1' AND computer_attempt_id='attempt-2' AND reason='attempt_terminal'`).Scan(&audited); err != nil || audited != 1 {
 		t.Fatalf("attempt-scoped revocation audit rows = %d err=%v, want 1", audited, err)
-	}
-}
-
-// #554: L1 settles an owed Computer-wide revocation late, after the Computer
-// may have minted a pass for an attempt that began after the authority loss.
-// The narrowed revoke-all ends every other grant of the Computer and leaves
-// the named attempts' grants alone; the receipt echoes what it preserved.
-func TestNarrowedRevokeAllPreservesNamedAttempts(t *testing.T) {
-	ctx := context.Background()
-	store, err := OpenStore(filepath.Join(t.TempDir(), "computer-narrowed-revoke-all.sqlite"), StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	replacementProof := testComputerScope()
-	replacementProof.ComputerAttemptID = "attempt-2"
-	replacement, err := store.MintComputerToken(ctx, replacementProof)
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherProof := testComputerScope()
-	otherProof.ComputerID = "computer-2"
-	otherProof.HostNodeID = "node-2"
-	other, err := store.MintComputerToken(ctx, otherProof)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, invalid := range map[string]ComputerTokenRevocationRequest{
-		"without_revoke_all":    {ComputerID: "computer-1", SubmitIntentRevision: 1, PreserveComputerAttemptIDs: []string{"attempt-2"}, Reason: "computer_stopped"},
-		"with_restore_revision": {ComputerID: "computer-1", SubmitIntentRevision: 1, RevokeAll: true, RestoreOperationRevision: 3, PreserveComputerAttemptIDs: []string{"attempt-2"}, Reason: "computer_restoring"},
-		"with_attempt":          {ComputerID: "computer-1", ComputerAttemptID: "attempt-1", PreserveComputerAttemptIDs: []string{"attempt-2"}, Reason: "attempt_terminal"},
-		"blank_attempt":         {ComputerID: "computer-1", SubmitIntentRevision: 1, RevokeAll: true, PreserveComputerAttemptIDs: []string{""}, Reason: "computer_stopped"},
-		"padded_attempt":        {ComputerID: "computer-1", SubmitIntentRevision: 1, RevokeAll: true, PreserveComputerAttemptIDs: []string{" attempt-2"}, Reason: "computer_stopped"},
-		"repeated_attempt":      {ComputerID: "computer-1", SubmitIntentRevision: 1, RevokeAll: true, PreserveComputerAttemptIDs: []string{"attempt-2", "attempt-2"}, Reason: "computer_stopped"},
-		"too_many_attempts": {ComputerID: "computer-1", SubmitIntentRevision: 1, RevokeAll: true,
-			PreserveComputerAttemptIDs: func() []string {
-				ids := make([]string, MaxPreservedComputerAttempts+1)
-				for index := range ids {
-					ids[index] = fmt.Sprintf("attempt-%d", index)
-				}
-				return ids
-			}(), Reason: "computer_stopped"},
-	} {
-		receipt, err := store.RevokeComputerTokens(ctx, invalid)
-		var protocolErr *Error
-		if !errors.As(err, &protocolErr) || protocolErr.Code != contract.ErrorInvalidRequest || receipt.RevokedGrantCount != 0 {
-			t.Fatalf("%s: receipt=%#v err=%v, want invalid_request", name, receipt, err)
-		}
-	}
-	if _, err := store.AuthenticateComputerToken(ctx, replacement.Token); err != nil {
-		t.Fatalf("a refused narrowed revocation revoked the replacement: %v", err)
-	}
-
-	narrowed := ComputerTokenRevocationRequest{ComputerID: "computer-1", SubmitIntentRevision: 1, RevokeAll: true,
-		PreserveComputerAttemptIDs: []string{"attempt-2"}, Reason: "computer_stopped"}
-	receipt, err := store.RevokeComputerTokens(ctx, narrowed)
-	if err != nil || receipt.RevokedGrantCount != 0 || !slices.Equal(receipt.PreservedComputerAttemptIDs, []string{"attempt-2"}) ||
-		receipt.ComputerAttemptID != "" || receipt.CommittedAt.IsZero() {
-		t.Fatalf("narrowed revoke-all receipt = %#v err=%v", receipt, err)
-	}
-	if _, err := store.AuthenticateComputerToken(ctx, replacement.Token); err != nil {
-		t.Fatalf("narrowed revoke-all revoked the preserved attempt: %v", err)
-	}
-	// Replayed, it is still a no-op for the preserved attempt.
-	if receipt, err = store.RevokeComputerTokens(ctx, narrowed); err != nil || receipt.RevokedGrantCount != 0 {
-		t.Fatalf("replayed narrowed revoke-all receipt = %#v err=%v", receipt, err)
-	}
-	// Preserving a different attempt ends this one.
-	receipt, err = store.RevokeComputerTokens(ctx, ComputerTokenRevocationRequest{ComputerID: "computer-1",
-		SubmitIntentRevision: 1, RevokeAll: true, PreserveComputerAttemptIDs: []string{"attempt-3"}, Reason: "computer_stopped"})
-	if err != nil || receipt.RevokedGrantCount != 1 {
-		t.Fatalf("revoke-all preserving another attempt receipt = %#v err=%v", receipt, err)
-	}
-	if _, err := store.AuthenticateComputerToken(ctx, replacement.Token); err == nil {
-		t.Fatal("revoke-all preserving another attempt left this attempt's grant active")
-	}
-	if _, err := store.AuthenticateComputerToken(ctx, other.Token); err != nil {
-		t.Fatalf("a narrowed revoke-all reached another Computer: %v", err)
 	}
 }

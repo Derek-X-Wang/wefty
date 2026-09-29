@@ -367,6 +367,10 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 		computer.DesiredDiskBytes != row.OldDiskBytes {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer grow no longer owns the current Storage budget")
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
+	}
 	status, failure := "applied", ""
 	if request.Receipt.Applied {
 		if _, err := tx.ExecContext(ctx, `UPDATE computers SET desired_disk_bytes=? WHERE computer_id=?`,
@@ -419,6 +423,7 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 		updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
 			computerID: computerID, hostNodeID: computerHostNodeID(computer),
 			verb: ComputerRevocationVerbGrowAcknowledgement, reason: "computer_grow_capacity_failed",
+			holdingAttempts: holding,
 		}, now)
 		if err != nil {
 			return Computer{}, err

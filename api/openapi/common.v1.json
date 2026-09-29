@@ -15,7 +15,6 @@
           "submit_intent_revision": { "type": "integer", "minimum": 0 },
           "restore_operation_revision": { "type": "integer", "minimum": 1, "description": "When present, acknowledges a committed fresh RevokeAll for this restore operation. Omitted for general or legacy revocation." },
           "computer_attempt_id": { "type": "string", "minLength": 1, "description": "When present, acknowledges a committed revocation of only this attempt's grants." },
-          "preserved_computer_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 256, "uniqueItems": true, "description": "When present, the attempts a narrowed revoke_all left untouched (#554)." },
           "revoked_grant_count": { "type": "integer", "minimum": 0 },
           "committed_at": { "type": "string", "format": "date-time", "description": "L3 audit time; never a cross-host ordering prerequisite." }
         }
@@ -526,7 +525,7 @@
           "owed_revocations": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/OwedComputerRevocation" },
-            "description": "Explicit L3 revocations this Computer's authority-losing mutations committed and the run ledger has not yet taken, oldest first. Omitted when none is owed. L3's live-scope check already refuses the old passes; each settles on the host Node's heartbeat (#554)."
+            "description": "Explicit L3 revocations this Computer's authority-losing mutations committed and the run ledger has not yet taken, oldest first. Omitted when none is owed. L3's live-scope check already refuses the old passes; each settles on the host Node's heartbeat, attempt-scoped (#554)."
           },
           "storage_cleanup_quarantines": {
             "type": "array",
@@ -819,15 +818,17 @@
       "OwedComputerRevocation": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["revocation_id", "computer_id", "host_node_id", "verb", "reason", "scope", "created_at", "settle_failures"],
+        "required": ["revocation_id", "computer_id", "host_node_id", "verb", "reason", "scope", "recorded_attempt_ids", "created_at", "settle_failures"],
         "properties": {
           "revocation_id": { "type": "integer", "format": "int64", "minimum": 1 },
           "computer_id": { "type": "string", "minLength": 1 },
           "host_node_id": { "type": "string", "minLength": 1, "description": "The Node whose heartbeat settles this revocation." },
           "verb": { "enum": ["stop", "restart", "reset", "project", "reimage", "remove", "grow_acknowledgement", "attempt_completion"] },
           "reason": { "type": "string", "minLength": 1 },
-          "scope": { "enum": ["revoke_all", "attempt"], "description": "revoke_all ends every grant the Computer held when the mutation committed and spares attempts begun later; attempt ends exactly computer_attempt_id's grants and never widens." },
+          "scope": { "enum": ["revoke_all", "attempt"], "description": "What the revocation sent right after the mutation ends: every grant of the Computer, or exactly computer_attempt_id's. A late settlement is always attempt-scoped, one request per recorded attempt, and never sends a revoke-all." },
           "computer_attempt_id": { "type": "string", "minLength": 1 },
+          "recorded_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true, "description": "The attempts whose passes this revocation ends: those of the Computer's current Job that were claimed or running when the mutation began, or the one completed attempt. An attempt started later is never named, so a late settlement cannot touch it." },
+          "revoked_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true, "description": "Recorded attempts the run ledger has already revoked; the row settles when every recorded attempt is here." },
           "created_at": { "type": "string", "format": "date-time" },
           "settle_failures": { "type": "integer", "minimum": 0 },
           "last_failure": { "type": "string" },
