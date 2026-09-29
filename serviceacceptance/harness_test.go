@@ -156,6 +156,11 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 			"--allow-plain-person-identities",
 			"--run-ledger="+runLedgerAddress,
 		)
+	} else {
+		// No L3 in this lane: plain Fabric cannot reach the default logical
+		// run-ledger name from a separate process, and L1 refuses to start
+		// with an unreachable one (#548).
+		controlPlaneArguments = append(controlPlaneArguments, "--run-ledger=")
 	}
 	if options.computerLane {
 		controlPlaneArguments = append(controlPlaneArguments, "--computer-backup-cap=4")

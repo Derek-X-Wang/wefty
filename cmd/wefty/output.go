@@ -82,12 +82,12 @@ func writeAccepted(writer io.Writer, accepted l3.RunAccepted, jsonOutput bool) e
 
 func writeNodesTable(writer io.Writer, nodes []l1.Node) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "NODE ID\tREACHABILITY\tCLAIMS ENABLED (ELIGIBILITY)\tONE-SHOT SLOTS\tSERVICE SLOTS\tOVERCOMMITTED\tINTENT REVISION\tINTENT REASON\tINTENT ACTOR\tOS/ARCH\tAGENT VERSION\tTAGS\tLAST HEARTBEAT"); err != nil {
+	if _, err := fmt.Fprintln(table, "NODE ID\tREACHABILITY\tWITHDRAWN CAPABILITIES\tWITHDRAWAL REASON\tCLAIMS ENABLED (ELIGIBILITY)\tONE-SHOT SLOTS\tSERVICE SLOTS\tOVERCOMMITTED\tINTENT REVISION\tINTENT REASON\tINTENT ACTOR\tOS/ARCH\tAGENT VERSION\tTAGS\tLAST HEARTBEAT"); err != nil {
 		return err
 	}
 	for _, node := range nodes {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%t\t%d/%d\t%d/%d\t%t\t%d\t%s\t%s\t%s/%s\t%s\t%s\t%s\n",
-			node.NodeID, node.State, node.ClaimsEnabled,
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%t\t%d/%d\t%d/%d\t%t\t%d\t%s\t%s\t%s/%s\t%s\t%s\t%s\n",
+			node.NodeID, node.State, withdrawnCapabilities(node), withdrawalReason(node), node.ClaimsEnabled,
 			node.OneshotOccupancy, node.MaxOneshotSlots, node.ServiceOccupancy, node.MaxServiceSlots,
 			node.Overcommitted, node.IntentRevision, node.IntentReason, node.IntentActor,
 			node.OS, node.Architecture, node.AgentVersion,
@@ -96,6 +96,26 @@ func writeNodesTable(writer io.Writer, nodes []l1.Node) error {
 		}
 	}
 	return table.Flush()
+}
+
+// withdrawnCapabilities and withdrawalReason put a node's own account of what
+// it can no longer run next to the reachability it still advertises. Without
+// them the fleet view showed a node as alive with claims enabled and a booked
+// service slot while it had quietly dropped kind:oci and could run nothing
+// (wefty #548). Both facts were already in the projection; only the table
+// hid them.
+func withdrawnCapabilities(node l1.Node) string {
+	if len(node.MissingCapabilities) == 0 {
+		return "none"
+	}
+	return strings.Join(node.MissingCapabilities, ",")
+}
+
+func withdrawalReason(node l1.Node) string {
+	if node.CapabilityReasonCode == "" {
+		return "none"
+	}
+	return string(node.CapabilityReasonCode)
 }
 
 func writeLogEvents(stdout, stderr io.Writer, events []contract.LogEvent) error {

@@ -42,7 +42,8 @@ func assertNodeCLIIntentAndCapacity(t *testing.T) {
 
 	initial := runNodeCLI(t, ctx, harness.clients, false, "nodes", "list")
 	for _, want := range []string{
-		"REACHABILITY", "CLAIMS ENABLED (ELIGIBILITY)", "ONE-SHOT SLOTS", "SERVICE SLOTS",
+		"REACHABILITY", "WITHDRAWN CAPABILITIES", "WITHDRAWAL REASON",
+		"CLAIMS ENABLED (ELIGIBILITY)", "ONE-SHOT SLOTS", "SERVICE SLOTS",
 		"capacity-node", "alive", "OVERCOMMITTED",
 	} {
 		if !strings.Contains(initial, want) {
@@ -50,7 +51,10 @@ func assertNodeCLIIntentAndCapacity(t *testing.T) {
 		}
 	}
 	initialFields := nodeTableFields(t, initial, capacityNode.node.NodeID)
-	if initialFields[3] != "2/8" || initialFields[4] != "3/4" || initialFields[5] != "false" {
+	if initialFields[2] != "none" || initialFields[3] != "none" {
+		t.Fatalf("a node with nothing withdrawn = %q, want explicit \"none\" capability columns", initialFields)
+	}
+	if initialFields[5] != "2/8" || initialFields[6] != "3/4" || initialFields[7] != "false" {
 		t.Fatalf("initial capacity fields = %q, want one-shot 2/8, service 3/4, overcommitted false", initialFields)
 	}
 
@@ -60,7 +64,7 @@ func assertNodeCLIIntentAndCapacity(t *testing.T) {
 	}
 	overcommitted := runNodeCLI(t, ctx, harness.clients, false, "nodes", "list")
 	overcommittedFields := nodeTableFields(t, overcommitted, capacityNode.node.NodeID)
-	if overcommittedFields[3] != "2/1" || overcommittedFields[4] != "3/2" || overcommittedFields[5] != "true" {
+	if overcommittedFields[5] != "2/1" || overcommittedFields[6] != "3/2" || overcommittedFields[7] != "true" {
 		t.Fatalf("reduced capacity fields = %q, want one-shot 2/1, service 3/2, overcommitted true", overcommittedFields)
 	}
 
@@ -262,4 +266,24 @@ func nodeTableFields(t *testing.T, output, nodeID string) []string {
 	}
 	t.Fatalf("node %q has no table row:\n%s", nodeID, output)
 	return nil
+}
+
+// TestNodeListNamesAWithdrawnCapability is the fleet-view half of wefty #548.
+// A node that had quietly dropped kind:oci still read as alive with claims
+// enabled and a booked service slot, so an operator scanning the fleet had no
+// way to see that it could run nothing.
+func TestNodeListNamesAWithdrawnCapability(t *testing.T) {
+	var output strings.Builder
+	node := l1.Node{State: contract.NodeAlive, ClaimsEnabled: true, MaxServiceSlots: 2, ServiceOccupancy: 1}
+	node.NodeID = "mac-attended"
+	node.MissingCapabilities = []string{"kind:oci"}
+	node.CapabilityReasonCode = contract.CapabilityReasonHelperHandshakeFailed
+	if err := writeNodesTable(&output, []l1.Node{node}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"kind:oci", string(contract.CapabilityReasonHelperHandshakeFailed)} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("nodes list output missing %q:\n%s", want, output.String())
+		}
+	}
 }

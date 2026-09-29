@@ -72,6 +72,7 @@ type Server struct {
 	computerPolicyFreshness time.Duration
 	computerPolicyWatchWait time.Duration
 	computerTokenRevoker    ComputerTokenRevoker
+	restoreRevocationBudget time.Duration
 	runLedgerNodeID         string
 	handler                 http.Handler
 	reconcile               func(context.Context) (ReconcileResult, error)
@@ -132,6 +133,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		computerPolicyFreshness: policyFreshness,
 		computerPolicyWatchWait: policyWatchWait,
 		computerTokenRevoker:    config.ComputerTokenRevoker,
+		restoreRevocationBudget: HeartbeatRestoreRevocationBudget,
 		runLedgerNodeID:         runLedgerNodeID,
 		reconcile:               store.Reconcile,
 		logf:                    log.Printf,
@@ -382,7 +384,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/admin-policy", s.authorize(personPrincipal, person))
 	root.Handle("/v1/admin-policy/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/whoami", s.authorize(personPrincipal, person))
-	return root
+	return s.observeInternalErrors(root)
 }
 
 func (s *Server) proveServiceBinding(w http.ResponseWriter, r *http.Request) {
@@ -446,7 +448,7 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 	}
 	var receipt *contract.ComputerTokenRevocationReceipt
 	if mutationApplied && s.computerTokenRevoker == nil {
-		writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"), "revoke Computer token grants"))
+		writeError(w, runLedgerUnavailable(nil, "this control plane has no run-ledger address, so Computer token grants cannot be revoked"))
 		return
 	}
 	if mutationApplied {
@@ -455,7 +457,8 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 			Reason: "submission_intent_advanced",
 		})
 		if revokeErr != nil {
-			writeError(w, internalError(revokeErr, "revoke Computer token grants before submission mutation"))
+			writeError(w, runLedgerUnavailable(revokeErr,
+				"the run ledger could not be reached to revoke Computer token grants, so the submission mutation was not applied"))
 			return
 		}
 		if observed.ComputerID != computer.ComputerID || observed.SubmitIntentRevision != computer.SubmitIntentRevision+1 || observed.CommittedAt.IsZero() {
@@ -1480,6 +1483,123 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
+// withoutUnrevokedRestores drops the copy directives for restores whose
+// pre-restore authority revocation is still owed. A restore must never reach a
+// node while the Computer's submission tokens are still live; withholding the
+// one directive keeps that closed without taking the heartbeat down with it.
+func withoutUnrevokedRestores(directives []ComputerStorageCopyDirective, owed map[string]struct{}) []ComputerStorageCopyDirective {
+	if len(owed) == 0 {
+		return directives
+	}
+	kept := make([]ComputerStorageCopyDirective, 0, len(directives))
+	for _, directive := range directives {
+		if _, blocked := owed[directive.DestinationComputerID]; blocked && directive.Operation == "restore" {
+			continue
+		}
+		kept = append(kept, directive)
+	}
+	return kept
+}
+
+// HeartbeatRestoreRevocationBudget bounds how long one heartbeat may spend
+// waiting on the run ledger for pre-restore revocations. The node agent gives
+// the whole heartbeat call agent.DefaultOperationTimeout, which is
+// ComputerPolicyClientTimeout (10s), and the run-ledger client uses that same
+// 10s. A run ledger that hangs rather than refuses would therefore spend the
+// agent's entire deadline before L1 could defer anything, and the heartbeat
+// would fail node-wide exactly as it did when the revocation refused (wefty
+// #548). Three seconds leaves the remaining seven for the heartbeat's own
+// store reads and writes and the network round trip; a healthy run ledger
+// answers a revocation in milliseconds.
+const HeartbeatRestoreRevocationBudget = 3 * time.Second
+
+type restoreRevocationOutcome struct {
+	revocation ComputerRestoreRevocationDirective
+	receipt    contract.ComputerTokenRevocationReceipt
+	err        error
+}
+
+// revokeBeforeRestores asks the run ledger for every owed pre-restore
+// revocation at once, under one shared budget. Concurrency is what keeps the
+// budget per pass rather than per Computer: one hanging revocation neither
+// starves the others of time nor multiplies the wait by the number of
+// restores. The call returns when every revocation has answered or the budget
+// ends, whichever is first, so a revoker that ignores its context still cannot
+// hold the heartbeat. Whatever has not answered by then is owed exactly like a
+// refusal: nothing is recorded, the restore directive is withheld, and the next
+// heartbeat lists it again. A late answer is discarded; the run ledger's
+// revoke-all is idempotent, so asking again next pass is safe. Results keep
+// input order so the store writes that follow stay sequential.
+func (s *Server) revokeBeforeRestores(ctx context.Context, revocations []ComputerRestoreRevocationDirective) []restoreRevocationOutcome {
+	outcomes := make([]restoreRevocationOutcome, len(revocations))
+	for index, revocation := range revocations {
+		outcomes[index] = restoreRevocationOutcome{revocation: revocation,
+			err: errors.New("this control plane has no run-ledger address")}
+	}
+	if len(revocations) == 0 || s.computerTokenRevoker == nil {
+		return outcomes
+	}
+	budget := s.restoreRevocationBudget
+	if budget <= 0 {
+		budget = HeartbeatRestoreRevocationBudget
+	}
+	budgetCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	type answer struct {
+		index   int
+		receipt contract.ComputerTokenRevocationReceipt
+		err     error
+	}
+	answers := make(chan answer, len(revocations))
+	for index, revocation := range revocations {
+		go func() {
+			receipt, err := s.computerTokenRevoker.RevokeComputerTokens(budgetCtx, ComputerTokenRevocation{
+				ComputerID: revocation.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true,
+				Reason: "computer_restoring", RestoreOperationRevision: revocation.OperationRevision,
+			})
+			answers <- answer{index: index, receipt: receipt, err: err}
+		}()
+	}
+	unanswered := fmt.Errorf("the run ledger did not answer within the %s heartbeat revocation budget", budget)
+	for index := range outcomes {
+		outcomes[index].err = unanswered
+	}
+	record := func(got answer) {
+		if got.err != nil && budgetCtx.Err() != nil {
+			got.err = fmt.Errorf("%w: %w", unanswered, got.err)
+		}
+		outcomes[got.index].receipt, outcomes[got.index].err = got.receipt, got.err
+	}
+	for pending := len(revocations); pending > 0; pending-- {
+		select {
+		case got := <-answers:
+			record(got)
+		case <-budgetCtx.Done():
+			// Keep every answer that is already in hand; only the silent
+			// ones are owed.
+			for {
+				select {
+				case got := <-answers:
+					record(got)
+				default:
+					return outcomes
+				}
+			}
+		}
+	}
+	return outcomes
+}
+
+// logRunLedgerRevocationDeferred records a pre-restore authority revocation
+// the run ledger did not take. The heartbeat still answers, so this log line
+// is the only place the deferral is named.
+func (s *Server) logRunLedgerRevocationDeferred(computerID string, err error) {
+	if s.logf == nil {
+		return
+	}
+	s.logf("event=l1_restore_revocation_deferred computer_id=%s cause=%q", computerID, scrubbedCause(err))
+}
+
 func (s *Server) revokeComputerAuthority(ctx context.Context, computerID, reason string) error {
 	_, err := s.revokeComputerAuthorityWithReceipt(ctx, computerID, reason)
 	return err
@@ -1493,7 +1613,11 @@ func (s *Server) revokeComputerAuthorityWithReceipt(ctx context.Context, compute
 		ComputerID: computerID, NewSubmitIntentRevision: 1, RevokeAll: true, Reason: reason,
 	})
 	if err != nil {
-		return nil, internalError(err, "revoke Computer token grants after authority loss")
+		// The store mutation that caused this authority loss has already
+		// committed. Saying so in the refusal is the difference between an
+		// operator retrying a verb that already applied and an operator
+		// fixing the run-ledger address (wefty #548).
+		return nil, computerRevocationNotRecorded(err)
 	}
 	return &receipt, nil
 }
@@ -1739,22 +1863,24 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	for _, revocation := range restoreRevocations {
-		if s.computerTokenRevoker == nil {
-			writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"),
-				"revoke pre-restore Computer authority"))
-			return
+	// A pre-restore revocation the run ledger will not take is owed, not
+	// fatal. It stays un-receipted, so the next heartbeat lists it again, and
+	// this heartbeat withholds that one Computer's copy directive below: the
+	// restore still fails closed, which is the whole point of revoking first.
+	// What no longer happens is the rest of the node going with it. Failing
+	// the entire heartbeat took the node's convergence surface down over one
+	// blocked Computer, so the agent could never finish a boot pass and
+	// withdrew kind:oci while still reporting itself alive and claiming
+	// (wefty #548).
+	authorityStillOwed := map[string]struct{}{}
+	for _, outcome := range s.revokeBeforeRestores(r.Context(), restoreRevocations) {
+		if outcome.err != nil {
+			authorityStillOwed[outcome.revocation.ComputerID] = struct{}{}
+			s.logRunLedgerRevocationDeferred(outcome.revocation.ComputerID, outcome.err)
+			continue
 		}
-		tokenReceipt, err := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
-			ComputerID: revocation.ComputerID, NewSubmitIntentRevision: 1, RevokeAll: true,
-			Reason: "computer_restoring", RestoreOperationRevision: revocation.OperationRevision,
-		})
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), revocation.ComputerID, revocation.OperationRevision, ComputerRestoreRevocationEvidence{
-			RevokeAll: true, TokenRevocation: tokenReceipt,
+		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), outcome.revocation.ComputerID, outcome.revocation.OperationRevision, ComputerRestoreRevocationEvidence{
+			RevokeAll: true, TokenRevocation: outcome.receipt,
 		}); err != nil {
 			writeError(w, err)
 			return
@@ -1765,6 +1891,7 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	storageCopies = withoutUnrevokedRestores(storageCopies, authorityStillOwed)
 	custodyExports, err := s.store.ListNodeComputerCustodyExportDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
 	if err != nil {
 		writeError(w, err)
@@ -2266,6 +2393,38 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// scrubbedErrorSink is how the response layer tells the log what it is about
+// to take out of the response. An operator reading "internal server error"
+// has no way to name the fault; L1 owes itself the cause in its own log.
+type scrubbedErrorSink interface {
+	recordScrubbedInternalError(err error)
+}
+
+// observedResponse is the ResponseWriter every route writes through. It holds
+// the request so a scrubbed cause can be logged against the path that raised
+// it, without threading the request through 200-odd writeError call sites.
+type observedResponse struct {
+	http.ResponseWriter
+	request *http.Request
+	logf    func(string, ...any)
+}
+
+func (o *observedResponse) recordScrubbedInternalError(err error) {
+	if o == nil || o.logf == nil {
+		return
+	}
+	o.logf("event=l1_internal_error_scrubbed method=%s path=%s class=%s cause=%q",
+		o.request.Method, o.request.URL.Path, scrubbedClass(err), scrubbedCause(err))
+}
+
+// observeInternalErrors installs the sink for one request. It wraps the whole
+// route tree, so authorization refusals and handler failures alike are seen.
+func (s *Server) observeInternalErrors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&observedResponse{ResponseWriter: w, request: r, logf: s.logf}, r)
+	})
+}
+
 func writeError(w http.ResponseWriter, err error) {
 	code := errorCode(err)
 	status := http.StatusConflict
@@ -2283,20 +2442,29 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusUnprocessableEntity
 	case contract.ErrorNotImplemented:
 		status = http.StatusNotImplemented
+	case contract.ErrorRunLedgerUnavailable:
+		status = http.StatusServiceUnavailable
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
 	}
 	message := err.Error()
 	var details map[string]any
+	retryable := code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted ||
+		code == contract.ErrorRunLedgerUnavailable
 	var protocolErr *Error
 	if errors.As(err, &protocolErr) {
 		details = protocolErr.Details
+		if protocolErr.notRetryable {
+			retryable = false
+		}
 	}
 	if code == contract.ErrorInternal {
 		message = "internal server error"
+		if sink, ok := w.(scrubbedErrorSink); ok {
+			sink.recordScrubbedInternalError(err)
+		}
 	}
 	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{
-		Code: code, Message: message, Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted,
-		Details: details,
+		Code: code, Message: message, Retryable: retryable, Details: details,
 	}})
 }

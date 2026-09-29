@@ -56,7 +56,14 @@ const (
 	ErrorUnsupportedRuntimeHandler   ErrorCode = "unsupported_runtime_handler"
 	ErrorNoResolvedImageSnapshot     ErrorCode = "no_resolved_image_snapshot"
 	ErrorNotImplemented              ErrorCode = "not_implemented"
-	ErrorInternal                    ErrorCode = "internal"
+	// ErrorRunLedgerUnavailable names the one dependency L1 cannot substitute
+	// for: the run ledger that holds Computer submission tokens. L1 must reach
+	// it to revoke a Computer's authority, and when it cannot, the caller is
+	// owed that fact by name. Answering "internal" instead told operators L1
+	// had a bug and told node agents to retry a call that could never succeed
+	// until a human changed the deployment (wefty #548).
+	ErrorRunLedgerUnavailable ErrorCode = "run_ledger_unavailable"
+	ErrorInternal             ErrorCode = "internal"
 )
 
 // APIError is the single error shape shared by every HTTP protocol. Retryable

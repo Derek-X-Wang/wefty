@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,9 +170,10 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
 		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: boolPointer(false),
 			IdempotencyKey: "disable-route"})
-	if status != http.StatusInternalServerError {
-		t.Fatalf("disable without L3 status=%d body=%s", status, body)
-	}
+	// Typed, not scrubbed: an operator who cannot reach the run ledger must be
+	// able to read that from the refusal itself (wefty #548).
+	// Pre-commit: nothing applied, so a retry is exactly the right remedy.
+	assertRunLedgerUnavailable(t, status, body, true, "the submission mutation was not applied")
 	current, err := readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -290,5 +292,129 @@ func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing
 	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"", node.NodeID); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("expired lease scope proof = %v", err)
+	}
+}
+
+// liveComputerTokenScope builds a claimed Computer whose token scope L1 proves,
+// the state every authority-losing verb starts from.
+func liveComputerTokenScope(t *testing.T, name string) (*integrationHarness, Computer, *Claim) {
+	t.Helper()
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: time.Minute}, map[string]NodePolicy{
+		"computer-node": DefaultNodePolicy(contract.StableNodeTagPrefix + "computer-node"),
+	})
+	ctx := context.Background()
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	admin := fabric.Identity{FabricID: "fabric-test", UserID: "admin", DeviceID: "device-1"}
+	challenge, err := h.store.InitiateAdminBootstrap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := h.store.BootstrapAdmin(ctx, admin, challenge.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, _, err := h.store.CreateComputer(ctx, CreateComputerRequest{Name: name,
+		Spec: computerCapabilityJobSpec("computer:" + name), Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, ComputerSubmissionRequest{
+		PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true),
+		IdempotencyKey: name + "-enable",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := h.store.ClaimJob(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim = (%#v, %v)", claim, err)
+	}
+	snapshot, err := h.store.IssueComputerPolicySnapshot(ctx, "fabric-computer-node", "fabric-test",
+		node.NodeID, node.BootSessionID, time.Minute)
+	if err != nil || snapshot == nil {
+		t.Fatalf("snapshot = (%#v, %v)", snapshot, err)
+	}
+	if err := h.store.AcknowledgeComputerPolicyInstallation(ctx, "fabric-computer-node", acknowledgementFor(*snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+		"fabric-computer-node", ""); err != nil {
+		t.Fatalf("scope proof for a live Computer = %v", err)
+	}
+	computer, err = h.store.GetComputer(ctx, computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h, computer, claim
+}
+
+// TestComputerTokenScopeProofRefusesAStoppingComputer closes the gap the #548
+// review found: stop, and a restart of a running resource latch, leave the
+// old attempt claimed or running while it drains, and L1 used to keep proving
+// its scope, so an old token whose explicit revocation was lost still worked
+// at L3. A Computer that is not meant to be running has no submission scope.
+func TestComputerTokenScopeProofRefusesAStoppingComputer(t *testing.T) {
+	for _, verb := range []struct {
+		name   string
+		mutate func(t *testing.T, h *integrationHarness, computer Computer) Computer
+	}{
+		{
+			name: "stop",
+			mutate: func(t *testing.T, h *integrationHarness, computer Computer) Computer {
+				stopped, err := h.store.SetComputerDesiredState(context.Background(), computer.ComputerID,
+					computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return stopped
+			},
+		},
+		{
+			name: "restart of a running resource latch",
+			mutate: func(t *testing.T, h *integrationHarness, computer Computer) Computer {
+				failure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk,
+					Message: "durable allocation is latched"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.store.db.Exec(`UPDATE service_jobs SET last_failure=? WHERE job_id=?`,
+					failure, computer.CurrentJobID); err != nil {
+					t.Fatal(err)
+				}
+				latched, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				restarted, _, err := h.store.RestartComputer(context.Background(), computer.ComputerID, ComputerRestartRequest{
+					ComputerMutationPrecondition: computerPrecondition(latched, "operator"), IdempotencyKey: "restart-latch",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if restarted.DesiredState != contract.ServiceDesiredRunning {
+					t.Fatalf("restart left desired state %q", restarted.DesiredState)
+				}
+				return restarted
+			},
+		},
+	} {
+		t.Run(verb.name, func(t *testing.T) {
+			h, computer, claim := liveComputerTokenScope(t, "scope-"+strings.ReplaceAll(verb.name, " ", "-"))
+			after := verb.mutate(t, h, computer)
+			if after.CurrentJob.State != contract.JobStopping || after.ReconfigurationPhase != ComputerReconfigurationStable {
+				t.Fatalf("%s did not leave a draining attempt behind: job=%q phase=%q", verb.name,
+					after.CurrentJob.State, after.ReconfigurationPhase)
+			}
+			var attemptState string
+			if err := h.store.db.QueryRow(`SELECT state FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).
+				Scan(&attemptState); err != nil || (attemptState != "claimed" && attemptState != "running") {
+				t.Fatalf("old attempt state = %q err=%v, want it still live while it drains", attemptState, err)
+			}
+			if proof, err := h.store.ProveComputerTokenScope(context.Background(), computer.ComputerID,
+				claim.Lease.AttemptID, "fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
+				t.Fatalf("scope proof after %s = (%#v, %v), want forbidden", verb.name, proof, err)
+			}
+		})
 	}
 }

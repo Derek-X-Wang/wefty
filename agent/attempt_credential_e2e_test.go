@@ -35,6 +35,8 @@ func TestProcessJobSpawnsChildWithOnlyTheInjectedCredential(t *testing.T) {
 	server := startManagedProcess(t, controlPlanePath,
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
+		// No run ledger in this installation, said explicitly (wefty #548).
+		"--run-ledger=",
 		"--db="+filepath.Join(directory, "l1.sqlite"),
 		"--lease-duration=3s",
 		"--node-tags=stable-node=linux",

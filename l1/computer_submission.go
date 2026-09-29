@@ -313,6 +313,15 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 	return computer, false, true, nil
 }
 
+// ProveComputerTokenScope is the live-scope gate L3 consults on every
+// Computer bearer request and at mint. It proves scope only for a Computer
+// that is meant to be running now: desired state running, current Job
+// claimed or running, stable reconfiguration phase, and the token's attempt
+// still live. A Computer that is stopping, whether from stop or from a
+// restart of a running resource latch, is refused here even while its old
+// attempt drains. A successful stop already revokes every grant, so the
+// workload has no submission authority during its stop grace either way; this
+// makes a lost revocation fail closed the same way (wefty #548).
 func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attemptID, hostIdentityNodeID, hostNodeID string) (ComputerTokenScopeProof, error) {
 	if computerID == "" || attemptID == "" || (hostIdentityNodeID == "") == (hostNodeID == "") {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer token scope proof is bound to the hosting Node")
@@ -323,11 +332,13 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 	err := s.db.QueryRowContext(ctx, `SELECT c.computer_id, a.attempt_id, c.storage_generation,
 		c.submit_intent_revision, host.identity_node_id, c.submit_max_inflight, c.submit_enabled, a.lease_expires_ns
 		FROM computers c JOIN attempts a ON a.job_id=c.current_job_id
+		JOIN jobs j ON j.job_id=c.current_job_id
 		JOIN nodes host ON host.node_id=a.node_id
 		WHERE c.computer_id=? AND a.attempt_id=? AND c.current_job_id=a.job_id
 		AND c.bound_node_id=a.node_id AND c.placement_node_id=a.node_id
 		AND (?='' OR host.identity_node_id=?) AND (?='' OR host.node_id=?)
-		AND c.desired_state<>'removed' AND c.reconfiguration_phase='stable'
+		AND c.desired_state='running' AND j.state IN ('claimed', 'running')
+		AND c.reconfiguration_phase='stable'
 		AND a.state IN ('claimed', 'running') AND EXISTS(
 			SELECT 1 FROM nodes n JOIN computer_policy_installations i
 			ON i.node_id=n.node_id AND i.boot_session_id=n.boot_session_id
