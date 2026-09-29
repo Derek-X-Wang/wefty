@@ -392,7 +392,33 @@ the lifecycle does not classify the cancellation cause as a `/complete`
 response: it releases that ownership and wakes the bounded outbox reconciler.
 The reconciler survives the attempt authority context, runs at most eight
 attempt workers, and retries both spool scan failures and per-attempt failures
-after the configured injected-clock backoff. While L1 reports the attempt as
+on the injected clock: the configured retry interval, doubled per consecutive
+failure of the same work and capped at 30 seconds (or at the interval itself
+when that is configured larger), reset by the first success. A typed refusal
+that repeating on a retry interval cannot clear -- `node_session_replaced`,
+`identity_bound`, or `principal_forbidden` -- moves the attempt onto a
+re-check schedule instead: 10 seconds, doubling per consecutive refusal, capped
+at one hour, and never abandoned while the evidence is pending. Only the first
+refusal of a run is logged (a different refusal code is logged once as well);
+identical repeats are silent, and one line records the attempt's recovery when
+it finally succeeds. A stuck attempt therefore costs at most one log line per
+agent process and about one L1 request an hour. Its durable evidence is left
+pending on disk throughout, neither delivered nor sealed, and a restarted agent
+starts the schedule again. The re-checks exist because `node_session_replaced`
+also answers a completion L1 has not accepted while the replaced registration's
+lease is still running; once that lease has expired the replay is answered
+`lease_expired` and the result is kept as late evidence, but only within L1's
+late-evidence window (48 hours by default, configurable down to minutes; after
+it L1 keeps a gap instead). The spool does not keep the lease a recovered
+attempt was claimed with, so the schedule starts short and lets doubling find
+it: every wait equals the time already waited plus 10 seconds, so the first
+re-check after the lease runs out comes at most the lease's remainder plus 10
+seconds later, and never more than an hour later. The result therefore lands
+as itself on any L1 whose late-evidence window is longer than its lease plus 10
+seconds; the cost is a few silent requests in the first minutes. For a completion L1 already accepted from an older
+registration, every replay is refused and the row stays until something else
+removes it (service removal purges the job's spool rows; a one-shot row has no
+such path). While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
 completion; an accepted completion closes that attempt's log stream at L1
 (`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
