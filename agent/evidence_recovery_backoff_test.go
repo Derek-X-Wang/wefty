@@ -2,7 +2,6 @@ package agent
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,11 +15,13 @@ import (
 
 // completionCounter answers /complete per attempt from a script: call n gets
 // answers[attempt][n], the last entry repeating, and an empty code is success.
-// An attempt with no script always succeeds. It counts every request.
+// An attempt with no script always succeeds; decide, when set, answers instead
+// of the scripts. It counts every request.
 type completionCounter struct {
 	mu      sync.Mutex
 	calls   map[string]int
 	answers map[string][]contract.ErrorCode
+	decide  func(attemptID string) contract.ErrorCode
 }
 
 func newCompletionCounter(answers map[string][]contract.ErrorCode) *completionCounter {
@@ -44,7 +45,9 @@ func (counter *completionCounter) ServeHTTP(w http.ResponseWriter, request *http
 	call := counter.calls[attemptID]
 	counter.calls[attemptID]++
 	var code contract.ErrorCode
-	if script := counter.answers[attemptID]; len(script) > 0 {
+	if counter.decide != nil {
+		code = counter.decide(attemptID)
+	} else if script := counter.answers[attemptID]; len(script) > 0 {
 		code = script[min(call, len(script)-1)]
 	}
 	counter.mu.Unlock()
@@ -114,13 +117,24 @@ func receiveReport(t *testing.T, reports <-chan error, want ...string) {
 	}
 }
 
+func waitForCompletionCalls(t *testing.T, counter *completionCounter, attemptID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for counter.count(attemptID) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("attempt %s was asked %d times, want %d", attemptID, counter.count(attemptID), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // #549: a node whose registration moved on kept asking L1 to replay a
 // completion L1 had already accepted from the older registration, ten times a
-// second, forever. Now a refusal gets exactly one re-check, after a delay that
-// outlasts the old registration's lease; refused again, the attempt is parked
-// for the life of the agent process. Two requests and two log lines, the
-// evidence untouched on disk, and the next agent process asks again.
-func TestEvidenceRecoveryRechecksRefusalOnceThenParks(t *testing.T) {
+// second, forever, one log line each. Now a refusal is re-checked on a slow
+// schedule -- 2m, 4m, ... capped at an hour -- that never gives up, with one
+// log line for the whole run of identical refusals, the evidence untouched on
+// disk, and the next agent process asking again.
+func TestEvidenceRecoveryRechecksRefusalSlowlyAndLogsOnce(t *testing.T) {
 	for _, code := range []contract.ErrorCode{
 		contract.ErrorNodeSessionReplaced, contract.ErrorIdentityBound, contract.ErrorPrincipalForbidden,
 	} {
@@ -144,22 +158,28 @@ func TestEvidenceRecoveryRechecksRefusalOnceThenParks(t *testing.T) {
 				reported.Add(1)
 				reports <- err
 			})
-			receiveReport(t, reports, string(code), refusedAttempt, "one re-check in 2m0s")
-			clock.waitForDeadline(t, clock.Now().Add(evidenceRecoveryRefusalRecheck))
-			clock.Advance(evidenceRecoveryRefusalRecheck)
-			receiveReport(t, reports, string(code), refusedAttempt, "refused again on re-check")
+			receiveReport(t, reports, string(code), refusedAttempt, "re-checking from 2m0s", "hourly")
 
-			// Each round moves the injected clock far past any backoff or
-			// re-check and runs a full pass.
-			for round := range 4 {
-				clock.Advance(10 * evidenceRecoveryRefusalRecheck)
-				deliverBarrier(t, outbox, fmt.Sprintf("attempt-barrier-%d", round))
+			delays := []time.Duration{
+				2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute, 32 * time.Minute,
+				time.Hour, time.Hour, time.Hour,
 			}
-			if calls := counter.count(refusedAttempt); calls != 2 {
-				t.Fatalf("refused attempt was asked %d times in one session, want 2", calls)
+			for index, delay := range delays {
+				// Armed at exactly this delay, and not asked before it.
+				clock.waitForDeadline(t, clock.Now().Add(delay))
+				if calls := counter.count(refusedAttempt); calls != index+1 {
+					t.Fatalf("before re-check %d L1 was asked %d times", index+1, calls)
+				}
+				clock.Advance(delay)
+				waitForCompletionCalls(t, counter, refusedAttempt, index+2)
 			}
-			if got := reported.Load(); got != 2 {
-				t.Fatalf("refusal produced %d log lines in one session, want 2", got)
+			// A full pass right after a re-check does not ask again early.
+			deliverBarrier(t, outbox, "attempt-barrier")
+			if calls := counter.count(refusedAttempt); calls != len(delays)+1 {
+				t.Fatalf("refused attempt was asked %d times, want %d", calls, len(delays)+1)
+			}
+			if got := reported.Load(); got != 1 {
+				t.Fatalf("a run of identical refusals produced %d log lines, want 1", got)
 			}
 			// Untouched: neither delivered nor sealed, still pending replay.
 			waitForCompletionState(t, outbox, refusedAttempt, "durable_completion")
@@ -176,28 +196,34 @@ func TestEvidenceRecoveryRechecksRefusalOnceThenParks(t *testing.T) {
 			defer restarted.Close()
 			restartReports := make(chan error, 64)
 			restarted.startRecovery(t.Context(), client, func(err error) { restartReports <- err })
-			receiveReport(t, restartReports, string(code), "one re-check")
-			if calls := counter.count(refusedAttempt); calls != 3 {
-				t.Fatalf("restarted agent asked %d times in total, want 3", calls)
+			receiveReport(t, restartReports, string(code), "re-checking from 2m0s")
+			if calls := counter.count(refusedAttempt); calls != len(delays)+2 {
+				t.Fatalf("restarted agent asked %d times in total, want %d", calls, len(delays)+2)
 			}
 			waitForCompletionState(t, restarted, refusedAttempt, "durable_completion")
 		})
 	}
 }
 
-// The case the re-check exists for: L1 refuses a completion it has not
-// accepted while the replaced registration's lease is still running, and
-// answers lease_expired -- recording the result as late evidence -- once that
-// lease has run out. The re-check is not early, and it lands the evidence.
-func TestEvidenceRecoveryRecheckLandsLateEvidenceAfterLease(t *testing.T) {
+// The case the re-checks exist for: L1 refuses a completion it has not
+// accepted while the replaced registration's lease is still running -- here a
+// five-minute lease, longer than the first re-check -- and answers
+// lease_expired, keeping the result as late evidence, once that lease has run
+// out. The re-checks keep going past the long lease and land it.
+func TestEvidenceRecoveryRefusalLandsAfterLongLease(t *testing.T) {
 	const attemptID = "attempt-replaced-in-lease"
-	counter := newCompletionCounter(map[string][]contract.ErrorCode{
-		attemptID: {contract.ErrorNodeSessionReplaced, contract.ErrorLeaseExpired},
-	})
+	clock := newManualClock(time.Date(2026, 9, 23, 3, 13, 0, 0, time.UTC))
+	leaseExpires := clock.Now().Add(5 * time.Minute)
+	counter := newCompletionCounter(nil)
+	counter.decide = func(string) contract.ErrorCode {
+		if clock.Now().Before(leaseExpires) {
+			return contract.ErrorNodeSessionReplaced
+		}
+		return contract.ErrorLeaseExpired
+	}
 	client, stopServer := startEvidenceReplayServer(t, counter, time.Second)
 	defer stopServer()
 	defer client.Close()
-	clock := newManualClock(time.Date(2026, 9, 23, 3, 13, 0, 0, time.UTC))
 	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024*1024, clock, 8, time.Hour, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
@@ -210,26 +236,23 @@ func TestEvidenceRecoveryRecheckLandsLateEvidenceAfterLease(t *testing.T) {
 		reported.Add(1)
 		reports <- err
 	})
-	receiveReport(t, reports, string(contract.ErrorNodeSessionReplaced), "one re-check in 2m0s")
-	recheckAt := clock.Now().Add(evidenceRecoveryRefusalRecheck)
-	clock.waitForDeadline(t, recheckAt)
+	receiveReport(t, reports, string(contract.ErrorNodeSessionReplaced), "re-checking from 2m0s")
 
-	// Well past L1's default lease but short of the re-check: a full pass
-	// leaves the refused attempt alone.
-	clock.Advance(evidenceRecoveryRefusalRecheck - time.Second)
-	deliverBarrier(t, outbox, "attempt-barrier-early")
-	if calls := counter.count(attemptID); calls != 1 {
-		t.Fatalf("refused attempt was re-checked early: %d calls", calls)
-	}
+	// t=2m: still inside the five-minute lease, refused again, silently.
+	clock.waitForDeadline(t, clock.Now().Add(2*time.Minute))
+	clock.Advance(2 * time.Minute)
+	waitForCompletionCalls(t, counter, attemptID, 2)
+	// t=6m: the lease has run out; L1 keeps the result and says lease_expired.
+	clock.waitForDeadline(t, clock.Now().Add(4*time.Minute))
 	waitForCompletionState(t, outbox, attemptID, "durable_completion")
-
-	clock.Advance(time.Second)
+	clock.Advance(4 * time.Minute)
 	waitForCompletionState(t, outbox, attemptID, "delivered")
-	if calls := counter.count(attemptID); calls != 2 {
-		t.Fatalf("L1 was asked %d times, want 2", calls)
+	receiveReport(t, reports, attemptID, "now succeeded")
+	if calls := counter.count(attemptID); calls != 3 {
+		t.Fatalf("L1 was asked %d times, want 3", calls)
 	}
-	if got := reported.Load(); got != 1 {
-		t.Fatalf("%d log lines, want 1", got)
+	if got := reported.Load(); got != 2 {
+		t.Fatalf("%d log lines, want 2 (first refusal, then success)", got)
 	}
 }
 
@@ -317,6 +340,13 @@ func TestEvidenceRecoveryBackoffIsCapped(t *testing.T) {
 	} {
 		if got := evidenceRecoveryBackoff(tc.interval, tc.failures); got != tc.want {
 			t.Errorf("evidenceRecoveryBackoff(%s, %d) = %s, want %s", tc.interval, tc.failures, got, tc.want)
+		}
+	}
+	for refusals, want := range map[int]time.Duration{
+		1: 2 * time.Minute, 2: 4 * time.Minute, 5: 32 * time.Minute, 6: time.Hour, 1 << 20: time.Hour,
+	} {
+		if got := evidenceRecoveryRefusalDelay(refusals); got != want {
+			t.Errorf("evidenceRecoveryRefusalDelay(%d) = %s, want %s", refusals, got, want)
 		}
 	}
 }
