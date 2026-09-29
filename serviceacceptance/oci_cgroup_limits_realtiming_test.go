@@ -3,6 +3,8 @@
 package serviceacceptance
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -12,7 +14,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
-	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
@@ -57,13 +59,16 @@ exit 0
 // linux.only.cgroup_v2_limits cell (#402). The OOM kill elsewhere in the lane
 // shows a memory limit bites; it never shows the limit that reached the kernel
 // is the one the job asked for, and no CPU-capped container ran at all. Here a
-// kind=oci job carrying both limits goes the whole product path -- L1 claim
-// gated on cgroup_v2, the real agent, the root helper's runtime profile,
-// containerd and runc -- and the running container reads its own memory.max
-// and cpu.max back. The expected values come from ocihelper.CgroupResources,
-// the code that wrote the runtime spec, so this proves the spec reached the
-// kernel verbatim; the millicore arithmetic is then checked on its own
-// meaning, and the throttle counter proves the kernel enforces the quota.
+// kind=oci image run carrying both limits goes the whole product path -- an L3
+// run, the L1 claim gated on cgroup_v2, the real agent, the root helper's
+// runtime profile, containerd and runc -- and the running container reads its
+// own memory.max and cpu.max back. It is submitted as a run, not straight to
+// L1, because a one-shot OCI attempt's handoff volume is owned by its run:
+// without the run's owner key the helper refuses the attempt (#494). The
+// expected values come from ocihelper.CgroupResources, the code that wrote the
+// runtime spec, so this proves the spec reached the kernel verbatim; the
+// millicore arithmetic is then checked on its own meaning, and the throttle
+// counter proves the kernel enforces the quota.
 func TestOCICgroupV2LimitsReadBackFromTheRunningContainer(t *testing.T) {
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
@@ -74,33 +79,34 @@ func TestOCICgroupV2LimitsReadBackFromTheRunningContainer(t *testing.T) {
 
 	evidence := newRealTimingEvidence(t)
 	harness := newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{
-		leaseDuration: 10 * time.Second, agentArguments: ociAgentArguments(t),
+		leaseDuration: 10 * time.Second, runLedgerLane: true, agentArguments: ociAgentArguments(t),
 	})
 	t.Cleanup(func() {
 		evidence.recordProcessOutput("oci-cgroup-limits-agent.log", harness.agent)
 	})
 
 	memoryBytes, cpuMillicores := ociCgroupLimitsMemoryBytes, ociCgroupLimitsCPUMillicores
-	spec := contract.JobSpec{
-		SchemaVersion:  contract.SchemaVersionV1,
-		DispatchKey:    "oci-cgroup-limits-" + strconv.FormatInt(time.Now().UnixNano(), 10),
-		Kind:           contract.JobKindOCI,
-		Class:          contract.JobClassOneShot,
-		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
-		RoutingTags:    []string{"service-acceptance"},
-		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
-			Image:  contract.OCIImageSpec{Reference: reference, Digest: stringPointer(digest)},
-			Argv:   []string{"/bin/sh", "-c", ociCgroupLimitsProbe},
-			Limits: &contract.OCILimits{MemoryBytes: &memoryBytes, CPUMillicores: &cpuMillicores},
-		}},
+	request := l3.CreateRunRequest{
+		Image: &contract.ImageProgram{
+			Reference: reference, Digest: stringPointer(digest),
+			Argv:           []string{"/bin/sh", "-c", ociCgroupLimitsProbe},
+			Limits:         &contract.OCILimits{MemoryBytes: &memoryBytes, CPUMillicores: &cpuMillicores},
+			RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+		},
+		Params: json.RawMessage(`{}`),
 	}
-	var job l1.Job
-	status, body := harness.doJSON(t, http.MethodPost, "/v1/jobs", spec, &job)
-	if status != http.StatusCreated {
-		t.Fatalf("submit cgroup-limited OCI job status = %d body=%s", status, body)
+	var accepted l3.RunAccepted
+	status, body := runLedgerJSON(t, harness, http.MethodPost, "/v1/runs",
+		"oci-cgroup-limits-"+strconv.FormatInt(time.Now().UnixNano(), 10), request, &accepted)
+	if (status != http.StatusCreated && status != http.StatusOK) || accepted.RunID == "" {
+		t.Fatalf("submit cgroup-limited OCI run status = %d body=%s", status, body)
 	}
-	finished := waitForOCICgroupLimitsJob(t, harness, job.JobID)
-	observed := readOCICgroupLimitsLines(t, harness, job.JobID)
+	waitForOCIMailboxRun(t, harness, accepted.RunID)
+	_, jobID := readRunLedgerStatus(t, harness, accepted.RunID)
+	if jobID == "" {
+		t.Fatalf("run %s succeeded without an L1 job", accepted.RunID)
+	}
+	observed, attemptID := readOCICgroupLimitsLines(t, harness, jobID)
 
 	memoryMax := observed["memory.max"]
 	quota, period, cpuParsed := parseCgroupCPUMax(observed["cpu.max"])
@@ -113,12 +119,12 @@ func TestOCICgroupV2LimitsReadBackFromTheRunningContainer(t *testing.T) {
 
 	evidence.write(ociCgroupLimitsReceipt, fmt.Appendf(nil,
 		"cgroup_memory_max_readback=%t\ncgroup_cpu_max_readback=%t\ncgroup_cpu_throttled=%t\n"+
-			"cgroup_job_id=%s\ncgroup_attempt_id=%s\n"+
+			"cgroup_run_id=%s\ncgroup_job_id=%s\ncgroup_attempt_id=%s\n"+
 			"cgroup_memory_bytes_requested=%d\ncgroup_memory_max_expected=%d\ncgroup_memory_max_observed=%s\n"+
 			"cgroup_cpu_millicores_requested=%d\ncgroup_cpu_quota_expected=%d\ncgroup_cpu_period_expected=%d\n"+
 			"cgroup_cpu_max_observed=%s\ncgroup_cpu_nr_throttled_before=%s\ncgroup_cpu_nr_throttled_after=%s\n",
 		memoryReadback, cpuReadback, throttled,
-		job.JobID, finished.CurrentAttemptID,
+		accepted.RunID, jobID, attemptID,
 		memoryBytes, expectedMemory, strings.ReplaceAll(memoryMax, " ", "_"),
 		cpuMillicores, expectedQuota, expectedPeriod,
 		strings.ReplaceAll(observed["cpu.max"], " ", "_"),
@@ -171,40 +177,19 @@ func expectedOCICgroupLimits(t *testing.T) (memory, quota int64, period uint64) 
 	return memory, quota, period
 }
 
-func waitForOCICgroupLimitsJob(t *testing.T, harness *acceptanceHarness, jobID string) l1.Job {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Minute)
-	var job l1.Job
-	for time.Now().Before(deadline) {
-		if harness.agent.exited() {
-			t.Fatalf("agent exited while the cgroup-limited job ran: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
-		}
-		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
-		if status != http.StatusOK {
-			t.Fatalf("get cgroup-limited job status = %d body=%s", status, body)
-		}
-		switch job.State {
-		case contract.JobSucceeded:
-			return job
-		case contract.JobFailed:
-			t.Fatalf("cgroup-limited OCI job failed: %s\nlogs:\n%s\nagent:\n%s", body, ociCgroupLimitsLogText(t, harness, jobID), harness.agent.outputString())
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("cgroup-limited OCI job %s stayed %q\nlogs:\n%s\nagent:\n%s", jobID, job.State, ociCgroupLimitsLogText(t, harness, jobID), harness.agent.outputString())
-	return l1.Job{}
-}
-
 // readOCICgroupLimitsLines collects the probe's marker lines from the job's
-// stdout. Completion and the final log flush are not ordered for a reader, so
-// it polls until all four lines are present.
-func readOCICgroupLimitsLines(t *testing.T, harness *acceptanceHarness, jobID string) map[string]string {
+// stdout the way the run-mailbox lane reads workload output: straight from
+// L1's log_events, which is where the agent delivered it. Completion and the
+// final log flush are not ordered for a reader, so it polls until all four
+// lines are present.
+func readOCICgroupLimitsLines(t *testing.T, harness *acceptanceHarness, jobID string) (map[string]string, string) {
 	t.Helper()
 	want := []string{"memory.max", "cpu.max", "nr_throttled_before", "nr_throttled_after"}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
+		stdout, attemptID := ociCgroupLimitsStdout(t, harness, jobID)
 		observed := map[string]string{}
-		for _, line := range strings.Split(ociCgroupLimitsStdout(t, harness, jobID), "\n") {
+		for _, line := range strings.Split(stdout, "\n") {
 			fact, found := strings.CutPrefix(line, ociCgroupLimitsMarker)
 			if !found {
 				continue
@@ -219,45 +204,44 @@ func readOCICgroupLimitsLines(t *testing.T, harness *acceptanceHarness, jobID st
 			complete = complete && present
 		}
 		if complete {
-			return observed
+			return observed, attemptID
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the probe's cgroup readback never reached L1: have %v\nlogs:\n%s", observed, ociCgroupLimitsLogText(t, harness, jobID))
+			t.Fatalf("the probe's cgroup readback never reached L1: have %v%s", observed, lastAttemptOutput(t, harness, jobID))
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
 }
 
-func ociCgroupLimitsStdout(t *testing.T, harness *acceptanceHarness, jobID string) string {
+// ociCgroupLimitsStdout concatenates the job's stdout chunks in delivery
+// order. The run is one-shot with a single successful attempt, which it also
+// returns for the receipt.
+func ociCgroupLimitsStdout(t *testing.T, harness *acceptanceHarness, jobID string) (string, string) {
 	t.Helper()
-	var page l1.LogPage
-	status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"/logs?limit=1000", nil, &page)
-	if status != http.StatusOK {
-		t.Fatalf("read cgroup-limited job logs status = %d body=%s", status, body)
+	database, err := sql.Open("sqlite", harness.l1Database+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer database.Close()
+	rows, err := database.Query(`SELECT attempt_id, bytes FROM log_events
+		WHERE job_id=? AND stream=? ORDER BY ordinal`, jobID, string(contract.LogStdout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
 	var stdout strings.Builder
-	for _, event := range page.Events {
-		if event.Stream == contract.LogStdout {
-			stdout.Write(event.Bytes)
+	var attemptID string
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&attemptID, &payload); err != nil {
+			t.Fatal(err)
 		}
+		stdout.Write(payload)
 	}
-	return stdout.String()
-}
-
-// ociCgroupLimitsLogText is diagnosis only: both streams, so a probe that
-// refused names its reason in the failure.
-func ociCgroupLimitsLogText(t *testing.T, harness *acceptanceHarness, jobID string) string {
-	t.Helper()
-	var page l1.LogPage
-	status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"/logs?limit=1000", nil, &page)
-	if status != http.StatusOK {
-		return fmt.Sprintf("<logs unreadable: status %d body=%s>", status, body)
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
-	var text strings.Builder
-	for _, event := range page.Events {
-		fmt.Fprintf(&text, "[%s] %s", event.Stream, event.Bytes)
-	}
-	return text.String()
+	return stdout.String(), attemptID
 }
 
 // parseCgroupCPUMax reads cgroup v2's "$MAX $PERIOD" pair. An unlimited cgroup
