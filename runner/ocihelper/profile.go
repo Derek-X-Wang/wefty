@@ -663,6 +663,15 @@ func isolationDevices() []specs.LinuxDevice {
 	}
 }
 
+// CgroupResources is the linux.resources block BuildRuntimeSpec writes for a
+// workload with these limits. It exists so the live Linux lane derives the
+// memory.max and cpu.max it reads back from a running container out of the
+// same code that produced the runtime spec, rather than restating the
+// millicore-to-quota mapping (#402).
+func CgroupResources(limits WorkloadLimits, computer bool) (*specs.LinuxResources, error) {
+	return isolationResources(limits, computer)
+}
+
 func isolationResources(limits WorkloadLimits, computer bool) (*specs.LinuxResources, error) {
 	// M3 deliberately leaves Resources.Pids absent; a PID limit remains a
 	// known profile gap rather than an invented default.

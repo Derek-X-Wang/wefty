@@ -47,7 +47,6 @@ const (
 var ociMatrixGapRows = []string{
 	"linux.oneshot.image_identity",
 	"linux.service.removal",
-	"linux.only.cgroup_v2_limits",
 }
 
 func TestOCIAcceptanceMatrixCoversEverySpecCell(t *testing.T) {
@@ -201,6 +200,48 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				}
 			})
 
+			// #402: the cgroup-v2 cell passes only on the live readback of the
+			// running container's own memory.max and cpu.max plus an observed
+			// throttle. A readback that disagreed is a red proof, and a lane
+			// that never wrote the receipt has no proof at all.
+			t.Run("cgroup readback disagreeing with the request fails the cell", func(t *testing.T) {
+				for _, fact := range []string{"cgroup_memory_max_readback", "cgroup_cpu_max_readback", "cgroup_cpu_throttled"} {
+					red := t.TempDir()
+					copyOCIEvidence(t, linux, red)
+					replaceOCIFact(t, filepath.Join(red, "oci-cgroup-limits-linux.txt"), fact, fact+"=false")
+					matrix := assembleOCIMatrix(t, shell, red, "none", "published-artifact", "github-hosted")
+					row := matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)
+					if row["status"] != "FAIL" || row["assertions"].(map[string]any)[fact] != false {
+						t.Fatalf("%s=false produced row %#v, want FAIL", fact, row)
+					}
+					if _, err := runOCIMatrixGate(t, shell, matrix, ociMatrixCandidate, "published-artifact", "github-hosted"); err == nil {
+						t.Fatalf("the matrix gate accepted a cgroup cell whose %s readback was false", fact)
+					}
+				}
+			})
+			t.Run("cgroup cell without its receipt is missing, not passed", func(t *testing.T) {
+				absent := t.TempDir()
+				copyOCIEvidence(t, linux, absent)
+				if err := os.Remove(filepath.Join(absent, "oci-cgroup-limits-linux.txt")); err != nil {
+					t.Fatal(err)
+				}
+				matrix := assembleOCIMatrix(t, shell, absent, "none", "published-artifact", "github-hosted")
+				row := matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)
+				if row["status"] != "MISSING" {
+					t.Fatalf("row without the cgroup receipt = %#v, want MISSING", row)
+				}
+			})
+			t.Run("cgroup cell passes on the live readback", func(t *testing.T) {
+				matrix := assembleOCIMatrix(t, shell, linux, "none", "published-artifact", "github-hosted")
+				row := matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)
+				assertions := row["assertions"].(map[string]any)
+				if row["status"] != "PASS" || len(row["gaps"].(map[string]any)) != 0 ||
+					assertions["cgroup_memory_max_readback"] != true || assertions["cgroup_cpu_max_readback"] != true ||
+					assertions["cgroup_cpu_throttled"] != true {
+					t.Fatalf("cgroup row = %#v, want a PASS measured by all three readback facts", row)
+				}
+			})
+
 			conformant := assembleOCIMatrix(t, shell, linux, conformantMacMatrixFragment(t), "published-artifact", "owner-hardware")
 			for name, mutate := range map[string]func(*testing.T, map[string]any){
 				"missing required row": func(t *testing.T, matrix map[string]any) {
@@ -250,10 +291,10 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 					matrix["rows"].(map[string]any)["mac.only.launch_topology"].(map[string]any)["source"] = "realtiming-linux"
 				},
 				"untyped skip": func(t *testing.T, matrix map[string]any) {
-					matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)["not_run_issue"] = 0
+					matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)["not_run_issue"] = 0
 				},
 				"skip without a reason": func(t *testing.T, matrix map[string]any) {
-					matrix["rows"].(map[string]any)["linux.only.cgroup_v2_limits"].(map[string]any)["reason"] = ""
+					matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)["reason"] = ""
 				},
 				"false assertion on a passing row": func(t *testing.T, matrix map[string]any) {
 					matrix["rows"].(map[string]any)["linux.oneshot.delivery"].(map[string]any)["assertions"] = map[string]any{"oneshot_bridge_once": false}
@@ -482,6 +523,10 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"helper_session_admitted_on_first_connect=true", "helper_first_session_is_probe=true",
 		"helper_service_state_before=inactive/dead", "helper_socket_state_before=active/listening",
 		"helper_service_state_after=active/running", "first_connect_session_dials=1")
+	write("oci-cgroup-limits-linux.txt",
+		"cgroup_memory_max_readback=true", "cgroup_cpu_max_readback=true", "cgroup_cpu_throttled=true",
+		"cgroup_memory_max_observed=67108864", "cgroup_cpu_max_observed=25000_100000",
+		"cgroup_cpu_nr_throttled_before=0", "cgroup_cpu_nr_throttled_after=19")
 	if err := os.WriteFile(filepath.Join(directory, "provenance-receipt.json"), []byte(
 		`{"version":1,"commit":"`+ociMatrixCandidate+`","source":"published-artifact","artifact_run_id":"4242"}`), 0o600); err != nil {
 		t.Fatal(err)
