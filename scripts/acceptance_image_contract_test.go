@@ -533,7 +533,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 }
 
 func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
-	modernWant := splitQualifiedPolicy(systemdpolicy.UnitPolicy(255))
+	modernWant := helperUnitStopAndRestartPolicy(255)
 	// Every source of a helper unit -- the two shipped renderers and the two
 	// workflow-written realtiming fixtures -- matches the shared authority key
 	// for key. There is no exemption: a lane whose helper can hot-loop its boot
@@ -562,7 +562,7 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
-			want := splitQualifiedPolicy(systemdpolicy.UnitPolicy(version))
+			want := helperUnitStopAndRestartPolicy(version)
 			if !maps.Equal(got["Unit"], want["Unit"]) || !maps.Equal(got["Service"], want["Service"]) {
 				t.Fatalf("%s policy=%#v", name, got)
 			}
@@ -626,6 +626,19 @@ func assertAtomicFaultFailurePublications(t *testing.T, text string) {
 			}
 		})
 	}
+}
+
+// helperUnitStopAndRestartPolicy is the shared restart authority plus the stop
+// semantics every helper unit carries. KillMode=mixed sends the stop's SIGTERM
+// to the helper alone, so work it is finishing -- a session reap and the
+// short-lived ip/iptables children it runs -- is not signalled underneath it
+// and the stop ends inactive rather than failed (#579). It lives beside the
+// restart policy rather than in it: doctor's restart-policy drift finding must
+// not start flagging nodes installed before the stop semantics were pinned.
+func helperUnitStopAndRestartPolicy(systemdVersion int) map[string]map[string]string {
+	want := splitQualifiedPolicy(systemdpolicy.UnitPolicy(systemdVersion))
+	want["Service"]["KillMode"] = "mixed"
+	return want
 }
 
 func splitQualifiedPolicy(policy map[string]string) map[string]map[string]string {
@@ -739,7 +752,7 @@ func parseHelperServicePolicySections(text string) (map[string]map[string]string
 			continue
 		}
 		switch key {
-		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec", "RestartPreventExitStatus":
+		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec", "RestartPreventExitStatus", "KillMode":
 			if installSeen {
 				return nil, fmt.Errorf("helper policy key %s appears after [Install]", key)
 			}

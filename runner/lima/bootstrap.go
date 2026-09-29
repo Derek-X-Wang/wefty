@@ -276,6 +276,8 @@ func renderGuestServiceUnit(config GuestHelperInstallConfig) []byte {
 		arguments[index] = systemdQuote(arguments[index])
 	}
 	restartPolicy := guestHelperRestartPolicy(config.SystemdVersion)
+	// KillMode=mixed matches the native unit: a stop signals only the helper,
+	// so a reap in flight is not failed by its own children being killed (#579).
 	return []byte(`[Unit]
 Description=Wefty privileged OCI helper
 After=containerd.service
@@ -289,6 +291,7 @@ Environment=` + ocihelper.AllowedUIDsEnvironment + `=` + strconv.FormatUint(uint
 ExecStart=` + strings.Join(arguments, " ") + `
 StandardOutput=journal
 StandardError=journal
+KillMode=mixed
 Restart=on-failure
 ` + restartPolicy + `NoNewPrivileges=false
 `)

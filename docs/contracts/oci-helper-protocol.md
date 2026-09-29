@@ -46,7 +46,18 @@ root with a narrow UID allowlist. Every shipped systemd helper service, native
 Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
 `Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`,
 `RestartMaxDelaySec=1s`, and `RestartPreventExitStatus=78` under `[Service]`; systemd versions before 254 use a fixed
-`RestartSec=1s` because the geometric directives are unavailable. The workflow-written realtiming
+`RestartSec=1s` because the geometric directives are unavailable.
+Every helper service also sets `KillMode=mixed` under `[Service]`: a stop
+sends SIGTERM to the helper process alone, so the short-lived `ip`, `iptables`,
+and e2fsprogs children it is running finish or are cancelled by the helper
+itself, and whatever remains is SIGKILLed once the helper exits. Containers,
+shims, and loggers live outside the unit's cgroup. A deliberate stop is not a
+failure: a session reap or boot Sweep+Verify that the stop interrupts is logged
+as `interrupted by helper shutdown` with its cause, is not counted toward the
+startup-failure bound below, and the helper exits `0`, so the unit ends
+inactive rather than failed. Nothing is lost, because the next helper start
+runs the whole boot barrier before it admits a session. A reap or barrier
+failure with no stop in progress still exits non-zero. The workflow-written realtiming
 units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
 systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
 baseline both provide systemd 255, and the Linux receipt records the executing
