@@ -142,6 +142,48 @@ func TestOCIAcceptanceMatrixGate(t *testing.T) {
 				}
 			})
 
+			// #402: a rerun after the tag moved is proven live, so the image
+			// identity cell measures it and no longer declares it a gap. Only the
+			// reboot gap keeps the row a typed skip.
+			t.Run("rerun under tag movement is measured, not a gap", func(t *testing.T) {
+				matrix := assembleOCIMatrix(t, shell, linux, conformantMacMatrixFragment(t), "published-artifact", "owner-hardware")
+				row := matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)
+				assertions, gaps := row["assertions"].(map[string]any), row["gaps"].(map[string]any)
+				if assertions["rerun_under_tag_movement_original_digest"] != true || assertions["rerun_under_tag_movement_tag_not_refloated"] != true {
+					t.Fatalf("image identity assertions = %#v, want both rerun facts measured true", assertions)
+				}
+				if _, declared := gaps["rerun_under_tag_movement"]; declared || len(gaps) != 1 || gaps["cache_intact_after_reboot"] == nil {
+					t.Fatalf("image identity gaps = %#v, want only cache_intact_after_reboot", gaps)
+				}
+			})
+			t.Run("rerun that left the original digest fails the cell", func(t *testing.T) {
+				for _, fact := range []string{"rerun_under_tag_movement_original_digest", "rerun_under_tag_movement_tag_not_refloated"} {
+					red := t.TempDir()
+					copyOCIEvidence(t, linux, red)
+					replaceOCIFact(t, filepath.Join(red, "oci-rerun-tag-movement-linux.txt"), fact, fact+"=false")
+					matrix := assembleOCIMatrix(t, shell, red, "none", "published-artifact", "github-hosted")
+					row := matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)
+					if row["status"] != "FAIL" || row["assertions"].(map[string]any)[fact] != false {
+						t.Fatalf("%s=false produced row %#v, want FAIL", fact, row)
+					}
+					if _, err := runOCIMatrixGate(t, shell, matrix, ociMatrixCandidate, "published-artifact", "github-hosted"); err == nil {
+						t.Fatalf("the matrix gate accepted an image identity cell whose %s was false", fact)
+					}
+				}
+			})
+			t.Run("rerun cell without its receipt is missing, not skipped", func(t *testing.T) {
+				absent := t.TempDir()
+				copyOCIEvidence(t, linux, absent)
+				if err := os.Remove(filepath.Join(absent, "oci-rerun-tag-movement-linux.txt")); err != nil {
+					t.Fatal(err)
+				}
+				matrix := assembleOCIMatrix(t, shell, absent, "none", "published-artifact", "github-hosted")
+				row := matrix["rows"].(map[string]any)["linux.oneshot.image_identity"].(map[string]any)
+				if row["status"] != "MISSING" {
+					t.Fatalf("row without the rerun receipt = %#v, want MISSING", row)
+				}
+			})
+
 			t.Run("pull-request lane typed skip", func(t *testing.T) {
 				pr := t.TempDir()
 				copyOCIEvidence(t, linux, pr)
@@ -395,6 +437,13 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"wait_before_start=true", "live_log_delivery=true", "exit_code=7", "plain_137_exit=true",
 		"oom_kill=true", "shim_loss=runtime_failure", "containerd_stop=runtime_failure",
 		"control_loss_reaped=true", "stdout_log=true", "stderr_log=true", "namespace_absent=true")
+	// The digests and request counts are receipt evidence; the two booleans are
+	// what the live test measured from them.
+	write("oci-rerun-tag-movement-linux.txt",
+		"rerun_under_tag_movement_original_digest=true", "rerun_under_tag_movement_tag_not_refloated=true",
+		"rerun_under_tag_movement_resolved_digest=sha256:"+strings.Repeat("a", 64),
+		"rerun_under_tag_movement_moved_digest=sha256:"+strings.Repeat("b", 64),
+		"rerun_under_tag_movement_tag_requests_before=2", "rerun_under_tag_movement_tag_requests_after=2")
 	write("oci-service-publication-linux.txt",
 		"health=true", "echo=true", "startup_timeout=true", "withdrawal=true", "republication=true",
 		"port_collision_avoided=true", "portless_started=true", "helper_tunnel=true",
