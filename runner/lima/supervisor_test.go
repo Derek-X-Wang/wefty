@@ -355,9 +355,13 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 	for _, test := range []struct {
 		name   string
 		silent bool
+		// expiredDial starves the first real-socket dial past its 25 ms
+		// takeover window, the scheduling edge a loaded CI runner hits.
+		expiredDial bool
 	}{
 		{name: "unit_unavailable"},
 		{name: "unit_unavailable_then_handshake_stalled", silent: true},
+		{name: "unit_unavailable_then_window_expired_dial", expiredDial: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			intent := newMutableIntent(true)
@@ -415,6 +419,12 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 			phase := "unavailable"
 			waits, unavailableDials, socketDials := 0, 0, 0
 			unavailableTransitions, stalledTransitions := 0, 0
+			// lastSocketDialWindowExpired records that the latest real-socket
+			// dial failed only because its takeover-window context expired
+			// first. expiredDialRetries counts the retries that fact explains.
+			lastSocketDialWindowExpired := false
+			expiredDialRetries := 0
+			const maximumExpiredDialRetries = 5
 			client := &ocihelper.Client{
 				Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
 				Dial: func(dialContext context.Context) (net.Conn, error) {
@@ -436,7 +446,14 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 						return clientSide, nil
 					default:
 						socketDials++
-						return (&net.Dialer{}).DialContext(dialContext, "unix", socketPath)
+						if test.expiredDial && socketDials == 1 {
+							<-dialContext.Done()
+						}
+						connection, err := (&net.Dialer{}).DialContext(dialContext, "unix", socketPath)
+						windowDeadline, _ := dialContext.Deadline()
+						lastSocketDialWindowExpired = err != nil && errors.Is(err, context.DeadlineExceeded) &&
+							errors.Is(dialContext.Err(), context.DeadlineExceeded) && windowDeadline.Before(recoveryDeadline)
+						return connection, err
 					}
 				},
 			}
@@ -491,8 +508,24 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 					phase = "socket"
 				case "socket":
 					// A real helper may need another bounded takeover window.
-					// Only positively classified retryable outcomes belong here.
-					if reason != contract.CapabilityReasonHelperUnitUnavailable && reason != contract.CapabilityReasonHelperHandshakeStalled {
+					// Only positively classified retryable outcomes belong here,
+					// plus one documented unknown: a dial the takeover window
+					// outlived is an unknown final dial, which the barrier
+					// reports as boot_sweep_failed (never positive absence) and
+					// Lima retries as helper_unreachable. It is explained only
+					// when the latest real dial failed on its own expired window.
+					switch reason {
+					case contract.CapabilityReasonHelperUnitUnavailable, contract.CapabilityReasonHelperHandshakeStalled:
+					case contract.CapabilityReasonBootSweepFailed:
+						if !lastSocketDialWindowExpired {
+							t.Fatalf("unexplained real-socket retry: reason=%s last_dial_window_expired=false", reason)
+						}
+						expiredDialRetries++
+						if expiredDialRetries > maximumExpiredDialRetries {
+							t.Fatalf("real-socket dial outlived its takeover window %d times", expiredDialRetries)
+						}
+						t.Logf("repair-phase explained_retry=window_expired_dial count=%d", expiredDialRetries)
+					default:
 						t.Fatalf("unexplained real-socket retry: reason=%s", reason)
 					}
 				}
@@ -505,6 +538,9 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 			}
 			if recoveryContexts != 1 || unavailableTransitions != 1 || (test.silent && stalledTransitions != 1) || (!test.silent && stalledTransitions != 0) || socketDials == 0 {
 				t.Fatalf("invalid repair phases: contexts=%d unavailable=%d stalled=%d socket_dials=%d", recoveryContexts, unavailableTransitions, stalledTransitions, socketDials)
+			}
+			if test.expiredDial && expiredDialRetries == 0 {
+				t.Fatal("starved real-socket dial produced no explained window-expired retry")
 			}
 			if supervisor.Facts().StalledWindows != 0 || helperBarrier.HandshakeStalledWindows() != 0 || helperBarrier.CapabilityReasonCode() != "" {
 				t.Fatalf("successful repair retained failure facts: supervisor=%+v helper_stalls=%d reason=%s", supervisor.Facts(), helperBarrier.HandshakeStalledWindows(), helperBarrier.CapabilityReasonCode())
