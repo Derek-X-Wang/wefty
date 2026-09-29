@@ -65,7 +65,10 @@ require_receipt() {
     ((.teardown.permission_repair_seconds // 0) | type == "number" and . >= 0) and
     (.teardown.observations | type == "array" and all(.[]; type == "object" and (.reason | type == "string") and ((.detail // "") | type == "string"))) and
     (.teardown.leftovers | type == "array" and all(.[]; type == "string")) and
-    (.teardown.leftovers | length) == 0
+    (.teardown.leftovers | length) == 0 and
+    ((.input_observer_session_drops // []) | type == "array" and all(.[];
+      type == "object" and (.check | type == "string") and (.detail | type == "string") and
+      (.drop | type == "number" and . >= 1 and floor == .)))
   ' "$receipt" >/dev/null 2>&1; then
     error "receipt/$row" "malformed receipt $receipt"
     return 1

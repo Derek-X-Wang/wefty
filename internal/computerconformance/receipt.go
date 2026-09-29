@@ -90,6 +90,16 @@ type Receipt struct {
 	Shm                   CompatibilityShm       `json:"shm"`
 	ReadinessSeconds      float64                `json:"readiness_seconds"`
 	Teardown              TeardownEvidence       `json:"teardown"`
+	// InputObserverSessionDrops is transport evidence, not a verdict: each
+	// entry is one established key-observer control session that the image
+	// side closed while the checker was proving guest input liveness (#569).
+	InputObserverSessionDrops []InputObserverSessionDrop `json:"input_observer_session_drops,omitempty"`
+}
+
+type InputObserverSessionDrop struct {
+	Check  string `json:"check"`
+	Drop   int    `json:"drop"`
+	Detail string `json:"detail"`
 }
 
 type TeardownEvidence struct {
@@ -261,6 +271,7 @@ func (r *Recorder) Finish(finishedAt time.Time) Receipt {
 	r.receipt.Status = Aggregate([]Check{{Status: r.receipt.ImageStatus}, {Status: r.receipt.HarnessStatus}})
 	r.projectObservedCompatibility()
 	r.receipt.Checks = slices.Clone(r.receipt.Checks)
+	r.receipt.InputObserverSessionDrops = slices.Clone(r.receipt.InputObserverSessionDrops)
 	return r.receipt
 }
 
@@ -307,6 +318,10 @@ func (r *Recorder) RecordPersistence(profile, signIn bool) {
 	r.receipt.ProfilePersistent, r.receipt.SignInPersistent = &profile, &signIn
 }
 func (r *Recorder) RecordEdgeRecovery(value bool) { r.receipt.RestartedEdgeRecovered = &value }
+
+func (r *Recorder) RecordInputObserverSessionDrop(check string, drop int, detail string) {
+	r.receipt.InputObserverSessionDrops = append(r.receipt.InputObserverSessionDrops, InputObserverSessionDrop{Check: check, Drop: drop, Detail: detail})
+}
 
 func (r *Recorder) RecordTeardownObservation(reason, detail string) {
 	r.receipt.Teardown.Observations = append(r.receipt.Teardown.Observations, TeardownObservation{Reason: reason, Detail: detail})
