@@ -234,6 +234,56 @@ type RetainedResultsFacts struct {
 	Unrecorded         int               `json:"unrecorded"`
 	Replaced           int               `json:"replaced"`
 	Truncated          int               `json:"truncated"`
+
+	// NodeBudgetBytes is the bound the node-wide figure below is enforced
+	// against. Zero means the agent that answered does not report the
+	// node-wide figure at all.
+	NodeBudgetBytes int64 `json:"node_budget_bytes,omitempty"`
+	// NodeChargedBytes is the figure the retained-results budget is enforced
+	// on: charged bytes across BOTH roots, the process handoff directories and
+	// the OCI helper's handoff volumes. It is a pointer because absent has to
+	// mean "not measured" and never 0: an agent that predates the figure, and
+	// a node whose OCI root could not be read this pass, both leave it nil,
+	// and a doctor that printed either as 0 would report an unmeasured node as
+	// an empty one. When the OCI pass was incomplete the figure is a floor,
+	// and OCI.Complete / OCI.Truncated say so.
+	NodeChargedBytes *int64 `json:"node_charged_bytes,omitempty"`
+	// OCIRoot says what the agent knows about the second root. Empty is an
+	// agent that does not say, and reads as unmeasured.
+	OCIRoot RetainedOCIRoot `json:"oci_root,omitempty"`
+	// OCI is the helper's handoff root as the last pass read it, present only
+	// when OCIRoot is measured.
+	OCI *RetainedOCIFacts `json:"oci,omitempty"`
+}
+
+// RetainedOCIRoot is what the agent knows about the OCI helper's handoff root.
+type RetainedOCIRoot string
+
+const (
+	// RetainedOCIRootMeasured: the helper reported its root this pass.
+	RetainedOCIRootMeasured RetainedOCIRoot = "measured"
+	// RetainedOCIRootAbsent: the agent has no OCI handoff root to report and
+	// did not fail to read one, so the process root is the whole node.
+	RetainedOCIRootAbsent RetainedOCIRoot = "absent"
+	// RetainedOCIRootUnread: the node has an OCI helper and its handoff root
+	// could not be read at all. Its bytes are unknown, not zero.
+	RetainedOCIRootUnread RetainedOCIRoot = "unread"
+)
+
+// RetainedOCIFacts is the OCI half of the node budget's measurement, in the
+// same unit as the process root's figures.
+type RetainedOCIFacts struct {
+	Volumes        int   `json:"volumes"`
+	Live           int   `json:"live"`
+	Unattributable int   `json:"unattributable"`
+	Entries        int64 `json:"entries"`
+	LogicalBytes   int64 `json:"logical_bytes"`
+	ChargedBytes   int64 `json:"charged_bytes"`
+	// Truncated counts volumes measured incompletely, whose figures are a
+	// floor. Complete says the pass read the helper's root to its end; when
+	// false the figures are a floor too.
+	Truncated int  `json:"truncated"`
+	Complete  bool `json:"complete"`
 }
 
 type DiagnosticFinding struct {
@@ -476,6 +526,11 @@ func buildRetainedResults(config DoctorConfig, report *DoctorResponse) {
 	report.RetainedResults = &facts
 	detail := fmt.Sprintf("the node retains %d run(s) (%d still in flight) across %d entries: %d logical bytes, %d charged bytes, %d quarantined record(s) still charged",
 		facts.Runs, facts.InFlight, facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords)
+	if facts.NodeChargedBytes != nil {
+		detail += fmt.Sprintf("; node-wide %d charged bytes against the %d byte retained-results budget", *facts.NodeChargedBytes, facts.NodeBudgetBytes)
+	} else {
+		detail += "; the node-wide charged figure is unmeasured"
+	}
 	if facts.Unrecorded == 0 && facts.Replaced == 0 && facts.Truncated == 0 {
 		report.Findings = append(report.Findings, finding("retained-results", diagnosticReceipt{
 			ran: true, passed: true, code: "oci_retained_results_measured", detail: detail,
@@ -1514,8 +1569,45 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 // that answered does not carry one.
 func retainedResultsLine(facts *RetainedResultsFacts) string {
 	if facts == nil {
-		return "RETAINED RESULTS\tNOT-RUN not reported by this agent version"
+		return "RETAINED RESULTS\tNOT-RUN not reported by this agent version\nRETAINED RESULTS NODE\tNOT-RUN not reported by this agent version"
 	}
+	return retainedResultsProcessLine(facts) + "\n" + retainedResultsNodeLine(facts)
+}
+
+// retainedResultsNodeLine renders the figure the node budget is enforced on.
+// A figure the agent did not report reads "unmeasured", never 0.
+func retainedResultsNodeLine(facts *RetainedResultsFacts) string {
+	if facts.Outcome != DiagnosticOK {
+		return "RETAINED RESULTS NODE\tNOT-RUN no accounting pass has completed"
+	}
+	if facts.NodeChargedBytes == nil {
+		reason := "the agent did not report a node-wide figure"
+		if facts.OCIRoot == RetainedOCIRootUnread {
+			reason = "the OCI handoff root could not be read this pass"
+		}
+		return fmt.Sprintf("RETAINED RESULTS NODE\tunmeasured node_charged_bytes=unmeasured budget_bytes=%d reason=%q oci_root=%s",
+			facts.NodeBudgetBytes, reason, retainedOCIRootName(facts.OCIRoot))
+	}
+	line := fmt.Sprintf("RETAINED RESULTS NODE\tmeasured node_charged_bytes=%d budget_bytes=%d oci_root=%s",
+		*facts.NodeChargedBytes, facts.NodeBudgetBytes, retainedOCIRootName(facts.OCIRoot))
+	if oci := facts.OCI; oci != nil {
+		line += fmt.Sprintf(" oci_volumes=%d oci_live=%d oci_entries=%d oci_logical_bytes=%d oci_charged_bytes=%d oci_unattributable=%d oci_truncated=%d oci_complete=%t",
+			oci.Volumes, oci.Live, oci.Entries, oci.LogicalBytes, oci.ChargedBytes, oci.Unattributable, oci.Truncated, oci.Complete)
+		if !oci.Complete || oci.Truncated != 0 {
+			line += " floor=true"
+		}
+	}
+	return line
+}
+
+func retainedOCIRootName(root RetainedOCIRoot) string {
+	if root == "" {
+		return "unmeasured"
+	}
+	return string(root)
+}
+
+func retainedResultsProcessLine(facts *RetainedResultsFacts) string {
 	return fmt.Sprintf("RETAINED RESULTS\t%s measured_at=%s runs=%d in_flight=%d entries=%d logical_bytes=%d charged_bytes=%d quarantined=%d unrecorded=%d replaced=%d truncated=%d",
 		facts.Outcome, formatOptionalTime(facts.MeasuredAt), facts.Runs, facts.InFlight,
 		facts.Entries, facts.LogicalBytes, facts.ChargedBytes, facts.QuarantinedRecords,
