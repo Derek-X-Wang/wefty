@@ -18,6 +18,7 @@ const SchemaVersionV1 = 1
 type ComputerTokenRevocationReceipt struct {
 	RestoreOperationRevision int64     `json:"restore_operation_revision,omitempty"`
 	ComputerID               string    `json:"computer_id"`
+	ComputerAttemptID        string    `json:"computer_attempt_id,omitempty"`
 	SubmitIntentRevision     int64     `json:"submit_intent_revision"`
 	RevokedGrantCount        int       `json:"revoked_grant_count"`
 	CommittedAt              time.Time `json:"committed_at"`

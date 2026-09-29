@@ -115,7 +115,11 @@ type ComputerTokenRevocation struct {
 	ComputerID               string `json:"computer_id"`
 	NewSubmitIntentRevision  int64  `json:"new_submit_intent_revision"`
 	RevokeAll                bool   `json:"revoke_all,omitempty"`
-	Reason                   string `json:"reason"`
+	// ComputerAttemptID, when set, asks the run ledger to revoke only the
+	// grants bound to that one attempt; NewSubmitIntentRevision, RevokeAll,
+	// and RestoreOperationRevision must then be zero.
+	ComputerAttemptID string `json:"computer_attempt_id,omitempty"`
+	Reason            string `json:"reason"`
 }
 
 type ComputerTokenRevoker interface {

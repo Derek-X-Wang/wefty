@@ -1622,6 +1622,21 @@ func (s *Server) revokeComputerAuthorityWithReceipt(ctx context.Context, compute
 	return &receipt, nil
 }
 
+// revokeComputerAttemptAuthority revokes only the Computer tokens bound to one
+// attempt, leaving any other attempt's tokens -- including a newer attempt's
+// minted concurrently -- untouched.
+func (s *Server) revokeComputerAttemptAuthority(ctx context.Context, computerID, attemptID, reason string) error {
+	if s.computerTokenRevoker == nil {
+		return nil
+	}
+	if _, err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
+		ComputerID: computerID, ComputerAttemptID: attemptID, Reason: reason,
+	}); err != nil {
+		return computerRevocationNotRecorded(err)
+	}
+	return nil
+}
+
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	if err := requireServiceClass(r); err != nil {
 		writeError(w, err)
@@ -2300,21 +2315,28 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	job, err := s.store.CompleteAttempt(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	outcome, err := s.store.CompleteAttemptOutcome(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if computerID, lookupErr := s.store.ComputerIDForJob(r.Context(), job.JobID); lookupErr != nil {
-		writeError(w, lookupErr)
-		return
-	} else if computerID != "" {
-		if revokeErr := s.revokeComputerAuthority(r.Context(), computerID, "attempt_terminal"); revokeErr != nil {
+	// A completion ends exactly one attempt's authority, so it revokes exactly
+	// that attempt's Computer tokens. Never Computer-wide: by the time the
+	// request reaches the run ledger a reimage or restart may already have
+	// minted the next attempt's tokens (#553 review). A replay re-drives it,
+	// which is the only retry of a revocation that failed after the completion
+	// committed (#548).
+	if outcome.ComputerID != "" {
+		if revokeErr := s.revokeComputerAttemptAuthority(r.Context(), outcome.ComputerID,
+			r.PathValue("attempt_id"), "attempt_terminal"); revokeErr != nil {
 			writeError(w, revokeErr)
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, redactJob(job))
+	if outcome.Replayed {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, redactJob(outcome.Job))
 }
 
 func (s *Server) acknowledgeServiceRemoval(w http.ResponseWriter, r *http.Request) {
