@@ -111,6 +111,19 @@ MANIFEST
           continue
         fi
         ;;
+      stop-helper-service-keep-socket)
+        # Only the service stops. The socket keeps listening, so the next
+        # client connect is the only thing that may start the helper again.
+        systemctl stop wefty-oci-helper-realtiming.service
+        if systemctl is-active --quiet wefty-oci-helper-realtiming.service; then
+          record_action_failure 'helper service remained active after a service-only stop'
+          continue
+        fi
+        if ! systemctl is-active --quiet wefty-oci-helper-realtiming.socket || ! test -S /run/wefty-oci-helper/helper.sock; then
+          record_action_failure 'helper socket stopped listening after a service-only stop'
+          continue
+        fi
+        ;;
       start-helper-topology)
         systemctl start wefty-oci-helper-realtiming.socket
         systemctl start wefty-oci-helper-realtiming.service

@@ -395,6 +395,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"kill-helper:service-restart-survival", "kill-helper:service-reconfiguration-reset", "kill-helper:service-l1-fresh-attempt",
 			"assert-helper-units-active",
 			"stop-helper-topology",
+			"stop-helper-service-keep-socket",
+			"systemctl stop wefty-oci-helper-realtiming.service\n",
 			`"/tmp/wefty-oci-faults/$action.failed"`,
 			"start-helper-topology",
 		} {
