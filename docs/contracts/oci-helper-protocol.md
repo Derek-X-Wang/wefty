@@ -759,7 +759,7 @@ configuration, image-rootfs user/group databases, guest architecture/kernel
 facts, resolver and hosts files, translated Lima mount paths, namespace/device
 policy, and OCI JSON never cross from the agent.
 
-The privileged adapter constructs `wefty-v1` from containerd v2.3.5's generated
+The privileged adapter constructs `wefty-v1` from containerd v2.3.6's generated
 Linux baseline, then replaces every security-sensitive field explicitly. It
 resolves the image `USER` and supplemental groups from the pinned guest rootfs;
 sets the fixed capability sets, `noNewPrivileges`, containerd default seccomp,
@@ -885,11 +885,11 @@ The baseline `RLIMIT_NOFILE` soft/hard value of 1024 remains containerd's pinned
 default and is an explicit M3 decision; raising it needs workload evidence and
 a profile amendment. Opportunistic AppArmor names use the closed
 `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}` shape. The `ociVersion` remains the linked
-runtime-spec v1.3.0 used by containerd v2.3.5 and the runc v2 shim targeted by
+runtime-spec v1.3.0 used by containerd v2.3.6 and the runc v2 shim targeted by
 #141; it is not versioned independently.
 
 The serialized fixtures under
-`runner/ocihelper/testdata/containerd-v2.3.5/` are the review boundary for
+`runner/ocihelper/testdata/containerd-v2.3.6/` are the review boundary for
 native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
 numeric-user, unlimited-resource, and the complete Computer profile. The
 Computer fixture proves image USER/ENTRYPOINT/CMD semantics, the unchanged

@@ -24,7 +24,7 @@ func TestRuntimeSpecGoldens(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			input := goldenRuntimeSpecInput(t, test.architecture)
 			test.configure(&input)
-			seccompFixture := filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-"+test.architecture+".json")
+			seccompFixture := filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-"+test.architecture+".json")
 			dependencies := goldenDependencies(t, seccompFixture)
 			regenerate := os.Getenv("UPDATE_OCI_PROFILE_GOLDENS") == "1" && runtime.GOOS == "linux" && runtime.GOARCH == test.architecture
 			if regenerate {
@@ -40,7 +40,7 @@ func TestRuntimeSpecGoldens(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			goldenPath := filepath.Join("testdata", "containerd-v2.3.5", test.golden)
+			goldenPath := filepath.Join("testdata", "containerd-v2.3.6", test.golden)
 			actual := redactSensitiveEnvironment(t, marshalRuntimeSpecIndented(t, spec), input.Workload.SensitiveEnvironment)
 			if regenerate {
 				if err := os.WriteFile(goldenPath, actual, 0o644); err != nil {
@@ -143,7 +143,7 @@ func TestCanonicalDocumentCrossesContainerdBoundaryWithoutReserialization(t *tes
 	input := goldenRuntimeSpecInput(t, "amd64")
 	input.Workload.Limits.MemoryBytes = math.MaxInt64
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestCanonicalDocumentCrossesContainerdBoundaryWithoutReserialization(t *tes
 
 func TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
-	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json"))
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
 	named, err := buildRuntimeSpec(context.Background(), input, dependencies)
 	if err != nil {
 		t.Fatal(err)
@@ -325,7 +325,7 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	input.ManagedVolumeSources = map[ManagedVolumeKind]string{ManagedVolumeComputerDisk: "/run/wefty/fixtures/computer-disk"}
 	input.ComputerControlSource = "/run/wefty/fixtures/control"
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,7 @@ func TestOperatorMountsSortParentsBeforeChildren(t *testing.T) {
 	}
 	input.OperatorMountSources = []string{"/mnt/wefty/operator/child", "/mnt/wefty/operator/parent"}
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,7 @@ func TestHelperTranslatesOperatorMountSourcesBeforeGuestValidation(t *testing.T)
 func TestRuntimeSpecHasNoRawDefaultsOrEscapeHatches(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +767,7 @@ func TestRuntimeSpecConstructionRejectsEveryInvalidBranch(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			input := goldenRuntimeSpecInput(t, "amd64")
-			dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json"))
+			dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
 			if test.mutateInput != nil {
 				test.mutateInput(&input)
 			}
@@ -835,7 +835,7 @@ func TestComputerIdentityMountSourcesCrossValidationBoundary(t *testing.T) {
 			break
 		}
 	}
-	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json"))
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
 	machineID := computerStorageIdentityAt(input.ManagedVolumeSources[ManagedVolumeComputerDisk]).MachineID
 	seen := map[string]bool{}
 	dependencies.validateSource = func(path string, _ []string, regularOnly bool) error {
@@ -892,7 +892,7 @@ func TestRuntimeSpecDocumentRejectsMountSwapAfterBuild(t *testing.T) {
 	input.OperatorMountSources = []string{translatedSource}
 
 	retained := &retainedMountSources{}
-	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.5", "seccomp-linux-amd64.json"))
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
 	dependencies.validateSource = retained.validate
 	spec, err := buildRuntimeSpec(context.Background(), input, dependencies)
 	if err != nil {

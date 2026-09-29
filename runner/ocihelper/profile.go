@@ -30,7 +30,7 @@ import (
 
 const (
 	IsolationProfileVersion      = "wefty-v1"
-	ContainerdBaselineVersion    = "v2.3.5"
+	ContainerdBaselineVersion    = "v2.3.6"
 	ContainerdNamespace          = "wefty"
 	DefaultRuntimeHandler        = "io.containerd.runc.v2"
 	DefaultSnapshotter           = "overlayfs"
@@ -404,7 +404,7 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	}
 
 	// Ticket #141 selected containerd v2.3.4's runc v2 shim and runtime-spec
-	// v1.3.0. The v2.3.5 baseline retains that linked runtime-spec version;
+	// v1.3.0. The v2.3.6 baseline retains that linked runtime-spec version;
 	// the bundle version must not be independently downgraded.
 	spec.Version = specs.Version
 	computerDisk := input.Workload.Computer

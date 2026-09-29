@@ -83,9 +83,9 @@ jobs:
           evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
           module = json.loads((evidence / "containerd-module-before.json").read_text())
           assert module["Path"] == "github.com/containerd/containerd/v2", module
-          assert module["Version"] == "v2.3.5" and "Replace" not in module, module
+          assert module["Version"] == "v2.3.6" and "Replace" not in module, module
           sums = [line for line in Path("go.sum").read_text().splitlines()
-                  if line.startswith("github.com/containerd/containerd/v2 v2.3.5")]
+                  if line.startswith("github.com/containerd/containerd/v2 v2.3.6")]
           assert len(sums) == 2, sums
           (evidence / "containerd-module-checksums.txt").write_text("\n".join(sums) + "\n")
           expected = {
@@ -94,7 +94,7 @@ jobs:
               "wefty-v1-default-root-linux-amd64.json", "seccomp-linux-arm64.json",
               "wefty-v1-lima-arm64.json", "wefty-v1-numeric-user-unlimited-lima-arm64.json",
           }
-          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.6")
           assert {path.name for path in root.iterdir()} == expected
           hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in sorted(expected)}
           (evidence / "fixtures-before.json").write_text(json.dumps(hashes, indent=2) + "\n")
@@ -123,7 +123,7 @@ jobs:
           import hashlib, json, os
           from pathlib import Path
           evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
-          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.6")
           hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(root.glob("*.json"))}
           (evidence / "fixtures-after-generation.json").write_text(json.dumps(hashes, indent=2) + "\n")
           PY
@@ -156,7 +156,7 @@ jobs:
               "TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup", "TestImageUserRootfsSymlinkBoundaries",
           }
           assert required_oracles <= passed("oracle"), "native public oracle was missing or skipped"
-          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.6")
           after_oracle = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(root.glob("*.json"))}
           after_generation = json.loads((evidence / "fixtures-after-generation.json").read_text())
           assert after_oracle == after_generation, "read-only oracle changed generated fixture bytes"
@@ -181,7 +181,7 @@ jobs:
           import hashlib, json, os, shutil
           from pathlib import Path
           evidence = Path(os.environ["RUNNER_TEMP"]) / "oci-profile-evidence"
-          root = Path("runner/ocihelper/testdata/containerd-v2.3.5")
+          root = Path("runner/ocihelper/testdata/containerd-v2.3.6")
           paths = sorted(root.glob("*.json"))
           assert len(paths) == 8, "incomplete fixture inventory"
           after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
