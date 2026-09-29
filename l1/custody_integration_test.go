@@ -3,11 +3,13 @@ package l1
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
 func beginCustodyExport(t *testing.T, h *integrationHarness, node Node, computer Computer, backup Backup, key string) (ComputerCustodyExport, ComputerCustodyExportDirective) {
@@ -507,6 +509,84 @@ func TestCustodyExportVerifiedAtTheDestinationTaintsTheSource(t *testing.T) {
 	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
 	if err != nil || !provenance.CustodyTainted {
 		t.Fatalf("verified export left the source untainted = %#v err=%v", provenance, err)
+	}
+}
+
+// TestCustodyExportedComputerRemovesReducedWhenTheRunLedgerRefusesRevocation
+// is the exact shape Computer lane run 3 filed as wefty #550: a verified
+// Custody export left the Computer's Storage on the operator's machine, nobody
+// attested it deleted, and `services remove` answered the #548 run-ledger
+// refusal after the removal had already committed. The custody outcome is
+// decided at finalization, not on the remove request, so the refused
+// revocation cannot skip it.
+//
+// It also pins the two separate facts a Computer removal reports, because
+// mixing them up is how #550 was filed: the Job state is `removed_verified`
+// because the node proved managed cleanup and the Slot went back, while the
+// Computer's own `removal_outcome` is `removed_reduced` because bytes of its
+// Storage survive outside managed custody. The Job state never carries the
+// custody outcome.
+func TestCustodyExportedComputerRemovesReducedWhenTheRunLedgerRefusesRevocation(t *testing.T) {
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+	export, directive := beginCustodyExport(t, h, node, computer, backup, "run3-shape")
+	receipt := successfulCustodyExportReceipt(directive)
+	completed, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
+		computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+	if err != nil || completed.Status != "available" || completed.OperatorAttestedDeleted {
+		t.Fatalf("verified, unattested Custody export = %#v err=%v", completed, err)
+	}
+	current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.server.computerTokenRevoker = unreachableRunLedger()
+	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
+	status, _, body := h.do(client, http.MethodPost, "/v1/computers/"+current.ComputerID+"/remove",
+		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator")})
+	assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied")
+
+	directives, err := h.store.ListNodeRemovalDirectives(context.Background(),
+		"fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("the refused remove did not leave its removal directive = %#v err=%v", directives, err)
+	}
+	for _, copy := range directives[0].ComputerBackupCopies.Copies {
+		if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "removed-" + copy.CopyID, Receipt: backupRemovalReceipt(copy)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node",
+		directives[0].JobID, RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			RemovalGeneration: directives[0].RemovalGeneration, CleanupFence: directives[0].CleanupFence,
+			RootInstanceID: directives[0].RootInstanceID, IdempotencyKey: "run3-shape-removed"}); err != nil {
+		t.Fatal(err)
+	}
+	finalizeOrObserveRemoval(t, h.store, directives[0].JobID, func(job Job) bool {
+		return job.State == contract.JobRemovedVerified
+	})
+
+	removed, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed.RemovalOutcome != "removed_reduced" {
+		t.Fatalf("a Computer whose Storage sits unattested outside managed custody finished removal_outcome=%q, want removed_reduced: %#v",
+			removed.RemovalOutcome, removed)
+	}
+	if removed.CurrentJob.State != contract.JobRemovedVerified {
+		t.Fatalf("Job state = %q, want %q: the Job records proven managed cleanup and Slot release, not custody",
+			removed.CurrentJob.State, contract.JobRemovedVerified)
+	}
+	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	if err != nil || !provenance.CustodyTainted || len(provenance.CustodyForks) != 1 ||
+		provenance.CustodyForks[0].ComputerID != computer.ComputerID ||
+		provenance.CustodyForks[0].RemovalOutcome != "removed_reduced" || len(provenance.CustodyExports) != 1 ||
+		provenance.CustodyExports[0].ExportID != export.ExportID || provenance.CustodyExports[0].OperatorAttestedDeleted {
+		t.Fatalf("reduced removal is not bound to the tainted Computer = %#v err=%v", provenance, err)
 	}
 }
 
