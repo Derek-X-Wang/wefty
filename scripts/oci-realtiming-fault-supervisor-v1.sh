@@ -111,12 +111,35 @@ MANIFEST
           continue
         fi
         ;;
+      stop-helper-service-keep-socket)
+        # Only the service stops. The socket keeps listening, so the next
+        # client connect is the only thing that may start the helper again. A
+        # failed stop is recorded, not fatal: under set -e it would take the
+        # shared supervisor down with it.
+        if ! systemctl stop wefty-oci-helper-realtiming.service; then
+          record_action_failure 'systemctl stop of the helper service failed'
+          continue
+        fi
+        if systemctl is-active --quiet wefty-oci-helper-realtiming.service; then
+          record_action_failure 'helper service remained active after a service-only stop'
+          continue
+        fi
+        if ! systemctl is-active --quiet wefty-oci-helper-realtiming.socket || ! test -S /run/wefty-oci-helper/helper.sock; then
+          record_action_failure 'helper socket stopped listening after a service-only stop'
+          continue
+        fi
+        ;;
       start-helper-topology)
-        systemctl start wefty-oci-helper-realtiming.socket
-        systemctl start wefty-oci-helper-realtiming.service
-        systemctl is-active --quiet wefty-oci-helper-realtiming.socket
-        systemctl is-active --quiet wefty-oci-helper-realtiming.service
-        test -S /run/wefty-oci-helper/helper.sock
+        # Recorded, not fatal: under set -e a failed start would take the
+        # shared supervisor down and strand every later fault request.
+        if ! systemctl start wefty-oci-helper-realtiming.socket || ! systemctl start wefty-oci-helper-realtiming.service; then
+          record_action_failure 'systemctl start of the helper topology failed'
+          continue
+        fi
+        if ! systemctl is-active --quiet wefty-oci-helper-realtiming.socket || ! systemctl is-active --quiet wefty-oci-helper-realtiming.service || ! test -S /run/wefty-oci-helper/helper.sock; then
+          record_action_failure 'helper topology not active after start'
+          continue
+        fi
         ;;
       reset-containerd)
         systemctl stop wefty-test-containerd.service

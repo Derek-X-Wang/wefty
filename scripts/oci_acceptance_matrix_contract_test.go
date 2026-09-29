@@ -47,7 +47,6 @@ const (
 var ociMatrixGapRows = []string{
 	"linux.oneshot.image_identity",
 	"linux.service.removal",
-	"linux.only.socket_activated_helper",
 	"linux.only.cgroup_v2_limits",
 }
 
@@ -478,6 +477,11 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"capability_claim_pair_oci_capable=true", "capability_claim_pair_oci_incapable=true",
 		"capability_claim_pair_doctor_source=cli",
 		"capability_revision_before=4", "capability_revision_after=6")
+	write("oci-helper-cold-socket-activation-linux.txt",
+		"helper_service_cold_before_first_connect=true", "helper_cold_unit_activated_on_connect=true",
+		"helper_session_admitted_on_first_connect=true", "helper_first_session_is_probe=true",
+		"helper_service_state_before=inactive/dead", "helper_socket_state_before=active/listening",
+		"helper_service_state_after=active/running", "first_connect_session_dials=1")
 	if err := os.WriteFile(filepath.Join(directory, "provenance-receipt.json"), []byte(
 		`{"version":1,"commit":"`+ociMatrixCandidate+`","source":"published-artifact","artifact_run_id":"4242"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -523,4 +527,71 @@ func conformantMacMatrixFragment(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// #402: the socket-activated helper cell passes only on the live proof that a
+// cold, stopped helper unit came up on socket activation after the probe began
+// dialing, as a fresh start, and admitted the probe's session before any other.
+// Root ownership alone no longer carries the row, and a lane that never wrote
+// the receipt has no proof. Accepted residual: the cell does not claim the
+// probe's connect caused the start -- an out-of-band start between the dial and
+// admission is not excluded, and nothing in the lane issues one.
+func TestOCIAcceptanceMatrixSocketActivatedHelperNeedsColdActivation(t *testing.T) {
+	const row = "linux.only.socket_activated_helper"
+	const receipt = "oci-helper-cold-socket-activation-linux.txt"
+	facts := []string{
+		"helper_service_cold_before_first_connect",
+		"helper_cold_unit_activated_on_connect",
+		"helper_session_admitted_on_first_connect",
+		"helper_first_session_is_probe",
+	}
+	for _, shell := range []string{"/bin/sh", "/bin/bash"} {
+		t.Run(filepath.Base(shell), func(t *testing.T) {
+			linux := conformantLinuxOCIEvidence(t)
+
+			t.Run("cold activation is measured, not a gap", func(t *testing.T) {
+				matrix := assembleOCIMatrix(t, shell, linux, "none", "published-artifact", "github-hosted")
+				cell := matrix["rows"].(map[string]any)[row].(map[string]any)
+				assertions := cell["assertions"].(map[string]any)
+				if cell["status"] != "PASS" || len(cell["gaps"].(map[string]any)) != 0 {
+					t.Fatalf("socket-activated helper row = %#v, want a PASS with no declared gap", cell)
+				}
+				for _, fact := range facts {
+					if assertions[fact] != true {
+						t.Fatalf("socket-activated helper assertions = %#v, want %s measured true", assertions, fact)
+					}
+				}
+			})
+			t.Run("a false cold activation fact fails the cell", func(t *testing.T) {
+				for _, fact := range facts {
+					red := t.TempDir()
+					copyOCIEvidence(t, linux, red)
+					replaceOCIFact(t, filepath.Join(red, receipt), fact, fact+"=false")
+					matrix := assembleOCIMatrix(t, shell, red, "none", "published-artifact", "github-hosted")
+					cell := matrix["rows"].(map[string]any)[row].(map[string]any)
+					if cell["status"] != "FAIL" || cell["assertions"].(map[string]any)[fact] != false {
+						t.Fatalf("%s=false produced row %#v, want FAIL", fact, cell)
+					}
+					if _, err := runOCIMatrixGate(t, shell, matrix, ociMatrixCandidate, "published-artifact", "github-hosted"); err == nil {
+						t.Fatalf("the matrix gate accepted a socket-activated helper cell whose %s was false", fact)
+					}
+				}
+			})
+			t.Run("a lane without the cold activation receipt is missing, not passed", func(t *testing.T) {
+				absent := t.TempDir()
+				copyOCIEvidence(t, linux, absent)
+				if err := os.Remove(filepath.Join(absent, receipt)); err != nil {
+					t.Fatal(err)
+				}
+				matrix := assembleOCIMatrix(t, shell, absent, "none", "published-artifact", "github-hosted")
+				cell := matrix["rows"].(map[string]any)[row].(map[string]any)
+				if cell["status"] != "MISSING" {
+					t.Fatalf("row without the cold activation receipt = %#v, want MISSING", cell)
+				}
+				if _, err := runOCIMatrixGate(t, shell, matrix, ociMatrixCandidate, "published-artifact", "github-hosted"); err == nil {
+					t.Fatal("the matrix gate accepted a socket-activated helper cell with no cold activation receipt")
+				}
+			})
+		})
+	}
 }

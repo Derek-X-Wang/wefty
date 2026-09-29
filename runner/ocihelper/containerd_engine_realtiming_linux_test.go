@@ -2840,10 +2840,18 @@ func nativeImageObservation(fence string, observation workloadrunner.OCIImageObs
 
 func requestRootFault(t *testing.T, action string) {
 	t.Helper()
+	if err := runRootFault(action); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runRootFault is requestRootFault without the Goexit, for cleanups that must
+// report a failed restore and still let the remaining cleanups run.
+func runRootFault(action string) error {
 	fifo := os.Getenv("WEFTY_OCI_FAULT_FIFO")
 	directory := os.Getenv("WEFTY_OCI_FAULT_DIR")
 	if fifo == "" || directory == "" {
-		t.Fatal("Linux OCI root fault supervisor is not provisioned")
+		return errors.New("Linux OCI root fault supervisor is not provisioned")
 	}
 	ack := filepath.Join(directory, action+".done")
 	failure := filepath.Join(directory, action+".failed")
@@ -2861,21 +2869,21 @@ func requestRootFault(t *testing.T, action string) {
 			err = errors.Join(writeErr, closeErr)
 		}
 		if time.Now().After(writeDeadline) {
-			t.Fatalf("write root fault %s before deadline: %v", action, err)
+			return fmt.Errorf("write root fault %s before deadline: %w", action, err)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(ack); err == nil {
-			return
+			return nil
 		}
 		if payload, err := os.ReadFile(failure); err == nil {
-			t.Fatalf("root assertion %s failed: %s", action, payload)
+			return fmt.Errorf("root assertion %s failed: %s", action, payload)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("root fault %s was not acknowledged", action)
+	return fmt.Errorf("root fault %s was not acknowledged", action)
 }
 
 func assertUnprivilegedRunnerReceipt(t *testing.T, path string) {
