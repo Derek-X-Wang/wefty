@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -518,7 +519,8 @@ func TestHungRunLedgerKeepsOwedRevocationsWithinHeartbeatBudget(t *testing.T) {
 		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
 	assertRunLedgerUnavailable(t, status, body, false, "is owed")
 
-	const budget = 300 * time.Millisecond
+	// Room, after the run-ledger calls give up, for the failure note.
+	const budget = 2400 * time.Millisecond
 	h.server.restoreRevocationBudget = budget
 	ledger.set(false, true)
 	if elapsed := heartbeatComputerNode(t, h, node); elapsed > budget+2*time.Second || elapsed >= ComputerPolicyClientTimeout {
@@ -691,5 +693,156 @@ func TestOwedRevocationWithoutRunLedgerIsClosedNotOwed(t *testing.T) {
 	audit := owedRevocationAuditRows(t, h, computer.ComputerID)
 	if len(audit) != 1 || audit[0].settlement != owedRevocationSettledNoRunLedger || audit[0].record != nil {
 		t.Fatalf("audit without a run ledger = %#v", audit)
+	}
+}
+
+// TestSettlementWritesStopWhenTooLittleBudgetIsLeft: a heartbeat starts an
+// owed-revocation write only while a full lock wait still fits its budget.
+// With less left, the writes are skipped and logged, nothing is recorded, and
+// the next heartbeat with room settles the row.
+func TestSettlementWritesStopWhenTooLittleBudgetIsLeft(t *testing.T) {
+	h, _, node, _ := computerCompletionHarness(t)
+	ledger := newOutageLedger(h)
+	client := h.client(fabric.Identity{NodeID: "computer-client", Tags: []string{DefaultClientPrincipalTag}})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "owed-no-room",
+		Spec: computerCapabilityJobSpec("computer:owed-no-room:v1"), Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := startComputerAttempt(t, h, node, nil)
+	ledger.mint(live.Lease.AttemptID)
+	computer = mustGetComputer(t, h, computer.ComputerID)
+	ledger.set(true, false)
+	status, _, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state",
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+	assertRunLedgerUnavailable(t, status, body, false, "is owed")
+	before := mustGetComputer(t, h, computer.ComputerID).OwedRevocations
+
+	logs := &recordedLog{}
+	h.server.logf = logs.record
+	h.server.restoreRevocationBudget = owedRevocationWriteWait + owedRevocationWriteMargin - 100*time.Millisecond
+	ledger.set(false, false)
+	heartbeatComputerNode(t, h, node)
+	after := mustGetComputer(t, h, computer.ComputerID).OwedRevocations
+	if len(after) != 1 || after[0].SettleFailures != before[0].SettleFailures || len(after[0].RevokedAttemptIDs) != 0 {
+		t.Fatalf("owed revocation after a heartbeat with no room to write = %#v, want it untouched", after)
+	}
+	if !strings.Contains(logs.text(), "event=l1_owed_revocation_writes_skipped skipped=1") {
+		t.Fatalf("skipped writes were not logged: %s", logs.text())
+	}
+	if len(ledger.taken()) != 1 {
+		t.Fatalf("run ledger took %d revocations, want the one whose answer was not recorded", len(ledger.taken()))
+	}
+
+	h.server.restoreRevocationBudget = HeartbeatRestoreRevocationBudget
+	heartbeatComputerNode(t, h, node)
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
+		t.Fatalf("owed revocation after a heartbeat with room = %#v", owed)
+	}
+}
+
+func TestOwedRevocationWriteBudgetAdmitsOnlyAFullLockWait(t *testing.T) {
+	roomy := &owedRevocationWriteBudget{deadline: time.Now().Add(owedRevocationWriteWait + owedRevocationWriteMargin + time.Second)}
+	if !roomy.allow() || !roomy.allow() {
+		t.Fatal("a budget with room for a full lock wait refused a write")
+	}
+	tight := &owedRevocationWriteBudget{deadline: time.Now().Add(owedRevocationWriteWait)}
+	if tight.allow() {
+		t.Fatal("a budget without room for a full lock wait admitted a write")
+	}
+	tight.deadline = time.Now().Add(time.Hour)
+	if tight.allow() {
+		t.Fatal("a budget that stopped admitting writes started again")
+	}
+}
+
+// TestSettlementWritesNeverChangeTheMainPoolsLockWait (#554 round 2 review):
+// however a settlement pass ends -- against a held lock, out of budget, or
+// canceled mid-write when the agent drops the heartbeat -- every connection
+// of L1's main pool keeps waiting sqliteBusyTimeout on SQLite's write lock,
+// and only the settlement handle waits owedRevocationWriteWait.
+func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
+	h, _, node, _ := computerCompletionHarness(t)
+	newOutageLedger(h)
+	ctx := t.Context()
+	tx, err := h.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{computerID: "computer-pool",
+		hostNodeID: node.NodeID, verb: ComputerRevocationVerbStop, reason: "computer_stopped",
+		holdingAttempts: []string{"attempt-pool"}}, h.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.store.listNodeOwedComputerRevocations(ctx, node.NodeID, MaxOwedRevocationsPerHeartbeat)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("owed rows = %d err=%v", len(rows), err)
+	}
+	settlements := []owedRevocationSettlement{{row: rows[0], attempts: []string{"attempt-pool"}}}
+	answers := []revocationAnswer{{err: errors.New("the run ledger is down")}}
+	for pass := range 2000 {
+		passContext, cancel := context.WithTimeout(context.Background(), time.Second)
+		go func() {
+			time.Sleep(time.Duration(pass%200) * time.Microsecond)
+			cancel()
+		}()
+		h.server.recordOwedRevocationSettlements(passContext, settlements, answers)
+		cancel()
+	}
+	lock, err := h.store.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	passContext, cancel := context.WithTimeout(context.Background(), 2*owedRevocationWriteWait)
+	h.server.recordOwedRevocationSettlements(passContext, settlements, answers)
+	cancel()
+
+	// Every main-pool connection, held at once so none is reused.
+	busyTimeout := func(conn interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	}) time.Duration {
+		t.Helper()
+		var wait int64
+		if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&wait); err != nil {
+			t.Fatal(err)
+		}
+		return time.Duration(wait) * time.Millisecond
+	}
+	conns := []*sql.Conn{}
+	for range 15 {
+		conn, err := h.store.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+		if wait := busyTimeout(conn); wait != sqliteBusyTimeout {
+			t.Fatalf("a main-pool connection waits %s on the write lock, want %s", wait, sqliteBusyTimeout)
+		}
+	}
+	for _, conn := range conns {
+		conn.Close()
+	}
+	if wait := busyTimeout(h.store.settlementDB); wait != owedRevocationWriteWait {
+		t.Fatalf("the settlement handle waits %s, want %s", wait, owedRevocationWriteWait)
+	}
+
+	// And behaviourally: an unrelated main-pool write outlasts a lock held
+	// well past the settlement wait.
+	const held = 3 * owedRevocationWriteWait
+	go func() {
+		time.Sleep(held)
+		_, _ = lock.ExecContext(context.Background(), `ROLLBACK`)
+		lock.Close()
+	}()
+	started := time.Now()
+	if _, err := h.store.db.ExecContext(ctx, `UPDATE computer_owed_revocations SET last_failure='' WHERE revocation_id=?`,
+		rows[0].owed.RevocationID); err != nil {
+		t.Fatalf("an unrelated main-pool write failed after %s against a lock held %s: %v", time.Since(started), held, err)
 	}
 }

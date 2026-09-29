@@ -1642,42 +1642,56 @@ func (s *Server) revokeOnHeartbeat(ctx context.Context, budget time.Duration, re
 }
 
 // recordOwedRevocationSettlements writes what the run ledger said to each
-// owed revocation, under ctx, which carries what is left of the heartbeat's
-// budget. The writes run on one connection whose SQLite lock wait ends at
-// that deadline, because the driver does not interrupt a lock wait when a
-// context ends. Nothing here fails the heartbeat. A write that cannot finish
-// in time -- the budget is spent, or SQLite is locked -- is skipped, not
-// retried: the row stays owed, and the run ledger's revocations are
-// idempotent, so the next heartbeat asks again and records then.
+// owed revocation, within what is left of the heartbeat's budget (ctx's
+// deadline). The writes go through the store's settlement handle, whose
+// SQLite lock wait is a fixed owedRevocationWriteWait, and a write starts
+// only while that wait still fits the budget. The driver does not interrupt
+// a lock wait when a context ends, so this, not the context, is what bounds
+// a heartbeat that meets a held lock. Nothing here fails the heartbeat. A
+// write that does not fit, or that meets the lock, is skipped: the row stays
+// owed, and the run ledger's revocations are idempotent, so the next
+// heartbeat asks again and records then.
 func (s *Server) recordOwedRevocationSettlements(ctx context.Context, settlements []owedRevocationSettlement, answers []revocationAnswer) {
 	if len(settlements) == 0 {
 		return
 	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		deadline = time.Now().Add(s.heartbeatRevocationBudget())
+	}
+	budget := &owedRevocationWriteBudget{deadline: deadline}
+	// Waiting for the settlement handle's one connection ends a lock wait
+	// early, so a write that gets the connection late still has its whole
+	// lock wait inside the budget.
+	writeContext, cancel := context.WithDeadline(ctx, deadline.Add(-owedRevocationWriteWait))
+	defer cancel()
 	skipped := 0
-	err := s.store.withBoundedWrites(ctx, func(session sqlSession) {
-		for index, settlement := range settlements {
-			if ctx.Err() != nil {
-				skipped = len(settlements) - index
-				return
-			}
-			s.recordOwedRevocationSettlement(ctx, session, settlement, answers)
+	for index, settlement := range settlements {
+		if !s.recordOwedRevocationSettlement(writeContext, budget, settlement, answers) {
+			skipped = len(settlements) - index
+			break
 		}
-	})
-	if err != nil {
-		skipped = len(settlements)
 	}
 	if skipped > 0 && s.logf != nil {
-		s.logf("event=l1_owed_revocation_writes_skipped skipped=%d cause=%q", skipped, "the heartbeat revocation budget ran out")
+		s.logf("event=l1_owed_revocation_writes_skipped skipped=%d cause=%q", skipped,
+			"too little of the heartbeat revocation budget was left for another write")
 	}
 }
 
-func (s *Server) recordOwedRevocationSettlement(ctx context.Context, session sqlSession, settlement owedRevocationSettlement, answers []revocationAnswer) {
+// recordOwedRevocationSettlement records one row's answers. It reports false
+// when the write budget ran out before the row's writes were done.
+func (s *Server) recordOwedRevocationSettlement(ctx context.Context, budget *owedRevocationWriteBudget,
+	settlement owedRevocationSettlement, answers []revocationAnswer) bool {
+	session := s.store.settlementDB
 	revocationID := settlement.row.owed.RevocationID
 	if s.computerTokenRevoker == nil {
+		if !budget.allow() {
+			return false
+		}
 		if _, err := s.store.settleOwedComputerRevocationWithoutRunLedger(ctx, session, revocationID); err != nil {
 			s.logOwedRevocationDeferred(settlement.row.owed, err)
 		}
-		return
+		return true
 	}
 	var receipts []contract.ComputerTokenRevocationReceipt
 	var failure error
@@ -1690,16 +1704,23 @@ func (s *Server) recordOwedRevocationSettlement(ctx context.Context, session sql
 		receipts = append(receipts, answer.receipt)
 	}
 	if len(receipts) > 0 || len(settlement.attempts) == 0 {
+		if !budget.allow() {
+			return false
+		}
 		if _, err := s.store.recordOwedComputerAttemptRevocations(ctx, session, revocationID, receipts); err != nil {
 			failure = errors.Join(failure, err)
 		}
 	}
 	if failure != nil {
 		s.logOwedRevocationDeferred(settlement.row.owed, failure)
+		if !budget.allow() {
+			return false
+		}
 		if err := s.store.recordOwedComputerRevocationFailure(ctx, session, revocationID, scrubbedCause(failure)); err != nil {
 			s.logOwedRevocationDeferred(settlement.row.owed, err)
 		}
 	}
+	return true
 }
 
 // revokeAfterAuthorityLoss performs the explicit L3 revocation an

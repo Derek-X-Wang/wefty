@@ -348,10 +348,14 @@ one. An attempt minted after the mutation is never named, so no late
 settlement can end its pass, however long the revocation was owed. The pass's
 run-ledger calls and the writes that record their answers share
 `HeartbeatRestoreRevocationBudget`: the calls stop waiting a sixth of it
-early, restore receipts are saved first, and the owed-revocation writes run on
-a connection whose SQLite lock wait ends at the budget, because the driver
-does not interrupt a lock wait when a context ends. A write that cannot finish
-in time is skipped, never fails the heartbeat, and is redone by the next one.
+early, and restore receipts are saved first. The owed-revocation writes then
+go through a separate one-connection handle to the same database whose
+SQLite lock wait is a fixed 250 ms (`owedRevocationWriteWait`), and a write
+starts only while that wait plus a 50 ms margin still fits the budget. A
+deadline alone cannot bound them, because the driver does not interrupt a
+lock wait when a context ends, and no connection of L1's main pool ever has
+its 5 s wait changed. A write that does not fit, or meets a held lock, is
+skipped, never fails the heartbeat, and is redone by the next one.
 A Computer whose host Node never heartbeats again keeps its rows owed and
 visible.
 

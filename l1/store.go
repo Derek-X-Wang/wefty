@@ -64,6 +64,7 @@ type StoreOptions struct {
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
 	db                                *sql.DB
+	settlementDB                      *sql.DB
 	clock                             Clock
 	restartJitter                     func(time.Duration) time.Duration
 	leaseDuration                     time.Duration
@@ -166,13 +167,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
-	query := make(url.Values)
-	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeout.Milliseconds()))
-	query.Add("_pragma", "foreign_keys(1)")
-	query.Add("_pragma", "secure_delete(1)")
-	query.Set("_txlock", "immediate")
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", sqliteDSN(path, sqliteBusyTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("l1: open SQLite: %w", err)
 	}
@@ -194,7 +189,36 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Owed-revocation settlement writes run inside a node heartbeat's budget,
+	// so they get their own handle whose lock wait is short and fixed. The
+	// main pool's connections keep sqliteBusyTimeout; nothing ever changes a
+	// shared connection's wait. WAL is a property of the database file, which
+	// initialize has already set.
+	settlementDB, err := sql.Open("sqlite", sqliteDSN(path, owedRevocationWriteWait))
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite owed-revocation handle: %w", err)
+	}
+	settlementDB.SetMaxOpenConns(1)
+	if err := settlementDB.PingContext(context.Background()); err != nil {
+		_ = settlementDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite owed-revocation handle: %w", err)
+	}
+	store.settlementDB = settlementDB
 	return store, nil
+}
+
+// sqliteDSN is the one way L1 opens its database file: foreign keys and
+// secure delete on, immediate write transactions, and busyTimeout as the
+// connection's wait on SQLite's write lock.
+func sqliteDSN(path string, busyTimeout time.Duration) string {
+	query := make(url.Values)
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "secure_delete(1)")
+	query.Set("_txlock", "immediate")
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 }
 
 func loadOrCreateDeploymentID(databasePath string) (string, error) {
@@ -1852,7 +1876,13 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	var settlementErr error
+	if s.settlementDB != nil {
+		settlementErr = s.settlementDB.Close()
+	}
+	return errors.Join(s.db.Close(), settlementErr)
+}
 
 // CreateJob creates a job or returns the identical dispatch-key replay.
 // JobOrigin records who a job is created for. A root submission carries only

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"time"
 	"unicode/utf8"
@@ -81,43 +80,40 @@ type ComputerRevocationSettlement struct {
 	Attempts  []contract.ComputerTokenRevocationReceipt `json:"attempts,omitempty"`
 }
 
-// sqliteBusyTimeout is how long an L1 connection waits on SQLite's write
-// lock by default. The driver does not interrupt that wait when a context
-// ends, so a write that must fit a deadline shortens it on its own
-// connection instead (withBoundedWrites).
+// sqliteBusyTimeout is how long a connection of L1's main pool waits on
+// SQLite's write lock. The driver does not interrupt that wait when a context
+// ends, so no deadline can shorten it.
 const sqliteBusyTimeout = 5 * time.Second
 
-// sqlSession is what owed-revocation writes run against: the pool, or one
-// connection whose lock wait is bounded.
+// owedRevocationWriteWait is the fixed lock wait of the handle owed-revocation
+// settlement writes use on a heartbeat (Store.settlementDB). A heartbeat
+// starts a write only while at least this wait plus owedRevocationWriteMargin
+// of its budget is left, so a held lock costs it at most one such wait.
+const (
+	owedRevocationWriteWait   = 250 * time.Millisecond
+	owedRevocationWriteMargin = 50 * time.Millisecond
+)
+
+// sqlSession is what owed-revocation writes run against: the main pool, or
+// the settlement handle.
 type sqlSession interface {
 	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-// withBoundedWrites runs fn on one connection whose SQLite lock wait ends at
-// ctx's deadline, so a held write lock cannot hold the caller past it. The
-// connection's usual wait is restored before it returns to the pool. With no
-// time left, fn is not run.
-func (s *Store) withBoundedWrites(ctx context.Context, fn func(sqlSession)) error {
-	deadline, bounded := ctx.Deadline()
-	wait := sqliteBusyTimeout
-	if bounded {
-		wait = time.Until(deadline)
+// owedRevocationWriteBudget admits heartbeat settlement writes while enough
+// of the heartbeat's budget is left for one full lock wait.
+type owedRevocationWriteBudget struct {
+	deadline time.Time
+	skipped  bool
+}
+
+func (budget *owedRevocationWriteBudget) allow() bool {
+	if budget.skipped || time.Until(budget.deadline) < owedRevocationWriteWait+owedRevocationWriteMargin {
+		budget.skipped = true
+		return false
 	}
-	if wait < time.Millisecond || ctx.Err() != nil {
-		return context.DeadlineExceeded
-	}
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", wait.Milliseconds())); err != nil {
-		return err
-	}
-	defer conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeout.Milliseconds()))
-	fn(conn)
-	return nil
+	return true
 }
 
 type owedRevocationRecord struct {
