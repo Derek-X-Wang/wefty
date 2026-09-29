@@ -220,9 +220,9 @@ wefty run result --file result.json --status failed    # also lands in the hando
 ```
 
 Add `--json` to print the written event's path. Every subcommand fails with a
-clear message when `WEFTY_RUN_DIR` is absent — an OCI job does not receive one
-yet. Submit with `--required-envelope` so a job that exits 0 having reported
-nothing cannot pass for a success.
+clear message when `WEFTY_RUN_DIR` is absent — a job submitted straight to L1
+rather than as an L3 run does not receive one. Submit with `--required-envelope`
+so a job that exits 0 having reported nothing cannot pass for a success.
 
 `wefty workflow init NAME` (above) writes a starter using exactly these
 subcommands, with an inline POSIX writer for an image that does not ship the

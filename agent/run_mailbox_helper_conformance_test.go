@@ -384,9 +384,10 @@ func TestInlineBashWriterTruncatesRatherThanLosingAnEvent(t *testing.T) {
 	}
 }
 
-// TestRunSubcommandsRefuseWithoutARunDir covers the job kinds that receive no
-// mailbox — an OCI job today. Reporting must fail loudly there, naming what is
-// missing, rather than write into a directory nobody publishes from.
+// TestRunSubcommandsRefuseWithoutARunDir covers a job that receives no
+// mailbox — one submitted straight to L1 rather than dispatched as an L3 run.
+// Reporting must fail loudly there, naming what is missing, rather than write
+// into a directory nobody publishes from.
 func TestRunSubcommandsRefuseWithoutARunDir(t *testing.T) {
 	t.Setenv(workflowhelper.RunDirEnv, "")
 	commands := [][]string{

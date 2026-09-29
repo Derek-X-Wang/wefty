@@ -113,9 +113,10 @@ func (e UsageError) Error() string { return string(e) }
 
 // ErrNoRunDir is what every `wefty run` subcommand returns when the job has no
 // mailbox. It names the reason rather than the variable alone, because the
-// common case is a job kind that does not receive one yet.
+// common case is a job that was not dispatched as an L3 run.
 var ErrNoRunDir = errors.New(RunDirEnv + " is not set: this job has no run mailbox to report through. " +
-	"The mailbox is delivered to process one-shots that L3 dispatched; an OCI job does not receive one today. " +
+	"The mailbox is delivered to every one-shot L3 dispatched, kind=process and kind=oci alike; " +
+	"a job submitted straight to L1 does not receive one. " +
 	"See docs/contracts/run-execution-context.md, \"Run mailbox\"")
 
 // Event is one run-mailbox event before it is encoded. Every field is the
