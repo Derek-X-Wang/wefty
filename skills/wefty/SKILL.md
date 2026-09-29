@@ -166,6 +166,13 @@ including what makes the run fail.
 the helper, a README with these commands, and a test that exercises the starter
 without a cluster. Start there rather than from an empty file.
 
+`wefty workflow init NAME --lang ts` writes the TypeScript version in the
+dogfood shape: `src/NAME.ts` with an inline mailbox writer (no package to
+install at run time), a `package.json` whose `npm run build` bundles it with
+esbuild into `dist/NAME.mjs`, and a test that runs that bundle. Build first,
+then submit the bundle — `--script=dist/NAME.mjs --interpreter=node` — on
+nodes with Node.js 22.7 or later.
+
 ## Inside a workflow script
 
 A workflow's job process receives the run execution context as env vars
@@ -220,9 +227,10 @@ nothing cannot pass for a success.
 `wefty workflow init NAME` (above) writes a starter using exactly these
 subcommands, with an inline POSIX writer for an image that does not ship the
 binary — parser-compatible, but neither hardened nor durable, so prefer the
-binary. bash is the only language the scaffold writes; a TypeScript workflow
-needs a bundle step, because a submission carries one inline script that the
-node materializes without a file extension.
+binary. `--lang ts` writes a TypeScript starter whose inline writer produces
+the same bytes as these subcommands; it is bundled before submission, because a
+submission carries one inline script that the node materializes without a file
+extension.
 
 Scope check before writing one: a mailbox write is a claim about the writing
 run and nothing else. Reporting through it confers no authority, so design the

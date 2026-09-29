@@ -11,9 +11,10 @@
 // about the writer's own run and nothing else.
 //
 // The file protocol is the contract; this package is only the recommended
-// producer of it. The inline POSIX writer the scaffold emits for an image
-// without the wefty binary produces byte-identical event files, and
-// TestInlineBashWriterProducesByteIdenticalEvents holds that.
+// producer of it. The inline POSIX writer the bash scaffold emits for an image
+// without the wefty binary produces byte-identical text events, and the
+// inline writer the TypeScript scaffold emits produces byte-identical events
+// of every kind; the conformance tests in agent/ hold both.
 package workflowhelper
 
 import (
