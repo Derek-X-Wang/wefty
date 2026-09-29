@@ -154,6 +154,10 @@ RemoveOnStop=true
 [Install]
 WantedBy=sockets.target
 `),
+		// KillMode=mixed: a stop signals only the helper, which finishes or
+		// cancels its own short-lived ip/iptables/e2fsprogs children in order;
+		// anything left is SIGKILLed once it exits. Containers, shims, and
+		// loggers live outside this unit's cgroup (#579).
 		HelperService: []byte(`[Unit]
 Description=Wefty privileged OCI helper
 After=containerd.service
@@ -168,6 +172,7 @@ Group=root
 ExecStart=` + quoteArguments(helperArguments) + `
 StandardOutput=journal
 StandardError=journal
+KillMode=mixed
 Restart=on-failure
 ` + restartPolicy + `NoNewPrivileges=false
 PrivateTmp=true

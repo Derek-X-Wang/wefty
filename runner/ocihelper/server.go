@@ -344,6 +344,18 @@ func (server *Server) startStartupBarrier(ctx context.Context) {
 	go func() {
 		defer server.startupWork.Done()
 		err := server.sweepAndVerifyStartup(ctx)
+		if err != nil && ctx.Err() != nil {
+			// A deliberate stop cut the barrier short. That is not the
+			// restart loop the bound counts, so it is neither recorded nor
+			// fatal: Serve returns nil, and the next generation runs the whole
+			// barrier again before it admits a session.
+			server.logStartupBarrierInterrupted(err)
+			server.sessionMu.Lock()
+			server.startupErr = err
+			close(server.startupDone)
+			server.sessionMu.Unlock()
+			return
+		}
 		if err == nil {
 			server.clearStartupBarrierFailures()
 		} else {
@@ -402,6 +414,12 @@ func (server *Server) superviseTrippedStartupBound(ctx context.Context, tripped 
 				return
 			}
 			err := server.sweepAndVerifyStartup(ctx)
+			if err != nil && ctx.Err() != nil {
+				// A stop interrupted the re-attempt; the streak it was
+				// scheduled by stays exactly as the ledger records it.
+				server.logStartupBarrierInterrupted(err)
+				return
+			}
 			if err == nil {
 				server.clearStartupBarrierFailures()
 				server.config.Logf("OCI helper startup barrier succeeded after a tripped bound; admitting sessions again")
@@ -444,6 +462,29 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	server.startupSweep = &sweep
 	server.sessionMu.Unlock()
 	return nil
+}
+
+// logStartupBarrierInterrupted records a boot barrier that a deliberate stop
+// cut short. The cause is the same text a fatal barrier failure would have
+// carried to the journal, so a real fault that coincided with the stop is still
+// readable there.
+func (server *Server) logStartupBarrierInterrupted(err error) {
+	phase := StartupBarrierPhase("unknown")
+	var barrier *StartupBarrierError
+	if errors.As(err, &barrier) {
+		phase = barrier.Phase
+	}
+	server.config.Logf("OCI helper startup barrier interrupted by helper shutdown phase=%s cause=%q; not counted toward the restart bound, and the next helper start runs the barrier again",
+		phase, err.Error())
+}
+
+// shuttingDown reports whether Serve's context is done: a deliberate stop
+// (SIGTERM or SIGINT in the helper process) is in progress.
+func (server *Server) shuttingDown() bool {
+	server.sessionMu.Lock()
+	ctx := server.serveCtx
+	server.sessionMu.Unlock()
+	return ctx != nil && ctx.Err() != nil
 }
 
 func (server *Server) fail(err error) {
@@ -787,6 +828,20 @@ func (session *serverSession) invalidate(reason string) {
 		reapSweep, reapErr := session.server.engine.ReapSession(ctx, session.identity)
 		cancel()
 		session.server.createSweep.Unlock()
+		if reapErr != nil && session.server.shuttingDown() {
+			// A deliberate stop landed while this reap ran. Under the unit's
+			// stop the reap's own children can be signalled underneath it
+			// (#579), so its failure is the stop's doing, not a helper fault:
+			// Serve returns nil and the process exits 0. Nothing is lost --
+			// the next helper start sweeps and verifies the whole runtime
+			// namespace before it admits a session. The cause is kept because
+			// a real fault that coincided with the stop is only readable here.
+			session.server.config.Logf(
+				"OCI helper session reap interrupted by helper shutdown reason=%q session_generation=%d cause=%q; the next helper start sweeps and verifies the runtime namespace before admitting a session",
+				reason, session.helper.SessionGeneration, reapErr.Error(),
+			)
+			return
+		}
 		if reapErr != nil {
 			// The session slot stays occupied by this closed session until the
 			// process dies, so every later request reads session_stale. Say so

@@ -402,6 +402,7 @@ jobs:
           User=root
           Group=root
           StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr
+          KillMode=mixed
           Restart=on-failure
           RestartSec=250ms
           RestartSteps=6

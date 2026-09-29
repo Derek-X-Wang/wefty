@@ -227,7 +227,7 @@ func TestGuestHelperUnitsPinSocketAuthorityAndPrivateMode(t *testing.T) {
 		"--oci-allowed-mount-root=/mnt/wefty-host", "--oci-lima-host-mount-root=/Users/operator/wefty-mounts",
 		"--oci-memory-capacity-bytes=4294967296", "--oci-memory-reserve-bytes=1073741824",
 		"StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=1s",
-		"RestartPreventExitStatus=78",
+		"RestartPreventExitStatus=78", "KillMode=mixed",
 	} {
 		if !strings.Contains(service, want) {
 			t.Fatalf("service unit missing %q:\n%s", want, service)
