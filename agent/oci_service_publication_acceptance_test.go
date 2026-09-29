@@ -230,10 +230,11 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var removalManifestComplete, removalPending, removalEveryAttempt bool
 	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
+	var removalAfterQuiescenceInjection bool
 	var serviceOperatorBindSourceUntouched, serviceBindMountContentVerified bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_helper_loss_injected=%t\nservice_helper_loss_observed=%t\nservice_helper_loss_observed_at=%s\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_recovery_bound=%s\nservice_fresh_attempt_admission_elapsed=%s\nservice_kill_to_fresh_attempt_admission_elapsed=%s\nservice_fresh_attempt_admission_bound=%s\nservice_fresh_attempt_admission_margin=%s\nservice_fresh_attempt_admission_margin_basis=round4_cleanup_lt_600ms_ceil_1s_plus_preface_admission_ceil_1s\nservice_fresh_attempt_admitted_at=%s\nservice_barrier_advertised_reap_timeout=%s\nservice_barrier_takeover_bound=%s\nservice_barrier_verified_ready_bound=%s\nservice_barrier_started_at=%s\nservice_barrier_preface_completed_at=%s\nservice_barrier_session_admitted_at=%s\nservice_barrier_verified_ready_at=%s\nservice_barrier_prefaced_during_startup=%t\nservice_barrier_handshake_elapsed=%s\nservice_barrier_session_admission_elapsed=%s\nservice_barrier_sweep_elapsed=%s\nservice_barrier_verify_elapsed=%s\nservice_barrier_verified_ready_elapsed=%s\nservice_lost_log_typed=%t\nservice_lost_log_disposition=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\nservice_operator_bind_source_untouched=%t\nservice_bind_mount_content_verified=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceHelperLossInjected, !serviceBarrierTimeline.HelperLossObservedAt.IsZero(), serviceBarrierTimeline.HelperLossObservedAt.UTC().Format(time.RFC3339Nano), serviceFreshAttemptReadmission, serviceRecoveryElapsed, serviceRecoveryBound, serviceFreshAttemptAdmissionElapsed, serviceKillToFreshAttemptAdmissionElapsed, serviceFreshAttemptAdmissionBound, nativeOCIFreshAttemptLeaseMargin, serviceFreshAttemptAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.AdvertisedReapTimeout, serviceBarrierTimeline.TakeoverBound, serviceBarrierTimeline.VerifiedReadyBound, serviceBarrierTimeline.BarrierStartedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefaceCompletedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.SessionAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.VerifiedReadyAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefacedDuringStartup, serviceBarrierTimeline.HandshakeElapsed, serviceBarrierTimeline.SessionAdmissionElapsed, serviceBarrierTimeline.SweepElapsed, serviceBarrierTimeline.VerifyElapsed, serviceBarrierTimeline.VerifiedReadyElapsed, serviceLostLogTyped, serviceLostLogDisposition, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep, serviceOperatorBindSourceUntouched, serviceBindMountContentVerified)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_helper_loss_injected=%t\nservice_helper_loss_observed=%t\nservice_helper_loss_observed_at=%s\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_recovery_bound=%s\nservice_fresh_attempt_admission_elapsed=%s\nservice_kill_to_fresh_attempt_admission_elapsed=%s\nservice_fresh_attempt_admission_bound=%s\nservice_fresh_attempt_admission_margin=%s\nservice_fresh_attempt_admission_margin_basis=round4_cleanup_lt_600ms_ceil_1s_plus_preface_admission_ceil_1s\nservice_fresh_attempt_admitted_at=%s\nservice_barrier_advertised_reap_timeout=%s\nservice_barrier_takeover_bound=%s\nservice_barrier_verified_ready_bound=%s\nservice_barrier_started_at=%s\nservice_barrier_preface_completed_at=%s\nservice_barrier_session_admitted_at=%s\nservice_barrier_verified_ready_at=%s\nservice_barrier_prefaced_during_startup=%t\nservice_barrier_handshake_elapsed=%s\nservice_barrier_session_admission_elapsed=%s\nservice_barrier_sweep_elapsed=%s\nservice_barrier_verify_elapsed=%s\nservice_barrier_verified_ready_elapsed=%s\nservice_lost_log_typed=%t\nservice_lost_log_disposition=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_after_quiescence_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\nservice_operator_bind_source_untouched=%t\nservice_bind_mount_content_verified=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceHelperLossInjected, !serviceBarrierTimeline.HelperLossObservedAt.IsZero(), serviceBarrierTimeline.HelperLossObservedAt.UTC().Format(time.RFC3339Nano), serviceFreshAttemptReadmission, serviceRecoveryElapsed, serviceRecoveryBound, serviceFreshAttemptAdmissionElapsed, serviceKillToFreshAttemptAdmissionElapsed, serviceFreshAttemptAdmissionBound, nativeOCIFreshAttemptLeaseMargin, serviceFreshAttemptAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.AdvertisedReapTimeout, serviceBarrierTimeline.TakeoverBound, serviceBarrierTimeline.VerifiedReadyBound, serviceBarrierTimeline.BarrierStartedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefaceCompletedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.SessionAdmittedAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.VerifiedReadyAt.UTC().Format(time.RFC3339Nano), serviceBarrierTimeline.PrefacedDuringStartup, serviceBarrierTimeline.HandshakeElapsed, serviceBarrierTimeline.SessionAdmissionElapsed, serviceBarrierTimeline.SweepElapsed, serviceBarrierTimeline.VerifyElapsed, serviceBarrierTimeline.VerifiedReadyElapsed, serviceLostLogTyped, serviceLostLogDisposition, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalAfterQuiescenceInjection, removalCompleted, removalPriorBootSweep, serviceOperatorBindSourceUntouched, serviceBindMountContentVerified)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -647,6 +648,7 @@ while :; do sleep 1; done
 		t.Fatal(err)
 	}
 	quiescenceEvidence := make(chan workloadrunner.ReapReceipt, 1)
+	quarantinedEvidence := make(chan runtimeRemovalRecord, 1)
 	completedEvidence := make(chan runtimeRemovalRecord, 1)
 	var crashedBeforeAttestation atomic.Bool
 	attestRuntimeRemoval := nodeAgent.session.removals.attestRuntimeRemoval
@@ -658,17 +660,41 @@ while :; do sleep 1; done
 	}
 	recordQuiesced := nodeAgent.session.removals.recordRuntimeQuiesced
 	nodeAgent.session.removals.recordRuntimeQuiesced = func(ctx context.Context, removal localRemoval, receipt workloadrunner.ReapReceipt) error {
-		if err := recordQuiesced(ctx, removal, receipt); err != nil {
+		// The after-quiescence crash below fires only once the receipt is
+		// durable, so the receipt it interrupts is still this removal's
+		// quiescence evidence. The retry resumes from the quarantined phase
+		// without recording quiescence again, so the crashed call is the
+		// capture.
+		err := recordQuiesced(ctx, removal, receipt)
+		if err != nil && !errors.Is(err, errInjectedRuntimeRemovalCrash) {
 			return err
 		}
 		select {
 		case quiescenceEvidence <- receipt:
 		default:
 		}
-		return nil
+		return err
 	}
-	var crashedAfterAttestation atomic.Bool
+	var crashedAfterQuiescence, crashedAfterAttestation atomic.Bool
 	nodeAgent.logSpool.runtimeRemovalCheckpoint = func(checkpoint runtimeRemovalCheckpoint) error {
+		if checkpoint == runtimeRemovalCheckpointAfterQuiescence {
+			// #402: the one declared delete checkpoint the live lane never
+			// injected. The quarantined phase and its reap receipt are
+			// committed; the crash lands before attestation or deletion, and
+			// removal must converge from that durable phase alone.
+			if !crashedAfterQuiescence.CompareAndSwap(false, true) {
+				return nil
+			}
+			stored, found, err := nodeAgent.logSpool.runtimeRemoval(t.Context(), primary.JobID)
+			if err != nil || !found {
+				return errors.Join(err, errors.New("quarantined runtime removal record disappeared at the after-quiescence crash"))
+			}
+			select {
+			case quarantinedEvidence <- stored:
+			default:
+			}
+			return errInjectedRuntimeRemovalCrash
+		}
 		if checkpoint != runtimeRemovalCheckpointAfterComplete {
 			return nil
 		}
@@ -708,6 +734,23 @@ while :; do sleep 1; done
 			t.Fatal("production-timing removal did not exercise both delete/attest crash boundaries")
 		}
 		removalDeleteAttestInjection = true
+		// The after-quiescence crash is proven by what survived it: the record
+		// read at the crash is quarantined with a positive reap receipt, and
+		// the completed record acknowledged to L1 carries that same receipt,
+		// so completion resumed from the pre-crash durable phase rather than
+		// from any quiescence evidence minted after it.
+		select {
+		case quarantined := <-quarantinedEvidence:
+			crashReceipt, crashErr := json.Marshal(quarantined.receipt)
+			completedReceipt, completedErr := json.Marshal(evidence.receipt)
+			if !crashedAfterQuiescence.Load() || quarantined.phase != runtimeRemovalQuarantined || quarantined.quiescedAt == nil ||
+				!quarantined.receipt.RuntimeQuiesced || crashErr != nil || completedErr != nil || !bytes.Equal(crashReceipt, completedReceipt) {
+				t.Fatalf("after-quiescence crash did not resume from its durable quarantined phase: at_crash=%+v completed=%+v", quarantined, evidence)
+			}
+			removalAfterQuiescenceInjection = true
+		case <-time.After(time.Second):
+			t.Fatal("production-timing removal did not exercise the after-quiescence crash boundary")
+		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("removal completion omitted captured absence attestation")
 	}

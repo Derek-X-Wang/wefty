@@ -409,7 +409,8 @@ func conformantLinuxOCIEvidence(t *testing.T) string {
 		"service_retained_binding_verified=true", "removal_manifest_complete=true", "removal_pending=true",
 		"removal_every_attempt=true", "removal_service_data_volume=true",
 		"removal_service_data_owner_record=true", "removal_post_delete_attestation=true",
-		"removal_delete_attest_crash_injected=true", "removal_completed=true",
+		"removal_delete_attest_crash_injected=true", "removal_after_quiescence_crash_injected=true",
+		"removal_completed=true",
 		"removal_prior_boot_oci_sweep=true", "service_operator_bind_source_untouched=true",
 		"service_bind_mount_content_verified=true")
 	write("helper-restart-timeline.txt", "socket_and_service_active_after_recovery=true")
