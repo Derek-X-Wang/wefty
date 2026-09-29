@@ -93,6 +93,7 @@ cd "$WEFTY_ROOT"
   --fabric=plain \
   --listen="$WEFTY_L1_ADDR" \
   --db="$WEFTY_STATE_ROOT/l1.sqlite" \
+  --run-ledger="$WEFTY_L3_ADDR" \
   --node-tags=dogfood-local=mac,arm64,wefty:node:dogfood-local \
   --node-max-oneshot-slots=dogfood-local=4 \
   --node-max-service-slots=dogfood-local=2
