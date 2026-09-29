@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -34,7 +35,7 @@ type computerServiceConfig struct {
 	storageGeneration    int64
 	fencingToken         string
 	dial                 computerEndpointDial
-	publish              func(context.Context, bool, string) error
+	publish              func(ctx context.Context, ready bool, displayEndpoint string, submitIntentRevision int64) error
 	publicationOperation func(context.Context) (context.Context, context.CancelFunc)
 }
 
@@ -242,6 +243,11 @@ func runComputerService(
 	var drainContext context.Context
 	var requestedPublication, confirmedWithdrawal bool
 	var lastPublicationErr error
+	// installedSubmission is the submission-intent revision whose authority is
+	// fully in place in this attempt: the claim's until the synchronizer
+	// installs a change. L1 refuses a ready publication at any other revision.
+	var installedSubmission atomic.Int64
+	installedSubmission.Store(config.submission.SubmitIntentRevision)
 	publication := newPublicationController(clock, 0, 0,
 		func(publishContext context.Context, ready bool) error {
 			publicationMu.Lock()
@@ -255,7 +261,7 @@ func runComputerService(
 			publicationMu.Unlock()
 			var err error
 			if config.publish != nil {
-				err = config.publish(publishContext, ready, displayEndpoint)
+				err = config.publish(publishContext, ready, displayEndpoint, installedSubmission.Load())
 			}
 			publicationMu.Lock()
 			lastPublicationErr = err
@@ -314,7 +320,11 @@ func runComputerService(
 			case <-runtimeStarted:
 			}
 			tokenSyncErrors <- syncComputerTokenFile(runContext, controlRuntime, request.Authority,
-				clock, config.computerTokens, config.computerBridge, config.computerID, config.attemptID, config.submission, initial, updates)
+				clock, config.computerTokens, config.computerBridge, config.computerID, config.attemptID, config.submission, initial, updates,
+				func(revision int64) {
+					installedSubmission.Store(revision)
+					publication.Reassert()
+				})
 		}()
 	}
 	defer stopTokenSync()
@@ -417,6 +427,14 @@ func runComputerService(
 	}
 }
 
+// syncComputerTokenFile makes the attempt's submission transport and files
+// follow the revisioned submission authority. L1 clears the Computer's
+// published readiness and display endpoint when it commits a submission
+// change, so readiness is earned again only under the new authority: installed
+// runs after a change is fully in place (a pass minted and verified at the new
+// revision and published, or the transport and files removed) with that
+// revision, and the caller republishes the same attempt's current readiness
+// fenced at it (wefty #559).
 func syncComputerTokenFile(
 	ctx context.Context,
 	runtime workloadrunner.OCIComputerControlRuntime,
@@ -428,7 +446,11 @@ func syncComputerTokenFile(
 	last ComputerSubmissionAuthority,
 	initial ComputerSubmissionAuthority,
 	updates <-chan ComputerSubmissionAuthority,
+	installed func(submitIntentRevision int64),
 ) error {
+	if installed == nil {
+		installed = func(int64) {}
+	}
 	apply := func(next ComputerSubmissionAuthority) error {
 		if next.Enabled == last.Enabled && next.SubmitIntentRevision == last.SubmitIntentRevision &&
 			next.SubmitMaxInflight == last.SubmitMaxInflight {
@@ -445,6 +467,7 @@ func syncComputerTokenFile(
 		}
 		last = next
 		if !next.Enabled {
+			installed(next.SubmitIntentRevision)
 			return nil
 		}
 		var grant l3.ComputerTokenGrant
@@ -477,6 +500,7 @@ func syncComputerTokenFile(
 			_ = bridge.disable(errComputerAttemptClosed)
 			return fmt.Errorf("publish re-minted Computer submission files: %w", err)
 		}
+		installed(next.SubmitIntentRevision)
 		return nil
 	}
 	if err := apply(initial); err != nil {

@@ -316,7 +316,7 @@
       "put": {
         "operationId": "setAttemptPublication",
         "summary": "Set absolute publication state for one service attempt",
-        "description": "L1 derives an ordinary service's immutable port from its specification; a Computer instead supplies its private Fabric front-door display endpoint only while ready. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
+        "description": "L1 derives an ordinary service's immutable port from its specification; a Computer instead supplies its private Fabric front-door display endpoint only while ready. A ready Computer publication may carry the submission-intent revision its readiness was earned under; L1 then accepts it only at the Computer's current revision and otherwise refuses with 409 stale_policy_revision, because a committed submission change clears readiness that must be earned again under the new authority. The field is rejected for ordinary services and for withdrawals, and omitting it leaves the publication unfenced. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
         "requestBody": {
           "required": true,
           "content": {
@@ -328,7 +328,8 @@
                 "properties": {
                   "fencing_token": { "type": "string", "minLength": 1 },
                   "ready": { "type": "boolean" },
-                  "display_endpoint": { "type": "string", "pattern": "^ws://[^/]+/websockify$" }
+                  "display_endpoint": { "type": "string", "pattern": "^ws://[^/]+/websockify$" },
+                  "submit_intent_revision": { "type": "integer", "format": "int64", "minimum": 0 }
                 }
               }
             }

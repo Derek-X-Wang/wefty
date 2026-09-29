@@ -3129,6 +3129,26 @@ func (s *Store) SetAttemptPublication(
 	} else if request.DisplayEndpoint != nil {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "display_endpoint is applicable only to Computers")
 	}
+	if request.SubmitIntentRevision != nil {
+		if !computerProjection || !*request.Ready || *request.SubmitIntentRevision < 0 {
+			return Job{}, protocolError(contract.ErrorInvalidRequest,
+				"submit_intent_revision is applicable only to a ready Computer publication and must be non-negative")
+		}
+		// A submission change clears readiness in the same transaction that
+		// advances the revision, so readiness earned under an older revision
+		// must not restore the screen the change withdrew (wefty #559).
+		var currentRevision int64
+		if err := tx.QueryRowContext(ctx, `SELECT computers.submit_intent_revision
+			FROM computer_job_projections JOIN computers ON computers.computer_id=computer_job_projections.computer_id
+			WHERE computer_job_projections.job_id=?`, jobID).Scan(&currentRevision); err != nil {
+			return Job{}, internalError(err, "read Computer submission revision for publication")
+		}
+		if currentRevision != *request.SubmitIntentRevision {
+			return Job{}, protocolErrorWithDetails(contract.ErrorStalePolicyRevision,
+				map[string]any{"expected_revision": currentRevision, "observed_revision": *request.SubmitIntentRevision},
+				"Computer readiness was earned under a superseded submission revision")
+		}
+	}
 
 	var targetAttempt any
 	var displayEndpoint any

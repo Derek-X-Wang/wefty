@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const (
@@ -34,6 +36,9 @@ type publicationController struct {
 	clearPending bool
 	stopping     bool
 	revision     uint64
+	// reassert records that L1 dropped an acknowledged publication on its
+	// own authority, so the current readiness must be sent again.
+	reassert bool
 }
 
 func newPublicationController(
@@ -83,6 +88,23 @@ func (controller *publicationController) Observe(ready bool) {
 	controller.mu.Unlock()
 }
 
+// Reassert tells the controller that L1 has cleared this attempt's
+// publication without the controller asking. A Computer submission-authority
+// change does that (wefty #559): the readiness it cleared must be earned again
+// under the new authority, and the agent calls Reassert once it has installed
+// that authority. An acknowledged true is then stale, so Run publishes the
+// current readiness again for the same attempt. Local readiness, forwarding,
+// and open sessions are untouched; a withdrawn or unready controller keeps
+// its ordinary recovery rules.
+func (controller *publicationController) Reassert() {
+	controller.mu.Lock()
+	if !controller.stopping {
+		controller.reassert = true
+		controller.signalLocked()
+	}
+	controller.mu.Unlock()
+}
+
 // Stop withdraws forwarding synchronously and asks Run to drain the final
 // absolute false mutation before returning. It is safe to call more than once.
 func (controller *publicationController) Stop() {
@@ -102,7 +124,17 @@ func (controller *publicationController) Run(ctx context.Context) error {
 	var acknowledged *bool
 	requestedTrue := false
 	for {
+		// Everything a pending signal announces is visible in the snapshot
+		// below, so it is consumed here; a stale refusal then parks until a
+		// signal sent after this publication began.
+		select {
+		case <-controller.notify:
+		default:
+		}
 		snapshot := controller.snapshot()
+		if controller.takeReassert() && acknowledged != nil && *acknowledged {
+			acknowledged = nil
+		}
 		if snapshot.clearPending && acknowledged != nil && !*acknowledged {
 			controller.markClearAcknowledged()
 			snapshot.clearPending = false
@@ -136,6 +168,18 @@ func (controller *publicationController) Run(ctx context.Context) error {
 			acknowledged = nil
 		}
 		err := controller.publish(ctx, *desired)
+		if err != nil && *desired && protocolErrorCode(err) == contract.ErrorStalePolicyRevision {
+			// L1 committed a newer Computer submission authority than this
+			// readiness was earned under, and that commit cleared the
+			// publication. Nothing is published; wait for the agent to install
+			// the newer authority (Reassert) or for readiness to change
+			// (wefty #559). This is neither a failure nor a retry loop.
+			if !controller.waitForSignal(ctx) {
+				controller.forward(false)
+				return nil
+			}
+			continue
+		}
 		if err != nil {
 			classification := classifyAgentProtocolError(err)
 			if classification.destination != errorDestinationTransient {
@@ -230,6 +274,14 @@ func (controller *publicationController) enableForwardingIfCurrent(revision uint
 	}
 }
 
+func (controller *publicationController) takeReassert() bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	reassert := controller.reassert
+	controller.reassert = false
+	return reassert
+}
+
 func (controller *publicationController) markClearAcknowledged() {
 	controller.mu.Lock()
 	controller.clearPending = false
@@ -250,6 +302,15 @@ func (controller *publicationController) wait(ctx context.Context, duration time
 		case <-timer.C():
 			return true
 		}
+	}
+}
+
+func (controller *publicationController) waitForSignal(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-controller.notify:
+		return true
 	}
 }
 

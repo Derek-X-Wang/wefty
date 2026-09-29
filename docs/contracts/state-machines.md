@@ -717,7 +717,12 @@ they succeed or the exact 60-second deadline yields typed,
 restartable `startup_readiness_timeout`. Readiness publishes the Fabric
 front-door URL as `display_endpoint`; later loss or stop first disables the
 front door and closes its sessions, then withdraws the fenced L1 projection.
-Recovery republishes through revision-ordered absolute state. Otherwise the
+Recovery republishes through revision-ordered absolute state. A committed
+submission-authority change clears the published readiness in L1; the agent
+republishes the same attempt once it has installed that authority, and each
+ready publication carries the submission-intent revision it was earned under,
+which L1 accepts only while it is current (`stale_policy_revision` otherwise;
+see `computer-image.md`). Otherwise the
 Computer projection returns an explicitly null endpoint and never guesses a
 placeholder URL.
 

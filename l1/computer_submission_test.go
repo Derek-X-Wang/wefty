@@ -227,7 +227,48 @@ func TestComputerSubmissionAuthorityChangeInvalidatesPublishedReadiness(t *testi
 	if publishedAttempt != nil {
 		t.Fatalf("published attempt survived authority change: %q", *publishedAttempt)
 	}
+
+	// Readiness earned under the superseded revision cannot restore the
+	// screen the change withdrew (wefty #559).
+	publish := func(revision *int64, ready bool, display *string) error {
+		_, err := h.store.SetAttemptPublication(ctx, "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
+			PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready, DisplayEndpoint: display, SubmitIntentRevision: revision})
+		return err
+	}
+	stale, current := int64(0), mutated.SubmitIntentRevision
+	err = publish(&stale, true, &endpoint)
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorStalePolicyRevision ||
+		typed.Details["expected_revision"] != current || typed.Details["observed_revision"] != stale {
+		t.Fatalf("stale-revision publication = %v, want stale_policy_revision expected=%d observed=%d", err, current, stale)
+	}
+	if after, err := h.store.GetComputer(ctx, computer.ComputerID); err != nil || after.DisplayEndpoint != nil {
+		t.Fatalf("stale-revision publication restored the display: %v err=%v", after.DisplayEndpoint, err)
+	}
+	for name, err := range map[string]error{
+		"withdrawal": publish(&current, false, nil),
+		"negative":   publish(int64Pointer(-1), true, &endpoint),
+	} {
+		if !errors.As(err, &typed) || typed.Code != contract.ErrorInvalidRequest {
+			t.Fatalf("%s revision publication = %v, want invalid_request", name, err)
+		}
+	}
+	if err := publish(&current, true, &endpoint); err != nil {
+		t.Fatalf("current-revision publication: %v", err)
+	}
+	if after, err := h.store.GetComputer(ctx, computer.ComputerID); err != nil || after.DisplayEndpoint == nil || *after.DisplayEndpoint != endpoint {
+		t.Fatalf("current-revision publication display = %v err=%v", after.DisplayEndpoint, err)
+	}
+	// An agent that sends no revision keeps the unfenced behaviour.
+	if err := publish(nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := publish(nil, true, &endpoint); err != nil {
+		t.Fatalf("unfenced publication: %v", err)
+	}
 }
+
+func int64Pointer(value int64) *int64 { return &value }
 
 func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 2 * time.Second}, map[string]NodePolicy{

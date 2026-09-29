@@ -136,6 +136,34 @@ whether L3 committed the request before revocation. The files remain
 attempt-local tmpfs and never enter `/wefty/service`, a JobSpec, logs,
 inspection, or removal evidence.
 
+Committing a submission change (enable, disable, or an inflight resize) clears
+the Computer's published readiness and `display_endpoint` in the same L1
+transaction, so readiness is earned again under the new authority. The running
+attempt keeps running. Once the agent has installed the change (a pass minted
+and verified at the new revision with both files published, or the transport
+closed and both files removed), it republishes that same attempt's current
+readiness without waiting for a backend transition or a fresh attempt. The
+screen is therefore absent from the commit until the agent's next policy
+delivery, one mint, and one publication round trip; if both backends are not
+ready at that point, the ordinary atomic readiness rules below decide when it
+returns. A re-mint that fails ends the attempt, and the replacement attempt
+publishes as usual.
+
+Every ready Computer publication carries `submit_intent_revision`, the
+revision whose authority the agent had fully installed when it sent it (the
+claim's revision until a change is installed). L1 checks it against the
+Computer's current revision inside the publication transaction and refuses a
+mismatch with HTTP 409 `stale_policy_revision`, leaving the publication as the
+change left it. Readiness earned under revision N therefore cannot restore the
+screen after N+1 has committed, however the two race. The agent treats that
+refusal as "a newer authority is on its way": it neither retries nor fails
+the attempt, and publishes again once it installs the newer revision or its
+readiness changes. The field is optional on the wire. An agent that omits it
+publishes unfenced as before, and L1 rejects it on ordinary services and on
+withdrawals, which are never fenced. Upgrade L1 before or together with the
+agents: an L1 that predates the field rejects it as an unknown request field,
+so a newer agent's Computer cannot publish its screen there.
+
 `/wefty/service`, `/wefty/control`, and `/wefty/handoff` are non-shadowable.
 Operator mount targets equal to, above, or below any of them are rejected after
 normalization. Image filesystem content at a reserved target is hidden by the

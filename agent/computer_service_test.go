@@ -54,7 +54,7 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 			clock:                systemClock{}, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
 			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 			fencingToken: "fence-1", dial: dial,
-			publish: func(_ context.Context, ready bool, endpoint string) error {
+			publish: func(_ context.Context, ready bool, endpoint string, _ int64) error {
 				publications <- publication{ready: ready, endpoint: endpoint}
 				return nil
 			},
@@ -208,7 +208,7 @@ func TestComputerBackendLossWithdrawsPublicationWithoutKillingPayload(t *testing
 			clock:                clock, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
 			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 			fencingToken: "fence-1", dial: dial,
-			publish: func(_ context.Context, ready bool, _ string) error {
+			publish: func(_ context.Context, ready bool, _ string, _ int64) error {
 				publications <- publication{ready: ready}
 				return nil
 			},
@@ -369,7 +369,7 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 				clock:                systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
 				computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 				fencingToken: "fence-1", dial: dial,
-				publish: func(_ context.Context, ready bool, endpoint string) error {
+				publish: func(_ context.Context, ready bool, endpoint string, _ int64) error {
 					if ready {
 						published <- endpoint
 					}
@@ -467,7 +467,7 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 			fencingToken: "fence-1",
 			dial:         func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
-			publish: func(_ context.Context, ready bool, endpoint string) error {
+			publish: func(_ context.Context, ready bool, endpoint string, _ int64) error {
 				if ready {
 					published <- endpoint
 				}
