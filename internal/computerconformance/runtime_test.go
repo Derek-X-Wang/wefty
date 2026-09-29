@@ -3,6 +3,8 @@ package computerconformance
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -15,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -388,8 +391,7 @@ func TestArm64KeyObserverWaitUsesMeasuredEventBudget(t *testing.T) {
 			close(done)
 		}()
 		session := &InputSession{connection: &websocketConnection{connection: client}}
-		_, observed, _, _, waitErr := runner.waitInputObserverAdvance(context.Background(), before, session)
-		session.Close()
+		_, observed, _, _, waitErr := runner.waitInputObserverAdvance(context.Background(), "input.view-isolated", before, session)
 		<-done
 		if waitErr != nil {
 			t.Fatalf("observer wait failed: %v", waitErr)
@@ -1370,5 +1372,226 @@ func TestTeardownDetachFailureRetainsRootAndNamesBothLeftovers(t *testing.T) {
 	evidence := recorder.Finish(time.Unix(101, 0)).Teardown
 	if strings.Join(evidence.Leftovers, ",") != want {
 		t.Fatalf("receipt leftovers = %v, want %q", evidence.Leftovers, want)
+	}
+}
+
+// fakeGuestInput is a minimal input oracle: control key events advance the
+// key observer, control pointer events enter the pointer history, and view
+// input never reaches it.
+type fakeGuestInput struct {
+	mu                                   sync.Mutex
+	generation, keyEvents, observerLines uint64
+	x, y                                 int
+	history                              [][2]int
+	failuresLeft, opened, closed         int
+}
+
+func (guest *fakeGuestInput) observation() string {
+	guest.mu.Lock()
+	defer guest.mu.Unlock()
+	payload, err := json.Marshal(inputObservation{Version: 1, Generation: guest.generation, KeyEvents: guest.keyEvents, X: guest.x, Y: guest.y, PointerHistory: guest.history, ObserverLines: &guest.observerLines})
+	if err != nil {
+		panic(err)
+	}
+	return string(payload)
+}
+
+func (guest *fakeGuestInput) controlEvent(event []byte) {
+	guest.mu.Lock()
+	defer guest.mu.Unlock()
+	switch {
+	case len(event) == 8 && event[0] == 4 && event[1] == 1:
+		guest.keyEvents++
+		guest.observerLines++
+	case len(event) == 6 && event[0] == 5:
+		guest.x, guest.y = int(binary.BigEndian.Uint16(event[2:4])), int(binary.BigEndian.Uint16(event[4:6]))
+		guest.generation++
+		guest.history = append(guest.history, [2]int{guest.x, guest.y})
+	}
+}
+
+// droppingKeySession stands in for the key observer's control client. Like a
+// cold wayvnc client it discards the keystroke sent while opening, and its
+// first failuresLeft writes fail as a closed peer would.
+type droppingKeySession struct{ guest *fakeGuestInput }
+
+func (session droppingKeySession) SendKey() error {
+	guest := session.guest
+	guest.mu.Lock()
+	if guest.failuresLeft > 0 {
+		guest.failuresLeft--
+		guest.mu.Unlock()
+		return &net.OpError{Op: "write", Net: "tcp4", Err: syscall.EPIPE}
+	}
+	guest.mu.Unlock()
+	guest.controlEvent(rfbKeyEvents()[0])
+	return nil
+}
+
+func (session droppingKeySession) Close() {
+	session.guest.mu.Lock()
+	session.guest.closed++
+	session.guest.mu.Unlock()
+}
+
+// startFakeRFBEndpoint serves the rfb-websocket-v1 handshake on every
+// connection concurrently and hands each client RFB message to onEvent.
+func startFakeRFBEndpoint(t *testing.T, onEvent func([]byte)) int {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connections sync.WaitGroup
+	t.Cleanup(func() {
+		_ = listener.Close()
+		connections.Wait()
+	})
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			connections.Add(1)
+			go func() {
+				defer connections.Done()
+				defer connection.Close()
+				_ = connection.SetDeadline(time.Now().Add(20 * time.Second))
+				reader := bufio.NewReader(connection)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == "\r\n" {
+						break
+					}
+				}
+				_, _ = fmt.Fprintf(connection, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\nSec-WebSocket-Protocol: %s\r\n\r\n", expectedWebSocketAccept(), contract.ComputerDisplayWebSocketSubprotocol)
+				client := &websocketConnection{connection: connection, reader: reader}
+				send := func(payload []byte) { _, _ = connection.Write(append([]byte{0x82, byte(len(payload))}, payload...)) }
+				receive := func() ([]byte, bool) {
+					header := make([]byte, 6)
+					if _, err := io.ReadFull(client.reader, header); err != nil {
+						return nil, false
+					}
+					payload := make([]byte, int(header[1]&0x7f))
+					if _, err := io.ReadFull(client.reader, payload); err != nil {
+						return nil, false
+					}
+					for index := range payload {
+						payload[index] ^= header[2+index%4]
+					}
+					return payload, true
+				}
+				send([]byte("RFB 003.008\n"))
+				for _, reply := range [][]byte{{1, 1}, {0, 0, 0, 0}, make([]byte, 24)} {
+					if _, ok := receive(); !ok {
+						return
+					}
+					send(reply)
+				}
+				for {
+					event, ok := receive()
+					if !ok {
+						return
+					}
+					onEvent(event)
+				}
+			}()
+		}
+	}()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func TestKeyObserverSessionDropsReconnectWithinCapWithoutChangingIsolationVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		failures     int
+		viewLeaks    bool
+		wantStatus   Status
+		wantDrops    int
+		wantOpened   int
+		wantDetailIn string
+	}{
+		{name: "no drop", failures: 0, wantStatus: StatusPass, wantOpened: 2},
+		// Round one's session drops once and is replaced; round two opens its
+		// own session. Isolation is still proved on the view endpoint.
+		{name: "one drop reconnects", failures: 1, wantStatus: StatusPass, wantDrops: 1, wantOpened: 3},
+		// A reconnect never excuses view input reaching the guest.
+		{name: "one drop then view leak fails", failures: 1, viewLeaks: true, wantStatus: StatusFail, wantDrops: 1, wantOpened: 2, wantDetailIn: "view pointer or key input reached the guest before the control sentinel"},
+		// The first session plus both reconnects drop: the third drop is over
+		// the cap and remains an assertion failure.
+		{name: "drops past the cap fail", failures: 3, wantStatus: StatusFail, wantDrops: 3, wantOpened: 3, wantDetailIn: "key observer session dropped 3 times, over the reconnect cap of 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			guest := &fakeGuestInput{failuresLeft: tc.failures}
+			controlPort := startFakeRFBEndpoint(t, guest.controlEvent)
+			viewPort := startFakeRFBEndpoint(t, func(event []byte) {
+				if tc.viewLeaks {
+					guest.controlEvent(event)
+				}
+			})
+			var diagnostics []string
+			runner := runtimeRunner{
+				viewPort:    viewPort,
+				controlPort: controlPort,
+				config: RuntimeConfig{
+					Platform:        "linux/arm64",
+					InputOraclePath: "/oracle",
+					Now:             time.Now,
+					Sleep:           sleepContext,
+				},
+				// A measured QEMU start keeps the observation window well above
+				// the real-clock polling this test performs.
+				firstBootReadiness: 5 * time.Second,
+				recorder:           NewRecorder("reference", "docker", "linux/arm64", time.Now()),
+				runCommandHook: func(_ context.Context, args ...string) (commandResult, error) {
+					if len(args) > 0 && args[0] == "logs" {
+						return commandResult{stdout: "wefty-rfb-backend[control]: x11vnc session exited by signal 11"}, nil
+					}
+					return commandResult{stdout: guest.observation()}, nil
+				},
+				startKeySessionHook: func(context.Context, int) (keyObserverSession, error) {
+					guest.mu.Lock()
+					guest.opened++
+					guest.mu.Unlock()
+					return droppingKeySession{guest: guest}, nil
+				},
+				diagnosticLogHook: func(message string) { diagnostics = append(diagnostics, message) },
+			}
+			proved := runner.proveViewIsolation(context.Background(), "input.view-isolated", 211, 173, 947, 411)
+			receipt := runner.recorder.Finish(time.Now())
+			var check Check
+			for _, candidate := range receipt.Checks {
+				if candidate.ID == "input.view-isolated" {
+					check = candidate
+				}
+			}
+			if proved != (tc.wantStatus == StatusPass) || check.Status != tc.wantStatus {
+				t.Fatalf("proved=%t check=%+v, want status %s", proved, check, tc.wantStatus)
+			}
+			if tc.wantStatus == StatusFail && (check.FailureReason != FailureAssertionFailed || !strings.Contains(check.Detail, tc.wantDetailIn)) {
+				t.Fatalf("over-cap evidence = %+v, want assertion_failed naming %q", check, tc.wantDetailIn)
+			}
+			if len(receipt.InputObserverSessionDrops) != tc.wantDrops || len(diagnostics) != tc.wantDrops {
+				t.Fatalf("drops=%+v diagnostics=%q, want %d of each", receipt.InputObserverSessionDrops, diagnostics, tc.wantDrops)
+			}
+			for index, drop := range receipt.InputObserverSessionDrops {
+				if drop.Check != "input.view-isolated" || drop.Drop != index+1 || !strings.Contains(drop.Detail, "broken pipe") {
+					t.Fatalf("drop %d evidence = %+v", index, drop)
+				}
+				if !strings.Contains(diagnostics[index], "exited by signal 11") {
+					t.Fatalf("drop %d diagnostics %q omit the tenant log tail", index, diagnostics[index])
+				}
+			}
+			guest.mu.Lock()
+			opened, closed := guest.opened, guest.closed
+			guest.mu.Unlock()
+			if opened != tc.wantOpened || closed != opened {
+				t.Fatalf("key sessions opened=%d closed=%d, want %d opened and all closed", opened, closed, tc.wantOpened)
+			}
+		})
 	}
 }

@@ -105,6 +105,9 @@ func TestRuntimeEvidenceDiagnosticsNameEveryTerminalFailure(t *testing.T) {
 	zero := write("zero.json", `{"version":2,"checks":[{"id":"expected","status":"PASS","detail":"ok"}],`+teardown+`}`)
 	wrong := write("wrong.json", `{"version":2,"checks":[{"id":"other","status":"FAIL","detail":"wrong","failure_reason":"assertion_failed"}],`+teardown+`}`)
 	positive := write("positive.json", `{"version":2,"status":"PASS","checks":[],`+teardown+`}`)
+	// #569: a key-observer session drop is transport evidence beside a PASS.
+	positiveWithDrop := write("positive-with-drop.json", `{"version":2,"status":"PASS","checks":[],`+teardown+`,"input_observer_session_drops":[{"check":"input.view-isolated","drop":1,"detail":"key observer session dropped: broken pipe"}]}`)
+	malformedDrop := write("malformed-drop.json", `{"version":2,"status":"PASS","checks":[],`+teardown+`,"input_observer_session_drops":[{"check":"input.view-isolated","drop":0}]}`)
 	oldPositive := write("old-positive.json", `{"version":1,"status":"PASS","checks":[],`+teardown+`}`)
 	nonPass := write("non-pass.json", `{"version":2,"status":"FAIL","checks":[],`+teardown+`}`)
 	missingTeardown := write("missing-teardown.json", `{"version":2,"status":"PASS","checks":[]}`)
@@ -126,6 +129,7 @@ func TestRuntimeEvidenceDiagnosticsNameEveryTerminalFailure(t *testing.T) {
 		"old positive":            {[]string{"positive", oldPositive}, "receipt/positive-runtime"},
 		"non-pass positive":       {[]string{"positive", nonPass}, "receipt/positive-runtime"},
 		"missing teardown":        {[]string{"positive", missingTeardown}, "receipt/positive-runtime"},
+		"malformed session drop":  {[]string{"positive", malformedDrop}, "receipt/positive-runtime"},
 		"teardown leftover":       {[]string{"mutation", leftover, "row", "expected", "detail", "1", "3"}, "receipt/row"},
 		"unknown readiness event": {[]string{"mutation", bogusReadiness, "row", "expected", "detail", "1", "3"}, "receipt/row"},
 		"repair wrong exit":       {[]string{"teardown-repair", repair, "1"}, "teardown-repair"},
@@ -144,9 +148,11 @@ func TestRuntimeEvidenceDiagnosticsNameEveryTerminalFailure(t *testing.T) {
 		})
 	}
 
-	command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "positive", positive)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("valid positive receipt failed: %v: %s", err, output)
+	for _, receipt := range []string{positive, positiveWithDrop} {
+		command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "positive", receipt)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("valid positive receipt %s failed: %v: %s", filepath.Base(receipt), err, output)
+		}
 	}
 }
 
@@ -354,5 +360,22 @@ func TestDriverWatcherUsesOneExactByteRead(t *testing.T) {
 	command.Dir = repositoryRoot
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("driver watcher regression failed: %v\n%s", err, output)
+	}
+}
+
+func TestRFBBackendBoundsSessionDiagnostics(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 unavailable; rfb-backend session diagnostics regression not run: %v", err)
+	}
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not resolve runtime_evidence_test.go path")
+	}
+	repositoryRoot := filepath.Dir(filepath.Dir(source))
+	command := exec.Command(python, filepath.Join(repositoryRoot, "examples", "computer", "test_rfb_backend.py"))
+	command.Dir = repositoryRoot
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("rfb-backend session diagnostics regression failed: %v\n%s", err, output)
 	}
 }

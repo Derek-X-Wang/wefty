@@ -37,7 +37,25 @@ const (
 	teardownRemoveRetryBudget = 2 * time.Second
 	permissionRepairScript    = `chmod -R u+rwX,go+rwX "$1"`
 	teardownPermissionFixture = "teardown-permission-repair"
+	// keyObserverSessionReconnectCap bounds how often one key-observer
+	// liveness window reopens its control session after the image side closed
+	// it. The probe exists to prove input isolation, not RFB session stability
+	// under emulation: #569 traced twelve xfce/arm64 lane failures to x11vnc
+	// sessions dropped mid-window under QEMU. A third drop in one window is
+	// still an assertion failure.
+	keyObserverSessionReconnectCap = 2
+	// Each drop prints a bounded tail of the tenant's logs to the checker's
+	// stderr so a backend exit behind the dropped session is diagnosable.
+	keyObserverDropLogLines = 40
+	keyObserverDropLogBytes = 4096
 )
+
+// keyObserverSession is the established control client the key-observer
+// liveness probe keeps open. Tests inject sessions whose writes fail.
+type keyObserverSession interface {
+	SendKey() error
+	Close()
+}
 
 type TeardownFailureReason string
 
@@ -100,6 +118,8 @@ type runtimeRunner struct {
 	runCommandHook                           func(context.Context, ...string) (commandResult, error)
 	removeAllHook                            func(string) error
 	teardownLogHook                          func(string)
+	startKeySessionHook                      func(context.Context, int) (keyObserverSession, error)
+	diagnosticLogHook                        func(string)
 }
 
 func Run(ctx context.Context, config RuntimeConfig) RuntimeResult {
@@ -247,19 +267,29 @@ func (r *runtimeRunner) withStartupLogs(ctx context.Context, readinessErr error)
 	// image that never exposed an edge. Keep those diagnostics on stderr, redact
 	// endpoint-looking values, and cap their size instead of putting them in the
 	// durable receipt.
-	result, err := r.runCommand(ctx, "logs", "--tail", "200", r.containerID)
-	if err != nil {
-		return readinessErr
-	}
-	logs := strings.TrimSpace(result.stdout + result.stderr)
+	logs := r.tenantLogTail(ctx, 200, 8192)
 	if logs == "" {
 		return readinessErr
 	}
-	logs = strings.TrimSpace(portPattern.ReplaceAllString(logs, "<endpoint>"))
-	if len(logs) > 8192 {
-		logs = logs[:8192]
-	}
 	return fmt.Errorf("%w; tenant startup logs: %s", readinessErr, logs)
+}
+
+// tenantLogTail returns at most limit bytes of the container's last lines,
+// with endpoint-looking values redacted, or "" when none are available.
+func (r *runtimeRunner) tenantLogTail(ctx context.Context, lines, limit int) string {
+	result, err := r.runCommand(ctx, "logs", "--tail", strconv.Itoa(lines), r.containerID)
+	if err != nil {
+		return ""
+	}
+	logs := strings.TrimSpace(result.stdout + result.stderr)
+	if logs == "" {
+		return ""
+	}
+	logs = strings.TrimSpace(portPattern.ReplaceAllString(logs, "<endpoint>"))
+	if len(logs) > limit {
+		logs = logs[:limit]
+	}
+	return logs
 }
 
 func (r *runtimeRunner) allocatePorts() error {
@@ -895,7 +925,14 @@ func inputObserverLines(observation inputObservation) uint64 {
 	return *observation.ObserverLines
 }
 
-func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inputObservation, session *InputSession) (inputObservation, bool, time.Duration, time.Duration, error) {
+// waitInputObserverAdvance owns session: it closes it, or any replacement,
+// before returning.
+func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, id string, before inputObservation, session keyObserverSession) (inputObservation, bool, time.Duration, time.Duration, error) {
+	defer func() {
+		if session != nil {
+			session.Close()
+		}
+	}()
 	last := inputObservation{}
 	// wayvnc can create a new client's virtual keyboard after its first RFB
 	// messages arrive. Reuse that established client while proving liveness so
@@ -903,6 +940,8 @@ func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inp
 	window := r.readinessEventObservationBudget()
 	startedAt := r.config.Now()
 	deadline := startedAt.Add(window)
+	drops := 0
+	var reconnectErr error
 	for r.config.Now().Before(deadline) {
 		for poll := 0; poll < 4 && r.config.Now().Before(deadline); poll++ {
 			value, err := r.readInputObservation(ctx)
@@ -916,11 +955,40 @@ func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inp
 				return last, false, window, r.config.Now().Sub(startedAt), err
 			}
 		}
-		if r.config.Now().Before(deadline) {
-			if err := session.SendKey(); err != nil {
-				return last, false, window, r.config.Now().Sub(startedAt), err
-			}
+		if !r.config.Now().Before(deadline) {
+			break
 		}
+		sendErr := reconnectErr
+		if session != nil {
+			sendErr = session.SendKey()
+		}
+		if sendErr == nil {
+			continue
+		}
+		// The image side closed the established session (or refused its
+		// replacement). Record the drop as transport evidence and reopen a
+		// fresh key session inside the same window; only a drop past the cap
+		// is a verdict.
+		drops++
+		detail := r.runtimeDetail("key observer session dropped", sendErr)
+		if r.recorder != nil {
+			r.recorder.RecordInputObserverSessionDrop(id, drops, detail)
+		}
+		r.diagnosticLog(fmt.Sprintf("%s drop %d (reconnect cap %d): %s; tenant logs: %s", id, drops, keyObserverSessionReconnectCap, detail, r.tenantLogTail(ctx, keyObserverDropLogLines, keyObserverDropLogBytes)))
+		if session != nil {
+			session.Close()
+			session = nil
+		}
+		if drops > keyObserverSessionReconnectCap {
+			return last, false, window, r.config.Now().Sub(startedAt), fmt.Errorf("key observer session dropped %d times, over the reconnect cap of %d: %w", drops, keyObserverSessionReconnectCap, sendErr)
+		}
+		remaining := deadline.Sub(r.config.Now())
+		if remaining <= 0 {
+			break
+		}
+		reconnectCtx, cancel := context.WithTimeout(ctx, min(10*time.Second, remaining))
+		session, reconnectErr = r.startKeySession(reconnectCtx, r.controlPort)
+		cancel()
 	}
 	elapsed := r.config.Now().Sub(startedAt)
 	if elapsed < window {
@@ -1003,7 +1071,7 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 		if hasProbeDeadline {
 			probeWindow = time.Until(probeDeadline)
 		}
-		observerSession, err := StartKey(probeCtx, r.controlPort)
+		observerSession, err := r.startKeySession(probeCtx, r.controlPort)
 		deadlineExpired := errors.Is(probeCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
 		var networkError net.Error
 		if !deadlineExpired && hasProbeDeadline && errors.As(err, &networkError) && networkError.Timeout() {
@@ -1025,8 +1093,7 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 			}
 			return false
 		}
-		observer, observerLive, window, elapsed, observerErr := r.waitInputObserverAdvance(ctx, before, observerSession)
-		observerSession.Close()
+		observer, observerLive, window, elapsed, observerErr := r.waitInputObserverAdvance(ctx, id, before, observerSession)
 		if observerErr != nil {
 			r.record(id, StatusFail, r.runtimeDetail("key observer liveness probe failed", observerErr))
 			return false
@@ -1592,6 +1659,26 @@ func (r *runtimeRunner) teardownSleep(ctx context.Context, duration time.Duratio
 		return r.config.Sleep(ctx, duration)
 	}
 	return sleepContext(ctx, duration)
+}
+
+func (r *runtimeRunner) startKeySession(ctx context.Context, port int) (keyObserverSession, error) {
+	if r.startKeySessionHook != nil {
+		return r.startKeySessionHook(ctx, port)
+	}
+	session, err := StartKey(ctx, port)
+	if err != nil {
+		// Never return a typed-nil interface.
+		return nil, err
+	}
+	return session, nil
+}
+
+func (r *runtimeRunner) diagnosticLog(message string) {
+	if r.diagnosticLogHook != nil {
+		r.diagnosticLogHook(message)
+		return
+	}
+	fmt.Fprintln(os.Stderr, message)
 }
 
 func (r *runtimeRunner) teardownLog(message string) {
