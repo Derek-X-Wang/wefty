@@ -52,11 +52,25 @@ func ValidateHandoffOwner(spec JobSpec) error {
 	switch {
 	case owner == "":
 		return errors.New("a kind=oci one-shot job needs a run identity to own its handoff volume: " +
-			"submit it as an L3 run, or label it with run_id")
+			"submit it as an L3 run, whose dispatch names its run in run_id")
 	case len(owner) > MaxHandoffOwnerKeyBytes:
 		return errors.New("a kind=oci one-shot job's handoff owner key (handoff_owner_run_id, else run_id) exceeds 255 bytes")
 	case strings.IndexByte(owner, 0) >= 0:
 		return errors.New("a kind=oci one-shot job's handoff owner key (handoff_owner_run_id, else run_id) contains a NUL byte")
 	}
 	return nil
+}
+
+// RunIdentityLabels returns the run identity labels a spec sets, trimmed, with
+// blank ones left out: run_id and handoff_owner_run_id, the two labels a node
+// keys a one-shot's handoff by and attributes its results to. A blank label
+// names no run, so it claims nothing.
+func RunIdentityLabels(spec JobSpec) map[string]string {
+	named := map[string]string{}
+	for _, label := range []string{LabelRunID, LabelHandoffOwnerRunID} {
+		if value := strings.TrimSpace(spec.Labels[label]); value != "" {
+			named[label] = value
+		}
+	}
+	return named
 }

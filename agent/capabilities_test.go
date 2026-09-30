@@ -385,7 +385,7 @@ func TestRestrictiveCapabilityTransitionPausesClaimsUntilPublished(t *testing.T)
 	if err := nodeAgent.RecoverOCIRuntimeCapabilities(context.Background()); err == nil {
 		t.Fatal("restrictive event probe returned no error")
 	}
-	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("capability-publication-barrier"))
+	job, _, err := store.CreateJobAs(context.Background(), testOCIJobSpec("capability-publication-barrier"), runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestOCIBootBarrierOrdersRemovalProbePublicationAndClaims(t *testing.T) {
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-boot-barrier": nil})
 	defer stopServer()
-	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("boot-barrier-order"))
+	job, _, err := store.CreateJobAs(context.Background(), testOCIJobSpec("boot-barrier-order"), runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +669,7 @@ func TestReusedBootAtomicallySupersedesHighRevisionOCIBadge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("reused-high-revision"))
+	job, _, err := store.CreateJobAs(context.Background(), testOCIJobSpec("reused-high-revision"), runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +728,7 @@ func TestFailedOCIBootSweepPublishesNoBadgeAndMintsNoClaim(t *testing.T) {
 	nodeAgent.session.removals = &removalController{managed: &recordingResumeResource{resume: func() {
 		removalResumed <- struct{}{}
 	}}}
-	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("boot-sweep-failed"))
+	job, _, err := store.CreateJobAs(context.Background(), testOCIJobSpec("boot-sweep-failed"), runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -793,7 +793,7 @@ func TestHelperLossAtBarrierStagesKeepsPoisedOCIClaimUnminted(t *testing.T) {
 					barrier.lose(errors.New("helper died during removal recovery"))
 				}
 			}}}
-			job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("poised-"+stage))
+			job, _, err := store.CreateJobAs(context.Background(), testOCIJobSpec("poised-"+stage), runLedgerOrigin)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1061,6 +1061,11 @@ func waitForAgentNode(t *testing.T, store *l1.Store, nodeID string, predicate fu
 	t.Fatalf("node %q did not reach capability predicate: %#v", nodeID, nodes)
 	return l1.Node{}
 }
+
+// runLedgerOrigin creates a fixture the way an OCI one-shot reaches L1 in
+// production: dispatched by the run ledger, the one root submitter entitled
+// to name the run its handoff volume is keyed by (wefty #583).
+var runLedgerOrigin = l1.JobOrigin{OriginatingSubmitter: "run-ledger", SubmittedByRunLedger: true}
 
 func testOCIJobSpec(dispatchKey string) contract.JobSpec {
 	return contract.JobSpec{

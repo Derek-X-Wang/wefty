@@ -395,6 +395,11 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	} else if !errors.Is(tombstoneErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(tombstoneErr, "read removed Computer dispatch key")
 	}
+	// Checked after replay resolution, so an identical replay of a Computer
+	// stored before L1 checked still returns it (wefty #583).
+	if err := refuseComputerRunIdentity(request.Spec); err != nil {
+		return Computer{}, false, err
+	}
 	var existingID string
 	if err := tx.QueryRowContext(ctx, "SELECT computer_id FROM computers WHERE name=?", request.Name).Scan(&existingID); err == nil {
 		return Computer{}, false, protocolError(contract.ErrorConflict,
@@ -445,6 +450,28 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	}
 	s.notifyComputerPolicyChanged()
 	return computer, false, nil
+}
+
+// refuseComputerRunIdentity refuses a caller-supplied Computer specification
+// that names a run in run_id or handoff_owner_run_id. A Computer is a service
+// and never belongs to a run: its data is keyed by its own Storage, and no
+// submitter -- the run ledger included -- is entitled to attribute it to one.
+// The labels would otherwise be stored and projected exactly as a /v1/jobs
+// submission's are, which is the claim authorizeRunIdentity refuses there.
+func refuseComputerRunIdentity(spec contract.JobSpec) error {
+	named := contract.RunIdentityLabels(spec)
+	if len(named) == 0 {
+		return nil
+	}
+	labels := make([]string, 0, len(named))
+	for _, label := range []string{contract.LabelRunID, contract.LabelHandoffOwnerRunID} {
+		if _, found := named[label]; found {
+			labels = append(labels, label)
+		}
+	}
+	return protocolErrorWithDetails(contract.ErrorRunIdentityNotEntitled,
+		map[string]any{"labels": labels},
+		"a Computer never belongs to a run, so its specification may not name one in %s", strings.Join(labels, " or "))
 }
 
 func encodeJobSpec(spec contract.JobSpec) ([]byte, string, error) {
@@ -1742,6 +1769,15 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	}
+	// A projection's spec is the caller's, so it may not name a run (wefty
+	// #583). A reimage's is the stored Computer's own with only the image
+	// replaced, so it can introduce no claim the Computer did not already
+	// hold. Both follow the replay check above.
+	if operation == ComputerIntentProject {
+		if err := refuseComputerRunIdentity(request.Spec); err != nil {
+			return Computer{}, err
+		}
 	}
 	// Refused before any revision is reserved: a projection or reimage of a
 	// Computer with no published Storage commits a phase whose directive no

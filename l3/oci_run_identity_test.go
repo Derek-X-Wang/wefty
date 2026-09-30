@@ -63,4 +63,18 @@ func TestAnOCIOneShotIsAcceptedAsARunAndRefusedWithoutOne(t *testing.T) {
 	if status != http.StatusConflict || refusal.Error.Code != contract.ErrorRunIdentityRequired {
 		t.Fatalf("direct submission status = %d body=%s, want 409 %s", status, body, contract.ErrorRunIdentityRequired)
 	}
+
+	// Nor can the operator borrow the run's identity (wefty #583): the same
+	// spec naming the ledger's run, posted straight to L1, is refused as a
+	// claim the operator is not entitled to make.
+	borrowed := dispatched.Spec
+	borrowed.DispatchKey = "borrowed-" + borrowed.DispatchKey
+	status, _, body = h.do(operator, http.MethodPost, "/v1/jobs", borrowed, nil)
+	refusal = contract.ErrorResponse{}
+	if err := json.Unmarshal(body, &refusal); err != nil {
+		t.Fatalf("decode borrowed submission response %s: %v", body, err)
+	}
+	if status != http.StatusForbidden || refusal.Error.Code != contract.ErrorRunIdentityNotEntitled {
+		t.Fatalf("borrowed run identity status = %d body=%s, want 403 %s", status, body, contract.ErrorRunIdentityNotEntitled)
+	}
 }

@@ -2710,7 +2710,9 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 			OCI:          &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference}, Argv: []string{"/usr/local/bin/wefty-echo-service", "--once"}},
 		},
 	}
-	job, _, err := store.CreateJob(ctx, spec)
+	// It names its run, so it is created as the run ledger dispatches it: the
+	// one root submitter L1 lets name a run (wefty #583).
+	job, _, err := store.CreateJobAs(ctx, spec, l1.JobOrigin{OriginatingSubmitter: "run-ledger", SubmittedByRunLedger: true})
 	if err != nil {
 		t.Fatal(err)
 	}

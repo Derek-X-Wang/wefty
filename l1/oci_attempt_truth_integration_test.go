@@ -492,7 +492,7 @@ func createOCIFixtureJob(t *testing.T, h *integrationHarness, dispatchKey, class
 	if err := contract.ValidateJobSpec(&ociSpec); err != nil {
 		t.Fatalf("OCI fixture does not satisfy the public contract: %v", err)
 	}
-	job, _, err := h.store.CreateJob(context.Background(), ociSpec)
+	job, _, err := h.store.CreateJobAs(context.Background(), ociSpec, runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1988,6 +1988,14 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read removed dispatch key")
 	}
+	// A run identity label is a claim to speak for that run: the node keys a
+	// one-shot's retained handoff by it and attributes the attempt's results
+	// to it. Only a submitter entitled to the run may make the claim (wefty
+	// #583). Like the check below, it follows replay resolution, so an
+	// identical replay of a job stored before L1 checked still returns it.
+	if err := authorizeRunIdentity(ctx, tx, spec, submittedByRunLedger, origin.Parent, now); err != nil {
+		return Job{}, false, err
+	}
 	// An OCI one-shot's handoff volume is named from its run identity, which
 	// only its immutable labels carry. One that names none would be refused by
 	// the node's helper on every attempt, and requeued each time as runtime
@@ -2054,6 +2062,55 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, reques
 		return Job{}, false, internalError(err, "commit job creation")
 	}
 	return job, false, nil
+}
+
+// authorizeRunIdentity refuses a new job whose run identity labels name a run
+// its submitter is not entitled to. The trusted run ledger dispatches every
+// run, so it may name any. A child submitted through an attempt credential
+// speaks for its parent's run and no other: its run_id must be the parent's
+// run_id, and its handoff_owner_run_id the parent's run_id or the run whose
+// handoff the parent itself reuses -- never more than the parent already
+// holds. The parent is the credential's job, which L1 proved against the
+// live attempt; its labels were checked the same way when it was stored, so
+// the entitlement is inherited down the spawn chain and never widened. Any
+// other submitter may name no run at all.
+func authorizeRunIdentity(ctx context.Context, q queryer, spec contract.JobSpec, submittedByRunLedger bool,
+	parent *AttemptCredentialScope, now time.Time) error {
+	named := contract.RunIdentityLabels(spec)
+	// A child is never classified as the ledger's own submission, whoever its
+	// root was, so it always takes the parent branch below.
+	if len(named) == 0 || submittedByRunLedger {
+		return nil
+	}
+	labels := make([]string, 0, len(named))
+	for _, label := range []string{contract.LabelRunID, contract.LabelHandoffOwnerRunID} {
+		if _, found := named[label]; found {
+			labels = append(labels, label)
+		}
+	}
+	if parent == nil {
+		return protocolErrorWithDetails(contract.ErrorRunIdentityNotEntitled,
+			map[string]any{"labels": labels},
+			"only the run ledger may name a run in %s: submit the work as an L3 run, whose dispatch names it",
+			strings.Join(labels, " or "))
+	}
+	parentJob, err := getJobByID(ctx, q, parent.JobID, now)
+	if err != nil {
+		return internalError(err, "read the credential's parent job")
+	}
+	parentRun := strings.TrimSpace(parentJob.Spec.Labels[contract.LabelRunID])
+	entitled := map[string][]string{
+		contract.LabelRunID:             {parentRun},
+		contract.LabelHandoffOwnerRunID: {parentRun, contract.HandoffOwnerKey(parentJob.Spec)},
+	}
+	for _, label := range labels {
+		if !slices.Contains(entitled[label], named[label]) {
+			return protocolErrorWithDetails(contract.ErrorRunIdentityNotEntitled,
+				map[string]any{"labels": labels, "parent_job_id": parent.JobID},
+				"a child job may name only its parent job's own run in %s", label)
+		}
+	}
+	return nil
 }
 
 // replayWithinScope decides whether a dispatch-key replay may be handed to

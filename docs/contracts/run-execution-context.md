@@ -219,7 +219,9 @@ the other non-retryable job-creation conflicts.
 A child is submitted with the ordinary `JobSpec` body, so the submitter ceiling
 is exactly what a client principal may express: the Computer trait remains
 refused with `computer_resource_required`, and every other structural rule is
-unchanged. The originating submitter is the client principal that created the
+unchanged. A child may name only its parent's run in `run_id` or
+`handoff_owner_run_id`; see the handoff owner rules below
+(`run_identity_not_entitled`, wefty #583). The originating submitter is the client principal that created the
 root job; it is recorded on every descendant and is never widened.
 
 Dispatch-key replay stays idempotent within a parent and never crosses one. A
@@ -742,12 +744,53 @@ so a job without a usable key could never run. L1 therefore refuses it at
 applies to a new job only: it follows dispatch-key resolution, so an identical
 replay of such a job stored before L1 refused them returns the stored job, as
 every replay does. Every run the ledger dispatches names its run and is
-unaffected; a direct submitter supplies `run_id` itself. Process one-shots and services (whose data is keyed by their
-job ID, Computers included) need no run identity and are not checked. A node
+unaffected; a direct root submitter cannot supply one (below), so an OCI
+one-shot reaches L1 as an L3 run or as a child of one. Process one-shots and
+services (whose data is keyed by their job ID, Computers included) need no run
+identity and are not checked. A node
 that claims such a job anyway — one stored before L1 refused them — completes
 the attempt once with the terminal spawn failure `handoff_preparation_failed`
 before asking the runtime, instead of letting the helper's refusal read as
 `runtime_unavailable`, which L1 requeues (wefty #578).
+
+Naming a run is a claim to speak for it: the node keys a one-shot's retained
+handoff directory or volume by the owner key and attributes the attempt's
+results to `run_id`. So only a submitter entitled to a run may set `run_id` or
+`handoff_owner_run_id` on `POST /v1/jobs` (wefty #583), whatever the job's kind
+or class:
+
+- the trusted run ledger — a submission L1 classifies `submitted_by_run_ledger`
+  from the authenticated identity — may name any run; it dispatches every run,
+  rerun and child run;
+- a child submitted with an attempt credential speaks for its parent job's run
+  and no other: its `run_id` must equal the parent's `run_id`, and its
+  `handoff_owner_run_id` must equal the parent's `run_id` or the parent's own
+  owner key (so a rerun's child may share the handoff its parent reuses). The
+  parent is the credential's job, which L1 proves against the live attempt, and
+  its labels passed this same check when it was stored, so the entitlement is
+  inherited down the spawn chain and never widened; a child of a job that names
+  no run may name none;
+- any other submitter may name no run.
+
+A label that is blank after trimming names no run and claims nothing. A
+submission naming a run it is not entitled to is refused with HTTP 403
+`run_identity_not_entitled`, `retryable: false`, and nothing is stored; the
+remedy is to submit the work as an L3 run, not to change a label. The check
+follows dispatch-key resolution exactly as the missing-identity refusal does,
+so an identical replay of a labelled job stored before L1 checked still returns
+the stored job, and it runs before that refusal, so an OCI one-shot naming a run
+it may not is refused for the claim, not for what it lacks.
+
+A Computer never belongs to a run, so no submitter — the run ledger included —
+may name one in a Computer specification. `POST /v1/computers`, a projection
+install (`POST /v1/computers/{computer_id}/projections`) and a Custody import
+(whose manifest, digest and all, is the caller's) refuse a spec with a non-blank
+`run_id` or `handoff_owner_run_id` with the same HTTP 403
+`run_identity_not_entitled`, and store or reserve nothing. Each check follows
+that route's replay resolution, so an identical replay of a Computer stored
+before L1 checked still returns it. Reimage and clone copy the stored Computer's
+own specification, so they can introduce no run the Computer did not already
+name.
 
 Neither form is removed at completion. Both are retained on every outcome and
 expire on the retention window below. Agent startup removes expired marked

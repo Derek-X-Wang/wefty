@@ -1174,14 +1174,14 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	}, 2*time.Second)
 	defer stopServer()
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+	job, _, err := store.CreateJobAs(t.Context(), contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-stop-oneshot",
 		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, Labels: map[string]string{contract.LabelRunID: "run-intent-stop"},
 		RoutingTags: []string{"intent-oneshot"}, RuntimeHandler: "io.containerd.runc.v2",
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-stop:v1", Digest: &digest}, Argv: []string{"/payload"},
 		}},
-	})
+	}, runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2351,14 +2351,14 @@ func TestOCIPreStartSpawnFailureIgnoresExpiredLogFinalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+	job, _, err := store.CreateJobAs(t.Context(), contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "pre-start-expired-log-finalization",
 		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, RuntimeHandler: "io.containerd.runc.v2",
 		Labels: map[string]string{contract.LabelRunID: "run-pre-start"},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: "example.invalid/pre-start:v1"}, Argv: []string{"/payload"},
 		}},
-	})
+	}, runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
