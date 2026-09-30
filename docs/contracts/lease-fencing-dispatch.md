@@ -156,7 +156,7 @@ require different reactions.
 | Stable node ID is bound to another Fabric identity | 403 | `identity_bound` | false |
 | Stable node ID has no registration | 409 | `node_not_registered` | false |
 | Registered node is dead | 409 | `node_dead` | false |
-| Registered node is draining | 409 | `node_draining` | false |
+| Registered node's boot session is draining | 409 | `node_draining` | false |
 | Boot session has been replaced | 409 | `node_session_replaced` | false |
 | Attempt ID does not exist | 404 | `attempt_not_found` | false |
 | Authenticated node does not own the attempt | 403 | `attempt_not_owned` | false |
@@ -431,6 +431,13 @@ issuing a dead claim.
 Node liveness and operator intent are independent. `claims_enabled` controls
 whether `ClaimJob` may win new work and is checked in that same transaction;
 `intent_revision` is a separate CAS counter and never fences a live attempt.
+A claim on an alive node whose claims are disabled is the ordinary empty claim
+(`204`, no eligible job), never `node_draining`: intent is not liveness, and an
+agent that read it as a boot-session drain would cancel the resident attempts
+the operator asked it to finish. The agent learns intent from the heartbeat
+response and stops asking; until then it keeps polling and keeps getting no
+work. `node_draining` is reserved for a node whose boot session actually entered
+the `draining` state, and that state outranks disabled intent.
 Registration increments authority generation but never changes
 `claims_enabled`, `intent_revision`, `intent_reason`, `intent_updated_at`, or
 `intent_actor` on an existing row.
