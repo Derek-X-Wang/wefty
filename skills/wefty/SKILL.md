@@ -156,7 +156,7 @@ wefty wait "$RUN_ID" --timeout 90m
 wefty --json results "$RUN_ID" | jq -er '.document.pr_url'
 ```
 
-Six phases — `read-issue`, `plan`, `implement`, `gates`, `push`, `open-pr` — so
+Six steps — `read-issue`, `plan`, `implement`, `gates`, `push`, `open-pr` — so
 `wefty runs list` names the one it is in and `inspect` shows how long each took.
 Each pushes a marker commit, so a run that stopped part-way resumes with
 `--params '{"issue":"479","continue_from":"<branch>"}'` and skips what is done.
@@ -192,7 +192,7 @@ privileged helper.
 
 `WEFTY_RUN_TOKEN` (scoped to this run — dispatch children, write own
 envelopes/gates; never sibling access) is **not** delivered by default. Submit
-with `--dispatch-authority` only when the workflow dispatches child steps
+with `--dispatch-authority` only when the workflow dispatches child runs
 through `POST /v1/runs` with `parent_run_id`; that also delivers the attempt
 credential. A workflow that only reports never needs it. Hand off across nodes via envelopes, never local files.
 

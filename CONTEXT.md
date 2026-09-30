@@ -20,17 +20,24 @@ with identity, envelopes, gates, logs, and a place in a lineage.
 _Avoid_: session, execution, task
 
 **Step**:
-A child run dispatched by a workflow. An ordinary run whose parent is the
-workflow's run; each step carries its own routing tags.
-_Avoid_: phase, stage, sub-task
+A named interval within one run, opened and closed by that run's own
+workload. A run's current step is the most recently started step that has not
+ended.
+_Avoid_: phase, stage, sub-task, child run
+
+**Child run**:
+A run dispatched by another run's workload, most often a workflow's, and
+recorded as that run's child in the lineage. It is an ordinary run and carries
+its own routing tags.
+_Avoid_: step, sub-run, sub-task
 
 **Lineage**:
 The recorded parent–child tree of runs.
 _Avoid_: run tree, hierarchy, chain
 
 **Envelope**:
-The typed result a step reports: status, summary, artifacts, notes for the
-next agent.
+The typed result a run reports for one of its steps: status, summary,
+artifacts, notes for the next agent.
 _Avoid_: output, result blob
 
 **Gate**:
@@ -49,8 +56,6 @@ _Avoid_: outbox (the agent's own durable evidence outbox), handoff directory
 The submitter's declaration, made when a run is created, that this run's
 workload dispatches child work. It is what delivers the in-job credentials to
 the workload; a run without it reports through its run mailbox and holds none.
-Until the mailbox reaches kind=oci, an OCI run that reports anything must
-declare it.
 _Avoid_: token flag, credential flag, privileged run
 
 **Pattern** _(reserved — does not exist yet)_:
@@ -117,8 +122,9 @@ payload from outliving the agent boot session that launched it.
 _Avoid_: supervisor, babysitter, wrapper, shim
 
 **Desired state**:
-The requested lifecycle target for a service job (`running` or `stopped`),
-distinct from the job state that records what the control plane observes.
+The requested lifecycle target for a service job or Computer (`running`,
+`stopped`, or `removed`), distinct from the job state that records what the
+control plane observes. `removed` is irreversible.
 _Avoid_: status, target status
 
 **Service data volume**:
@@ -140,28 +146,6 @@ or retention binding, reported separately from runtime residue. Retained state
 is auditable but does not by itself block runtime namespace absence.
 _Avoid_: ignored residue, projected inventory, leaked data
 
-**Storage generation**:
-One immutable allocation generation of a Computer's durable Storage identity.
-Exactly one generation is current; reset may temporarily add one staging
-generation and retains retired generations until verified deletion.
-_Avoid_: disk version, volume revision, Lineage
-
-**Backup**:
-An immutable logical cold-copy record for one exact Storage generation. It
-survives explicit pruning of its physical copy and records `encryption=none`
-until a later encryption contract exists.
-_Avoid_: snapshot, image, archive, Lineage
-
-**Backup copy**:
-One helper-owned physical realization of a Backup, bound to its Node and
-managed-root instance. V1 permits exactly one live source-node copy.
-_Avoid_: replica when only the V1 source copy exists, Lineage
-
-**Storage provenance**:
-The immutable origin record connecting a Backup to the exact source Storage
-identity and generation from which it was created.
-_Avoid_: Lineage, ancestry, parent disk
-
 ### Placement and movement
 
 **Movable**:
@@ -171,7 +155,7 @@ _Avoid_: stateless, floating
 
 **Pinned**:
 Work that depends on node-local state (a worktree, a handoff directory) and
-therefore carries a node tag. Cross-node steps hand off through envelopes,
+therefore carries a node tag. Cross-node child runs hand off through envelopes,
 never through local files.
 _Avoid_: sticky, affinity
 
@@ -203,23 +187,32 @@ made unlikely by distinct names.
 _Avoid_: collision, cross-talk, neighbour access as an owner exception
 
 **Storage generation**:
-One monotonically identified incarnation of a Computer's persistent storage.
-Exactly one generation may be current and attached.
-_Avoid_: disk version, snapshot, removal generation, authority generation
+One immutable, monotonically identified incarnation of a Computer's persistent
+Storage. At most one generation is current, and it is attached only while the
+Computer runs. A reset may briefly add a staging generation beside the current
+one, an import begins with only a staging generation, and retired generations
+are kept until their deletion is verified.
+_Avoid_: disk version, volume revision, snapshot, removal generation,
+authority generation, Lineage
 
 **Backup**:
-An immutable wefty-managed copy of one Storage generation under wefty's
-removal responsibility.
-_Avoid_: snapshot, export, archive, recovery point
+An immutable logical cold-copy record of one exact Storage generation, under
+wefty's removal responsibility. It outlives explicit pruning of its physical
+copy.
+_Avoid_: snapshot, image, export, archive, recovery point, Lineage
 
 **Backup copy**:
-One physical wefty-owned replica of a Backup on one Node.
-_Avoid_: Backup, mirror, custody export
+One wefty-owned physical realization of a Backup on one Node. Today a Backup
+has at most one live copy, on its source Node; pruning removes that copy and
+leaves the logical Backup with none.
+_Avoid_: Backup (the logical record), replica or mirror while at most the source
+copy exists, custody export, Lineage
 
 **Storage provenance**:
-The recorded source relationships among Storage generations, Backups,
-clones, imports, and Custody exports.
-_Avoid_: Lineage, run lineage, attachment history
+The immutable recorded source relationships among Storage generations,
+Backups, clones, imports, and Custody exports, through which custody taint
+follows every descendant.
+_Avoid_: Lineage, run lineage, ancestry, parent disk, attachment history
 
 **Custody export**:
 The recorded transfer of storage bytes outside wefty ownership, permanently

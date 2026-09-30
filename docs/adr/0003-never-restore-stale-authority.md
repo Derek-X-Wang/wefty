@@ -25,7 +25,7 @@ laptop that sleeps.
    token that a still-running payload already holds — two writers, both
    believing they are current, with the fence unable to tell them apart.
 2. **A cold, empty control plane is safe by construction.** Attempt IDs are
-   random 128-bit values (`l1/store.go:1100-1106`), so no credential minted
+   random 128-bit values (`newID` in `l1/store.go`), so no credential minted
    before the wipe can ever match anything after it. Every stale credential
    fails closed. Emptiness costs work-in-flight; restoration costs
    correctness.

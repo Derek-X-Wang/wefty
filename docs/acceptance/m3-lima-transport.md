@@ -526,8 +526,9 @@ artifact through the ordinary `wefty submit --image ... --argv
 wefty-echo-service --argv=--once` surface. Do not call the helper or OCI
 adapter directly for these rows. The L3 snapshot must be the only source of
 the `kind=oci`, `class=one-shot` Job. Submit with `--dispatch-authority`: a
-dispatched job holds no credential by default, and `kind=oci` has no run
-mailbox yet, so the authenticated bridge request below has nothing to
+dispatched job holds no credential by default -- it reports through its run
+mailbox, which `kind=oci` one-shots have as well and which needs no
+credential -- so the authenticated bridge request below has nothing to
 authenticate with otherwise.
 
 Record four rows:
