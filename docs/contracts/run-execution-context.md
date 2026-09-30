@@ -328,8 +328,10 @@ to be running now: desired state `running`, current Job `claimed` or
 own attempt still live on its host. A Computer that is stopping — after stop,
 or after a restart of a running resource latch — is refused even while its old
 attempt drains, and so is one that is reset, reimaged, restoring, removed, or
-whose attempt is terminal. L1 submission-intent mutation revokes older L3
-grants before reporting success.
+whose attempt is terminal. A submission-intent change commits first and
+then revokes the Computer's L3 grants below its new revision; an applied
+change whose revocation the run ledger did not take still reports success,
+with `revoked: null` and `revocation_notice` (#600; see `state-machines.md`).
 
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
@@ -403,9 +405,10 @@ ledger answers.
 When L1 cannot reach the run ledger to perform a revocation it says so by
 name: typed `run_ledger_unavailable`, HTTP 503. It is never reported as
 `internal`, because the remedy is a deployment address, not an L1 fix, and a
-scrubbed message hides the only fact that leads to it. Before a submission
-enable or disable commits, the refusal is `retryable: true`: nothing applied,
-and a retry performs both. After an authority-losing Computer mutation
+scrubbed message hides the only fact that leads to it. A control plane
+that names no run ledger refuses a submission change `retryable: true` before
+applying anything. A submission change never refuses over its revocation
+once it has committed: it answers 200 with `revocation_notice` instead. After an authority-losing Computer mutation
 commits, the refusal is `retryable: false`, and its message says that the
 mutation applied, that the explicit revocation is owed and L1 will retry it
 until the run ledger takes it, that the request should not be retried for it,

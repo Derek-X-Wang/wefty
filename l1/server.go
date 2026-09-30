@@ -508,65 +508,68 @@ func (s *Server) proveComputerTokenScope(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, proof)
 }
 
+// computerSubmissionRevocationNotRecorded is the notice an applied submission
+// change carries when its L3 revocation was not recorded.
+const computerSubmissionRevocationNotRecorded = "the submission change applied, but its L3 revocation was not recorded: " +
+	"L3's live-scope check already refuses the Computer's superseded passes, and the agent's re-mint at the new " +
+	"revision revokes them, so do not retry the request for it"
+
+// mutateComputerSubmission commits the change first and only then revokes the
+// passes it superseded (wefty #600). Revoking first meant a change that lost
+// its CAS, for example to another Computer's change bumping the global
+// policy revision, had already ended the Computer's live pass while its L1
+// authority stood still, so the agent never re-minted. The revocation is
+// revision-bound: it ends grants below the committed revision and never a
+// pass the agent re-mints at it. It is defense in depth plus audit, not the
+// gate: L3 re-proves the pass's submit revision against live L1 on every use.
 func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request) {
 	var request ComputerSubmissionRequest
 	if err := decodeJSON(r, &request); err != nil {
 		writeError(w, err)
 		return
 	}
+	if s.computerTokenRevoker == nil {
+		writeError(w, runLedgerUnavailable(nil,
+			"this control plane names no run ledger, so Computer token grants cannot be revoked; the submission mutation was not applied"))
+		return
+	}
 	identity := identityFromRequest(r)
-	computer, replayed, mutationApplied, err := s.store.PrepareComputerSubmissionMutation(r.Context(), identity, r.PathValue("computer_id"), request)
+	computer, replayed, mutationApplied, err := s.store.MutateComputerSubmission(r.Context(), identity, r.PathValue("computer_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	if replayed {
 		w.Header().Set("Idempotent-Replay", "true")
-		result, resultErr := s.computerSubmissionResult(r.Context(), identity, computer, false, nil)
-		if resultErr != nil {
-			writeError(w, resultErr)
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-		return
+		mutationApplied = false
 	}
 	var receipt *contract.ComputerTokenRevocationReceipt
-	if mutationApplied && s.computerTokenRevoker == nil {
-		writeError(w, runLedgerUnavailable(nil, "this control plane has no run-ledger address, so Computer token grants cannot be revoked"))
-		return
-	}
+	notice := ""
 	if mutationApplied {
 		observed, revokeErr := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
-			ComputerID: computer.ComputerID, NewSubmitIntentRevision: computer.SubmitIntentRevision + 1,
+			ComputerID: computer.ComputerID, NewSubmitIntentRevision: computer.SubmitIntentRevision,
 			Reason: "submission_intent_advanced",
 		})
+		if revokeErr == nil && (observed.ComputerID != computer.ComputerID ||
+			observed.SubmitIntentRevision != computer.SubmitIntentRevision || observed.CommittedAt.IsZero()) {
+			revokeErr = errors.New("L3 Computer token revocation receipt did not match the mutation")
+		}
 		if revokeErr != nil {
-			writeError(w, runLedgerUnavailable(revokeErr,
-				"the run ledger could not be reached to revoke Computer token grants, so the submission mutation was not applied"))
-			return
+			notice = computerSubmissionRevocationNotRecorded
+			if s.logf != nil {
+				s.logf("event=l1_submission_revocation_not_recorded computer_id=%s submit_intent_revision=%d cause=%q",
+					computer.ComputerID, computer.SubmitIntentRevision, scrubbedCause(revokeErr))
+			}
+		} else {
+			receipt = &observed
 		}
-		if observed.ComputerID != computer.ComputerID || observed.SubmitIntentRevision != computer.SubmitIntentRevision+1 || observed.CommittedAt.IsZero() {
-			writeError(w, internalError(errors.New("L3 Computer token revocation receipt did not match the mutation"), "verify Computer token revocation receipt"))
-			return
-		}
-		receipt = &observed
-	}
-	computer, replayed, mutationApplied, err = s.store.MutateComputerSubmission(r.Context(), identity, computer.ComputerID, request)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if replayed {
-		w.Header().Set("Idempotent-Replay", "true")
-	}
-	if replayed || !mutationApplied {
-		receipt = nil
 	}
 	result, err := s.computerSubmissionResult(r.Context(), identity, computer, mutationApplied, receipt)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	result.RevocationNotice = notice
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -598,6 +601,11 @@ func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.I
 		return ComputerSubmissionMutationResult{}, internalError(errors.New("L3 Computer inflight reader is not configured"), "read Computer inflight state")
 	}
 	state.InflightCount, err = s.computerTokenRevoker.CountComputerInflight(ctx, computer.ComputerID)
+	if err != nil && mutationApplied {
+		// The change committed; a refusal must not read as nothing applied.
+		return ComputerSubmissionMutationResult{}, &Error{Code: contract.ErrorRunLedgerUnavailable, Cause: err, notRetryable: true,
+			Message: fmt.Sprintf("the submission change applied, but the run ledger could not be reached to read the Computer's inflight count, so do not retry the request for it: %v", err)}
+	}
 	if err != nil {
 		return ComputerSubmissionMutationResult{}, internalError(err, "read Computer inflight state")
 	}

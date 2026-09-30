@@ -593,6 +593,69 @@ func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	}
 }
 
+// TestComputerPassIsRefusedOnceL1CommitsANewSubmitRevision is the security
+// property wefty #600 relies on. L1 commits a submission change before it
+// revokes, and that revocation may never arrive. Until it does, the old pass
+// is still an unrevoked grant here, yet L3 refuses it: it re-proves the pass's
+// submit revision against live L1 on every bearer request and again inside
+// the Run write. The revision-bound revocation that follows spares the pass
+// the agent re-mints at the new revision.
+func TestComputerPassIsRefusedOnceL1CommitsANewSubmitRevision(t *testing.T) {
+	proof := ComputerTokenScopeProof{ComputerID: "computer-committed", ComputerAttemptID: "attempt-committed",
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 4, HostNodeID: "fabric-node-committed", SubmitMaxInflight: 2}
+	verifier := &controlledComputerGrantVerifier{proof: proof, blockCall: 2, blocked: make(chan struct{}), release: make(chan struct{})}
+	h := newComputerHTTPHarness(t, verifier)
+	client := h.client(proof.HostNodeID)
+	old := mintComputerHTTPToken(t, h, client, proof)
+	type response struct {
+		status int
+		body   []byte
+	}
+	result := make(chan response, 1)
+	go func() {
+		status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", old.Token, "committed-race", computerHTTPRunRequest("exit 0\n"))
+		result <- response{status: status, body: body}
+	}()
+	select {
+	case <-verifier.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("submission did not pause after bearer authentication")
+	}
+	// L1 commits revision 5; no revocation reaches L3.
+	advanced := proof
+	advanced.SubmitIntentRevision = 5
+	verifier.mu.Lock()
+	verifier.proof = advanced
+	verifier.mu.Unlock()
+	close(verifier.release)
+	if got := <-result; got.status != http.StatusUnauthorized {
+		t.Fatalf("an old pass submitted after L1 committed a new revision: status=%d body=%s", got.status, got.body)
+	}
+	for _, request := range []struct {
+		method, path string
+		body         any
+	}{{http.MethodGet, "/v1/computer/self", nil}, {http.MethodPost, "/v1/runs", computerHTTPRunRequest("exit 0\n")}} {
+		status, _, body := doComputerHTTP(t, client, request.method, request.path, old.Token, "committed-old", request.body)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("unrevoked old pass %s %s status=%d body=%s", request.method, request.path, status, body)
+		}
+	}
+	var runs int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM run_triggers WHERE computer_id=?`, proof.ComputerID).Scan(&runs); err != nil || runs != 0 {
+		t.Fatalf("an old pass committed %d Runs (err=%v)", runs, err)
+	}
+
+	current := mintComputerHTTPToken(t, h, client, advanced)
+	if _, err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
+		ComputerID: proof.ComputerID, SubmitIntentRevision: advanced.SubmitIntentRevision, Reason: "submission_intent_advanced"}); err != nil {
+		t.Fatal(err)
+	}
+	status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", current.Token, "committed-current", computerHTTPRunRequest("exit 0\n"))
+	if status != http.StatusCreated {
+		t.Fatalf("the revision-bound revocation ended the re-minted pass: status=%d body=%s", status, body)
+	}
+}
+
 func TestComputerTransientScopeProofFailureDoesNotRevokeGrant(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-transient", ComputerAttemptID: "attempt-transient",
 		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-transient", SubmitMaxInflight: 2}

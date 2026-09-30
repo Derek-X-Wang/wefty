@@ -790,6 +790,31 @@ see `computer-image.md`). Otherwise the
 Computer projection returns an explicitly null endpoint and never guesses a
 placeholder URL.
 
+A Computer submission change (enable, disable, or an inflight resize) is one
+L1 CAS transaction on the Computer's `submit_intent_revision` and the global
+admin policy revision, and it revokes nothing itself (#600). Only after it
+commits does L1 ask L3 to revoke the Computer's grants below the committed
+revision N+1. The request is revision-bound, never `revoke_all`, so it spares
+a pass the agent has already re-minted at N+1 for the same attempt. A change
+that loses its CAS -- for example to another Computer's change that advanced
+the global policy revision -- revokes nothing and leaves the Computer's live
+pass alone. Revoking first had ended that pass while L1's authority stood
+still, so the agent never re-minted. When the run ledger does not take the
+post-commit revocation, the change still stands: the response is 200 with
+`mutation_applied: true`, `revoked: null`, and `revocation_notice`, and L1
+logs `event=l1_submission_revocation_not_recorded`. Nothing retries it, and
+nothing needs to. Between the commit and any revocation, the revision-N pass
+cannot submit. L3 re-proves every Computer bearer request against live L1,
+once when it authenticates and again inside the `POST /v1/runs` write
+transaction, and refuses the pass unless L1's proof carries the same
+`submit_intent_revision` and `submit_max_inflight` as the grant. L1 proves
+nothing for the Computer until its host Node installs the policy revision
+that carries N+1, and then proves only N+1. The agent's re-mint at N+1 also
+revokes every older grant of the Computer at L3. The explicit revocation is
+therefore defense in depth plus audit, never the gate. A control plane that
+names no run ledger refuses the change with `run_ledger_unavailable` before
+applying anything.
+
 L1 stores the immutable take-over vocabulary `admission_denied`,
 `session_open`, `session_close`, `control_acquired`, `control_released`, and
 `admin_overrode`. Uploads are idempotent under `(attempt_id, event_id)` and

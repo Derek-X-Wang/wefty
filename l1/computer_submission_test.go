@@ -89,7 +89,7 @@ func TestComputerSubmissionIntentDefaultsOffAndAdvancesWithAudit(t *testing.T) {
 	}
 }
 
-func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
+func TestComputerSubmissionRouteCommitsBeforeRevokingL3(t *testing.T) {
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
 	ctx := context.Background()
 	admin := fabric.Identity{NodeID: "admin-device", UserID: "admin", DeviceID: "device-1"}
@@ -134,13 +134,15 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 			t.Fatalf("submission state leaked %q: %s", forbidden, body)
 		}
 	}
-	revokedBeforeMutation := false
+	revokedAfterCommit := false
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		current, readErr := readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now())
 		if readErr != nil {
 			return contract.ComputerTokenRevocationReceipt{}, readErr
 		}
-		revokedBeforeMutation = !current.SubmitEnabled && current.SubmitIntentRevision == 0 &&
+		// Revision-bound, never revoke-all: it must spare a pass the agent
+		// re-mints at the committed revision (wefty #600).
+		revokedAfterCommit = current.SubmitEnabled && current.SubmitIntentRevision == 1 && !request.RevokeAll &&
 			request.ComputerID == computer.ComputerID && request.NewSubmitIntentRevision == 1
 		return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
 			SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
@@ -148,8 +150,8 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	status, headers, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
 		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true),
 			IdempotencyKey: "enable-route"})
-	if status != http.StatusOK || !revokedBeforeMutation || headers.Get("Idempotent-Replay") != "" {
-		t.Fatalf("enable route status=%d body=%s revoked-before=%t headers=%v", status, body, revokedBeforeMutation, headers)
+	if status != http.StatusOK || !revokedAfterCommit || headers.Get("Idempotent-Replay") != "" {
+		t.Fatalf("enable route status=%d body=%s revoked-after-commit=%t headers=%v", status, body, revokedAfterCommit, headers)
 	}
 	var mutation ComputerSubmissionMutationResult
 	if err := json.Unmarshal(body, &mutation); err != nil || !mutation.MutationApplied || mutation.Revoked == nil ||
@@ -167,19 +169,39 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		return contract.ComputerTokenRevocationReceipt{}, errors.New("L3 unavailable")
 	}}
+	logs := &recordedLog{}
+	h.server.logf = logs.record
 	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
 		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: boolPointer(false),
 			IdempotencyKey: "disable-route"})
-	// Typed, not scrubbed: an operator who cannot reach the run ledger must be
-	// able to read that from the refusal itself (wefty #548).
-	// Pre-commit: nothing applied, so a retry is exactly the right remedy.
-	assertRunLedgerUnavailable(t, status, body, true, "the submission mutation was not applied")
+	// The change committed before the revocation was attempted, so it stands
+	// and says so; the revocation is only not recorded (wefty #600).
+	mutation = ComputerSubmissionMutationResult{}
+	if err := json.Unmarshal(body, &mutation); status != http.StatusOK || err != nil || !mutation.MutationApplied ||
+		mutation.Revoked != nil || !strings.Contains(mutation.RevocationNotice, "revocation was not recorded") ||
+		mutation.SubmitEnabled || mutation.SubmitIntentRevision != 2 {
+		t.Fatalf("disable with an unreachable run ledger status=%d mutation=%#v err=%v body=%s", status, mutation, err, body)
+	}
+	if !strings.Contains(logs.text(), "event=l1_submission_revocation_not_recorded computer_id="+computer.ComputerID) {
+		t.Fatalf("the unrecorded submission revocation was not named in the log: %s", logs.text())
+	}
 	current, err := readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !current.SubmitEnabled || current.SubmitIntentRevision != 1 {
-		t.Fatalf("failed revocation mutated submission authority: %#v", current)
+	if current.SubmitEnabled || current.SubmitIntentRevision != 2 {
+		t.Fatalf("an applied change was lost with its revocation: %#v", current)
+	}
+
+	// Without a run ledger at all nothing is applied, and a retry is right.
+	h.server.computerTokenRevoker = nil
+	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
+		ComputerSubmissionRequest{PolicyRevision: 3, SubmitIntentRevision: 2, SubmitEnabled: boolPointer(true),
+			IdempotencyKey: "enable-without-run-ledger"})
+	assertRunLedgerUnavailable(t, status, body, true, "the submission mutation was not applied")
+	if current, err = readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now()); err != nil ||
+		current.SubmitEnabled || current.SubmitIntentRevision != 2 {
+		t.Fatalf("a refused change mutated submission authority: %#v err=%v", current, err)
 	}
 }
 

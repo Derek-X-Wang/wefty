@@ -137,7 +137,7 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 	if replayed {
 		result.MutationApplied = false
 	}
-	if result.MutationApplied && result.Revoked == nil {
+	if result.MutationApplied && result.Revoked == nil && result.RevocationNotice == "" {
 		return &apiResponseError{Service: "L1", StatusCode: http.StatusInternalServerError,
 			APIError: contract.APIError{Code: contract.ErrorInternal, Message: "L1 submission mutation omitted its L3 revocation receipt"}}
 	}
@@ -147,6 +147,11 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 	}
 	if err := writeComputerSubmissionOutput(stdout, output); err != nil {
 		return err
+	}
+	if output.MutationApplied && output.Revoked == nil {
+		if _, err := fmt.Fprintf(stderr, "warning: %s\n", output.RevocationNotice); err != nil {
+			return err
+		}
 	}
 	if verb == "set-inflight" && output.InflightCount >= output.SubmitMaxInflight {
 		_, err := fmt.Fprintf(stderr, "warning: Computer %s is saturated at inflight %d/%d\n",

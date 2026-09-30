@@ -70,7 +70,7 @@
       "put": {
         "operationId": "mutateComputerSubmission",
         "summary": "Enable, disable, or resize Computer Run submission",
-        "description": "Current administrators only. Exactly one policy is changed against caller-observed CAS revisions. An applied change invalidates readiness and carries L3's exact revocation receipt; replay and audited no-op responses carry revoked=null.",
+        "description": "Current administrators only. Exactly one policy is changed against caller-observed CAS revisions. L1 commits the change first and only then revokes, at L3, the Computer's passes below the committed submit_intent_revision; a change that loses its CAS revokes nothing. An applied change invalidates readiness and carries L3's exact revocation receipt; replay and audited no-op responses carry revoked=null. When the run ledger does not take the revocation, the change still stands: the response carries mutation_applied=true, revoked=null and revocation_notice, and L3 already refuses the superseded passes because it re-proves each pass's submit revision against live L1 on every use. A control plane with no run ledger refuses with run_ledger_unavailable before applying anything.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["policy_revision", "submit_intent_revision", "idempotency_key"],
@@ -103,7 +103,8 @@
                 "status": { "type": "string" },
                 "pass_unavailable": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" },
                 "mutation_applied": { "type": "boolean" },
-                "revoked": { "oneOf": [{ "$ref": "./common.v1.json#/components/schemas/ComputerTokenRevocationReceipt" }, { "type": "null" }] }
+                "revoked": { "oneOf": [{ "$ref": "./common.v1.json#/components/schemas/ComputerTokenRevocationReceipt" }, { "type": "null" }] },
+                "revocation_notice": { "type": "string", "minLength": 1, "description": "Present only when an applied change's L3 revocation was not recorded; revoked is then null. Do not retry the request for it." }
               }
             } } }
           },
