@@ -375,6 +375,47 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	}
 }
 
+func TestRegistrationKeepsSameBootDrainAndNewBootRevives(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(agent, "node-1")
+	h.submit(client, "drain-rejoin", []string{"linux"})
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/drain", DrainRequest{BootSessionID: "boot-node-1"})
+	if status != http.StatusOK {
+		t.Fatalf("drain status = %d body=%s", status, body)
+	}
+
+	rejoined := h.register(agent, "node-1")
+	if rejoined.State != contract.NodeDraining {
+		t.Fatalf("same-boot re-registration state = %q, want draining", rejoined.State)
+	}
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
+
+	next := contract.NodeRegistration{
+		NodeID: "node-1", BootSessionID: "boot-node-1-next", RootInstanceID: "root-node-1",
+		OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: rejoined.CapabilityRevision + 1,
+		CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
+	}
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", next)
+	if status != http.StatusOK {
+		t.Fatalf("new-boot register status = %d body=%s", status, body)
+	}
+	var revived Node
+	if err := json.Unmarshal(body, &revived); err != nil {
+		t.Fatal(err)
+	}
+	if revived.State != contract.NodeAlive {
+		t.Fatalf("new-boot registration state = %q, want alive", revived.State)
+	}
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1-next", Class: contract.JobClassOneShot})
+	if status != http.StatusOK {
+		t.Fatalf("new-boot claim status = %d body=%s", status, body)
+	}
+}
+
 func TestCompletionReplayDoesNotDoubleTransition(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
