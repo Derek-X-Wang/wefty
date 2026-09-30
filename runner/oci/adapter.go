@@ -2832,9 +2832,6 @@ const (
 // burst, Node-wide.
 var connectionLimitRetries ocihelper.ConnectionLimitLog
 
-// observeConnectionLimitRetry is a test seam called on every refusal retried.
-var observeConnectionLimitRetry = func(string) {}
-
 // retryOnConnectionLimit repeats call while the helper refuses it with
 // connection_limit, backing off from 100 ms to 1 s. A refusal means the helper
 // admitted nothing -- no signal delivered, no delete done, no event streamed
@@ -2904,7 +2901,6 @@ func retryOnConnectionLimitWhile(ctx context.Context, operation string, budget t
 		if !ocihelper.IsConnectionLimitRefusal(err) {
 			return err
 		}
-		observeConnectionLimitRetry(operation)
 		now := clock.now()
 		if report, suppressed := connectionLimitRetries.Note(now); report {
 			log.Printf("OCI helper refused %s for want of a connection slot (%d more refusals since the last report); retrying", operation, suppressed)

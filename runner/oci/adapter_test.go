@@ -10,10 +10,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3410,143 +3410,201 @@ func TestTerminationObservationPrivacyAndClassification(t *testing.T) {
 	}
 }
 
+// drainingPortTestEngine holds each attempt-port stream open until the client
+// closes it, so a test can occupy helper connection slots with streams it
+// knows were admitted and free them exactly when it chooses.
+type drainingPortTestEngine struct{ *adapterTestEngine }
+
+func (*drainingPortTestEngine) DialAttemptPort(_ context.Context, _ ocihelper.DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	if _, err := stream.Write([]byte{1}); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, stream)
+	return nil
+}
+
+// steppedRetryClock replaces the connection-limit retry clock. Every backoff
+// the retry loop asks for is handed to the test as a step, and simulated time
+// moves only when the test takes that step, so what the loop observes never
+// depends on how fast the runner is.
+type steppedRetryClock struct {
+	mu     sync.Mutex
+	origin time.Time
+	now    time.Time
+	steps  chan retryStep
+}
+
+type retryStep struct {
+	delay   time.Duration
+	proceed chan struct{}
+}
+
+func installSteppedRetryClock(t *testing.T) *steppedRetryClock {
+	t.Helper()
+	origin := time.Unix(1_700_000_000, 0)
+	clock := &steppedRetryClock{origin: origin, now: origin, steps: make(chan retryStep)}
+	previous := connectionLimitClock
+	connectionLimitClock.now = func() time.Time {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return clock.now
+	}
+	connectionLimitClock.sleep = func(ctx context.Context, delay time.Duration) bool {
+		step := retryStep{delay: delay, proceed: make(chan struct{})}
+		select {
+		case clock.steps <- step:
+		case <-ctx.Done():
+			return false
+		}
+		select {
+		case <-step.proceed:
+			return ctx.Err() == nil
+		case <-ctx.Done():
+			return false
+		}
+	}
+	t.Cleanup(func() { connectionLimitClock = previous })
+	return clock
+}
+
+// take advances simulated time by the step's delay and lets the loop go on.
+func (clock *steppedRetryClock) take(step retryStep) time.Duration {
+	clock.mu.Lock()
+	clock.now = clock.now.Add(step.delay)
+	elapsed := clock.now.Sub(clock.origin)
+	clock.mu.Unlock()
+	close(step.proceed)
+	return elapsed
+}
+
+// saturatedWatchRun starts a portful attempt on a helper with four connection
+// slots and, once Run has returned, fills the three the control connection
+// leaves with attempt-port streams. A stream dial returns only once the helper
+// has admitted it, so after three the helper is provably full and Watch start
+// can only be refused until the test closes them. A dial refused because the
+// finished Run's handler still holds its slot is simply repeated.
+func saturatedWatchRun(t *testing.T) (*steppedRetryClock, func(), <-chan workloadrunner.Result, <-chan error) {
+	t.Helper()
+	engine := &drainingPortTestEngine{&adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}}
+	adapter, _, _, _, closeAdapter := startAdapterTestServerWithConfig(t, engine, ImagePolicy{},
+		ocihelper.ServerConfig{ConnectionLimit: 4, ControlConnectionReserve: 1})
+	t.Cleanup(closeAdapter)
+	clock := installSteppedRetryClock(t)
+
+	var streamsMu sync.Mutex
+	var streams []net.Conn
+	release := func() {
+		streamsMu.Lock()
+		defer streamsMu.Unlock()
+		for _, stream := range streams {
+			_ = stream.Close()
+		}
+		streams = nil
+	}
+	t.Cleanup(release)
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
+	var endpoint workloadrunner.AttemptEndpoint
+	request.AttemptEndpointReady = func(_ string, value workloadrunner.AttemptEndpoint) error {
+		endpoint = value
+		return nil
+	}
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) {
+		t.Error("helper saturation asked for OCI runtime recovery")
+	}
+	request.OCIStarted = func(ctx context.Context, _ workloadrunner.OCIImageObservation) error {
+		for {
+			streamsMu.Lock()
+			full := len(streams) == 3
+			streamsMu.Unlock()
+			if full {
+				return nil
+			}
+			stream, err := endpoint.Dial(ctx)
+			if ocihelper.IsConnectionLimitRefusal(err) {
+				runtime.Gosched()
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			streamsMu.Lock()
+			streams = append(streams, stream)
+			streamsMu.Unlock()
+		}
+	}
+	results := make(chan workloadrunner.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		result, err := adapter.Run(t.Context(), request, nil)
+		results <- result
+		errs <- err
+	}()
+	return clock, release, results, errs
+}
+
+func requireSaturatedWatchAttached(t *testing.T, result workloadrunner.Result, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("a refused Watch start failed the attempt: %v", err)
+	}
+	if result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 || result.Outcome.RuntimeFailure != nil {
+		t.Fatalf("outcome after a refused Watch start = %+v", result.Outcome)
+	}
+}
+
 // A Watch start the helper refuses for want of a connection slot -- another
 // connection took the slot Run just freed -- is retried until a slot frees.
 // Failing it instead turned Node-wide stream pressure into a runtime failure
 // whose finalization reaped a healthy attempt (#597 review).
 func TestAdapterRetriesRefusedWatchStartUntilASlotFrees(t *testing.T) {
-	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
-	adapter, _, _, socketPath, closeAdapter := startAdapterTestServerWithConfig(t, engine, ImagePolicy{}, ocihelper.ServerConfig{ConnectionLimit: 4})
-	defer closeAdapter()
-	var refusals atomic.Int32
-	observeConnectionLimitRetry = func(operation string) {
-		if operation == "Watch" {
-			refusals.Add(1)
-		}
-	}
-	defer func() { observeConnectionLimitRetry = func(string) {} }()
-
-	var held []net.Conn
-	defer func() {
-		for _, connection := range held {
-			_ = connection.Close()
-		}
-	}()
-	request := adapterTestRequest()
-	recoveries := 0
-	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
-	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
-		// Run has returned; take every slot before Watch can, and give them
-		// back only after Watch has been refused.
-		for range 4 {
-			connection, err := net.Dial("unix", socketPath)
-			if err != nil {
-				return err
+	clock, release, results, errs := saturatedWatchRun(t)
+	refusals := 0
+	for {
+		select {
+		case step := <-clock.steps:
+			refusals++
+			if refusals == 1 {
+				release()
 			}
-			held = append(held, connection)
+			clock.take(step)
+			continue
+		case result := <-results:
+			requireSaturatedWatchAttached(t, result, <-errs)
 		}
-		go func() {
-			deadline := time.Now().Add(5 * time.Second)
-			for refusals.Load() == 0 && time.Now().Before(deadline) {
-				time.Sleep(10 * time.Millisecond)
-			}
-			for _, connection := range held {
-				_ = connection.Close()
-			}
-		}()
-		return nil
+		break
 	}
-	result, err := adapter.Run(t.Context(), request, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
-	if err != nil {
-		t.Fatalf("refused Watch start failed the attempt: %v", err)
-	}
-	if result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 || result.Outcome.RuntimeFailure != nil {
-		t.Fatalf("outcome after a refused Watch start = %+v", result.Outcome)
-	}
-	if refusals.Load() == 0 {
-		t.Fatal("the test never made the helper refuse Watch")
-	}
-	if recoveries != 0 {
-		t.Fatalf("a refused Watch start asked for OCI runtime recovery %d times", recoveries)
+	if refusals == 0 {
+		t.Fatal("the helper never refused Watch start")
 	}
 }
 
 // Saturation that outlasts any fixed retry budget still does not fail a
 // running attempt: Watch start keeps retrying for as long as the attempt
 // lives, and attaches once a slot frees. A 60 s cap here reaped healthy
-// attempts under sustained pressure (#597 review round 2).
+// attempts under sustained pressure (#597 review round 2). The helper stays
+// full until the retry loop has itself observed 1.5 times the old cap.
 func TestAdapterWatchStartOutlastsSaturationBeyondAnyFixedBudget(t *testing.T) {
-	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
-	adapter, _, _, socketPath, closeAdapter := startAdapterTestServerWithConfig(t, engine, ImagePolicy{}, ocihelper.ServerConfig{ConnectionLimit: 4})
-	defer closeAdapter()
-
-	// A fake clock lets each backoff pass at once while time moves on by it,
-	// so minutes of saturation take milliseconds of test.
-	var clockMu sync.Mutex
-	origin := time.Unix(1_700_000_000, 0)
-	fakeNow := origin
-	elapsed := func() time.Duration {
-		clockMu.Lock()
-		defer clockMu.Unlock()
-		return fakeNow.Sub(origin)
-	}
-	previousClock := connectionLimitClock
-	connectionLimitClock.now = func() time.Time {
-		clockMu.Lock()
-		defer clockMu.Unlock()
-		return fakeNow
-	}
-	connectionLimitClock.sleep = func(ctx context.Context, delay time.Duration) bool {
-		clockMu.Lock()
-		fakeNow = fakeNow.Add(delay)
-		clockMu.Unlock()
-		time.Sleep(time.Millisecond)
-		return ctx.Err() == nil
-	}
-	defer func() { connectionLimitClock = previousClock }()
 	const saturation = 3 * connectionLimitRetryBudget / 2
-
-	var held []net.Conn
-	defer func() {
-		for _, connection := range held {
-			_ = connection.Close()
+	clock, release, results, errs := saturatedWatchRun(t)
+	var observed time.Duration
+	released := false
+	for {
+		select {
+		case step := <-clock.steps:
+			observed = clock.take(step)
+			if !released && observed >= saturation {
+				release()
+				released = true
+			}
+			continue
+		case result := <-results:
+			requireSaturatedWatchAttached(t, result, <-errs)
 		}
-	}()
-	released := make(chan time.Duration, 1)
-	request := adapterTestRequest()
-	recoveries := 0
-	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
-	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
-		for range 4 {
-			connection, err := net.Dial("unix", socketPath)
-			if err != nil {
-				return err
-			}
-			held = append(held, connection)
-		}
-		go func() {
-			deadline := time.Now().Add(4 * time.Second)
-			for elapsed() < saturation && time.Now().Before(deadline) {
-				time.Sleep(5 * time.Millisecond)
-			}
-			for _, connection := range held {
-				_ = connection.Close()
-			}
-			released <- elapsed()
-		}()
-		return nil
+		break
 	}
-	result, err := adapter.Run(t.Context(), request, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
-	if err != nil {
-		t.Fatalf("saturation beyond the old budget failed the attempt: %v", err)
-	}
-	if result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 || result.Outcome.RuntimeFailure != nil {
-		t.Fatalf("outcome after sustained saturation = %+v", result.Outcome)
-	}
-	if saturated := <-released; saturated < saturation {
-		t.Fatalf("slots were held for only %s of simulated saturation, want at least %s", saturated, saturation)
-	}
-	if recoveries != 0 {
-		t.Fatalf("sustained saturation asked for OCI runtime recovery %d times", recoveries)
+	if !released || observed < saturation {
+		t.Fatalf("Watch attached after %s of simulated saturation, want at least %s", observed, saturation)
 	}
 }
