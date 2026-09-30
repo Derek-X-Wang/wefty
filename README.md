@@ -84,7 +84,7 @@ This bounds raw pending payload at 96 MiB, but it also means a noisy service
 can ring-evict a quiet service's unacknowledged bytes (recorded as gaps), and a
 noisy one-shot can exhaust the shared budget and fail a sibling's output sink.
 
-Export the same four variables in three terminals, then start one process in
+Export the same five variables in three terminals, then start one process in
 each.
 
 Terminal 1 — L1 control plane:
@@ -126,7 +126,21 @@ mkdir -p "$WEFTY_STATE_ROOT/agent-logs"
   --log-spool-dir="$WEFTY_STATE_ROOT/agent-logs"
 ```
 
-From another shell with the same variables, verify the node and submit a run:
+Relative `--db`, `--log-spool-dir`, `--managed-root` and `--handoff-root`
+paths resolve against the directory each process was started in.
+
+Stopping the agent: the first `SIGTERM` or Ctrl-C drains. The node stops
+claiming new work and shows `draining` in `wefty status` and `wefty nodes
+list`, and the agent then waits for every attempt it is already running to
+finish, which can take as long as that attempt's `--max-runtime`. Until it
+exits, a replacement agent for the same node ID cannot start ("stable node ...
+is already active"). A second signal stops waiting and kills the resident
+attempts, which record `signal terminated (agent)`.
+
+From another shell with the same variables, verify the node and submit a run.
+The CLI reads `WEFTY_L1_ADDR` and `WEFTY_L3_ADDR` as the defaults for `--l1` and
+`--l3` (a flag always wins), so with them exported the flags below are
+optional:
 
 ```sh
 cd "$WEFTY_ROOT"
@@ -159,8 +173,10 @@ The full pass criteria and evidence commands are in the
 - `wefty whoami` shows the authenticated person identity used for operator actions; `wefty --json whoami` emits the same projection as JSON. Machine principals and missing person identity fail with the typed unauthorized exit code `3`, while invalid arguments fail with usage exit code `2`.
 - `wefty nodes list` shows reachability separately from claim eligibility, per-class slot occupancy, durable intent, and tags.
 - `wefty nodes set-claims NODE_ID --claims-enabled=false --intent-revision=REV --reason="maintenance"` records revision-guarded operator intent; the authenticated Fabric identity is recorded as the actor.
-- `wefty submit` submits a saved workflow or inline script to the run ledger.
-- `wefty logs RUN_ID --follow` reads a run's logs until it settles.
+- `wefty submit` submits a saved workflow or inline script to the run ledger. It warns on stderr, and in a `--json` `warnings` field, when no alive node carries the run's routing tags and kind; the run is still accepted and waits for one.
+- `wefty logs RUN_ID --follow` reads a run's logs until it settles. For a run no node has started yet, it says it is waiting for a node, and why no node can take it when L1 knows.
+- `wefty wait RUN_ID` blocks until the run settles and exits 10 if it failed, printing one line on why: the exit code or signal, a refused dispatch, or the ledger gate that failed it (a missing required envelope, a failed gate or child). `wefty inspect RUN_ID` shows the same line.
+- `wefty runs list` shows each run's AGE (since submission) and DURATION (since it started), and marks a queued run that no node can take.
 - `wefty results RUN_ID [--out FILE]` reads the result document the run uploaded when it finished, from the ledger rather than from the node that produced it.
 - `wefty rerun RUN_ID` creates a new run from the original stored snapshot.
 - `wefty drain NODE_ID` stops new claims on a node while current work finishes.

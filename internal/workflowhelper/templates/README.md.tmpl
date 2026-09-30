@@ -22,6 +22,7 @@ mailbox is delivered to every one-shot L3 dispatched, `kind=process` and
 | File | What it is |
 |---|---|
 | `{{.Name}}.sh` | the workflow |
+| `params.json` | the params the submit command below sends |
 | `{{.TestFile}}` | `bash -n`, shellcheck, and a local run that asserts the four events |
 
 `{{.Name}}.sh` calls `wefty run ...` when the `wefty` binary is on PATH and
@@ -55,13 +56,15 @@ wefty --json submit \
 
 wefty logs <run_id> --follow      # wait for it, live
 wefty --json inspect <run_id>     # the envelopes, gates and lineage it produced
+wefty results <run_id>            # the result document
 ```
 
 `--required-envelope` is not optional advice: without it a job that exits 0
 having reported nothing still looks like a success, which is the one failure
 this whole reporting shape exists to prevent.
 
-`params.json` is an ordinary JSON object; this starter reads `subject`:
+`params.json` is an ordinary JSON object, scaffolded next to this README; this
+starter reads `subject`:
 
 ```json
 {"subject": "wefty"}

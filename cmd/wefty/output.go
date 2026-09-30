@@ -66,9 +66,16 @@ func writeJSONLine(writer io.Writer, value any) error {
 	return json.NewEncoder(writer).Encode(value)
 }
 
-func writeAccepted(writer io.Writer, accepted l3.RunAccepted, jsonOutput bool) error {
+// acceptedOutput is the submit --json shape: the ledger's acceptance, plus
+// any warning about a run that was accepted but that nothing can run yet.
+type acceptedOutput struct {
+	l3.RunAccepted
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+func writeAccepted(writer io.Writer, accepted l3.RunAccepted, warnings []string, jsonOutput bool) error {
 	if jsonOutput {
-		return writeJSON(writer, accepted)
+		return writeJSON(writer, acceptedOutput{RunAccepted: accepted, Warnings: warnings})
 	}
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	if _, err := fmt.Fprintln(table, "RUN ID\tSTATUS URL\tLOGS URL"); err != nil {
@@ -402,6 +409,23 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	}
 	if err := table.Flush(); err != nil {
 		return err
+	}
+	// Why a run failed is the first thing a reader of a failed run wants, so
+	// it follows the table rather than hiding under --execution.
+	for index, run := range inspection.Runs {
+		if run.Status != contract.RunFailed {
+			continue
+		}
+		reason := run.FailureReason
+		if index == 0 && inspection.FailureReason != "" {
+			reason = inspection.FailureReason
+		}
+		if reason == "" {
+			reason = "no reason was recorded; see --execution"
+		}
+		if _, err := fmt.Fprintf(writer, "failed: %s: %s\n", run.RunID, reason); err != nil {
+			return err
+		}
 	}
 	if err := writeRunSteps(writer, inspection.Steps); err != nil {
 		return err

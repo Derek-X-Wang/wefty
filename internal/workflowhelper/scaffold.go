@@ -18,6 +18,11 @@ var inlineWriter string
 //go:embed templates/starter.sh.tmpl
 var bashStarterTemplate string
 
+// paramsTemplate is the params document the README submits with
+// --params-file=params.json. Without it the documented command failed with
+// "open params.json: no such file" (#604).
+const paramsTemplate = "{\"subject\": \"wefty\"}\n"
+
 //go:embed templates/README.md.tmpl
 var readmeTemplate string
 
@@ -172,6 +177,7 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 			{"tsconfig.json", tsconfigTemplate, 0o644},
 			{".gitignore", typeScriptGitignore, 0o644},
 			{"README.md", typeScriptReadmeTemplate, 0o644},
+			{"params.json", paramsTemplate, 0o644},
 			{data.TestFile, typeScriptIntegrationTestTemplate, 0o644},
 		}
 		submit = fmt.Sprintf("build it, then submit the bundle:\n  (cd %s && npm ci && npm run build)\n  wefty --json submit --script=%s --interpreter=node --required-envelope --tag=<routing-tag>\n",
@@ -182,6 +188,7 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 		files = []scaffoldFile{
 			{data.ScriptName, bashStarterTemplate, 0o755},
 			{"README.md", readmeTemplate, 0o644},
+			{"params.json", paramsTemplate, 0o644},
 			{data.TestFile, integrationTestTemplate, 0o644},
 		}
 		submit = fmt.Sprintf("submit with\n  wefty --json submit --script=%s --interpreter=bash --required-envelope --tag=<routing-tag>\n",

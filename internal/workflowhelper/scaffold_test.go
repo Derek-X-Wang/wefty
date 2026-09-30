@@ -54,7 +54,7 @@ func TestWorkflowInitTypeScriptWritesTheDogfoodShape(t *testing.T) {
 
 	for _, name := range []string{
 		"src/Demo_Flow.ts", "package.json", "package-lock.json", "tsconfig.json",
-		".gitignore", "README.md", "demoflow_integration_test.go",
+		".gitignore", "README.md", "params.json", "demoflow_integration_test.go",
 	} {
 		info, err := os.Stat(filepath.Join(target, name))
 		if err != nil {
@@ -234,5 +234,33 @@ func TestWorkflowInitRefusesAnUnknownLanguageBeforeWriting(t *testing.T) {
 	}
 	if _, statErr := os.Stat(parent); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("a refused scaffold still created %s: %v", parent, statErr)
+	}
+}
+
+// TestWorkflowInitWritesTheParamsTheReadmeSubmits: the README submits
+// --params-file=params.json, and a scaffold without that file sent the first
+// submit into "open params.json: no such file" (#604).
+func TestWorkflowInitWritesTheParamsTheReadmeSubmits(t *testing.T) {
+	for _, language := range []string{"bash", "ts"} {
+		parent, _ := initWorkflow(t, "withparams", "--lang", language)
+		target := filepath.Join(parent, "withparams")
+		readme, err := os.ReadFile(filepath.Join(target, "README.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(readme), "--params-file=params.json") {
+			t.Fatalf("%s README no longer submits params.json; drop this test with it", language)
+		}
+		if !strings.Contains(string(readme), "wefty results <run_id>") {
+			t.Fatalf("%s README does not say how to read the result document", language)
+		}
+		raw, err := os.ReadFile(filepath.Join(target, "params.json"))
+		if err != nil {
+			t.Fatalf("%s scaffold wrote no params.json: %v", language, err)
+		}
+		var params map[string]any
+		if err := json.Unmarshal(raw, &params); err != nil || params["subject"] != "wefty" {
+			t.Fatalf("%s params.json = %s (%v)", language, raw, err)
+		}
 	}
 }

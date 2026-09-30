@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l3"
 )
 
 // `wefty wait` is the command a script writes between submitting work and
@@ -40,10 +41,15 @@ const (
 type runOutcomeError struct {
 	runID  string
 	status contract.RunState
+	// reason is the one line saying why, when the ledger recorded one.
+	reason string
 }
 
 func (e *runOutcomeError) Error() string {
-	return fmt.Sprintf("run %s %s", e.runID, e.status)
+	if e.reason == "" {
+		return fmt.Sprintf("run %s %s (no reason was recorded; see `wefty inspect %s --execution`)", e.runID, e.status, e.runID)
+	}
+	return fmt.Sprintf("run %s %s: %s", e.runID, e.status, e.reason)
 }
 
 // waitTimeoutError is the third outcome, kept separate from a failed run for
@@ -116,7 +122,14 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			}
 			last = record.Status
 			if runIsTerminal(record.Status) {
-				return reportTerminalRun(stdout, record, jsonOutput)
+				// The reason lookup is bounded like every other read here:
+				// by what is left of --timeout, and by its own cap. A lookup
+				// that does not answer leaves the reason out; the outcome
+				// and its exit code stand either way.
+				reasonCtx := requestContext(ctx, deadline, &cancelRequest)
+				reason := runFailureReason(reasonCtx, clients, record)
+				cancelRequest()
+				return reportTerminalRun(stdout, record, reason, jsonOutput)
 			}
 		}
 		sleep := delay
@@ -190,8 +203,10 @@ func waitExpired(stdout io.Writer, runID string, status contract.RunState, start
 
 // reportTerminalRun prints the outcome and then turns it into an exit code. The
 // status is printed either way, because a script that wants the word as well as
-// the code should not have to run a second command for it.
-func reportTerminalRun(stdout io.Writer, record contract.RunRecord, jsonOutput bool) error {
+// the code should not have to run a second command for it. Stdout stays the
+// bare status; why a failed run failed travels in the error, which main prints
+// to stderr as one line.
+func reportTerminalRun(stdout io.Writer, record contract.RunRecord, reason string, jsonOutput bool) error {
 	if jsonOutput {
 		if err := writeJSON(stdout, record); err != nil {
 			return err
@@ -202,7 +217,45 @@ func reportTerminalRun(stdout io.Writer, record contract.RunRecord, jsonOutput b
 	if record.Status == contract.RunSucceeded {
 		return nil
 	}
-	return &runOutcomeError{runID: record.RunID, status: record.Status}
+	return &runOutcomeError{runID: record.RunID, status: record.Status, reason: reason}
+}
+
+// runFailureReason is why a failed run failed, in one line. The ledger records
+// it where it decides the failure; a run failed before it did has none, and
+// then the L1 job's own evidence is read once through the execution view. An
+// answer that cannot be read is left empty rather than guessed.
+func runFailureReason(ctx context.Context, clients *apiClients, record contract.RunRecord) string {
+	if record.Status != contract.RunFailed {
+		return ""
+	}
+	if record.FailureReason != "" {
+		return record.FailureReason
+	}
+	if clients == nil || ctx.Err() != nil {
+		return ""
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, failureReasonLookupBudget)
+	defer cancel()
+	execution, err := clients.getRunExecution(lookupCtx, record.RunID)
+	if err != nil {
+		return ""
+	}
+	return executionFailureReason(execution)
+}
+
+// failureReasonLookupBudget caps the one extra read a legacy failed run
+// costs. The reason is a courtesy on top of the outcome; it must never be
+// what keeps `wait` or `inspect` from returning.
+var failureReasonLookupBudget = statusProbeBudget
+
+func executionFailureReason(execution l3.RunExecution) string {
+	if execution.Job != nil && execution.Job.State == contract.JobFailed {
+		return l3.JobFailureReason(*execution.Job)
+	}
+	if execution.DispatchError != nil {
+		return l3.SanitizeFailureReason(fmt.Sprintf("dispatch failed: %s: %s", execution.DispatchError.Code, execution.DispatchError.Message))
+	}
+	return ""
 }
 
 // runIsTerminal reads the ledger's own transition table rather than restating

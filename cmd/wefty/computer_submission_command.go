@@ -261,10 +261,11 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		if err != nil {
 			return err
 		}
+		annotated := annotateRunListing(ctx, clients, page)
 		if jsonOutput {
-			return writeJSON(stdout, page)
+			return writeJSON(stdout, annotated)
 		}
-		return writeRunListing(stdout, page, time.Now().UTC())
+		return writeRunListing(stdout, annotated, time.Now().UTC())
 	}
 	if status != "" {
 		return usageError("--status applies to the general listing; an --origin listing is not filtered by state")
@@ -289,37 +290,61 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	return writeComputerOriginRuns(stdout, page)
 }
 
-// writeRunListing is the operator's table. AGE is relative because "how long
-// has this been going" is the question, and STEP is the run's current step,
-// which is empty for a run that reported none -- shown as a dash rather than
-// blank so a column never reads as missing data.
-func writeRunListing(writer io.Writer, page l3.RunListPage, now time.Time) error {
+// writeRunListing is the operator's table. AGE is how long ago the run was
+// submitted and DURATION how long it has run, or ran: the two answer
+// different questions, and one column showing the second under the first
+// name read "0s" for a run minutes old (#604). STEP is the run's current
+// step, empty for a run that reported none -- shown as a dash rather than
+// blank so a column never reads as missing data. A queued run no node can
+// take says so in its status.
+func writeRunListing(writer io.Writer, page runListingPage, now time.Time) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "RUN ID\tSTATUS\tTRIGGER\tAGE\tSTEP"); err != nil {
+	if _, err := fmt.Fprintln(table, "RUN ID\tSTATUS\tTRIGGER\tAGE\tDURATION\tSTEP"); err != nil {
 		return err
 	}
+	var unschedulable []runListingRow
 	for _, run := range page.Runs {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n",
-			run.RunID, run.Status, run.Trigger.Type, runAge(run, now), valueOrNA(run.CurrentStep)); err != nil {
+		status := string(run.Status)
+		if run.UnschedulableReason != "" {
+			status += " (no eligible node)"
+			unschedulable = append(unschedulable, run)
+		}
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			run.RunID, status, run.Trigger.Type, runAge(run.RunSummary, now), runDuration(run.RunSummary, now),
+			valueOrNA(run.CurrentStep)); err != nil {
 			return err
 		}
 	}
-	return table.Flush()
+	if err := table.Flush(); err != nil {
+		return err
+	}
+	for _, run := range unschedulable {
+		if _, err := fmt.Fprintf(writer, "%s: %s\n", run.RunID, run.UnschedulableReason); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// runAge is how long the run has been going, or how long it took. A finished
-// run's age stops at its finish: the useful number for work that is over is how
-// long it lasted, not how long ago it was.
+// runAge is how long ago the run was submitted.
 func runAge(run l3.RunSummary, now time.Time) string {
-	start := run.CreatedAt
-	if run.StartedAt != nil {
-		start = *run.StartedAt
+	return formatElapsed(now.Sub(run.CreatedAt))
+}
+
+// runDuration is how long the run has been running, or how long it ran. A run
+// no node has started has no duration yet, which is a dash rather than 0s.
+func runDuration(run l3.RunSummary, now time.Time) string {
+	if run.StartedAt == nil {
+		return "-"
 	}
 	end := now
 	if run.FinishedAt != nil {
 		end = *run.FinishedAt
 	}
-	elapsed := end.Sub(start)
+	return formatElapsed(end.Sub(*run.StartedAt))
+}
+
+func formatElapsed(elapsed time.Duration) string {
 	if elapsed < 0 {
 		elapsed = 0
 	}

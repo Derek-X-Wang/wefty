@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -64,5 +67,39 @@ func TestRequireReachableRunLedgerRefusesAnUnreachableDefault(t *testing.T) {
 				t.Fatalf("refusal does not say what to pass instead: %v", err)
 			}
 		})
+	}
+}
+
+// TestRelativeDatabasePathWorks is #604 item 4 at the process boundary: a
+// relative -db used to fail with "invalid uri authority" after leaving an
+// authority-instance marker behind. It resolves against the directory the
+// daemon starts in, so the database and its marker land together there.
+func TestRelativeDatabasePathWorks(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "wefty-l1")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build wefty-l1: %v\n%s", err, output)
+	}
+	working := t.TempDir()
+	if err := os.Mkdir(filepath.Join(working, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(binary, "-db=state/l1.sqlite", "-initiate-admin-bootstrap")
+	command.Dir = working
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wefty-l1 with a relative -db: %v\n%s", err, output)
+	}
+	for _, name := range []string{"l1.sqlite", "l1.sqlite.authority-instance"} {
+		if _, err := os.Stat(filepath.Join(working, "state", name)); err != nil {
+			t.Fatalf("state/%s: %v", name, err)
+		}
+	}
+	entries, err := os.ReadDir(working)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stray files beside state/: %v", entries)
 	}
 }

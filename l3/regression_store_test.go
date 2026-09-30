@@ -236,8 +236,12 @@ func TestL1RegressionFirstTerminalProjectionWins(t *testing.T) {
 			}
 			run.State = contract.RunRunning
 			entered, release := make(chan struct{}), make(chan struct{})
+			// A pass may read the job twice: once to project it and, for a
+			// run the ledger failed meanwhile, once more to settle its node
+			// attribution. Only the first read is the race under test.
+			var enterOnce sync.Once
 			c := &recoveryJobClient{get: func(context.Context, string) (l1.Job, error) {
-				close(entered)
+				enterOnce.Do(func() { close(entered) })
 				<-release
 				if order == "missing first" {
 					return l1.Job{JobID: run.JobID, State: contract.JobSucceeded, NodeID: "late-node"}, nil
@@ -255,7 +259,7 @@ func TestL1RegressionFirstTerminalProjectionWins(t *testing.T) {
 			case "success first":
 				err = s.projectJobState(ctx, run, contract.JobSucceeded)
 			case "protocol first":
-				err = s.rejectProtocolWrite(ctx, run.RunID, "envelope", "rejected", []byte(`{}`), "hash", "invalid envelope")
+				err = s.rejectProtocolWrite(ctx, run.RunID, "envelope", "rejected", []byte(`{}`), "hash", "invalid envelope", errors.New("invalid envelope"))
 			default:
 				_, err = s.failMissingL1Job(ctx, run)
 			}

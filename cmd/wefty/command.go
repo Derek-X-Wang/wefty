@@ -99,6 +99,10 @@ type runInspection struct {
 	Steps     l3.RunSteps      `json:"steps"`
 	Results   *runResults      `json:"results,omitempty"`
 	Execution *l3.RunExecution `json:"execution,omitempty"`
+	// FailureReason is why the root run failed, in one line: the ledger's
+	// recorded reason, or for a run failed before the ledger recorded one,
+	// the L1 job's own evidence. Empty for a run that did not fail.
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 // runResults says where a finished run's files are, how long they last, and
@@ -317,6 +321,15 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 		}
 		inspection.Execution = &execution
 	}
+	switch {
+	case root.Status != contract.RunFailed:
+	case root.FailureReason != "":
+		inspection.FailureReason = root.FailureReason
+	case inspection.Execution != nil:
+		inspection.FailureReason = executionFailureReason(*inspection.Execution)
+	default:
+		inspection.FailureReason = runFailureReason(ctx, clients, root)
+	}
 	if jsonOutput {
 		return writeJSON(stdout, inspection)
 	}
@@ -481,7 +494,14 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	if err != nil {
 		return err
 	}
-	return writeAccepted(stdout, accepted, jsonOutput)
+	var warnings []string
+	if warning := routingWarning(ctx, clients, runKind(image), resolvedTags); warning != "" {
+		warnings = append(warnings, warning)
+		if _, err := fmt.Fprintf(stderr, "wefty: warning: %s\n", warning); err != nil {
+			return err
+		}
+	}
+	return writeAccepted(stdout, accepted, warnings, jsonOutput)
 }
 
 func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -504,7 +524,7 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	if err != nil {
 		return err
 	}
-	return writeAccepted(stdout, accepted, jsonOutput)
+	return writeAccepted(stdout, accepted, nil, jsonOutput)
 }
 
 func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -532,9 +552,24 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	runID := flags.Arg(0)
 	cursor := ""
 	var truncation truncationAnnouncer
+	var lastStatus contract.RunState
+	announcedWaiting := false
+	followStarted := time.Now()
+	// stopped is how an interrupted follow ends: a caller's timeout or ^C
+	// is not a failure to explain as "context canceled", it is the reader
+	// leaving, and the useful thing to say is where the run was.
+	stopped := func() error {
+		if lastStatus == "" {
+			return fmt.Errorf("stopped following run %s", runID)
+		}
+		return fmt.Errorf("stopped following run %s while it was %s", runID, lastStatus)
+	}
 	for {
 		page, err := clients.getRunLogs(ctx, runID, cursor, limit)
 		if err != nil {
+			if follow && ctx.Err() != nil {
+				return stopped()
+			}
 			return err
 		}
 		if jsonOutput {
@@ -566,19 +601,49 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		}
 		run, err := clients.getRun(ctx, runID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return stopped()
+			}
 			return err
 		}
+		lastStatus = run.Status
 		if isTerminalRun(run.Status) && len(page.Events) == 0 {
 			return nil
+		}
+		// A run no node has started produces no output, and following it
+		// used to be indistinguishable from following a hung one (#604).
+		// Say once, on stderr, what the silence is -- after a short grace,
+		// so a run that is simply being dispatched is not narrated.
+		if !announcedWaiting && queuedRunIsWaiting(run.Status) && time.Since(followStarted) >= followWaitingNoticeAfter {
+			announcedWaiting = true
+			if err := announceWaitingForNode(ctx, clients, stderr, runID, run.Status); err != nil {
+				return err
+			}
 		}
 		timer := time.NewTimer(pollInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return stopped()
 		case <-timer.C:
 		}
 	}
+}
+
+// followWaitingNoticeAfter is how long a follow waits on a run no node has
+// started before saying so. Dispatch and a claim take a second or two on a
+// healthy cluster; past this the silence is worth explaining.
+var followWaitingNoticeAfter = 3 * time.Second
+
+// announceWaitingForNode is the one line a follower of a not-yet-started run
+// reads, with L1's reason when no node could ever take it as things stand.
+func announceWaitingForNode(ctx context.Context, clients *apiClients, stderr io.Writer, runID string, status contract.RunState) error {
+	line := fmt.Sprintf("wefty: run %s is %s; waiting for a node to start it", runID, status)
+	if reason, _ := unschedulableReason(ctx, clients, runID); reason != "" {
+		line += " (no eligible node: " + reason + ")"
+	}
+	_, err := fmt.Fprintln(stderr, line)
+	return err
 }
 
 func moveFirstPositionalToEnd(args []string) []string {

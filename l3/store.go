@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS runs (
   dispatch_authority INTEGER NOT NULL DEFAULT 0,
   l1_job_id TEXT,
   node_id TEXT,
+  failure_reason TEXT,
+  node_attribution_pending INTEGER NOT NULL DEFAULT 0,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
@@ -340,6 +342,21 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_id", "TEXT"); err != nil {
 		return fmt.Errorf("l3: migrate run node attribution: %w", err)
+	}
+	// A run failed before the ledger recorded reasons keeps a NULL one; it
+	// reads as a failure with no recorded reason, which is what it is.
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "failure_reason", "TEXT"); err != nil {
+		return fmt.Errorf("l3: migrate run failure reason: %w", err)
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_attribution_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run node attribution pending: %w", err)
+	}
+	// Every reconcile pass asks for the pending attributions; the partial
+	// index keeps that a lookup of the few pending rows, not a scan of every
+	// run the ledger has ever held.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_node_attribution_pending
+ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
+		return fmt.Errorf("l3: index pending run node attributions: %w", err)
 	}
 	// A ledger written before credential delivery became opt-in has no column.
 	// Defaulting it to 0 is the safe direction: an old run reads as one that
@@ -1233,7 +1250,7 @@ func normalizeTags(tags []string) ([]string, error) {
 // typed program and trigger rows.
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
 	var record contract.RunRecord
-	var parent, l1JobID, nodeID, sourceRun, workflowRef sql.NullString
+	var parent, l1JobID, nodeID, failureReason, sourceRun, workflowRef sql.NullString
 	var computerID, computerAttemptID sql.NullString
 	var computerStorageGeneration, submitIntentRevision sql.NullInt64
 	var paramsJSON, tagsJSON []byte
@@ -1244,7 +1261,7 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	var createdNS, updatedNS int64
 	var startedNS, finishedNS sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
-SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
+SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.failure_reason, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.dispatch_authority, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
 	       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id,
 	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision
@@ -1252,7 +1269,7 @@ FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
+WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failureReason, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
 		&record.DispatchAuthority, &createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun,
 		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1265,6 +1282,7 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &recor
 	record.ParentRunID = parent.String
 	record.L1JobID = l1JobID.String
 	record.NodeID = nodeID.String
+	record.FailureReason = failureReason.String
 	record.Params = append(json.RawMessage(nil), paramsJSON...)
 	if err := json.Unmarshal(tagsJSON, &record.Tags); err != nil {
 		return contract.RunRecord{}, internalError(err, "decode run tags")
@@ -1472,10 +1490,10 @@ func (s *Store) AppendEnvelope(ctx context.Context, scope RunTokenScope, raw jso
 		validationErr = json.Unmarshal(canonical, &envelope)
 	}
 	if validationErr == nil && envelope.RunID != scope.RunID {
-		validationErr = fmt.Errorf("run_id must match the authenticated run")
+		validationErr = errRunIDMismatch
 	}
 	if validationErr == nil && envelope.AttemptID != scope.AttemptID {
-		validationErr = fmt.Errorf("attempt_id must match the authenticated run attempt")
+		validationErr = errAttemptIDMismatch
 	}
 	if validationErr == nil {
 		var callerSchema []byte
@@ -1496,7 +1514,7 @@ func (s *Store) AppendEnvelope(ctx context.Context, scope RunTokenScope, raw jso
 	}
 	if validationErr != nil {
 		reason := "envelope validation failed: " + validationErr.Error()
-		if err := s.rejectProtocolWrite(ctx, scope.RunID, "envelope", protocolIdempotencyKey(canonical, hash), canonical, hash, reason); err != nil {
+		if err := s.rejectProtocolWrite(ctx, scope.RunID, "envelope", protocolIdempotencyKey(canonical, hash), canonical, hash, reason, validationErr); err != nil {
 			return contract.Envelope{}, false, err
 		}
 		return contract.Envelope{}, false, protocolError(contract.ErrorInvalidRequest, "%s", reason)
@@ -1552,14 +1570,14 @@ func (s *Store) AppendGateResult(ctx context.Context, scope RunTokenScope, raw j
 		validationErr = json.Unmarshal(canonical, &gate)
 	}
 	if validationErr == nil && gate.RunID != scope.RunID {
-		validationErr = fmt.Errorf("run_id must match the authenticated run")
+		validationErr = errRunIDMismatch
 	}
 	if validationErr == nil && gate.AttemptID != scope.AttemptID {
-		validationErr = fmt.Errorf("attempt_id must match the authenticated run attempt")
+		validationErr = errAttemptIDMismatch
 	}
 	if validationErr != nil {
 		reason := "gate result validation failed: " + validationErr.Error()
-		if err := s.rejectProtocolWrite(ctx, scope.RunID, "gate", protocolIdempotencyKey(canonical, hash), canonical, hash, reason); err != nil {
+		if err := s.rejectProtocolWrite(ctx, scope.RunID, "gate", protocolIdempotencyKey(canonical, hash), canonical, hash, reason, validationErr); err != nil {
 			return contract.GateResult{}, false, err
 		}
 		return contract.GateResult{}, false, protocolError(contract.ErrorInvalidRequest, "%s", reason)
@@ -1597,7 +1615,8 @@ func (s *Store) AppendGateResult(ctx context.Context, scope RunTokenScope, raw j
 		return contract.GateResult{}, false, internalError(err, "append gate result")
 	}
 	if gate.Outcome == contract.GateFail || gate.Outcome == contract.GateError {
-		if err := failRunTx(ctx, tx, scope.RunID, now, s.tokenGrace); err != nil {
+		reason := fmt.Sprintf("gate %q reported %s", gate.Name, gate.Outcome)
+		if err := failRunTx(ctx, tx, scope.RunID, now, s.tokenGrace, reason); err != nil {
 			return contract.GateResult{}, false, err
 		}
 	}
@@ -1730,7 +1749,10 @@ func protocolIdempotencyKey(raw json.RawMessage, hash string) string {
 	return "body:" + hash
 }
 
-func (s *Store) rejectProtocolWrite(ctx context.Context, runID, kind, idempotencyKey string, body json.RawMessage, hash, reason string) error {
+// rejectProtocolWrite keeps the full refusal with the rejected write, where a
+// person debugging the workload can read it, and fails the run with a
+// value-free summary of cause.
+func (s *Store) rejectProtocolWrite(ctx context.Context, runID, kind, idempotencyKey string, body json.RawMessage, hash, reason string, cause error) error {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1741,7 +1763,7 @@ func (s *Store) rejectProtocolWrite(ctx context.Context, runID, kind, idempotenc
 		newID("reject"), runID, kind, idempotencyKey, hash, []byte(body), reason, now.UnixNano()); err != nil {
 		return internalError(err, "store protocol rejection")
 	}
-	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace); err != nil {
+	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, rejectedWriteSummary(kind, cause)); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1750,9 +1772,23 @@ func (s *Store) rejectProtocolWrite(ctx context.Context, runID, kind, idempotenc
 	return nil
 }
 
-func failRunTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time, tokenGrace time.Duration) error {
-	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, updated_ns=?, started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?) WHERE run_id=? AND status NOT IN (?, ?)`,
-		contract.RunFailed, now.UnixNano(), now.UnixNano(), now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed)
+// failRunTx fails a non-terminal run from the ledger side and records why.
+// The reason is written only by the transition that fails the run, so the
+// first cause is the one kept.
+//
+// The run's node attribution is cleared and marked pending when an L1 job
+// exists. The ledger cannot tell which node wrote the failing evidence -- a
+// run token names the run, not the L1 attempt -- and a node recorded while
+// the job was live may be one an earlier attempt failed on before it was
+// requeued. Once the job settles, the reconciler fills the node from the
+// attempt that settled it, from empty only (#604 review).
+func failRunTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time, tokenGrace time.Duration, reason string) error {
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, failure_reason=?, updated_ns=?,
+  started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?),
+  node_id=CASE WHEN l1_job_id IS NULL THEN node_id ELSE NULL END,
+  node_attribution_pending=CASE WHEN l1_job_id IS NULL THEN 0 ELSE 1 END
+WHERE run_id=? AND status NOT IN (?, ?)`,
+		contract.RunFailed, nullableReason(reason), now.UnixNano(), now.UnixNano(), now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed)
 	if err != nil {
 		return internalError(err, "fail run protocol")
 	}
@@ -1905,7 +1941,7 @@ func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr erro
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 		return internalError(err, "record permanent dispatch error")
 	}
-	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace); err != nil {
+	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, dispatchFailureReason(dispatchErr)); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1988,10 +2024,11 @@ func (s *Store) failMissingL1Job(ctx context.Context, run projectedRun) (bool, e
 		return false, internalError(err, "begin L1 regression")
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, updated_ns=?, started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?)
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, failure_reason=?, updated_ns=?, started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?)
  WHERE run_id=? AND status=? AND l1_job_id=? AND EXISTS (
  SELECT 1 FROM dispatch_outbox o WHERE o.run_id=runs.run_id AND o.job_id=? AND o.dispatched_ns IS NOT NULL)`,
-		contract.RunFailed, now.UnixNano(), now.UnixNano(), now.UnixNano(), run.RunID, run.State, run.JobID, run.JobID)
+		contract.RunFailed, nullableReason("L1 lost the dispatched job "+run.JobID+"; the work was not replayed"),
+		now.UnixNano(), now.UnixNano(), now.UnixNano(), run.RunID, run.State, run.JobID, run.JobID)
 	if err != nil {
 		return false, internalError(err, "fail L1-regressed run")
 	}
@@ -2015,6 +2052,14 @@ func (s *Store) failMissingL1Job(ctx context.Context, run projectedRun) (bool, e
 }
 
 func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState contract.JobState) error {
+	return s.projectJobOutcome(ctx, run, jobState, "")
+}
+
+// projectJobOutcome projects an observed L1 job state onto its run.
+// jobFailure is the job's own account of why it failed; it is recorded when a
+// failed job fails the run. When a job that succeeded fails the run anyway,
+// the ledger's own gate decides, and it records the gate it applied.
+func (s *Store) projectJobOutcome(ctx context.Context, run projectedRun, jobState contract.JobState, jobFailure string) error {
 	target, change, err := ProjectJobState(run.State, jobState)
 	if err != nil || !change {
 		return err
@@ -2025,6 +2070,13 @@ func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState 
 		return internalError(err, "begin run projection")
 	}
 	defer tx.Rollback()
+	var failureReason string
+	if jobState == contract.JobFailed {
+		failureReason = jobFailure
+		if failureReason == "" {
+			failureReason = "the L1 job failed"
+		}
+	}
 	if jobState == contract.JobSucceeded {
 		var acceptedEnvelopes, rejectedWrites, failedGates, activeChildren, failedChildren int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM envelopes WHERE run_id=?`, run.RunID).Scan(&acceptedEnvelopes); err != nil {
@@ -2044,6 +2096,7 @@ func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState 
 		}
 		if rejectedWrites > 0 || failedGates > 0 || failedChildren > 0 || (run.RequiredEnvelope && acceptedEnvelopes == 0) {
 			target = contract.RunFailed
+			failureReason = succeededJobFailureReason(rejectedWrites, failedGates, failedChildren)
 		} else if activeChildren > 0 {
 			// The parent process has exited successfully, but its run remains
 			// non-terminal until every child lineage settles.
@@ -2055,11 +2108,15 @@ func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState 
 	}
 	started := target == contract.RunRunning || target == contract.RunAwaitingInput || target == contract.RunSucceeded || target == contract.RunFailed
 	finished := target == contract.RunSucceeded || target == contract.RunFailed
+	if target != contract.RunFailed {
+		failureReason = ""
+	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE runs SET status=?, updated_ns=?,
+  failure_reason=COALESCE(?, failure_reason),
   started_ns=CASE WHEN ? THEN COALESCE(started_ns, ?) ELSE started_ns END,
   finished_ns=CASE WHEN ? THEN ? ELSE finished_ns END
-WHERE run_id=? AND status=?`, target, now.UnixNano(), started, now.UnixNano(), finished, now.UnixNano(), run.RunID, run.State)
+WHERE run_id=? AND status=?`, target, now.UnixNano(), nullableReason(failureReason), started, now.UnixNano(), finished, now.UnixNano(), run.RunID, run.State)
 	if err != nil {
 		return internalError(err, "project job state onto run")
 	}
@@ -2082,12 +2139,107 @@ WHERE run_id=? AND status=?`, target, now.UnixNano(), started, now.UnixNano(), f
 	return nil
 }
 
-func (s *Store) recordRunNode(ctx context.Context, runID, nodeID string) error {
+// succeededJobFailureReason names the ledger gate that failed a run whose job
+// exited successfully. The checks mirror the gate above, in the order a
+// reader would look: a write the ledger refused, a gate the run itself
+// failed, a child that failed, and finally the envelope a
+// --required-envelope run promised and never reported.
+func succeededJobFailureReason(rejectedWrites, failedGates, failedChildren int) string {
+	switch {
+	case rejectedWrites > 0:
+		return fmt.Sprintf("the job exited 0, but the ledger rejected %d of its protocol writes", rejectedWrites)
+	case failedGates > 0:
+		return fmt.Sprintf("the job exited 0, but %d of its gates reported fail or error", failedGates)
+	case failedChildren > 0:
+		return fmt.Sprintf("the job exited 0, but %d of its child runs failed", failedChildren)
+	default:
+		return "the job exited 0 without reporting the envelope --required-envelope requires"
+	}
+}
+
+// dispatchFailureReason is a permanent dispatch refusal as one line.
+func dispatchFailureReason(err error) string {
+	apiErr := apiErrorFrom(err)
+	return fmt.Sprintf("L1 refused the dispatch: %s: %s", apiErr.Code, apiErr.Message)
+}
+
+// nullableReason is the one way a failure_reason reaches the database:
+// sanitized to a capped single line, and NULL when empty so COALESCE never
+// overwrites a recorded reason with nothing.
+func nullableReason(reason string) any {
+	reason = SanitizeFailureReason(reason)
+	if reason == "" {
+		return nil
+	}
+	return reason
+}
+
+// pendingNodeAttribution is a run the ledger failed while its L1 job was
+// still live, waiting for that job to settle so its node can be named.
+type pendingNodeAttribution struct {
+	RunID string
+	JobID string
+}
+
+// pendingNodeAttributionsQuery names node_attribution_pending=1 literally so
+// SQLite can answer it from the runs_node_attribution_pending partial index.
+const pendingNodeAttributionsQuery = `SELECT run_id, l1_job_id FROM runs
+WHERE node_attribution_pending=1 AND l1_job_id IS NOT NULL ORDER BY created_ns, run_id`
+
+func (s *Store) pendingNodeAttributions(ctx context.Context) ([]pendingNodeAttribution, error) {
+	rows, err := s.db.QueryContext(ctx, pendingNodeAttributionsQuery)
+	if err != nil {
+		return nil, internalError(err, "list pending run node attributions")
+	}
+	defer rows.Close()
+	var pending []pendingNodeAttribution
+	for rows.Next() {
+		var item pendingNodeAttribution
+		if err := rows.Scan(&item.RunID, &item.JobID); err != nil {
+			return nil, internalError(err, "scan pending run node attribution")
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate pending run node attributions")
+	}
+	return pending, nil
+}
+
+// settleNodeAttribution is the one write allowed to a terminal run's node:
+// it fills an empty attribution from the attempt that settled the job, and
+// ends the wait either way. An empty nodeID (a job with no attempt, or one L1
+// no longer has) leaves the run unattributed rather than guessed.
+func (s *Store) settleNodeAttribution(ctx context.Context, runID, nodeID string) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET
+  node_id=CASE WHEN COALESCE(node_id, '')='' AND ?<>'' THEN ? ELSE node_id END,
+  node_attribution_pending=0
+WHERE run_id=? AND node_attribution_pending=1`, nodeID, nodeID, runID); err != nil {
+		return internalError(err, "settle run node attribution")
+	}
+	return nil
+}
+
+// recordRunNode attributes a run to a node. A provisional answer -- the node
+// of a live job's current attempt -- only fills an empty attribution. A
+// settled one -- the attempt that ended the job -- replaces a different
+// provisional node, because an attempt that failed before it started and was
+// requeued elsewhere is not where the run ran. Either way a terminal run's
+// attribution is never rewritten.
+func (s *Store) recordRunNode(ctx context.Context, runID, nodeID string, settled bool) error {
 	if nodeID == "" {
 		return nil
 	}
 	now := canonicalTime(s.clock.Now())
-	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=? AND COALESCE(node_id, '')='' AND status NOT IN (?, ?)`, nodeID, now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed); err != nil {
+	// A provisional answer matches only an empty attribution; a settled one
+	// matches any attribution that differs from it.
+	replaceable := ""
+	if settled {
+		replaceable = nodeID
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=?
+  AND (COALESCE(node_id, '')='' OR (?<>'' AND node_id<>?)) AND status NOT IN (?, ?)`,
+		nodeID, now.UnixNano(), runID, replaceable, replaceable, contract.RunSucceeded, contract.RunFailed); err != nil {
 		return internalError(err, "record run node attribution")
 	}
 	return nil

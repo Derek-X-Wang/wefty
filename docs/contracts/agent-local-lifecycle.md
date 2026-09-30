@@ -20,9 +20,13 @@ healthy idle process. `last_semantic_error` retains the most recent L1 error
 code, message, and local observation time; transport errors do not invent a
 semantic code.
 
-The first SIGINT or SIGTERM starts a graceful drain with a 30-second bound. A
-second signal is an explicit forced-shutdown transition: it cancels resident
-attempts immediately. While Drain is joining residents it emits
+The first SIGINT or SIGTERM starts a graceful drain. The 30-second bound
+applies to the drain request to L1, which moves the node to `draining`; the
+agent then stops claiming and waits for every resident attempt to finish, which
+is bounded only by each attempt's own max runtime. Until the process exits its
+node lock is held, so a replacement agent for the same stable node ID is
+refused. A second signal is an explicit forced-shutdown transition: it cancels
+resident attempts immediately. While Drain is joining residents it emits
 `forced_shutdown transition=draining_to_forced reason=second_signal`; after
 Drain returns it emits
 `forced_shutdown transition=drained_to_forced reason=second_signal`. These

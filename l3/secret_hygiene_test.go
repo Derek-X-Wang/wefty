@@ -3,6 +3,7 @@ package l3
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -44,7 +45,7 @@ func TestTerminalRunDropsItsStagedTokenDelivery(t *testing.T) {
 	if staged.String != token {
 		t.Fatalf("fixture error: staged delivery = %v, want the minted bearer", staged)
 	}
-	if err := s.rejectProtocolWrite(ctx, record.RunID, "envelope", "rejected", []byte(`{}`), "hash", "invalid envelope"); err != nil {
+	if err := s.rejectProtocolWrite(ctx, record.RunID, "envelope", "rejected", []byte(`{}`), "hash", "invalid envelope", errors.New("invalid envelope")); err != nil {
 		t.Fatal(err)
 	}
 	var status contract.RunState

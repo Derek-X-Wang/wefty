@@ -37,18 +37,18 @@ func TestRunListingTableShowsTheCurrentStepAndAge(t *testing.T) {
 		},
 	}}
 	var out strings.Builder
-	if err := writeRunListing(&out, page, listNow); err != nil {
+	if err := writeRunListing(&out, runListingPage{Runs: []runListingRow{{RunSummary: page.Runs[0]}, {RunSummary: page.Runs[1]}}}, listNow); err != nil {
 		t.Fatal(err)
 	}
 	rendered := out.String()
-	for _, want := range []string{"RUN ID", "STATUS", "TRIGGER", "AGE", "STEP", "run-running", "gates", "1m30s"} {
+	for _, want := range []string{"RUN ID", "STATUS", "TRIGGER", "AGE", "DURATION", "STEP", "run-running", "gates", "1m30s"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("listing is missing %q:\n%s", want, rendered)
 		}
 	}
-	// A finished run's age is how long it took, not how long ago it was.
+	// A finished run's duration is how long it took.
 	if !strings.Contains(rendered, "1m0s") {
-		t.Fatalf("a finished run's age is not its duration:\n%s", rendered)
+		t.Fatalf("a finished run's duration is not how long it took:\n%s", rendered)
 	}
 	if !strings.Contains(rendered, "-") {
 		t.Fatalf("a run in no step renders no placeholder:\n%s", rendered)
@@ -63,11 +63,15 @@ func TestRunAgeReadsAsElapsedTime(t *testing.T) {
 		run  l3.RunSummary
 		want string
 	}{
-		"seconds":        {l3.RunSummary{CreatedAt: listNow.Add(-5 * time.Second)}, "5s"},
-		"minutes":        {l3.RunSummary{CreatedAt: listNow.Add(-125 * time.Second)}, "2m5s"},
-		"hours":          {l3.RunSummary{CreatedAt: listNow.Add(-90 * time.Minute)}, "1h30m"},
-		"days":           {l3.RunSummary{CreatedAt: listNow.Add(-50 * time.Hour)}, "2d2h"},
-		"started counts": {l3.RunSummary{CreatedAt: created, StartedAt: ptrTime(listNow.Add(-time.Minute))}, "1m0s"},
+		"seconds": {l3.RunSummary{CreatedAt: listNow.Add(-5 * time.Second)}, "5s"},
+		"minutes": {l3.RunSummary{CreatedAt: listNow.Add(-125 * time.Second)}, "2m5s"},
+		"hours":   {l3.RunSummary{CreatedAt: listNow.Add(-90 * time.Minute)}, "1h30m"},
+		"days":    {l3.RunSummary{CreatedAt: listNow.Add(-50 * time.Hour)}, "2d2h"},
+		// Age is since submission, whatever the run did after (#604): a run
+		// that finished in a second three hours ago is three hours old.
+		"a started run": {l3.RunSummary{CreatedAt: created, StartedAt: ptrTime(listNow.Add(-time.Minute))}, "3h0m"},
+		"a finished run": {l3.RunSummary{CreatedAt: created, StartedAt: ptrTime(created),
+			FinishedAt: ptrTime(created.Add(time.Second))}, "3h0m"},
 	}
 	for name, test := range tests {
 		test := test
@@ -87,7 +91,7 @@ func TestWaitTurnsATerminalRunIntoAnExitCode(t *testing.T) {
 
 	succeeded := contract.RunRecord{RunID: "run-ok", Status: contract.RunSucceeded}
 	var out strings.Builder
-	if err := reportTerminalRun(&out, succeeded, false); err != nil {
+	if err := reportTerminalRun(&out, succeeded, "", false); err != nil {
 		t.Fatalf("a successful run reported an error: %v", err)
 	}
 	if strings.TrimSpace(out.String()) != string(contract.RunSucceeded) {
@@ -96,7 +100,7 @@ func TestWaitTurnsATerminalRunIntoAnExitCode(t *testing.T) {
 
 	failed := contract.RunRecord{RunID: "run-bad", Status: contract.RunFailed}
 	out.Reset()
-	err := reportTerminalRun(&out, failed, false)
+	err := reportTerminalRun(&out, failed, "", false)
 	if err == nil {
 		t.Fatal("a failed run exited zero")
 	}
@@ -302,7 +306,7 @@ func TestWaitJSONPrintsTheFinalRecord(t *testing.T) {
 	for _, status := range []contract.RunState{contract.RunSucceeded, contract.RunFailed} {
 		var out strings.Builder
 		record := contract.RunRecord{RunID: "run-json", Status: status}
-		_ = reportTerminalRun(&out, record, true)
+		_ = reportTerminalRun(&out, record, "", true)
 		var decoded contract.RunRecord
 		if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
 			t.Fatalf("--json output for a %s run is not JSON: %v (%s)", status, err, out.String())

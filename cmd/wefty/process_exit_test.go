@@ -39,10 +39,22 @@ func buildWefty(t *testing.T) string {
 // runWefty runs the built binary and returns its exit status and output.
 func runWefty(t *testing.T, binary string, budget time.Duration, args ...string) (int, string) {
 	t.Helper()
+	return runWeftyWithEnv(t, binary, budget, nil, args...)
+}
+
+// runWeftyWithEnv is runWefty with extra environment. The address variables
+// are cleared first, so an operator's exported shell cannot steer a test.
+func runWeftyWithEnv(t *testing.T, binary string, budget time.Duration, env []string, args ...string) (int, string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), budget)
 	defer cancel()
 	command := exec.CommandContext(ctx, binary, args...)
-	command.Env = os.Environ()
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, l1AddressEnv+"=") && !strings.HasPrefix(entry, l3AddressEnv+"=") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, env...)
 	output, err := command.CombinedOutput()
 	if ctx.Err() != nil {
 		t.Fatalf("`wefty %s` did not finish within %s:\n%s", strings.Join(args, " "), budget, output)
@@ -132,7 +144,11 @@ func TestWaitExitCodesFromTheRealBinary(t *testing.T) {
 		current := status
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(contract.RunRecord{RunID: "run-under-test", Status: current})
+		record := contract.RunRecord{RunID: "run-under-test", Status: current}
+		if current == contract.RunFailed {
+			record.FailureReason = "exit 3"
+		}
+		_ = json.NewEncoder(w).Encode(record)
 	})
 
 	code, output := runWefty(t, binary, 60*time.Second,
@@ -142,6 +158,17 @@ func TestWaitExitCodesFromTheRealBinary(t *testing.T) {
 	}
 	if !strings.Contains(output, string(contract.RunFailed)) {
 		t.Fatalf("wait printed no status:\n%s", output)
+	}
+	// Why it failed is one line on the way out, not a trip to --execution.
+	if !strings.Contains(output, "wefty: run run-under-test failed: exit 3") {
+		t.Fatalf("wait did not name why the run failed:\n%s", output)
+	}
+
+	// The ledger address can come from WEFTY_L3_ADDR alone (#604).
+	code, output = runWeftyWithEnv(t, binary, 60*time.Second, []string{l3AddressEnv + "=" + ledger},
+		"--l1="+unusedAddress(t), "wait", "run-under-test", "--timeout", "30s")
+	if code != exitRunFailed {
+		t.Fatalf("`wefty wait` with the ledger from %s exited %d, want %d:\n%s", l3AddressEnv, code, exitRunFailed, output)
 	}
 
 	mu.Lock()

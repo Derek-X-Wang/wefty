@@ -8,11 +8,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -45,6 +47,16 @@ func run() error {
 	flag.Parse()
 	if *reconcileEvery <= 0 {
 		return fmt.Errorf("--reconcile-interval must be positive")
+	}
+	if err := pathflags.Absolutize(
+		pathflags.Flag{Name: "db", Value: databasePath},
+		pathflags.Flag{Name: "state-dir", Value: stateDirectory},
+		pathflags.Flag{Name: "ready-file", Value: readyFile},
+	); err != nil {
+		return err
+	}
+	if err := requireReachableControlPlane(*fabricMode, *controlPlane); err != nil {
+		return err
 	}
 
 	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
@@ -106,6 +118,26 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return server.Serve(ctx, listener)
+}
+
+// requireReachableControlPlane is L1's -run-ledger guard, mirrored (#604).
+// Plain Fabric resolves a wefty:// logical name only inside the process that
+// registered it, so the default control-plane name can never be dialed from a
+// separate L3 process: the ledger would start, accept runs, and never dispatch
+// one. The address is knowable at start, so it is refused at start.
+func requireReachableControlPlane(fabricMode, controlPlane string) error {
+	if !strings.EqualFold(strings.TrimSpace(fabricMode), "plain") {
+		return nil
+	}
+	address := strings.TrimSpace(controlPlane)
+	if address == "" {
+		return fmt.Errorf("-control-plane is required: pass the control plane's host:port")
+	}
+	if !strings.HasPrefix(strings.ToLower(address), "wefty:") {
+		return nil
+	}
+	return fmt.Errorf("-control-plane=%s is a logical Fabric address that plain Fabric resolves only within one process; "+
+		"pass the control plane's host:port instead", controlPlane)
 }
 
 func publishReadyFile(path, address string) error {

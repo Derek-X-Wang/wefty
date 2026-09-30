@@ -194,6 +194,7 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	l3Status := serviceStatus{Name: "L3", Endpoint: clients.l3.address}
 
 	var nodes l1.NodeList
+	var stuck []queuedRunNote
 	var group sync.WaitGroup
 	group.Add(3)
 	go func() {
@@ -216,11 +217,25 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 			l3Status.Detail = "no L3 endpoint is configured; this is an L1-only installation"
 			return
 		}
-		if _, err := clients.listRuns(probeCtx, "", 1); err != nil {
+		// The queued listing is the reachability probe too, so the one
+		// thing a ready cluster can still hide -- a run nothing can take
+		// (#604) -- costs no extra round trip unless there is a queued run.
+		queued, err := clients.listRuns(probeCtx, string(contract.RunQueued), maxAnnotatedQueuedRuns)
+		if err != nil {
 			l3Status.Detail = probeDetail(err)
 			return
 		}
 		l3Status.Reachable = true
+		runIDs := make([]string, 0, len(queued.Runs))
+		for _, run := range queued.Runs {
+			runIDs = append(runIDs, run.RunID)
+		}
+		reasons := queuedRunReasons(probeCtx, clients, runIDs)
+		for _, runID := range runIDs {
+			if reason := reasons[runID]; reason != "" {
+				stuck = append(stuck, queuedRunNote{runID: runID, reason: reason})
+			}
+		}
 	}()
 	go func() {
 		defer group.Done()
@@ -244,9 +259,30 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	status.Nodes = nodeStatuses(nodes)
 	status.Capacity = capacityByKind(status.Nodes)
 	status.Reasons, status.Limitations = reasonsFor(l1Status, l3Status, status.Nodes, status.Capacity)
+	if note, ok := unschedulableRunsNote(stuck); ok {
+		status.Limitations = append(status.Limitations, note)
+	}
 	status.Ready = len(status.Reasons) == 0
 	status.Verdict = verdictOf(status.Reasons)
 	return status
+}
+
+// queuedRunNote is one queued run L1 says no tag-eligible node can take.
+type queuedRunNote struct {
+	runID, reason string
+}
+
+// unschedulableRunsNote is a limitation, not a reason: the cluster can still
+// take other work, and the run may yet be placed when a matching node joins.
+func unschedulableRunsNote(stuck []queuedRunNote) (statusReason, bool) {
+	if len(stuck) == 0 {
+		return statusReason{}, false
+	}
+	detail := fmt.Sprintf("queued run %s has no eligible node: %s", stuck[0].runID, stuck[0].reason)
+	if len(stuck) > 1 {
+		detail = fmt.Sprintf("%d queued runs have no eligible node, e.g. run %s: %s", len(stuck), stuck[0].runID, stuck[0].reason)
+	}
+	return statusReason{Code: "queued_run_unschedulable", Detail: detail}, true
 }
 
 // identityFromRefusal reads a refusal as the fact it is.
@@ -369,11 +405,11 @@ func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 	capacity map[string]int) (reasons, limitations []statusReason) {
 	if !l1Status.Reachable {
 		reasons = append(reasons, statusReason{Code: "l1_unreachable",
-			Detail: "L1 at " + endpointOrNone(l1Status.Endpoint) + " is not reachable"})
+			Detail: "L1 at " + endpointOrNone(l1Status.Endpoint) + " is not reachable (" + addressHint("l1") + ")"})
 	}
 	if !l3Status.Reachable {
 		reasons = append(reasons, statusReason{Code: "l3_unreachable",
-			Detail: "L3 at " + endpointOrNone(l3Status.Endpoint) + " is not reachable"})
+			Detail: "L3 at " + endpointOrNone(l3Status.Endpoint) + " is not reachable (" + addressHint("l3") + ")"})
 	}
 	if !l1Status.Reachable {
 		// Without L1 there is no node projection at all, so anything said
@@ -385,6 +421,19 @@ func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 	}
 	alive := filterNodes(nodes, func(node nodeStatus) bool { return node.State == contract.NodeAlive })
 	if len(alive) == 0 {
+		// A draining node is not dead: it stopped taking work and is
+		// finishing what it holds, and a replacement cannot register until it
+		// is done. Saying "no node is alive" sent people to start a second
+		// agent, which fails (#604).
+		draining := filterNodes(nodes, func(node nodeStatus) bool { return node.State == contract.NodeDraining })
+		if len(draining) > 0 {
+			ids := make([]string, 0, len(draining))
+			for _, node := range draining {
+				ids = append(ids, node.NodeID)
+			}
+			return append(reasons, statusReason{Code: "nodes_draining",
+				Detail: "no node is alive; draining (finishing resident attempts before it stops): " + strings.Join(ids, ", ")}), nil
+		}
 		return append(reasons, statusReason{Code: "no_alive_node", Detail: "no node is alive"}), nil
 	}
 	claiming := filterNodes(alive, func(node nodeStatus) bool { return node.ClaimsEnabled })
