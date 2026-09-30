@@ -939,16 +939,19 @@ that transition.
 | --- | --- | --- |
 | `alive` | Heartbeats are within the alive threshold. New claims additionally require durable `claims_enabled=true` intent. | `stale`, `draining`, `dead` |
 | `stale` | Heartbeats exceed the stale threshold; new claims are forbidden. | `alive`, `draining`, `dead` |
-| `draining` | The current boot session is shutting down; existing attempts may finish and new claims are forbidden. | `dead`, `alive` through registration |
+| `draining` | The current boot session is shutting down; existing attempts may finish and new claims are forbidden. | `dead`, `alive` through a new boot session's registration |
 | `dead` | Heartbeats exceed the dead threshold or the boot session ended. | `alive` |
 
 Registration carries stable node ID and per-boot session ID. A `dead` or
 `draining` node may become `alive` only through registration, which always
 names the current boot session: L1 records the registering boot session and
-writes `alive` whatever the stored state was, so the next boot session after a
-graceful drain returns the node to `alive`. Heartbeat never leaves `draining`
-or `dead`. The Go `NodeTransitions` table does not yet list
-`draining → alive`; registration writes the state directly. Routing
+writes `alive`, so the next boot session after a graceful drain returns the
+node to `alive`. The one exception is a drain: a re-registration from the same
+boot session that asked for it keeps `draining`, because that rejoin is the
+draining process itself and must not silently undo its own drain. Heartbeat
+never leaves `draining` or `dead`. The Go `NodeTransitions` table lists
+`draining → alive` but cannot express its new-boot-session condition; that
+lives in registration. Routing
 tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness and may atomically replace the current
 boot's full capability observation with a higher Capability revision; it does

@@ -789,13 +789,13 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"revocation_race_result": fmt.Sprintf("guest_status=%d guest_code=%s transport_error=%s authority_outcome=%s authority_before=%d authority_after=%d race_run_id=%s race_run_created_at=%s revocation_committed_at=%s",
 			pausedResult.Status, pausedError.Error.Code, pausedResult.TransportError, authorityRace.Outcome,
 			len(authorityRunsBefore.Runs), len(authorityRunsAfter.Runs), authorityRace.RunID, authorityRace.RunCreatedAt, authorityRace.RevocationCommittedAt),
-		"blocked_assertion": "candidate-bound complete M3 OCI matrix root Run execution result"}
+		"blocked_assertion": "candidate-bound root Run execution result"}
 	if mutatingLinuxComputerRow("linux.guest_authority") {
 		if err := receipt.pass("linux.guest_authority", guestAssertions, guestEvidence); err == nil {
 			t.Fatal("guest-authority lane mutation did not fail")
 		}
-	} else if err := receipt.notRun("linux.guest_authority", 157,
-		"the complete M3 OCI matrix does not yet publish the single candidate-bound root Run execution result required to join this live Computer authority proof",
+	} else if err := receipt.notRun("linux.guest_authority", 196,
+		"no lane yet drives a Computer-submitted root Run to a candidate-bound root Run execution result; the closed M3 OCI matrix (#157) proves kind=oci cells, not Runs, so there is nothing to join to this live Computer authority proof",
 		guestAssertions, guestEvidence); err != nil {
 		t.Fatalf("%v; revocation_race_result=%s", err, guestEvidence["revocation_race_result"])
 	}

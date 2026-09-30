@@ -64,21 +64,91 @@ func (s *Store) adoptComputerAuthorityInstance(ctx context.Context) error {
 	return nil
 }
 
-// MintComputerToken persists only the digest and immutable audit. Minting a
-// second pass revokes every older grant for the Computer before the fresh
-// bearer is returned. This makes a new attempt a definitive authority fence.
+// ComputerScopeReprover proves a mint's scope with L1 again after its grant
+// has committed and before its bearer is returned.
+type ComputerScopeReprover func(context.Context) (ComputerTokenScopeProof, error)
+
+// MintComputerToken mints for a caller whose proof is still current when the
+// call returns, such as an in-process test. The HTTP mint route never uses
+// it: it re-proves through MintReprovedComputerToken.
 func (s *Store) MintComputerToken(ctx context.Context, proof ComputerTokenScopeProof) (ComputerTokenGrant, error) {
+	return s.MintReprovedComputerToken(ctx, proof, func(context.Context) (ComputerTokenScopeProof, error) { return proof, nil })
+}
+
+// MintReprovedComputerToken persists only the digest and immutable audit, and
+// makes a new attempt's grant the Computer's authority fence without ever
+// letting an ended attempt's late mint revoke its successor's grant.
+//
+// L3 cannot order attempts itself, so the mint does not guess. Its transaction
+// revokes only the same attempt's earlier grants and inserts the new one. It
+// then re-proves the scope with L1. At most one attempt of a Computer passes
+// that proof at any moment and an ended attempt never passes it again, so a
+// grant that re-proves after it committed is newer than every grant already
+// committed for the Computer: those, with a lower grant revision, are revoked
+// as regranted. A grant that fails the re-proof is revoked and its bearer is
+// never returned; a grant committed after it is left for its own re-proof to
+// settle. Every bearer use re-proves the live scope as well.
+func (s *Store) MintReprovedComputerToken(ctx context.Context, proof ComputerTokenScopeProof, reprove ComputerScopeReprover) (ComputerTokenGrant, error) {
 	if err := validComputerScopeProof(proof); err != nil {
 		return ComputerTokenGrant{}, err
 	}
+	if reprove == nil {
+		return ComputerTokenGrant{}, internalError(errors.New("no Computer scope re-prover"), "mint Computer token")
+	}
+	grant, err := s.insertComputerGrant(ctx, proof)
+	if err != nil {
+		return ComputerTokenGrant{}, err
+	}
+	current, proofErr := reprove(ctx)
+	if proofErr == nil && !sameComputerGrantScope(current, proof) {
+		proofErr = protocolError(contract.ErrorForbidden, "Computer submission authority changed while its token was minted")
+	}
+	if proofErr != nil {
+		// The bearer was never handed out, so this revocation must land even
+		// when the caller has gone away.
+		if err := s.settleComputerGrantMint(context.WithoutCancel(ctx), grant, `computer_id=? AND grant_revision=? AND revoked_ns IS NULL`,
+			[]any{grant.ComputerID, grant.GrantRevision}, "mint_scope_not_current"); err != nil {
+			return ComputerTokenGrant{}, errors.Join(proofErr, err)
+		}
+		return ComputerTokenGrant{}, proofErr
+	}
+	if err := s.settleComputerGrantMint(ctx, grant, `computer_id=? AND grant_revision<? AND revoked_ns IS NULL`,
+		[]any{grant.ComputerID, grant.GrantRevision}, "regranted"); err != nil {
+		return ComputerTokenGrant{}, err
+	}
+	return grant, nil
+}
+
+func sameComputerGrantScope(current, minted ComputerTokenScopeProof) bool {
+	return current.ComputerID == minted.ComputerID && current.ComputerAttemptID == minted.ComputerAttemptID &&
+		current.ComputerStorageGeneration == minted.ComputerStorageGeneration &&
+		current.SubmitIntentRevision == minted.SubmitIntentRevision && current.HostNodeID == minted.HostNodeID
+}
+
+func (s *Store) settleComputerGrantMint(ctx context.Context, grant ComputerTokenGrant, predicate string, args []any, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin Computer token mint settlement")
+	}
+	defer tx.Rollback()
+	if err := revokeComputerGrantRows(ctx, tx, predicate, args, canonicalTime(s.clock.Now()).UnixNano(), reason); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit Computer token mint settlement")
+	}
+	return nil
+}
+
+func (s *Store) insertComputerGrant(ctx context.Context, proof ComputerTokenScopeProof) (ComputerTokenGrant, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ComputerTokenGrant{}, internalError(err, "begin Computer token mint")
 	}
 	defer tx.Rollback()
 	now := canonicalTime(s.clock.Now())
-	if err := revokeComputerGrantRows(ctx, tx, `computer_id=? AND revoked_ns IS NULL`,
-		[]any{proof.ComputerID}, now.UnixNano(), "regranted"); err != nil {
+	if err := revokeComputerGrantRows(ctx, tx, `computer_id=? AND computer_attempt_id=? AND revoked_ns IS NULL`,
+		[]any{proof.ComputerID, proof.ComputerAttemptID}, now.UnixNano(), "regranted"); err != nil {
 		return ComputerTokenGrant{}, err
 	}
 	var authorityGeneration, grantRevision int64

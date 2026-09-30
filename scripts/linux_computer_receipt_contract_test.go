@@ -84,6 +84,9 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"wrong aggregate not-run issue": func(receipt map[string]any) {
 			receipt["not_run_issue"] = 286
 		},
+		"guest authority skip names the closed M3 OCI matrix": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.guest_authority"].(map[string]any)["not_run_issue"] = 157
+		},
 		"missing restore token revocation evidence": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["evidence"] = map[string]string{}
 		},
@@ -301,9 +304,9 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	}
 	guest := rows["linux.guest_authority"].(map[string]any)
 	guest["status"] = "NOT-RUN"
-	guest["not_run_issue"] = 157
-	guest["not_run_reason"] = "complete M3 OCI matrix root result is not published"
-	guest["evidence"] = map[string]string{"blocked_assertion": "candidate-bound root Run route"}
+	guest["not_run_issue"] = 196
+	guest["not_run_reason"] = "no lane yet drives a Computer-submitted root Run to a root Run execution result"
+	guest["evidence"] = map[string]string{"blocked_assertion": "candidate-bound root Run execution result"}
 	storage := rows["linux.storage_provenance"].(map[string]any)
 	storage["evidence"] = map[string]string{"restore_token_revocation_receipt": "operation_revision=9 revoke_all=true computer_id=computer-1"}
 	crossover := rows["linux.screen_crossover_refused"].(map[string]any)
@@ -362,7 +365,7 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	return map[string]any{
 		"version":       5,
 		"status":        "NOT-RUN",
-		"not_run_issue": 157,
+		"not_run_issue": 196,
 		"candidate_sha": candidate,
 		"platform":      "linux/amd64",
 		"image": map[string]any{

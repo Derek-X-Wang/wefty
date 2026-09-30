@@ -355,6 +355,25 @@ then revokes the Computer's L3 grants below its new revision; an applied
 change whose revocation the run ledger did not take still reports success,
 with `revoked: null` and `revocation_notice` (#600; see `state-machines.md`).
 
+Minting a pass is a fence for the new attempt, but L3 cannot order attempts:
+their IDs are opaque, and a mint's own time says nothing about when its
+attempt began. So a mint never revokes another attempt's grant on the strength
+of its own first proof, which may be stale by the time it commits (#605). Its
+transaction revokes only the same attempt's earlier grants and inserts the new
+grant. After that commits, and before the bearer is returned, L3 proves the
+scope with L1 again. If that proof fails, or names a different Storage
+generation, submit-intent revision or host, the new grant is revoked
+(`mint_scope_not_current`), the bearer is never returned, and the mint answers
+with the proof's refusal. If it succeeds, L3 revokes every grant of the
+Computer with a lower grant revision as `regranted`. This is safe because at
+most one attempt of a Computer passes the L1 proof at any moment and an ended
+attempt never passes it again: a grant that re-proves after it committed is
+newer than every grant committed before it, while a late mint from an ended
+attempt fails its own re-proof and can revoke nothing but itself. A grant
+committed later is left for its own re-proof to settle, and every bearer use
+re-proves the live scope regardless. A same-attempt remint whose re-proof fails
+leaves that attempt with no pass until it mints again.
+
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
 already failed) is followed by an explicit L3 revoke-all. Attempt completion,
@@ -462,6 +481,16 @@ deadline; a revocation that has not answered by then is owed exactly like a
 refused one, so a run ledger that hangs costs the same as one that refuses. A
 blocked restore must never take a Node's whole convergence surface — and with
 it the capabilities the Node advertises — out of service.
+
+A node agent treats `run_ledger_unavailable` on its own attempt completion as
+transient whatever `retryable` says. L1 has already committed that completion
+and holds its attempt revocation owed, so nothing is lost by waiting, but each
+replay makes L1 try the run ledger once more (and wait out its client timeout
+when the ledger hangs). The agent therefore replays such a completion on the
+evidence-recovery backoff: the completion retry interval doubled per
+consecutive `run_ledger_unavailable` answer, capped at 30 seconds (or the
+interval itself when configured larger). Any other transient answer keeps the
+base interval and restarts the doubling.
 
 L1 logs the cause of every response it scrubs, as one
 `event=l1_internal_error_scrubbed` line naming the method, the path, the error

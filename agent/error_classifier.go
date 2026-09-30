@@ -36,6 +36,13 @@ var agentProtocolErrorClassifications = map[contract.ErrorCode]agentProtocolErro
 	contract.ErrorNodeSessionReplaced: {destination: errorDestinationNodeSession, nodeSessionReaction: nodeSessionStopRecordAndEscalate},
 	contract.ErrorIdentityBound:       {destination: errorDestinationNodeSession, nodeSessionReaction: nodeSessionStopRecordAndEscalate},
 	contract.ErrorPrincipalForbidden:  {destination: errorDestinationNodeSession, nodeSessionReaction: nodeSessionStopRecordAndEscalate},
+
+	// run_ledger_unavailable is transient to the agent even when L1 marks it
+	// not retryable: L1 then means a caller must not re-issue a mutation that
+	// already applied, while the agent still owes its completion a delivery
+	// once the run ledger answers. The completion loop backs off on it rather
+	// than replaying at its base interval.
+	contract.ErrorRunLedgerUnavailable: {destination: errorDestinationTransient},
 }
 
 // classifyAgentProtocolError classifies an error returned by a Client

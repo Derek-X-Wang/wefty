@@ -38,6 +38,12 @@ func TestStateTransitionRules(t *testing.T) {
 	if CanTransition(AttemptTransitions, AttemptLost, AttemptClaimed) {
 		t.Fatal("lost is terminal; v0.1 never requeues an attempt")
 	}
+	if !CanTransition(NodeTransitions, NodeDraining, NodeAlive) {
+		t.Fatal("a new boot session's registration must be able to return a draining node to alive")
+	}
+	if CanTransition(NodeTransitions, NodeDraining, NodeStale) {
+		t.Fatal("heartbeat never leaves draining")
+	}
 	if CanTransition(JobTransitions, JobSucceeded, JobRunning) {
 		t.Fatal("succeeded job must be terminal")
 	}

@@ -2541,13 +2541,14 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	defer tx.Rollback()
 	var storedIdentity, storedBoot string
+	var storedState contract.NodeState
 	var storedCapabilitiesJSON, storedMissingJSON []byte
 	var storedRevision, storedObservedNS int64
 	var storedReason contract.CapabilityReasonCode
-	readErr := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id, capabilities_json,
+	readErr := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id, state, capabilities_json,
 		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code
 		FROM nodes WHERE node_id=?`, registration.NodeID).Scan(
-		&storedIdentity, &storedBoot, &storedCapabilitiesJSON, &storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason,
+		&storedIdentity, &storedBoot, &storedState, &storedCapabilitiesJSON, &storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason,
 	)
 	replaceCapabilities := true
 	advanceCapabilityObservedAt := false
@@ -2567,6 +2568,14 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	case storedIdentity != identity.NodeID:
 		return Node{}, protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", registration.NodeID)
 	default:
+		// A drain belongs to the boot session that asked for it. The same boot
+		// session re-registering (a rejoin while its drain is still joining
+		// resident attempts) must not silently undo that drain; only a new boot
+		// session returns a draining node to alive.
+		registeredState := contract.NodeAlive
+		if storedBoot == registration.BootSessionID && storedState == contract.NodeDraining {
+			registeredState = contract.NodeDraining
+		}
 		if storedBoot == registration.BootSessionID {
 			if registration.SupersedeCapabilityRevision {
 				incoming.observation.Revision = storedRevision + 1
@@ -2592,19 +2601,19 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 				state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?, authority_generation=authority_generation+1
 				WHERE node_id=?`, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID, registration.OS,
 				registration.Architecture, registration.AgentVersion, incoming.capabilitiesJSON, incoming.observation.Revision,
-				incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON, incoming.observation.ReasonCode, contract.NodeAlive,
+				incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON, incoming.observation.ReasonCode, registeredState,
 				now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, registration.NodeID)
 		} else if advanceCapabilityObservedAt {
 			_, err = tx.ExecContext(ctx, `UPDATE nodes SET boot_session_id=?, connect_host=?, root_instance_id=?, os=?, architecture=?, agent_version=?,
 				capability_observed_ns=?, state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?, authority_generation=authority_generation+1
 				WHERE node_id=?`, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID, registration.OS,
-				registration.Architecture, registration.AgentVersion, incoming.observation.ObservedAt.UnixNano(), contract.NodeAlive,
+				registration.Architecture, registration.AgentVersion, incoming.observation.ObservedAt.UnixNano(), registeredState,
 				now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, registration.NodeID)
 		} else {
 			_, err = tx.ExecContext(ctx, `UPDATE nodes SET boot_session_id=?, connect_host=?, root_instance_id=?, os=?, architecture=?, agent_version=?,
 				state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?, authority_generation=authority_generation+1
 				WHERE node_id=?`, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID, registration.OS,
-				registration.Architecture, registration.AgentVersion, contract.NodeAlive, now.UnixNano(), policy.MaxOneshotSlots,
+				registration.Architecture, registration.AgentVersion, registeredState, now.UnixNano(), policy.MaxOneshotSlots,
 				policy.MaxServiceSlots, registration.NodeID)
 		}
 	}

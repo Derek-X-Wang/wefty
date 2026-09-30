@@ -80,6 +80,10 @@ func TestClassifyAgentProtocolErrorDefaultsClientFailuresToTransient(t *testing.
 			StatusCode: http.StatusBadRequest,
 			APIError:   contract.APIError{Code: contract.ErrorInternal, Retryable: false},
 		}},
+		{name: "run ledger unavailable retryable false", err: &ProtocolError{
+			StatusCode: http.StatusServiceUnavailable,
+			APIError:   contract.APIError{Code: contract.ErrorRunLedgerUnavailable, Retryable: false},
+		}},
 		{name: "unknown", err: &ProtocolError{
 			StatusCode: http.StatusForbidden,
 			APIError:   contract.APIError{Code: contract.ErrorCode("future_code"), Retryable: false},
