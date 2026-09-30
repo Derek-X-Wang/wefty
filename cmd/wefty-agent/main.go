@@ -448,6 +448,7 @@ func run() error {
 		maxServiceSlots       = flag.Int("max-service-slots", l1.DefaultMaxServiceSlots, "local ceiling for concurrent service attempts")
 		logSpoolDirectory     = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
 		logSpoolMaxBytes      = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged one-shot log payload bytes retained on disk (service logs use a 32 MiB ring)")
+		logSpoolSweepAfter    = flag.Duration("log-spool-sweep-after", agent.DefaultLogSpoolSweepAfter, "age after which a one-shot's incomplete-evidence tombstone or undeliverable completion is swept from the spool; keep it above L1's --late-evidence-window")
 		managedRoot           = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
 		handoffRoot           = flag.String("handoff-root", contract.DefaultHandoffRoot, "root for the one-shot process handoff directories this node owns; a dispatched run-owned path is adopted under it, and that run's retained results and result upload follow it")
 		ociHelperSocket       = flag.String("oci-helper-socket", "", "private OCI helper Unix socket; empty disables OCI")
@@ -622,6 +623,7 @@ func run() error {
 		MaxServiceSlots:         *maxServiceSlots,
 		LogSpoolDirectory:       *logSpoolDirectory,
 		LogSpoolMaxBytes:        *logSpoolMaxBytes,
+		LogSpoolSweepAfter:      *logSpoolSweepAfter,
 		ManagedRootDirectory:    *managedRoot,
 		GuardianExecutable:      agentExecutable,
 		HandoffRoot:             *handoffRoot,

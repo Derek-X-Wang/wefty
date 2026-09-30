@@ -402,7 +402,8 @@ when that is configured larger), reset by the first success. A typed refusal
 that repeating on a retry interval cannot clear -- `node_session_replaced`,
 `identity_bound`, or `principal_forbidden` -- moves the attempt onto a
 re-check schedule instead: 10 seconds, doubling per consecutive refusal, capped
-at one hour, and never abandoned while the evidence is pending. Only the first
+at one hour, and not abandoned while L1 could still record the evidence (a
+one-shot's is swept once it no longer could, below). Only the first
 refusal of a run is logged (a different refusal code is logged once as well);
 identical repeats are silent, and one line records the attempt's recovery when
 it finally succeeds. A stuck attempt therefore costs at most one log line per
@@ -443,6 +444,24 @@ completion only while L1 reports the attempt live, but if the remaining lease
 expires mid-drain L1 seals by expiry without `completion_replay_attempt_id` and
 the reconciler's lost-at-L1 path is thereafter bounded to eight log batches per
 pass.
+
+The reconciler also sweeps one-shot spool rows L1 can no longer take, once
+they are older than `--log-spool-sweep-after` (72 hours by default: L1's
+default 48-hour late-evidence window plus a day, which covers the lease the
+attempt still held and clock skew; an operator who widens L1's window widens
+this with it). Two kinds of row qualify: an incomplete-evidence tombstone, aged
+from when it was sealed (recovery never sends a sealed attempt again, so the
+tombstone is a local diagnostic only), and a completion still undelivered
+although its process finished that long ago. Renewal stops when the process
+finishes, so L1 lost the attempt at most one lease later and its window has
+closed. Were that completion to land now, L1 would keep only a gap saying the
+window expired, never the result. A row still pending that long is one L1
+keeps refusing. A service row, a row with pending logs but no completion, and
+an attempt this process still owns are never swept. The attempt's spool events
+and acknowledgements go with its row. The sweep rides on the reconciler's own
+passes, at most once an hour, deleting at most 256 rows in one transaction; a
+full batch leaves it due at once, so a backlog drains across passes. Each
+sweep that removes rows logs one line with the counts.
 
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat

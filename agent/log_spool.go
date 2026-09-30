@@ -303,6 +303,7 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		{table: "spool_attempts", column: "completion_disposition", definition: "TEXT"},
 		{table: "spool_attempts", column: "completion_reason", definition: "TEXT"},
 		{table: "spool_attempts", column: "intent_revision", definition: "INTEGER"},
+		{table: "spool_attempts", column: "sealed_ns", definition: "INTEGER"},
 		{table: "spool_completion_receipts", column: "intent_revision", definition: "INTEGER"},
 		{table: "spool_completion_receipts", column: "job_id", definition: "TEXT"},
 		{table: "spool_completion_receipts", column: "finished_ns", definition: "INTEGER"},
@@ -379,6 +380,9 @@ WHERE phase=? AND absence_attestation_json IS NULL`, runtimeRemovalQuarantined, 
 		return fmt.Errorf("agent: migrate pre-attestation runtime removals: %w", err)
 	}
 	if err := spool.compactExistingSuppressedCompletionPayloads(ctx); err != nil {
+		return err
+	}
+	if err := backfillTombstoneSealTimes(ctx, spool.db); err != nil {
 		return err
 	}
 	return nil
@@ -1661,7 +1665,8 @@ func (spool *logSpool) sealIncomplete(ctx context.Context, attemptID, reason str
 		return fmt.Errorf("agent: release incomplete log acknowledgements: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts
-SET result_json=NULL, finished_ns=NULL, incomplete_json=? WHERE attempt_id=?`, tombstoneJSON, attemptID); err != nil {
+SET result_json=NULL, finished_ns=NULL, incomplete_json=?, sealed_ns=? WHERE attempt_id=?`,
+		tombstoneJSON, tombstone.SealedAt.UnixNano(), attemptID); err != nil {
 		return fmt.Errorf("agent: persist incomplete evidence tombstone: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

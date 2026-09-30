@@ -84,13 +84,18 @@ type Config struct {
 	// OperationTimeout bounds one L1 request. It also bounds a suppression
 	// transaction held under the OCI intent completion gate, clamped to the OCI
 	// control server's response-drain budget. Zero uses ten seconds.
-	OperationTimeout     time.Duration
-	FinalizationTimeout  time.Duration
-	LogBatchSize         int
-	LogFlushInterval     time.Duration
-	LogRetryInterval     time.Duration
-	LogSpoolDirectory    string
-	LogSpoolMaxBytes     int64
+	OperationTimeout    time.Duration
+	FinalizationTimeout time.Duration
+	LogBatchSize        int
+	LogFlushInterval    time.Duration
+	LogRetryInterval    time.Duration
+	LogSpoolDirectory   string
+	LogSpoolMaxBytes    int64
+	// LogSpoolSweepAfter is how long a one-shot's dead spool row (an
+	// incomplete-evidence tombstone, or a completion L1 would no longer record
+	// as a result) is kept before it is swept. Zero means
+	// DefaultLogSpoolSweepAfter; it must exceed L1's late-evidence window.
+	LogSpoolSweepAfter   time.Duration
 	ManagedRootDirectory string
 	GuardianExecutable   string
 	// WorkloadRuntimes supplies open kind adapters. kind=process is installed
@@ -179,6 +184,9 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.LogSpoolMaxBytes < 0 {
 		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
+	}
+	if config.LogSpoolSweepAfter < 0 {
+		return nil, errors.New("agent: log spool sweep age cannot be negative")
 	}
 	if config.MaxOneshotSlots < 0 || config.MaxServiceSlots < 0 {
 		return nil, errors.New("agent: local slot limits cannot be negative")
@@ -290,6 +298,7 @@ func New(config Config) (*Agent, error) {
 		}
 	}
 	outbox.ociIntentGate = intentGate
+	outbox.spoolSweepAfter = durationOrDefault(config.LogSpoolSweepAfter, DefaultLogSpoolSweepAfter)
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
 	if err != nil {
 		_ = outbox.Close()
