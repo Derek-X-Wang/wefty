@@ -14,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"github.com/coder/websocket"
 )
 
@@ -460,16 +461,24 @@ func (tenure *controllerTenure) failTake(
 	backendFailed bool,
 	failure error,
 ) error {
+	// Only a control leg the OCI helper refused for want of a stream slot,
+	// with every follow-up below succeeding, is a refusal the caller need not
+	// report: an audit or signal-clear failure alongside it still is.
+	helperConnectionLimit := backendFailed && ocihelper.IsConnectionLimitRefusal(failure)
 	if override && backendFailed {
 		if recordErr := tenure.record(session, serial, l1.ComputerTakeoverAdminOverrode, l1.ComputerTakeoverControlBackendFailed); recordErr != nil {
 			failure = errors.Join(failure, recordErr)
+			helperConnectionLimit = false
 		}
 	}
 	if signalTrue {
-		failure = errors.Join(failure, tenure.clear(context.Background()))
+		if clearErr := tenure.clear(context.Background()); clearErr != nil {
+			failure = errors.Join(failure, clearErr)
+			helperConnectionLimit = false
+		}
 	}
 	tenure.finishOperation(operation, nil)
-	return &ComputerTenureError{Code: ComputerTenureUnavailable, Err: failure}
+	return &ComputerTenureError{Code: ComputerTenureUnavailable, Err: failure, HelperConnectionLimit: helperConnectionLimit}
 }
 
 func (tenure *controllerTenure) finishOperation(operation *controllerOperation, holder *controllerHolder) bool {

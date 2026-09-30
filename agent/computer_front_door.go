@@ -61,6 +61,12 @@ const (
 type ComputerTenureError struct {
 	Code ComputerTenureErrorCode
 	Err  error
+	// HelperConnectionLimit marks a take refused only because the OCI helper
+	// had no stream slot for its control leg (connection_limit). The take
+	// fails like any unavailable backend, but nothing about the Computer or
+	// its attempt failed, so the front door refuses the request without
+	// reporting it (#597).
+	HelperConnectionLimit bool
 }
 
 func (failure *ComputerTenureError) Error() string {
@@ -502,7 +508,11 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 		writeComputerControlError(writer, status, contract.APIError{Code: tenureErr.Code,
 			Message:   "Computer " + action + " was refused by Controller tenure",
 			Retryable: tenureErr.Code == contract.ErrorControllerBusy}, &receipt)
-		if tenureErr.Err != nil {
+		if tenureErr.HelperConnectionLimit {
+			if report, suppressed := frontDoor.limitRefusals.Note(time.Now()); report {
+				log.Printf("Computer front door refused a take-over control take: the OCI helper's connection budget is full (%d more refusals since the last report); the Computer is unaffected", suppressed)
+			}
+		} else if tenureErr.Err != nil {
 			frontDoor.report(fmt.Errorf("perform Computer control action: %w", err))
 		}
 		return

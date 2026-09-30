@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"github.com/coder/websocket"
 )
 
@@ -1007,6 +1008,7 @@ type controllerTenureFixture struct {
 	events          []l1.ComputerTakeoverAuditEvent
 	controlDials    int
 	failDial        bool
+	dialErr         error
 	failSet         bool
 	failClear       bool
 	mismatchReceipt bool
@@ -1027,6 +1029,7 @@ func newControllerTenureFixture(t *testing.T) *controllerTenureFixture {
 			fixture.controlDials++
 			fixture.actions = append(fixture.actions, "dial:"+name)
 			fail := fixture.failDial
+			dialErr := fixture.dialErr
 			gate := fixture.dialGate
 			started := fixture.dialStarted
 			fixture.mu.Unlock()
@@ -1035,6 +1038,9 @@ func newControllerTenureFixture(t *testing.T) *controllerTenureFixture {
 			}
 			if fail {
 				return nil, errors.New("injected control backend failure")
+			}
+			if dialErr != nil {
+				return nil, dialErr
 			}
 			if gate != nil {
 				select {
@@ -1150,4 +1156,126 @@ func waitForControllerFree(t *testing.T, tenure *controllerTenure) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for Controller tenure to return Free")
+}
+
+// The OCI helper refusing a take's control-leg stream for want of a
+// connection slot refuses that take and nothing else. It used to reach the
+// front door's report() like any backend failure, which ended the whole
+// Computer attempt (#597). Now the take is refused with 503
+// tenure_unavailable, the signal is cleared, the viewer's session keeps
+// relaying, and a later take succeeds once a slot is free.
+func TestComputerFrontDoorHelperConnectionLimitOnControlLegRefusesOnlyTheTake(t *testing.T) {
+	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+	originalServer.Close()
+	viewBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "view:", rfbHandshake: true})
+	defer viewBackend.Close()
+	controlBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "control:", rfbHandshake: true})
+	defer controlBackend.Close()
+
+	var controlRefused atomic.Bool
+	controlRefused.Store(true)
+	config := fixture.frontDoor.config
+	config.dial = func(ctx context.Context, name string) (net.Conn, error) {
+		switch name {
+		case workloadrunner.AttemptEndpointView:
+			return viewBackend.dial(ctx)
+		case workloadrunner.AttemptEndpointControl:
+			if controlRefused.Load() {
+				return nil, &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit, Message: "OCI helper data-stream budget is full; retry this stream"}
+			}
+			return controlBackend.dial(ctx)
+		default:
+			return nil, errors.New("unexpected endpoint")
+		}
+	}
+	var signalMu sync.Mutex
+	var signals []bool
+	tenure, err := newControllerTenure(controllerTenureConfig{
+		authorityContext: config.authorityContext,
+		clock:            config.clock,
+		dial:             config.dial,
+		setControlState: func(_ context.Context, value bool) error {
+			signalMu.Lock()
+			signals = append(signals, value)
+			signalMu.Unlock()
+			return nil
+		},
+		record: func(ctx context.Context, event l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error) {
+			return auditor.AppendComputerTakeoverAudit(ctx, config.computerID, config.jobID, config.attemptID,
+				l1.ComputerTakeoverAuditRequest{FencingToken: config.fencingToken, Event: event})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.controlTenure = tenure
+	frontDoor, err := newComputerFrontDoor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenure.config.report = frontDoor.report
+	frontDoor.SetReady(true)
+	server := httptest.NewServer(frontDoor)
+	defer server.Close()
+
+	client, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
+	defer client.CloseNow()
+	if _, banner, err := client.Read(t.Context()); err != nil || string(banner) != "RFB 003.008\n" {
+		t.Fatalf("banner = %q err=%v", banner, err)
+	}
+	completeInitialRFBHandshake(t, client)
+	assertRelayRoundTrip(t, client, "before", "view:before")
+
+	refused := postComputerControlFailure(t, server.URL, computerControlTakePath, token)
+	if refused.status != http.StatusServiceUnavailable || refused.body.Error.Code != contract.ErrorTenureUnavailable {
+		t.Fatalf("refused take = %d %#v, want 503 %s", refused.status, refused.body.Error, contract.ErrorTenureUnavailable)
+	}
+	select {
+	case err := <-frontDoor.Errors():
+		t.Fatalf("a connection_limit control leg failed the Computer front door: %v (pending: %v)", err, frontDoor.takeErrors())
+	case <-time.After(50 * time.Millisecond):
+	}
+	assertRelayRoundTrip(t, client, "still-viewing", "view:still-viewing")
+
+	controlRefused.Store(false)
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
+		t.Fatalf("take after the refusal = %d", status)
+	}
+	assertRelayRoundTrip(t, client, "driving", "control:driving")
+	if status := postComputerControl(t, server.URL, computerControlReleasePath, token); status != http.StatusOK {
+		t.Fatalf("release status = %d", status)
+	}
+	signalMu.Lock()
+	gotSignals := append([]bool(nil), signals...)
+	signalMu.Unlock()
+	if len(gotSignals) != 4 || !gotSignals[0] || gotSignals[1] || !gotSignals[2] || gotSignals[3] {
+		t.Fatalf("signal writes = %v, want the refused take cleared before the successful one", gotSignals)
+	}
+	select {
+	case err := <-frontDoor.Errors():
+		t.Fatalf("Computer front door reported a failure: %v", err)
+	default:
+	}
+}
+
+// Only the refusal alone is exempt: a signal clear that fails after a
+// connection_limit control leg is still reported.
+func TestControllerTenureHelperConnectionLimitIsExemptOnlyWhenCleanupSucceeds(t *testing.T) {
+	fixture := newControllerTenureFixture(t)
+	session := fixture.register(t, "driver", true, false)
+	fixture.dialErr = &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit, Message: "OCI helper data-stream budget is full; retry this stream"}
+	_, err := fixture.tenure.Take(t.Context(), session.id)
+	var tenureErr *ComputerTenureError
+	if !errors.As(err, &tenureErr) || tenureErr.Code != ComputerTenureUnavailable || !tenureErr.HelperConnectionLimit {
+		t.Fatalf("refused control leg = %#v, want an unavailable take marked as a helper connection_limit", err)
+	}
+	if fixture.tenure.held != nil {
+		t.Fatalf("refused control leg left a holder: %#v", fixture.tenure.held)
+	}
+
+	fixture.failClear = true
+	_, err = fixture.tenure.Take(t.Context(), session.id)
+	if !errors.As(err, &tenureErr) || tenureErr.HelperConnectionLimit {
+		t.Fatalf("refused control leg with a failed clear = %#v, want it reported", err)
+	}
 }

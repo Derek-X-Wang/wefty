@@ -269,7 +269,9 @@ the client read EOF as loss, and one service with about 60 keep-alive clients
 reaped every OCI workload on the Node (#597). The agent turns the refusal into
 the smallest failure it names: a service front door closes only that client's
 TCP connection, a Computer take-over view is refused with 503 and the Computer
-keeps running, a host-bridge pump backs off 250 ms and retries, and a
+keeps running, a take whose control leg meets it is refused `503
+tenure_unavailable` like any unavailable replacement backend (signal cleared,
+tenure Free) without failing the attempt, a host-bridge pump backs off 250 ms and retries, and a
 readiness probe that meets it is inconclusive and leaves readiness where it
 was -- flipping to unready would withdraw publication and sever the very
 clients the budget protects. None of these embargo OCI, and each logs the
