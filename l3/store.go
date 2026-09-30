@@ -689,12 +689,6 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		if err := validateComputerGrantTx(ctx, tx, *input.ComputerScope); err != nil {
 			return contract.RunRecord{}, false, err
 		}
-		if err := input.VerifyComputerScope(ctx, *input.ComputerScope); err != nil {
-			return contract.RunRecord{}, false, err
-		}
-		if err := validateComputerGrantTx(ctx, tx, *input.ComputerScope); err != nil {
-			return contract.RunRecord{}, false, err
-		}
 		inflight, err := countComputerInflight(ctx, tx, input.ComputerScope.ComputerID)
 		if err != nil {
 			return contract.RunRecord{}, false, err
@@ -738,6 +732,20 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		}
 		if err := contract.ValidatePinnedRouting(*snapshot.Image, input.Request.Tags); err != nil {
 			return contract.RunRecord{}, false, protocolError(contract.ErrorInvalidRequest, "image routing: %v", err)
+		}
+	}
+	if input.ComputerScope != nil {
+		// The final live L1 proof is the authorization point, so it is taken
+		// as late as it can be: after every local read and just before the
+		// Run row is written. A submission change that commits in L1 after
+		// this proof cannot stop this one Run; every later proof refuses the
+		// superseded pass (wefty #600). The write lock held since BEGIN
+		// IMMEDIATE keeps any L3 revocation out until this Run commits.
+		if err := input.VerifyComputerScope(ctx, *input.ComputerScope); err != nil {
+			return contract.RunRecord{}, false, err
+		}
+		if err := validateComputerGrantTx(ctx, tx, *input.ComputerScope); err != nil {
+			return contract.RunRecord{}, false, err
 		}
 	}
 

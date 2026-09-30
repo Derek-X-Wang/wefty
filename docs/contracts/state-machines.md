@@ -430,7 +430,9 @@ that inner Computer/revision binding as well as its current-operation CAS;
 `committed_at` remains L3 audit time and is never compared with L1's reservation
 clock. Missing or mismatched inner binding cannot authorize a successor, even
 with a future timestamp. Same-operation replay preserves the first bound
-receipt. A current reserved/prepared restore with missing receipt JSON or valid
+receipt. A receipt L1 cannot record -- the restore was removed or superseded
+while L3 answered, or the write itself failed -- leaves only that restore
+un-receipted and blocked; it never fails the node heartbeat (#600). A current reserved/prepared restore with missing receipt JSON or valid
 legacy unbound JSON reissues revocation and blocks helper admission/publication
 until L1 transactionally replaces that legacy receipt and recorded time with a
 bound acknowledgement. Malformed or wrong nonzero bindings remain fail closed;
@@ -807,6 +809,43 @@ which L1 accepts only while it is current (`stale_policy_revision` otherwise;
 see `computer-image.md`). Otherwise the
 Computer projection returns an explicitly null endpoint and never guesses a
 placeholder URL.
+
+A Computer submission change (enable, disable, or an inflight resize) is one
+L1 CAS transaction on the Computer's `submit_intent_revision` and the global
+admin policy revision, and it revokes nothing itself (#600). Only after it
+commits does L1 ask L3 to revoke the Computer's grants below the committed
+revision N+1. The request is revision-bound, never `revoke_all`, so it spares
+a pass the agent has already re-minted at N+1 for the same attempt. A change
+that loses its CAS -- for example to another Computer's change that advanced
+the global policy revision -- revokes nothing and leaves the Computer's live
+pass alone. Revoking first had ended that pass while L1's authority stood
+still, so the agent never re-minted. When the run ledger does not take the
+post-commit revocation, the change still stands: the response is 200 with
+`mutation_applied: true`, `revoked: null`, and `revocation_notice`, and L1
+logs `event=l1_submission_revocation_not_recorded`. Once the change has
+applied, nothing after the commit turns the answer into a failure: an
+inflight count the run ledger cannot report is `inflight_count: null`
+(`event=l1_submission_inflight_unread`), and the state is projected from the
+committed change itself. Nothing retries the revocation, and nothing needs
+to.
+
+The gate is an authorization-time property of L3. L3 re-proves every
+Computer bearer request against live L1 and refuses the pass unless L1's
+proof carries the same `submit_intent_revision` and `submit_max_inflight` as
+the grant. For `POST /v1/runs` the final proof is taken inside the Run's
+write transaction, after every local read and just before the Run row is
+written, and that proof authorizes the Run. L1 proves nothing for the
+Computer until its host Node installs the policy revision that carries N+1,
+and then proves only N+1. So a submission change refuses every request whose
+final L1 proof is taken after the change commits. A request whose final
+proof preceded the commit may still complete, bounded by that one request's
+lifetime. The revision-bound revocation additionally fences grant use once
+it lands: it waits for any Run write already in progress and refuses the
+grant from then on, without asking L1. The agent's re-mint at N+1 also
+revokes every older grant of the Computer at L3. The explicit revocation is
+therefore defense in depth plus audit, never the gate. A control plane that
+names no run ledger refuses the change with `run_ledger_unavailable` (HTTP
+503, retryable) before applying anything.
 
 L1 stores the immutable take-over vocabulary `admission_denied`,
 `session_open`, `session_close`, `control_acquired`, `control_released`, and
