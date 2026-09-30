@@ -23,9 +23,7 @@ const (
 	// A refused attempt is re-checked on its own schedule, starting at
 	// evidenceRecoveryRefusalRecheck and doubling to
 	// maxEvidenceRecoveryRefusalRecheck, for as long as the evidence is
-	// pending (a one-shot's is swept only by the 30-day disk-safety backstop;
-	// see sweepDeadOneShotSpool). Until then it never stops:
-	// node_session_replaced also answers a
+	// pending. It never stops: node_session_replaced also answers a
 	// completion L1 has not accepted while the replaced registration's lease
 	// is still running, and that turns into lease_expired -- the result kept
 	// as late evidence -- only once the lease runs out, and only within L1's
@@ -106,12 +104,9 @@ type evidenceOutbox struct {
 	flushInterval time.Duration
 	retryInterval time.Duration
 	ociIntentGate *ociIntentCompletionGate
-	// spoolBackstopAge is the disk-safety backstop: how old a one-shot spool
-	// row L1 never refused must be before recovery sweeps it anyway; zero
-	// means DefaultLogSpoolBackstopAge. sweepDue is owned by the recovery
-	// goroutine.
-	spoolBackstopAge time.Duration
-	sweepDue         time.Time
+	// sweepDue is when recovery next sweeps one-shot spool rows L1 refused
+	// for good; it is owned by the recovery goroutine.
+	sweepDue time.Time
 	// completionStored is a test seam for ordering cancellation against the
 	// durable commit edge. Production construction leaves it nil.
 	completionStored func()

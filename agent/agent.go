@@ -84,18 +84,13 @@ type Config struct {
 	// OperationTimeout bounds one L1 request. It also bounds a suppression
 	// transaction held under the OCI intent completion gate, clamped to the OCI
 	// control server's response-drain budget. Zero uses ten seconds.
-	OperationTimeout    time.Duration
-	FinalizationTimeout time.Duration
-	LogBatchSize        int
-	LogFlushInterval    time.Duration
-	LogRetryInterval    time.Duration
-	LogSpoolDirectory   string
-	LogSpoolMaxBytes    int64
-	// LogSpoolBackstopAge is the disk-safety backstop for one-shot spool
-	// rows L1 never refused: a tombstone or undelivered completion this old
-	// is swept anyway, with a warning. A row L1 refused for good is swept
-	// without waiting. Zero means DefaultLogSpoolBackstopAge.
-	LogSpoolBackstopAge  time.Duration
+	OperationTimeout     time.Duration
+	FinalizationTimeout  time.Duration
+	LogBatchSize         int
+	LogFlushInterval     time.Duration
+	LogRetryInterval     time.Duration
+	LogSpoolDirectory    string
+	LogSpoolMaxBytes     int64
 	ManagedRootDirectory string
 	GuardianExecutable   string
 	// WorkloadRuntimes supplies open kind adapters. kind=process is installed
@@ -184,9 +179,6 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.LogSpoolMaxBytes < 0 {
 		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
-	}
-	if config.LogSpoolBackstopAge < 0 {
-		return nil, errors.New("agent: log spool backstop age cannot be negative")
 	}
 	if config.MaxOneshotSlots < 0 || config.MaxServiceSlots < 0 {
 		return nil, errors.New("agent: local slot limits cannot be negative")
@@ -298,7 +290,6 @@ func New(config Config) (*Agent, error) {
 		}
 	}
 	outbox.ociIntentGate = intentGate
-	outbox.spoolBackstopAge = durationOrDefault(config.LogSpoolBackstopAge, DefaultLogSpoolBackstopAge)
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
 	if err != nil {
 		_ = outbox.Close()

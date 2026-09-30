@@ -21,16 +21,14 @@ func spoolRowExists(t *testing.T, spool *logSpool, attemptID string) bool {
 }
 
 // #52 S3: one-shot spool rows L1 can no longer take were kept forever. The
-// sweep removes a row only once L1 has refused its evidence for good, or, as
-// a disk-safety backstop, once a row L1 never refused is 30 days old.
-// Everything L1 may still accept, services, and attempts this process still
-// owns stay.
-func TestSpoolSweepRemovesOnlyRefusedOrBackstopRows(t *testing.T) {
+// sweep removes a row only once L1 has refused its evidence for good, never
+// by age. Everything L1 may still accept, however old, services, and attempts
+// this process still owns stay.
+func TestSpoolSweepRemovesOnlyRowsL1RefusedForGood(t *testing.T) {
 	directory := t.TempDir()
 	spool := openTestLogSpool(t, directory, "node-sweep", 1<<20)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	backstop := now.Add(-DefaultLogSpoolBackstopAge)
 	exitCode := 0
 	claimRow := func(claim l1.Claim) string {
 		t.Helper()
@@ -76,17 +74,17 @@ func TestSpoolSweepRemovesOnlyRefusedOrBackstopRows(t *testing.T) {
 	seal(notOwned, contract.ErrorAttemptNotOwned, now.Add(-5*24*time.Hour))
 	pendingOnly := claimRow(spoolTestClaim("pending-only"))
 	withEvents(pendingOnly)
-	// Past the backstop and never refused: swept, as backstop.
-	backstopCompletion := claimRow(spoolTestClaim("backstop-completion"))
-	withEvents(backstopCompletion)
-	finish(backstopCompletion, backstop.Add(-time.Minute))
-	backstopTombstone := claimRow(spoolTestClaim("backstop-tombstone"))
-	seal(backstopTombstone, contract.ErrorAttemptNotOwned, backstop.Add(-time.Minute))
+	// Sixty days old and never refused: L1 may still take it.
+	ancientCompletion := claimRow(spoolTestClaim("ancient-completion"))
+	withEvents(ancientCompletion)
+	finish(ancientCompletion, now.Add(-60*24*time.Hour))
+	ancientTombstone := claimRow(spoolTestClaim("ancient-tombstone"))
+	seal(ancientTombstone, contract.ErrorAttemptNotOwned, now.Add(-60*24*time.Hour))
 	// Services are never swept, refused or old.
 	serviceRefused := claimRow(serviceSpoolTestClaim("service-refused"))
 	seal(serviceRefused, contract.ErrorAttemptNotFound, now.Add(-time.Minute))
 	serviceOld := claimRow(serviceSpoolTestClaim("service-old"))
-	finish(serviceOld, backstop.Add(-24*time.Hour))
+	finish(serviceOld, now.Add(-60*24*time.Hour))
 	liveRefused := claimRow(spoolTestClaim("live-refused"))
 	seal(liveRefused, contract.ErrorAttemptNotFound, now.Add(-time.Minute))
 
@@ -96,7 +94,7 @@ func TestSpoolSweepRemovesOnlyRefusedOrBackstopRows(t *testing.T) {
 	seal(legacyRefused, contract.ErrorStaleFence, now.Add(-time.Hour))
 	legacyNotOwned := claimRow(spoolTestClaim("legacy-not-owned"))
 	seal(legacyNotOwned, contract.ErrorAttemptNotOwned, now.Add(-time.Hour))
-	if _, err := spool.db.Exec(`UPDATE spool_attempts SET sealed_ns=NULL, l1_refused_ns=NULL, l1_refusal_code=NULL
+	if _, err := spool.db.Exec(`UPDATE spool_attempts SET l1_refused_ns=NULL, l1_refusal_code=NULL
 		WHERE attempt_id IN (?, ?)`, legacyRefused, legacyNotOwned); err != nil {
 		t.Fatal(err)
 	}
@@ -105,28 +103,34 @@ func TestSpoolSweepRemovesOnlyRefusedOrBackstopRows(t *testing.T) {
 	}
 	spool = openTestLogSpool(t, directory, "node-sweep", 1<<20)
 	defer spool.Close()
-	var code string
-	if err := spool.db.QueryRow(`SELECT l1_refusal_code FROM spool_attempts WHERE attempt_id=?`, refused).Scan(&code); err != nil {
-		t.Fatal(err)
-	}
-	if code != string(contract.ErrorAttemptNotFound) {
-		t.Fatalf("recorded refusal = %q", code)
+	for attemptID, want := range map[string]contract.ErrorCode{
+		refused: contract.ErrorAttemptNotFound, notOwned: contract.ErrorAttemptNotOwned,
+		legacyRefused: contract.ErrorStaleFence, legacyNotOwned: contract.ErrorAttemptNotOwned,
+	} {
+		var code string
+		if err := spool.db.QueryRow(`SELECT l1_refusal_code FROM spool_attempts WHERE attempt_id=?`, attemptID).Scan(&code); err != nil {
+			t.Fatal(err)
+		}
+		if code != string(want) {
+			t.Fatalf("%s recorded L1 answer = %q, want %q", attemptID, code, want)
+		}
 	}
 
 	live := func(attemptID string) bool { return attemptID == liveRefused }
-	sweep, err := spool.sweepDeadOneShotAttempts(ctx, backstop, spoolSweepBatch, live)
+	sweep, err := spool.sweepDeadOneShotAttempts(ctx, spoolSweepBatch, live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sweep.refused != 3 || fmt.Sprint(sweep.backstop) != fmt.Sprint([]string{backstopCompletion, backstopTombstone}) || sweep.full {
-		t.Fatalf("sweep = %+v, want 3 refused and the two backstop rows", sweep)
+	if sweep.refused != 3 || sweep.full {
+		t.Fatalf("sweep = %+v, want the 3 refused rows", sweep)
 	}
-	for _, gone := range []string{refused, refusedConflict, legacyRefused, backstopCompletion, backstopTombstone} {
+	for _, gone := range []string{refused, refusedConflict, legacyRefused} {
 		if spoolRowExists(t, spool, gone) {
 			t.Fatalf("%s survived the sweep", gone)
 		}
 	}
-	for _, kept := range []string{unanswered, notOwned, pendingOnly, serviceRefused, serviceOld, liveRefused, legacyNotOwned} {
+	for _, kept := range []string{unanswered, notOwned, pendingOnly, ancientCompletion, ancientTombstone,
+		serviceRefused, serviceOld, liveRefused, legacyNotOwned} {
 		if !spoolRowExists(t, spool, kept) {
 			t.Fatalf("%s was swept", kept)
 		}
@@ -148,7 +152,7 @@ func TestSpoolSweepRemovesOnlyRefusedOrBackstopRows(t *testing.T) {
 	for _, attempt := range attempts {
 		pending[attempt.attemptID] = true
 	}
-	if !pending[unanswered] || !pending[pendingOnly] {
+	if !pending[unanswered] || !pending[pendingOnly] || !pending[ancientCompletion] {
 		t.Fatalf("pending after sweep = %v", pending)
 	}
 }

@@ -155,34 +155,47 @@ func TestRecoverySweepsOnlyWhatL1RefusedForGood(t *testing.T) {
 	}
 }
 
-// The disk-safety backstop: a one-shot row L1 never refused is swept once it
-// is 30 days old, with a warning that names it; a younger one is kept.
-func TestRecoveryBackstopSweepsUnrefusedRowsLoudly(t *testing.T) {
+// #52 S3 review round 2: no age sweeps anything. A completion L1 has not
+// answered for sixty days -- past L1's one-shot log retention, which covers
+// logs, not results -- is still kept, and delivered when L1 returns.
+func TestRecoveryKeepsAnUnansweredCompletionForSixtyDays(t *testing.T) {
+	const attemptID = "attempt-sixty-day-outage"
 	clock := newManualClock(time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC))
-	outbox, err := newEvidenceOutbox(t.TempDir(), "backstop-node", 1<<20, clock,
-		DefaultLogBatchSize, DefaultLogFlushInterval, DefaultLogRetryInterval)
+	var offline atomic.Bool
+	offline.Store(true)
+	counter := newCompletionCounter(nil)
+	counter.decide = func(string) contract.ErrorCode {
+		if offline.Load() {
+			return contract.ErrorInternal
+		}
+		return ""
+	}
+	client, stopServer := startEvidenceReplayServer(t, counter, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "long-outage-node", 1<<20, clock, 8, time.Hour, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
-	ctx := t.Context()
-	for attemptID, sealedAt := range map[string]time.Time{
-		"backstop-tombstone": clock.Now().Add(-31 * 24 * time.Hour),
-		"young-tombstone":    clock.Now().Add(-29 * 24 * time.Hour),
-	} {
-		if err := outbox.spool.ensureAttempt(ctx, spoolTestClaim(attemptID)); err != nil {
-			t.Fatal(err)
-		}
-		// attempt_not_owned seals the row but is not a refusal for good.
-		if err := outbox.spool.sealIncomplete(ctx, attemptID, "test", contract.ErrorAttemptNotOwned, sealedAt); err != nil {
-			t.Fatal(err)
-		}
+	storeClockCompletion(t, outbox, clock, attemptID)
+	reports := make(chan error, 256)
+	outbox.startRecovery(t.Context(), client, func(err error) { reports <- err })
+	waitForCompletionCalls(t, counter, attemptID, 1)
+	for day := 1; day <= 60; day++ {
+		calls := counter.count(attemptID)
+		clock.Advance(24 * time.Hour)
+		waitForCompletionCalls(t, counter, attemptID, calls+1)
 	}
-	reports := make(chan error, 8)
-	outbox.startRecovery(ctx, nil, func(err error) { reports <- err })
-	waitForSpoolRowGone(t, outbox, "backstop-tombstone")
-	receiveReport(t, reports, "WARNING", "backstop", "never answered or refused", "backstop-tombstone")
-	if !spoolRowExists(t, outbox.spool, "young-tombstone") {
-		t.Fatal("the backstop swept a row younger than 30 days")
+	waitForCompletionState(t, outbox, attemptID, "durable_completion")
+	assertAttemptPending(t, outbox, attemptID)
+
+	offline.Store(false)
+	clock.Advance(time.Minute) // past the capped transient backoff
+	waitForCompletionState(t, outbox, attemptID, "delivered")
+	for len(reports) > 0 {
+		if report := (<-reports).Error(); strings.Contains(report, "swept") {
+			t.Fatalf("recovery swept something during the outage: %s", report)
+		}
 	}
 }

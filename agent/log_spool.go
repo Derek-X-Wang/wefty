@@ -303,7 +303,6 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		{table: "spool_attempts", column: "completion_disposition", definition: "TEXT"},
 		{table: "spool_attempts", column: "completion_reason", definition: "TEXT"},
 		{table: "spool_attempts", column: "intent_revision", definition: "INTEGER"},
-		{table: "spool_attempts", column: "sealed_ns", definition: "INTEGER"},
 		{table: "spool_attempts", column: "l1_refused_ns", definition: "INTEGER"},
 		{table: "spool_attempts", column: "l1_refusal_code", definition: "TEXT"},
 		{table: "spool_completion_receipts", column: "intent_revision", definition: "INTEGER"},
@@ -384,7 +383,7 @@ WHERE phase=? AND absence_attestation_json IS NULL`, runtimeRemovalQuarantined, 
 	if err := spool.compactExistingSuppressedCompletionPayloads(ctx); err != nil {
 		return err
 	}
-	if err := backfillTombstoneSealTimes(ctx, spool.db); err != nil {
+	if err := backfillTombstoneRefusals(ctx, spool.db); err != nil {
 		return err
 	}
 	return nil
@@ -1666,15 +1665,16 @@ func (spool *logSpool) sealIncomplete(ctx context.Context, attemptID, reason str
 	if _, err := tx.ExecContext(ctx, "DELETE FROM spool_acknowledgements WHERE attempt_id=?", attemptID); err != nil {
 		return fmt.Errorf("agent: release incomplete log acknowledgements: %w", err)
 	}
-	// An L1 answer that closes the door on the attempt is recorded apart
-	// from the seal: only such a row may be swept before the backstop.
-	var refusedNS, refusalCode any
+	// The L1 answer that sealed the row is recorded on it, and its time
+	// when that answer closes the door on the attempt: only such a row is
+	// ever swept.
+	var refusedNS any
 	if l1ClosedEvidence(code) {
-		refusedNS, refusalCode = tombstone.SealedAt.UnixNano(), string(code)
+		refusedNS = tombstone.SealedAt.UnixNano()
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts
-SET result_json=NULL, finished_ns=NULL, incomplete_json=?, sealed_ns=?, l1_refused_ns=?, l1_refusal_code=? WHERE attempt_id=?`,
-		tombstoneJSON, tombstone.SealedAt.UnixNano(), refusedNS, refusalCode, attemptID); err != nil {
+SET result_json=NULL, finished_ns=NULL, incomplete_json=?, l1_refused_ns=?, l1_refusal_code=? WHERE attempt_id=?`,
+		tombstoneJSON, refusedNS, string(code), attemptID); err != nil {
 		return fmt.Errorf("agent: persist incomplete evidence tombstone: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
