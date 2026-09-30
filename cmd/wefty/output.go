@@ -131,6 +131,47 @@ func writeLogEvents(stdout, stderr io.Writer, events []contract.LogEvent) error 
 	return nil
 }
 
+// writeLogTruncationNotice tells a human reader that L1 log retention deleted
+// earlier history, so a trimmed job never reads as a quiet one. It goes to
+// stderr, keeping stdout exactly the job's own output.
+func writeLogTruncationNotice(w io.Writer, truncation *l1.LogTruncation) error {
+	if truncation == nil {
+		return nil
+	}
+	bound := string(truncation.BoundKind)
+	switch truncation.BoundKind {
+	case l1.LogRetentionBytes:
+		bound = "per-job size cap"
+	case l1.LogRetentionAge:
+		bound = "age limit"
+	case l1.LogRetentionTotal:
+		bound = "cluster-wide log ceiling"
+	}
+	retained := "no events retained"
+	if truncation.EarliestRetainedAt != nil {
+		retained = "earliest retained event " + truncation.EarliestRetainedAt.UTC().Format(time.RFC3339Nano)
+	}
+	_, err := fmt.Fprintf(w, "wefty: logs trimmed by L1 retention: %d earlier events (%d bytes) deleted, last by the %s; %s\n",
+		truncation.EvictedEventCount, truncation.EvictedByteCount, bound, retained)
+	return err
+}
+
+// truncationAnnouncer prints the retention notice once, and again whenever
+// L1 reports more history trimmed, for a reader that stays on the logs.
+type truncationAnnouncer struct {
+	announced bool
+	events    int64
+}
+
+func (announcer *truncationAnnouncer) announce(w io.Writer, truncation *l1.LogTruncation) error {
+	if truncation == nil || (announcer.announced && truncation.EvictedEventCount <= announcer.events) {
+		return nil
+	}
+	announcer.announced = true
+	announcer.events = truncation.EvictedEventCount
+	return writeLogTruncationNotice(w, truncation)
+}
+
 type serviceOutput struct {
 	l1.Job
 	Status                 string                       `json:"status"`

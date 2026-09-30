@@ -8,16 +8,22 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag                 = "tag:wefty-client"
-	DefaultAgentPrincipalTag                  = "tag:wefty-agent"
-	DefaultLeaseDuration                      = 30 * time.Second
-	DefaultLateEvidenceWindow                 = 48 * time.Hour
-	DefaultNodeStaleAfter                     = 45 * time.Second
-	DefaultNodeDeadAfter                      = 2 * time.Minute
-	DefaultReconcileInterval                  = time.Second
-	DefaultServiceStabilityWindow             = 2 * time.Minute
-	DefaultServiceLogRetentionAge             = 7 * 24 * time.Hour
-	DefaultServiceLogRetentionBytes     int64 = 32 << 20
+	DefaultClientPrincipalTag             = "tag:wefty-client"
+	DefaultAgentPrincipalTag              = "tag:wefty-agent"
+	DefaultLeaseDuration                  = 30 * time.Second
+	DefaultLateEvidenceWindow             = 48 * time.Hour
+	DefaultNodeStaleAfter                 = 45 * time.Second
+	DefaultNodeDeadAfter                  = 2 * time.Minute
+	DefaultReconcileInterval              = time.Second
+	DefaultServiceStabilityWindow         = 2 * time.Minute
+	DefaultServiceLogRetentionAge         = 7 * 24 * time.Hour
+	DefaultServiceLogRetentionBytes int64 = 32 << 20
+	DefaultOneshotLogRetentionAge         = 30 * 24 * time.Hour
+	DefaultOneshotLogRetentionBytes int64 = 32 << 20
+	// DefaultLogRetentionTotalBytes is the cluster-wide ceiling on retained
+	// raw log payload across every job, one-shot and service alike: 5 GB,
+	// decimal, so the ratified "5 GB" is never exceeded by a unit reading.
+	DefaultLogRetentionTotalBytes       int64 = 5_000_000_000
 	DefaultServiceAttemptSummaries            = 32 // A detached Computer's replay-bound terminal attempt consumes one non-current slot.
 	DefaultMaxOneshotSlots                    = 4
 	DefaultMaxServiceSlots                    = 2
@@ -719,28 +725,52 @@ type AppendLogsResponse struct {
 }
 
 type LogPage struct {
-	Events     []contract.LogEvent   `json:"events"`
-	NextCursor string                `json:"next_cursor,omitempty"`
-	Truncation *ServiceLogTruncation `json:"truncation,omitempty"`
+	Events     []contract.LogEvent `json:"events"`
+	NextCursor string              `json:"next_cursor,omitempty"`
+	Truncation *LogTruncation      `json:"truncation,omitempty"`
 }
 
-// ServiceLogTruncation is L1's aggregate declaration that retained service
-// history was evicted. It is intentionally distinct from contract.LogGap,
-// which declares evidence lost before L1 accepted it.
-type ServiceLogTruncation struct {
-	BoundKind             ServiceLogRetentionBound `json:"bound_kind"`
-	EvictedEventCount     int64                    `json:"evicted_event_count"`
-	EvictedByteCount      int64                    `json:"evicted_byte_count"`
-	EvictedThroughOrdinal int64                    `json:"evicted_through_ordinal"`
-	EarliestRetainedAt    *time.Time               `json:"earliest_retained_at"`
-	UpdatedAt             time.Time                `json:"updated_at"`
+// LogTruncation is L1's aggregate declaration that a job's retained log
+// history was evicted by a retention bound. There is one per job, one-shot
+// or service, and it only ever grows. It is intentionally distinct from
+// contract.LogGap, which declares evidence lost before L1 accepted it.
+type LogTruncation struct {
+	BoundKind             LogRetentionBound `json:"bound_kind"`
+	EvictedEventCount     int64             `json:"evicted_event_count"`
+	EvictedByteCount      int64             `json:"evicted_byte_count"`
+	EvictedThroughOrdinal int64             `json:"evicted_through_ordinal"`
+	EarliestRetainedAt    *time.Time        `json:"earliest_retained_at"`
+	UpdatedAt             time.Time         `json:"updated_at"`
 }
 
-type ServiceLogRetentionBound string
+// LogRetentionBound names the bound that most recently evicted a job's logs.
+type LogRetentionBound string
 
 const (
-	ServiceLogRetentionBytes ServiceLogRetentionBound = "bytes"
-	ServiceLogRetentionAge   ServiceLogRetentionBound = "age"
+	// LogRetentionBytes is the per-job retained-byte cap.
+	LogRetentionBytes LogRetentionBound = "bytes"
+	// LogRetentionAge is the per-class age bound, measured by each event's
+	// own timestamp.
+	LogRetentionAge LogRetentionBound = "age"
+	// LogRetentionTotal is the cluster-wide ceiling on all jobs' logs.
+	LogRetentionTotal LogRetentionBound = "total"
+)
+
+// ServiceLogTruncation is the pre-#52 name of LogTruncation. The wire shape
+// is unchanged; only one-shot jobs and the "total" bound are new.
+//
+// Deprecated: use LogTruncation.
+type ServiceLogTruncation = LogTruncation
+
+// ServiceLogRetentionBound is the pre-#52 name of LogRetentionBound.
+//
+// Deprecated: use LogRetentionBound.
+type ServiceLogRetentionBound = LogRetentionBound
+
+// Deprecated: use LogRetentionBytes and LogRetentionAge.
+const (
+	ServiceLogRetentionBytes = LogRetentionBytes
+	ServiceLogRetentionAge   = LogRetentionAge
 )
 
 // AttemptResultRequest is one attempt's result document, uploaded by the node

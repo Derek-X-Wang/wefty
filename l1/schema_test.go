@@ -36,6 +36,29 @@ func TestCustodyExportSQLAndOpenAPIStatusEnumsStayBound(t *testing.T) {
 	}
 }
 
+func TestLogTruncationBoundSQLAndOpenAPIEnumsStayBound(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "api", "openapi", "common.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(`"enum": [%q, %q, %q]`, LogRetentionBytes, LogRetentionAge, LogRetentionTotal)
+	if !strings.Contains(string(openAPI), want) {
+		t.Fatalf("OpenAPI LogTruncation bound_kind enum does not contain %s", want)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "truncation-enum.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var tableSQL string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='job_log_truncations'`).Scan(&tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tableSQL, fmt.Sprintf("bound_kind IN ('%s', '%s', '%s')", LogRetentionBytes, LogRetentionAge, LogRetentionTotal)) {
+		t.Fatal("SQLite job log truncation bound CHECK diverged from the Go and OpenAPI bounds")
+	}
+}
+
 func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "schema.sqlite"), StoreOptions{})
 	if err != nil {
@@ -141,10 +164,12 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"authority_generation", "occurred_ns", "reason", "event_count", "request_hash",
 		},
 		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
-		"service_log_truncations": {
+		"job_log_truncations": {
 			"job_id", "bound_kind", "evicted_event_count", "evicted_byte_count",
 			"evicted_through_ordinal", "earliest_retained_ns", "updated_ns",
 		},
+		"job_log_usage":   {"job_id", "retained_bytes"},
+		"log_usage_total": {"singleton", "retained_bytes"},
 		"service_removals": {
 			"job_id", "bound_node_id", "removal_generation", "cleanup_fence", "root_instance_id", "status",
 			"cleanup_status", "requested_ns", "cleanup_acknowledgement_key", "cleanup_acknowledgement_hash", "cleanup_quarantine_json", "agent_cleaned_ns", "removed_ns",
@@ -571,12 +596,21 @@ func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
 			t.Fatalf("service retention defaults = %d/%s, want %d/%s", store.serviceLogRetentionBytes,
 				store.serviceLogRetentionAge, DefaultServiceLogRetentionBytes, DefaultServiceLogRetentionAge)
 		}
+		// #52's ratified bounds: one-shots 30 days and 32 MiB each, all
+		// logs together under 5 GB; services keep 7 days and 32 MiB.
+		want := logRetentionLimits{oneshotBytes: 32 << 20, oneshotAge: 30 * 24 * time.Hour, totalBytes: 5_000_000_000}
+		if store.logRetention != want {
+			t.Fatalf("one-shot/total retention defaults = %+v, want %+v", store.logRetention, want)
+		}
 	})
 
 	t.Run("configured", func(t *testing.T) {
 		store, err := OpenStore(filepath.Join(t.TempDir(), "service-retention-configured.sqlite"), StoreOptions{
 			ServiceLogRetentionBytes: 1234,
 			ServiceLogRetentionAge:   36 * time.Hour,
+			OneshotLogRetentionBytes: 99,
+			OneshotLogRetentionAge:   2 * time.Hour,
+			LogRetentionTotalBytes:   4321,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -584,6 +618,9 @@ func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
 		defer store.Close()
 		if store.serviceLogRetentionBytes != 1234 || store.serviceLogRetentionAge != 36*time.Hour {
 			t.Fatalf("configured service retention = %d/%s", store.serviceLogRetentionBytes, store.serviceLogRetentionAge)
+		}
+		if store.logRetention != (logRetentionLimits{oneshotBytes: 99, oneshotAge: 2 * time.Hour, totalBytes: 4321}) {
+			t.Fatalf("configured one-shot/total retention = %+v", store.logRetention)
 		}
 	})
 
@@ -593,6 +630,9 @@ func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
 	}{
 		{name: "negative bytes", options: StoreOptions{ServiceLogRetentionBytes: -1}},
 		{name: "negative age", options: StoreOptions{ServiceLogRetentionAge: -time.Second}},
+		{name: "negative one-shot bytes", options: StoreOptions{OneshotLogRetentionBytes: -1}},
+		{name: "negative one-shot age", options: StoreOptions{OneshotLogRetentionAge: -time.Second}},
+		{name: "negative total bytes", options: StoreOptions{LogRetentionTotalBytes: -1}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store, err := OpenStore(filepath.Join(t.TempDir(), "invalid-service-retention.sqlite"), test.options)

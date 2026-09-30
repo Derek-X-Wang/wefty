@@ -140,8 +140,11 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err := serviceRows.Err(); err != nil {
 		return ReconcileResult{}, internalError(err, "iterate services for log retention sweep")
 	}
+	// One eviction budget covers every bound this pass, services and
+	// one-shots alike, so no backlog can hold this write transaction long.
+	evictionBudget := sweepEvictionBudget()
 	for _, jobID := range serviceJobIDs {
-		ageStats, err := s.enforceServiceLogAgeRetention(ctx, tx, jobID, now)
+		ageStats, err := s.enforceServiceLogAgeRetention(ctx, tx, jobID, now, evictionBudget)
 		if err != nil {
 			return ReconcileResult{}, err
 		}
@@ -150,18 +153,34 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		// Ingest is the mandatory byte-enforcement site. Reconciliation also
 		// applies it so a tighter configuration takes effect for an idle
 		// service after restart without waiting for another batch.
-		byteStats, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now)
+		byteStats, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, evictionBudget)
 		if err != nil {
 			return ReconcileResult{}, err
 		}
 		result.EvictedLogEvents += byteStats.events
 		result.EvictedLogBytes += byteStats.bytes
-		pruned, err := pruneServiceAttemptSummaries(ctx, tx, jobID)
+		pruned, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now)
 		if err != nil {
 			return ReconcileResult{}, err
 		}
 		result.PrunedAttempts += pruned
 	}
+	// One-shots are kept forever as records, so their logs are never swept
+	// job by job: the per-job cap re-trims only jobs the usage index shows
+	// over it, and age and the cluster-wide ceiling walk the timestamp index
+	// oldest-first, all within the pass's budget.
+	oneshotStats, err := s.enforceOneshotLogRetention(ctx, tx, now, evictionBudget)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	result.EvictedLogEvents += oneshotStats.events
+	result.EvictedLogBytes += oneshotStats.bytes
+	totalStats, err := s.enforceLogRetentionTotal(ctx, tx, now, evictionBudget)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	result.EvictedLogEvents += totalStats.events
+	result.EvictedLogBytes += totalStats.bytes
 
 	// Take-over audit has its own age bound. This sweep is intentionally not
 	// nested in service attempt-summary retention, and the audit table has no

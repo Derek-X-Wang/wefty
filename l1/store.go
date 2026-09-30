@@ -49,6 +49,9 @@ type StoreOptions struct {
 	ServiceStabilityWindow            time.Duration
 	ServiceLogRetentionBytes          int64
 	ServiceLogRetentionAge            time.Duration
+	OneshotLogRetentionBytes          int64
+	OneshotLogRetentionAge            time.Duration
+	LogRetentionTotalBytes            int64
 	PrestartInfrastructureBudget      time.Duration
 	RemovalStallBound                 time.Duration
 	AdminBootstrapTTL                 time.Duration
@@ -75,6 +78,7 @@ type Store struct {
 	serviceStabilityWindow            time.Duration
 	serviceLogRetentionBytes          int64
 	serviceLogRetentionAge            time.Duration
+	logRetention                      logRetentionLimits
 	prestartInfrastructureBudget      time.Duration
 	removalStallBound                 time.Duration
 	adminBootstrapTTL                 time.Duration
@@ -146,6 +150,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if serviceLogRetentionAge == 0 {
 		serviceLogRetentionAge = DefaultServiceLogRetentionAge
 	}
+	logRetention, err := resolveLogRetentionLimits(options)
+	if err != nil {
+		return nil, err
+	}
 	prestartInfrastructureBudget := options.PrestartInfrastructureBudget
 	if prestartInfrastructureBudget <= 0 {
 		prestartInfrastructureBudget = DefaultPrestartInfrastructureBudget
@@ -185,6 +193,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
+		logRetention:                      logRetention,
 		prestartInfrastructureBudget:      prestartInfrastructureBudget,
 		removalStallBound:                 removalStallBound,
 		adminBootstrapTTL:                 adminBootstrapTTL,
@@ -953,6 +962,25 @@ CREATE TABLE IF NOT EXISTS log_events (
   UNIQUE(attempt_id, stream, sequence)
 );
 CREATE INDEX IF NOT EXISTS log_events_job_order ON log_events(job_id, ordinal);
+-- Oldest-first eviction across jobs (the one-shot age bound and the
+-- cluster-wide ceiling) walks this index instead of every job.
+CREATE INDEX IF NOT EXISTS log_events_age_order ON log_events(timestamp_ns, ordinal);
+-- The highest sequence accepted per attempt stream. Upload continuity and
+-- replay idempotency read it, never the retained log_events rows, so log
+-- retention may delete any row.
+CREATE TABLE IF NOT EXISTS log_stream_continuity (
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+  stream TEXT NOT NULL,
+  accepted_through INTEGER NOT NULL CHECK(accepted_through >= 0),
+  PRIMARY KEY(attempt_id, stream)
+) WITHOUT ROWID;
+-- One row per one-time data migration, written in the same transaction as
+-- the migration's rows, so a crash before the commit leaves the migration to
+-- run again on the next open instead of being skipped for good.
+CREATE TABLE IF NOT EXISTS l1_data_migrations (
+  name TEXT PRIMARY KEY,
+  applied_ns INTEGER NOT NULL
+);
 -- job_results holds one result document per job: the run's own verdict,
 -- uploaded by the node that produced it. It is one row, not a log: a retry
 -- replaces it, because the result of a job is whatever its latest attempt
@@ -966,15 +994,46 @@ CREATE TABLE IF NOT EXISTS job_results (
   skip_reason TEXT NOT NULL DEFAULT '',
   uploaded_ns INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS service_log_truncations (
-  job_id TEXT PRIMARY KEY REFERENCES service_jobs(job_id) ON DELETE CASCADE,
-  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age')),
+-- job_log_truncations is the one aggregate retention marker per job, one-shot
+-- or service. It replaced #49's service-only service_log_truncations, whose
+-- rows migrateServiceLogTruncations carries over on an existing database.
+CREATE TABLE IF NOT EXISTS job_log_truncations (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age', 'total')),
   evicted_event_count INTEGER NOT NULL CHECK(evicted_event_count >= 0),
   evicted_byte_count INTEGER NOT NULL CHECK(evicted_byte_count >= 0),
   evicted_through_ordinal INTEGER NOT NULL CHECK(evicted_through_ordinal >= 0),
   earliest_retained_ns INTEGER,
   updated_ns INTEGER NOT NULL
 );
+-- Retained raw log payload, maintained by triggers so neither the per-job cap
+-- at append nor the cluster-wide ceiling in the sweep has to SUM log_events.
+-- The counters are a cache of SUM(LENGTH(bytes)); ensureLogUsageCounters
+-- rebuilds them from log_events when the singleton total row is absent.
+CREATE TABLE IF NOT EXISTS job_log_usage (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  retained_bytes INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS job_log_usage_retained ON job_log_usage(retained_bytes);
+CREATE TABLE IF NOT EXISTS log_usage_total (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  retained_bytes INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS log_events_usage_insert AFTER INSERT ON log_events BEGIN
+  INSERT INTO job_log_usage(job_id, retained_bytes) VALUES(NEW.job_id, LENGTH(NEW.bytes))
+    ON CONFLICT(job_id) DO UPDATE SET retained_bytes=job_log_usage.retained_bytes+excluded.retained_bytes;
+  UPDATE log_usage_total SET retained_bytes=retained_bytes+LENGTH(NEW.bytes) WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS log_events_usage_delete AFTER DELETE ON log_events BEGIN
+  UPDATE job_log_usage SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes), 0) WHERE job_id=OLD.job_id;
+  UPDATE log_usage_total SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes), 0) WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS log_events_usage_update AFTER UPDATE OF bytes, job_id ON log_events BEGIN
+  UPDATE job_log_usage SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes), 0) WHERE job_id=OLD.job_id;
+  INSERT INTO job_log_usage(job_id, retained_bytes) VALUES(NEW.job_id, LENGTH(NEW.bytes))
+    ON CONFLICT(job_id) DO UPDATE SET retained_bytes=job_log_usage.retained_bytes+excluded.retained_bytes;
+  UPDATE log_usage_total SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes)+LENGTH(NEW.bytes), 0) WHERE singleton=1;
+END;
 CREATE TABLE IF NOT EXISTS job_log_jsonl (
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   jsonl BLOB NOT NULL
@@ -1021,6 +1080,15 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if err := s.seedLogContinuity(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateServiceLogTruncations(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureLogUsageCounters(ctx); err != nil {
+		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
 		return err
@@ -2844,7 +2912,7 @@ AND state=@job_queued
 			computerStorage = &storage
 		}
 	}
-	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return nil, err
 	}
 	if err := pruneAttemptCredentials(ctx, tx); err != nil {
@@ -3443,9 +3511,11 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		raw         []byte
 	}
 	seen := make(map[eventKey][]byte, len(request.Events))
-	streams := make(map[contract.LogStream]struct{}, 2)
+	// recorded is each stream's durable high-water mark before this batch;
+	// next is the sequence this batch must continue with. Neither reads the
+	// retained rows, which log retention may already have deleted.
+	recorded := make(map[contract.LogStream]int64, 2)
 	next := make(map[contract.LogStream]int64, 2)
-	acknowledged := make(map[contract.LogStream]uint64, 2)
 	newEvents := make([]preparedEvent, 0, len(request.Events))
 
 	for _, input := range request.Events {
@@ -3466,7 +3536,6 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 			return AppendLogsResponse{}, internalError(err, "encode log event")
 		}
 		key := eventKey{stream: event.Stream, sequence: event.Sequence}
-		streams[event.Stream] = struct{}{}
 		if prior, ok := seen[key]; ok {
 			if !bytes.Equal(prior, raw) {
 				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts within the batch", event.Stream, event.Sequence)
@@ -3475,41 +3544,48 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		}
 		seen[key] = raw
 
-		var stored []byte
-		err = tx.QueryRowContext(ctx, "SELECT event_json FROM log_events WHERE attempt_id=? AND stream=? AND sequence=?", attemptID, event.Stream, event.Sequence).Scan(&stored)
-		switch {
-		case err == nil:
-			if !bytes.Equal(stored, originalRaw) && !bytes.Equal(stored, raw) {
-				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts with the accepted event", event.Stream, event.Sequence)
+		through, ok := recorded[event.Stream]
+		if !ok {
+			through, err = readLogContinuity(ctx, tx, attemptID, event.Stream)
+			if err != nil {
+				return AppendLogsResponse{}, err
 			}
-			acknowledged[event.Stream] = maxSequence(acknowledged[event.Stream], event.Sequence)
+			recorded[event.Stream] = through
+		}
+		endSequence := logEventEndSequence(event)
+		if int64(event.Sequence) <= through {
+			// A replay of an accepted range. Content is compared wherever the
+			// accepted row is still retained; once retention has deleted it,
+			// the recorded high-water mark alone answers the replay.
+			if int64(endSequence) > through {
+				return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s event %d..%d extends past the accepted sequence %d", event.Stream, event.Sequence, endSequence, through)
+			}
+			if err := checkRetainedLogReplay(ctx, tx, attemptID, event, endSequence, originalRaw, raw); err != nil {
+				return AppendLogsResponse{}, err
+			}
 			continue
-		case !errors.Is(err, sql.ErrNoRows):
-			return AppendLogsResponse{}, internalError(err, "read accepted log event")
 		}
 
 		expected, ok := next[event.Stream]
 		if !ok {
-			var maximum int64
-			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence_end), -1) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, event.Stream).Scan(&maximum); err != nil {
-				return AppendLogsResponse{}, internalError(err, "read log sequence acknowledgement")
-			}
-			expected = maximum + 1
+			expected = through + 1
 		}
 		if int64(event.Sequence) != expected {
 			return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s expected sequence %d, got %d", event.Stream, expected, event.Sequence)
 		}
-		endSequence := logEventEndSequence(event)
 		next[event.Stream] = int64(endSequence) + 1
-		acknowledged[event.Stream] = endSequence
 		newEvents = append(newEvents, preparedEvent{event: event, endSequence: endSequence, raw: raw})
+	}
+	acknowledged := make(map[contract.LogStream]uint64, len(recorded))
+	for stream, through := range recorded {
+		if following, ok := next[stream]; ok {
+			through = following - 1
+		}
+		acknowledged[stream] = uint64(through)
 	}
 
 	// Already-accepted events remain replayable after authority loss.
 	if len(newEvents) == 0 {
-		if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
-			return AppendLogsResponse{}, err
-		}
 		if err := tx.Commit(); err != nil {
 			return AppendLogsResponse{}, internalError(err, "commit log replay")
 		}
@@ -3531,6 +3607,11 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 			return AppendLogsResponse{}, internalError(err, "store log event")
 		}
 	}
+	for stream, following := range next {
+		if err := recordLogContinuity(ctx, tx, attemptID, stream, uint64(following-1)); err != nil {
+			return AppendLogsResponse{}, err
+		}
+	}
 	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
@@ -3547,30 +3628,16 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
 		attempt.state = contract.AttemptRunning
 	}
-	if _, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now); err != nil {
+	if _, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, appendEvictionBudget()); err != nil {
 		return AppendLogsResponse{}, err
 	}
-	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
-		return AppendLogsResponse{}, err
-	}
-	if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
+	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return AppendLogsResponse{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return AppendLogsResponse{}, internalError(err, "commit log append")
 	}
 	return AppendLogsResponse{Acknowledged: acknowledged, AttemptState: attempt.state}, nil
-}
-
-func readLogAcknowledgements(ctx context.Context, q queryer, attemptID string, streams map[contract.LogStream]struct{}, acknowledgements map[contract.LogStream]uint64) error {
-	for stream := range streams {
-		var maximum int64
-		if err := q.QueryRowContext(ctx, "SELECT MAX(sequence_end) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, stream).Scan(&maximum); err != nil {
-			return internalError(err, "read log acknowledgement")
-		}
-		acknowledgements[stream] = uint64(maximum)
-	}
-	return nil
 }
 
 // GetJobLogs returns one polling page after an opaque reader cursor. The
@@ -3611,7 +3678,7 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 		return LogPage{}, internalError(err, "iterate job logs")
 	}
 	page.NextCursor = encodeLogCursor(last)
-	page.Truncation, err = readServiceLogTruncation(ctx, s.db, jobID)
+	page.Truncation, err = readLogTruncation(ctx, s.db, jobID)
 	if err != nil {
 		return LogPage{}, err
 	}
@@ -3708,13 +3775,6 @@ func lateEvidenceGap(event contract.LogEvent, source []byte) contract.LogEvent {
 		SourceEventSHA256: hex.EncodeToString(hash[:]),
 	}
 	return event
-}
-
-func maxSequence(left, right uint64) uint64 {
-	if right > left {
-		return right
-	}
-	return left
 }
 
 func encodeLogCursor(after int64) string {
@@ -3999,7 +4059,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 			return CompletionOutcome{}, internalError(updateErr, "record runtime resource failure")
 		}
 	}
-	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return CompletionOutcome{}, err
 	}
 	job, err := getJobByID(ctx, tx, jobID, now)

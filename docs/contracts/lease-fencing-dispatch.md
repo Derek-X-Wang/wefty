@@ -224,9 +224,10 @@ fencing token, but is not gated by the current job attempt, authority
 generation, or lease validity. A `lost` attempt accepts new in-sequence events
 as non-authoritative observation for 48 hours after authority loss. After that
 explicit window, L1 replaces each received raw event with a truthful per-stream
-`late_evidence_window_expired` gap; the independent 7-day service-log retention
-age remains a storage bound and therefore binds later. Neither path changes the
-job verdict, attempt verdict, current attempt, or authority generation.
+`late_evidence_window_expired` gap; the independent log retention ages (7 days
+for services, 30 days for one-shots) remain storage bounds and therefore bind
+later. Neither path changes the job verdict, attempt verdict, current attempt,
+or authority generation.
 
 The claimed-to-running promotion block inside a log append remains in place
 for `kind=process` because it is authority-changing. It runs only while the
@@ -276,6 +277,97 @@ For `kind=process`, first renewal retains the legacy claimed-to-running
 acknowledgement. For `kind=oci`, renewal changes only the lease and directive;
 it never acknowledges execution or starts the portless-service stability
 clock. Successful completion likewise never supplies a missing OCI `Started`.
+
+## Log retention
+
+L1 bounds the log bytes it keeps; the job record (spec, status, attempts,
+result) is not a log and is not trimmed by these bounds. Every bound is an L1
+flag, measured in raw payload bytes (`LENGTH(bytes)`, not the stored JSON):
+
+| Bound | Services | One-shots | Enforced |
+| --- | --- | --- | --- |
+| Per-job bytes | 32 MiB (`--service-log-retention-bytes`) | 32 MiB (`--oneshot-log-retention-bytes`) | in the append transaction, and again by the reconcile sweep |
+| Age, by each event's own timestamp | 7 days (`--service-log-retention-age`) | 30 days (`--oneshot-log-retention-age`) | by the reconcile sweep |
+| Cluster-wide total, all jobs together | 5 GB = 5,000,000,000 bytes (`--log-retention-total-bytes`) | same ceiling | by the reconcile sweep |
+
+Whichever bound binds first trims oldest-first: per-job bounds in insertion
+order within the job, the one-shot age bound and the total ceiling by event
+timestamp across jobs. Trimmed bytes are deleted, not archived. Any row may
+be evicted, including a live attempt's newest row per stream and rows of a
+`lost` attempt still inside its late-evidence window, because upload
+continuity does not live in the retained rows (see "Log upload continuity").
+
+Per-job and total retained bytes are trigger-maintained counters over
+`log_events` (`job_log_usage`, `log_usage_total`), so neither the append path
+nor the sweep sums the table. Services are few and are swept job by job, as
+before. One-shots are kept as records forever and are never walked: the sweep
+re-trims only one-shots the usage index shows over their cap (at most 16 per
+pass), and one-shot age and the total ceiling walk the `(timestamp_ns,
+ordinal)` index.
+
+Every eviction is budgeted, so a backlog (an upgraded database, a lowered cap)
+is worked off in pieces instead of holding the write transaction that
+renewals, claims, and completions wait behind. One reconcile pass evicts at
+most 4096 rows and 64 MiB across every bound and every job together; the next
+pass continues. An append transaction evicts at most 512 rows and 40 MiB,
+twice what one batch can add, so a job at its cap stays there under steady
+ingest, and anything beyond that is left to the sweep. A row is evicted whole
+or not at all: one that does not fit what is left of the byte budget ends the
+transaction's eviction, so the budget is never exceeded.
+
+`wefty logs` and `wefty services logs` report a marker on stderr, never on
+stdout: once when first seen and again whenever more history is trimmed while
+following, in human and `--json --follow` output alike (whose stdout stays one
+log event per line). Plain `--json` output carries the `truncation` object.
+
+A trimmed job carries one aggregate `LogTruncation` marker
+(`job_log_truncations`) on every log page, one-shot and service alike, so
+trimmed logs never read as empty ones. `bound_kind` names the bound that most
+recently evicted (`bytes`, `age`, or `total`); the event and byte counts only
+grow; `earliest_retained_at` is null once nothing remains. It is distinct from
+`LogGap`, which declares loss before L1 accepted evidence. The marker replaced
+#49's service-only `service_log_truncations`, whose rows an existing database
+carries over on first open; the wire shape is unchanged and `ServiceLogTruncation`
+remains an alias of `LogTruncation` in the OpenAPI.
+
+## Log upload continuity
+
+Upload continuity and replay idempotency are durable and independent of
+retention. In the append transaction L1 records, per (attempt, stream), the
+highest sequence it has accepted (`log_stream_continuity`). Every check reads
+that record, never the retained rows:
+
+- An event whose sequence is past the record must be exactly the next one;
+  any other sequence is `conflict` (`expected sequence N, got M`).
+- An event whose whole range is at or below the record is a replay of an
+  accepted range. It is checked against every retained row that intersects
+  its range. If none does, the accepted rows were evicted and the record alone
+  acknowledges it; L1 then cannot detect a replay whose content differs from
+  what it accepted. If exactly one does, with exactly this range and this
+  content, it is an idempotent replay. Anything else (a partial overlap with
+  a retained row, several retained rows, other content) is
+  `idempotency_conflict`.
+- An event that starts at or below the record and ends past it is `conflict`.
+- The acknowledgement for each stream in the batch is the record after the
+  batch.
+
+So an identical retry of a batch whose response was lost is acknowledged even
+when the same append transaction evicted it, and a `lost` attempt continues
+where it stopped for its whole late-evidence window, however much of it
+retention has deleted. Service attempt-summary pruning decides whether an
+attempt can still send evidence from the attempt's own state, never from
+whether rows of it are retained: a live attempt, and a `lost` one whose
+late-evidence window is still open, are never pruned, so neither loses its
+record to a cascade.
+
+On the first open of a database that predates the record, L1 seeds it from
+the highest retained sequence per attempt stream, in one transaction with a
+`l1_data_migrations` marker, so a crash before that commit seeds again on the
+next open. #49
+never evicted a live attempt's newest row per stream, so every stream that can
+still grow is seeded exactly; a stream whose rows were all evicted before the
+upgrade belonged to an attempt that was no longer live, gets no record, and
+behaves as it did before.
 
 ## OCI image, start, and pre-start retry truth
 

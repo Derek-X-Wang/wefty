@@ -6,7 +6,7 @@ import "testing"
 
 func TestServiceAcceptanceBoundedL1LogRetention(t *testing.T) {
 	assertServiceLogByteRetentionAndDerivedJSONL(t)
-	assertServiceLogWatermarksPreserveStrictPerStreamContinuity(t)
+	assertServiceLogByteRetentionKeepsStrictPerStreamContinuity(t)
 	assertServiceLogAgeRetentionRunsFromReconcile(t)
 	assertServiceAttemptSummariesAreBounded(t)
 }

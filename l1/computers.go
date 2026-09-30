@@ -1584,7 +1584,7 @@ func scrubComputerControllerState(ctx context.Context, tx *sql.Tx, computerID st
 		if _, err := tx.ExecContext(ctx, "DELETE FROM log_events WHERE job_id=?", item.jobID); err != nil {
 			return internalError(err, "scrub Computer log events")
 		}
-		if _, err := tx.ExecContext(ctx, "DELETE FROM service_log_truncations WHERE job_id=?", item.jobID); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM job_log_truncations WHERE job_id=?", item.jobID); err != nil {
 			return internalError(err, "scrub Computer log truncation")
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE job_log_jsonl SET jsonl=X'' WHERE job_id=?", item.jobID); err != nil {
