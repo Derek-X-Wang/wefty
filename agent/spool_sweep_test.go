@@ -203,3 +203,39 @@ func TestSpoolSweepIsBoundedAndReported(t *testing.T) {
 		t.Fatal("the sweep did not run after its interval")
 	}
 }
+
+// The process-lifetime reconciler runs the sweep itself: an old one-shot
+// tombstone left on disk is gone after recovery starts, a fresh one is not.
+func TestRecoverySweepsDeadOneShotSpoolRows(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC))
+	outbox, err := newEvidenceOutbox(t.TempDir(), "node-recovery-sweep", 1<<20, clock,
+		DefaultLogBatchSize, DefaultLogFlushInterval, DefaultLogRetryInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	ctx := context.Background()
+	for attemptID, sealedAt := range map[string]time.Time{
+		"dead-tombstone":  clock.Now().Add(-4 * 24 * time.Hour),
+		"fresh-tombstone": clock.Now().Add(-time.Hour),
+	} {
+		claim := spoolTestClaim(attemptID)
+		if err := outbox.spool.ensureAttempt(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		if err := outbox.spool.sealIncomplete(ctx, attemptID, "test", contract.ErrorAttemptNotFound, sealedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outbox.startRecovery(ctx, nil, func(error) {})
+	deadline := time.Now().Add(5 * time.Second)
+	for spoolRowExists(t, outbox.spool, "dead-tombstone") {
+		if time.Now().After(deadline) {
+			t.Fatal("recovery did not sweep a four-day-old one-shot tombstone")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !spoolRowExists(t, outbox.spool, "fresh-tombstone") {
+		t.Fatal("recovery swept a fresh tombstone")
+	}
+}
