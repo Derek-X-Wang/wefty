@@ -349,8 +349,14 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags := flag.NewFlagSet("wefty", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&options.fabricMode, "fabric", "plain", "fabric implementation: plain or tsnet")
-	flags.StringVar(&options.l1Address, "l1", l3.DefaultL1Address, "L1 control-plane Fabric address")
-	flags.StringVar(&options.l3Address, "l3", l3.DefaultL3Address, "L3 run-ledger Fabric address (default wefty://run-ledger; pass --l3= for an L1-only installation)")
+	// The addresses default from the environment so a shell that exported
+	// them once -- as the README and the acceptance docs do -- does not have
+	// to repeat them on every call. An explicit flag always wins, including
+	// an explicit --l3= choosing an L1-only installation.
+	flags.StringVar(&options.l1Address, "l1", addressFromEnvironment(l1AddressEnv, l3.DefaultL1Address),
+		"L1 control-plane Fabric address (default $"+l1AddressEnv+", else "+l3.DefaultL1Address+")")
+	flags.StringVar(&options.l3Address, "l3", addressFromEnvironment(l3AddressEnv, l3.DefaultL3Address),
+		"L3 run-ledger Fabric address (default $"+l3AddressEnv+", else "+l3.DefaultL3Address+"; pass --l3= for an L1-only installation)")
 	flags.StringVar(&options.plainIdentity, "plain-identity", "wefty-cli", "plain Fabric identity node ID")
 	flags.StringVar(&options.plainUserID, "plain-user-id", os.Getenv("WEFTY_DEV_PLAIN_USER_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person user ID")
 	flags.StringVar(&options.plainDeviceID, "plain-device-id", os.Getenv("WEFTY_DEV_PLAIN_DEVICE_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person device ID")
@@ -371,6 +377,24 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 		return globalOptions{}, nil, err
 	}
 	return options, flags.Args(), nil
+}
+
+// l1AddressEnv and l3AddressEnv are the variables the README and the
+// acceptance docs export. They are read as the flags' defaults, never as an
+// override of a flag that was passed.
+const (
+	l1AddressEnv = "WEFTY_L1_ADDR"
+	l3AddressEnv = "WEFTY_L3_ADDR"
+)
+
+// addressFromEnvironment treats an empty or blank variable as unset. Choosing
+// an L1-only installation is a decision, and it is made with an explicit
+// --l3=, not by an exported variable that happens to be empty.
+func addressFromEnvironment(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func defaultNodeConfigPath() string {
@@ -472,8 +496,9 @@ Commands:
 
 Global flags:
   --fabric plain|tsnet
-  --l1 ADDRESS
-  --l3 ADDRESS               default wefty://run-ledger; pass --l3= for an L1-only installation
+  --l1 ADDRESS               default $WEFTY_L1_ADDR, else wefty://control-plane
+  --l3 ADDRESS               default $WEFTY_L3_ADDR, else wefty://run-ledger;
+                             pass --l3= for an L1-only installation
   --plain-user-id USER_ID    DEVELOPMENT ONLY: self-asserted plain person identity
   --plain-device-id DEVICE_ID
   --json

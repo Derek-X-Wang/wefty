@@ -62,10 +62,10 @@ const dialBudget = statusProbeBudget
 
 func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*apiClients, error) {
 	if participant == nil {
-		return nil, fmt.Errorf("wefty: fabric is required")
+		return nil, fmt.Errorf("fabric is required")
 	}
 	if strings.TrimSpace(l1Address) == "" {
-		return nil, fmt.Errorf("wefty: --l1 is required")
+		return nil, fmt.Errorf("--l1 is required (or set %s)", l1AddressEnv)
 	}
 	l3Client := &apiClient{name: "L3", flag: "l3", address: strings.TrimSpace(l3Address)}
 	if strings.TrimSpace(l3Address) != "" {
@@ -103,6 +103,20 @@ func newAPIClient(name, flagName string, participant fabric.Fabric, address stri
 		return participant.Dial(dialCtx, network, address)
 	}}
 	return &apiClient{name: name, flag: flagName, address: address, client: &http.Client{Transport: transport}}
+}
+
+// addressHint names the flag and the variable that choose this client's
+// address, so an unreachable service reads as something to fix.
+func (c *apiClient) addressHint() string {
+	return addressHint(c.flag)
+}
+
+func addressHint(flagName string) string {
+	env := l1AddressEnv
+	if flagName == "l3" {
+		env = l3AddressEnv
+	}
+	return "is it running? pass --" + flagName + " or set " + env
 }
 
 func (c *apiClients) close() {
@@ -688,7 +702,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 
 func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {
 	if c.client == nil {
-		return nil, fmt.Errorf("wefty: this command requires --%s, which is not configured", c.flag)
+		return nil, fmt.Errorf("this command requires --%s, which is not configured", c.flag)
 	}
 	var reader io.Reader
 	if body != nil {
@@ -710,7 +724,12 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("call %s: %w", c.name, err)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("call %s: %w", c.name, err)
+		}
+		// A transport failure is almost always the wrong address or a
+		// service that is not running, and the fix is to say where to look.
+		return nil, fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint())
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
