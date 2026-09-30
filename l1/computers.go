@@ -516,9 +516,6 @@ func insertComputerJobWithID(
 		state, now.UnixNano(), now.UnixNano()); err != nil {
 		return Job{}, internalError(err, "store Computer Job projection")
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
-		return Job{}, internalError(err, "initialize Computer Job log")
-	}
 	for _, capability := range RequiredCapabilities(spec) {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)", job.JobID, capability); err != nil {
 			return Job{}, internalError(err, "store Computer Job capability")
@@ -1586,9 +1583,6 @@ func scrubComputerControllerState(ctx context.Context, tx *sql.Tx, computerID st
 		}
 		if _, err := tx.ExecContext(ctx, "DELETE FROM job_log_truncations WHERE job_id=?", item.jobID); err != nil {
 			return internalError(err, "scrub Computer log truncation")
-		}
-		if _, err := tx.ExecContext(ctx, "UPDATE job_log_jsonl SET jsonl=X'' WHERE job_id=?", item.jobID); err != nil {
-			return internalError(err, "scrub Computer authoritative log")
 		}
 	}
 	return nil

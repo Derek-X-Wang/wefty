@@ -981,6 +981,15 @@ CREATE TABLE IF NOT EXISTS l1_data_migrations (
   name TEXT PRIMARY KEY,
   applied_ns INTEGER NOT NULL
 );
+-- The resume point of a data migration that runs in bounded batches after
+-- open, committed with each batch; its l1_data_migrations marker replaces it
+-- with the last batch. ceiling_ordinal fixes, on the first batch, the last
+-- row the migration may have to touch.
+CREATE TABLE IF NOT EXISTS l1_data_migration_cursors (
+  name TEXT PRIMARY KEY,
+  through_ordinal INTEGER NOT NULL,
+  ceiling_ordinal INTEGER NOT NULL
+);
 -- job_results holds one result document per job: the run's own verdict,
 -- uploaded by the node that produced it. It is one row, not a log: a retry
 -- replaces it, because the result of a job is whatever its latest attempt
@@ -1034,10 +1043,6 @@ CREATE TRIGGER IF NOT EXISTS log_events_usage_update AFTER UPDATE OF bytes, job_
     ON CONFLICT(job_id) DO UPDATE SET retained_bytes=job_log_usage.retained_bytes+excluded.retained_bytes;
   UPDATE log_usage_total SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes)+LENGTH(NEW.bytes), 0) WHERE singleton=1;
 END;
-CREATE TABLE IF NOT EXISTS job_log_jsonl (
-  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
-  jsonl BLOB NOT NULL
-);
 CREATE TABLE IF NOT EXISTS service_removals (
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   bound_node_id TEXT NOT NULL,
@@ -1076,7 +1081,9 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
   stall_acknowledgement_hash TEXT,
   stalled_ns INTEGER
 );
-INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
+-- job_log_jsonl held one empty row per job: JSONL has been derived from
+-- log_events at read time since #49, and nothing read the table (#52).
+DROP TABLE IF EXISTS job_log_jsonl;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
@@ -1088,6 +1095,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return err
 	}
 	if err := s.ensureLogUsageCounters(ctx); err != nil {
+		return err
+	}
+	if err := s.markLogEventDocumentsCompactOnNewDatabase(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
@@ -2130,9 +2140,6 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, reques
 		// it after rolling this transaction back and preserve replay semantics.
 		_ = tx.Rollback()
 		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, origin, err)
-	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
-		return Job{}, false, internalError(err, "initialize authoritative job log")
 	}
 	for _, capability := range requiredCapabilities {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)", job.JobID, capability); err != nil {
@@ -3602,8 +3609,14 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		if event.Gap != nil {
 			storedBytes = []byte{}
 		}
+		// The payload is stored once, raw; the document keeps every other
+		// field, and every read rebuilds the event from the two.
+		document, err := storedLogEventDocument(event)
+		if err != nil {
+			return AppendLogsResponse{}, internalError(err, "encode stored log event")
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO log_events(job_id, attempt_id, stream, sequence, sequence_end, timestamp_ns, bytes, event_json)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, prepared.endSequence, event.Timestamp.UnixNano(), storedBytes, prepared.raw); err != nil {
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, prepared.endSequence, event.Timestamp.UnixNano(), storedBytes, document); err != nil {
 			return AppendLogsResponse{}, internalError(err, "store log event")
 		}
 	}
@@ -3653,7 +3666,7 @@ func (s *Store) GetJobLogs(ctx context.Context, jobID, cursor string, limit int)
 	if err != nil {
 		return LogPage{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, event_json FROM log_events
+	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, event_json, bytes FROM log_events
 WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 	if err != nil {
 		return LogPage{}, internalError(err, "read job logs")
@@ -3663,12 +3676,12 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 	last := after
 	for rows.Next() {
 		var ordinal int64
-		var raw []byte
-		if err := rows.Scan(&ordinal, &raw); err != nil {
+		var stored, payload []byte
+		if err := rows.Scan(&ordinal, &stored, &payload); err != nil {
 			return LogPage{}, internalError(err, "scan job log")
 		}
-		var event contract.LogEvent
-		if err := json.Unmarshal(raw, &event); err != nil {
+		event, err := decodeStoredLogEvent(stored, payload)
+		if err != nil {
 			return LogPage{}, internalError(err, "decode authoritative log event")
 		}
 		page.Events = append(page.Events, event)
@@ -3691,18 +3704,18 @@ func (s *Store) RawJobLogJSONL(ctx context.Context, jobID string) ([]byte, error
 	if _, err := s.GetJob(ctx, jobID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT event_json FROM log_events WHERE job_id=? ORDER BY ordinal", jobID)
+	rows, err := s.db.QueryContext(ctx, "SELECT event_json, bytes FROM log_events WHERE job_id=? ORDER BY ordinal", jobID)
 	if err != nil {
 		return nil, internalError(err, "read authoritative job log events for JSONL export")
 	}
 	defer rows.Close()
 	var raw bytes.Buffer
 	for rows.Next() {
-		var eventJSON []byte
-		if err := rows.Scan(&eventJSON); err != nil {
+		var stored, payload []byte
+		if err := rows.Scan(&stored, &payload); err != nil {
 			return nil, internalError(err, "scan authoritative job log event for JSONL export")
 		}
-		raw.Write(eventJSON)
+		raw.Write(logEventDocument(stored, payload))
 		raw.WriteByte('\n')
 	}
 	if err := rows.Err(); err != nil {

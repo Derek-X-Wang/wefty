@@ -224,6 +224,38 @@ func (s *Store) ListChildJobs(ctx context.Context, parentJobID, cursorValue stri
 	return page, nil
 }
 
+// attemptCredentialPruneBatch bounds how many ended attempts' credential
+// rows one reconcile pass deletes, so the backlog an upgrade finds (one row
+// per one-shot that ever ran) is worked off across passes.
+const attemptCredentialPruneBatch = 4096
+
+// pruneEndedAttemptCredentials deletes the credential rows of attempts that
+// have ended, or no longer exist. A credential authorizes only while its
+// attempt is claimed, running or awaiting input, and an attempt never leaves
+// a terminal state (ADR-0003), so such a row can never authorize again.
+// pruneAttemptCredentials, at claim, only reaches attempts a newer claim of
+// the same job superseded, so before #52 a terminal job's last attempt kept
+// its row forever: one per finished one-shot. Nothing else reads the row.
+// Completion replay (#553), late evidence and log upload authenticate with
+// the node identity and the attempt's fencing token, never with this
+// credential, so none of them needs the row through the late-evidence
+// window.
+func pruneEndedAttemptCredentials(ctx context.Context, tx *sql.Tx, limit int) (int64, error) {
+	result, err := tx.ExecContext(ctx, `DELETE FROM attempt_credentials WHERE token_hash IN (
+		SELECT c.token_hash FROM attempt_credentials c
+		LEFT JOIN attempts a ON a.attempt_id=c.attempt_id
+		WHERE a.attempt_id IS NULL OR a.state NOT IN (?, ?, ?)
+		LIMIT ?)`, contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, limit)
+	if err != nil {
+		return 0, internalError(err, "prune ended attempt credentials")
+	}
+	pruned, err := result.RowsAffected()
+	if err != nil {
+		return 0, internalError(err, "read ended attempt credential pruning")
+	}
+	return pruned, nil
+}
+
 // pruneAttemptCredentials deletes rows that can no longer authorize anything.
 // Enforcement never depends on this running: ResolveAttemptCredential already
 // refuses a superseded attempt. This only keeps the table from growing with

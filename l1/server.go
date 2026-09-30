@@ -77,7 +77,10 @@ type Server struct {
 	handler                 http.Handler
 	reconcile               func(context.Context) (ReconcileResult, error)
 	sweepScrubbedSecrets    func(context.Context) (SecretScrubSweep, error)
-	logf                    func(string, ...any)
+	compactLogEvents        func(context.Context) (LogEventCompaction, error)
+	// logEventDocumentsCompact is touched only by the reconcile loop.
+	logEventDocumentsCompact bool
+	logf                     func(string, ...any)
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -138,6 +141,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		runLedgerNodeID:         runLedgerNodeID,
 		reconcile:               store.Reconcile,
 		sweepScrubbedSecrets:    store.SweepScrubbedSecrets,
+		compactLogEvents:        store.CompactLogEventDocuments,
 		logf:                    log.Printf,
 	}
 	s.handler = s.routes()
@@ -177,6 +181,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return fmt.Errorf("l1: initial recovery: %w", err)
 	}
 	s.sweepSecrets(ctx)
+	s.compactLogEventDocuments(ctx)
 	httpServer := &http.Server{Handler: s.handler}
 	reconcileFailures := make(chan error, 1)
 	reconcileContext, stopReconcile := context.WithCancel(ctx)
@@ -206,6 +211,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 					return
 				}
 				s.sweepSecrets(reconcileContext)
+				s.compactLogEventDocuments(reconcileContext)
 			}
 		}
 	}()
@@ -254,6 +260,28 @@ func (s *Server) sweepSecrets(ctx context.Context) {
 	if sweep.TruncationDeferred && s.logf != nil {
 		s.logf("event=l1_secret_wal_truncation_deferred action=retry_next_tick wait=%s", secretWALCheckpointWait)
 	}
+}
+
+// compactLogEventDocuments runs one bounded batch of the migration that
+// strips the payload copy from log event documents written before #52. A
+// failed batch is logged and redone on the next tick: every batch commits
+// with its own resume point, and until the migration finishes every read
+// accepts both document shapes.
+func (s *Server) compactLogEventDocuments(ctx context.Context) {
+	if s.compactLogEvents == nil || s.logEventDocumentsCompact {
+		return
+	}
+	compaction, err := s.compactLogEvents(ctx)
+	if err != nil {
+		if ctx.Err() == nil && s.logf != nil {
+			s.logf("event=l1_log_event_document_migration_failed action=retry_next_tick error=%v", err)
+		}
+		return
+	}
+	if compaction.Rewritten > 0 && s.logf != nil {
+		s.logf("event=l1_log_event_documents_compacted rows=%d done=%t", compaction.Rewritten, compaction.Done)
+	}
+	s.logEventDocumentsCompact = compaction.Done
 }
 
 const (

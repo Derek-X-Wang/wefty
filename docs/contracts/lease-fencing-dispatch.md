@@ -315,6 +315,20 @@ ingest, and anything beyond that is left to the sweep. A row is evicted whole
 or not at all: one that does not fit what is left of the byte budget ends the
 transaction's eviction, so the budget is never exceeded.
 
+Each accepted event's payload is stored once, raw, in `log_events.bytes`;
+`log_events.event_json` holds every other field of the event. Every read (log
+pages, following, the derived JSONL export, replay comparison) rebuilds the
+event from the two, so the wire event is byte for byte what was accepted.
+Before #52 the document also carried the payload Base64-encoded, so each
+logged byte was stored about 2.3 times. An upgraded database rewrites those
+documents in the background, one batch of at most 512 rows or 16 MiB of
+documents per reconcile tick, each batch committed with its resume point
+(`l1_data_migration_cursors`) and the last with its `l1_data_migrations`
+marker; until it finishes, reads accept either shape. A document that is not
+exactly what L1 wrote is left as it is. SQLite reuses the freed pages; the
+file itself shrinks only on a `VACUUM`. No independent JSONL copy is kept:
+the one-empty-row-per-job `job_log_jsonl` table is dropped on open.
+
 `wefty logs` and `wefty services logs` report a marker on stderr, never on
 stdout: once when first seen and again whenever more history is trimmed while
 following, in human and `--json --follow` output alike (whose stdout stays one
@@ -471,9 +485,14 @@ the live attempt, so the credential stops working at the same instant the
 lease, boot session, or authority generation does, and a request presenting it
 must still arrive with the Fabric identity of the node holding that attempt.
 Authority is never restored by a later renewal or by a different attempt of the
-same job: a fresh claim mints a fresh credential. Deleting a superseded
-credential row is hygiene, not enforcement; refusal is decided by reading the
-live attempt.
+same job: a fresh claim mints a fresh credential. Deleting a credential row is
+hygiene, not enforcement; refusal is decided by reading the live attempt. A
+claim deletes the rows of attempts it superseded, and every reconcile pass
+deletes, at most 4096 at a time, the rows of attempts that have ended or no
+longer exist, so a finished job's last attempt keeps no credential hash.
+Nothing needs the row after its attempt ends: completion replay and late
+evidence authenticate with the node identity and fencing token, not the
+attempt credential.
 
 Log idempotency is keyed by `(attempt_id, stream, sequence)`. The same bytes and
 timestamp are replay-safe; a different event at an existing key is an

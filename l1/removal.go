@@ -1031,9 +1031,6 @@ func scrubServiceControllerState(ctx context.Context, tx *sql.Tx, jobID string, 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM job_log_truncations WHERE job_id=?`, jobID); err != nil {
 		return internalError(err, "scrub service log truncation")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE job_log_jsonl SET jsonl=X'' WHERE job_id=?`, jobID); err != nil {
-		return internalError(err, "scrub authoritative service log")
-	}
 	return nil
 }
 

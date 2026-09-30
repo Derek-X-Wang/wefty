@@ -75,13 +75,7 @@ func assertServiceLogByteRetentionAndDerivedJSONL(t *testing.T) {
 	if !bytes.Equal(raw, wantRaw) {
 		t.Fatalf("derived JSONL = %s, want %s", raw, wantRaw)
 	}
-	var legacyBlobBytes int
-	if err := h.store.db.QueryRow("SELECT LENGTH(jsonl) FROM job_log_jsonl WHERE job_id=?", job.JobID).Scan(&legacyBlobBytes); err != nil {
-		t.Fatal(err)
-	}
-	if legacyBlobBytes != 0 {
-		t.Fatalf("independent JSONL blob grew to %d bytes", legacyBlobBytes)
-	}
+	assertNoJobLogJSONLTable(t, h.store)
 
 	oneshot := h.submit(client, "one-shot-byte-exemption", nil)
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{

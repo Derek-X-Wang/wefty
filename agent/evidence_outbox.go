@@ -104,6 +104,9 @@ type evidenceOutbox struct {
 	flushInterval time.Duration
 	retryInterval time.Duration
 	ociIntentGate *ociIntentCompletionGate
+	// sweepDue is when recovery next sweeps one-shot spool rows L1 refused
+	// for good; it is owned by the recovery goroutine.
+	sweepDue time.Time
 	// completionStored is a test seam for ordering cancellation against the
 	// durable commit edge. Production construction leaves it nil.
 	completionStored func()
@@ -323,6 +326,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		var launchPending func()
 		launchPending = func() {
 			now := outbox.clock.Now()
+			outbox.sweepDeadOneShotSpool(recoveryContext, now, report)
 			if !scanRetryAt.IsZero() && now.Before(scanRetryAt) {
 				armRetry()
 				return

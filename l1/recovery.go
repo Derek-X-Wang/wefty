@@ -232,6 +232,13 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		}
 	}
 
+	// Last, so an attempt this pass expired loses its credential row in the
+	// same pass.
+	result.PrunedAttemptCredentials, err = pruneEndedAttemptCredentials(ctx, tx, attemptCredentialPruneBatch)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")
 	}

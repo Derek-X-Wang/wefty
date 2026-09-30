@@ -444,6 +444,36 @@ expires mid-drain L1 seals by expiry without `completion_replay_attempt_id` and
 the reconciler's lost-at-L1 path is thereafter bounded to eight log batches per
 pass.
 
+The reconciler also sweeps one-shot spool rows L1 has closed the door on, and
+nothing else. A row goes only once L1 has answered a delivery of its evidence
+with a refusal that holds for good -- `attempt_not_found`, `not_found`,
+`stale_fence`, `attempt_mismatch`, `invalid_request`, `unsupported_class`, `unsupported_kind`,
+`unsupported_runtime_handler`, or `not_implemented` -- which seals the row and
+records that answer and its time on it. `conflict` and `idempotency_conflict`
+are not refusals for good: a replay gap's conflict clears once the missing
+earlier sequences arrive, and an idempotency conflict clears once retention
+evicts the conflicting rows, so a row sealed on either is kept. No row is
+swept by age. L1 never
+refuses evidence as too late: past its late-evidence window it keeps a gap in
+place of a result and answers a completion `lease_expired`, which retires the
+row as delivered. That window starts when L1 records the loss, not when the
+process finished, and L1 keeps late results for as long as it keeps the
+attempt, so an L1 unreachable for any length of time still takes the evidence
+when it returns, and the spool keeps it until then. A row L1 has not
+answered, a row parked on a node-session refusal (#549), and a row sealed on
+`attempt_not_owned` (which a node reconfigured with the wrong identity also
+gets) are therefore kept. Disk use is bounded where it is large: pending
+one-shot log payload counts against the one-shot spool budget
+(`--log-spool-max-bytes`, 64 MiB by default), and at that limit the spool
+refuses new output, which ends the producing attempt with an output-sink
+failure, rather than evicting evidence already spooled. A completion or
+tombstone row is not counted against that budget; each is one small document.
+A service row and an attempt this process still owns are never swept. The
+attempt's spool events and acknowledgements go with its row. The sweep rides
+on the reconciler's own passes, at most once an hour, deleting at most 256
+rows in one transaction; a full batch leaves it due at once, so a backlog
+drains across passes.
+
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat
 `execution.handoff_directory`: after `kind=oci` selects the adapter, the
