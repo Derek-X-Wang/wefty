@@ -328,8 +328,10 @@ to be running now: desired state `running`, current Job `claimed` or
 own attempt still live on its host. A Computer that is stopping — after stop,
 or after a restart of a running resource latch — is refused even while its old
 attempt drains, and so is one that is reset, reimaged, restoring, removed, or
-whose attempt is terminal. L1 submission-intent mutation revokes older L3
-grants before reporting success.
+whose attempt is terminal. A submission-intent change commits first and
+then revokes the Computer's L3 grants below its new revision; an applied
+change whose revocation the run ledger did not take still reports success,
+with `revoked: null` and `revocation_notice` (#600; see `state-machines.md`).
 
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
@@ -349,7 +351,9 @@ An online grow that fails without failing the job keeps its running attempt
 and returns to `stable`, so its passes stay valid by design and nothing is
 revoked. That revocation is
 defense in depth plus audit, not the gate: the live-scope check above already
-refuses the old passes the moment the mutation commits.
+refuses the old passes at every final L1 proof taken after the mutation
+commits (see `state-machines.md` for the one request whose final proof
+preceded the commit).
 
 Each of those mutations writes the revocation it owes as a row in L1's
 `computer_owed_revocations`, in the mutation's own transaction (#554): the
@@ -403,9 +407,10 @@ ledger answers.
 When L1 cannot reach the run ledger to perform a revocation it says so by
 name: typed `run_ledger_unavailable`, HTTP 503. It is never reported as
 `internal`, because the remedy is a deployment address, not an L1 fix, and a
-scrubbed message hides the only fact that leads to it. Before a submission
-enable or disable commits, the refusal is `retryable: true`: nothing applied,
-and a retry performs both. After an authority-losing Computer mutation
+scrubbed message hides the only fact that leads to it. A control plane
+that names no run ledger refuses a submission change `retryable: true` before
+applying anything. A submission change never refuses over its revocation
+once it has committed: it answers 200 with `revocation_notice` instead. After an authority-losing Computer mutation
 commits, the refusal is `retryable: false`, and its message says that the
 mutation applied, that the explicit revocation is owed and L1 will retry it
 until the run ledger takes it, that the request should not be retried for it,
@@ -416,7 +421,14 @@ that could not re-drive its revocation says that the revocation was not
 recorded. The owed row above is the durable record. The node heartbeat is the
 one surface that does not refuse: a pre-restore revocation the run ledger will
 not take is left owed and re-listed next pass, and only that Computer's
-restore directive is withheld. The heartbeat asks for all owed pre-restore
+restore directive is withheld. Recording the run ledger's receipt afterwards
+is per-Computer the same way (#600): when that write fails, including
+`stale_intent_revision` because the operator removed the Computer or its
+restore was superseded while the run ledger answered, L1 logs
+`event=l1_restore_revocation_receipt_deferred`, withholds that one restore
+directive, and still answers the heartbeat with every other directive. The
+next pass lists the revocation again only if the restore is still current;
+a removed or superseded restore is owed nothing. The heartbeat asks for all owed pre-restore
 revocations at once and waits for them at most
 `HeartbeatRestoreRevocationBudget` (3s), well inside the agent's 10s heartbeat
 deadline; a revocation that has not answered by then is owed exactly like a
@@ -435,7 +447,8 @@ older passes.
 
 `POST /v1/runs` rechecks the digest grant, revocation state, exact live L1
 attempt proof, and bound revisions after entering its immediate SQLite write
-transaction. Administrative revocation therefore serializes with the Run
+transaction, taking the live L1 proof last, just before the Run row is
+written. Administrative revocation therefore serializes with the Run
 commit: whichever write acquires the fence first wins. A transient L1 proof
 failure returns unauthorized or service unavailable without mutating the
 grant. Definitive attempt, policy, Storage, Computer, host, helper, agent, or

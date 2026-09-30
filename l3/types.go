@@ -124,9 +124,10 @@ type CreateRunInput struct {
 	Actor          string
 	Request        CreateRunRequest
 	ComputerScope  *ComputerTokenScope
-	// VerifyComputerScope is called after the immediate SQLite write transaction
-	// begins and before any Run row is committed. The caller must re-prove the
-	// exact live L1 attempt authority represented by ComputerScope.
+	// VerifyComputerScope is called inside the immediate SQLite write
+	// transaction, after every local read and just before the Run row is
+	// written. The caller must re-prove the exact live L1 attempt authority
+	// represented by ComputerScope; that proof is the Run's authorization.
 	VerifyComputerScope func(context.Context, ComputerTokenScope) error
 }
 
