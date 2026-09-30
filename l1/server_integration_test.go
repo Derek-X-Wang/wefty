@@ -590,9 +590,6 @@ VALUES(?, ?, ?, ?, ?, NULL, NULL, 'caller', 0, 0, ?, ?)`, storedJobID, stored.Di
 		contract.JobQueued, now, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.db.Exec(`INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)`, storedJobID, []byte{}); err != nil {
-		t.Fatal(err)
-	}
 	for _, capability := range RequiredCapabilities(stored) {
 		if _, err := h.store.db.Exec(`INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)`, storedJobID, capability); err != nil {
 			t.Fatal(err)

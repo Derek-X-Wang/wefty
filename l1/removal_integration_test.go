@@ -148,12 +148,12 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 			t.Fatalf("%s rows after remove = %d, want 0", table, count)
 		}
 	}
-	var jsonl []byte
-	if err := h.store.db.QueryRow(`SELECT jsonl FROM job_log_jsonl WHERE job_id=?`, job.JobID).Scan(&jsonl); err != nil {
+	jsonl, err := h.store.RawJobLogJSONL(context.Background(), job.JobID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(jsonl) != 0 {
-		t.Fatalf("authoritative JSONL after remove = %q, want empty", jsonl)
+		t.Fatalf("derived JSONL after remove = %q, want empty", jsonl)
 	}
 	if _, err := h.store.AppendLogs(context.Background(), "fabric-agent", job.JobID, claim.Lease.AttemptID, AppendLogsRequest{
 		FencingToken: claim.Lease.FencingToken,
