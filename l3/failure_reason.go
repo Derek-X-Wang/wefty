@@ -40,58 +40,100 @@ func jobFailureReason(job l1.Job) string {
 		}
 		return "the L1 job failed with no recorded result"
 	}
-	attempt := job.Attempts[len(job.Attempts)-1]
+	last := len(job.Attempts) - 1
+	attempt := job.Attempts[last]
 	var reason string
-	switch {
-	case attempt.Result != nil:
-		reason = ProcessResultReason(*attempt.Result)
-	case attempt.State == contract.AttemptLost:
-		reason = "the attempt lost its lease"
-		if attempt.NodeID != "" {
-			reason = "the attempt on node " + attempt.NodeID + " lost its lease"
-		}
-	case job.FailureReason != "":
-		reason = "L1: " + job.FailureReason
-	default:
-		reason = fmt.Sprintf("attempt %s %s with no recorded result", attempt.AttemptID, attempt.State)
-	}
-	if late := attempt.LateResult; late != nil {
+	if outcome, ok := attemptOutcome(job, last, false); ok {
+		reason = outcome.reason()
+	} else {
 		switch {
-		case late.Result != nil:
-			reason += " (late result: " + ProcessResultReason(*late.Result) + ")"
-		case late.Gap != nil:
-			reason += " (late result unavailable: " + string(late.Gap.Reason) + ")"
+		case attempt.State == contract.AttemptLost:
+			reason = "the attempt lost its lease"
+			if attempt.NodeID != "" {
+				reason = "the attempt on node " + attempt.NodeID + " lost its lease"
+			}
+		case job.FailureReason != "":
+			reason = "L1: " + job.FailureReason
+		default:
+			reason = fmt.Sprintf("attempt %s %s with no recorded result", attempt.AttemptID, attempt.State)
 		}
+	}
+	if late, ok := attemptOutcome(job, last, true); ok {
+		reason += " (late result: " + late.reason() + ")"
+	} else if attempt.LateResult != nil && attempt.LateResult.Gap != nil {
+		reason += " (late result unavailable: " + string(attempt.LateResult.Gap.Reason) + ")"
 	}
 	return reason
 }
 
-// ProcessResultReason is one attempt result as a reader names it: the exit
-// code, the signal and who sent it, or the spawn/runtime failure.
-func ProcessResultReason(result l1.ProcessResult) string {
+// resultOutcome is what a reason needs from one attempt result. It is read
+// out of the l1.Job wire type field by field rather than by naming L1's
+// result type, which ADR-0006 keeps off the L3 side of the boundary: the job
+// projection is the allowlisted wire type, and its attempts ride inside it.
+type resultOutcome struct {
+	exitCode      *int
+	spawn         string
+	runtime       string
+	outputError   string
+	signal        string
+	cause         string
+	outOfMemory   bool
+	diskExhausted bool
+}
+
+// attemptOutcome reads the attempt's authoritative result, or with late set
+// its non-authoritative late result. ok is false when there is none.
+func attemptOutcome(job l1.Job, index int, late bool) (resultOutcome, bool) {
+	attempt := job.Attempts[index]
+	result := attempt.Result
+	if late {
+		if attempt.LateResult == nil {
+			return resultOutcome{}, false
+		}
+		result = attempt.LateResult.Result
+	}
+	if result == nil {
+		return resultOutcome{}, false
+	}
+	outcome := resultOutcome{
+		exitCode: result.ExitCode, outputError: result.OutputError, signal: result.Signal,
+		cause: string(result.TerminationCause), outOfMemory: result.OOM, diskExhausted: result.DiskExhausted,
+	}
+	if result.SpawnError != nil {
+		outcome.spawn = fmt.Sprintf("spawn %s: %s", result.SpawnError.Code, result.SpawnError.Message)
+	}
+	if result.RuntimeFailure != nil {
+		outcome.runtime = fmt.Sprintf("runtime %s: %s", result.RuntimeFailure.Code, result.RuntimeFailure.Message)
+	}
+	return outcome, true
+}
+
+// reason is one attempt result as a reader names it: the exit code, the
+// signal and who sent it, or the spawn/runtime failure.
+func (outcome resultOutcome) reason() string {
 	var reason string
 	switch {
-	case result.ExitCode != nil:
-		reason = fmt.Sprintf("exit %d", *result.ExitCode)
-	case result.SpawnError != nil:
-		reason = fmt.Sprintf("spawn %s: %s", result.SpawnError.Code, result.SpawnError.Message)
-	case result.RuntimeFailure != nil:
-		reason = fmt.Sprintf("runtime %s: %s", result.RuntimeFailure.Code, result.RuntimeFailure.Message)
-	case result.OutputError != "":
-		reason = "output error: " + result.OutputError
-	case result.Signal != "":
-		reason = "signal " + result.Signal
-		if result.TerminationCause != "" {
-			reason += " (" + string(result.TerminationCause) + ")"
+	case outcome.exitCode != nil:
+		reason = fmt.Sprintf("exit %d", *outcome.exitCode)
+	case outcome.spawn != "":
+		reason = outcome.spawn
+	case outcome.runtime != "":
+		reason = outcome.runtime
+	case outcome.outputError != "":
+		reason = "output error: " + outcome.outputError
+	case outcome.signal != "":
+		reason = "signal " + outcome.signal
+		if outcome.cause != "" {
+			reason += " (" + outcome.cause + ")"
 		}
 	default:
 		reason = "no exit code, signal or failure was recorded"
 	}
 	var flags []string
-	if result.OOM {
+	if outcome.outOfMemory {
 		flags = append(flags, "out of memory")
 	}
-	if result.DiskExhausted {
+	if outcome.diskExhausted {
 		flags = append(flags, "disk exhausted")
 	}
 	if len(flags) > 0 {
