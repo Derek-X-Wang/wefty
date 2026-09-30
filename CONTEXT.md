@@ -188,9 +188,10 @@ _Avoid_: collision, cross-talk, neighbour access as an owner exception
 
 **Storage generation**:
 One immutable, monotonically identified incarnation of a Computer's persistent
-Storage. Exactly one generation is current and attached; a reset or import may
-briefly add a staging generation, and retired generations are kept until their
-deletion is verified.
+Storage. At most one generation is current, and it is attached only while the
+Computer runs. A reset may briefly add a staging generation beside the current
+one, an import begins with only a staging generation, and retired generations
+are kept until their deletion is verified.
 _Avoid_: disk version, volume revision, snapshot, removal generation,
 authority generation, Lineage
 
@@ -202,8 +203,9 @@ _Avoid_: snapshot, image, export, archive, recovery point, Lineage
 
 **Backup copy**:
 One wefty-owned physical realization of a Backup on one Node. Today a Backup
-has exactly one live copy, on its source Node.
-_Avoid_: Backup (the logical record), replica or mirror while only the source
+has at most one live copy, on its source Node; pruning removes that copy and
+leaves the logical Backup with none.
+_Avoid_: Backup (the logical record), replica or mirror while at most the source
 copy exists, custody export, Lineage
 
 **Storage provenance**:

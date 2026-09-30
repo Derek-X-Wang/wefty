@@ -105,10 +105,18 @@ helper's `computer_disk` attachment mechanic.
 
 The agent runs one pool of claim loops per class. Each loop blocks on its own
 class admission gate, so a service cannot prevent the one-shot pool from asking
-for work and vice versa. The pool size and the gate limit are the smaller of the
-node's local slot limit and the L1-granted capacity the agent reads on every
-registration and heartbeat. Every claim names the jobs already resident on the
-node as exclusions, so L1 never hands the node a job it is still executing.
+for work and vice versa. The gate limit is the smaller of the node's local
+slot limit and the L1-granted capacity the agent reads on every registration
+and heartbeat, and each pool grows to that limit. The one-shot pool also
+shrinks to it; the service pool never shrinks within a session, because a
+service worker that already holds a binding stays that service's pull path
+through restart backoff. After a capacity decrease the lowered gate and the L1
+claim transaction refuse newcomers, but a bound service that L1 admits because
+its binding already holds the slot may still restart while the node is
+overcommitted, and the agent records that execution against the gate without
+treating the gate as the authority. Every claim names the jobs already resident
+on the node as exclusions, so L1 never hands the node a job it is still
+executing.
 
 The control plane obtains tags and capacity from authenticated Fabric identity
 plus operator configuration. Nodes in `stale`, `dead`, or `draining` state
