@@ -872,3 +872,89 @@ func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestADeadHostsOwedRevocationsAreSettledAsMoot is #605: only the host's
+// heartbeat settled owed rows, so a host that never came back kept them owed
+// forever. L1 settles them as host_dead when it marks the host dead, sends
+// the run ledger nothing, and leaves every row it already settled alone.
+func TestADeadHostsOwedRevocationsAreSettledAsMoot(t *testing.T) {
+	h, ledger, _, computer, _ := owedOutage(t, "owed-dead-host")
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 2 {
+		t.Fatalf("fixture error: owed revocations = %#v", owed)
+	}
+	before := owedRevocationAuditRows(t, h, computer.ComputerID)
+	ledger.set(false, false)
+
+	h.clock.Advance(DefaultNodeDeadAfter + time.Second)
+	if _, err := h.store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
+		t.Fatalf("a dead host's revocations are still owed: %#v", owed)
+	}
+	after := owedRevocationAuditRows(t, h, computer.ComputerID)
+	if len(after) != len(before) {
+		t.Fatalf("audit rows = %#v, want %d", after, len(before))
+	}
+	for index, row := range after {
+		want := owedRevocationSettledHostDead
+		if before[index].settlement != "" {
+			want = before[index].settlement
+		}
+		if row.settlement != want || (want == owedRevocationSettledHostDead && row.record != nil) {
+			t.Fatalf("audit row %d = %#v, want settlement %q", index, row, want)
+		}
+	}
+	if taken := ledger.taken(); len(taken) != 0 {
+		t.Fatalf("settling a dead host's rows called the run ledger: %#v", taken)
+	}
+}
+
+// A database created before host_dead existed is rebuilt to admit it, and
+// keeps its rows, indexes and immutability triggers.
+func TestOwedRevocationSettlementMigrationAdmitsHostDead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "l1.sqlite")
+	store, err := OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_owed_revocations'`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(current, ", 'host_dead')", ")", 1)
+	legacy = strings.Replace(legacy, "computer_owed_revocations", "computer_owed_revocations_legacy", 1)
+	if legacy == current {
+		t.Fatal("fixture error: could not derive the legacy schema")
+	}
+	if _, err := store.db.Exec(legacy + `;
+INSERT INTO computer_owed_revocations_legacy(computer_id, host_node_id, verb, reason, scope, recorded_attempt_ids_json, created_ns)
+VALUES('computer-1', 'node-1', 'stop', 'test', 'revoke_all', '[]', 1);
+DROP TABLE computer_owed_revocations;
+ALTER TABLE computer_owed_revocations_legacy RENAME TO computer_owed_revocations;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var objects int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE tbl_name='computer_owed_revocations'
+		AND name IN ('computer_owed_revocations_computer', 'computer_owed_revocations_host',
+			'computer_owed_revocations_settled_immutable', 'computer_owed_revocations_no_delete')`).Scan(&objects); err != nil {
+		t.Fatal(err)
+	}
+	if objects != 4 {
+		t.Fatalf("migrated table kept %d of its 4 indexes and triggers", objects)
+	}
+	if _, err := store.db.Exec(`UPDATE computer_owed_revocations SET settlement='host_dead', settled_ns=2 WHERE computer_id='computer-1'`); err != nil {
+		t.Fatalf("migrated table refuses host_dead: %v", err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM computer_owed_revocations`); err == nil {
+		t.Fatal("migrated table lost its immutability trigger")
+	}
+}

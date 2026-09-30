@@ -42,6 +42,13 @@ const (
 	owedRevocationSettledRevoked         = "revoked"
 	owedRevocationSettledNothingToRevoke = "nothing_to_revoke"
 	owedRevocationSettledNoRunLedger     = "no_run_ledger"
+	// owedRevocationSettledHostDead closes a row whose host Node L1 marked
+	// dead: no heartbeat will ever settle it. Its passes are already refused,
+	// because every bearer use re-proves the live scope with L1 and the
+	// mutation that owed the row changed that scope (and a dead host's
+	// attempts stop renewing their leases), and the host's next boot revokes
+	// every grant L3 still holds for it (revoke-host).
+	owedRevocationSettledHostDead = "host_dead"
 	// MaxOwedRevocationsPerHeartbeat bounds the owed revocations one node
 	// heartbeat settles. They share the heartbeat's revocation budget with
 	// the pre-restore revocations; the rest wait for the next heartbeat.

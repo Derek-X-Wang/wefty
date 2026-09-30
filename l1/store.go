@@ -1008,7 +1008,7 @@ CREATE TABLE IF NOT EXISTS computer_owed_revocations (
   settle_failures INTEGER NOT NULL DEFAULT 0 CHECK(settle_failures >= 0),
   last_failure TEXT NOT NULL DEFAULT '',
   last_failure_ns INTEGER,
-  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'nothing_to_revoke', 'no_run_ledger')),
+  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'nothing_to_revoke', 'no_run_ledger', 'host_dead')),
   settled_ns INTEGER,
   receipt_json BLOB,
   CHECK((scope = 'attempt') = (computer_attempt_id <> '')),
@@ -1328,6 +1328,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	if err := s.migrateBackupDigestConstraint(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateOwedRevocationSettlementConstraint(ctx); err != nil {
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
@@ -1869,6 +1872,54 @@ func (s *Store) migrateCustodyExportConstraints(ctx context.Context) error {
 	}
 	_, err = connection.ExecContext(ctx, "PRAGMA foreign_keys=ON")
 	return err
+}
+
+// migrateOwedRevocationSettlementConstraint admits the host_dead settlement
+// on a database created before it. The rebuild drops the table's indexes and
+// immutability triggers with it, so it recreates them in the same
+// transaction.
+func (s *Store) migrateOwedRevocationSettlementConstraint(ctx context.Context) error {
+	var sourceSQL string
+	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_owed_revocations'`).Scan(&sourceSQL); err != nil {
+		return fmt.Errorf("l1: inspect owed Computer revocation schema: %w", err)
+	}
+	if strings.Contains(sourceSQL, "'host_dead'") {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin owed Computer revocation settlement migration: %w", err)
+	}
+	defer tx.Rollback()
+	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_owed_revocations_settlement_migration", map[string]string{
+		"'no_run_ledger')": "'no_run_ledger', 'host_dead')",
+	})
+	if err != nil {
+		return fmt.Errorf("l1: rewrite owed Computer revocation schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("l1: create owed Computer revocation schema: %w", err)
+	}
+	if err := copySQLiteTableColumns(ctx, tx, "computer_owed_revocations", "computer_owed_revocations_settlement_migration"); err != nil {
+		return fmt.Errorf("l1: copy owed Computer revocations during settlement migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE computer_owed_revocations;
+ALTER TABLE computer_owed_revocations_settlement_migration RENAME TO computer_owed_revocations;
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_computer
+  ON computer_owed_revocations(computer_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_host
+  ON computer_owed_revocations(host_node_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_settled_immutable
+BEFORE UPDATE ON computer_owed_revocations WHEN OLD.settled_ns IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a settled Computer revocation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_no_delete
+BEFORE DELETE ON computer_owed_revocations BEGIN SELECT RAISE(ABORT, 'Computer revocation audit is immutable'); END;`); err != nil {
+		return fmt.Errorf("l1: replace owed Computer revocation schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit owed Computer revocation settlement migration: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) migrateBackupDigestConstraint(ctx context.Context) error {
@@ -4875,15 +4926,23 @@ func latestAttemptID(ctx context.Context, q queryer, jobID string) (string, erro
 // GetJobResult reads the stored result document. Absence is a typed not-found
 // rather than an empty document: "this run uploaded nothing" and "this run's
 // result was empty" are different answers.
+//
+// The row is served only while it belongs to the job's latest attempt. Every
+// completion that reaches its upload replaces the row, but a node that crashes
+// between completing an attempt and uploading its result leaves the
+// predecessor's row in place, and that document is not this run's answer. The
+// reader is told there is no result rather than shown an earlier attempt's.
 func (s *Store) GetJobResult(ctx context.Context, jobID string) (JobResult, error) {
 	var result JobResult
 	var uploadedNS int64
 	var skipReason string
-	err := s.db.QueryRowContext(ctx, `SELECT job_id, attempt_id, document, sha256, skip_reason, uploaded_ns
-		FROM job_results WHERE job_id=?`, jobID).
+	err := s.db.QueryRowContext(ctx, `SELECT r.job_id, r.attempt_id, r.document, r.sha256, r.skip_reason, r.uploaded_ns
+		FROM job_results r WHERE r.job_id=? AND r.attempt_id=(
+			SELECT a.attempt_id FROM attempts a WHERE a.job_id=r.job_id
+			ORDER BY a.created_ns DESC, a.attempt_id DESC LIMIT 1)`, jobID).
 		Scan(&result.JobID, &result.AttemptID, &result.Document, &result.SHA256, &skipReason, &uploadedNS)
 	if errors.Is(err, sql.ErrNoRows) {
-		return JobResult{}, protocolError(contract.ErrorNotFound, "job %s has no uploaded result", jobID)
+		return JobResult{}, protocolError(contract.ErrorNotFound, "job %s has no uploaded result from its latest attempt", jobID)
 	}
 	if err != nil {
 		return JobResult{}, internalError(err, "read job result")

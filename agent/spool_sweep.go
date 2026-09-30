@@ -55,18 +55,36 @@ func l1ClosedEvidence(code contract.ErrorCode) bool {
 	}
 }
 
-// spoolSweep reports one sweep of one-shot spool rows L1 refused for good.
+// spoolSweep reports one sweep of one-shot spool rows L1 refused for good and
+// of empty rows an interrupted attempt left behind.
 type spoolSweep struct {
 	refused int
+	empty   int
 	full    bool
 }
 
-const spoolSweepPredicate = `class=? AND l1_refused_ns IS NOT NULL`
+// spoolEmptyLeftover is a one-shot row that holds nothing for anyone: no
+// spooled event, no completion, no delivery outcome, no incomplete marker and
+// no runtime manifest. An agent that crashes mid-attempt leaves exactly this
+// once its delivered log events are gone, and no delivery predicate ever
+// matches it, because there is nothing to deliver. Acknowledgement high-water
+// marks record evidence L1 already holds, so they do not keep a row.
+const spoolEmptyLeftover = `result_json IS NULL AND finished_ns IS NULL AND incomplete_json IS NULL
+  AND completion_disposition IS NULL AND l1_refused_ns IS NULL AND l1_refusal_code IS NULL
+  AND NOT EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=spool_attempts.attempt_id)
+  AND NOT EXISTS (SELECT 1 FROM spool_completion_receipts r WHERE r.attempt_id=spool_attempts.attempt_id)
+  AND NOT EXISTS (SELECT 1 FROM runtime_attempt_manifests m WHERE m.attempt_id=spool_attempts.attempt_id)`
+
+const spoolSweepPredicate = `class=? AND (l1_refused_ns IS NOT NULL OR (` + spoolEmptyLeftover + `))`
 
 // sweepDeadOneShotAttempts deletes, at most limit at a time, the one-shot
 // spool rows L1 has closed the door on: a delivery of the row's evidence was
 // answered with an l1ClosedEvidence code, recorded on the row when it was
-// sealed (l1_refused_ns). Nothing is swept by age. L1's late-evidence window
+// sealed (l1_refused_ns). It also deletes empty leftovers
+// (spoolEmptyLeftover), which hold no evidence at all, but only one a previous
+// process left: createdHere names rows this process created and has not
+// released, which may simply not have their first evidence yet. Nothing is
+// swept by age. L1's late-evidence window
 // starts when L1 records the loss, and L1 keeps late results for as long as
 // it keeps the attempt, so a completion or log L1 has not answered stays on
 // disk however long L1 is unreachable; the one-shot spool byte budget, which
@@ -74,26 +92,30 @@ const spoolSweepPredicate = `class=? AND l1_refused_ns IS NOT NULL`
 // service row, and an attempt this process still owns (live reports it), is
 // never swept. The attempt's spool events and acknowledgements cascade with
 // the row.
-func (spool *logSpool) sweepDeadOneShotAttempts(ctx context.Context, limit int, live func(string) bool) (spoolSweep, error) {
+func (spool *logSpool) sweepDeadOneShotAttempts(ctx context.Context, limit int, live, createdHere func(string) bool) (spoolSweep, error) {
 	tx, err := spool.db.BeginTx(ctx, nil)
 	if err != nil {
 		return spoolSweep{}, fmt.Errorf("agent: begin one-shot spool sweep: %w", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT attempt_id FROM spool_attempts
+	rows, err := tx.QueryContext(ctx, `SELECT attempt_id, l1_refused_ns IS NOT NULL FROM spool_attempts
 WHERE `+spoolSweepPredicate+`
 ORDER BY created_ns, attempt_id LIMIT ?`, contract.JobClassOneShot, limit)
 	if err != nil {
 		return spoolSweep{}, fmt.Errorf("agent: select dead one-shot spool rows: %w", err)
 	}
-	var candidates []string
+	type candidate struct {
+		attemptID string
+		refused   bool
+	}
+	var candidates []candidate
 	for rows.Next() {
-		var attemptID string
-		if err := rows.Scan(&attemptID); err != nil {
+		var row candidate
+		if err := rows.Scan(&row.attemptID, &row.refused); err != nil {
 			_ = rows.Close()
 			return spoolSweep{}, fmt.Errorf("agent: scan dead one-shot spool row: %w", err)
 		}
-		candidates = append(candidates, attemptID)
+		candidates = append(candidates, row)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -103,8 +125,16 @@ ORDER BY created_ns, attempt_id LIMIT ?`, contract.JobClassOneShot, limit)
 		return spoolSweep{}, fmt.Errorf("agent: close dead one-shot spool rows: %w", err)
 	}
 	var sweep spoolSweep
-	for _, attemptID := range candidates {
+	// Spool transactions take the write lock when they begin, so no attempt
+	// can create or add to a row between these checks and the delete. A row
+	// is marked as created here before it is created, so an empty row that
+	// is not marked was left by an earlier process.
+	for _, row := range candidates {
+		attemptID := row.attemptID
 		if live != nil && live(attemptID) {
+			continue
+		}
+		if !row.refused && createdHere != nil && createdHere(attemptID) {
 			continue
 		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM spool_attempts WHERE attempt_id=? AND `+spoolSweepPredicate,
@@ -117,14 +147,18 @@ ORDER BY created_ns, attempt_id LIMIT ?`, contract.JobClassOneShot, limit)
 		} else if changed == 0 {
 			continue
 		}
-		sweep.refused++
+		if row.refused {
+			sweep.refused++
+		} else {
+			sweep.empty++
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return spoolSweep{}, fmt.Errorf("agent: commit one-shot spool sweep: %w", err)
 	}
 	// Only a batch that was full and made progress leaves the sweep due at
 	// once; one held up by live attempts waits for the interval.
-	sweep.full = len(candidates) >= limit && sweep.refused > 0
+	sweep.full = len(candidates) >= limit && sweep.refused+sweep.empty > 0
 	return sweep, nil
 }
 
@@ -191,7 +225,7 @@ func (outbox *evidenceOutbox) sweepDeadOneShotSpool(ctx context.Context, now tim
 	if !outbox.sweepDue.IsZero() && now.Before(outbox.sweepDue) {
 		return
 	}
-	sweep, err := outbox.spool.sweepDeadOneShotAttempts(ctx, spoolSweepBatch, outbox.attemptIsLive)
+	sweep, err := outbox.spool.sweepDeadOneShotAttempts(ctx, spoolSweepBatch, outbox.attemptIsLive, outbox.attemptCreatedHere)
 	if err != nil {
 		outbox.sweepDue = now.Add(evidenceRecoveryBackoff(outbox.retryInterval, 1))
 		if ctx.Err() == nil && report != nil {
@@ -206,5 +240,8 @@ func (outbox *evidenceOutbox) sweepDeadOneShotSpool(ctx context.Context, now tim
 	}
 	if sweep.refused > 0 && report != nil {
 		report(fmt.Errorf("swept %d one-shot spool rows whose evidence L1 refused for good", sweep.refused))
+	}
+	if sweep.empty > 0 && report != nil {
+		report(fmt.Errorf("swept %d empty one-shot spool rows left by interrupted attempts", sweep.empty))
 	}
 }

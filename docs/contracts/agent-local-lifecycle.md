@@ -449,7 +449,13 @@ the reconciler's lost-at-L1 path is thereafter bounded to eight log batches per
 pass.
 
 The reconciler also sweeps one-shot spool rows L1 has closed the door on, and
-nothing else. A row goes only once L1 has answered a delivery of its evidence
+empty rows an interrupted attempt left behind, and nothing else. An empty
+row is one a crashed agent leaves: created by an earlier agent process, with no spooled
+event, no completion, no recorded delivery outcome or completion receipt, no
+incomplete marker and no runtime attempt manifest. It holds nothing any
+delivery could send, so no delivery predicate ever retires it; acknowledgement
+high-water marks record evidence L1 already holds and do not keep it. A row
+with any evidence is never swept this way. Otherwise a row goes only once L1 has answered a delivery of its evidence
 with a refusal that holds for good -- `attempt_not_found`, `not_found`,
 `stale_fence`, `attempt_mismatch`, `invalid_request`, `unsupported_class`, `unsupported_kind`,
 `unsupported_runtime_handler`, or `not_implemented` -- which seals the row and

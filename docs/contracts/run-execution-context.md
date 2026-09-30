@@ -415,8 +415,13 @@ deadline alone cannot bound them, because the driver does not interrupt a
 lock wait when a context ends, and no connection of L1's main pool ever has
 its 5 s wait changed. A write that does not fit, or meets a held lock, is
 skipped, never fails the heartbeat, and is redone by the next one.
-A Computer whose host Node never heartbeats again keeps its rows owed and
-visible.
+A host Node that never heartbeats again cannot settle its rows, so when L1
+marks a Node dead its reconcile pass settles every row that Node still owes
+as `host_dead`, with no receipt and no run-ledger call. The rows are moot.
+Every bearer use re-proves the live scope with L1, and the mutation that owed
+the row already changed that scope. A dead host's attempts have also stopped
+renewing their leases, and the host's next boot sends `revoke-host`. A
+settled row is never reopened, even if the Node later returns.
 
 The owed record deliberately does not cover the grant of an attempt that was
 already `lost` when the mutation began (for example a lease that expired on a
@@ -1183,8 +1188,11 @@ An upload from an attempt a later one has already superseded is refused
 (`superseded_attempt`), and every completion writes the row — the document, or
 the named reason there is none, `absent` included — so a retry that produced no
 result displaces its predecessor's document and a reader is never shown an
-earlier attempt's result as this run's answer. The row is removed with the job,
-exactly as its logs are; L3 exposes it per run.
+earlier attempt's result as this run's answer. The row is also served only
+while it belongs to the latest attempt: a node that completes an attempt and
+crashes before its upload leaves the predecessor's row in place, and a reader
+then gets an ordinary not-found rather than that earlier document. The row is
+removed with the job, exactly as its logs are; L3 exposes it per run.
 
     wefty results RUN_ID [--out FILE]
 

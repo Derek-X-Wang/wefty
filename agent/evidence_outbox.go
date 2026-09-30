@@ -126,6 +126,11 @@ type evidenceOutbox struct {
 	lateCancel     context.CancelFunc
 	lateWG         sync.WaitGroup
 	lateClosed     bool
+
+	// createdHere names the spool rows this process created and has not yet
+	// released, guarded by ownershipMu. The spool sweep takes an empty row
+	// only when a previous process left it (#605).
+	createdHere map[string]struct{}
 }
 
 func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) (*evidenceOutbox, error) {
@@ -146,6 +151,7 @@ func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, ba
 }
 
 func (outbox *evidenceOutbox) newLogSink(ctx context.Context, client *Client, claim l1.Claim) (*batchingLogSink, error) {
+	outbox.markCreatedHere(claim.Lease.AttemptID)
 	sink, err := newBatchingLogSink(ctx, client, claim, outbox.spool, outbox.clock, outbox.batchSize, outbox.flushInterval, outbox.retryInterval)
 	if err != nil {
 		return nil, err
@@ -155,7 +161,19 @@ func (outbox *evidenceOutbox) newLogSink(ctx context.Context, client *Client, cl
 }
 
 func (outbox *evidenceOutbox) ensureAttempt(ctx context.Context, claim l1.Claim) error {
+	outbox.markCreatedHere(claim.Lease.AttemptID)
 	return outbox.spool.ensureAttempt(ctx, claim)
+}
+
+// markCreatedHere records, before the spool row exists, that this process
+// creates it; every path that creates a row goes through here first.
+func (outbox *evidenceOutbox) markCreatedHere(attemptID string) {
+	outbox.ownershipMu.Lock()
+	if outbox.createdHere == nil {
+		outbox.createdHere = make(map[string]struct{})
+	}
+	outbox.createdHere[attemptID] = struct{}{}
+	outbox.ownershipMu.Unlock()
 }
 
 func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
@@ -471,6 +489,7 @@ func (outbox *evidenceOutbox) releaseAttempt(attemptID string, reconcile bool) {
 	}
 	outbox.ownershipMu.Lock()
 	delete(outbox.liveAttempts, attemptID)
+	delete(outbox.createdHere, attemptID)
 	outbox.ownershipMu.Unlock()
 	if reconcile {
 		outbox.scheduleRecovery()
@@ -483,6 +502,13 @@ func (outbox *evidenceOutbox) attemptIsLive(attemptID string) bool {
 	live = live || outbox.lateEvents[attemptID] > 0
 	outbox.ownershipMu.RUnlock()
 	return live
+}
+
+func (outbox *evidenceOutbox) attemptCreatedHere(attemptID string) bool {
+	outbox.ownershipMu.RLock()
+	_, created := outbox.createdHere[attemptID]
+	outbox.ownershipMu.RUnlock()
+	return created
 }
 
 // retainLateEvent transfers a redacted event whose first durable append was
