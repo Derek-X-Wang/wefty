@@ -70,7 +70,7 @@
       "put": {
         "operationId": "mutateComputerSubmission",
         "summary": "Enable, disable, or resize Computer Run submission",
-        "description": "Current administrators only. Exactly one policy is changed against caller-observed CAS revisions. L1 commits the change first and only then revokes, at L3, the Computer's passes below the committed submit_intent_revision; a change that loses its CAS revokes nothing. An applied change invalidates readiness and carries L3's exact revocation receipt; replay and audited no-op responses carry revoked=null. When the run ledger does not take the revocation, the change still stands: the response carries mutation_applied=true, revoked=null and revocation_notice, and L3 already refuses the superseded passes because it re-proves each pass's submit revision against live L1 on every use. A control plane with no run ledger refuses with run_ledger_unavailable before applying anything.",
+        "description": "Current administrators only. Exactly one policy is changed against caller-observed CAS revisions. L1 commits the change first and only then revokes, at L3, the Computer's passes below the committed submit_intent_revision; a change that loses its CAS revokes nothing. An applied change invalidates readiness and carries L3's exact revocation receipt; replay and audited no-op responses carry revoked=null. Once the change has applied, nothing after the commit turns the answer into a failure: when the run ledger does not take the revocation, the response carries mutation_applied=true, revoked=null and revocation_notice, and when it cannot report the inflight count, inflight_count is null. L3 refuses every Computer Run whose final live L1 proof follows the commit, because it re-proves each pass's submit revision against live L1. A control plane with no run ledger refuses with run_ledger_unavailable before applying anything.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["policy_revision", "submit_intent_revision", "idempotency_key"],
@@ -97,7 +97,7 @@
                 "submit_enabled": { "type": "boolean" },
                 "submit_intent_revision": { "type": "integer", "minimum": 0 },
                 "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                "inflight_count": { "type": "integer", "minimum": 0 },
+                "inflight_count": { "type": ["integer", "null"], "minimum": 0, "description": "Null only when the change applied but the run ledger could not report the count afterwards." },
                 "policy_revision": { "type": "integer", "minimum": 1 },
                 "ready": { "type": ["boolean", "null"] },
                 "status": { "type": "string" },
@@ -113,7 +113,8 @@
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "description": "run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
         }
       }
     },

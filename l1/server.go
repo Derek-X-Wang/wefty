@@ -583,30 +583,43 @@ func (s *Server) getComputerSubmission(w http.ResponseWriter, r *http.Request) {
 		writeError(w, internalError(errors.New("L3 Computer inflight reader is not configured"), "read Computer inflight state"))
 		return
 	}
-	state.InflightCount, err = s.computerTokenRevoker.CountComputerInflight(r.Context(), state.ComputerID)
+	inflight, err := s.computerTokenRevoker.CountComputerInflight(r.Context(), state.ComputerID)
 	if err != nil {
 		writeError(w, internalError(err, "read Computer inflight state"))
 		return
 	}
+	state.InflightCount = &inflight
 	writeJSON(w, http.StatusOK, state)
 }
 
+// computerSubmissionResult answers a submission request. Once a change has
+// applied, nothing after its commit may turn the answer into a failure (wefty
+// #600): the state is projected from the committed change itself, and an
+// inflight count the run ledger cannot give is reported as null.
 func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.Identity, computer Computer, mutationApplied bool,
 	receipt *contract.ComputerTokenRevocationReceipt) (ComputerSubmissionMutationResult, error) {
-	state, err := s.store.GetComputerSubmissionState(ctx, identity, computer.ComputerID)
-	if err != nil {
-		return ComputerSubmissionMutationResult{}, err
+	var state ComputerSubmissionState
+	if mutationApplied {
+		state = projectComputerSubmissionState(computer, computer.SubmitPolicyRevision)
+	} else {
+		var err error
+		if state, err = s.store.GetComputerSubmissionState(ctx, identity, computer.ComputerID); err != nil {
+			return ComputerSubmissionMutationResult{}, err
+		}
 	}
 	if s.computerTokenRevoker == nil {
 		return ComputerSubmissionMutationResult{}, internalError(errors.New("L3 Computer inflight reader is not configured"), "read Computer inflight state")
 	}
-	state.InflightCount, err = s.computerTokenRevoker.CountComputerInflight(ctx, computer.ComputerID)
-	if err != nil && mutationApplied {
-		// The change committed; a refusal must not read as nothing applied.
-		return ComputerSubmissionMutationResult{}, &Error{Code: contract.ErrorRunLedgerUnavailable, Cause: err, notRetryable: true,
-			Message: fmt.Sprintf("the submission change applied, but the run ledger could not be reached to read the Computer's inflight count, so do not retry the request for it: %v", err)}
-	}
-	if err != nil {
+	inflight, err := s.computerTokenRevoker.CountComputerInflight(ctx, computer.ComputerID)
+	switch {
+	case err == nil:
+		state.InflightCount = &inflight
+	case mutationApplied:
+		if s.logf != nil {
+			s.logf("event=l1_submission_inflight_unread computer_id=%s submit_intent_revision=%d cause=%q",
+				computer.ComputerID, computer.SubmitIntentRevision, scrubbedCause(err))
+		}
+	default:
 		return ComputerSubmissionMutationResult{}, internalError(err, "read Computer inflight state")
 	}
 	return ComputerSubmissionMutationResult{ComputerSubmissionState: state, MutationApplied: mutationApplied, Revoked: receipt}, nil

@@ -351,7 +351,9 @@ An online grow that fails without failing the job keeps its running attempt
 and returns to `stable`, so its passes stay valid by design and nothing is
 revoked. That revocation is
 defense in depth plus audit, not the gate: the live-scope check above already
-refuses the old passes the moment the mutation commits.
+refuses the old passes at every final L1 proof taken after the mutation
+commits (see `state-machines.md` for the one request whose final proof
+preceded the commit).
 
 Each of those mutations writes the revocation it owes as a row in L1's
 `computer_owed_revocations`, in the mutation's own transaction (#554): the
@@ -445,7 +447,8 @@ older passes.
 
 `POST /v1/runs` rechecks the digest grant, revocation state, exact live L1
 attempt proof, and bound revisions after entering its immediate SQLite write
-transaction. Administrative revocation therefore serializes with the Run
+transaction, taking the live L1 proof last, just before the Run row is
+written. Administrative revocation therefore serializes with the Run
 commit: whichever write acquires the fence first wins. A transient L1 proof
 failure returns unauthorized or service unavailable without mutating the
 grant. Definitive attempt, policy, Storage, Computer, host, helper, agent, or

@@ -42,15 +42,17 @@ type ComputerSubmissionAudit struct {
 // drive CAS mutations without exposing grants or other Computer lifecycle
 // authority through the submission command family.
 type ComputerSubmissionState struct {
-	ComputerID           string                 `json:"computer_id"`
-	SubmitEnabled        bool                   `json:"submit_enabled"`
-	SubmitIntentRevision int64                  `json:"submit_intent_revision"`
-	SubmitMaxInflight    int                    `json:"submit_max_inflight"`
-	InflightCount        int                    `json:"inflight_count"`
-	PolicyRevision       int64                  `json:"policy_revision"`
-	Ready                *bool                  `json:"ready"`
-	Status               string                 `json:"status,omitempty"`
-	PassUnavailable      *contract.SpawnFailure `json:"pass_unavailable,omitempty"`
+	ComputerID           string `json:"computer_id"`
+	SubmitEnabled        bool   `json:"submit_enabled"`
+	SubmitIntentRevision int64  `json:"submit_intent_revision"`
+	SubmitMaxInflight    int    `json:"submit_max_inflight"`
+	// InflightCount is null only in the answer to an applied change whose
+	// run ledger could not be read after the commit.
+	InflightCount   *int                   `json:"inflight_count"`
+	PolicyRevision  int64                  `json:"policy_revision"`
+	Ready           *bool                  `json:"ready"`
+	Status          string                 `json:"status,omitempty"`
+	PassUnavailable *contract.SpawnFailure `json:"pass_unavailable,omitempty"`
 }
 
 type ComputerSubmissionMutationResult struct {

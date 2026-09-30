@@ -261,19 +261,33 @@ func TestSubmissionChangeRevokesTheOldPassAndSparesTheReMint(t *testing.T) {
 	}
 }
 
-// TestSubmissionChangeWhoseRevocationFailsStillFencesTheOldPass is the
-// failure between commit and revoke. The change stands and says its
-// revocation was not recorded, and L1's live scope proof no longer admits the
+// TestSubmissionChangeWithTheRunLedgerDownAfterCommitStillAnswersApplied is
+// the failure between commit and revoke, with the run ledger fully down: it
+// takes no revocation and cannot count inflight. The change stands and says
+// so: 200, mutation_applied, revoked null, the revocation notice, and an
+// unknown (null) inflight count. L1's live scope proof no longer admits the
 // old pass's revision, which is what L3 re-proves on every use.
-func TestSubmissionChangeWhoseRevocationFailsStillFencesTheOldPass(t *testing.T) {
-	h, computer, claim := liveComputerTokenScope(t, "revocation-fails")
-	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
-		return contract.ComputerTokenRevocationReceipt{}, errors.New("run ledger unreachable")
-	}}
+func TestSubmissionChangeWithTheRunLedgerDownAfterCommitStillAnswersApplied(t *testing.T) {
+	h, computer, claim := liveComputerTokenScope(t, "run-ledger-down")
+	logs := &recordedLog{}
+	h.server.logf = logs.record
+	h.server.computerTokenRevoker = recordingComputerTokenRevoker{
+		revoke: func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+			return contract.ComputerTokenRevocationReceipt{}, errors.New("run ledger unreachable")
+		},
+		count: func(context.Context, string) (int, error) { return 0, errors.New("run ledger unreachable") },
+	}
 	status, body, mutation := resizeComputerSubmission(t, h, computer, 7)
-	if status != http.StatusOK || !mutation.MutationApplied || mutation.Revoked != nil || mutation.RevocationNotice == "" ||
+	var wire map[string]json.RawMessage
+	if status != http.StatusOK || json.Unmarshal(body, &wire) != nil || string(wire["inflight_count"]) != "null" ||
+		!mutation.MutationApplied || mutation.Revoked != nil || mutation.RevocationNotice == "" || mutation.InflightCount != nil ||
 		mutation.SubmitIntentRevision != computer.SubmitIntentRevision+1 || mutation.SubmitMaxInflight != 7 {
-		t.Fatalf("resize with a failing revocation status=%d body=%s", status, body)
+		t.Fatalf("resize with the run ledger down status=%d body=%s", status, body)
+	}
+	for _, event := range []string{"event=l1_submission_revocation_not_recorded", "event=l1_submission_inflight_unread"} {
+		if !strings.Contains(logs.text(), event+" computer_id="+computer.ComputerID) {
+			t.Fatalf("%s was not logged: %s", event, logs.text())
+		}
 	}
 	ctx := context.Background()
 	// Until the node installs the new policy, L1 proves no scope at all.

@@ -153,9 +153,15 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 			return err
 		}
 	}
-	if verb == "set-inflight" && output.InflightCount >= output.SubmitMaxInflight {
+	if output.MutationApplied && output.InflightCount == nil {
+		if _, err := fmt.Fprintf(stderr, "warning: the submission change applied, but the run ledger could not report Computer %s's inflight count\n",
+			output.ComputerID); err != nil {
+			return err
+		}
+	}
+	if verb == "set-inflight" && output.InflightCount != nil && *output.InflightCount >= output.SubmitMaxInflight {
 		_, err := fmt.Fprintf(stderr, "warning: Computer %s is saturated at inflight %d/%d\n",
-			output.ComputerID, output.InflightCount, output.SubmitMaxInflight)
+			output.ComputerID, *output.InflightCount, output.SubmitMaxInflight)
 		return err
 	}
 	return nil
@@ -193,8 +199,12 @@ func writeComputerSubmissionOutput(writer io.Writer, output computerSubmissionOu
 		revoked = fmt.Sprintf("revision %d at %s (%d grants)", output.Revoked.SubmitIntentRevision,
 			output.Revoked.CommittedAt.Format(time.RFC3339), output.Revoked.RevokedGrantCount)
 	}
-	if _, err := fmt.Fprintf(table, "%s\t%t\t%d/%d\t%d\t%d\t%s\t%s\t%t\t%t\t%s\n",
-		output.ComputerID, output.SubmitEnabled, output.InflightCount, output.SubmitMaxInflight,
+	inflight := "unknown"
+	if output.InflightCount != nil {
+		inflight = strconv.Itoa(*output.InflightCount)
+	}
+	if _, err := fmt.Fprintf(table, "%s\t%t\t%s/%d\t%d\t%d\t%s\t%s\t%t\t%t\t%s\n",
+		output.ComputerID, output.SubmitEnabled, inflight, output.SubmitMaxInflight,
 		output.SubmitIntentRevision, output.PolicyRevision, boolOrNA(output.Ready),
 		passUnavailable, output.MutationApplied, output.IdempotentReplay, revoked); err != nil {
 		return err

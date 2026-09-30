@@ -432,21 +432,22 @@ func computerRunRequest(content string) l3.CreateRunRequest {
 	return l3.CreateRunRequest{InlineScript: &l3.InlineScriptInput{Content: content, SHA256: hex.EncodeToString(digest[:]), Interpreter: []string{"/bin/sh"}}, Params: json.RawMessage(`{}`)}
 }
 
-// unrecordedRevocationLedger takes no revocation but still counts inflight.
-type unrecordedRevocationLedger struct{}
+// downRunLedger answers nothing: no revocation and no inflight count.
+type downRunLedger struct{}
 
-func (unrecordedRevocationLedger) RevokeComputerTokens(context.Context, l1.ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+func (downRunLedger) RevokeComputerTokens(context.Context, l1.ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 	return contract.ComputerTokenRevocationReceipt{}, &l1.Error{Code: contract.ErrorRunLedgerUnavailable, Message: "run ledger unreachable"}
 }
 
-func (unrecordedRevocationLedger) CountComputerInflight(context.Context, string) (int, error) {
-	return 0, nil
+func (downRunLedger) CountComputerInflight(context.Context, string) (int, error) {
+	return 0, &l1.Error{Code: contract.ErrorRunLedgerUnavailable, Message: "run ledger unreachable"}
 }
 
 // TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorded
 // covers wefty #600: L1 commits a submission change before it revokes, so a
-// revocation the run ledger did not take leaves the change applied. The CLI
-// reports it as applied and warns; it never calls it a failure to retry.
+// run ledger that is down after the commit leaves the change applied with no
+// revocation and no inflight count. The CLI reports it as applied and warns;
+// it never calls it a failure to retry.
 func TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	network := plain.NewNetwork()
@@ -457,7 +458,7 @@ func TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorde
 		t.Fatal(err)
 	}
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
-		AllowSelfAssertedPersonIdentities: true, ComputerTokenRevoker: unrecordedRevocationLedger{}, RunLedgerNodeID: "run-ledger",
+		AllowSelfAssertedPersonIdentities: true, ComputerTokenRevoker: downRunLedger{}, RunLedgerNodeID: "run-ledger",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -496,13 +497,14 @@ func TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorde
 		"--policy-revision", "1", "--submit-intent-revision", "0"}, &human, &warning); err != nil {
 		t.Fatalf("enable with an unrecorded revocation: %v", err)
 	}
-	if !strings.Contains(human.String(), "true") || !strings.Contains(human.String(), "none") ||
-		!strings.Contains(warning.String(), "warning: the submission change applied, but its L3 revocation was not recorded") {
+	if !strings.Contains(human.String(), "unknown/20") || !strings.Contains(human.String(), "none") ||
+		!strings.Contains(warning.String(), "warning: the submission change applied, but its L3 revocation was not recorded") ||
+		!strings.Contains(warning.String(), "could not report Computer "+computer.ComputerID+"'s inflight count") {
 		t.Fatalf("human output=%q warning=%q", human.String(), warning.String())
 	}
 	disabled := executeComputerSubmissionJSON(t, ctx, clients, "disable", computer.ComputerID,
 		"--policy-revision", "2", "--submit-intent-revision", "1")
-	if !disabled.MutationApplied || disabled.Revoked != nil || disabled.RevocationNotice == "" ||
+	if !disabled.MutationApplied || disabled.Revoked != nil || disabled.RevocationNotice == "" || disabled.InflightCount != nil ||
 		disabled.SubmitEnabled || disabled.SubmitIntentRevision != 2 {
 		t.Fatalf("disable with an unrecorded revocation = %#v", disabled)
 	}
