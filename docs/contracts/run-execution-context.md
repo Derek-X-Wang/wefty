@@ -389,8 +389,13 @@ deadline alone cannot bound them, because the driver does not interrupt a
 lock wait when a context ends, and no connection of L1's main pool ever has
 its 5 s wait changed. A write that does not fit, or meets a held lock, is
 skipped, never fails the heartbeat, and is redone by the next one.
-A Computer whose host Node never heartbeats again keeps its rows owed and
-visible.
+A host Node that never heartbeats again cannot settle its rows, so when L1
+marks a Node dead its reconcile pass settles every row that Node still owes
+as `host_dead`, with no receipt and no run-ledger call. The rows are moot.
+Every bearer use re-proves the live scope with L1, and the mutation that owed
+the row already changed that scope. A dead host's attempts have also stopped
+renewing their leases, and the host's next boot sends `revoke-host`. A
+settled row is never reopened, even if the Node later returns.
 
 The owed record deliberately does not cover the grant of an attempt that was
 already `lost` when the mutation began (for example a lease that expired on a

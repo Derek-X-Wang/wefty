@@ -932,7 +932,7 @@ CREATE TABLE IF NOT EXISTS computer_owed_revocations (
   settle_failures INTEGER NOT NULL DEFAULT 0 CHECK(settle_failures >= 0),
   last_failure TEXT NOT NULL DEFAULT '',
   last_failure_ns INTEGER,
-  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'nothing_to_revoke', 'no_run_ledger')),
+  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'nothing_to_revoke', 'no_run_ledger', 'host_dead')),
   settled_ns INTEGER,
   receipt_json BLOB,
   CHECK((scope = 'attempt') = (computer_attempt_id <> '')),
@@ -1252,6 +1252,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	if err := s.migrateBackupDigestConstraint(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateOwedRevocationSettlementConstraint(ctx); err != nil {
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
@@ -1793,6 +1796,54 @@ func (s *Store) migrateCustodyExportConstraints(ctx context.Context) error {
 	}
 	_, err = connection.ExecContext(ctx, "PRAGMA foreign_keys=ON")
 	return err
+}
+
+// migrateOwedRevocationSettlementConstraint admits the host_dead settlement
+// on a database created before it. The rebuild drops the table's indexes and
+// immutability triggers with it, so it recreates them in the same
+// transaction.
+func (s *Store) migrateOwedRevocationSettlementConstraint(ctx context.Context) error {
+	var sourceSQL string
+	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_owed_revocations'`).Scan(&sourceSQL); err != nil {
+		return fmt.Errorf("l1: inspect owed Computer revocation schema: %w", err)
+	}
+	if strings.Contains(sourceSQL, "'host_dead'") {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin owed Computer revocation settlement migration: %w", err)
+	}
+	defer tx.Rollback()
+	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_owed_revocations_settlement_migration", map[string]string{
+		"'no_run_ledger')": "'no_run_ledger', 'host_dead')",
+	})
+	if err != nil {
+		return fmt.Errorf("l1: rewrite owed Computer revocation schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("l1: create owed Computer revocation schema: %w", err)
+	}
+	if err := copySQLiteTableColumns(ctx, tx, "computer_owed_revocations", "computer_owed_revocations_settlement_migration"); err != nil {
+		return fmt.Errorf("l1: copy owed Computer revocations during settlement migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE computer_owed_revocations;
+ALTER TABLE computer_owed_revocations_settlement_migration RENAME TO computer_owed_revocations;
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_computer
+  ON computer_owed_revocations(computer_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_host
+  ON computer_owed_revocations(host_node_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_settled_immutable
+BEFORE UPDATE ON computer_owed_revocations WHEN OLD.settled_ns IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a settled Computer revocation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_no_delete
+BEFORE DELETE ON computer_owed_revocations BEGIN SELECT RAISE(ABORT, 'Computer revocation audit is immutable'); END;`); err != nil {
+		return fmt.Errorf("l1: replace owed Computer revocation schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit owed Computer revocation settlement migration: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) migrateBackupDigestConstraint(ctx context.Context) error {

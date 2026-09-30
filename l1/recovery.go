@@ -33,6 +33,14 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "read dead-node result")
 	}
+	// Only the host's heartbeat settles an owed revocation, so a host that
+	// never heartbeats again would keep its rows owed forever. They are moot
+	// once it is dead (owedRevocationSettledHostDead).
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_owed_revocations SET settlement=?, settled_ns=?
+		WHERE settled_ns IS NULL AND host_node_id IN (SELECT node_id FROM nodes WHERE state=?)`,
+		owedRevocationSettledHostDead, now.UnixNano(), contract.NodeDead); err != nil {
+		return ReconcileResult{}, internalError(err, "settle a dead host's owed Computer revocations")
+	}
 
 	stale, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?
 		WHERE state=? AND last_heartbeat_ns<=?`, contract.NodeStale, contract.NodeAlive,
