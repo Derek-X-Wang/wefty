@@ -566,7 +566,8 @@ func TestCallerComputerOriginRunListSpansGenerationsAndKeepsExactTriggers(t *tes
 func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-race", ComputerAttemptID: "attempt-race",
 		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-race", SubmitMaxInflight: 2}
-	verifier := &controlledComputerGrantVerifier{proof: proof, blockCall: 2, blocked: make(chan struct{}), release: make(chan struct{})}
+	// Calls 1 and 2 are the mint's proof and re-proof; call 3 is the bearer's.
+	verifier := &controlledComputerGrantVerifier{proof: proof, blockCall: 3, blocked: make(chan struct{}), release: make(chan struct{})}
 	h := newComputerHTTPHarness(t, verifier)
 	client := h.client(proof.HostNodeID)
 	grant := mintComputerHTTPToken(t, h, client, proof)

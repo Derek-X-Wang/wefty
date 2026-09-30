@@ -355,6 +355,25 @@ then revokes the Computer's L3 grants below its new revision; an applied
 change whose revocation the run ledger did not take still reports success,
 with `revoked: null` and `revocation_notice` (#600; see `state-machines.md`).
 
+Minting a pass is a fence for the new attempt, but L3 cannot order attempts:
+their IDs are opaque, and a mint's own time says nothing about when its
+attempt began. So a mint never revokes another attempt's grant on the strength
+of its own first proof, which may be stale by the time it commits (#605). Its
+transaction revokes only the same attempt's earlier grants and inserts the new
+grant. After that commits, and before the bearer is returned, L3 proves the
+scope with L1 again. If that proof fails, or names a different Storage
+generation, submit-intent revision or host, the new grant is revoked
+(`mint_scope_not_current`), the bearer is never returned, and the mint answers
+with the proof's refusal. If it succeeds, L3 revokes every grant of the
+Computer with a lower grant revision as `regranted`. This is safe because at
+most one attempt of a Computer passes the L1 proof at any moment and an ended
+attempt never passes it again: a grant that re-proves after it committed is
+newer than every grant committed before it, while a late mint from an ended
+attempt fails its own re-proof and can revoke nothing but itself. A grant
+committed later is left for its own re-proof to settle, and every bearer use
+re-proves the live scope regardless. A same-attempt remint whose re-proof fails
+leaves that attempt with no pass until it mints again.
+
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
 already failed) is followed by an explicit L3 revoke-all. Attempt completion,

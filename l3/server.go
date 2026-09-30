@@ -330,7 +330,9 @@ func (s *Server) mintComputerToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	grant, err := s.store.MintComputerToken(r.Context(), proof)
+	grant, err := s.store.MintReprovedComputerToken(r.Context(), proof, func(ctx context.Context) (ComputerTokenScopeProof, error) {
+		return s.computerGrants.ProveComputerTokenScope(ctx, request.ComputerID, request.ComputerAttemptID, identity.NodeID, "")
+	})
 	if err != nil {
 		writeError(w, err)
 		return
