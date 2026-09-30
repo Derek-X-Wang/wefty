@@ -241,7 +241,7 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	} else {
 		mux := http.NewServeMux()
 		if !bridge.suppressRunLedger {
-			mux.Handle("/l3/", l3Proxy)
+			mux.Handle("/l3/", runLedgerHandler(l3Proxy))
 		}
 		if bridge.l1 != nil {
 			mux.Handle("/l1/", bridge.controlPlaneHandler(
@@ -290,6 +290,42 @@ func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 		defer cancel()
 		next.ServeHTTP(w, request.WithContext(requestContext))
 	})
+}
+
+// runLedgerHandler restricts the run surface's /l3 proxy to the routes a run
+// token authenticates, and to requests that carry a bearer at all. The bridge
+// dials L3 as the agent's own Fabric identity, and L3 authorizes its
+// Computer-pass administration routes by node identity alone, so without this
+// a workload could revoke or re-mint every Computer pass on its node (#595).
+// Requiring a bearer keeps L3's no-credential Fabric-tag fallback out of reach
+// too: the workload gets the run token's authority, never the agent's.
+func runLedgerHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !bridgeRouteAllowed(runBridgeRoutes, request.Method, strings.TrimPrefix(request.URL.Path, "/l3")) {
+			writeWorkflowBridgeError(w, http.StatusForbidden, contract.ErrorForbidden,
+				"route is outside the run bridge allowlist")
+			return
+		}
+		token, ok := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
+		if !ok || strings.TrimSpace(token) == "" {
+			writeWorkflowBridgeError(w, http.StatusUnauthorized, contract.ErrorUnauthorized,
+				"run bridge requires Authorization: Bearer <WEFTY_RUN_TOKEN>")
+			return
+		}
+		next.ServeHTTP(w, request)
+	})
+}
+
+// runBridgeRoutes mirrors l3.RunTokenRoutes exactly.
+var runBridgeRoutes = []bridgeRoute{
+	{Method: http.MethodPost, Path: "/v1/runs"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/lineage"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/logs"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/execution"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/result"},
+	{Method: http.MethodPost, Path: "/v1/runs/{run_id}/envelopes"},
+	{Method: http.MethodPost, Path: "/v1/runs/{run_id}/gates"},
 }
 
 // controlPlaneHandler restricts the attempt-credential surface to the exact

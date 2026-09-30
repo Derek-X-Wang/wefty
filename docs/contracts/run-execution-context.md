@@ -119,14 +119,37 @@ credentials intentionally.
 The node agent replaces internal `wefty://` service addresses with per-attempt
 `http://127.0.0.1` bridge URLs before starting the workflow process. The bridge
 is torn down with the attempt and forwards L3 calls through the agent's
-authenticated Fabric connection. Run status, lineage, and log reads use L3's
-run-token-scoped endpoints. The same attempt-local bridge also exposes an `/l1`
-surface restricted to the attempt-credential route allowlist. It is transport
-only: the agent's Fabric identity carries the agent principal tag, which no L1
-client route accepts, so a request without a valid attempt credential is
-refused by L1 regardless of how it reached the bridge. Callers must still send
-the run token or the attempt credential, and no Fabric tag privilege is
-projected into the workflow process.
+authenticated Fabric connection. Because that connection carries the agent's
+own Node identity, and L3 authorizes some routes by Node identity alone (the
+Computer-pass mint and revocation routes), the bridge's `/l3` surface forwards
+only the exact method and path set on which L3 serves a run token
+(`l3.RunTokenRoutes`, mirrored by the bridge and checked against it):
+
+| Method | Path |
+|---|---|
+| `POST` | `/v1/runs` (a direct child of the token's own run) |
+| `GET` | `/v1/runs/{run_id}` |
+| `GET` | `/v1/runs/{run_id}/lineage` |
+| `GET` | `/v1/runs/{run_id}/logs` |
+| `GET` | `/v1/runs/{run_id}/execution` |
+| `GET` | `/v1/runs/{run_id}/result` |
+| `POST` | `/v1/runs/{run_id}/envelopes` |
+| `POST` | `/v1/runs/{run_id}/gates` |
+
+Every other `/l3` method or path, including the Run listings, rerun, the
+reserved cancel, Workflow administration, `/v1/computer/self`, and every
+`/v1/computer-token/*` and `/v1/computers/*` route, is refused at the bridge
+with a typed `403 forbidden` and never reaches L3. A request on an allowlisted
+route that carries no `Authorization: Bearer` credential is refused with a
+typed `401 unauthorized` and never reaches L3 either, so L3's credential-free
+Fabric-tag path cannot be exercised as the agent. L3 still decides the run
+token's scope on every forwarded request. The same attempt-local bridge also
+exposes an `/l1` surface restricted to the attempt-credential route allowlist.
+It is transport only: the agent's Fabric identity carries the agent principal
+tag, which no L1 client route accepts, so a request without a valid attempt
+credential is refused by L1 regardless of how it reached the bridge. Callers
+must still send the run token or the attempt credential, and no Fabric
+privilege of the agent is projected into the workflow process.
 
 Linux and process workloads receive the loopback bridge URL. A Mac OCI
 workload receives `host.lima.internal:<port>` after the agent discovers and
