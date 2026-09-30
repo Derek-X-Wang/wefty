@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,7 +242,7 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	} else {
 		mux := http.NewServeMux()
 		if !bridge.suppressRunLedger {
-			mux.Handle("/l3/", runLedgerHandler(l3Proxy))
+			mux.Handle("/l3/", runLedgerHandler(newRunLedgerProxy(bridge.l3)))
 		}
 		if bridge.l1 != nil {
 			mux.Handle("/l1/", bridge.controlPlaneHandler(
@@ -299,21 +300,93 @@ func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 // a workload could revoke or re-mint every Computer pass on its node (#595).
 // Requiring a bearer keeps L3's no-credential Fabric-tag fallback out of reach
 // too: the workload gets the run token's authority, never the agent's.
+//
+// This inbound check only refuses early. A request can name Authorization in
+// its Connection header, and the proxy then strips the credential after this
+// check has seen it; runLedgerGuard repeats both checks on the outbound
+// request, so a stripped credential fails closed there.
 func runLedgerHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if !bridgeRouteAllowed(runBridgeRoutes, request.Method, strings.TrimPrefix(request.URL.Path, "/l3")) {
-			writeWorkflowBridgeError(w, http.StatusForbidden, contract.ErrorForbidden,
-				"route is outside the run bridge allowlist")
+		if connectionNamesAuthorization(request.Header) {
+			writeWorkflowBridgeError(w, http.StatusUnauthorized, contract.ErrorUnauthorized,
+				"run bridge refuses a Connection header that would drop Authorization")
 			return
 		}
-		token, ok := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
-		if !ok || strings.TrimSpace(token) == "" {
-			writeWorkflowBridgeError(w, http.StatusUnauthorized, contract.ErrorUnauthorized,
-				"run bridge requires Authorization: Bearer <WEFTY_RUN_TOKEN>")
+		if refusal := checkRunLedgerRequest(request.Method, strings.TrimPrefix(request.URL.Path, "/l3"), request.Header); refusal != nil {
+			writeWorkflowBridgeError(w, refusal.status, refusal.code, refusal.message)
 			return
 		}
 		next.ServeHTTP(w, request)
 	})
+}
+
+// newRunLedgerProxy forwards to L3 through runLedgerGuard. The inbound
+// runLedgerHandler refuses early; the guard is the enforcement, because it
+// sees the request L3 will actually receive.
+func newRunLedgerProxy(transport http.RoundTripper) *httputil.ReverseProxy {
+	proxy := workflowReverseProxy(runLedgerGuard{next: transport}, "/l3", contract.ErrorInternal)
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		var refusal *runLedgerRefusal
+		if errors.As(err, &refusal) {
+			writeWorkflowBridgeError(w, refusal.status, refusal.code, refusal.message)
+			return
+		}
+		writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorInternal, err.Error())
+	}
+	return proxy
+}
+
+// runLedgerGuard is the run surface's last check before the wire. It sees the
+// request exactly as the proxy will send it to L3: path already stripped of
+// /l3 and hop-by-hop headers already removed.
+type runLedgerGuard struct{ next http.RoundTripper }
+
+func (g runLedgerGuard) RoundTrip(out *http.Request) (*http.Response, error) {
+	path := out.URL.Path
+	if decoded, err := url.PathUnescape(out.URL.EscapedPath()); err != nil || decoded != path {
+		// The bytes on the wire would name a different path from the one
+		// checked; refuse rather than guess which one L3 routes.
+		path = ""
+	}
+	if refusal := checkRunLedgerRequest(out.Method, path, out.Header); refusal != nil {
+		if out.Body != nil {
+			_ = out.Body.Close()
+		}
+		return nil, refusal
+	}
+	return g.next.RoundTrip(out)
+}
+
+type runLedgerRefusal struct {
+	status  int
+	code    contract.ErrorCode
+	message string
+}
+
+func (r *runLedgerRefusal) Error() string { return r.message }
+
+func checkRunLedgerRequest(method, path string, header http.Header) *runLedgerRefusal {
+	if !bridgeRouteAllowed(runBridgeRoutes, method, path) {
+		return &runLedgerRefusal{status: http.StatusForbidden, code: contract.ErrorForbidden,
+			message: "route is outside the run bridge allowlist"}
+	}
+	token, ok := strings.CutPrefix(header.Get("Authorization"), "Bearer ")
+	if !ok || strings.TrimSpace(token) == "" {
+		return &runLedgerRefusal{status: http.StatusUnauthorized, code: contract.ErrorUnauthorized,
+			message: "run bridge requires Authorization: Bearer <WEFTY_RUN_TOKEN>"}
+	}
+	return nil
+}
+
+func connectionNamesAuthorization(header http.Header) bool {
+	for _, value := range header.Values("Connection") {
+		for token := range strings.SplitSeq(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "Authorization") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // runBridgeRoutes mirrors l3.RunTokenRoutes exactly.

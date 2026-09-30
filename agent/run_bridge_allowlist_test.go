@@ -280,3 +280,46 @@ func TestOrdinaryRunBridgeCannotRevokeOrRemintNeighbourComputerPasses(t *testing
 		t.Fatalf("neighbour Computer pass after the attempts: status=%d body=%s; want it still authenticating", response.StatusCode, body)
 	}
 }
+
+// A Connection header that names Authorization makes the proxy strip the
+// credential as hop-by-hop after the inbound check has seen it. L3 would then
+// fall back to the agent's Fabric identity (#595 review).
+func TestRunBridgeRefusesAConnectionHeaderThatWouldDropAuthorization(t *testing.T) {
+	bridge, recorder := startRunBridgeWithRecordingL3(t)
+	for _, connection := range [][]string{
+		{"Authorization"},
+		{"authorization"},
+		{"AUTHORIZATION"},
+		{"keep-alive, authorization"},
+		{"keep-alive,Authorization "},
+		{"keep-alive", "Authorization"},
+	} {
+		for _, route := range []struct{ method, path string }{
+			{http.MethodGet, "/v1/runs/run-other"},
+			{http.MethodPost, "/v1/runs"},
+		} {
+			request, err := http.NewRequestWithContext(t.Context(), route.method, bridge.l3Endpoint+route.path, strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer anything")
+			for _, value := range connection {
+				request.Header.Add("Connection", value)
+			}
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var typed contract.ErrorResponse
+			decodeErr := json.NewDecoder(response.Body).Decode(&typed)
+			response.Body.Close()
+			if response.StatusCode != http.StatusUnauthorized || decodeErr != nil || typed.Error.Code != contract.ErrorUnauthorized {
+				t.Errorf("Connection %q on %s %s: status=%d code=%q; want 401 %q", connection, route.method, route.path,
+					response.StatusCode, typed.Error.Code, contract.ErrorUnauthorized)
+			}
+		}
+	}
+	if hits := recorder.recorded(); len(hits) != 0 {
+		t.Fatalf("requests whose credential the proxy dropped reached L3: %q", hits)
+	}
+}

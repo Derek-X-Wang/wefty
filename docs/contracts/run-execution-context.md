@@ -142,8 +142,11 @@ reserved cancel, Workflow administration, `/v1/computer/self`, and every
 with a typed `403 forbidden` and never reaches L3. A request on an allowlisted
 route that carries no `Authorization: Bearer` credential is refused with a
 typed `401 unauthorized` and never reaches L3 either, so L3's credential-free
-Fabric-tag path cannot be exercised as the agent. L3 still decides the run
-token's scope on every forwarded request. The same attempt-local bridge also
+Fabric-tag path cannot be exercised as the agent. The bridge judges both rules
+on the request as it will leave for L3, after hop-by-hop headers are removed:
+a request whose `Connection` header names `Authorization` would lose its
+credential in transit, so it is refused with the same typed `401`. L3 still
+decides the run token's scope on every forwarded request. The same attempt-local bridge also
 exposes an `/l1` surface restricted to the attempt-credential route allowlist.
 It is transport only: the agent's Fabric identity carries the agent principal
 tag, which no L1 client route accepts, so a request without a valid attempt
