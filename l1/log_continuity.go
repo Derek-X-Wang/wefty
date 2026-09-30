@@ -108,7 +108,7 @@ func checkRetainedLogReplay(ctx context.Context, tx *sql.Tx, attemptID string, e
 	case previousEnd >= int64(event.Sequence):
 		return conflict
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT sequence, sequence_end, event_json FROM log_events
+	rows, err := tx.QueryContext(ctx, `SELECT sequence, sequence_end, event_json, bytes FROM log_events
 		WHERE attempt_id=? AND stream=? AND sequence>=? AND sequence<=? ORDER BY sequence LIMIT 2`,
 		attemptID, event.Stream, event.Sequence, end)
 	if err != nil {
@@ -119,13 +119,14 @@ func checkRetainedLogReplay(ctx context.Context, tx *sql.Tx, attemptID string, e
 	matched := false
 	for rows.Next() {
 		var start, stop int64
-		var stored []byte
-		if err := rows.Scan(&start, &stop, &stored); err != nil {
+		var stored, payload []byte
+		if err := rows.Scan(&start, &stop, &stored, &payload); err != nil {
 			return internalError(err, "scan retained log row inside a replay")
 		}
 		intersecting++
+		document := logEventDocument(stored, payload)
 		matched = start == int64(event.Sequence) && stop == int64(end) &&
-			(bytes.Equal(stored, originalRaw) || bytes.Equal(stored, raw))
+			(bytes.Equal(document, originalRaw) || bytes.Equal(document, raw))
 	}
 	if err := rows.Err(); err != nil {
 		return internalError(err, "iterate retained log rows inside a replay")
