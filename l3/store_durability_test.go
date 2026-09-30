@@ -3,8 +3,11 @@ package l3
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/internal/durable"
@@ -15,8 +18,8 @@ import (
 // F_FULLFSYNC for commits and checkpoints (#599). Elsewhere nothing is added.
 // The pragmas are per connection, so two pooled connections are checked.
 func TestTheL3LedgerCarriesTheDurabilityPragmas(t *testing.T) {
-	durable.EnableSQLiteFullFsyncForTests()
-	t.Cleanup(durable.DisableSQLiteFullFsyncForTests)
+	sqliteFullFsyncOffInTests.Store(false)
+	t.Cleanup(func() { sqliteFullFsyncOffInTests.Store(true) })
 	want := 0
 	if runtime.GOOS == "darwin" {
 		want = 1
@@ -47,6 +50,42 @@ func TestTheL3LedgerCarriesTheDurabilityPragmas(t *testing.T) {
 			if value != want {
 				t.Fatalf("%s: PRAGMA %s = %d on %s, want %d", label, pragma, value, runtime.GOOS, want)
 			}
+		}
+	}
+}
+
+// TestL3DurabilityPragmasMatchTheSharedOnes: l3 keeps its own copy of the
+// pragma list because ADR-0006 keeps its non-test imports to contract, fabric
+// and l1. The copy must not drift from internal/durable's.
+func TestL3DurabilityPragmasMatchTheSharedOnes(t *testing.T) {
+	sqliteFullFsyncOffInTests.Store(false)
+	durable.EnableSQLiteFullFsyncForTests()
+	t.Cleanup(func() {
+		sqliteFullFsyncOffInTests.Store(true)
+		durable.DisableSQLiteFullFsyncForTests()
+	})
+	if got, want := sqliteDurabilityPragmas(), durable.SQLitePragmas(); !slices.Equal(got, want) {
+		t.Fatalf("l3 pragmas = %v, internal/durable = %v", got, want)
+	}
+}
+
+// TestOnlyTestsTurnOffTheL3DurabilityPragmas: the switch must never reach a
+// production binary, so no non-test l3 file may set it.
+func TestOnlyTestsTurnOffTheL3DurabilityPragmas(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		payload, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(payload), "sqliteFullFsyncOffInTests.Store(") {
+			t.Fatalf("%s sets the test-only full-fsync switch", file)
 		}
 	}
 }

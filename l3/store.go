@@ -14,13 +14,14 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
-	"github.com/Derek-X-Wang/wefty/internal/durable"
 	_ "modernc.org/sqlite"
 )
 
@@ -57,7 +58,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	query.Add("_pragma", "secure_delete(1)")
 	// An acknowledged commit must survive power loss, which on darwin takes
 	// F_FULLFSYNC (#599).
-	for _, pragma := range durable.SQLitePragmas() {
+	for _, pragma := range sqliteDurabilityPragmas() {
 		query.Add("_pragma", pragma)
 	}
 	query.Set("_txlock", "immediate")
@@ -82,6 +83,28 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	return store, nil
 }
+
+// sqliteDurabilityPragmas are the per-connection pragmas that make an
+// acknowledged commit survive power loss: on darwin a plain fsync leaves the
+// commit in the drive's cache, so SQLite is told to use F_FULLFSYNC for
+// commits and checkpoints; elsewhere fsync is enough (#599).
+//
+// It duplicates internal/durable.SQLitePragmas on purpose. ADR-0006 keeps
+// non-test l3 code to contract, fabric and l1 from this repository, so an L3
+// stays buildable from the published contract alone; a test pins the two
+// lists equal.
+func sqliteDurabilityPragmas() []string {
+	if runtime.GOOS != "darwin" || sqliteFullFsyncOffInTests.Load() {
+		return nil
+	}
+	return []string{"fullfsync(1)", "checkpoint_fullfsync(1)"}
+}
+
+// sqliteFullFsyncOffInTests is set only by this package's TestMain, which
+// opens test stores without F_FULLFSYNC: it makes the suite many times slower
+// on darwin and proves nothing a test asserts. No non-test code sets it, and
+// TestOnlyTestsTurnOffTheL3DurabilityPragmas fails if any does.
+var sqliteFullFsyncOffInTests atomic.Bool
 
 func (s *Store) initialize(ctx context.Context) error {
 	var mode string
