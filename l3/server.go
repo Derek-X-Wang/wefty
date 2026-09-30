@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -90,11 +91,22 @@ func (s *Server) ListenAndServe(ctx context.Context, network, address string) er
 	return s.Serve(ctx, listener)
 }
 
+// Serve returns only after its reconciler has stopped, so a caller may close
+// the Store as soon as Serve returns without racing a reconcile pass that is
+// still writing the ledger.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	serveCtx, stopReconciler := context.WithCancel(ctx)
-	defer stopReconciler()
+	var background sync.WaitGroup
+	defer func() {
+		stopReconciler()
+		background.Wait()
+	}()
 	if s.reconciler != nil {
-		go func() { _ = s.reconciler.Run(serveCtx) }()
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			_ = s.reconciler.Run(serveCtx)
+		}()
 	}
 	httpServer := &http.Server{Handler: s.handler}
 	stopped := make(chan struct{})
