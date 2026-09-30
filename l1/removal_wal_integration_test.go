@@ -25,42 +25,40 @@ import (
 
 const (
 	removalWALSecret = "removal-secret-6e0a27"
-	// removalWALReaderHold is how long the reader keeps its snapshot. It is
-	// well past the checkpoint handle's wait and well short of the main
-	// pool's, so a removal that waits for the reader shows up as time.
-	removalWALReaderHold = 2 * time.Second
-	// removalWALPromptBound is what a removal, or a writer behind its one
-	// checkpoint attempt, may take while the reader holds: the checkpoint
-	// handle's wait plus scheduling, with room for a slow runner.
+	// removalWALPromptBound is what a removal, or a writer behind a removal's
+	// checkpoint attempt, may take while a reader holds the WAL: about one
+	// checkpoint handle wait plus scheduling, with room for a slow runner.
 	removalWALPromptBound = time.Second
+	// removalWALReaderWatchdog releases the held reader only if the test
+	// hangs, so a removal that waits for the reader fails on time rather
+	// than blocking forever. The reader is otherwise released by the test.
+	removalWALReaderWatchdog = 10 * time.Second
+	// concurrentRemovals is enough removals that, taking one checkpoint wait
+	// each in turn behind the write lock, they would exceed the bound. It is
+	// kept small because removals released together from one checkpoint's
+	// write-lock wait also retry the lock in step, about one per 100 ms of
+	// SQLite's busy-handler backoff, which is not what this test measures.
+	concurrentRemovals = 5
 )
 
 func TestServiceRemovalDefersWALTruncationPastAHeldReader(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "service-removal.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	spec := removalServiceSpec("removal-held-reader", nil)
-	spec.Execution.SensitiveEnv = map[string]string{"SERVICE_SECRET": removalWALSecret}
-	job, _, err := store.CreateJob(context.Background(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertRemovalDefersWALTruncation(t, store, path, func() error {
-		_, err := store.RemoveService(context.Background(), job.JobID)
-		return err
-	})
+	store, path := openRemovalWALStore(t)
+	removals := createRemovalServices(t, store, 1)
+	assertRemovalsDeferWALTruncation(t, store, path, removals)
+}
+
+// Removals under one held reader coalesce: a removal does not queue for the
+// checkpoint handle behind another removal, and does not retry a checkpoint
+// that has just been deferred, so none of them takes more than about one
+// checkpoint wait.
+func TestConcurrentServiceRemovalsUnderAHeldReaderEachReturnWithinOneWait(t *testing.T) {
+	store, path := openRemovalWALStore(t)
+	removals := createRemovalServices(t, store, concurrentRemovals)
+	assertRemovalsDeferWALTruncation(t, store, path, removals)
 }
 
 func TestComputerRemovalDefersWALTruncationPastAHeldReader(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "computer-removal.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
+	store, path := openRemovalWALStore(t)
 	spec := computerCapabilityJobSpec("computer:removal-held-reader")
 	spec.Execution.SensitiveEnv = map[string]string{"COMPUTER_SECRET": removalWALSecret}
 	computer, _, err := store.CreateComputer(context.Background(), CreateComputerRequest{
@@ -69,23 +67,52 @@ func TestComputerRemovalDefersWALTruncationPastAHeldReader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRemovalDefersWALTruncation(t, store, path, func() error {
+	assertRemovalsDeferWALTruncation(t, store, path, []func() error{func() error {
 		_, err := store.RemoveComputer(context.Background(), computer.ComputerID, ComputerRemoveRequest{
 			ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
 		})
 		return err
-	})
+	}})
 }
 
-// assertRemovalDefersWALTruncation runs remove while a reader holds a WAL
-// snapshot. The removal and an unrelated writer finish within the checkpoint
-// handle's short wait, and once the reader leaves the sweep truncates the WAL
-// because the removal marked the truncation due.
-func assertRemovalDefersWALTruncation(t *testing.T, store *Store, path string, remove func() error) {
+func openRemovalWALStore(t *testing.T) (*Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "removal.sqlite")
+	store, err := OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store, path
+}
+
+func createRemovalServices(t *testing.T, store *Store, count int) []func() error {
+	t.Helper()
+	removals := make([]func() error, 0, count)
+	for i := range count {
+		spec := removalServiceSpec(fmt.Sprintf("removal-held-reader-%d", i), nil)
+		spec.Execution.SensitiveEnv = map[string]string{"SERVICE_SECRET": removalWALSecret}
+		job, _, err := store.CreateJob(context.Background(), spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		removals = append(removals, func() error {
+			_, err := store.RemoveService(context.Background(), job.JobID)
+			return err
+		})
+	}
+	return removals
+}
+
+// assertRemovalsDeferWALTruncation runs removals concurrently while a reader
+// holds a WAL snapshot. Every removal and an unrelated writer finish within
+// about one checkpoint wait, and once the reader leaves the sweep truncates
+// the WAL because the removals marked the truncation due.
+func assertRemovalsDeferWALTruncation(t *testing.T, store *Store, path string, removals []func() error) {
 	t.Helper()
 	ctx := context.Background()
 	// The first sweep in a process always truncates. After it the sweep owes
-	// nothing, so the later sweep truncates only if the removal said so.
+	// nothing, so the later sweep truncates only if a removal said so.
 	if sweep, err := store.SweepScrubbedSecrets(ctx); err != nil || !sweep.TruncatedWAL {
 		t.Fatalf("settling sweep = %+v err %v, want the WAL truncated", sweep, err)
 	}
@@ -106,46 +133,67 @@ func assertRemovalDefersWALTruncation(t *testing.T, store *Store, path string, r
 	if err := held.QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	released := make(chan struct{})
-	time.AfterFunc(removalWALReaderHold, func() {
-		_ = held.Rollback()
-		close(released)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { _ = held.Rollback() }) }
+	defer release()
+	watchdogFired := make(chan struct{})
+	watchdog := time.AfterFunc(removalWALReaderWatchdog, func() {
+		close(watchdogFired)
+		release()
 	})
+	defer watchdog.Stop()
 
 	writerDone := make(chan time.Duration, 1)
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		began := time.Now()
 		if _, _, err := store.CreateJobAs(ctx, validJobSpec("removal-held-reader-writer", nil), JobOrigin{}); err != nil {
-			t.Errorf("writer behind the removal: %v", err)
+			t.Errorf("writer behind the removals: %v", err)
 		}
 		writerDone <- time.Since(began)
 	}()
-	start := time.Now()
-	if err := remove(); err != nil {
-		t.Fatalf("removal under a held reader: %v", err)
+	elapsed := make([]time.Duration, len(removals))
+	errs := make([]error, len(removals))
+	var wg sync.WaitGroup
+	for i, remove := range removals {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			began := time.Now()
+			errs[i] = remove()
+			elapsed[i] = time.Since(began)
+		}()
 	}
-	if elapsed := time.Since(start); elapsed > removalWALPromptBound {
-		t.Fatalf("removal under a %v reader took %v, want at most about the %v checkpoint wait",
-			removalWALReaderHold, elapsed, secretWALCheckpointWait)
-	}
-	if waited := <-writerDone; waited > removalWALPromptBound {
-		t.Fatalf("a writer behind the removal waited %v, want at most about the %v checkpoint wait",
-			waited, secretWALCheckpointWait)
-	}
+	wg.Wait()
+	waited := <-writerDone
+	t.Logf("removals took %v; writer waited %v", elapsed, waited)
 	select {
-	case <-released:
-		t.Fatal("the reader left before the removal was checked; the probe proved nothing")
+	case <-watchdogFired:
+		t.Fatalf("the removals waited for the reader until the %v watchdog released it: %v",
+			removalWALReaderWatchdog, elapsed)
 	default:
+	}
+	for i := range removals {
+		if errs[i] != nil {
+			t.Fatalf("removal %d under a held reader: %v", i, errs[i])
+		}
+		if elapsed[i] > removalWALPromptBound {
+			t.Fatalf("removal %d of %d under a held reader took %v (all: %v), want at most about one %v checkpoint wait",
+				i, len(removals), elapsed[i], elapsed, secretWALCheckpointWait)
+		}
+	}
+	if waited > removalWALPromptBound {
+		t.Fatalf("a writer behind the removals waited %v, want at most about one %v checkpoint wait",
+			waited, secretWALCheckpointWait)
 	}
 	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() == 0 {
 		t.Fatalf("WAL under a held reader = %v err %v, want its frames still there", info, err)
 	}
 
-	<-released
+	release()
 	sweep, err := store.SweepScrubbedSecrets(ctx)
 	if err != nil || !sweep.TruncatedWAL || sweep.TruncationDeferred {
-		t.Fatalf("sweep after the reader left = %+v err %v, want the removal's truncation done", sweep, err)
+		t.Fatalf("sweep after the reader left = %+v err %v, want the removals' truncation done", sweep, err)
 	}
 	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() != 0 {
 		t.Fatalf("WAL after the sweep = %v err %v, want it truncated", info, err)

@@ -141,20 +141,32 @@ func (s *Store) SweepScrubbedSecrets(ctx context.Context) (SecretScrubSweep, err
 	return sweep, nil
 }
 
-// truncateSecretWAL makes one TRUNCATE checkpoint attempt on the short-wait
-// handle. It reports false, without error, when SQLite could not finish
-// within that handle's wait: the checkpoint answers busy, or refuses with
-// SQLITE_BUSY because another checkpoint is running.
+// truncateSecretWAL makes the sweep's one TRUNCATE checkpoint attempt on the
+// short-wait handle, after any removal attempt already in flight. It reports
+// false, without error, when SQLite could not finish within that handle's
+// wait.
 func (s *Store) truncateSecretWAL(ctx context.Context) (bool, error) {
+	s.walCheckpointMu.Lock()
+	defer s.walCheckpointMu.Unlock()
+	return s.checkpointSecretWALOnce(ctx)
+}
+
+// checkpointSecretWALOnce runs one TRUNCATE checkpoint on the short-wait
+// handle; its caller holds walCheckpointMu. It reports false, without error,
+// when the checkpoint answers busy or refuses with SQLITE_BUSY because
+// another checkpoint is running, and records the outcome for removals.
+func (s *Store) checkpointSecretWALOnce(ctx context.Context) (bool, error) {
 	var busy, logFrames, checkpointedFrames int
 	err := s.checkpointDB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames)
 	var sqliteErr sqliteErrorCoder
 	if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteBusyPrimaryCode {
+		s.walTruncationDeferred.Store(true)
 		return false, nil
 	}
 	if err != nil {
 		return false, internalError(err, "truncate secret-bearing SQLite WAL")
 	}
+	s.walTruncationDeferred.Store(busy != 0)
 	return busy == 0, nil
 }
 
@@ -172,13 +184,21 @@ func markSecretWALTruncationDue(ctx context.Context, tx *sql.Tx) error {
 }
 
 // truncateRemovalSecretWAL is a removal's best-effort truncation of the WAL
-// its committed scrub wrote into. It makes the sweep's one attempt on the
-// sweep's short-wait handle. A reader holding the WAL defers it: the removal
-// responds instead of waiting, and the writers queued behind the checkpoint
-// are held off only that handle's wait, never the main pool's (#598). The
-// removal transaction marked the truncation due, so the sweep finishes it.
+// its committed scrub wrote into. The removal transaction marked the
+// truncation due, so the sweep finishes whatever this leaves, and a removal
+// never waits for the WAL (#598). It tries at most once, on the sweep's
+// short-wait handle, and not at all when another checkpoint is running or the
+// last one was deferred and no truncation has succeeded since: a reader is
+// then likely still holding the WAL. Removals therefore coalesce under a held
+// reader. Each attempt holds off writers for the handle's wait, and the
+// removals queued on the write lock behind one would otherwise each add
+// another wait in turn.
 func (s *Store) truncateRemovalSecretWAL(ctx context.Context) error {
-	_, err := s.truncateSecretWAL(ctx)
+	if s.walTruncationDeferred.Load() || !s.walCheckpointMu.TryLock() {
+		return nil
+	}
+	defer s.walCheckpointMu.Unlock()
+	_, err := s.checkpointSecretWALOnce(ctx)
 	return err
 }
 

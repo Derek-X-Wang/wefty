@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -96,6 +97,11 @@ type Store struct {
 	secretWALMu         sync.Mutex
 	secretWALGeneration int64
 	secretWALTruncated  bool
+	// walCheckpointMu admits one checkpoint on checkpointDB at a time; the
+	// sweep waits for it and a removal only tries it. walTruncationDeferred
+	// is true from a deferred checkpoint until one succeeds.
+	walCheckpointMu       sync.Mutex
+	walTruncationDeferred atomic.Bool
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
