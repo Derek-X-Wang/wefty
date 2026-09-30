@@ -13,7 +13,7 @@ agent systems put that brain in a service and send your code to it; wefty keeps
 the trust boundary inside your cluster. Future cloud services may provide
 connectivity or capacity, but they will not host the control plane.
 
-**Pre-release. Core loop implemented and CI-tested; v0.1 single-machine acceptance pending.**
+**Pre-release. The v0.1 single-machine loop is tagged, and OCI workloads have shipped since; nothing is a compatibility promise yet.**
 
 ## Architecture at a glance
 
@@ -62,13 +62,15 @@ npm run build
 plain-Fabric processes. Every participant must use the same `plain-`-prefixed
 value; production authority must use the configured non-plain Fabric instead.
 
-Pre-1.0 schema changes are applied only to newly created databases; there is
-no migration mechanism: L1 and the agent's durable evidence schema are edited
-in place, with no `ALTER TABLE` compatibility path. In particular, spool
-attempts now persist workload class so the 64 MiB one-shot budget and 32 MiB
-service ring remain distinct after restart. If this state root came from an
-older checkout, stop the stack and delete the disposable L1 and agent-spool
-SQLite files (including their `-wal` and `-shm` sidecars) before restarting:
+Pre-1.0 state has no versioned migration framework and no promise of
+compatibility with older checkouts. At startup L1 and the agent spool add some
+missing columns in place (`ALTER TABLE ... ADD COLUMN`) and L1 rebuilds a few
+tables whose constraints changed, but other schema changes, such as the spool's
+per-attempt workload class that keeps the 64 MiB one-shot budget and 32 MiB
+service ring distinct after restart, are only in the `CREATE TABLE` blocks and
+reach new databases alone. If this state root came from an older checkout,
+stop the stack and delete the disposable L1 and agent-spool SQLite files
+(including their `-wal` and `-shm` sidecars) before restarting:
 
 ```sh
 test -n "$WEFTY_STATE_ROOT"
@@ -167,10 +169,11 @@ Run `wefty help` for the complete command list and global flags.
 
 ## Roadmap
 
-The next proof point is v0.1 acceptance of the single-machine plain-fabric
-dogfood loop. The build order then adds OCI workloads through containerd and
-Lima, followed by a Daytona sandbox connector and a Fly Machines node
-connector. These are pre-release milestones, not compatibility promises.
+v0.1, the single-machine plain-fabric dogfood loop, is tagged. OCI workloads
+through containerd on Linux and through Lima on macOS have shipped since, along
+with persistent Computers built on them. The build order next adds a Daytona
+sandbox connector and a Fly Machines node connector. These are pre-release
+milestones, not compatibility promises.
 
 ## Project decisions and contributions
 

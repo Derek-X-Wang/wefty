@@ -111,7 +111,7 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 		if err := tx.Commit(); err != nil {
 			return Job{}, internalError(err, "commit idempotent service removal")
 		}
-		if err := s.checkpointSecretWAL(ctx); err != nil {
+		if err := s.truncateRemovalSecretWAL(ctx); err != nil {
 			return Job{}, err
 		}
 		return job, nil
@@ -124,6 +124,9 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 		return Job{}, internalError(err, "scrub service specification")
 	}
 	if err := scrubServiceControllerState(ctx, tx, jobID, scrubbedSpec, now); err != nil {
+		return Job{}, err
+	}
+	if err := markSecretWALTruncationDue(ctx, tx); err != nil {
 		return Job{}, err
 	}
 
@@ -142,7 +145,7 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 		if err := tx.Commit(); err != nil {
 			return Job{}, internalError(err, "commit unbound service removal")
 		}
-		if err := s.checkpointSecretWAL(ctx); err != nil {
+		if err := s.truncateRemovalSecretWAL(ctx); err != nil {
 			return Job{}, err
 		}
 		return tombstone.job(), nil
@@ -170,7 +173,7 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 	if err := tx.Commit(); err != nil {
 		return Job{}, internalError(err, "commit service removal")
 	}
-	if err := s.checkpointSecretWAL(ctx); err != nil {
+	if err := s.truncateRemovalSecretWAL(ctx); err != nil {
 		return Job{}, err
 	}
 	return job, nil
@@ -1051,26 +1054,6 @@ func deleteServiceRows(ctx context.Context, tx *sql.Tx, jobID string) error {
 		return internalError(err, "delete removed service job")
 	}
 	return nil
-}
-
-func (s *Store) checkpointSecretWAL(ctx context.Context) error {
-	for {
-		var busy, logFrames, checkpointedFrames int
-		err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames)
-		if err != nil {
-			return internalError(err, "truncate secret-bearing SQLite WAL")
-		}
-		if busy == 0 {
-			return nil
-		}
-		timer := time.NewTimer(10 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return internalError(ctx.Err(), fmt.Sprintf("retry SQLite WAL truncation (%d/%d frames)", checkpointedFrames, logFrames))
-		case <-timer.C:
-		}
-	}
 }
 
 func readServiceRemoval(ctx context.Context, q queryer, jobID string) (serviceRemovalRow, error) {

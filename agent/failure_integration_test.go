@@ -2880,6 +2880,157 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaims(t *testing.T) {
 	_ = first
 }
 
+// #596: the one-slot test above never runs the claim loop while a slot is
+// free. With production intervals the agent polls claims every second but
+// learns operator intent only from the 15 s heartbeat, so a free slot asks L1
+// for work under disabled intent many times before the heartbeat lands. That
+// answer must read as "no work": the resident attempt finishes, the agent
+// stays up, and re-enabling intent resumes claiming.
+func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
+	start := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(start)
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, clock, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	resident := createAgentTestJob(t, store, "claims-disabled-free-slot-resident")
+	runner := newSlotRefillRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
+		Capabilities:      map[string]bool{"kind:process": true},
+		HeartbeatInterval: DefaultHeartbeatInterval, ClaimInterval: DefaultClaimInterval, RenewalInterval: DefaultRenewalInterval,
+		MaxOneshotSlots:  2,
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+
+	residentAttemptID := runner.waitStarted(t)
+	// The free slot has already been told "no work" once and now waits one
+	// claim interval before asking again.
+	waitForClaimTick(t, clock, done, start.Add(DefaultClaimInterval))
+	if _, err := store.SetNodeClaimsByOperator(context.Background(), "node-1", "operator", l1.NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	queued := createAgentTestJob(t, store, "claims-disabled-free-slot-queued")
+	assertClaimsDisabledHolds := func(phase string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			t.Fatalf("%s: agent Run returned %v, want the agent to stay up", phase, err)
+		default:
+		}
+		if state := nodeAgent.Status().State; state == LifecycleDraining || state == LifecycleQuarantined {
+			t.Fatalf("%s: agent state = %q", phase, state)
+		}
+		select {
+		case attemptID := <-runner.started:
+			t.Fatalf("%s: claims-disabled agent started attempt %q", phase, attemptID)
+		default:
+		}
+		job, err := store.GetJob(context.Background(), queued.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.State != contract.JobQueued {
+			t.Fatalf("%s: queued job state = %q, want queued", phase, job.State)
+		}
+	}
+
+	// Seconds 1..14: every tick the free slot asks L1 for work while the agent
+	// still believes claims are enabled. Second 10 also renews the resident
+	// attempt's lease under disabled intent.
+	for second := 1; second < 15; second++ {
+		clock.Advance(DefaultClaimInterval)
+		waitForClaimTick(t, clock, done, start.Add(time.Duration(second+1)*DefaultClaimInterval))
+	}
+	assertClaimsDisabledHolds("before the heartbeat")
+
+	// Second 15: the heartbeat delivers the intent; the claim loop idles locally.
+	clock.Advance(DefaultClaimInterval)
+	waitForClaimTick(t, clock, done, start.Add(16*DefaultClaimInterval))
+	runner.release(residentAttemptID)
+	if _, err := waitForFailureJobState(store, resident.JobID, contract.JobSucceeded, 5*time.Second); err != nil {
+		t.Fatalf("resident attempt under disabled claims: %v", err)
+	}
+	for second := 16; second < 18; second++ {
+		clock.Advance(DefaultClaimInterval)
+		waitForClaimTick(t, clock, done, start.Add(time.Duration(second+1)*DefaultClaimInterval))
+	}
+	assertClaimsDisabledHolds("after the resident attempt finished")
+
+	if _, err := store.SetNodeClaimsByOperator(context.Background(), "node-1", "operator", l1.NodeIntentRequest{
+		ClaimsEnabled: true, IntentRevision: 1, Reason: "maintenance over",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The agent learns the re-enabled intent from the next heartbeat (second
+	// 30) and resumes claiming on the following claim tick.
+	var resumedAttemptID string
+	for step := 0; step < 30 && resumedAttemptID == ""; step++ {
+		clock.Advance(DefaultClaimInterval)
+		select {
+		case resumedAttemptID = <-runner.started:
+		case err := <-done:
+			t.Fatalf("agent Run returned %v while waiting for claims to resume", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if resumedAttemptID == "" {
+		t.Fatal("re-enabled claims did not resume claiming")
+	}
+	runner.release(resumedAttemptID)
+	if _, err := waitForFailureJobState(store, queued.JobID, contract.JobSucceeded, 5*time.Second); err != nil {
+		t.Fatalf("resumed job: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("claims-disabled free-slot daemon exit = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent did not return after outer cancellation")
+	}
+}
+
+// waitForClaimTick waits until some agent timer is armed for deadline, failing
+// fast if the agent exits instead.
+func waitForClaimTick(t *testing.T, clock *manualClock, done <-chan error, deadline time.Time) {
+	t.Helper()
+	waitUntil := time.Now().Add(5 * time.Second)
+	for time.Now().Before(waitUntil) {
+		select {
+		case err := <-done:
+			t.Fatalf("agent Run returned %v before arming the timer for %s", err, deadline)
+		default:
+		}
+		clock.mu.Lock()
+		found := false
+		for _, timer := range clock.timers {
+			if timer.active && timer.deadline.Equal(deadline) {
+				found = true
+				break
+			}
+		}
+		clock.mu.Unlock()
+		if found {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for timer deadline %s", deadline)
+}
+
 func startFailureServer(t *testing.T, network *plain.Network, clock l1.Clock, nodeTags map[string][]string) (*l1.Store, func()) {
 	t.Helper()
 	policies := make(map[string]l1.NodePolicy, len(nodeTags))

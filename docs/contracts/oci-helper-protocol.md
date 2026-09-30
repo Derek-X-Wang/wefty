@@ -1654,9 +1654,9 @@ operator's path before it creates anything and before any pathname is
 canonicalized: the node path is translated into the helper's own filesystem
 view exactly as an operator mount source is, is judged lexically against the
 managed root and against the helper's configured operator mount roots
-(`--oci-allowed-mount-root`, the list `node oci doctor` publishes), and is
-only then walked component by component through descriptors the helper opens
-itself. A path that reaches the managed root is `managed_root_path`; a path
+(`--oci-allowed-mount-root`, the list `wefty node doctor` publishes as
+`mounts.allowed_roots`), and is only then walked component by component
+through descriptors the helper opens itself. A path that reaches the managed root is `managed_root_path`; a path
 under no configured root, or one whose component is a symlink, is not a
 directory, or changes identity while being opened, is
 `external_path_unconfined`. Resolving symlinks before the walk is forbidden:

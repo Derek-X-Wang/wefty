@@ -56,7 +56,13 @@ truncation to a later tick rather than stalling writers, and
 the database runs with `secure_delete`, so the replaced bytes leave the files
 as well as the row. The same pass scrubs, a bounded batch at a time, any
 terminal one-shot stored before this rule existed. L3's program snapshot, not
-the L1 spec, is what a rerun is built from.
+the L1 spec, is what a rerun is built from. A service or Computer removal's
+scrub transaction marks the same truncation due. The removal then makes at
+most one truncation attempt on that handle before it responds, and none while
+another checkpoint runs or after one was deferred until a truncation succeeds,
+so concurrent removals under a held reader do not each add a wait. If a reader
+holds the WAL, the removal responds without waiting, and the reconcile loop
+truncates the WAL within one tick of the reader leaving.
 
 A job created through an attempt credential additionally records its parent
 job, the parent attempt that submitted it, the originating submitter inherited
@@ -76,12 +82,12 @@ resumable.
 
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
-| `queued` | No live attempt. Initial, restart-ready, or waiting until `next_restart_at`. | `claimed`, `stopped`, `failed` |
-| `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `queued`, `failed` |
-| `running` | The current attempt acknowledged execution. | `stopping`, `queued`, `failed` |
-| `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed` |
-| `stopped` | Desired stopped and no live attempt remains. | `queued` through explicit operator start or restart only |
-| `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only |
+| `queued` | No live attempt. Initial, restart-ready, or waiting until `next_restart_at`. | `claimed`, `stopped`, `failed`, `removal_pending` |
+| `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `queued`, `failed`, `removal_pending` |
+| `running` | The current attempt acknowledged execution. | `stopping`, `queued`, `failed`, `removal_pending` |
+| `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed`, `removal_pending` |
+| `stopped` | Desired stopped and no live attempt remains. | `queued` through explicit operator start or restart only; `failed` through the image-reconciliation latch; `removal_pending` |
+| `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only; `removal_pending` |
 | `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified`, `stalled_cleanup_unverified` |
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
 | `removed_verified` | Cleanup was proven. An ordinary service deleted its remaining attempt/service rows and committed the verified tombstone; a Computer-projecting Job is finalized in place and keeps its Job and removal rows. Terminal. | none |
@@ -98,6 +104,14 @@ Legal desired/observed pairings are: desired `running` with `queued`,
 state until final deletion. `restart-pending` is never persisted. It is computed
 when a service is `queued`, desired `running`, and its `next_restart_at` is in
 the future.
+
+Removal is accepted from every pre-removal state and enters `removal_pending`
+in the same transaction that fences the live attempt `lost`; a service that
+was never bound to a node has nothing to clean and is deleted at once with a
+`removed_verified` tombstone. The bound agent may also latch `failed` from any
+pre-removal state, `stopped` included, when it cannot reconcile the service's
+pinned image: the same transaction fences the live attempt `lost`, clears the
+restart schedule, and records the typed failure as `last_failure`.
 
 A removal that cannot complete ends in `stalled_cleanup_unverified` with
 `removal_outcome=cleanup_stalled`. It is agent-declared non-completion, not an
@@ -320,11 +334,19 @@ was unchanged. A fresh grow intent may retry immediately and the helper then
 re-evaluates the locked current capacity facts; the still-running Computer
 does not need a restart. Shrink is never an operation.
 
-`backing_up`, `resetting`, `reimaging`, and `growing` have one typed abort escape hatch
+`backing_up`, `resetting`, `reimaging`, `growing`, `exporting`, and `importing`
+have one typed abort escape hatch
 when their exact bound Node is durably `dead`. Abort is CAS- and
 idempotency-guarded, preserves Computer desired state, supersedes uncertain
-artifacts for later composite removal, and holds the projection stopped until
+artifacts for later composite removal, fences the current attempt `lost`, and
+holds the projection stopped until
 an explicit restart. It does not manufacture node-local absence evidence.
+Aborting `exporting` records the planned Custody export `failed` with
+`failure_code=aborted_dead_node`, which taints like any other failed export.
+Aborting `importing` supersedes the import reservation with the same
+`failure_code=aborted_dead_node`, retires its staging Storage generation, and
+renames the destination Computer to `aborted-import-<computer_id>` so the
+reserved name is free again.
 
 A cold Backup is one explicitly disruptive Computer intent. L1 first commits
 the immutable logical Backup identity and its one planned V1 source-node copy
@@ -417,6 +439,18 @@ Node/root/operation-bound evidence. L1 records that evidence before publishing
 the staging generation and retiring its predecessor. The source Backup is
 immutable, no phase auto-resumes the Computer, and predecessor deletion reuses
 the shared generation-removal machinery.
+A restore that precommitted "keep predecessor as Backup" and whose predecessor
+copy fails with a typed Backup failure receipt is aborted before switchover:
+L1 records the restore operation `failed` with that copy's `failure_code`,
+retires the never-published staging generation, and returns the Computer to
+`stable` on the old generation. A completed restore (`retired`) also ends
+`stable`, so the Computer alone cannot tell the two apart. The restore
+response, fresh or replayed, names the operation its idempotency key started
+in a `Restore-Operation-Revision` header -- never the Computer's latest
+operation -- and `GET /v1/computers/{id}?restore_operation_revision=N` returns
+that restore's own `status`, `failure_code`, and `completed_at` as
+`restore_operation`. A client waiting on a restore follows that record: only
+`retired` is success; `failed` and `superseded` are not.
 
 Clone uses the same cold-copy primitive but creates a new `computer_id`,
 `storage_id`, required name, dispatch authority, and generation one with no
@@ -832,7 +866,7 @@ is expiry of the agent-owned bound.
 | `awaiting-input` | Reserved live attempt awaiting a future prompt verb. | `running`, `failed`, `lost` |
 | `succeeded` | A matching, in-lease completion was accepted. Terminal. | none |
 | `failed` | A matching, in-lease failure was accepted. Terminal. | none |
-| `lost` | The control plane's clock observed lease expiry. Terminal; a desired-running service may requeue its containing job, never this attempt. | none |
+| `lost` | The control plane's clock observed lease expiry, or L1 revoked the attempt's authority: an image-reconciliation latch, a Computer reconfiguration abort, or removal of its service or Computer. Terminal; a desired-running service may requeue its containing job, never this attempt. | none |
 
 Only the current `(job_id, attempt_id, fencing_token)` tuple may renew a lease,
 append logs, or complete. An expired attempt becomes `lost` exactly once.
@@ -846,11 +880,16 @@ that transition.
 | --- | --- | --- |
 | `alive` | Heartbeats are within the alive threshold. New claims additionally require durable `claims_enabled=true` intent. | `stale`, `draining`, `dead` |
 | `stale` | Heartbeats exceed the stale threshold; new claims are forbidden. | `alive`, `draining`, `dead` |
-| `draining` | The current boot session is shutting down; existing attempts may finish and new claims are forbidden. | `dead` |
+| `draining` | The current boot session is shutting down; existing attempts may finish and new claims are forbidden. | `dead`, `alive` through registration |
 | `dead` | Heartbeats exceed the dead threshold or the boot session ended. | `alive` |
 
-Registration carries stable node ID and per-boot session ID. A `dead` node may
-become `alive` only through registration of the current boot session. Routing
+Registration carries stable node ID and per-boot session ID. A `dead` or
+`draining` node may become `alive` only through registration, which always
+names the current boot session: L1 records the registering boot session and
+writes `alive` whatever the stored state was, so the next boot session after a
+graceful drain returns the node to `alive`. Heartbeat never leaves `draining`
+or `dead`. The Go `NodeTransitions` table does not yet list
+`draining → alive`; registration writes the state directly. Routing
 tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness and may atomically replace the current
 boot's full capability observation with a higher Capability revision; it does
@@ -882,7 +921,8 @@ reopens OCI capability in the running agent, at a strictly higher Capability
 revision, with no restart.
 Operator claim intent is not a node state: it is durable across registration,
 may be changed while the node is dead, and does not revoke authority already
-bound into a live attempt. The boot-session-scoped agent drain used for
+bound into a live attempt. A claim refused only by that intent is an empty
+claim, never a `draining` refusal. The boot-session-scoped agent drain used for
 graceful process shutdown changes only liveness state; it never changes that
 operator intent.
 

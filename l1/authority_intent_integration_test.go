@@ -147,7 +147,9 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		status, _, body := h.do(unexpectedAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{
 			NodeID: "unexpected-node", BootSessionID: "boot-unexpected-node", Class: contract.JobClassOneShot,
 		})
-		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
+		if status != http.StatusNoContent {
+			t.Fatalf("claims-disabled unexpected-node claim status = %d body=%s, want 204 no work", status, body)
+		}
 
 		h.clock.Advance(DefaultNodeDeadAfter)
 		if _, err := h.store.Reconcile(t.Context()); err != nil {
@@ -173,7 +175,9 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 			t.Fatalf("disabled-node re-registration status = %d body=%s", status, body)
 		}
 		status, _, body = h.do(expectedAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "expected-node", BootSessionID: "boot-rejoined", Class: contract.JobClassOneShot})
-		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
+		if status != http.StatusNoContent {
+			t.Fatalf("claims-disabled rejoined claim status = %d body=%s, want 204 no work", status, body)
+		}
 
 		liveAgent := h.client(fabric.Identity{NodeID: "fabric-live", Tags: []string{DefaultAgentPrincipalTag}})
 		live := h.register(liveAgent, "live-node")
@@ -208,6 +212,110 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		})
 		if status != http.StatusOK {
 			t.Fatalf("complete after intent change status = %d body=%s", status, body)
+		}
+	})
+
+	// #596: disabling claims is operator intent, not liveness. The claim route
+	// must answer it with the ordinary empty claim so an agent keeps finishing
+	// resident work; only a node whose boot session really is draining gets
+	// node_draining.
+	t.Run("claims-disabled is no work while real draining is node_draining", func(t *testing.T) {
+		h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+		operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+		node := h.register(agent, "node-1")
+		claimPath := "/v1/agent/jobs/claim"
+		oneShotClaim := ClaimRequest{NodeID: "node-1", BootSessionID: node.BootSessionID, Class: contract.JobClassOneShot}
+		serviceClaim := ClaimRequest{NodeID: "node-1", BootSessionID: node.BootSessionID, Class: contract.JobClassService}
+
+		running := h.submit(operator, "intent-resident", []string{"linux"})
+		status, _, body := h.do(agent, http.MethodPost, claimPath, oneShotClaim)
+		if status != http.StatusOK {
+			t.Fatalf("resident claim status = %d body=%s", status, body)
+		}
+		var resident Claim
+		if err := json.Unmarshal(body, &resident); err != nil {
+			t.Fatal(err)
+		}
+		if resident.Job.JobID != running.JobID {
+			t.Fatalf("resident claim job = %q, want %q", resident.Job.JobID, running.JobID)
+		}
+		queued := h.submit(operator, "intent-queued", []string{"linux"})
+
+		status, _, body = h.do(operator, http.MethodPost, "/v1/nodes/node-1/drain", NodeIntentRequest{
+			ClaimsEnabled: false, IntentRevision: 0, Reason: "finish current work only",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("operator drain status = %d body=%s", status, body)
+		}
+		for _, request := range []ClaimRequest{oneShotClaim, serviceClaim} {
+			status, _, body = h.do(agent, http.MethodPost, claimPath, request)
+			if status != http.StatusNoContent {
+				t.Fatalf("claims-disabled %s claim status = %d body=%s, want 204 no work", request.Class, status, body)
+			}
+		}
+		claim, err := h.store.ClaimJob(t.Context(), "fabric-node", "node-1", node.BootSessionID, contract.JobClassOneShot)
+		if claim != nil || err != nil {
+			t.Fatalf("claims-disabled store claim = %#v, %v; want no claim and no error", claim, err)
+		}
+		if job, err := h.store.GetJob(t.Context(), queued.JobID); err != nil || job.State != contract.JobQueued {
+			t.Fatalf("claims-disabled queued job = %#v, %v; want queued", job, err)
+		}
+		if current, err := getNode(t.Context(), h.store.db, "node-1"); err != nil || current.State != contract.NodeAlive {
+			t.Fatalf("claims-disabled node = %#v, %v; want alive", current, err)
+		}
+
+		// The resident attempt keeps its authority under disabled intent.
+		renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", running.JobID, resident.Lease.AttemptID)
+		status, _, body = h.do(agent, http.MethodPost, renewPath, RenewalRequest{FencingToken: resident.Lease.FencingToken})
+		if status != http.StatusOK {
+			t.Fatalf("claims-disabled renew status = %d body=%s", status, body)
+		}
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node))
+		if status != http.StatusOK {
+			t.Fatalf("claims-disabled heartbeat status = %d body=%s", status, body)
+		}
+		zero := 0
+		completePath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", running.JobID, resident.Lease.AttemptID)
+		status, _, body = h.do(agent, http.MethodPost, completePath, CompletionRequest{
+			FencingToken: resident.Lease.FencingToken, IdempotencyKey: "complete-under-disabled-intent", Result: ProcessResult{ExitCode: &zero},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("claims-disabled complete status = %d body=%s", status, body)
+		}
+
+		status, _, body = h.do(operator, http.MethodPost, "/v1/nodes/node-1/claims", NodeIntentRequest{
+			ClaimsEnabled: true, IntentRevision: 1, Reason: "maintenance over",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("re-enable claims status = %d body=%s", status, body)
+		}
+		status, _, body = h.do(agent, http.MethodPost, claimPath, oneShotClaim)
+		if status != http.StatusOK {
+			t.Fatalf("re-enabled claim status = %d body=%s", status, body)
+		}
+		var resumed Claim
+		if err := json.Unmarshal(body, &resumed); err != nil {
+			t.Fatal(err)
+		}
+		if resumed.Job.JobID != queued.JobID {
+			t.Fatalf("re-enabled claim job = %q, want %q", resumed.Job.JobID, queued.JobID)
+		}
+
+		// A real boot-session drain is liveness and outranks intent.
+		status, _, body = h.do(operator, http.MethodPost, "/v1/nodes/node-1/claims", NodeIntentRequest{
+			ClaimsEnabled: false, IntentRevision: 2, Reason: "maintenance again",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("second disable status = %d body=%s", status, body)
+		}
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/drain", DrainRequest{BootSessionID: node.BootSessionID})
+		if status != http.StatusOK {
+			t.Fatalf("agent drain status = %d body=%s", status, body)
+		}
+		for _, request := range []ClaimRequest{oneShotClaim, serviceClaim} {
+			status, _, body = h.do(agent, http.MethodPost, claimPath, request)
+			assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
 		}
 	})
 }

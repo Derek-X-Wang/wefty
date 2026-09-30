@@ -103,11 +103,20 @@ The successful agent claim projects the exact current `computer_id`,
 absent for ordinary Jobs and is the only identity the agent may pass to the
 helper's `computer_disk` attachment mechanic.
 
-The agent issues one fixed claim loop per class. Each loop blocks on its own
-existing class admission gate, currently pinned to one resident attempt, so a
-service cannot prevent the one-shot loop from asking for work and vice versa.
-Issue #85 owns widening those loop counts to the L1-granted capacities,
-capacity negotiation, and per-job local-quiescence exclusion.
+The agent runs one pool of claim loops per class. Each loop blocks on its own
+class admission gate, so a service cannot prevent the one-shot pool from asking
+for work and vice versa. The gate limit is the smaller of the node's local
+slot limit and the L1-granted capacity the agent reads on every registration
+and heartbeat, and each pool grows to that limit. The one-shot pool also
+shrinks to it; the service pool never shrinks within a session, because a
+service worker that already holds a binding stays that service's pull path
+through restart backoff. After a capacity decrease the lowered gate and the L1
+claim transaction refuse newcomers, but a bound service that L1 admits because
+its binding already holds the slot may still restart while the node is
+overcommitted, and the agent records that execution against the gate without
+treating the gate as the authority. Every claim names the jobs already resident
+on the node as exclusions, so L1 never hands the node a job it is still
+executing.
 
 The control plane obtains tags and capacity from authenticated Fabric identity
 plus operator configuration. Nodes in `stale`, `dead`, or `draining` state
@@ -156,7 +165,7 @@ require different reactions.
 | Stable node ID is bound to another Fabric identity | 403 | `identity_bound` | false |
 | Stable node ID has no registration | 409 | `node_not_registered` | false |
 | Registered node is dead | 409 | `node_dead` | false |
-| Registered node is draining | 409 | `node_draining` | false |
+| Registered node's boot session is draining | 409 | `node_draining` | false |
 | Boot session has been replaced | 409 | `node_session_replaced` | false |
 | Attempt ID does not exist | 404 | `attempt_not_found` | false |
 | Authenticated node does not own the attempt | 403 | `attempt_not_owned` | false |
@@ -256,12 +265,12 @@ back to `alive`, while a dead node must register its boot session again.
 to `draining` idempotently. Draining nodes continue heartbeating and retain
 authority for attempts they already own, but cannot claim another job. On
 SIGINT or SIGTERM the agent invokes this verb and waits up to 30 seconds for
-both class loops to finish the resident attempt each is already waiting on. A
+its claim loops to finish the resident attempts they are already waiting on. A
 second signal forces cancellation during that wait and emits typed
 `forced_shutdown` evidence; a single signal continues to prove graceful drain
 to completion. This is only
-a join around the pre-existing per-attempt wait; issue #88 owns service stop
-transitions, fenced shutdown completion, and forced-drain ordering. This route
+a join around the per-attempt wait; service stop transitions belong to the
+service job state machine in `state-machines.md`. This route
 is session liveness, not operator intent: it leaves `claims_enabled` and every
 `intent_*` field untouched. A fenced service shutdown completion is an
 infrastructure interruption, so desired `running` projects back to `queued`
@@ -431,6 +440,13 @@ issuing a dead claim.
 Node liveness and operator intent are independent. `claims_enabled` controls
 whether `ClaimJob` may win new work and is checked in that same transaction;
 `intent_revision` is a separate CAS counter and never fences a live attempt.
+A claim on an alive node whose claims are disabled is the ordinary empty claim
+(`204`, no eligible job), never `node_draining`: intent is not liveness, and an
+agent that read it as a boot-session drain would cancel the resident attempts
+the operator asked it to finish. The agent learns intent from the heartbeat
+response and stops asking; until then it keeps polling and keeps getting no
+work. `node_draining` is reserved for a node whose boot session actually entered
+the `draining` state, and that state outranks disabled intent.
 Registration increments authority generation but never changes
 `claims_enabled`, `intent_revision`, `intent_reason`, `intent_updated_at`, or
 `intent_actor` on an existing row.
