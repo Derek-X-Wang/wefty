@@ -1141,7 +1141,22 @@ func writeComputerMutationHeaders(w http.ResponseWriter, applied, replayed bool)
 }
 
 func (s *Server) getComputer(w http.ResponseWriter, r *http.Request) {
-	computer, err := s.store.GetComputer(r.Context(), r.PathValue("computer_id"))
+	var cloneRevision int64
+	if raw := strings.TrimSpace(r.URL.Query().Get("clone_operation_revision")); raw != "" {
+		revision, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || revision < 1 {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "clone_operation_revision must be a positive integer"))
+			return
+		}
+		cloneRevision = revision
+	}
+	var computer Computer
+	var err error
+	if cloneRevision > 0 {
+		computer, err = s.store.GetComputerWithCloneOperation(r.Context(), r.PathValue("computer_id"), cloneRevision)
+	} else {
+		computer, err = s.store.GetComputer(r.Context(), r.PathValue("computer_id"))
+	}
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1452,6 +1467,13 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	operation, err := s.store.ComputerCloneOperationForKey(r.Context(), request.BackupID, request.IdempotencyKey)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	w.Header().Set("Clone-Computer-Id", operation.DestinationComputerID)
+	w.Header().Set("Clone-Operation-Revision", strconv.FormatInt(operation.OperationRevision, 10))
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK

@@ -580,11 +580,35 @@ func (c *apiClients) getComputerRestoreOperation(ctx context.Context, computerID
 	return computer, err
 }
 
-func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, bool, error) {
+// cloneComputerOperation names the clone an idempotency key started: the
+// destination Computer it created and that operation's revision.
+type cloneComputerOperation struct {
+	computerID        string
+	operationRevision int64
+}
+
+// cloneComputerBackup also returns the clone L1 names as the operation this
+// key started, on a fresh call and on any replay; zero when L1 named none.
+func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, cloneComputerOperation, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(sourceComputerID) + "/backups/" + url.PathEscape(backupID) + "/clone"
 	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
-	return computer, responseWasIdempotentReplay(headers), err
+	var operation cloneComputerOperation
+	if parsed, parseErr := strconv.ParseInt(headers.Get("Clone-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
+		if computerID := strings.TrimSpace(headers.Get("Clone-Computer-Id")); computerID != "" {
+			operation = cloneComputerOperation{computerID: computerID, operationRevision: parsed}
+		}
+	}
+	return computer, operation, responseWasIdempotentReplay(headers), err
+}
+
+// getComputerCloneOperation reads the destination Computer together with one
+// clone's own state.
+func (c *apiClients) getComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "?clone_operation_revision=" + strconv.FormatInt(operationRevision, 10)
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &computer, http.StatusOK)
+	return computer, err
 }
 
 func (c *apiClients) exportComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerCustodyExportRequest) (l1.ComputerCustodyExport, bool, error) {

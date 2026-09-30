@@ -554,6 +554,7 @@
           "last_grow_operation": { "$ref": "#/components/schemas/ComputerStorageGrowOutcome" },
           "last_restore_revocation": { "$ref": "#/components/schemas/ComputerRestoreRevocationReceipt" },
           "restore_operation": { "$ref": "#/components/schemas/ComputerRestoreOperation", "description": "Present only when the read named a restore_operation_revision: that restore's own state." },
+          "clone_operation": { "$ref": "#/components/schemas/ComputerCloneOperation", "description": "Present only when the read named a clone_operation_revision: that clone's own state." },
           "owed_revocations": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/OwedComputerRevocation" },
@@ -777,7 +778,7 @@
           "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached"] },
           "completed_at": { "type": "string", "format": "date-time" }
         },
-        "description": "Latest Computer Backup operation observation. A planned status is still running; failed always carries a typed failure_code."
+        "description": "Computer Backup operation observation. A planned status is still running and every other status is terminal: published succeeded; failed always carries a typed failure_code; superseded means a removal or dead-node abort overtook it. A superseded operation carries completed_at only once its planned copy's absence is recorded, so a caller judges the outcome by status, not by completed_at."
       },
       "ComputerStorageGrowOutcome": {
         "type": "object",
@@ -805,6 +806,20 @@
           "completed_at": { "type": "string", "format": "date-time" }
         },
         "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the precommitted predecessor Backup copy failed and the restore was aborted with the old generation still current, and carries that copy's failure_code; `superseded` means a removal overtook it. The Computer is `stable` after both `retired` and `failed`."
+      },
+      "ComputerCloneOperation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation_revision", "source_computer_id", "backup_id", "status"],
+        "properties": {
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "source_computer_id": { "type": "string", "minLength": 1 },
+          "backup_id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["reserved", "prepared", "complete", "failed", "superseded"] },
+          "failure_code": { "enum": ["insufficient_disk", "computer_storage_quarantined", "computer_storage_preparation_interrupted"] },
+          "completed_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "One Computer clone's own observed state, read through its destination Computer. reserved and prepared are still running; complete published the destination generation; failed means the helper refused the destination or could never prepare it and carries failure_code; superseded means a removal of the destination or source overtook it. The destination's Job failure may belong to a later operation, so only this record says how the clone ended."
       },
       "ServiceRemovalStall": {
         "type": "object",
