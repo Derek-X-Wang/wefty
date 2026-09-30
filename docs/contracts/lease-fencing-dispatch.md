@@ -299,6 +299,12 @@ flag, measured in raw payload bytes (`LENGTH(bytes)`, not the stored JSON):
 | Age, by each event's own timestamp | 7 days (`--service-log-retention-age`) | 30 days (`--oneshot-log-retention-age`) | by the reconcile sweep |
 | Cluster-wide total, all jobs together | 5 GB = 5,000,000,000 bytes (`--log-retention-total-bytes`) | same ceiling | by the reconcile sweep |
 
+The age bound reads the timestamp the workload runtime stamped on each event
+when it observed the output. The agent's log sink stamps an event handed to it
+without one with its own wall clock, in UTC, before the event is spooled, so no
+event reaches L1 unset: an unset time has no nanosecond encoding and would
+otherwise be spooled as a date centuries old and evicted by the next sweep.
+
 Whichever bound binds first trims oldest-first: per-job bounds in insertion
 order within the job, the one-shot age bound and the total ceiling by event
 timestamp across jobs. Trimmed bytes are deleted, not archived. Any row may

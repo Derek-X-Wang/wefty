@@ -318,8 +318,8 @@ func (runtime *ociOneshotAcceptanceRuntime) Run(ctx context.Context, request wor
 	runtime.bridgeRuns = append(runtime.bridgeRuns, runID)
 	runtime.mu.Unlock()
 	for _, event := range []contract.LogEvent{
-		{AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("wefty-echo-once-stdout\n")},
-		{AttemptID: request.Authority.AttemptID, Stream: contract.LogStderr, Sequence: 0, Bytes: []byte("wefty-echo-once-stderr\n")},
+		{AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Sequence: 0, Timestamp: time.Now().UTC(), Bytes: []byte("wefty-echo-once-stdout\n")},
+		{AttemptID: request.Authority.AttemptID, Stream: contract.LogStderr, Sequence: 0, Timestamp: time.Now().UTC(), Bytes: []byte("wefty-echo-once-stderr\n")},
 	} {
 		if err := sink.WriteOutput(ctx, event); err != nil {
 			return workloadrunner.Result{}, err

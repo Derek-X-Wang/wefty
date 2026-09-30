@@ -461,7 +461,7 @@ func executeComputerClone(ctx context.Context, clients *apiClients, jsonOutput b
 	if err != nil {
 		return err
 	}
-	computer, replayed, err := clients.cloneComputerBackup(ctx, sourceComputerID, backupID, l1.ComputerCloneRequest{
+	computer, operation, replayed, err := clients.cloneComputerBackup(ctx, sourceComputerID, backupID, l1.ComputerCloneRequest{
 		ComputerMutationPrecondition: precondition, Name: strings.TrimSpace(name), DiskBytes: diskBytes.value, IdempotencyKey: key,
 	})
 	if err != nil {
@@ -470,9 +470,12 @@ func executeComputerClone(ctx context.Context, clients *apiClients, jsonOutput b
 	output := storageMutationOutput{MutationApplied: !replayed, IdempotentReplay: replayed, Computer: &computer}
 	var waitErr error
 	if wait.timeout > 0 {
+		if operation.operationRevision == 0 {
+			return errors.New("L1 did not identify the clone operation this request started")
+		}
 		var observed l1.Computer
 		var observation storageWaitObservation
-		observed, observation, waitErr = waitForComputerRevision(ctx, clients, computer.ComputerID, computer.IntentRevision, wait)
+		observed, observation, waitErr = waitForComputerClone(ctx, clients, operation, wait)
 		output.Computer, output.Observation = &observed, &observation
 		if waitErr == nil {
 			waitErr = awaitedComputerCloneFailure(observed)
@@ -482,51 +485,62 @@ func executeComputerClone(ctx context.Context, clients *apiClients, jsonOutput b
 	return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
 }
 
-// awaitedComputerCloneFailure reports the destination's terminal latch as the
+// awaitedComputerCloneFailure reports a clone that did not complete as the
 // typed refusal it is. A clone that reached `stable` without copying a byte is
 // a failure, not a completed revision -- whether the disk was too small, the
 // destination generation was quarantined, or the helper session that was
-// copying it was lost.
+// copying it was lost -- and a clone a removal overtook is no success either.
+// Only the clone's own record decides: the destination's Job failure may
+// belong to a later operation, such as a refused grow (#602).
 func awaitedComputerCloneFailure(computer l1.Computer) error {
-	var failure contract.SpawnFailure
-	if len(computer.CurrentJob.LastFailure) == 0 ||
-		json.Unmarshal(computer.CurrentJob.LastFailure, &failure) != nil {
+	outcome := computer.CloneOperation
+	if outcome == nil || outcome.Status == "complete" {
 		return nil
 	}
-	details := map[string]any{"computer_id": computer.ComputerID, "failure_code": string(failure.Code),
-		"requested_bytes": failure.RequestedBytes}
-	switch failure.Code {
-	case contract.SpawnFailureInsufficientDisk:
-		details["observed_available_bytes"] = failure.ObservedAvailableBytes
-		return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
-			Code: contract.ErrorCapacityExhausted, Message: "Computer clone failed: insufficient_disk",
-			Retryable: false, Details: details,
-		}}
-	case contract.SpawnFailureComputerStorageQuarantined, contract.SpawnFailureComputerStoragePreparationInterrupted:
-		return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
-			Code: contract.ErrorConflict, Message: "Computer clone failed: " + string(failure.Code),
-			Retryable: false, Details: details,
-		}}
+	details := map[string]any{"computer_id": computer.ComputerID, "source_computer_id": outcome.SourceComputerID,
+		"backup_id": outcome.BackupID, "operation_revision": outcome.OperationRevision, "status": outcome.Status,
+		"failure_code": outcome.FailureCode}
+	// A failed clone latches its own typed failure on the destination Job,
+	// which nothing can start again; its byte counts are the clone's.
+	var failure contract.SpawnFailure
+	if outcome.Status == "failed" && len(computer.CurrentJob.LastFailure) > 0 &&
+		json.Unmarshal(computer.CurrentJob.LastFailure, &failure) == nil && string(failure.Code) == outcome.FailureCode {
+		details["requested_bytes"] = failure.RequestedBytes
+		if failure.Code == contract.SpawnFailureInsufficientDisk {
+			details["observed_available_bytes"] = failure.ObservedAvailableBytes
+		}
 	}
-	return nil
+	code := contract.ErrorConflict
+	if outcome.FailureCode == string(contract.SpawnFailureInsufficientDisk) {
+		code = contract.ErrorCapacityExhausted
+	}
+	message := "Computer clone " + outcome.Status
+	if outcome.FailureCode != "" {
+		message += ": " + outcome.FailureCode
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: code, Message: message, Retryable: false, Details: details,
+	}}
 }
 
-// awaitedBackupFailure reports a Backup operation that ended `failed` as the
-// typed refusal it is. Like a clone, a Backup that reaches its terminal
+// awaitedBackupFailure reports a Backup operation that ended without
+// publishing -- `failed`, or `superseded` by a removal or dead-node abort -- as
+// the typed refusal it is. Like a clone, a Backup that reaches its terminal
 // outcome without publishing anything is a failure, not a success the caller
-// has to find in the JSON (#588).
+// has to find in the JSON (#588, #602).
 func awaitedBackupFailure(computerID string, backups l1.BackupList) error {
 	outcome := backups.Operation
-	if outcome == nil || outcome.Status != "failed" {
+	if outcome == nil || outcome.Status == "planned" || outcome.Status == "published" {
 		return nil
 	}
 	details := map[string]any{"computer_id": computerID, "backup_id": outcome.BackupID,
-		"operation_revision": outcome.OperationRevision, "failure_code": string(outcome.FailureCode)}
+		"operation_revision": outcome.OperationRevision, "status": outcome.Status,
+		"failure_code": string(outcome.FailureCode)}
 	code := contract.ErrorConflict
 	if outcome.FailureCode == l1.ComputerBackupFailureInsufficientDisk {
 		code = contract.ErrorCapacityExhausted
 	}
-	message := "Computer Backup failed"
+	message := "Computer Backup " + outcome.Status
 	if outcome.FailureCode != "" {
 		message += ": " + string(outcome.FailureCode)
 	}
@@ -562,19 +576,20 @@ func awaitedComputerRestoreFailure(computer l1.Computer) error {
 }
 
 // awaitedCustodyExportFailure does the same for a Custody export whose
-// terminal status is `failed`, such as external_path_unconfined (#588).
+// terminal status is `failed`, such as external_path_unconfined (#588), or
+// `superseded` by a removal (#602).
 func awaitedCustodyExportFailure(exported l1.ComputerCustodyExport) error {
-	if exported.Status != "failed" {
+	if exported.Status == "planned" || exported.Status == "available" {
 		return nil
 	}
-	message := "Custody export failed"
+	message := "Custody export " + exported.Status
 	if exported.FailureCode != "" {
 		message += ": " + exported.FailureCode
 	}
 	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
 		Code: contract.ErrorConflict, Message: message, Retryable: false,
 		Details: map[string]any{"computer_id": exported.ComputerID, "export_id": exported.ExportID,
-			"backup_id": exported.BackupID, "failure_code": exported.FailureCode},
+			"backup_id": exported.BackupID, "status": exported.Status, "failure_code": exported.FailureCode},
 	}}
 }
 
@@ -743,7 +758,13 @@ func waitForBackupOperation(ctx context.Context, clients *apiClients, computerID
 		if readErr != nil {
 			return false, readErr
 		}
-		return last.Operation != nil && last.Operation.CompletedAt != nil, nil
+		if last.Operation == nil {
+			return false, fmt.Errorf("L1 did not return Backup operation %q of Computer %q", backupID, computerID)
+		}
+		// Status, not completed_at, is terminal: a removal or dead-node abort
+		// supersedes a planned Backup without stamping a completion time
+		// (#602). Only `planned` is still running.
+		return last.Operation.Status != "planned", nil
 	})
 	return last, observation, err
 }
@@ -791,15 +812,25 @@ func waitForBackupPrune(ctx context.Context, clients *apiClients, computerID, ba
 	return observed, observation, err
 }
 
-func waitForComputerRevision(ctx context.Context, clients *apiClients, computerID string, operationRevision int64, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
+// waitForComputerClone follows one clone until its own record is terminal. It
+// never judges the destination's latest revision or Job failure: replaying a
+// clone after a later operation on its destination must report the clone.
+func waitForComputerClone(ctx context.Context, clients *apiClients, operation cloneComputerOperation, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
 	var observed l1.Computer
 	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
 		var readErr error
-		observed, readErr = clients.getComputerStorageAuthority(ctx, computerID)
+		observed, readErr = clients.getComputerCloneOperation(ctx, operation.computerID, operation.operationRevision)
 		if readErr != nil {
 			return false, readErr
 		}
-		return observed.AppliedRevision >= operationRevision && observed.ReconfigurationPhase == l1.ComputerReconfigurationStable, nil
+		if observed.CloneOperation == nil {
+			return false, fmt.Errorf("L1 did not return clone operation %d of Computer %q", operation.operationRevision, operation.computerID)
+		}
+		switch observed.CloneOperation.Status {
+		case "reserved", "prepared":
+			return false, nil
+		}
+		return true, nil
 	})
 	return observed, observation, err
 }
@@ -883,7 +914,9 @@ func waitForCustodyExport(ctx context.Context, clients *apiClients, computerID, 
 		for _, exported := range exports {
 			if exported.ExportID == exportID {
 				observed = exported
-				return exported.CompletedAt != nil, nil
+				// Only `planned` is still running; a removal supersedes a
+				// planned export without a completion time (#602).
+				return exported.Status != "planned", nil
 			}
 		}
 		return false, fmt.Errorf("L1 omitted Custody export %q while observing completion", exportID)
