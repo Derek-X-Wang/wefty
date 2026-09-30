@@ -676,13 +676,20 @@ type Evidence struct {
 }
 
 type RunRecord struct {
-	SchemaVersion int             `json:"schema_version"`
-	RunID         string          `json:"run_id"`
-	L1JobID       string          `json:"l1_job_id,omitempty"`
-	NodeID        string          `json:"node_id,omitempty"`
-	ParentRunID   string          `json:"parent_run_id,omitempty"`
-	DispatchKey   string          `json:"dispatch_key"`
-	Status        RunState        `json:"status"`
+	SchemaVersion int      `json:"schema_version"`
+	RunID         string   `json:"run_id"`
+	L1JobID       string   `json:"l1_job_id,omitempty"`
+	NodeID        string   `json:"node_id,omitempty"`
+	ParentRunID   string   `json:"parent_run_id,omitempty"`
+	DispatchKey   string   `json:"dispatch_key"`
+	Status        RunState `json:"status"`
+	// FailureReason is one line saying why a failed run failed: the job's
+	// exit code or signal, a dispatch L1 refused, or the ledger gate that
+	// failed a job that exited 0 (a gate, a rejected write, a failed child,
+	// or a missing required envelope). It is recorded by the transition that
+	// fails the run and is empty for any other run, and for a run failed
+	// before the ledger recorded reasons.
+	FailureReason string          `json:"failure_reason,omitempty"`
 	Trigger       Trigger         `json:"trigger"`
 	Workflow      WorkflowSource  `json:"workflow"`
 	Params        json.RawMessage `json:"params"`

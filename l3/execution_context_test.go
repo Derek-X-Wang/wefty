@@ -232,7 +232,7 @@ func TestTerminalRunTokenGraceRejectsNewChildDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := failRunTx(context.Background(), tx, parent.RunID, time.Now().UTC(), time.Minute); err != nil {
+	if err := failRunTx(context.Background(), tx, parent.RunID, time.Now().UTC(), time.Minute, "test failure"); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {

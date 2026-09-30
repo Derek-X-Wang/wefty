@@ -26,6 +26,11 @@
     "status": {
       "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"]
     },
+    "failure_reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One line saying why a failed run failed, recorded by the transition that failed it. Absent for any other run and for a run failed before reasons were recorded."
+    },
     "trigger": {
       "type": "object",
       "additionalProperties": false,

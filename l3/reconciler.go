@@ -124,11 +124,17 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 				continue
 			}
 		}
-		if err := r.store.recordRunNode(ctx, run.RunID, job.NodeID); err != nil {
+		// jobNodeID falls back to the last attempt: a job that finished
+		// between two passes has no current attempt, and so no NodeID.
+		if err := r.store.recordRunNode(ctx, run.RunID, jobNodeID(job)); err != nil {
 			passErrors = append(passErrors, err)
 			continue
 		}
-		if err := r.store.projectJobState(ctx, run, job.State); err != nil {
+		jobFailure := ""
+		if job.State == contract.JobFailed {
+			jobFailure = JobFailureReason(job)
+		}
+		if err := r.store.projectJobOutcome(ctx, run, job.State, jobFailure); err != nil {
 			passErrors = append(passErrors, err)
 		}
 	}
