@@ -303,30 +303,50 @@ const (
 		"published; the agent never sends one on a Computer Storage retirement, which has no stall outcome"
 )
 
-// driftEnumExceptions lists Go closed vocabularies that legitimately differ
-// from one schema enum. Keys are "<go type>@<schema location>".
-var driftEnumExceptions = map[string]string{
-	"contract.ServiceDesiredState@" + component(commonDoc, "Job") + "/properties/removal/properties/desired_state": "a " +
-		"removal projection is always desired_state removed",
-	"contract.ServiceDesiredState@" + requestBody(clientDoc, "put", "/v1/jobs/{job_id}/desired-state") +
-		"/properties/desired_state": "the route accepts running or stopped; removal has its own route",
-	"contract.ServiceDesiredState@" + requestBody(clientDoc, "put", "/v1/computers/{computer_id}/desired-state") +
-		"/properties/desired_state": "the route accepts running or stopped; removal has its own route",
-	"l1.ComputerGrantPermission@" + component(commonDoc, "ComputerPolicyRevocation") + "/properties/target_permission": "a " +
-		"revocation is recorded only for a downgrade, so its target is never control",
-	"l1.ComputerGrantPermission@" + component(commonDoc, "ComputerTakeoverAuditEvent") + "/properties/authorized_role": "L1 " +
-		"refuses a takeover audit event whose role is not view or control",
-	"l1.ComputerGrantPermission@" + component(commonDoc, "ComputerTakeoverSession") + "/properties/authorized_role": "sessions " +
-		"are projected from audit events, whose role is view or control",
-	"l1.ComputerStorageGenerationPhase@" + component(commonDoc, "ComputerStorageGeneration") + "/properties/phase": "absent " +
-		"names a missing generation row in a refusal's error details; it is never a stored phase",
-	"contract.ErrorCode@" + component(commonDoc, "Error") + "/properties/code": "deliberately open: the one error " +
-		"envelope serves L1 and L3 and gains codes with new refusals, so a client acts on the codes it knows and on " +
-		"retryable for the rest",
-	"contract.SpawnFailureCode@" + component(commonDoc, "SpawnFailure") + "/properties/code": "deliberately open: " +
-		"the schema tells readers that unknown codes default to terminal service policy",
-	"contract.RuntimeFailureCode@" + component(commonDoc, "RuntimeFailure") + "/properties/code": "deliberately open: " +
-		"the schema tells readers that unknown codes default to terminal",
+// driftEnumException is a Go closed vocabulary that legitimately differs from
+// one schema enum. A closed-subset exception pins the exact subset the route or
+// projection admits, and the schema enum must equal it. An open exception
+// (subset nil) is a location that deliberately publishes no enum, and it must
+// stay that way.
+type driftEnumException struct {
+	subset []string
+	reason string
+}
+
+// driftEnumExceptions is keyed by "<go type>@<schema location>".
+var driftEnumExceptions = map[string]driftEnumException{
+	"contract.ServiceDesiredState@" + component(commonDoc, "Job") + "/properties/removal/properties/desired_state": {
+		subset: []string{"removed"}, reason: "a removal projection is always desired_state removed",
+	},
+	"contract.ServiceDesiredState@" + requestBody(clientDoc, "put", "/v1/jobs/{job_id}/desired-state") + "/properties/desired_state": {
+		subset: []string{"running", "stopped"}, reason: "the route refuses removed; removal has its own route",
+	},
+	"contract.ServiceDesiredState@" + requestBody(clientDoc, "put", "/v1/computers/{computer_id}/desired-state") + "/properties/desired_state": {
+		subset: []string{"running", "stopped"}, reason: "the route refuses removed; removal has its own route",
+	},
+	"l1.ComputerGrantPermission@" + component(commonDoc, "ComputerPolicyRevocation") + "/properties/target_permission": {
+		subset: []string{"none", "view"}, reason: "a revocation is recorded only for a downgrade, so its target is never control",
+	},
+	"l1.ComputerGrantPermission@" + component(commonDoc, "ComputerTakeoverAuditEvent") + "/properties/authorized_role": {
+		subset: []string{"view", "control"}, reason: "L1 refuses a takeover audit event whose role is not view or control",
+	},
+	"l1.ComputerGrantPermission@" + component(commonDoc, "ComputerTakeoverSession") + "/properties/authorized_role": {
+		subset: []string{"view", "control"}, reason: "sessions are projected from audit events, whose role is view or control",
+	},
+	"l1.ComputerStorageGenerationPhase@" + component(commonDoc, "ComputerStorageGeneration") + "/properties/phase": {
+		subset: []string{"current", "staging", "retired"},
+		reason: "absent names a missing generation row in a refusal's error details; it is never a stored phase",
+	},
+	"contract.ErrorCode@" + component(commonDoc, "Error") + "/properties/code": {
+		reason: "deliberately open: the one error envelope serves L1 and L3 and gains codes with new refusals, " +
+			"so a client acts on the codes it knows and on retryable for the rest",
+	},
+	"contract.SpawnFailureCode@" + component(commonDoc, "SpawnFailure") + "/properties/code": {
+		reason: "deliberately open: the schema tells readers that unknown codes default to terminal service policy",
+	},
+	"contract.RuntimeFailureCode@" + component(commonDoc, "RuntimeFailure") + "/properties/code": {
+		reason: "deliberately open: the schema tells readers that unknown codes default to terminal",
+	},
 }
 
 // driftMustCompare names Go type and schema pairs the walk has to reach. They
@@ -430,8 +450,8 @@ func TestValidatorVocabulariesMatchPublishedEnums(t *testing.T) {
 			t.Errorf("%s names no schema", entry.schema)
 			continue
 		}
-		published, ok := set.enumValues(set.root(entry.schema))
-		if !ok {
+		published, closed := set.vocabulary(set.root(entry.schema))
+		if !closed {
 			t.Errorf("%s publishes no enum for %s.%s", entry.schema, entry.source, entry.function)
 			continue
 		}
@@ -442,12 +462,15 @@ func TestValidatorVocabulariesMatchPublishedEnums(t *testing.T) {
 	}
 }
 
-// TestComposedSchemasCloseAtTheComposingLevel forbids a closed member inside
-// allOf. additionalProperties (and unevaluatedProperties) only see the member's
-// own properties, so a closed member refuses every field its siblings add: Node
-// was allOf[NodeRegistration (closed), ...] and no real Node validated (#601).
-// A composite closes itself with unevaluatedProperties over open members. The
-// only closed member allowed is a lone one, which has no siblings to refuse.
+// TestComposedSchemasCloseAtTheComposingLevel forbids closure keywords that
+// refuse fields a sibling schema adds. additionalProperties (and a member's
+// unevaluatedProperties) see only their own schema's properties, so a closed
+// allOf member refuses every field its siblings add: Node was
+// allOf[NodeRegistration (closed), ...] and no real Node validated (#601). A
+// $ref with applicator siblings is allOf[target, siblings] and is held to the
+// same rule. A composite closes itself with unevaluatedProperties over open
+// arms; additionalProperties:false beside arms is allowed only when the node's
+// own properties already declare everything the arms add.
 func TestComposedSchemasCloseAtTheComposingLevel(t *testing.T) {
 	t.Parallel()
 
@@ -462,17 +485,7 @@ func TestComposedSchemasCloseAtTheComposingLevel(t *testing.T) {
 		walk = func(value any, pointer string) {
 			switch node := value.(type) {
 			case map[string]any:
-				if members, ok := node["allOf"].([]any); ok && len(members) > 1 {
-					composites++
-					for index := range members {
-						member := set.resolve(set.root(document+"#"+pointer+"/allOf/"+strconv.Itoa(index)), nil)
-						if member.loc.node["additionalProperties"] == false || member.loc.node["unevaluatedProperties"] == false {
-							t.Errorf("%s#%s: allOf member %d (%s) is closed and refuses its siblings' fields; "+
-								"leave members open and close the composite with unevaluatedProperties",
-								document, pointer, index, member.loc.key())
-						}
-					}
-				}
+				checkComposedClosure(t, set, set.root(document+"#"+pointer), &composites)
 				for key, child := range node {
 					walk(child, pointer+"/"+escapePointer(key))
 				}
@@ -485,7 +498,109 @@ func TestComposedSchemasCloseAtTheComposingLevel(t *testing.T) {
 		walk(set.document(document), "")
 	}
 	if composites == 0 {
-		t.Fatal("found no allOf composition to check")
+		t.Fatal("found no composition to check")
+	}
+}
+
+func checkComposedClosure(t *testing.T, set *schemaSet, r schemaRef, composites *int) {
+	t.Helper()
+	node := r.loc.node
+	if pureReference(node) {
+		return // a plain alias adds nothing beside its target
+	}
+	all, alternatives, conditional := set.arms(r)
+	arms := len(all)
+	if _, hasRef := set.reference(r); hasRef {
+		arms++ // the siblings of the $ref are an arm of their own
+	}
+	if arms > 1 {
+		*composites++
+		for _, arm := range all {
+			if set.shape(arm, nil).closed {
+				t.Errorf("%s: arm %s is closed and refuses its siblings' fields; leave arms open and close "+
+					"the composite with unevaluatedProperties", r.loc.key(), arm.loc.key())
+			}
+		}
+	}
+	if node["additionalProperties"] != false {
+		return
+	}
+	own, _ := node["properties"].(map[string]any)
+	for _, group := range alternatives {
+		all = append(all, group...)
+	}
+	all = append(all, conditional...)
+	for _, arm := range all {
+		for name := range set.shape(arm, nil).properties {
+			if _, declared := own[name]; !declared {
+				t.Errorf("%s: additionalProperties:false refuses %q, which arm %s declares; close with "+
+					"unevaluatedProperties or declare it here", r.loc.key(), name, arm.loc.key())
+			}
+		}
+	}
+}
+
+// TestVocabularyFollowsCompositionSemantics pins how the enum reader combines
+// arms: allOf narrows, an alternative group widens and is open when any arm is,
+// $ref siblings still apply, and a keyword it does not model fails loudly.
+func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
+	t.Parallel()
+
+	const document = `{"$defs": {
+		"ab": {"enum": ["a", "b"]},
+		"narrowed": {"allOf": [{"enum": ["a", "b"]}, {"enum": ["b", "c"]}]},
+		"openAlternative": {"anyOf": [{"enum": ["a"]}, {"type": "string"}]},
+		"closedAlternative": {"oneOf": [{"enum": ["a"]}, {"enum": ["b"]}]},
+		"nullable": {"oneOf": [{"type": "null"}, {"enum": ["a"]}]},
+		"refWithSibling": {"$ref": "#/$defs/ab", "enum": ["b", "z"]},
+		"aliasOnly": {"$ref": "#/$defs/ab", "description": "an annotation does not narrow"},
+		"plain": {"type": "string"},
+		"negated": {"type": "string", "not": {"enum": ["a"]}}
+	}}`
+	var parsed any
+	if err := json.Unmarshal([]byte(document), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	type failure struct{ message string }
+	set := &schemaSet{docs: map[string]any{"inline.json": parsed}}
+	set.fatalf = func(format string, args ...any) { panic(failure{fmt.Sprintf(format, args...)}) }
+	read := func(name string) (values []string, closed bool, refused string) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				caught, ok := recovered.(failure)
+				if !ok {
+					panic(recovered)
+				}
+				refused = caught.message
+			}
+		}()
+		admitted, closed := set.vocabulary(set.root("inline.json#/$defs/" + name))
+		return sortedKeys(admitted), closed, ""
+	}
+	for _, check := range []struct {
+		name   string
+		values []string
+		closed bool
+	}{
+		{"narrowed", []string{"b"}, true},
+		{"openAlternative", []string{}, false},
+		{"closedAlternative", []string{"a", "b"}, true},
+		{"nullable", []string{"a"}, true},
+		{"refWithSibling", []string{"b"}, true},
+		{"aliasOnly", []string{"a", "b"}, true},
+		{"plain", []string{}, false},
+	} {
+		values, closed, refused := read(check.name)
+		if refused != "" {
+			t.Errorf("%s: refused: %s", check.name, refused)
+			continue
+		}
+		if closed != check.closed || (closed && !reflect.DeepEqual(values, check.values)) {
+			t.Errorf("%s: vocabulary = %v closed=%v, want %v closed=%v", check.name, values, closed, check.values, check.closed)
+		}
+	}
+	if _, _, refused := read("negated"); !strings.Contains(refused, `"not"`) {
+		t.Errorf("a schema using not was read instead of refused (%q)", refused)
 	}
 }
 
@@ -618,8 +733,8 @@ func TestEveryServedRouteIsPublished(t *testing.T) {
 // ---- schema navigation ----
 
 type schemaSet struct {
-	t    *testing.T
-	docs map[string]any
+	fatalf func(format string, args ...any)
+	docs   map[string]any
 }
 
 type schemaLocation struct {
@@ -641,7 +756,7 @@ type schemaRef struct {
 }
 
 func newSchemaSet(t *testing.T) *schemaSet {
-	return &schemaSet{t: t, docs: map[string]any{}}
+	return &schemaSet{fatalf: t.Fatalf, docs: map[string]any{}}
 }
 
 func (s *schemaSet) document(name string) any {
@@ -650,11 +765,11 @@ func (s *schemaSet) document(name string) any {
 	}
 	raw, err := os.ReadFile(filepath.FromSlash(name))
 	if err != nil {
-		s.t.Fatal(err)
+		s.fatalf("%v", err)
 	}
 	var document any
 	if err := json.Unmarshal(raw, &document); err != nil {
-		s.t.Fatalf("%s: %v", name, err)
+		s.fatalf("%s: %v", name, err)
 	}
 	s.docs[name] = document
 	return document
@@ -706,13 +821,37 @@ func enterResource(scope []schemaLocation, resource schemaLocation) []schemaLoca
 	return append(append([]schemaLocation(nil), scope...), resource)
 }
 
-// resolve follows $ref and $dynamicRef chains, reporting every hop to visit.
-// A reference kind it cannot follow is a test failure, never an empty shape:
-// an unfollowed reference is exactly where drift would hide.
+// annotationKeywords change no instance's validity. A $ref whose siblings are
+// all annotations is a plain alias; any other sibling still applies beside the
+// reference (OpenAPI 3.1 / JSON Schema 2020-12), as if allOf[target, siblings].
+var annotationKeywords = map[string]bool{
+	"$ref": true, "$dynamicRef": true, "$id": true, "$schema": true, "$anchor": true, "$dynamicAnchor": true,
+	"$defs": true, "$comment": true, "title": true, "description": true, "default": true, "examples": true,
+	"example": true, "deprecated": true, "readOnly": true, "writeOnly": true, "format": true, "externalDocs": true,
+}
+
+func pureReference(node map[string]any) bool {
+	_, hasRef := node["$ref"]
+	_, hasDynamic := node["$dynamicRef"]
+	if !hasRef && !hasDynamic {
+		return false
+	}
+	for key := range node {
+		if !annotationKeywords[key] && !strings.HasPrefix(key, "x-") {
+			return false
+		}
+	}
+	return true
+}
+
+// resolve follows plain-alias $ref and $dynamicRef chains, reporting every hop
+// to visit. It stops at a reference with applicator siblings; the readers below
+// treat that reference as one more allOf arm. A reference kind it cannot follow
+// is a test failure, never an empty shape: that is exactly where drift hides.
 func (s *schemaSet) resolve(r schemaRef, visit func(schemaLocation)) schemaRef {
 	for range 32 {
 		if r.loc.node == nil {
-			s.t.Fatalf("%s: no schema at this location", r.loc.key())
+			s.fatalf("%s: no schema at this location", r.loc.key())
 		}
 		if visit != nil {
 			visit(r.loc)
@@ -722,29 +861,69 @@ func (s *schemaSet) resolve(r schemaRef, visit func(schemaLocation)) schemaRef {
 		}
 		for _, unsupported := range []string{"$recursiveRef", "$recursiveAnchor"} {
 			if _, ok := r.loc.node[unsupported]; ok {
-				s.t.Fatalf("%s: the drift resolver does not follow %s", r.loc.key(), unsupported)
+				s.fatalf("%s: the drift resolver does not follow %s", r.loc.key(), unsupported)
 			}
 		}
-		if reference, ok := r.loc.node["$ref"]; ok {
-			text, isString := reference.(string)
-			if !isString {
-				s.t.Fatalf("%s: $ref is not a string", r.loc.key())
-			}
-			r = s.follow(r, text)
-			continue
+		if !pureReference(r.loc.node) {
+			return r
 		}
-		if reference, ok := r.loc.node["$dynamicRef"]; ok {
-			text, isString := reference.(string)
-			if !isString {
-				s.t.Fatalf("%s: $dynamicRef is not a string", r.loc.key())
-			}
-			r = s.dynamic(r, text)
-			continue
-		}
-		return r
+		r, _ = s.reference(r)
 	}
-	s.t.Fatalf("%s: reference chain too deep", r.loc.key())
+	s.fatalf("%s: reference chain too deep", r.loc.key())
 	return r
+}
+
+// reference follows the one $ref or $dynamicRef a (resolved) node carries.
+func (s *schemaSet) reference(r schemaRef) (schemaRef, bool) {
+	ref, hasRef := r.loc.node["$ref"]
+	dynamic, hasDynamic := r.loc.node["$dynamicRef"]
+	switch {
+	case hasRef && hasDynamic:
+		s.fatalf("%s: both $ref and $dynamicRef", r.loc.key())
+	case hasRef:
+		text, ok := ref.(string)
+		if !ok {
+			s.fatalf("%s: $ref is not a string", r.loc.key())
+		}
+		return s.follow(r, text), true
+	case hasDynamic:
+		text, ok := dynamic.(string)
+		if !ok {
+			s.fatalf("%s: $dynamicRef is not a string", r.loc.key())
+		}
+		return s.dynamic(r, text), true
+	}
+	return schemaRef{}, false
+}
+
+// arms splits a resolved schema's subschemas by how they apply: every arm of
+// all applies (allOf members, and a $ref beside applicator siblings); one arm
+// of each alternative group applies (oneOf, anyOf); conditional arms apply
+// sometimes (then, else).
+func (s *schemaSet) arms(r schemaRef) (all []schemaRef, alternatives [][]schemaRef, conditional []schemaRef) {
+	if members, ok := r.loc.node["allOf"].([]any); ok {
+		for index := range members {
+			all = append(all, s.child(r, "allOf", strconv.Itoa(index)))
+		}
+	}
+	if target, ok := s.reference(r); ok {
+		all = append(all, target)
+	}
+	for _, keyword := range []string{"oneOf", "anyOf"} {
+		if members, ok := r.loc.node[keyword].([]any); ok {
+			group := make([]schemaRef, 0, len(members))
+			for index := range members {
+				group = append(group, s.child(r, keyword, strconv.Itoa(index)))
+			}
+			alternatives = append(alternatives, group)
+		}
+	}
+	for _, keyword := range []string{"then", "else"} {
+		if _, ok := r.loc.node[keyword].(map[string]any); ok {
+			conditional = append(conditional, s.child(r, keyword))
+		}
+	}
+	return all, alternatives, conditional
 }
 
 func (s *schemaSet) follow(r schemaRef, reference string) schemaRef {
@@ -752,7 +931,7 @@ func (s *schemaSet) follow(r schemaRef, reference string) schemaRef {
 	document, scope := r.loc.doc, r.scope
 	if file != "" {
 		if strings.Contains(file, ":") {
-			s.t.Fatalf("%s: the drift resolver does not follow absolute reference %q", r.loc.key(), reference)
+			s.fatalf("%s: the drift resolver does not follow absolute reference %q", r.loc.key(), reference)
 		}
 		document = path.Clean(path.Join(path.Dir(r.loc.doc), file))
 		scope = enterResource(scope, s.location(document+"#"))
@@ -764,12 +943,12 @@ func (s *schemaSet) follow(r schemaRef, reference string) schemaRef {
 	default:
 		found, _, ok := s.anchor(s.location(document+"#"), fragment)
 		if !ok {
-			s.t.Fatalf("%s: $ref %q names no anchor", r.loc.key(), reference)
+			s.fatalf("%s: $ref %q names no anchor", r.loc.key(), reference)
 		}
 		target = found
 	}
 	if target.node == nil {
-		s.t.Fatalf("%s: unresolvable $ref %q", r.loc.key(), reference)
+		s.fatalf("%s: unresolvable $ref %q", r.loc.key(), reference)
 	}
 	return schemaRef{loc: target, scope: scope}
 }
@@ -780,11 +959,11 @@ func (s *schemaSet) follow(r schemaRef, reference string) schemaRef {
 func (s *schemaSet) dynamic(r schemaRef, reference string) schemaRef {
 	name, isFragment := strings.CutPrefix(reference, "#")
 	if !isFragment || name == "" || strings.HasPrefix(name, "/") {
-		s.t.Fatalf("%s: the drift resolver follows only same-resource \"#name\" $dynamicRef, not %q", r.loc.key(), reference)
+		s.fatalf("%s: the drift resolver follows only same-resource \"#name\" $dynamicRef, not %q", r.loc.key(), reference)
 	}
 	initial, isDynamic, ok := s.anchor(r.scope[len(r.scope)-1], name)
 	if !ok {
-		s.t.Fatalf("%s: $dynamicRef %q names no anchor in its resource", r.loc.key(), reference)
+		s.fatalf("%s: $dynamicRef %q names no anchor in its resource", r.loc.key(), reference)
 	}
 	if isDynamic {
 		for _, resource := range r.scope {
@@ -846,9 +1025,10 @@ type objectShape struct {
 
 func (shape objectShape) isObject() bool { return len(shape.properties) > 0 || shape.closed }
 
-// shape merges what an object schema declares. allOf members contribute
-// required fields and closure; oneOf, anyOf and conditional branches only
-// contribute properties, since what they require holds on one arm alone.
+// shape merges what an object schema declares. Arms that always apply (allOf
+// members, a $ref beside siblings) contribute required fields and closure;
+// alternative and conditional arms only contribute properties, since what
+// they require holds on one arm alone.
 func (s *schemaSet) shape(r schemaRef, visit func(schemaLocation)) objectShape {
 	shape := objectShape{properties: map[string]schemaRef{}, required: map[string]bool{}}
 	seen := map[string]bool{}
@@ -883,17 +1063,17 @@ func (s *schemaSet) shape(r schemaRef, visit func(schemaLocation)) objectShape {
 				shape.closed = true
 			}
 		}
-		for _, keyword := range []string{"allOf", "oneOf", "anyOf"} {
-			if members, ok := r.loc.node[keyword].([]any); ok {
-				for index := range members {
-					walk(s.child(r, keyword, strconv.Itoa(index)), unconditional && keyword == "allOf")
-				}
+		all, alternatives, conditional := s.arms(r)
+		for _, arm := range all {
+			walk(arm, unconditional)
+		}
+		for _, group := range alternatives {
+			for _, arm := range group {
+				walk(arm, false)
 			}
 		}
-		for _, keyword := range []string{"then", "else"} {
-			if _, ok := r.loc.node[keyword].(map[string]any); ok {
-				walk(s.child(r, keyword), false)
-			}
+		for _, arm := range conditional {
+			walk(arm, false)
 		}
 	}
 	walk(r, true)
@@ -917,54 +1097,109 @@ func declaresFreeFormObject(node map[string]any) bool {
 }
 
 // nested finds the schema for array items ("items") or map values
-// ("additionalProperties"), looking through composition keywords.
+// ("additionalProperties"), looking through every arm.
 func (s *schemaSet) nested(r schemaRef, keyword string) (schemaRef, bool) {
 	r = s.resolve(r, nil)
 	if _, ok := r.loc.node[keyword].(map[string]any); ok {
 		return s.child(r, keyword), true
 	}
-	for _, composition := range []string{"allOf", "oneOf", "anyOf"} {
-		if members, ok := r.loc.node[composition].([]any); ok {
-			for index := range members {
-				if found, ok := s.nested(s.child(r, composition, strconv.Itoa(index)), keyword); ok {
-					return found, true
-				}
-			}
+	all, alternatives, _ := s.arms(r)
+	for _, group := range alternatives {
+		all = append(all, group...)
+	}
+	for _, arm := range all {
+		if found, ok := s.nested(arm, keyword); ok {
+			return found, true
 		}
 	}
 	return schemaRef{}, false
 }
 
-// enumValues is the string vocabulary a schema admits, through composition.
-func (s *schemaSet) enumValues(r schemaRef) (map[string]bool, bool) {
+// vocabulary is the set of strings a schema admits, and whether that set is
+// closed. Every arm that always applies narrows it (intersection); an
+// alternative group admits the union of its arms, and is open when any arm is.
+// A schema whose type excludes string admits none. Keywords whose effect on
+// the set this reader does not model fail the test.
+func (s *schemaSet) vocabulary(r schemaRef) (map[string]bool, bool) {
 	r = s.resolve(r, nil)
-	values := map[string]bool{}
-	found := false
+	for _, unsupported := range []string{"not", "if", "then", "else", "dependentSchemas"} {
+		if _, ok := r.loc.node[unsupported]; ok {
+			s.fatalf("%s: the drift enum reader does not model %q", r.loc.key(), unsupported)
+		}
+	}
+	var values map[string]bool
+	closed := false
+	narrow := func(admitted map[string]bool) {
+		if !closed {
+			values, closed = admitted, true
+			return
+		}
+		kept := map[string]bool{}
+		for value := range values {
+			if admitted[value] {
+				kept[value] = true
+			}
+		}
+		values = kept
+	}
 	if list, ok := r.loc.node["enum"].([]any); ok {
-		found = true
+		admitted := map[string]bool{}
 		for _, value := range list {
 			if text, ok := value.(string); ok {
-				values[text] = true
+				admitted[text] = true
 			}
 		}
+		narrow(admitted)
 	}
-	if value, ok := r.loc.node["const"].(string); ok {
-		found = true
-		values[value] = true
+	if value, ok := r.loc.node["const"]; ok {
+		admitted := map[string]bool{}
+		if text, ok := value.(string); ok {
+			admitted[text] = true
+		}
+		narrow(admitted)
 	}
-	for _, composition := range []string{"allOf", "oneOf", "anyOf"} {
-		if members, ok := r.loc.node[composition].([]any); ok {
-			for index := range members {
-				if branch, ok := s.enumValues(s.child(r, composition, strconv.Itoa(index))); ok {
-					found = true
-					for value := range branch {
-						values[value] = true
-					}
-				}
-			}
+	if kind, ok := r.loc.node["type"]; ok && !typeAdmitsString(kind) {
+		narrow(map[string]bool{})
+	}
+	all, alternatives, _ := s.arms(r)
+	for _, arm := range all {
+		if admitted, armClosed := s.vocabulary(arm); armClosed {
+			narrow(admitted)
 		}
 	}
-	return values, found
+	for _, group := range alternatives {
+		union := map[string]bool{}
+		open := false
+		for _, arm := range group {
+			admitted, armClosed := s.vocabulary(arm)
+			if !armClosed {
+				open = true
+				break
+			}
+			for value := range admitted {
+				union[value] = true
+			}
+		}
+		if !open {
+			narrow(union)
+		}
+	}
+	return values, closed
+}
+
+func typeAdmitsString(kind any) bool {
+	switch value := kind.(type) {
+	case string:
+		return value == "string"
+	case []any:
+		for _, item := range value {
+			if item == "string" {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // publishedObjectSchemas lists every component and every inline request or
@@ -975,7 +1210,7 @@ func (s *schemaSet) publishedObjectSchemas() []schemaLocation {
 		if l.node == nil {
 			return
 		}
-		if _, isRef := l.node["$ref"]; isRef && !strings.Contains(l.pointer, "/components/") {
+		if pureReference(l.node) && !strings.Contains(l.pointer, "/components/") {
 			return // an inline body that points at a component is covered by that component
 		}
 		if s.shape(s.root(l.key()), nil).isObject() {
@@ -1242,12 +1477,34 @@ func (c *driftChecker) compareEnum(where string, t reflect.Type, r schemaRef) {
 	}
 	resolved := c.set.resolve(r, nil)
 	key := t.String() + "@" + resolved.loc.key()
-	if _, allowed := driftEnumExceptions[key]; allowed {
+	published, closed := c.set.vocabulary(r)
+	if exception, allowed := driftEnumExceptions[key]; allowed {
 		c.use(&c.usedEnumExceptions, key)
+		if exception.subset == nil {
+			if closed {
+				c.problem("%s: schema %s is listed as deliberately open but publishes enum %v",
+					where, resolved.loc.key(), sortedKeys(published))
+			}
+			return
+		}
+		subset := map[string]bool{}
+		for _, value := range exception.subset {
+			if !vocabulary[value] {
+				c.problem("%s: the allowed subset for %s names %q, which Go %s does not define", where, key, value, t)
+			}
+			subset[value] = true
+		}
+		if !closed {
+			c.problem("%s: schema %s publishes no enum; it must admit exactly %v", where, resolved.loc.key(), exception.subset)
+			return
+		}
+		if missing, extra := setDifference(subset, published); len(missing)+len(extra) > 0 {
+			c.problem("%s: schema %s enum differs from the allowed subset: subset-only %v, schema-only %v",
+				where, resolved.loc.key(), missing, extra)
+		}
 		return
 	}
-	published, ok := c.set.enumValues(r)
-	if !ok {
+	if !closed {
 		c.problem("%s: Go %s is a closed vocabulary %v, but schema %s publishes no enum",
 			where, t, sortedKeys(vocabulary), resolved.loc.key())
 		return
