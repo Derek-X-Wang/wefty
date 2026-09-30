@@ -23,6 +23,50 @@ func storeClockCompletion(t *testing.T, outbox *evidenceOutbox, clock *manualClo
 	}
 }
 
+// waitForArmedRetry waits until recovery has taken in its last answer and
+// armed its next retry: some timer is due after the clock's now. Only then
+// may a test advance the clock. Advanced any earlier, while an ask is still
+// in flight, recovery would arm its retry after the advance, relative to the
+// new now, and the next advance would be the first to fire it.
+func waitForArmedRetry(t *testing.T, clock *manualClock) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		clock.mu.Lock()
+		armed := false
+		for _, timer := range clock.timers {
+			if timer.active && timer.deadline.After(clock.now) {
+				armed = true
+				break
+			}
+		}
+		clock.mu.Unlock()
+		if armed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recovery never armed its next retry")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// advanceRecoveryDays drives recovery through days of simulated time, one
+// day at a time, each to quiescence: the retry armed before the day is
+// advanced past, and the day's ask of attemptID seen before the next. It
+// asserts at least one ask per day, never a total that depends on how fast
+// the runner schedules recovery.
+func advanceRecoveryDays(t *testing.T, clock *manualClock, counter *completionCounter, attemptID string, days int) {
+	t.Helper()
+	for day := 1; day <= days; day++ {
+		waitForArmedRetry(t, clock)
+		calls := counter.count(attemptID)
+		clock.Advance(24 * time.Hour)
+		waitForCompletionCalls(t, counter, attemptID, calls+1)
+	}
+	waitForArmedRetry(t, clock)
+}
+
 func waitForSpoolRowGone(t *testing.T, outbox *evidenceOutbox, attemptID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -64,11 +108,7 @@ func TestRecoveryKeepsAnUnansweredCompletionThroughAFiveDayOutage(t *testing.T) 
 
 	// Five days of an unavailable L1: every recovery pass, and every sweep
 	// it carries, runs while nothing has answered.
-	for day := 1; day <= 5; day++ {
-		calls := counter.count(attemptID)
-		clock.Advance(24 * time.Hour)
-		waitForCompletionCalls(t, counter, attemptID, calls+1)
-	}
+	advanceRecoveryDays(t, clock, counter, attemptID, 5)
 	waitForCompletionState(t, outbox, attemptID, "durable_completion")
 	assertAttemptPending(t, outbox, attemptID)
 
@@ -131,14 +171,9 @@ func TestRecoverySweepsOnlyWhatL1RefusedForGood(t *testing.T) {
 			t.Fatalf("%s was swept", kept)
 		}
 	}
-	// Five more days of the parked refusal: still kept, still asked.
-	for day := 0; day < 5; day++ {
-		clock.Advance(24 * time.Hour)
-		outbox.scheduleRecovery()
-	}
-	calls := counter.count(parked)
-	clock.Advance(time.Hour)
-	waitForCompletionCalls(t, counter, parked, calls+1)
+	// Five more days of the parked refusal: still kept, still asked every
+	// day.
+	advanceRecoveryDays(t, clock, counter, parked, 5)
 	waitForCompletionState(t, outbox, parked, "durable_completion")
 	assertAttemptPending(t, outbox, parked)
 	if !spoolRowExists(t, outbox.spool, service) {
@@ -182,11 +217,7 @@ func TestRecoveryKeepsAnUnansweredCompletionForSixtyDays(t *testing.T) {
 	reports := make(chan error, 256)
 	outbox.startRecovery(t.Context(), client, func(err error) { reports <- err })
 	waitForCompletionCalls(t, counter, attemptID, 1)
-	for day := 1; day <= 60; day++ {
-		calls := counter.count(attemptID)
-		clock.Advance(24 * time.Hour)
-		waitForCompletionCalls(t, counter, attemptID, calls+1)
-	}
+	advanceRecoveryDays(t, clock, counter, attemptID, 60)
 	waitForCompletionState(t, outbox, attemptID, "durable_completion")
 	assertAttemptPending(t, outbox, attemptID)
 
