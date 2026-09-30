@@ -206,6 +206,12 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 						}
 						continue
 					}
+					if sqliteLockContention(err) {
+						if s.logf != nil {
+							s.logf("event=l1_reconcile_sqlite_busy action=retry_next_tick error=%v", err)
+						}
+						continue
+					}
 					reconcileFailures <- err
 					_ = httpServer.Close()
 					return
@@ -286,11 +292,30 @@ func (s *Server) compactLogEventDocuments(ctx context.Context) {
 
 const (
 	sqliteBusyPrimaryCode      = 5
+	sqliteLockedPrimaryCode    = 6
 	sqliteInterruptPrimaryCode = 9
 )
 
 type sqliteErrorCoder interface {
 	Code() int
+}
+
+// sqliteLockContention reports whether err is SQLITE_BUSY or SQLITE_LOCKED,
+// in any extended form: another connection held a lock past this
+// connection's wait. A reconcile pass that fails this way rolls back what it
+// had not committed, and the next tick recomputes every step from the
+// database, so the loop retries rather than stopping L1 (#598). A long reader
+// or a checkpoint holding the WAL is ordinary operation, not a failure state.
+func sqliteLockContention(err error) bool {
+	var sqliteErr sqliteErrorCoder
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() & 0xff {
+	case sqliteBusyPrimaryCode, sqliteLockedPrimaryCode:
+		return true
+	}
+	return false
 }
 
 func reconciliationCanceledByShutdown(ctx context.Context, err error) bool {

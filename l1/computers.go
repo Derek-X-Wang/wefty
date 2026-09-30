@@ -1450,6 +1450,9 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if err := scrubComputerControllerState(ctx, tx, computerID); err != nil {
 		return Computer{}, err
 	}
+	if err := markSecretWALTruncationDue(ctx, tx); err != nil {
+		return Computer{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, published_attempt_id=NULL,
 		healthy_since_ns=NULL, next_restart_at=NULL WHERE job_id=?`,
 		contract.ServiceDesiredStopped, computer.CurrentJobID); err != nil {
@@ -1537,7 +1540,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer removal intent")
 	}
-	if err := s.checkpointSecretWAL(ctx); err != nil {
+	if err := s.truncateRemovalSecretWAL(ctx); err != nil {
 		return Computer{}, err
 	}
 	s.notifyComputerPolicyChanged()

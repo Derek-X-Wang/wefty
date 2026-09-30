@@ -56,7 +56,13 @@ truncation to a later tick rather than stalling writers, and
 the database runs with `secure_delete`, so the replaced bytes leave the files
 as well as the row. The same pass scrubs, a bounded batch at a time, any
 terminal one-shot stored before this rule existed. L3's program snapshot, not
-the L1 spec, is what a rerun is built from.
+the L1 spec, is what a rerun is built from. A service or Computer removal's
+scrub transaction marks the same truncation due. The removal then makes at
+most one truncation attempt on that handle before it responds, and none while
+another checkpoint runs or after one was deferred until a truncation succeeds,
+so concurrent removals under a held reader do not each add a wait. If a reader
+holds the WAL, the removal responds without waiting, and the reconcile loop
+truncates the WAL within one tick of the reader leaving.
 
 A job created through an attempt credential additionally records its parent
 job, the parent attempt that submitted it, the originating submitter inherited
