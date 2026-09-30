@@ -1200,6 +1200,9 @@
       "get": {
         "operationId": "listComputerBackups",
         "summary": "List immutable logical Backups and their managed source-node copy",
+        "parameters": [
+          { "name": "backup_id", "in": "query", "required": false, "schema": { "type": "string", "minLength": 1 }, "description": "Also return that Backup operation's own observed state as `operation`, so a caller follows the operation it started rather than the latest one. 404 when the Computer has no such operation." }
+        ],
         "responses": {
           "200": { "description": "Backup records with Storage provenance and physical copy lifecycle.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/BackupList" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -1224,8 +1227,8 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical creation replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
-          "202": { "description": "Backup intent planned; reconfiguration remains backing_up until the exact receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Identical creation replay. The Backup headers name the operation this key started, not the Computer's latest one.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } }, "Backup-Id": { "schema": { "type": "string" } }, "Backup-Operation-Revision": { "schema": { "type": "integer", "format": "int64" } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "202": { "description": "Backup intent planned; reconfiguration remains backing_up until the exact receipt is accepted.", "headers": { "Backup-Id": { "schema": { "type": "string" } }, "Backup-Operation-Revision": { "schema": { "type": "integer", "format": "int64" } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },

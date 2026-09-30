@@ -340,6 +340,12 @@ A helper failure receipt with positive copy absence settles the operation
 `source_never_detached` for a source generation nothing has ever detached
 from -- publishes nothing, and returns the Computer to `stable`; the directive
 is not dispatched again.
+The create response, fresh or replayed, names the operation its idempotency key
+started in `Backup-Id` and `Backup-Operation-Revision` headers -- never the
+Computer's latest operation, which a replay after a newer Backup would
+otherwise misreport. `GET .../backups?backup_id=ID` returns that operation's
+own state as `operation`, and a client waiting on a Backup follows it rather
+than `last_operation`.
 The Job resumes only when desired-running intent and the exact operation
 revision are unchanged; an intervening stop or remove wins.
 

@@ -66,6 +66,10 @@ type BackupCopy struct {
 type BackupList struct {
 	Backups       []Backup                        `json:"backups"`
 	LastOperation *ComputerBackupOperationOutcome `json:"last_operation,omitempty"`
+	// Operation is one specific Backup operation, named by the backup_id query
+	// parameter. `last_operation` is only the latest, so a caller waiting on an
+	// operation it started earlier follows this instead (#588).
+	Operation *ComputerBackupOperationOutcome `json:"operation,omitempty"`
 }
 
 type ComputerBackupFailureCode string
@@ -565,6 +569,40 @@ func readLastComputerBackupOperation(ctx context.Context, q queryer, computerID 
 		outcome.CompletedAt = &value
 	}
 	return &outcome, nil
+}
+
+// ComputerBackupOperationForKey names the operation an idempotency key
+// started. The key-to-operation binding is immutable, so a fresh call and any
+// later replay -- even after newer operations exist -- name the same one.
+func (s *Store) ComputerBackupOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerBackupOperationOutcome, error) {
+	row, err := readComputerBackupOperationByKey(ctx, s.db, computerID, strings.TrimSpace(idempotencyKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ComputerBackupOperationOutcome{}, protocolError(contract.ErrorNotFound, "Computer Backup operation was not found")
+	}
+	if err != nil {
+		return ComputerBackupOperationOutcome{}, internalError(err, "read Computer Backup operation by key")
+	}
+	return s.ComputerBackupOperation(ctx, computerID, row.BackupID)
+}
+
+// ComputerBackupOperation reads one Backup operation's own observed state.
+func (s *Store) ComputerBackupOperation(ctx context.Context, computerID, backupID string) (ComputerBackupOperationOutcome, error) {
+	var outcome ComputerBackupOperationOutcome
+	var completedNS sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT operation_revision, backup_id, status, failure_code, completed_ns
+		FROM computer_backup_operations WHERE computer_id=? AND backup_id=?`, computerID, backupID).Scan(
+		&outcome.OperationRevision, &outcome.BackupID, &outcome.Status, &outcome.FailureCode, &completedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ComputerBackupOperationOutcome{}, protocolError(contract.ErrorNotFound, "Backup operation %q was not found", backupID)
+	}
+	if err != nil {
+		return ComputerBackupOperationOutcome{}, internalError(err, "read Computer Backup operation")
+	}
+	if completedNS.Valid {
+		value := time.Unix(0, completedNS.Int64).UTC()
+		outcome.CompletedAt = &value
+	}
+	return outcome, nil
 }
 
 func readBackup(ctx context.Context, q queryer, backupID string) (Backup, error) {
