@@ -367,7 +367,12 @@ started in `Backup-Id` and `Backup-Operation-Revision` headers -- never the
 Computer's latest operation, which a replay after a newer Backup would
 otherwise misreport. `GET .../backups?backup_id=ID` returns that operation's
 own state as `operation`, and a client waiting on a Backup follows it rather
-than `last_operation`.
+than `last_operation`. Only `planned` is still running; `published`, `failed`,
+and `superseded` are terminal, and a waiting client judges them by status:
+only `published` is success. Removal and dead-node abort supersede a planned
+Backup without a completion time -- a superseded operation's `completed_at`
+is the later absence receipt for its planned copy -- so `completed_at` never
+decides whether the wait is over.
 The Job resumes only when desired-running intent and the exact operation
 revision are unchanged; an intervening stop or remove wins.
 
@@ -503,6 +508,16 @@ predecessor still owns the bytes. Removal is always available: a destination
 rolled back to a lock-only root proves exact absence through the same removal
 inventory a refused clone uses.
 
+The clone response, fresh or replayed, names the clone its idempotency key
+started in `Clone-Computer-Id` and `Clone-Operation-Revision` headers, and
+`GET /v1/computers/{id}?clone_operation_revision=N` returns that clone's own
+`status`, `failure_code`, and `completed_at` as `clone_operation`. A client
+waiting on a clone follows that record, never the destination's latest
+revision or Job `last_failure`: a later operation on a completed clone, such
+as a refused grow, latches its own failure there. `reserved` and `prepared`
+are still running; only `complete` is success, and `failed` and `superseded`
+-- a removal of the destination or of its source overtook it -- are not.
+
 A Computer whose current Storage generation was never published owns no bytes
 to start from or to change. Start, restart, and claim admission refuse it with
 the typed reason `storage_generation_retired`, and so do reimage, projection
@@ -541,7 +556,10 @@ names the node's operator mount roots must name canonical absolute
 directories consistent with the recorded external path, or L1 refuses the
 acknowledgement rather than recording an untainting outcome it cannot check.
 Removal supersedes a still-planned export and closes its directive fence; the
-already-committed event remains permanent taint. A verified helper receipt advances the durable export from `planned` to
+already-committed event remains permanent taint. A superseded export carries no
+completion time, so a client waiting on an export judges its status: only
+`planned` is still running, only `available` is success, and `failed` and
+`superseded` are not. A verified helper receipt advances the durable export from `planned` to
 `available`, meaning the complete external disk and `custody.json` manifest
 were both digest-verified. Typed helper failure evidence records `failed` and
 closes `exporting`, and a dead bound Node permits an explicit abort.

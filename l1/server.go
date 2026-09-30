@@ -1159,6 +1159,19 @@ func (s *Server) getComputer(w http.ResponseWriter, r *http.Request) {
 		}
 		computer.RestoreOperation = &operation
 	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("clone_operation_revision")); raw != "" {
+		revision, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || revision < 1 {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "clone_operation_revision must be a positive integer"))
+			return
+		}
+		operation, err := s.store.ComputerCloneOperation(r.Context(), computer.ComputerID, revision)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		computer.CloneOperation = &operation
+	}
 	writeJSON(w, http.StatusOK, redactComputer(computer))
 }
 
@@ -1452,6 +1465,13 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	operation, err := s.store.ComputerCloneOperationForKey(r.Context(), request.BackupID, request.IdempotencyKey)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	w.Header().Set("Clone-Computer-Id", operation.DestinationComputerID)
+	w.Header().Set("Clone-Operation-Revision", strconv.FormatInt(operation.OperationRevision, 10))
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK

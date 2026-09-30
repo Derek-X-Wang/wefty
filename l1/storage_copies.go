@@ -41,6 +41,27 @@ type ComputerRestoreOperation struct {
 	CompletedAt       *time.Time                `json:"completed_at,omitempty"`
 }
 
+// ComputerCloneOperation is one clone's own observed state. A clone is
+// `reserved` or `prepared` while it runs and ends `complete` when its
+// destination generation is published, `failed` when the helper refused the
+// destination or could never prepare it (failure_code names why), or
+// `superseded` when a removal of its destination or source overtook it. The
+// destination Computer's later Job failures, such as a refused grow, belong to
+// later operations, so only this record says how the clone itself ended
+// (#602). A Computer read carries it as `clone_operation` only when the
+// request names it with clone_operation_revision.
+type ComputerCloneOperation struct {
+	OperationRevision int64      `json:"operation_revision"`
+	SourceComputerID  string     `json:"source_computer_id"`
+	BackupID          string     `json:"backup_id"`
+	Status            string     `json:"status"`
+	FailureCode       string     `json:"failure_code,omitempty"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	// DestinationComputerID names the Computer the clone created. It is not
+	// serialized: the record is read through that Computer.
+	DestinationComputerID string `json:"-"`
+}
+
 type ComputerCloneRequest struct {
 	ComputerMutationPrecondition
 	BackupID         string `json:"-"`
@@ -406,6 +427,46 @@ func (s *Store) ComputerRestoreOperation(ctx context.Context, computerID string,
 	}
 	if err != nil {
 		return ComputerRestoreOperation{}, internalError(err, "read Computer restore operation")
+	}
+	if completedNS.Valid {
+		value := time.Unix(0, completedNS.Int64).UTC()
+		outcome.CompletedAt = &value
+	}
+	return outcome, nil
+}
+
+// ComputerCloneOperationForKey names the clone an idempotency key started.
+// A clone is keyed by its source Backup, and the key-to-operation binding is
+// immutable, so a fresh call and any later replay name the same destination
+// Computer and revision however many operations followed.
+func (s *Store) ComputerCloneOperationForKey(ctx context.Context, backupID, idempotencyKey string) (ComputerCloneOperation, error) {
+	var computerID string
+	var operationRevision int64
+	err := s.db.QueryRowContext(ctx, `SELECT destination_computer_id, operation_revision FROM computer_storage_copy_operations
+		WHERE backup_id=? AND idempotency_key=? AND operation='clone'`,
+		strings.TrimSpace(backupID), strings.TrimSpace(idempotencyKey)).Scan(&computerID, &operationRevision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ComputerCloneOperation{}, protocolError(contract.ErrorNotFound, "Computer clone operation was not found")
+	}
+	if err != nil {
+		return ComputerCloneOperation{}, internalError(err, "read Computer clone operation by key")
+	}
+	return s.ComputerCloneOperation(ctx, computerID, operationRevision)
+}
+
+// ComputerCloneOperation reads one clone's own observed state.
+func (s *Store) ComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerCloneOperation, error) {
+	outcome := ComputerCloneOperation{DestinationComputerID: computerID}
+	var completedNS sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT operation_revision, source_computer_id, backup_id, status, failure_code, completed_ns
+		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='clone'`,
+		computerID, operationRevision).Scan(&outcome.OperationRevision, &outcome.SourceComputerID, &outcome.BackupID,
+		&outcome.Status, &outcome.FailureCode, &completedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ComputerCloneOperation{}, protocolError(contract.ErrorNotFound, "Computer clone operation %d was not found", operationRevision)
+	}
+	if err != nil {
+		return ComputerCloneOperation{}, internalError(err, "read Computer clone operation")
 	}
 	if completedNS.Valid {
 		value := time.Unix(0, completedNS.Int64).UTC()
