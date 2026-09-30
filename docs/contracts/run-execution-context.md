@@ -119,14 +119,40 @@ credentials intentionally.
 The node agent replaces internal `wefty://` service addresses with per-attempt
 `http://127.0.0.1` bridge URLs before starting the workflow process. The bridge
 is torn down with the attempt and forwards L3 calls through the agent's
-authenticated Fabric connection. Run status, lineage, and log reads use L3's
-run-token-scoped endpoints. The same attempt-local bridge also exposes an `/l1`
-surface restricted to the attempt-credential route allowlist. It is transport
-only: the agent's Fabric identity carries the agent principal tag, which no L1
-client route accepts, so a request without a valid attempt credential is
-refused by L1 regardless of how it reached the bridge. Callers must still send
-the run token or the attempt credential, and no Fabric tag privilege is
-projected into the workflow process.
+authenticated Fabric connection. Because that connection carries the agent's
+own Node identity, and L3 authorizes some routes by Node identity alone (the
+Computer-pass mint and revocation routes), the bridge's `/l3` surface forwards
+only the exact method and path set on which L3 serves a run token
+(`l3.RunTokenRoutes`, mirrored by the bridge and checked against it):
+
+| Method | Path |
+|---|---|
+| `POST` | `/v1/runs` (a direct child of the token's own run) |
+| `GET` | `/v1/runs/{run_id}` |
+| `GET` | `/v1/runs/{run_id}/lineage` |
+| `GET` | `/v1/runs/{run_id}/logs` |
+| `GET` | `/v1/runs/{run_id}/execution` |
+| `GET` | `/v1/runs/{run_id}/result` |
+| `POST` | `/v1/runs/{run_id}/envelopes` |
+| `POST` | `/v1/runs/{run_id}/gates` |
+
+Every other `/l3` method or path, including the Run listings, rerun, the
+reserved cancel, Workflow administration, `/v1/computer/self`, and every
+`/v1/computer-token/*` and `/v1/computers/*` route, is refused at the bridge
+with a typed `403 forbidden` and never reaches L3. A request on an allowlisted
+route that carries no `Authorization: Bearer` credential is refused with a
+typed `401 unauthorized` and never reaches L3 either, so L3's credential-free
+Fabric-tag path cannot be exercised as the agent. The bridge judges both rules
+on the request as it will leave for L3, after hop-by-hop headers are removed:
+a request whose `Connection` header names `Authorization` would lose its
+credential in transit, so it is refused with the same typed `401`. L3 still
+decides the run token's scope on every forwarded request. The same attempt-local bridge also
+exposes an `/l1` surface restricted to the attempt-credential route allowlist.
+It is transport only: the agent's Fabric identity carries the agent principal
+tag, which no L1 client route accepts, so a request without a valid attempt
+credential is refused by L1 regardless of how it reached the bridge. Callers
+must still send the run token or the attempt credential, and no Fabric
+privilege of the agent is projected into the workflow process.
 
 Linux and process workloads receive the loopback bridge URL. A Mac OCI
 workload receives `host.lima.internal:<port>` after the agent discovers and
@@ -438,7 +464,13 @@ typed `submit_inflight_limit`. The guest bridge is transport-only defense in
 depth and never supplies or trusts provenance headers. Its method/path
 allowlist exactly mirrors L3's Computer-token surface: self, self-scoped Run
 list, root submission, scoped Run read (including accepted Envelopes), lineage,
-and logs. It closes and cancels in-flight traffic at attempt cancellation,
+and logs. Every allowlisted request must carry the pass as `Authorization:
+Bearer`, because the bridge dials L3 as the agent's own Node identity and a
+credential-free request would be authorized as the agent. Like the run bridge,
+it judges both rules on the request as it will leave for L3, after hop-by-hop
+headers are removed, so a request whose `Connection` header names
+`Authorization` is refused too. These refusals keep this surface's vocabulary:
+a typed `403 forbidden` that never reaches L3, never `unauthorized`. It closes and cancels in-flight traffic at attempt cancellation,
 policy/lease/authority/helper loss, agent restart, reimage/reset, and removal;
 L3 revocation remains the authority and closure only removes reachability.
 Bridge cancellation is a typed retryable `pass_unavailable` with an

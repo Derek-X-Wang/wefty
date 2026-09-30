@@ -254,9 +254,9 @@ func TestAWorkloadWithoutTheRunTokenCannotAppendToL3(t *testing.T) {
 		t.Fatal(err)
 	}
 	// No bearer at all: the workload inherits no Fabric privilege from the
-	// agent that proxied its request.
-	if anonymousStatus != http.StatusForbidden {
-		t.Fatalf("unauthenticated append status = %d, want %d", anonymousStatus, http.StatusForbidden)
+	// agent that proxied its request. The bridge refuses it before L3 (#595).
+	if anonymousStatus != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated append status = %d, want %d", anonymousStatus, http.StatusUnauthorized)
 	}
 	if forgedStatus != http.StatusUnauthorized {
 		t.Fatalf("forged-bearer append status = %d, want %d", forgedStatus, http.StatusUnauthorized)
