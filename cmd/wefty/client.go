@@ -557,11 +557,27 @@ func (c *apiClients) pruneComputerBackup(ctx context.Context, computerID, backup
 	return backup, responseWasIdempotentReplay(headers), err
 }
 
-func (c *apiClients) restoreComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerRestoreRequest) (l1.Computer, bool, error) {
+// restoreComputerBackup also returns the operation revision L1 names as the
+// restore this key started, on a fresh call and on any replay; zero when L1
+// named none.
+func (c *apiClients) restoreComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerRestoreRequest) (l1.Computer, int64, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/restore"
 	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
-	return computer, responseWasIdempotentReplay(headers), err
+	var operationRevision int64
+	if parsed, parseErr := strconv.ParseInt(headers.Get("Restore-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
+		operationRevision = parsed
+	}
+	return computer, operationRevision, responseWasIdempotentReplay(headers), err
+}
+
+// getComputerRestoreOperation reads the Computer together with one restore's
+// own state.
+func (c *apiClients) getComputerRestoreOperation(ctx context.Context, computerID string, operationRevision int64) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "?restore_operation_revision=" + strconv.FormatInt(operationRevision, 10)
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &computer, http.StatusOK)
+	return computer, err
 }
 
 func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, bool, error) {

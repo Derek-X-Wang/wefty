@@ -553,6 +553,7 @@
           "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
           "last_grow_operation": { "$ref": "#/components/schemas/ComputerStorageGrowOutcome" },
           "last_restore_revocation": { "$ref": "#/components/schemas/ComputerRestoreRevocationReceipt" },
+          "restore_operation": { "$ref": "#/components/schemas/ComputerRestoreOperation", "description": "Present only when the read named a restore_operation_revision: that restore's own state." },
           "owed_revocations": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/OwedComputerRevocation" },
@@ -791,6 +792,19 @@
           "completed_at": { "type": "string", "format": "date-time" }
         },
         "description": "Latest durable Computer Storage grow observation. Available bytes exist only when a validated helper refusal receipt supplied them."
+      },
+      "ComputerRestoreOperation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation_revision", "backup_id", "status"],
+        "properties": {
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "backup_id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["reserved", "prepared", "published", "retired", "failed", "superseded"] },
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached"] },
+          "completed_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the precommitted predecessor Backup copy failed and the restore was aborted with the old generation still current, and carries that copy's failure_code; `superseded` means a removal overtook it. The Computer is `stable` after both `retired` and `failed`."
       },
       "ServiceRemovalStall": {
         "type": "object",

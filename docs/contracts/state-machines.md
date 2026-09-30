@@ -417,6 +417,18 @@ Node/root/operation-bound evidence. L1 records that evidence before publishing
 the staging generation and retiring its predecessor. The source Backup is
 immutable, no phase auto-resumes the Computer, and predecessor deletion reuses
 the shared generation-removal machinery.
+A restore that precommitted "keep predecessor as Backup" and whose predecessor
+copy fails with a typed Backup failure receipt is aborted before switchover:
+L1 records the restore operation `failed` with that copy's `failure_code`,
+retires the never-published staging generation, and returns the Computer to
+`stable` on the old generation. A completed restore (`retired`) also ends
+`stable`, so the Computer alone cannot tell the two apart. The restore
+response, fresh or replayed, names the operation its idempotency key started
+in a `Restore-Operation-Revision` header -- never the Computer's latest
+operation -- and `GET /v1/computers/{id}?restore_operation_revision=N` returns
+that restore's own `status`, `failure_code`, and `completed_at` as
+`restore_operation`. A client waiting on a restore follows that record: only
+`retired` is success; `failed` and `superseded` are not.
 
 Clone uses the same cold-copy primitive but creates a new `computer_id`,
 `storage_id`, required name, dispatch authority, and generation one with no
