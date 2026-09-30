@@ -50,6 +50,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
 	query.Add("_pragma", "foreign_keys(1)")
+	// The ledger stages run-token bearers and holds run scripts; a cleared or
+	// deleted value is zeroed on disk rather than left in a free page (#52),
+	// as L1 does.
+	query.Add("_pragma", "secure_delete(1)")
 	query.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
@@ -1725,6 +1729,18 @@ func failRunTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time, tok
 			return internalError(err, "expire protocol-failed run token")
 		}
 	}
+	return clearStagedTokenDelivery(ctx, tx, runID)
+}
+
+// clearStagedTokenDelivery drops a terminal run's staged run-token bearer. A
+// terminal run is never dispatched again, so a bearer still staged for a
+// dispatch L3 never recorded -- L1 accepted the job, L3 crashed before
+// completeDispatch, and the run then ended -- would otherwise stay in the
+// outbox in plaintext forever (#52).
+func clearStagedTokenDelivery(ctx context.Context, tx *sql.Tx, runID string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=NULL WHERE run_id=? AND token_delivery IS NOT NULL`, runID); err != nil {
+		return internalError(err, "clear terminal run's staged token delivery")
+	}
 	return nil
 }
 
@@ -2018,6 +2034,9 @@ WHERE run_id=? AND status=?`, target, now.UnixNano(), started, now.UnixNano(), f
 		expires := canonicalTime(now.Add(s.tokenGrace))
 		if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, expires.UnixNano(), run.RunID); err != nil {
 			return internalError(err, "expire terminal run token")
+		}
+		if err := clearStagedTokenDelivery(ctx, tx, run.RunID); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {

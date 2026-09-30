@@ -69,7 +69,7 @@
           },
           "spec": {
             "$ref": "#/components/schemas/JobSpec",
-            "description": "Absent after removal finalizes; tombstones retain no executable or environment bytes."
+            "description": "Absent after removal finalizes; tombstones retain no executable or environment bytes. Once secrets_scrubbed_at is set it is the permanent record of a terminal one-shot, not a resubmittable request: execution.executable keeps its sha256, interpreter and mode but no inline_base64, and the run_params_json label is gone. Client responses never carry sensitive_env."
           },
           "current_attempt_id": { "type": "string" },
           "parent_job_id": { "type": "string", "description": "Job whose live attempt submitted this job through its attempt credential. Derived from the credential, never supplied by the caller; absent on a root job." },
@@ -104,6 +104,11 @@
           "failure_reason": {
             "type": "string",
             "description": "Present when L1 terminalized a job without minting a new attempt, such as expiry of a persisted pre-start infrastructure budget while awaiting scheduling."
+          },
+          "secrets_scrubbed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "One-shot jobs only. When L1 removed the job's sensitive environment, inline executable bytes and run_params_json label from its stored spec, in the same transaction that made it succeeded or failed. Absent while the job can still run."
           },
           "restart_suppressed_reason": {
             "type": "string",
