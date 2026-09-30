@@ -139,7 +139,41 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 			passErrors = append(passErrors, err)
 		}
 	}
+	passErrors = append(passErrors, r.settlePendingNodeAttributions(ctx)...)
 	return errors.Join(passErrors...)
+}
+
+// settlePendingNodeAttributions names the node of runs the ledger failed while
+// their L1 job was live. They are terminal, so the projection loop above no
+// longer visits them; this waits for the job to settle and fills the node from
+// the attempt that settled it. A job L1 no longer has ends the wait unnamed.
+func (r *Reconciler) settlePendingNodeAttributions(ctx context.Context) []error {
+	pending, err := r.store.pendingNodeAttributions(ctx)
+	if err != nil {
+		return []error{err}
+	}
+	var passErrors []error
+	for _, item := range pending {
+		job, err := r.jobs.GetJob(ctx, item.JobID)
+		if err != nil {
+			if isMissingL1Job(err, item.JobID) {
+				if err := r.store.settleNodeAttribution(ctx, item.RunID, ""); err != nil {
+					passErrors = append(passErrors, err)
+				}
+				continue
+			}
+			passErrors = append(passErrors, err)
+			continue
+		}
+		nodeID, settled := jobNodeID(job)
+		if !settled {
+			continue
+		}
+		if err := r.store.settleNodeAttribution(ctx, item.RunID, nodeID); err != nil {
+			passErrors = append(passErrors, err)
+		}
+	}
+	return passErrors
 }
 
 func retryableDispatchError(err error) bool {

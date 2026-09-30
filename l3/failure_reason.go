@@ -1,11 +1,14 @@
 package l3
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // A failed run says why in one line.
@@ -27,6 +30,10 @@ import (
 // the reason would say the opposite of what happened. It is kept, marked as
 // late, after the cause.
 func JobFailureReason(job l1.Job) string {
+	return SanitizeFailureReason(jobFailureReason(job))
+}
+
+func jobFailureReason(job l1.Job) string {
 	if len(job.Attempts) == 0 {
 		if job.FailureReason != "" {
 			return "L1: " + job.FailureReason
@@ -118,4 +125,70 @@ func jobNodeID(job l1.Job) (nodeID string, settled bool) {
 		return attempt.NodeID, true
 	}
 	return job.NodeID, true
+}
+
+// maxFailureReasonRunes bounds a recorded reason. It is one line a person
+// reads beside a status, not a place to keep evidence; the evidence has its
+// own homes (the attempt, the protocol rejection, the logs).
+const maxFailureReasonRunes = 200
+
+// SanitizeFailureReason makes any reason safe to store and print as one line:
+// every run of whitespace or control characters becomes one space, and the
+// result is capped. Every failure_reason passes through it, whatever wrote
+// it, because some sources -- an L1 spawn message, a gate name -- carry text
+// the ledger did not write.
+func SanitizeFailureReason(reason string) string {
+	fields := strings.FieldsFunc(reason, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) })
+	line := strings.Join(fields, " ")
+	if runes := []rune(line); len(runes) > maxFailureReasonRunes {
+		line = string(runes[:maxFailureReasonRunes-1]) + "…"
+	}
+	return line
+}
+
+// errRunIDMismatch and errAttemptIDMismatch are the two binding refusals a
+// protocol write can meet. Their text is fixed, so a rejected-write summary
+// may repeat it.
+var (
+	errRunIDMismatch     = errors.New("run_id must match the authenticated run")
+	errAttemptIDMismatch = errors.New("attempt_id must match the authenticated run attempt")
+)
+
+// rejectedWriteSummary is the failure_reason for a run failed by a write the
+// ledger refused. It is fixed text plus, for a schema failure, the JSON
+// pointer of the offending field -- never the value. A format or pattern
+// error quotes the rejected value, and a workload that put a token in an
+// envelope field would otherwise have it copied into run metadata and onto
+// every terminal that runs `wefty wait` (#604 review).
+func rejectedWriteSummary(kind string, cause error) string {
+	var validation *jsonschema.ValidationError
+	switch {
+	case errors.As(cause, &validation):
+		return fmt.Sprintf("rejected %s: schema validation failed at %s", kind, jsonPointer(firstValidationLeaf(validation).InstanceLocation))
+	case errors.Is(cause, errRunIDMismatch), errors.Is(cause, errAttemptIDMismatch):
+		return "rejected " + kind + ": " + cause.Error()
+	default:
+		return "rejected " + kind + ": validation failed"
+	}
+}
+
+// firstValidationLeaf follows the first cause down to the most specific
+// failure, which is the one whose location names the field.
+func firstValidationLeaf(validation *jsonschema.ValidationError) *jsonschema.ValidationError {
+	for len(validation.Causes) > 0 {
+		validation = validation.Causes[0]
+	}
+	return validation
+}
+
+// jsonPointer renders an instance location as an RFC 6901 pointer.
+func jsonPointer(location []string) string {
+	if len(location) == 0 {
+		return "/"
+	}
+	escaped := make([]string, len(location))
+	for index, token := range location {
+		escaped[index] = strings.ReplaceAll(strings.ReplaceAll(token, "~", "~0"), "/", "~1")
+	}
+	return "/" + strings.Join(escaped, "/")
 }

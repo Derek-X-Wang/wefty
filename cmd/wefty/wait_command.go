@@ -253,7 +253,7 @@ func executionFailureReason(execution l3.RunExecution) string {
 		return l3.JobFailureReason(*execution.Job)
 	}
 	if execution.DispatchError != nil {
-		return fmt.Sprintf("dispatch failed: %s: %s", execution.DispatchError.Code, execution.DispatchError.Message)
+		return l3.SanitizeFailureReason(fmt.Sprintf("dispatch failed: %s: %s", execution.DispatchError.Code, execution.DispatchError.Message))
 	}
 	return ""
 }

@@ -29,7 +29,8 @@
     "failure_reason": {
       "type": "string",
       "minLength": 1,
-      "description": "One line saying why a failed run failed, recorded by the transition that failed it. Absent for any other run and for a run failed before reasons were recorded."
+      "maxLength": 200,
+      "description": "One line (no newlines, at most 200 characters) saying why a failed run failed, recorded by the transition that failed it. A rejected write names the kind and, for a schema failure, the JSON pointer of the field, never its value. Absent for any other run and for a run failed before reasons were recorded."
     },
     "trigger": {
       "type": "object",

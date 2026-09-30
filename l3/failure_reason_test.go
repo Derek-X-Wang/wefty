@@ -2,6 +2,7 @@ package l3
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -253,5 +254,149 @@ func TestRequeuedJobIsNotAttributedToTheAttemptThatFailed(t *testing.T) {
 	}
 	if record.NodeID != "" {
 		t.Fatalf("a requeued job's failed attempt attributed the run to %q", record.NodeID)
+	}
+}
+
+func TestSanitizeFailureReasonIsOneCappedLine(t *testing.T) {
+	got := SanitizeFailureReason("spawn failed:\n  line two\r\n\tline\x00three  ")
+	if got != "spawn failed: line two line three" {
+		t.Fatalf("sanitized = %q", got)
+	}
+	long := SanitizeFailureReason(strings.Repeat("x", 500))
+	if runes := []rune(long); len(runes) != maxFailureReasonRunes || !strings.HasSuffix(long, "…") {
+		t.Fatalf("capped reason is %d runes: %q", len(runes), long)
+	}
+}
+
+// TestRejectedWriteReasonNamesThePathNotTheValue is the #604 review P2: a
+// schema error quotes the rejected value, and a token put in an envelope
+// field was copied into the run's failure_reason and onto stderr. The
+// recorded reason names where the write failed, never what it held.
+func TestRejectedWriteReasonNamesThePathNotTheValue(t *testing.T) {
+	s, _, _ := recoveryStore(t)
+	ctx := context.Background()
+	const secret = "wefty_tok_live_4f9c2a7e1b"
+	request := inlineRunRequest("#!/bin/sh\nexit 0\n")
+	request.EnvelopeSchema = json.RawMessage(`{"type":"object","properties":{"summary":{"pattern":"^[a-z ]+$"}}}`)
+	record, _, err := s.CreateRun(ctx, CreateRunInput{IdempotencyKey: "leaky", Actor: "test", Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.ensureRunToken(ctx, record.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := s.AuthenticateRunToken(ctx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := validEnvelope(record.RunID, scope.AttemptID, "leaky")
+	envelope.Summary = "result\n" + secret
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AppendEnvelope(ctx, scope, raw); err == nil {
+		t.Fatal("an envelope failing the caller schema was accepted")
+	}
+	failed, err := s.GetRun(ctx, record.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != contract.RunFailed {
+		t.Fatalf("status = %s", failed.Status)
+	}
+	if failed.FailureReason != "rejected envelope: schema validation failed at /summary" {
+		t.Fatalf("failure_reason = %q", failed.FailureReason)
+	}
+	if strings.Contains(failed.FailureReason, secret) || strings.ContainsAny(failed.FailureReason, "\r\n") {
+		t.Fatalf("failure_reason leaks the value or spans lines: %q", failed.FailureReason)
+	}
+}
+
+// TestLedgerFailedRunIsAttributedOnceItsJobSettles is the #604 review P2 on
+// ledger-driven failures: an attempt on A fails before it starts, the job is
+// retried on B, and B reports a failed gate before its L1 job is terminal.
+// The gate fails the run at once and the projection loop then skips it, so a
+// node recorded while A held the job used to stay. The ledger cannot tell
+// which node wrote the gate, so it clears the provisional node and names the
+// node once the job settles.
+func TestLedgerFailedRunIsAttributedOnceItsJobSettles(t *testing.T) {
+	s, _, _ := recoveryStore(t)
+	ctx := context.Background()
+	run, token := dispatchedRecoveryRun(t, s, "gate-on-b")
+	client := &fixedJobClient{jobs: map[string]l1.Job{}}
+	reconciler, err := NewReconciler(s, client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeOf := func() string {
+		t.Helper()
+		record, err := s.GetRun(ctx, run.RunID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record.NodeID
+	}
+	failedOnA := l1.Attempt{AttemptID: "attempt-a", NodeID: "node-a", State: contract.AttemptFailed,
+		Result: &l1.ProcessResult{SpawnError: &contract.SpawnFailure{Code: "image_unavailable", Message: "pull failed"}}}
+	runningOnB := l1.Attempt{AttemptID: "attempt-b", NodeID: "node-b", State: contract.AttemptRunning}
+
+	client.jobs[run.JobID] = l1.Job{JobID: run.JobID, State: contract.JobClaimed, NodeID: "node-a",
+		Attempts: []l1.Attempt{{AttemptID: "attempt-a", NodeID: "node-a", State: contract.AttemptClaimed}}}
+	if err := reconciler.ReconcileOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	client.jobs[run.JobID] = l1.Job{JobID: run.JobID, State: contract.JobRunning, NodeID: "node-b",
+		Attempts: []l1.Attempt{failedOnA, runningOnB}}
+	if err := reconciler.ReconcileOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeOf(); got != "node-a" {
+		t.Fatalf("precondition: provisional node = %q, want the stale node-a", got)
+	}
+
+	scope, err := s.AuthenticateRunToken(ctx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := validGate(run.RunID, scope.AttemptID, "failing-gate")
+	gate.Outcome = contract.GateFail
+	raw, err := json.Marshal(gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AppendGateResult(ctx, scope, raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeOf(); got != "" {
+		t.Fatalf("after the gate: node_id = %q, want the stale node cleared", got)
+	}
+
+	// Still running on B: the run stays unattributed rather than guessed.
+	if err := reconciler.ReconcileOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeOf(); got != "" {
+		t.Fatalf("while B runs: node_id = %q", got)
+	}
+
+	// B settles the job: the terminal run is named from empty, once.
+	runningOnB.State = contract.AttemptSucceeded
+	runningOnB.Result = &l1.ProcessResult{ExitCode: exitCode(0)}
+	client.jobs[run.JobID] = l1.Job{JobID: run.JobID, State: contract.JobSucceeded, Attempts: []l1.Attempt{failedOnA, runningOnB}}
+	if err := reconciler.ReconcileOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	record, err := s.GetRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.NodeID != "node-b" || record.Status != contract.RunFailed || !strings.Contains(record.FailureReason, `gate "tests" reported fail`) {
+		t.Fatalf("run = %s on %q (%q), want failed on node-b for the gate", record.Status, record.NodeID, record.FailureReason)
+	}
+	var pending int
+	if err := s.db.QueryRow(`SELECT node_attribution_pending FROM runs WHERE run_id=?`, run.RunID).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("attribution still pending (%d, %v)", pending, err)
 	}
 }

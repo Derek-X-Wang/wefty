@@ -686,7 +686,9 @@ type RunRecord struct {
 	// FailureReason is one line saying why a failed run failed: the job's
 	// exit code or signal, a dispatch L1 refused, or the ledger gate that
 	// failed a job that exited 0 (a gate, a rejected write, a failed child,
-	// or a missing required envelope). It is recorded by the transition that
+	// or a missing required envelope). It is one line of at most 200
+	// characters, and a rejected write is summarized by kind and JSON pointer,
+	// never by the rejected value. It is recorded by the transition that
 	// fails the run and is empty for any other run, and for a run failed
 	// before the ledger recorded reasons.
 	FailureReason string          `json:"failure_reason,omitempty"`
