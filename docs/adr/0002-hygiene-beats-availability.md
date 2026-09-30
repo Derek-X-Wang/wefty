@@ -44,6 +44,11 @@ conflict, **hygiene wins.**
   `removal_pending`, never clean. `forget --force` waives the proof but
   leaves the deletion directive standing.
 - **Retention is bounded by default**, not retained until someone notices.
+- **Secrets end with the work that needed them.** A one-shot's
+  `SensitiveEnv`, inline script bytes and parameter label are scrubbed from
+  L1 in the transaction that makes it terminal, and its WAL is truncated
+  soon after ([#52](https://github.com/Derek-X-Wang/wefty/issues/52)); a
+  service's are scrubbed at removal.
 - **Failure design chooses correctness over uptime.** In
   [#53](https://github.com/Derek-X-Wang/wefty/issues/53), a payload whose
   authority cannot be confirmed is killed rather than left serving; a
