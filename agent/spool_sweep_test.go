@@ -118,7 +118,7 @@ func TestSpoolSweepRemovesOnlyRowsL1RefusedForGood(t *testing.T) {
 	}
 
 	live := func(attemptID string) bool { return attemptID == liveRefused }
-	sweep, err := spool.sweepDeadOneShotAttempts(ctx, spoolSweepBatch, live)
+	sweep, err := spool.sweepDeadOneShotAttempts(ctx, spoolSweepBatch, live, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,5 +241,97 @@ func TestL1ClosedEvidenceCodes(t *testing.T) {
 		if l1ClosedEvidence(code) {
 			t.Fatalf("%q must not let the sweep take a row", code)
 		}
+	}
+}
+
+// #605: an agent that crashes mid-attempt leaves a one-shot row no delivery
+// predicate ever matches and no L1 refusal ever seals. The sweep removes it
+// only when it holds nothing at all; any evidence, delivered-outcome record
+// or runtime manifest keeps it.
+func TestSpoolSweepRemovesOnlyEmptyLeftoversOfInterruptedOneShots(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "node-sweep-empty", 1<<20)
+	defer spool.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	exitCode := 0
+	claimRow := func(claim l1.Claim) string {
+		t.Helper()
+		if err := spool.ensureAttempt(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		return claim.Lease.AttemptID
+	}
+	withEvent := func(attemptID string) {
+		t.Helper()
+		if err := spool.append(ctx, spoolTestEvent(attemptID, contract.LogStdout, 0, "out")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := spool.db.Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Crashed before writing anything: swept.
+	neverLogged := claimRow(spoolTestClaim("never-logged"))
+	// Crashed after L1 took every log event: swept, acknowledgements with it.
+	allDelivered := claimRow(spoolTestClaim("all-delivered"))
+	withEvent(allDelivered)
+	if err := spool.acknowledge(ctx, allDelivered, map[contract.LogStream]uint64{contract.LogStdout: 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Everything below holds something and stays.
+	undelivered := claimRow(spoolTestClaim("undelivered"))
+	withEvent(undelivered)
+	finished := claimRow(spoolTestClaim("finished"))
+	if err := spool.storeCompletion(ctx, finished, l1.ProcessResult{ExitCode: &exitCode}, now); err != nil {
+		t.Fatal(err)
+	}
+	sealed := claimRow(spoolTestClaim("sealed"))
+	if err := spool.sealIncomplete(ctx, sealed, "test", contract.ErrorAttemptNotOwned, now); err != nil {
+		t.Fatal(err)
+	}
+	disposed := claimRow(spoolTestClaim("disposed"))
+	exec(`UPDATE spool_attempts SET completion_disposition='withheld', completion_reason='test' WHERE attempt_id=?`, disposed)
+	receipted := claimRow(spoolTestClaim("receipted"))
+	exec(`INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns) VALUES(?, 'withheld', 'test', ?)`,
+		receipted, now.UnixNano())
+	manifested := claimRow(spoolTestClaim("manifested"))
+	exec(`INSERT INTO runtime_attempt_manifests(attempt_id, job_id, runtime_kind, removal_generation, manifest_json, created_ns)
+VALUES(?, 'job-manifested', 'oci', 'g1', '{}', ?)`, manifested, now.UnixNano())
+	live := claimRow(spoolTestClaim("live"))
+	// Created by this process and not yet released: its first evidence may
+	// simply not have arrived.
+	createdHere := claimRow(spoolTestClaim("created-here"))
+	service := claimRow(serviceSpoolTestClaim("service-empty"))
+
+	sweep, err := spool.sweepDeadOneShotAttempts(ctx, spoolSweepBatch,
+		func(attemptID string) bool { return attemptID == live },
+		func(attemptID string) bool { return attemptID == createdHere })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sweep.empty != 2 || sweep.refused != 0 || sweep.full {
+		t.Fatalf("sweep = %+v, want the 2 empty leftovers", sweep)
+	}
+	for _, gone := range []string{neverLogged, allDelivered} {
+		if spoolRowExists(t, spool, gone) {
+			t.Fatalf("%s survived the sweep", gone)
+		}
+	}
+	for _, kept := range []string{undelivered, finished, sealed, disposed, receipted, manifested, live, createdHere, service} {
+		if !spoolRowExists(t, spool, kept) {
+			t.Fatalf("%s was swept", kept)
+		}
+	}
+	var orphans int
+	if err := spool.db.QueryRow(`SELECT COUNT(*) FROM spool_acknowledgements WHERE attempt_id=?`, allDelivered).Scan(&orphans); err != nil {
+		t.Fatal(err)
+	}
+	if orphans != 0 {
+		t.Fatalf("%d acknowledgements outlived their swept attempt", orphans)
 	}
 }
