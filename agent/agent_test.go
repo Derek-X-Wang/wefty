@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -35,6 +36,10 @@ var (
 )
 
 func TestMain(main *testing.M) {
+	// Test stores open without F_FULLFSYNC: it makes this suite much slower on
+	// darwin and proves nothing a test asserts, since no test cuts power. The
+	// binaries built below are production builds and keep it (#599).
+	durable.DisableSQLiteFullFsyncForTests()
 	directory, err := os.MkdirTemp("", "wefty-agent-test-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
