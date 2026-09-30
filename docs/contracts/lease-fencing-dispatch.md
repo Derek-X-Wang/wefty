@@ -485,9 +485,14 @@ the live attempt, so the credential stops working at the same instant the
 lease, boot session, or authority generation does, and a request presenting it
 must still arrive with the Fabric identity of the node holding that attempt.
 Authority is never restored by a later renewal or by a different attempt of the
-same job: a fresh claim mints a fresh credential. Deleting a superseded
-credential row is hygiene, not enforcement; refusal is decided by reading the
-live attempt.
+same job: a fresh claim mints a fresh credential. Deleting a credential row is
+hygiene, not enforcement; refusal is decided by reading the live attempt. A
+claim deletes the rows of attempts it superseded, and every reconcile pass
+deletes, at most 4096 at a time, the rows of attempts that have ended or no
+longer exist, so a finished job's last attempt keeps no credential hash.
+Nothing needs the row after its attempt ends: completion replay and late
+evidence authenticate with the node identity and fencing token, not the
+attempt credential.
 
 Log idempotency is keyed by `(attempt_id, stream, sequence)`. The same bytes and
 timestamp are replay-safe; a different event at an existing key is an

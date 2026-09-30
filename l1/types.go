@@ -708,6 +708,7 @@ type ReconcileResult struct {
 	PrunedAttempts                    int64 `json:"pruned_attempts"`
 	PrunedComputerTakeoverAuditEvents int64 `json:"pruned_computer_takeover_audit_events"`
 	FinalizedRemovals                 int64 `json:"finalized_removals"`
+	PrunedAttemptCredentials          int64 `json:"pruned_attempt_credentials"`
 }
 
 // AppendLogsRequest is one provenance-authenticated, idempotent upload batch.

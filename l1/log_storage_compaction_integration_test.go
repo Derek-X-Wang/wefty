@@ -515,3 +515,142 @@ func TestServerRunsLogEventDocumentMigrationUntilDone(t *testing.T) {
 		t.Fatalf("logged %q, want %q", logged, want)
 	}
 }
+
+func credentialRows(t *testing.T, store *Store, attemptID string) int {
+	t.Helper()
+	var rows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM attempt_credentials WHERE attempt_id=?`, attemptID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+// #52 S3: claim-time pruning only reached attempts a newer claim superseded,
+// so a finished job's last attempt kept its credential hash forever -- one
+// row per one-shot. The reconcile pass now deletes the row of every attempt
+// that has ended. The credential was already refused the moment its attempt
+// ended, and completion replay and late evidence authenticate with the node
+// identity and fencing token, so both still land after the row is gone.
+func TestEndedAttemptCredentialsArePruned(t *testing.T) {
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{
+		"node-1": DefaultNodePolicy("node-1"),
+	}, true, time.Hour)
+	client := h.client(fabric.Identity{NodeID: "submitter", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "node-1")
+
+	// A one-shot that succeeded.
+	finished := h.submit(client, "credential-finished", nil)
+	finishedClaim := claimOneshot(t, h, agent, node, finished.JobID)
+	exitCode := 0
+	completionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", finished.JobID, finishedClaim.Lease.AttemptID)
+	completion := CompletionRequest{FencingToken: finishedClaim.Lease.FencingToken,
+		IdempotencyKey: "completion:" + finishedClaim.Lease.AttemptID, Result: ProcessResult{ExitCode: &exitCode}}
+	if status, _, body := h.do(agent, http.MethodPost, completionPath, completion); status != http.StatusOK {
+		t.Fatalf("completion status = %d body=%s", status, body)
+	}
+	// A one-shot whose lease is about to be lost.
+	lost := h.submit(client, "credential-lost", nil)
+	lostClaim := claimOneshot(t, h, agent, node, lost.JobID)
+	lostLogs := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", lost.JobID, lostClaim.Lease.AttemptID)
+	appendRetentionLogs(t, h, agent, lostLogs, lostClaim.Lease.FencingToken, []contract.LogEvent{
+		logEvent(lostClaim.Lease.AttemptID, contract.LogStdout, 0, []byte("before-loss")),
+	})
+
+	ownJob := func(claim Claim) int {
+		status, _ := h.credentialRequest(agent, http.MethodGet, "/v1/jobs/"+claim.Job.JobID, claim.AttemptToken, nil)
+		return status
+	}
+	if status := ownJob(finishedClaim); status != http.StatusUnauthorized {
+		t.Fatalf("finished attempt's credential before pruning = %d, want 401", status)
+	}
+	if credentialRows(t, h.store, finishedClaim.Lease.AttemptID) != 1 {
+		t.Fatal("the finished attempt's credential row is gone before any pass")
+	}
+
+	h.clock.Advance(time.Minute) // past the 30 s lease of the second attempt
+	if status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node)); status != http.StatusOK {
+		t.Fatalf("heartbeat status = %d body=%s", status, body)
+	}
+	live := h.submit(client, "credential-live", nil)
+	liveClaim := claimOneshot(t, h, agent, node, live.JobID)
+	result, err := h.store.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAttemptState(t, h, lostClaim.Lease.AttemptID, contract.AttemptLost)
+	if result.PrunedAttemptCredentials != 2 {
+		t.Fatalf("pruned credentials = %d, want the finished and the just-lost attempt", result.PrunedAttemptCredentials)
+	}
+	for _, claim := range []Claim{finishedClaim, lostClaim} {
+		if credentialRows(t, h.store, claim.Lease.AttemptID) != 0 {
+			t.Fatalf("attempt %s kept its credential row", claim.Lease.AttemptID)
+		}
+		if status := ownJob(claim); status != http.StatusUnauthorized {
+			t.Fatalf("pruned credential = %d, want 401", status)
+		}
+	}
+	// A live attempt keeps its row and its authority.
+	if credentialRows(t, h.store, liveClaim.Lease.AttemptID) != 1 || ownJob(liveClaim) != http.StatusOK {
+		t.Fatal("a live attempt lost its credential")
+	}
+
+	// Completion replay (#553) of the finished attempt is still answered.
+	status, headers, body := h.do(agent, http.MethodPost, completionPath, completion)
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("completion replay after pruning = %d %q body=%s", status, headers.Get("Idempotent-Replay"), body)
+	}
+	// The lost attempt's late evidence, inside its window, still lands.
+	late := logEvent(lostClaim.Lease.AttemptID, contract.LogStdout, 1, []byte("late"))
+	late.Timestamp = h.clock.Now()
+	if response := appendLogsExpectingOK(t, h, agent, lostLogs, lostClaim.Lease.FencingToken, []contract.LogEvent{late}); response.AttemptState != contract.AttemptLost {
+		t.Fatalf("late upload after pruning = %#v", response)
+	}
+	lateCompletion := CompletionRequest{FencingToken: lostClaim.Lease.FencingToken,
+		IdempotencyKey: "completion:" + lostClaim.Lease.AttemptID, Result: ProcessResult{ExitCode: &exitCode}}
+	lostCompletionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", lost.JobID, lostClaim.Lease.AttemptID)
+	// Late evidence is recorded and answered lease_expired, which the agent
+	// treats as delivered.
+	if status, _, body := h.do(agent, http.MethodPost, lostCompletionPath, lateCompletion); status != http.StatusConflict ||
+		!bytes.Contains(body, []byte(contract.ErrorLeaseExpired)) {
+		t.Fatalf("late completion after pruning = %d body=%s", status, body)
+	}
+	var lateResult sql.NullString
+	if err := h.store.db.QueryRow(`SELECT late_result_json FROM attempts WHERE attempt_id=?`, lostClaim.Lease.AttemptID).Scan(&lateResult); err != nil {
+		t.Fatal(err)
+	}
+	if !lateResult.Valid || !bytes.Contains([]byte(lateResult.String), []byte(`"late":true`)) {
+		t.Fatalf("late completion evidence = %v", lateResult)
+	}
+}
+
+// The backlog an upgraded database carries is pruned in bounded passes.
+func TestEndedAttemptCredentialPruningIsBounded(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "credentials.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < attemptCredentialPruneBatch+10; index++ {
+		if _, err := tx.Exec(`INSERT INTO attempt_credentials(token_hash, attempt_id, job_id, node_id, created_ns)
+			VALUES(?, ?, 'job', 'node', 1)`, fmt.Sprintf("hash-%05d", index), fmt.Sprintf("gone-%05d", index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []int64{attemptCredentialPruneBatch, 10, 0} {
+		result, err := store.Reconcile(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.PrunedAttemptCredentials != want {
+			t.Fatalf("pass pruned %d credentials, want %d", result.PrunedAttemptCredentials, want)
+		}
+	}
+}
