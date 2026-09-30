@@ -132,7 +132,10 @@ request canceled by bridge closure has an indeterminate outcome and, when the
 bridge can still produce a response, receives typed retryable
 `pass_unavailable`; only L3 may return an authorization verdict. The tenant
 must reopen both files and retry with the same idempotency key to resolve
-whether L3 committed the request before revocation. The files remain
+whether L3 committed the request before revocation. Every request must carry
+the pass as `Authorization: Bearer`; the bridge refuses one without it, or one
+whose `Connection` header would drop it in transit, with typed `403 forbidden`
+before L3 sees it (`run-execution-context.md`). The files remain
 attempt-local tmpfs and never enter `/wefty/service`, a JobSpec, logs,
 inspection, or removal evidence.
 
