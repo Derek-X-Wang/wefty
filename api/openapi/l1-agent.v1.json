@@ -267,6 +267,59 @@
         }
       }
     },
+    "/v1/agent/jobs/{job_id}/service-binding-proof": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "proveServiceBinding",
+        "summary": "Ask whether this node still owes a service binding its image pin",
+        "description": "Read-only. The agent asks before reconciliation deletes a pinned OCI image. bound is true while the job is a queued, claimed, running, stopping, stopped, or failed service bound to this node, and also while a stalled removal's cleanup is still unacknowledged, because that removal released its Slot without proving cleanup and its standing directive still needs the image. An unknown job, a job bound elsewhere, or any other state answers false. The node and boot session must be the authenticated node's current registration.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 },
+            "boot_session_id": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Binding proof.", "content": { "application/json": { "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["bound"],
+            "properties": { "bound": { "type": "boolean" } }
+          } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/jobs/{job_id}/image-reconciliation-failure": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "latchServiceImageReconciliationFailure",
+        "summary": "Latch a service failed after its bound node could not deliver the service image",
+        "description": "Sent by the bound node when image reconciliation could not deliver a pinned OCI image to one of its service bindings. L1 moves the service to failed, fences any claimed or running attempt as lost, clears its restart schedule and publication, and records the spawn failure as last_failure. Only the node that holds the binding, in its current boot session, may latch it.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "failure"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 },
+            "boot_session_id": { "type": "string", "minLength": 1 },
+            "failure": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "The latched service job.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease": {
       "parameters": [
         { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
@@ -750,27 +803,7 @@
             "node_id": { "type": "string", "minLength": 1 },
             "boot_session_id": { "type": "string", "minLength": 1 },
             "idempotency_key": { "type": "string", "minLength": 1 },
-            "receipt": {
-              "type": "object", "additionalProperties": false,
-              "required": ["kind", "receipt_id", "operation", "backup_id", "copy_id", "source_computer_id", "source_storage_id", "source_generation", "destination_computer_id", "destination_storage_id", "destination_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "helper_generation", "source_size", "destination_size", "source_digest", "destination_digest", "os_identity_rekeyed", "filesystem_expanded"],
-              "properties": {
-                "kind": { "enum": ["computer_storage_copy_verified", "computer_storage_copy_failed_absent"] }, "receipt_id": { "type": "string", "minLength": 1 },
-                "operation": { "enum": ["restore", "clone", "import"] }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
-                "export_id": { "type": "string", "minLength": 1 }, "external_path": { "type": "string", "minLength": 1 },
-                "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-                "source_computer_id": { "type": "string", "minLength": 1 }, "source_storage_id": { "type": "string", "minLength": 1 },
-                "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-                "destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
-                "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-                "node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 }, "job_id": { "type": "string", "minLength": 1 },
-                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
-                "helper_generation": { "type": "integer", "minimum": 1 }, "source_size": { "type": "integer", "format": "int64", "minimum": 1 }, "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
-                "source_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "destination_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-                "os_identity_rekeyed": { "type": "boolean" }, "filesystem_expanded": { "type": "boolean" },
-                "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled"] },
-                "destination_absent": { "type": "boolean" }
-              }
-            },
+            "receipt": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCopyReceipt" },
       "preparation_outcome": {
         "type": "object", "additionalProperties": false,
         "required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation", "recorded_at"],
@@ -801,7 +834,7 @@
       "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
       "post": {
         "operationId": "acknowledgeComputerCustodyExport",
-        "summary": "Record assertion-derived completion of an already-tainting Custody export",
+        "summary": "Record assertion-derived completion or refusal of a Custody export",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
@@ -819,16 +852,26 @@
                 "root_instance_id": { "type": "string", "minLength": 1 }, "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
                 "custody_fence": { "type": "string", "minLength": 1 }, "helper_generation": { "type": "integer", "minimum": 1 },
                 "external_path": { "type": "string", "minLength": 1 }, "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
-                "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "manifest_digest": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$", "description": "Empty on a computer_custody_export_failed receipt." },
                 "external_owner_uid": { "type": "integer", "minimum": 0 }, "external_owner_gid": { "type": "integer", "minimum": 0 },
                 "ownership_applied": { "type": "boolean" }, "private_mode_applied": { "type": "boolean" },
-                "failure_code": { "enum": ["insufficient_disk", "destination_not_empty", "managed_root_path", "destination_substituted", "ownership_failed", "cancelled"] }
+                "failure_code": {
+                  "enum": ["insufficient_disk", "destination_not_empty", "managed_root_path", "destination_substituted", "ownership_failed", "cancelled",
+                    "external_path_unconfined", "external_root_unmounted", "external_path_crosses_mount", "external_write_started", "external_write_completed"],
+                  "description": "computer_custody_export_failed receipts only. managed_root_path, external_path_unconfined, external_root_unmounted, and external_path_crosses_mount are refusals before any byte reached the destination, so they leave the source Storage free of custody taint. external_write_started and external_write_completed report that an earlier invocation already began or finished writing, so the taint stands."
+                },
+                "external_roots": {
+                  "type": "array", "maxItems": 16, "uniqueItems": true,
+                  "items": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/" },
+                  "description": "The Node's operator mount roots, as clean absolute paths, named only by a managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount refusal so the operator learns where an export may go. A Node with no configured root names none. For an unmounted root or a path crossing a mount, a named root covers external_path."
+                }
               }
             }
           }
         } } } },
         "responses": {
-          "200": { "description": "Completion evidence recorded; the pre-write custody taint remains permanent.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "200": { "description": "Completion or refusal evidence recorded. The source Storage stays custody-tainted unless the receipt is a refusal that left the destination untouched.", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
@@ -877,7 +920,7 @@
             "idempotency_key": { "type": "string", "minLength": 1 },
             "receipt": {
               "type": "object", "additionalProperties": false,
-              "required": ["kind", "receipt_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "operation_fence", "helper_generation", "old_disk_bytes", "new_disk_bytes", "applied", "failure_code", "observed_available_bytes"],
+              "required": ["kind", "receipt_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "operation_fence", "helper_generation", "old_disk_bytes", "new_disk_bytes", "applied"],
               "properties": {
                 "kind": { "enum": ["computer_storage_grow_applied", "computer_storage_grow_failed_unchanged"] },
                 "receipt_id": { "type": "string", "minLength": 1 },
@@ -893,8 +936,8 @@
                 "old_disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
                 "new_disk_bytes": { "type": "integer", "format": "int64", "minimum": 2 },
                 "applied": { "type": "boolean" },
-                "failure_code": { "type": "string", "enum": ["", "insufficient_disk"] },
-                "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0 }
+                "failure_code": { "type": "string", "enum": ["", "insufficient_disk"], "description": "Absent or empty on an applied receipt; insufficient_disk on a failed_unchanged receipt." },
+                "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0, "description": "The capacity fact behind an insufficient_disk refusal. Absent on an applied receipt, and absent when zero." }
               }
             }
           }

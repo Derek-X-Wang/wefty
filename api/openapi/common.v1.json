@@ -142,6 +142,11 @@
           },
           "restart_streak": { "type": "integer", "minimum": 0 },
           "lifetime_restart_count": { "type": "integer", "minimum": 0 },
+          "lease_loss_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Service jobs only. Attempts whose lease expired. A lease loss proves execution authority ended, not that the process failed, so it is counted apart from restarts and drives its own bounded retry backoff."
+          },
           "next_restart_at": { "type": "string", "format": "date-time" },
           "published_port": {
             "type": "integer",
@@ -290,10 +295,14 @@
       "ComputerGrantMutationResult": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["grant", "replayed"],
+        "required": ["grant", "replayed", "mutation_applied"],
         "properties": {
           "grant": { "$ref": "#/components/schemas/ComputerGrant" },
           "replayed": { "type": "boolean" },
+          "mutation_applied": {
+            "type": "boolean",
+            "description": "True when this request committed the mutation and its new policy revision; false on an idempotent replay."
+          },
           "revocation": { "$ref": "#/components/schemas/ComputerPolicyRevocation" }
         }
       },
@@ -459,14 +468,13 @@
       "ComputerTakeoverAccess": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["computer_id", "friendly_name", "user_id", "device_id", "authorized_role", "policy_revision", "display_endpoint"],
+        "required": ["computer_id", "friendly_name", "user_id", "device_id", "policy_revision", "display_endpoint"],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
           "friendly_name": { "type": "string", "minLength": 1 },
           "user_id": { "type": "string", "minLength": 1 },
           "device_id": { "type": "string", "minLength": 1 },
           "display_name": { "type": "string" },
-          "authorized_role": { "enum": ["view", "control"] },
           "policy_revision": { "type": "integer", "minimum": 1 },
           "display_endpoint": {
             "oneOf": [
@@ -475,7 +483,7 @@
             ]
           }
         },
-        "description": "Person-bound view-first discovery. friendly_name is the wefty-owned Computer name. The endpoint is the authorized Fabric front door, never a raw view/control backend; null means admission is not ready."
+        "description": "Person-bound view-first discovery. friendly_name is the wefty-owned Computer name. The endpoint is the authorized Fabric front door, never a raw view/control backend; null means admission is not ready. Discovery is durable availability, never a live admission role: the front door always attempts view-first admission at the agent's current evaluator."
       },
       "ComputerHandleResolution": {
         "type": "object",
@@ -637,6 +645,10 @@
           "destination_computer_id": { "type": "string", "minLength": 1 },
           "destination_storage_id": { "type": "string", "minLength": 1 },
           "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "copy_receipt": {
+            "$ref": "#/components/schemas/ComputerStorageCopyReceipt",
+            "description": "Present only in the storage-provenance projection, on restore, clone, and import entries: the verified helper receipt that published the destination generation."
+          },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
@@ -660,11 +672,42 @@
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
           "removal_outcome": { "enum": ["removal_pending", "removed_reduced", "removed_verified"] },
-          "custody_tainted": { "type": "boolean", "description": "True when the custody graph contains a committed export or imported external bytes; operator deletion attestation never clears it." },
+          "custody_tainted": { "type": "boolean", "description": "True when the custody graph contains imported external bytes or a Custody export that may have placed bytes outside managed custody. An export the helper refused before touching the destination (managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount) does not taint. Operator deletion attestation never clears it." },
           "custody_forks": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerCustodyBranch" } },
           "storage_provenance": { "type": "array", "items": { "$ref": "#/components/schemas/StorageProvenance" } },
           "custody_exports": { "type": "array", "items": { "type": "object" } }
         }
+      },
+      "ComputerStorageCopyReceipt": {
+        "type": "object", "additionalProperties": false,
+        "required": ["kind", "receipt_id", "operation", "backup_id", "copy_id", "source_computer_id", "source_storage_id", "source_generation", "destination_computer_id", "destination_storage_id", "destination_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "helper_generation", "source_size", "destination_size", "source_digest", "destination_digest", "os_identity_rekeyed", "filesystem_expanded"],
+        "properties": {
+          "kind": { "enum": ["computer_storage_copy_verified", "computer_storage_copy_failed_absent"] }, "receipt_id": { "type": "string", "minLength": 1 },
+          "operation": { "enum": ["restore", "clone", "import"] }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+          "export_id": { "type": "string", "minLength": 1 }, "external_path": { "type": "string", "minLength": 1 },
+          "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "source_computer_id": { "type": "string", "minLength": 1 }, "source_storage_id": { "type": "string", "minLength": 1 },
+          "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
+          "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 }, "job_id": { "type": "string", "minLength": 1 },
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
+          "helper_generation": { "type": "integer", "minimum": 1 }, "source_size": { "type": "integer", "format": "int64", "minimum": 1 }, "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
+          "source_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "destination_digest": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$", "description": "Empty on a failed_absent receipt." },
+          "os_identity_rekeyed": { "type": "boolean", "description": "Clone and import only: the destination's machine-id was rekeyed. Nothing else in the OS identity is rewritten." },
+          "machine_id_before_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Clone and import only: digest of the copied machine-id before rekeying." },
+          "machine_id_after_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Clone and import only: digest of the destination machine-id after rekeying; it differs from machine_id_before_digest." },
+          "machine_id_repaired": { "type": "boolean", "description": "Clone and import only: the copied machine-id was not well-formed and the helper repaired it before rekeying." },
+          "source_unchanged": { "type": "boolean", "description": "The helper re-verified the source after the copy. True on every verified receipt, false on failed_absent." },
+          "destination_prepared": { "type": "boolean", "description": "The destination disk carries its preparation marker. True on every verified receipt, false on failed_absent." },
+          "preparation_receipt": { "type": "boolean", "description": "The destination disk carries a Storage-reset preparation receipt. Always false: a copied destination is never a reset generation." },
+          "destination_chown": { "type": "boolean", "description": "The destination requested an ownership rewrite. Always false for a Storage copy." },
+          "filesystem_expanded": { "type": "boolean" },
+          "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled"], "description": "failed_absent receipts only. Custody import may report any of these; clone reports only insufficient_disk; restore has no failure receipt." },
+          "destination_absent": { "type": "boolean" },
+          "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0, "description": "The capacity fact behind an insufficient_disk refusal, measured on the Node when the copy was refused. Absent from every other outcome and when zero." }
+        },
+        "description": "Assertion-derived helper evidence that one exact Backup copy produced a detached destination Storage generation (verified), or that a refused copy left no staged destination behind (failed_absent). The source digest is checked before any destination publication; the destination digest is recorded after the machine-id rekey and optional expansion."
       },
       "ComputerStoragePreparationOutcome": {
     "type": "object",
@@ -1301,7 +1344,7 @@
         "properties": {
           "run_id": { "type": "string" },
           "parent_run_id": { "type": "string" },
-          "status": { "type": "string" },
+          "status": { "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"], "description": "The run's status, from the same vocabulary as RunRecord.status." },
           "trigger": {
             "type": "object",
             "description": "The Run's immutable trigger provenance, the same projection RunRecord carries.",
@@ -1346,8 +1389,12 @@
         }
       },
       "NodeRegistration": {
+        "allOf": [{ "$ref": "#/components/schemas/NodeRegistrationFields" }],
+        "unevaluatedProperties": false,
+        "description": "The registration request: exactly NodeRegistrationFields and nothing else."
+      },
+      "NodeRegistrationFields": {
         "type": "object",
-        "additionalProperties": false,
         "required": [
           "node_id", "boot_session_id", "os", "architecture", "agent_version",
           "capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"
@@ -1395,9 +1442,13 @@
               "lima_start_timeout", "template_restart_required", "template_recreate_required",
               "mount_root_unavailable", "local_permission_denied"
             ]
+          },
+          "supersede_capability_revision": {
+            "type": "boolean",
+            "description": "Asks L1 to assign the stored capability_revision + 1 to this restrictive same-boot observation atomically. Reserved for a runtime authority barrier that must revoke stale advertised capability before it can learn the stored revision."
           }
         },
-        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection."
+        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection. Open on purpose: NodeRegistration, Node, and HeartbeatResponse compose it and close at their own level with unevaluatedProperties, since a closed member inside allOf would refuse its siblings' fields."
       },
     "ComputerStorageClaim": {
     "type": "object",
@@ -1552,8 +1603,14 @@
         }
       },
       "Node": {
+        "allOf": [{ "$ref": "#/components/schemas/NodeFields" }],
+        "unevaluatedProperties": false,
+        "description": "The operator-visible Node projection: exactly NodeFields and nothing else."
+      },
+      "NodeFields": {
+        "description": "NodeRegistrationFields plus L1's authoritative Node facts. Open on purpose so HeartbeatResponse can extend it; Node closes it.",
         "allOf": [
-          { "$ref": "#/components/schemas/NodeRegistration" },
+          { "$ref": "#/components/schemas/NodeRegistrationFields" },
           {
             "type": "object",
             "required": [
@@ -1626,8 +1683,9 @@
         ]
       },
       "HeartbeatResponse": {
+        "unevaluatedProperties": false,
         "allOf": [
-          { "$ref": "#/components/schemas/Node" },
+          { "$ref": "#/components/schemas/NodeFields" },
           {
             "type": "object",
             "required": ["removal_directives", "storage_reset_directives", "storage_grow_directives", "reimage_preflight_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives", "custody_export_directives"],

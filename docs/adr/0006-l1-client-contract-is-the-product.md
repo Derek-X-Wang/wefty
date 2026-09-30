@@ -54,9 +54,11 @@ is tags and pool administration under L1.
   test enforces the same boundary with no production change; the package
   split can follow when the hand-written clients are unified.
 - **Generate Go and TypeScript SDKs now.** Deferred: there is one consumer of
-  the L1 API and it already has a thin client behind interfaces. The existing
-  OpenAPI contract test already pins the server to the schema, so
-  conformance does not need a generator.
+  the L1 API and it already has a thin client behind interfaces. The OpenAPI
+  drift test (`api/openapi/drift_test.go`) pins the server to the schema: every
+  served route is published, and every Go wire type agrees with its schema on
+  fields, required fields, and closed vocabularies. Conformance therefore
+  does not need a generator.
 
 ## Consequences
 

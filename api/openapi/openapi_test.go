@@ -588,7 +588,7 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 		t.Error("Job response exposes the internal publication marker instead of computed readiness")
 	}
 
-	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
+	nodeRegistration := object(t, schemas["NodeRegistrationFields"], "NodeRegistrationFields")
 	properties := object(t, nodeRegistration["properties"], "NodeRegistration.properties")
 	if _, ok := properties["connect_host"]; !ok {
 		t.Fatal("NodeRegistration must carry the non-authoritative Fabric connect_host projection")
@@ -601,9 +601,9 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 			t.Fatalf("NodeRegistration must not accept self-reported %s", field)
 		}
 	}
-	node := object(t, schemas["Node"], "Node")
+	node := object(t, schemas["NodeFields"], "NodeFields")
 	nodeParts := node["allOf"].([]any)
-	nodeProjection := object(t, nodeParts[1], "Node.allOf[1]")
+	nodeProjection := object(t, nodeParts[1], "NodeFields.allOf[1]")
 	nodeProperties := object(t, nodeProjection["properties"], "Node.properties")
 	for _, field := range []string{
 		"max_oneshot_slots", "max_service_slots", "authority_generation", "claims_enabled",
@@ -634,7 +634,7 @@ func TestAgentProtocolCarriesFullCapabilityObservations(t *testing.T) {
 
 	common := readObject(t, "common.v1.json")
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
-	registration := object(t, schemas["NodeRegistration"], "NodeRegistration")
+	registration := object(t, schemas["NodeRegistrationFields"], "NodeRegistrationFields")
 	registrationRequired := stringSet(t, registration["required"])
 	for _, field := range []string{"capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"} {
 		if !registrationRequired[field] {
@@ -674,7 +674,7 @@ func TestCapabilityReasonVocabularyMatchesOpenAPIEnums(t *testing.T) {
 		enum any
 	}{
 		{name: "common.v1.json NodeRegistration", enum: object(t, object(t, object(t,
-			object(t, readObject(t, "common.v1.json")["components"], "common components")["schemas"], "common schemas")["NodeRegistration"], "NodeRegistration")["properties"], "NodeRegistration properties")["capability_reason_code"]},
+			object(t, readObject(t, "common.v1.json")["components"], "common components")["schemas"], "common schemas")["NodeRegistrationFields"], "NodeRegistrationFields")["properties"], "NodeRegistration properties")["capability_reason_code"]},
 		{name: "l1-agent.v1.json heartbeat", enum: object(t, object(t, object(t, object(t, object(t,
 			object(t, object(t, object(t, readObject(t, "l1-agent.v1.json")["paths"], "agent paths")["/v1/agent/nodes/{node_id}/heartbeat"], "heartbeat path")["post"], "heartbeat post")["requestBody"], "heartbeat request body")["content"], "heartbeat content")["application/json"], "heartbeat media")["schema"], "heartbeat schema")["properties"], "heartbeat properties")["capability_reason_code"]},
 	} {
@@ -686,21 +686,27 @@ func TestCapabilityReasonVocabularyMatchesOpenAPIEnums(t *testing.T) {
 	}
 }
 
+// Service-only routes require class=service outright. Job reads serve both
+// classes, so there the selector is conditional (#601): the server demands it
+// for a service job and refuses it for a one-shot, which a required parameter
+// could not express.
 func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 	t.Parallel()
 	doc := readObject(t, "l1-client.v1.json")
 	paths := object(t, doc["paths"], "paths")
 	operations := []struct {
-		path   string
-		method string
+		path     string
+		method   string
+		required bool
 	}{
-		{path: "/v1/jobs", method: "get"},
-		{path: "/v1/jobs/{job_id}", method: "get"},
-		{path: "/v1/jobs/{job_id}/logs", method: "get"},
-		{path: "/v1/jobs/{job_id}/desired-state", method: "put"},
-		{path: "/v1/jobs/{job_id}/restart", method: "post"},
-		{path: "/v1/jobs/{job_id}/remove", method: "post"},
-		{path: "/v1/jobs/{job_id}/forget", method: "post"},
+		{path: "/v1/jobs", method: "get", required: true},
+		{path: "/v1/jobs/{job_id}/desired-state", method: "put", required: true},
+		{path: "/v1/jobs/{job_id}/restart", method: "post", required: true},
+		{path: "/v1/jobs/{job_id}/remove", method: "post", required: true},
+		{path: "/v1/jobs/{job_id}/forget", method: "post", required: true},
+		{path: "/v1/jobs/{job_id}", method: "get", required: false},
+		{path: "/v1/jobs/{job_id}/logs", method: "get", required: false},
+		{path: "/v1/jobs/{job_id}/result", method: "get", required: false},
 	}
 	for _, expected := range operations {
 		path := object(t, paths[expected.path], expected.path)
@@ -716,12 +722,19 @@ func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 				continue
 			}
 			found = true
-			if parameter["required"] != true || parameter["in"] != "query" {
-				t.Fatalf("%s %s class selector = %#v", expected.method, expected.path, parameter)
+			required, _ := parameter["required"].(bool)
+			if required != expected.required || parameter["in"] != "query" {
+				t.Fatalf("%s %s class selector = %#v, want required=%v", expected.method, expected.path, parameter, expected.required)
 			}
 			schema := object(t, parameter["schema"], expected.path+" class schema")
 			if schema["const"] != "service" {
 				t.Fatalf("%s %s class const = %v", expected.method, expected.path, schema["const"])
+			}
+			if !expected.required {
+				description, _ := parameter["description"].(string)
+				if !strings.Contains(description, "service") || !strings.Contains(description, "one-shot") {
+					t.Fatalf("%s %s conditional class selector does not state both rules: %q", expected.method, expected.path, description)
+				}
 			}
 		}
 		if !found {
