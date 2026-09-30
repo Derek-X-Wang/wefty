@@ -198,6 +198,10 @@ func (s *Store) truncateRemovalSecretWAL(ctx context.Context) error {
 		return nil
 	}
 	defer s.walCheckpointMu.Unlock()
+	// A checkpoint may have been deferred between the check and the lock.
+	if s.walTruncationDeferred.Load() {
+		return nil
+	}
 	_, err := s.checkpointSecretWALOnce(ctx)
 	return err
 }

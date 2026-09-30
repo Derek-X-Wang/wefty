@@ -27,8 +27,10 @@ const (
 	removalWALSecret = "removal-secret-6e0a27"
 	// removalWALPromptBound is what a removal, or a writer behind a removal's
 	// checkpoint attempt, may take while a reader holds the WAL: about one
-	// checkpoint handle wait plus scheduling, with room for a slow runner.
-	removalWALPromptBound = time.Second
+	// checkpoint handle wait, plus the write-lock backoff of removals released
+	// together, with room for a slow runner. Removals that each make their own
+	// attempt take about 1.5 s for concurrentRemovals.
+	removalWALPromptBound = 1250 * time.Millisecond
 	// removalWALReaderWatchdog releases the held reader only if the test
 	// hangs, so a removal that waits for the reader fails on time rather
 	// than blocking forever. The reader is otherwise released by the test.
