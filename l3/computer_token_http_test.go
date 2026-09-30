@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,11 +31,47 @@ func (emptyComputerJobLogs) GetJobLogs(context.Context, string, string, int) (l1
 	return l1.LogPage{Events: []contract.LogEvent{}}, nil
 }
 
+// computerProofSite names which L3 path asked L1 for a Computer scope proof.
+// Tests pause a proof by what it is for, not by its position among the calls:
+// a mint takes two proofs and a Run submission two more, and those counts are
+// implementation detail.
+type computerProofSite int
+
+const (
+	computerProofNone computerProofSite = iota
+	// computerProofMint is a mint's proof or its post-commit re-proof.
+	computerProofMint
+	// computerProofBearer is the bearer authentication before the handler.
+	computerProofBearer
+	// computerProofFinalRun is the final proof inside the Run's write
+	// transaction, just before the insert.
+	computerProofFinalRun
+)
+
+func callingComputerProofSite() computerProofSite {
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	site := computerProofMint
+	for {
+		frame, more := frames.Next()
+		switch {
+		case strings.HasSuffix(frame.Function, ".(*Store).CreateRun"):
+			return computerProofFinalRun
+		case strings.HasSuffix(frame.Function, ".(*Server).verifyComputerScope"):
+			site = computerProofBearer
+		}
+		if !more {
+			return site
+		}
+	}
+}
+
 type controlledComputerGrantVerifier struct {
 	mu           sync.Mutex
 	proof        ComputerTokenScopeProof
 	calls        int
-	blockCall    int
+	blockAt      computerProofSite
+	didBlock     bool
 	blocked      chan struct{}
 	release      chan struct{}
 	transientErr error
@@ -46,8 +84,8 @@ type controlledComputerGrantVerifier struct {
 func (verifier *controlledComputerGrantVerifier) ProveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error) {
 	verifier.mu.Lock()
 	verifier.calls++
-	call := verifier.calls
-	block := verifier.blockCall == call
+	block := verifier.blockAt != computerProofNone && !verifier.didBlock && callingComputerProofSite() == verifier.blockAt
+	verifier.didBlock = verifier.didBlock || block
 	blocked, release := verifier.blocked, verifier.release
 	err := verifier.transientErr
 	proof := verifier.proof
@@ -566,8 +604,7 @@ func TestCallerComputerOriginRunListSpansGenerationsAndKeepsExactTriggers(t *tes
 func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-race", ComputerAttemptID: "attempt-race",
 		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-race", SubmitMaxInflight: 2}
-	// Calls 1 and 2 are the mint's proof and re-proof; call 3 is the bearer's.
-	verifier := &controlledComputerGrantVerifier{proof: proof, blockCall: 3, blocked: make(chan struct{}), release: make(chan struct{})}
+	verifier := &controlledComputerGrantVerifier{proof: proof, blockAt: computerProofBearer, blocked: make(chan struct{}), release: make(chan struct{})}
 	h := newComputerHTTPHarness(t, verifier)
 	client := h.client(proof.HostNodeID)
 	grant := mintComputerHTTPToken(t, h, client, proof)
@@ -621,10 +658,9 @@ func TestComputerRunIsAuthorizedByItsFinalL1Proof(t *testing.T) {
 		status int
 		body   []byte
 	}
-	// Call 1 is the mint, call 2 the bearer check, call 3 the final proof.
 	submitPausedAtFinalProof := func(t *testing.T, proofAtRelease bool) (*computerHTTPHarness, *controlledComputerGrantVerifier, *http.Client, ComputerTokenGrant, <-chan response) {
 		t.Helper()
-		verifier := &controlledComputerGrantVerifier{proof: proof, blockCall: 3, proofAtRelease: proofAtRelease,
+		verifier := &controlledComputerGrantVerifier{proof: proof, blockAt: computerProofFinalRun, proofAtRelease: proofAtRelease,
 			blocked: make(chan struct{}), release: make(chan struct{})}
 		h := newComputerHTTPHarness(t, verifier)
 		client := h.client(proof.HostNodeID)
