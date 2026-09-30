@@ -4799,15 +4799,23 @@ func latestAttemptID(ctx context.Context, q queryer, jobID string) (string, erro
 // GetJobResult reads the stored result document. Absence is a typed not-found
 // rather than an empty document: "this run uploaded nothing" and "this run's
 // result was empty" are different answers.
+//
+// The row is served only while it belongs to the job's latest attempt. Every
+// completion that reaches its upload replaces the row, but a node that crashes
+// between completing an attempt and uploading its result leaves the
+// predecessor's row in place, and that document is not this run's answer. The
+// reader is told there is no result rather than shown an earlier attempt's.
 func (s *Store) GetJobResult(ctx context.Context, jobID string) (JobResult, error) {
 	var result JobResult
 	var uploadedNS int64
 	var skipReason string
-	err := s.db.QueryRowContext(ctx, `SELECT job_id, attempt_id, document, sha256, skip_reason, uploaded_ns
-		FROM job_results WHERE job_id=?`, jobID).
+	err := s.db.QueryRowContext(ctx, `SELECT r.job_id, r.attempt_id, r.document, r.sha256, r.skip_reason, r.uploaded_ns
+		FROM job_results r WHERE r.job_id=? AND r.attempt_id=(
+			SELECT a.attempt_id FROM attempts a WHERE a.job_id=r.job_id
+			ORDER BY a.created_ns DESC, a.attempt_id DESC LIMIT 1)`, jobID).
 		Scan(&result.JobID, &result.AttemptID, &result.Document, &result.SHA256, &skipReason, &uploadedNS)
 	if errors.Is(err, sql.ErrNoRows) {
-		return JobResult{}, protocolError(contract.ErrorNotFound, "job %s has no uploaded result", jobID)
+		return JobResult{}, protocolError(contract.ErrorNotFound, "job %s has no uploaded result from its latest attempt", jobID)
 	}
 	if err != nil {
 		return JobResult{}, internalError(err, "read job result")

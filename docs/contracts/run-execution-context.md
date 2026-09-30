@@ -1136,8 +1136,11 @@ An upload from an attempt a later one has already superseded is refused
 (`superseded_attempt`), and every completion writes the row — the document, or
 the named reason there is none, `absent` included — so a retry that produced no
 result displaces its predecessor's document and a reader is never shown an
-earlier attempt's result as this run's answer. The row is removed with the job,
-exactly as its logs are; L3 exposes it per run.
+earlier attempt's result as this run's answer. The row is also served only
+while it belongs to the latest attempt: a node that completes an attempt and
+crashes before its upload leaves the predecessor's row in place, and a reader
+then gets an ordinary not-found rather than that earlier document. The row is
+removed with the job, exactly as its logs are; L3 exposes it per run.
 
     wefty results RUN_ID [--out FILE]
 

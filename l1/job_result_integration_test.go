@@ -283,6 +283,45 @@ func TestASuccessorThatWroteNoResultDisplacesItsPredecessorsDocument(t *testing.
 	}
 }
 
+// TestAPredecessorsResultIsNotServedWhenTheLatestAttemptNeverUploaded is the
+// crash window the rule above cannot close on its own: a node that completes
+// an attempt and dies before uploading leaves no row for it, so the row still
+// in place is the predecessor's. It is not this run's answer, and a reader is
+// told there is none rather than shown it (#605).
+func TestAPredecessorsResultIsNotServedWhenTheLatestAttemptNeverUploaded(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{
+		Jitter: func(delay time.Duration) time.Duration { return delay },
+	}, map[string]NodePolicy{"node-1": {Tags: []string{"linux"}, MaxServiceSlots: 1, MaxOneshotSlots: 1}})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	agentClient := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agentClient, "node-1")
+	service := submitRestartService(t, h, client, "stale-result", []string{"linux"}, nil)
+	first := restartedServiceAttempt(t, h, agentClient, node, service.JobID, nil)
+
+	status, _, body := h.do(agentClient, http.MethodPost, resultPath(service.JobID, first.Lease.AttemptID),
+		AttemptResultRequest{FencingToken: first.Lease.FencingToken, Document: []byte(`{"attempt":1}`)})
+	if status != http.StatusOK {
+		t.Fatalf("first upload status = %d body=%s", status, body)
+	}
+	// The second attempt completes and its node dies before the upload.
+	second := restartedServiceAttempt(t, h, agentClient, node, service.JobID, &first)
+	exitCode := 1
+	status, _, body = h.do(agentClient, http.MethodPost,
+		"/v1/agent/jobs/"+service.JobID+"/attempts/"+second.Lease.AttemptID+"/complete", CompletionRequest{
+			FencingToken: second.Lease.FencingToken, IdempotencyKey: "stale-result-exit",
+			Result: ProcessResult{ExitCode: &exitCode},
+		})
+	if status != http.StatusOK {
+		t.Fatalf("complete status = %d body=%s", status, body)
+	}
+
+	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+service.JobID+"/result?class=service", nil)
+	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
+	if stored, err := h.store.GetJobResult(context.Background(), service.JobID); err == nil {
+		t.Fatalf("a predecessor's result was served as the run's answer: %#v", stored)
+	}
+}
+
 // restartedServiceAttempt claims the service job's next attempt, failing the
 // previous one first when there is one.
 func restartedServiceAttempt(t *testing.T, h *integrationHarness, agentClient *http.Client,
