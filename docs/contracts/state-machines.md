@@ -882,7 +882,8 @@ reopens OCI capability in the running agent, at a strictly higher Capability
 revision, with no restart.
 Operator claim intent is not a node state: it is durable across registration,
 may be changed while the node is dead, and does not revoke authority already
-bound into a live attempt. The boot-session-scoped agent drain used for
+bound into a live attempt. A claim refused only by that intent is an empty
+claim, never a `draining` refusal. The boot-session-scoped agent drain used for
 graceful process shutdown changes only liveness state; it never changes that
 operator intent.
 

@@ -2651,8 +2651,13 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 			return nil, protocolError(contract.ErrorConflict, "node %q is not alive", nodeID)
 		}
 	}
+	// Operator claim intent is not liveness: a claims-disabled node is
+	// eligible for nothing, which is the ordinary empty claim. Answering with
+	// node_draining here would tell the agent its boot session is draining,
+	// and the agent would cancel the very attempts the operator asked it to
+	// finish. Only the node's real draining state above earns that code.
 	if !claimsEnabled {
-		return nil, protocolError(contract.ErrorNodeDraining, "node %q has claims disabled by operator intent", nodeID)
+		return nil, nil
 	}
 	if class == contract.JobClassOneShot {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs

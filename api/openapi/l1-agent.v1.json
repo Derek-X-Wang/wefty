@@ -259,7 +259,7 @@
               }
             }
           },
-          "204": { "description": "No eligible queued job." },
+          "204": { "description": "No eligible queued job. This is also the answer for an alive node whose durable operator claim intent is disabled: intent is not liveness, so it is never reported as node_draining, which is reserved for a boot session that is actually draining." },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
