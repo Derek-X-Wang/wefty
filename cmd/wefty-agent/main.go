@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
@@ -469,6 +470,18 @@ func run() error {
 	flag.Parse()
 	if *nodeID == "" {
 		return fmt.Errorf("--node-id is required")
+	}
+	// The OCI paths below stay required-absolute: they name operator-owned
+	// files whose location is part of a security check, and a guess would
+	// weaken it. The agent's own state directories resolve against where it
+	// was started, like the control plane's --db (#604).
+	if err := pathflags.Absolutize(
+		pathflags.Flag{Name: "log-spool-dir", Value: logSpoolDirectory},
+		pathflags.Flag{Name: "managed-root", Value: managedRoot},
+		pathflags.Flag{Name: "handoff-root", Value: handoffRoot},
+		pathflags.Flag{Name: "state-dir", Value: stateDirectory},
+	); err != nil {
+		return err
 	}
 	if *ociHelperSocket != "" && *ociHelperChecksum == "" {
 		return fmt.Errorf("--oci-helper-checksum is required with --oci-helper-socket")

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -113,6 +114,13 @@ func run() error {
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
+	if err := pathflags.Absolutize(
+		pathflags.Flag{Name: "db", Value: databasePath},
+		pathflags.Flag{Name: "state-dir", Value: stateDirectory},
+		pathflags.Flag{Name: "ready-file", Value: readyFile},
+	); err != nil {
+		return err
+	}
 	storeOptions := l1.StoreOptions{
 		LeaseDuration:                *leaseDuration,
 		LateEvidenceWindow:           *lateEvidenceWindow,
