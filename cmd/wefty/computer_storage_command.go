@@ -278,6 +278,9 @@ func executeComputerBackupCreate(ctx context.Context, clients *apiClients, jsonO
 	if wait.timeout > 0 {
 		result, observation, waitErr := waitForBackupOperation(ctx, clients, computerID, computer.IntentRevision, wait)
 		output.Backups, output.Observation = &result, &observation
+		if waitErr == nil {
+			waitErr = awaitedBackupFailure(computerID, computer.IntentRevision, result)
+		}
 		waitErr = attachStorageProvenance(ctx, clients, computerID, &output, waitErr)
 		return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
 	}
@@ -499,6 +502,47 @@ func awaitedComputerCloneFailure(computer l1.Computer) error {
 	return nil
 }
 
+// awaitedBackupFailure reports a Backup operation that ended `failed` as the
+// typed refusal it is. Like a clone, a Backup that reaches its terminal
+// outcome without publishing anything is a failure, not a success the caller
+// has to find in the JSON (#588).
+func awaitedBackupFailure(computerID string, operationRevision int64, backups l1.BackupList) error {
+	outcome := backups.LastOperation
+	if outcome == nil || outcome.OperationRevision != operationRevision || outcome.Status != "failed" {
+		return nil
+	}
+	details := map[string]any{"computer_id": computerID, "backup_id": outcome.BackupID,
+		"operation_revision": outcome.OperationRevision, "failure_code": string(outcome.FailureCode)}
+	code := contract.ErrorConflict
+	if outcome.FailureCode == l1.ComputerBackupFailureInsufficientDisk {
+		code = contract.ErrorCapacityExhausted
+	}
+	message := "Computer Backup failed"
+	if outcome.FailureCode != "" {
+		message += ": " + string(outcome.FailureCode)
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: code, Message: message, Retryable: false, Details: details,
+	}}
+}
+
+// awaitedCustodyExportFailure does the same for a Custody export whose
+// terminal status is `failed`, such as external_path_unconfined (#588).
+func awaitedCustodyExportFailure(exported l1.ComputerCustodyExport) error {
+	if exported.Status != "failed" {
+		return nil
+	}
+	message := "Custody export failed"
+	if exported.FailureCode != "" {
+		message += ": " + exported.FailureCode
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: contract.ErrorConflict, Message: message, Retryable: false,
+		Details: map[string]any{"computer_id": exported.ComputerID, "export_id": exported.ExportID,
+			"backup_id": exported.BackupID, "failure_code": exported.FailureCode},
+	}}
+}
+
 func executeComputerCustody(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usageError("usage: wefty services custody export|import|attest")
@@ -561,6 +605,9 @@ func executeComputerCustodyExport(ctx context.Context, clients *apiClients, json
 		var observation storageWaitObservation
 		observed, observation, waitErr = waitForCustodyExport(ctx, clients, computerID, exported.ExportID, wait)
 		output.CustodyExport, output.Observation = &observed, &observation
+		if waitErr == nil {
+			waitErr = awaitedCustodyExportFailure(observed)
+		}
 	}
 	waitErr = attachStorageProvenance(ctx, clients, computerID, &output, waitErr)
 	return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
