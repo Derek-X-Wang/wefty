@@ -20,18 +20,17 @@ func spoolRowExists(t *testing.T, spool *logSpool, attemptID string) bool {
 	return exists
 }
 
-// #52 S3: one-shot spool rows L1 can no longer take -- incomplete-evidence
-// tombstones, and completions whose process finished before L1's
-// late-evidence window could still record them -- were kept forever. The
-// sweep removes exactly those once they are older than the window plus a
-// margin; everything L1 can still accept, services, and attempts this
-// process still owns stay.
-func TestSpoolSweepRemovesOnlyDeadOneShotRowsPastTheWindow(t *testing.T) {
+// #52 S3: one-shot spool rows L1 can no longer take were kept forever. The
+// sweep removes a row only once L1 has refused its evidence for good, or, as
+// a disk-safety backstop, once a row L1 never refused is 30 days old.
+// Everything L1 may still accept, services, and attempts this process still
+// owns stay.
+func TestSpoolSweepRemovesOnlyRefusedOrBackstopRows(t *testing.T) {
 	directory := t.TempDir()
 	spool := openTestLogSpool(t, directory, "node-sweep", 1<<20)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	cutoff := now.Add(-DefaultLogSpoolSweepAfter)
+	backstop := now.Add(-DefaultLogSpoolBackstopAge)
 	exitCode := 0
 	claimRow := func(claim l1.Claim) string {
 		t.Helper()
@@ -54,39 +53,51 @@ func TestSpoolSweepRemovesOnlyDeadOneShotRowsPastTheWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	seal := func(attemptID string, at time.Time) {
+	seal := func(attemptID string, code contract.ErrorCode, at time.Time) {
 		t.Helper()
-		if err := spool.sealIncomplete(ctx, attemptID, "attempt authority no longer accepts evidence", contract.ErrorAttemptNotFound, at); err != nil {
+		if err := spool.sealIncomplete(ctx, attemptID, "test", code, at); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	oldTombstone := claimRow(spoolTestClaim("old-tombstone"))
-	withEvents(oldTombstone)
-	seal(oldTombstone, cutoff.Add(-time.Minute))
-	freshTombstone := claimRow(spoolTestClaim("fresh-tombstone"))
-	seal(freshTombstone, cutoff.Add(time.Minute))
-	oldUndelivered := claimRow(spoolTestClaim("old-undelivered"))
-	withEvents(oldUndelivered)
-	finish(oldUndelivered, cutoff.Add(-time.Minute))
-	freshUndelivered := claimRow(spoolTestClaim("fresh-undelivered"))
-	finish(freshUndelivered, cutoff.Add(time.Minute))
-	// Logs still pending and no completion: L1 may still take them.
+	// Refused for good a minute ago: swept at once.
+	refused := claimRow(spoolTestClaim("refused"))
+	withEvents(refused)
+	finish(refused, now.Add(-time.Hour))
+	seal(refused, contract.ErrorAttemptNotFound, now.Add(-time.Minute))
+	refusedConflict := claimRow(spoolTestClaim("refused-conflict"))
+	seal(refusedConflict, contract.ErrorConflict, now.Add(-time.Minute))
+	// Never answered for five days: L1 may still take it.
+	unanswered := claimRow(spoolTestClaim("unanswered"))
+	withEvents(unanswered)
+	finish(unanswered, now.Add(-5*24*time.Hour))
+	// Sealed on an answer that is not a refusal for good.
+	notOwned := claimRow(spoolTestClaim("not-owned"))
+	seal(notOwned, contract.ErrorAttemptNotOwned, now.Add(-5*24*time.Hour))
 	pendingOnly := claimRow(spoolTestClaim("pending-only"))
 	withEvents(pendingOnly)
-	serviceTombstone := claimRow(serviceSpoolTestClaim("service-tombstone"))
-	seal(serviceTombstone, cutoff.Add(-24*time.Hour))
-	serviceUndelivered := claimRow(serviceSpoolTestClaim("service-undelivered"))
-	finish(serviceUndelivered, cutoff.Add(-24*time.Hour))
-	liveTombstone := claimRow(spoolTestClaim("live-tombstone"))
-	seal(liveTombstone, cutoff.Add(-time.Hour))
+	// Past the backstop and never refused: swept, as backstop.
+	backstopCompletion := claimRow(spoolTestClaim("backstop-completion"))
+	withEvents(backstopCompletion)
+	finish(backstopCompletion, backstop.Add(-time.Minute))
+	backstopTombstone := claimRow(spoolTestClaim("backstop-tombstone"))
+	seal(backstopTombstone, contract.ErrorAttemptNotOwned, backstop.Add(-time.Minute))
+	// Services are never swept, refused or old.
+	serviceRefused := claimRow(serviceSpoolTestClaim("service-refused"))
+	seal(serviceRefused, contract.ErrorAttemptNotFound, now.Add(-time.Minute))
+	serviceOld := claimRow(serviceSpoolTestClaim("service-old"))
+	finish(serviceOld, backstop.Add(-24*time.Hour))
+	liveRefused := claimRow(spoolTestClaim("live-refused"))
+	seal(liveRefused, contract.ErrorAttemptNotFound, now.Add(-time.Minute))
 
-	// A tombstone sealed before sealed_ns existed is aged from its document.
-	legacyOld := claimRow(spoolTestClaim("legacy-old-tombstone"))
-	seal(legacyOld, cutoff.Add(-time.Hour))
-	legacyFresh := claimRow(spoolTestClaim("legacy-fresh-tombstone"))
-	seal(legacyFresh, cutoff.Add(time.Hour))
-	if _, err := spool.db.Exec(`UPDATE spool_attempts SET sealed_ns=NULL WHERE attempt_id IN (?, ?)`, legacyOld, legacyFresh); err != nil {
+	// Tombstones sealed before the refusal was recorded on the row get it
+	// from their own document.
+	legacyRefused := claimRow(spoolTestClaim("legacy-refused"))
+	seal(legacyRefused, contract.ErrorStaleFence, now.Add(-time.Hour))
+	legacyNotOwned := claimRow(spoolTestClaim("legacy-not-owned"))
+	seal(legacyNotOwned, contract.ErrorAttemptNotOwned, now.Add(-time.Hour))
+	if _, err := spool.db.Exec(`UPDATE spool_attempts SET sealed_ns=NULL, l1_refused_ns=NULL, l1_refusal_code=NULL
+		WHERE attempt_id IN (?, ?)`, legacyRefused, legacyNotOwned); err != nil {
 		t.Fatal(err)
 	}
 	if err := spool.Close(); err != nil {
@@ -94,21 +105,28 @@ func TestSpoolSweepRemovesOnlyDeadOneShotRowsPastTheWindow(t *testing.T) {
 	}
 	spool = openTestLogSpool(t, directory, "node-sweep", 1<<20)
 	defer spool.Close()
+	var code string
+	if err := spool.db.QueryRow(`SELECT l1_refusal_code FROM spool_attempts WHERE attempt_id=?`, refused).Scan(&code); err != nil {
+		t.Fatal(err)
+	}
+	if code != string(contract.ErrorAttemptNotFound) {
+		t.Fatalf("recorded refusal = %q", code)
+	}
 
-	live := func(attemptID string) bool { return attemptID == liveTombstone }
-	sweep, err := spool.sweepDeadOneShotAttempts(ctx, cutoff, spoolSweepBatch, live)
+	live := func(attemptID string) bool { return attemptID == liveRefused }
+	sweep, err := spool.sweepDeadOneShotAttempts(ctx, backstop, spoolSweepBatch, live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sweep.sealed != 2 || sweep.undelivered != 1 || sweep.full {
-		t.Fatalf("sweep = %+v, want 2 tombstones and 1 undelivered completion", sweep)
+	if sweep.refused != 3 || fmt.Sprint(sweep.backstop) != fmt.Sprint([]string{backstopCompletion, backstopTombstone}) || sweep.full {
+		t.Fatalf("sweep = %+v, want 3 refused and the two backstop rows", sweep)
 	}
-	for _, gone := range []string{oldTombstone, oldUndelivered, legacyOld} {
+	for _, gone := range []string{refused, refusedConflict, legacyRefused, backstopCompletion, backstopTombstone} {
 		if spoolRowExists(t, spool, gone) {
 			t.Fatalf("%s survived the sweep", gone)
 		}
 	}
-	for _, kept := range []string{freshTombstone, freshUndelivered, pendingOnly, serviceTombstone, serviceUndelivered, liveTombstone, legacyFresh} {
+	for _, kept := range []string{unanswered, notOwned, pendingOnly, serviceRefused, serviceOld, liveRefused, legacyNotOwned} {
 		if !spoolRowExists(t, spool, kept) {
 			t.Fatalf("%s was swept", kept)
 		}
@@ -122,7 +140,6 @@ func TestSpoolSweepRemovesOnlyDeadOneShotRowsPastTheWindow(t *testing.T) {
 	if orphans != 0 {
 		t.Fatalf("%d spool events or acknowledgements outlived their swept attempt", orphans)
 	}
-	// The row L1 can still take is still pending recovery.
 	attempts, err := spool.pendingAttempts(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +148,7 @@ func TestSpoolSweepRemovesOnlyDeadOneShotRowsPastTheWindow(t *testing.T) {
 	for _, attempt := range attempts {
 		pending[attempt.attemptID] = true
 	}
-	if !pending[pendingOnly] || !pending[freshUndelivered] {
+	if !pending[unanswered] || !pending[pendingOnly] {
 		t.Fatalf("pending after sweep = %v", pending)
 	}
 }
@@ -144,14 +161,13 @@ func TestSpoolSweepIsBoundedAndReported(t *testing.T) {
 	defer spool.Close()
 	ctx := context.Background()
 	clock := newManualClock(time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC))
-	sealedAt := clock.Now().Add(-DefaultLogSpoolSweepAfter - time.Minute)
 	const backlog = spoolSweepBatch + 44
 	for index := 0; index < backlog; index++ {
 		claim := spoolTestClaim(fmt.Sprintf("backlog-%03d", index))
 		if err := spool.ensureAttempt(ctx, claim); err != nil {
 			t.Fatal(err)
 		}
-		if err := spool.sealIncomplete(ctx, claim.Lease.AttemptID, "test", contract.ErrorAttemptNotFound, sealedAt); err != nil {
+		if err := spool.sealIncomplete(ctx, claim.Lease.AttemptID, "test", contract.ErrorAttemptNotFound, clock.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -177,10 +193,8 @@ func TestSpoolSweepIsBoundedAndReported(t *testing.T) {
 		t.Fatalf("rows after the backlog = %d, want 0", got)
 	}
 	want := []string{
-		fmt.Sprintf("swept %d one-shot spool rows older than %s (%d incomplete-evidence tombstones, 0 undelivered completions L1 can no longer record as results)",
-			spoolSweepBatch, DefaultLogSpoolSweepAfter, spoolSweepBatch),
-		fmt.Sprintf("swept %d one-shot spool rows older than %s (%d incomplete-evidence tombstones, 0 undelivered completions L1 can no longer record as results)",
-			44, DefaultLogSpoolSweepAfter, 44),
+		fmt.Sprintf("swept %d one-shot spool rows whose evidence L1 refused for good", spoolSweepBatch),
+		"swept 44 one-shot spool rows whose evidence L1 refused for good",
 	}
 	if strings.Join(reports, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("reports = %q, want %q", reports, want)
@@ -191,7 +205,7 @@ func TestSpoolSweepIsBoundedAndReported(t *testing.T) {
 	if err := spool.ensureAttempt(ctx, claim); err != nil {
 		t.Fatal(err)
 	}
-	if err := spool.sealIncomplete(ctx, claim.Lease.AttemptID, "test", contract.ErrorAttemptNotFound, sealedAt); err != nil {
+	if err := spool.sealIncomplete(ctx, claim.Lease.AttemptID, "test", contract.ErrorAttemptNotFound, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
 	outbox.sweepDeadOneShotSpool(ctx, clock.Now().Add(spoolSweepInterval-time.Second), report)
@@ -204,38 +218,22 @@ func TestSpoolSweepIsBoundedAndReported(t *testing.T) {
 	}
 }
 
-// The process-lifetime reconciler runs the sweep itself: an old one-shot
-// tombstone left on disk is gone after recovery starts, a fresh one is not.
-func TestRecoverySweepsDeadOneShotSpoolRows(t *testing.T) {
-	clock := newManualClock(time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC))
-	outbox, err := newEvidenceOutbox(t.TempDir(), "node-recovery-sweep", 1<<20, clock,
-		DefaultLogBatchSize, DefaultLogFlushInterval, DefaultLogRetryInterval)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer outbox.Close()
-	ctx := context.Background()
-	for attemptID, sealedAt := range map[string]time.Time{
-		"dead-tombstone":  clock.Now().Add(-4 * 24 * time.Hour),
-		"fresh-tombstone": clock.Now().Add(-time.Hour),
+func TestL1ClosedEvidenceCodes(t *testing.T) {
+	for _, code := range []contract.ErrorCode{
+		contract.ErrorAttemptNotFound, contract.ErrorNotFound, contract.ErrorStaleFence, contract.ErrorAttemptMismatch,
+		contract.ErrorConflict, contract.ErrorIdempotencyConflict, contract.ErrorInvalidRequest,
 	} {
-		claim := spoolTestClaim(attemptID)
-		if err := outbox.spool.ensureAttempt(ctx, claim); err != nil {
-			t.Fatal(err)
-		}
-		if err := outbox.spool.sealIncomplete(ctx, attemptID, "test", contract.ErrorAttemptNotFound, sealedAt); err != nil {
-			t.Fatal(err)
+		if !l1ClosedEvidence(code) {
+			t.Fatalf("%s is not a refusal for good", code)
 		}
 	}
-	outbox.startRecovery(ctx, nil, func(error) {})
-	deadline := time.Now().Add(5 * time.Second)
-	for spoolRowExists(t, outbox.spool, "dead-tombstone") {
-		if time.Now().After(deadline) {
-			t.Fatal("recovery did not sweep a four-day-old one-shot tombstone")
+	for _, code := range []contract.ErrorCode{
+		"", contract.ErrorInternal, contract.ErrorLeaseExpired, contract.ErrorAttemptNotOwned,
+		contract.ErrorNodeSessionReplaced, contract.ErrorIdentityBound, contract.ErrorPrincipalForbidden,
+		contract.ErrorNodeNotRegistered, contract.ErrorNodeDead, contract.ErrorNodeDraining,
+	} {
+		if l1ClosedEvidence(code) {
+			t.Fatalf("%q must not let the sweep take a row", code)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !spoolRowExists(t, outbox.spool, "fresh-tombstone") {
-		t.Fatal("recovery swept a fresh tombstone")
 	}
 }

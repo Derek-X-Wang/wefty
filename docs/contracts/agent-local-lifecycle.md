@@ -402,8 +402,8 @@ when that is configured larger), reset by the first success. A typed refusal
 that repeating on a retry interval cannot clear -- `node_session_replaced`,
 `identity_bound`, or `principal_forbidden` -- moves the attempt onto a
 re-check schedule instead: 10 seconds, doubling per consecutive refusal, capped
-at one hour, and not abandoned while L1 could still record the evidence (a
-one-shot's is swept once it no longer could, below). Only the first
+at one hour, and never abandoned while the evidence is pending (a one-shot's
+is swept only by the 30-day disk-safety backstop, below). Only the first
 refusal of a run is logged (a different refusal code is logged once as well);
 identical repeats are silent, and one line records the attempt's recovery when
 it finally succeeds. A stuck attempt therefore costs at most one log line per
@@ -445,23 +445,28 @@ expires mid-drain L1 seals by expiry without `completion_replay_attempt_id` and
 the reconciler's lost-at-L1 path is thereafter bounded to eight log batches per
 pass.
 
-The reconciler also sweeps one-shot spool rows L1 can no longer take, once
-they are older than `--log-spool-sweep-after` (72 hours by default: L1's
-default 48-hour late-evidence window plus a day, which covers the lease the
-attempt still held and clock skew; an operator who widens L1's window widens
-this with it). Two kinds of row qualify: an incomplete-evidence tombstone, aged
-from when it was sealed (recovery never sends a sealed attempt again, so the
-tombstone is a local diagnostic only), and a completion still undelivered
-although its process finished that long ago. Renewal stops when the process
-finishes, so L1 lost the attempt at most one lease later and its window has
-closed. Were that completion to land now, L1 would keep only a gap saying the
-window expired, never the result. A row still pending that long is one L1
-keeps refusing. A service row, a row with pending logs but no completion, and
-an attempt this process still owns are never swept. The attempt's spool events
-and acknowledgements go with its row. The sweep rides on the reconciler's own
-passes, at most once an hour, deleting at most 256 rows in one transaction; a
-full batch leaves it due at once, so a backlog drains across passes. Each
-sweep that removes rows logs one line with the counts.
+The reconciler also sweeps one-shot spool rows L1 has closed the door on. A
+row goes only once L1 has answered a delivery of its evidence with a refusal
+that holds for good -- `attempt_not_found`, `not_found`, `stale_fence`,
+`attempt_mismatch`, `conflict`, `idempotency_conflict`, `invalid_request`,
+`unsupported_class`, `unsupported_kind`, `unsupported_runtime_handler`, or
+`not_implemented` -- which seals the row and records the refusal and its time
+on it. L1 never refuses evidence as too late: past its late-evidence window it
+keeps a gap in place of a result and answers a completion `lease_expired`,
+which retires the row as delivered. That window starts when L1 records the
+loss, not when the process finished, so an L1 unreachable for days still takes
+the evidence when it returns, and the spool must keep it. So a row L1 has not
+answered, a row parked on a node-session refusal (#549), and a row sealed on
+`attempt_not_owned` (which a node reconfigured with the wrong identity also
+gets) are kept. The one exception is a disk-safety backstop: a one-shot
+tombstone sealed, or completion finished, `--log-spool-backstop-age` ago (30
+days by default, L1's one-shot log retention age) is swept even unrefused, and
+each such sweep logs a warning naming every attempt it took. A service row, a
+row with pending logs but no completion, and an attempt this process still
+owns are never swept. The attempt's spool events and acknowledgements go with
+its row. The sweep rides on the reconciler's own passes, at most once an hour,
+deleting at most 256 rows in one transaction; a full batch leaves it due at
+once, so a backlog drains across passes.
 
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat

@@ -91,11 +91,11 @@ type Config struct {
 	LogRetryInterval    time.Duration
 	LogSpoolDirectory   string
 	LogSpoolMaxBytes    int64
-	// LogSpoolSweepAfter is how long a one-shot's dead spool row (an
-	// incomplete-evidence tombstone, or a completion L1 would no longer record
-	// as a result) is kept before it is swept. Zero means
-	// DefaultLogSpoolSweepAfter; it must exceed L1's late-evidence window.
-	LogSpoolSweepAfter   time.Duration
+	// LogSpoolBackstopAge is the disk-safety backstop for one-shot spool
+	// rows L1 never refused: a tombstone or undelivered completion this old
+	// is swept anyway, with a warning. A row L1 refused for good is swept
+	// without waiting. Zero means DefaultLogSpoolBackstopAge.
+	LogSpoolBackstopAge  time.Duration
 	ManagedRootDirectory string
 	GuardianExecutable   string
 	// WorkloadRuntimes supplies open kind adapters. kind=process is installed
@@ -185,8 +185,8 @@ func New(config Config) (*Agent, error) {
 	if config.LogSpoolMaxBytes < 0 {
 		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
 	}
-	if config.LogSpoolSweepAfter < 0 {
-		return nil, errors.New("agent: log spool sweep age cannot be negative")
+	if config.LogSpoolBackstopAge < 0 {
+		return nil, errors.New("agent: log spool backstop age cannot be negative")
 	}
 	if config.MaxOneshotSlots < 0 || config.MaxServiceSlots < 0 {
 		return nil, errors.New("agent: local slot limits cannot be negative")
@@ -298,7 +298,7 @@ func New(config Config) (*Agent, error) {
 		}
 	}
 	outbox.ociIntentGate = intentGate
-	outbox.spoolSweepAfter = durationOrDefault(config.LogSpoolSweepAfter, DefaultLogSpoolSweepAfter)
+	outbox.spoolBackstopAge = durationOrDefault(config.LogSpoolBackstopAge, DefaultLogSpoolBackstopAge)
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
 	if err != nil {
 		_ = outbox.Close()
