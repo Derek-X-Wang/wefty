@@ -447,10 +447,13 @@ pass.
 The reconciler also sweeps one-shot spool rows L1 has closed the door on, and
 nothing else. A row goes only once L1 has answered a delivery of its evidence
 with a refusal that holds for good -- `attempt_not_found`, `not_found`,
-`stale_fence`, `attempt_mismatch`, `conflict`, `idempotency_conflict`,
-`invalid_request`, `unsupported_class`, `unsupported_kind`,
+`stale_fence`, `attempt_mismatch`, `invalid_request`, `unsupported_class`, `unsupported_kind`,
 `unsupported_runtime_handler`, or `not_implemented` -- which seals the row and
-records that answer and its time on it. No row is swept by age. L1 never
+records that answer and its time on it. `conflict` and `idempotency_conflict`
+are not refusals for good: a replay gap's conflict clears once the missing
+earlier sequences arrive, and an idempotency conflict clears once retention
+evicts the conflicting rows, so a row sealed on either is kept. No row is
+swept by age. L1 never
 refuses evidence as too late: past its late-evidence window it keeps a gap in
 place of a result and answers a completion `lease_expired`, which retires the
 row as delivered. That window starts when L1 records the loss, not when the

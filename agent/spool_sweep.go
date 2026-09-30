@@ -31,13 +31,13 @@ const (
 //   - stale_fence, attempt_mismatch: the fence or path is not the attempt's,
 //     or the attempt is no longer the job's current or completion-replay
 //     attempt;
-//   - conflict: the attempt is terminal, its service removal revoked
-//     evidence, or the body contradicts the attempt's phase;
-//   - idempotency_conflict: L1 accepted different evidence at that key;
 //   - invalid_request, unsupported_*, not_implemented: the body can never be
 //     accepted.
 //
-// Not included, so such a row is kept: lease_expired, which on
+// Not included, so such a row is kept: conflict and idempotency_conflict,
+// which can clear later (a replay gap's conflict once the missing earlier
+// sequences arrive; an idempotency conflict once the conflicting retained
+// rows are evicted by retention); lease_expired, which on
 // /complete means L1 kept the evidence (as a gap past its late-evidence
 // window) and the row is retired as delivered; attempt_not_owned, which a
 // node reconfigured with the wrong identity also gets; the node-session codes
@@ -47,7 +47,6 @@ func l1ClosedEvidence(code contract.ErrorCode) bool {
 	switch code {
 	case contract.ErrorAttemptNotFound, contract.ErrorNotFound,
 		contract.ErrorStaleFence, contract.ErrorAttemptMismatch,
-		contract.ErrorConflict, contract.ErrorIdempotencyConflict,
 		contract.ErrorInvalidRequest, contract.ErrorUnsupportedClass, contract.ErrorUnsupportedKind,
 		contract.ErrorUnsupportedRuntimeHandler, contract.ErrorNotImplemented:
 		return true

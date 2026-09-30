@@ -63,6 +63,7 @@ func TestSpoolSweepRemovesOnlyRowsL1RefusedForGood(t *testing.T) {
 	withEvents(refused)
 	finish(refused, now.Add(-time.Hour))
 	seal(refused, contract.ErrorAttemptNotFound, now.Add(-time.Minute))
+	// Sealed on a conflict, which can clear later: kept.
 	refusedConflict := claimRow(spoolTestClaim("refused-conflict"))
 	seal(refusedConflict, contract.ErrorConflict, now.Add(-time.Minute))
 	// Never answered for five days: L1 may still take it.
@@ -121,15 +122,15 @@ func TestSpoolSweepRemovesOnlyRowsL1RefusedForGood(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sweep.refused != 3 || sweep.full {
-		t.Fatalf("sweep = %+v, want the 3 refused rows", sweep)
+	if sweep.refused != 2 || sweep.full {
+		t.Fatalf("sweep = %+v, want the 2 rows refused for good", sweep)
 	}
-	for _, gone := range []string{refused, refusedConflict, legacyRefused} {
+	for _, gone := range []string{refused, legacyRefused} {
 		if spoolRowExists(t, spool, gone) {
 			t.Fatalf("%s survived the sweep", gone)
 		}
 	}
-	for _, kept := range []string{unanswered, notOwned, pendingOnly, ancientCompletion, ancientTombstone,
+	for _, kept := range []string{unanswered, notOwned, refusedConflict, pendingOnly, ancientCompletion, ancientTombstone,
 		serviceRefused, serviceOld, liveRefused, legacyNotOwned} {
 		if !spoolRowExists(t, spool, kept) {
 			t.Fatalf("%s was swept", kept)
@@ -225,7 +226,7 @@ func TestSpoolSweepIsBoundedAndReported(t *testing.T) {
 func TestL1ClosedEvidenceCodes(t *testing.T) {
 	for _, code := range []contract.ErrorCode{
 		contract.ErrorAttemptNotFound, contract.ErrorNotFound, contract.ErrorStaleFence, contract.ErrorAttemptMismatch,
-		contract.ErrorConflict, contract.ErrorIdempotencyConflict, contract.ErrorInvalidRequest,
+		contract.ErrorInvalidRequest,
 	} {
 		if !l1ClosedEvidence(code) {
 			t.Fatalf("%s is not a refusal for good", code)
@@ -233,6 +234,7 @@ func TestL1ClosedEvidenceCodes(t *testing.T) {
 	}
 	for _, code := range []contract.ErrorCode{
 		"", contract.ErrorInternal, contract.ErrorLeaseExpired, contract.ErrorAttemptNotOwned,
+		contract.ErrorConflict, contract.ErrorIdempotencyConflict,
 		contract.ErrorNodeSessionReplaced, contract.ErrorIdentityBound, contract.ErrorPrincipalForbidden,
 		contract.ErrorNodeNotRegistered, contract.ErrorNodeDead, contract.ErrorNodeDraining,
 	} {
