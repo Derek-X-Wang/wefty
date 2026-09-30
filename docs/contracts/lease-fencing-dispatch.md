@@ -103,11 +103,12 @@ The successful agent claim projects the exact current `computer_id`,
 absent for ordinary Jobs and is the only identity the agent may pass to the
 helper's `computer_disk` attachment mechanic.
 
-The agent issues one fixed claim loop per class. Each loop blocks on its own
-existing class admission gate, currently pinned to one resident attempt, so a
-service cannot prevent the one-shot loop from asking for work and vice versa.
-Issue #85 owns widening those loop counts to the L1-granted capacities,
-capacity negotiation, and per-job local-quiescence exclusion.
+The agent runs one pool of claim loops per class. Each loop blocks on its own
+class admission gate, so a service cannot prevent the one-shot pool from asking
+for work and vice versa. The pool size and the gate limit are the smaller of the
+node's local slot limit and the L1-granted capacity the agent reads on every
+registration and heartbeat. Every claim names the jobs already resident on the
+node as exclusions, so L1 never hands the node a job it is still executing.
 
 The control plane obtains tags and capacity from authenticated Fabric identity
 plus operator configuration. Nodes in `stale`, `dead`, or `draining` state
@@ -256,12 +257,12 @@ back to `alive`, while a dead node must register its boot session again.
 to `draining` idempotently. Draining nodes continue heartbeating and retain
 authority for attempts they already own, but cannot claim another job. On
 SIGINT or SIGTERM the agent invokes this verb and waits up to 30 seconds for
-both class loops to finish the resident attempt each is already waiting on. A
+its claim loops to finish the resident attempts they are already waiting on. A
 second signal forces cancellation during that wait and emits typed
 `forced_shutdown` evidence; a single signal continues to prove graceful drain
 to completion. This is only
-a join around the pre-existing per-attempt wait; issue #88 owns service stop
-transitions, fenced shutdown completion, and forced-drain ordering. This route
+a join around the per-attempt wait; service stop transitions belong to the
+service job state machine in `state-machines.md`. This route
 is session liveness, not operator intent: it leaves `claims_enabled` and every
 `intent_*` field untouched. A fenced service shutdown completion is an
 infrastructure interruption, so desired `running` projects back to `queued`

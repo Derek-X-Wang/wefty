@@ -201,7 +201,7 @@ reads the existing helper session and capability snapshot and never acquires a
 session, runs a functional probe, sweeps, changes intent, applies convergence,
 starts a service, or enforces cache policy. Failed checks use the closed M3
 reason vocabulary and stable `docs/runbooks/oci-node.md#doctor-code-*` anchors.
-It also surfaces #220's process-payload UID-isolation limitation without
+It also surfaces the accepted process-payload UID limitation (#220) without
 claiming that operator peer credentials distinguish the shared UID.
 
 `NOT-RUN` is a first-class receipt: it carries no failure reason and instead
@@ -238,9 +238,10 @@ Fabric initialization and use only the live agent's Unix control socket. Its
 private runtime directory is `0700`, its socket is `0600`, an active socket is never replaced,
 and a symlink or non-socket path fails closed. The server authenticates every
 accepted peer with `SO_PEERCRED` on Linux or `LOCAL_PEERCRED` on macOS and
-allows only the installed operator UID. Process-kind payloads currently share
-that UID with the agent; #220 owns the required payload UID isolation and this
-known pre-existing limitation grants no additional control authority. The agent is the sole writer of
+allows only the installed operator UID. Process-kind payloads share that UID
+with the agent. That is accepted behavior (#220): choosing the non-sandboxed
+process kind is choosing that trust level, container kinds are the isolation
+story, and the limitation grants no additional control authority. The agent is the sole writer of
 intent and runtime state. `load-image` streams an OCI archive through this
 surface to the existing helper-owned import/cache seam and returns only
 verified top-level and admitted-platform digests plus bounded evidence. The
