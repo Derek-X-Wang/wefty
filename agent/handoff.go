@@ -15,11 +15,15 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 const (
 	handoffMarkerName = ".wefty-handoff.json"
+	// handoffMarkerStagingName is where writeHandoffMarker stages a marker
+	// before renaming it into place.
+	handoffMarkerStagingName = handoffMarkerName + durable.StagingSuffix
 	// handoffResultName is the one file the per-run bound will not drop. It is
 	// the contract's name for a run's result document.
 	handoffResultName = "result.json"
@@ -1190,7 +1194,9 @@ func handoffHasFiles(run *os.Root) (bool, error) {
 		return false, fmt.Errorf("read handoff directory: %w", err)
 	}
 	for _, entry := range entries {
-		if entry.Name() != handoffMarkerName {
+		// A marker write that crashed before its rename leaves its staging
+		// file; it is the agent's own, and the next marker write replaces it.
+		if name := entry.Name(); name != handoffMarkerName && name != handoffMarkerStagingName {
 			return true, nil
 		}
 	}
@@ -1250,21 +1256,19 @@ func readHandoffMarker(run *os.Root) (handoffMarker, bool, error) {
 
 // writeHandoffMarker replaces the name rather than writing through it, so a
 // link planted there is destroyed instead of truncating its target.
+//
+// The replacement is one rename of a synced staging file, followed by a sync
+// of the run directory. Deleting the old marker and then creating the new one
+// left a window with no marker at all, and a crash in it made the next
+// preparation refuse the directory as unmanaged until retention expired
+// (#599).
 func writeHandoffMarker(run *os.Root, marker handoffMarker) error {
 	payload, err := json.Marshal(marker)
 	if err != nil {
 		return fmt.Errorf("encode handoff marker: %w", err)
 	}
-	if err := run.Remove(handoffMarkerName); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("replace handoff marker: %w", err)
-	}
-	file, err := openHandoffFile(run, handoffMarkerName, os.O_WRONLY|os.O_CREATE|os.O_EXCL|noFollowOpenFlag, 0o600)
-	if err != nil {
+	if err := durable.WriteFile(run, handoffMarkerName, payload, 0o600); err != nil {
 		return fmt.Errorf("write handoff marker: %w", err)
 	}
-	if _, err := file.Write(payload); err != nil {
-		file.Close()
-		return fmt.Errorf("write handoff marker: %w", err)
-	}
-	return file.Close()
+	return nil
 }

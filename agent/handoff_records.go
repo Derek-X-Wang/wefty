@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 )
 
 // A retained run's authority lives here, on the agent's side of the boundary,
@@ -486,10 +487,13 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 	return nil
 }
 
-// writeStateDocument writes one small agent-owned JSON document by
-// write-then-rename. The staging name is removed first rather than truncated,
-// so a name that is anything but the file the agent expects is replaced rather
-// than written through.
+// writeStateDocument writes one small agent-owned JSON document durably:
+// staged, synced, renamed over the name, and the directory synced. A record
+// torn by power loss is one loadRecords skips and adoption must repair, so the
+// name holds the old document or the new one and never a partial one (#599).
+// The staging name is removed first rather than truncated, so a name that is
+// anything but the file the agent expects is replaced rather than written
+// through.
 func writeStateDocument(root, name string, value any) error {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", root, err)
@@ -498,23 +502,15 @@ func writeStateDocument(root, name string, value any) error {
 	if err != nil {
 		return fmt.Errorf("encode agent state document: %w", err)
 	}
-	path := filepath.Join(root, name)
-	staging := path + ".tmp"
-	if err := os.Remove(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	file, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	directory, err := os.OpenRoot(root)
 	if err != nil {
+		return fmt.Errorf("open %s: %w", root, err)
+	}
+	defer directory.Close()
+	if err := durable.WriteFile(directory, name, payload, 0o600); err != nil {
 		return fmt.Errorf("write agent state document: %w", err)
 	}
-	if _, err := file.Write(payload); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return os.Rename(staging, path)
+	return nil
 }
 
 // removeRecord drops both names a run's record can be under. Removing only the
@@ -605,10 +601,15 @@ func (m *handoffManager) readRecord(path string) (retentionRecord, error) {
 	}
 	var record retentionRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
-		return retentionRecord{}, err
+		return retentionRecord{}, fmt.Errorf("%w: %w", errRecordUndecodable, err)
 	}
 	return record, nil
 }
+
+// errRecordUndecodable is a regular record file whose bytes are not a record
+// at all -- empty, or cut short -- which is what power loss leaves of a record
+// an agent that did not sync its writes was replacing. It names no run.
+var errRecordUndecodable = errors.New("retention record is not a decodable record")
 
 // readStateDocument reads one small agent-owned JSON document. It refuses
 // anything that is not a regular file, never follows a link, opens

@@ -12,18 +12,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 	_ "modernc.org/sqlite"
 )
 
@@ -254,52 +258,114 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 }
 
 // sqliteDSN is the one way L1 opens its database file: foreign keys and
-// secure delete on, immediate write transactions, and busyTimeout as the
-// connection's wait on SQLite's write lock.
+// secure delete on, immediate write transactions, busyTimeout as the
+// connection's wait on SQLite's write lock, and the platform's durability
+// pragmas, so an acknowledged commit survives power loss (#599).
 func sqliteDSN(path string, busyTimeout time.Duration) string {
 	query := make(url.Values)
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", "secure_delete(1)")
+	for _, pragma := range durable.SQLitePragmas() {
+		query.Add("_pragma", pragma)
+	}
 	query.Set("_txlock", "immediate")
 	return (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 }
 
+// loadOrCreateDeploymentID reads this database's authority instance identity,
+// creating it on first boot.
+//
+// Creation publishes a fully synced file with a link that never replaces, so of
+// two racing first boots exactly one identity wins and the other reads it, and
+// power loss leaves either no file or the whole identity (#599). An empty file
+// is what an older L1 left when it died between creating the name and syncing
+// its bytes; it never held an identity anything could have used, so it is
+// discarded and the identity created as on first boot. A file that holds bytes
+// and is not an identity stays a hard failure: that is damage, not a first boot
+// that never finished.
 func loadOrCreateDeploymentID(databasePath string) (string, error) {
 	path := databasePath + ".authority-instance"
-	value := make([]byte, 32)
-	if _, err := rand.Read(value); err != nil {
-		return "", fmt.Errorf("l1: generate authority instance identity: %w", err)
-	}
-	generated := hex.EncodeToString(value)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err == nil {
-		if _, err := file.WriteString(generated); err != nil {
-			_ = file.Close()
-			return "", fmt.Errorf("l1: write authority instance identity: %w", err)
-		}
-		if err := file.Sync(); err != nil {
-			_ = file.Close()
-			return "", fmt.Errorf("l1: sync authority instance identity: %w", err)
-		}
-		if err := file.Close(); err != nil {
-			return "", fmt.Errorf("l1: close authority instance identity: %w", err)
-		}
-		return generated, nil
-	}
-	if !errors.Is(err, os.ErrExist) {
-		return "", fmt.Errorf("l1: create authority instance identity: %w", err)
-	}
-	payload, err := os.ReadFile(path)
+	dir, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
-		return "", fmt.Errorf("l1: read authority instance identity: %w", err)
+		return "", fmt.Errorf("l1: open authority instance identity directory: %w", err)
 	}
-	identity := strings.TrimSpace(string(payload))
-	decoded, err := hex.DecodeString(identity)
-	if err != nil || len(decoded) != 32 {
-		return "", fmt.Errorf("l1: authority instance identity is invalid")
+	defer dir.Close()
+	name := filepath.Base(path)
+	// Each pass either returns or observes a change another boot made to the
+	// name (its create won, or it discarded the empty file first), so a few
+	// passes always settle.
+	for range 8 {
+		payload, err := dir.ReadFile(name)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			value := make([]byte, 32)
+			if _, err := rand.Read(value); err != nil {
+				return "", fmt.Errorf("l1: generate authority instance identity: %w", err)
+			}
+			generated := hex.EncodeToString(value)
+			err := durable.CreateFile(dir, name, []byte(generated), 0o600)
+			if err == nil {
+				return generated, nil
+			}
+			if !errors.Is(err, fs.ErrExist) {
+				return "", fmt.Errorf("l1: create authority instance identity: %w", err)
+			}
+		case err != nil:
+			return "", fmt.Errorf("l1: read authority instance identity: %w", err)
+		case len(payload) == 0:
+			if err := discardEmptyIdentity(dir, name); err != nil {
+				return "", fmt.Errorf("l1: discard empty authority instance identity: %w", err)
+			}
+		default:
+			identity := strings.TrimSpace(string(payload))
+			decoded, err := hex.DecodeString(identity)
+			if err != nil || len(decoded) != 32 {
+				return "", fmt.Errorf("l1: authority instance identity is invalid")
+			}
+			return identity, nil
+		}
 	}
-	return identity, nil
+	return "", fmt.Errorf("l1: authority instance identity did not settle")
+}
+
+// discardEmptyIdentity removes the empty identity file at name, and only that
+// file. Every boot discarding it locks the file first, then re-checks under the
+// lock that the name still holds that same file and that it is still empty, so
+// no boot can remove an identity another boot has since published in its place.
+// Publishing never replaces a name, so only a discard can change what the name
+// holds while the lock is held.
+func discardEmptyIdentity(dir *os.Root, name string) error {
+	file, err := dir.Open(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	locked, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	current, err := dir.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(locked, current) || locked.Size() != 0 {
+		return nil
+	}
+	if err := dir.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return durable.SyncDir(dir)
 }
 
 func (s *Store) initialize(ctx context.Context) error {

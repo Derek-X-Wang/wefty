@@ -276,7 +276,15 @@ or when the run becomes terminal first. L1 keeps the bearer in the job's spec
 only until the one-shot is terminal with no retry left, and then scrubs it with
 the inline script bytes and the `run_params_json` label (`state-machines.md`).
 L1, L3 and the node agent's spool all open SQLite with `secure_delete`, so a
-cleared or deleted value is zeroed on disk.
+cleared or deleted value is zeroed on disk. Every connection of the three also
+opens with `fullfsync` and `checkpoint_fullfsync` on darwin, where a plain
+fsync leaves a commit in the drive's cache: a commit any of them acknowledged
+survives power loss or a kernel panic, not only a process crash. Linux fsync
+already reaches stable storage and adds nothing. L1's authority instance
+identity file is published whole, synced, by a link that never replaces, so two
+racing first boots agree on one identity and power loss leaves either no file
+or the whole identity; an empty file an older L1 left is treated as a first
+boot that never finished, while any other invalid content still fails startup.
 
 The scope is:
 
@@ -765,6 +773,10 @@ keeps the directory it was dispatched with, and has no retained results, no
 retention record and no result row on the node either way. Before execution, the
 node agent rejects symlinks and non-directories, creates the directory when it
 is absent, forces mode `0700`, and writes an ownership marker at mode `0600`.
+The marker and the agent's retention records are replaced by renaming a synced
+staging file over the name and then syncing the directory, so after power loss
+each name holds the old document or the new one, never a partial one, and a
+marker is never absent while it is being rewritten.
 For `kind=oci`, the agent instead requests a helper-owned
 managed volume keyed by the job's stable run ID or `handoff_owner_run_id`; the
 helper hashes that opaque key and mounts the resulting source at
@@ -944,7 +956,12 @@ names: a directory a workload made under this node's handoff root, carrying a
 marker naming this node and that run, qualifies. What adoption may do with it
 is bounded instead. It only ever creates a record, never replaces one that
 already stands at that run's name, and it gives no authority beyond an expiry
-schedule over a directory under this node's own root. The deadline it takes
+schedule over a directory under this node's own root. The one exception is a
+regular file at that run's own name whose bytes are not a record at all --
+empty or cut short, as an older agent's unsynced write could be left by power
+loss. It names no run and the sweep already skips it, so adoption replaces it
+rather than leaving the directory unsweepable; a name that is not a regular
+file, cannot be read, or holds another run's record is still refused. The deadline it takes
 from the marker is at most one retention window **after the adoption**, so a
 forged marker may shorten its own run's retention freely and may extend nothing
 past a window from the moment the node adopted it. A record whose run was

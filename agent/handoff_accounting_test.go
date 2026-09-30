@@ -753,7 +753,8 @@ func TestTwoRunNamesSharingTheirFirstBytesNoLongerShareARecordFile(t *testing.T)
 
 // TestAdoptionNeverWritesOverARecordItDoesNotOwn: adoption is the one path that
 // writes a record for a directory it did not prepare, on evidence a workload
-// can write. It creates; it never replaces.
+// can write. It never replaces a record that names another run. (A torn record
+// that names no run is TestAdoptionReplacesATornRecordAtItsOwnName.)
 func TestAdoptionNeverWritesOverARecordItDoesNotOwn(t *testing.T) {
 	for _, testCase := range []struct {
 		name     string
@@ -764,11 +765,6 @@ func TestAdoptionNeverWritesOverARecordItDoesNotOwn(t *testing.T) {
 			name:     "a record that names another run",
 			planted:  `{"run_id":"run_other","node_id":"node-1","directory":"/elsewhere/run_other","retained_at":"2026-09-17T11:00:00Z","retain_until":"2026-09-17T12:30:00Z"}`,
 			expected: "already holds run",
-		},
-		{
-			name:     "a record that cannot be read",
-			planted:  "{not json",
-			expected: "could not be read",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 	_ "modernc.org/sqlite"
 )
 
@@ -54,6 +55,11 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	// deleted value is zeroed on disk rather than left in a free page (#52),
 	// as L1 does.
 	query.Add("_pragma", "secure_delete(1)")
+	// An acknowledged commit must survive power loss, which on darwin takes
+	// F_FULLFSYNC (#599).
+	for _, pragma := range durable.SQLitePragmas() {
+		query.Add("_pragma", pragma)
+	}
 	query.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)

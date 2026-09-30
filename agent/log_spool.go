@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -115,6 +116,12 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 	// secure_delete zeroes them on disk rather than leaving them in a free
 	// page (#52), as L1 does.
 	query.Add("_pragma", "secure_delete(1)")
+	// Rows L1 acknowledged are deleted and never re-sent, so a commit the
+	// spool reported must survive power loss; on darwin that takes
+	// F_FULLFSYNC (#599).
+	for _, pragma := range durable.SQLitePragmas() {
+		query.Add("_pragma", pragma)
+	}
 	query.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
