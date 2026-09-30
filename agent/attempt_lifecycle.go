@@ -755,6 +755,12 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 }
 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
+	// ledgerRefusals counts consecutive run_ledger_unavailable answers. L1
+	// has already committed such a completion and owes only the run ledger's
+	// token revocation, which it settles on its own; every replay still costs
+	// L1 a run-ledger call, so the replay backs off like evidence recovery
+	// instead of retrying at the completion interval for the whole outage.
+	ledgerRefusals := 0
 	for {
 		var observation OCIIntentObservation
 		var releaseIntent func()
@@ -820,7 +826,14 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 				}
 				return destinationError{destination: classification.destination, err: err}
 			}
-			timer := lifecycle.dependencies.clock.NewTimer(lifecycle.dependencies.completionRetry)
+			delay := lifecycle.dependencies.completionRetry
+			if protocolErrorCode(err) == contract.ErrorRunLedgerUnavailable {
+				ledgerRefusals++
+				delay = evidenceRecoveryBackoff(delay, ledgerRefusals)
+			} else {
+				ledgerRefusals = 0
+			}
+			timer := lifecycle.dependencies.clock.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				stopTimer(timer)

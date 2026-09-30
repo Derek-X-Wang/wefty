@@ -458,6 +458,16 @@ refused one, so a run ledger that hangs costs the same as one that refuses. A
 blocked restore must never take a Node's whole convergence surface — and with
 it the capabilities the Node advertises — out of service.
 
+A node agent treats `run_ledger_unavailable` on its own attempt completion as
+transient whatever `retryable` says. L1 has already committed that completion
+and holds its attempt revocation owed, so nothing is lost by waiting, but each
+replay makes L1 try the run ledger once more (and wait out its client timeout
+when the ledger hangs). The agent therefore replays such a completion on the
+evidence-recovery backoff: the completion retry interval doubled per
+consecutive `run_ledger_unavailable` answer, capped at 30 seconds (or the
+interval itself when configured larger). Any other transient answer keeps the
+base interval and restarts the doubling.
+
 L1 logs the cause of every response it scrubs, as one
 `event=l1_internal_error_scrubbed` line naming the method, the path, the error
 class and the unwrapped cause. A fault an operator cannot see is worse than a
