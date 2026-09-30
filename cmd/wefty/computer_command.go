@@ -694,12 +694,12 @@ func writeComputerProjection(writer io.Writer, computer computerOperatorProjecti
 
 func writeComputersTable(writer io.Writer, computers []computerOperatorProjection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tLAST GROW\tACTIVE CAPACITY FAILURE\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
+	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tLAST GROW\tACTIVE CAPACITY FAILURE\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tOWED REVOCATIONS\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
 		return err
 	}
 	for _, computer := range computers {
 		job := computer.CurrentJob
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			computer.ComputerID, computer.Name, computer.DesiredState, job.State,
 			computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 			computer.ReconfigurationPhase, computer.CurrentJobID, valueOrNA(job.CurrentAttemptID),
@@ -708,12 +708,30 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 			computer.Capacity.ActiveFailure.Status+"("+computer.Capacity.ActiveFailure.Code+")",
 			boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
 			computer.ControllerTenure,
-			jsonOrNA(job.LastFailure), computerRemovalColumn(computer.RemovalOutcome, job.Removal), boolPointerOrNA(computer.MutationApplied),
+			jsonOrNA(job.LastFailure), computerRemovalColumn(computer.RemovalOutcome, job.Removal),
+			computerOwedRevocationsColumn(computer.OwedRevocations), boolPointerOrNA(computer.MutationApplied),
 			boolPointerOrNA(computer.IdempotentReplay)); err != nil {
 			return err
 		}
 	}
 	return table.Flush()
+}
+
+// computerOwedRevocationsColumn names the explicit L3 revocations this
+// Computer's authority-losing mutations still owe (#554): how many, and which
+// verbs owe them, oldest first. L3's live-scope check already refuses the
+// Computer's old passes, so an owed revocation is missing defense in depth
+// and audit, not an open door; it settles on the host Node's heartbeat once
+// the run ledger answers.
+func computerOwedRevocationsColumn(owed []l1.OwedComputerRevocation) string {
+	if len(owed) == 0 {
+		return "none"
+	}
+	verbs := make([]string, 0, len(owed))
+	for _, revocation := range owed {
+		verbs = append(verbs, string(revocation.Verb))
+	}
+	return fmt.Sprintf("%d(%s)", len(owed), strings.Join(verbs, ","))
 }
 
 // computerRemovalColumn never shows a bare custody outcome for a Job whose

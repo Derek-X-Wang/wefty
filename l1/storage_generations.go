@@ -229,6 +229,10 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	if err := requireCurrentComputerStorage(ctx, tx, computer, "reset"); err != nil {
 		return Computer{}, false, err
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, false, err
+	}
 	nextRevision := computer.IntentRevision + 1
 	var nextGeneration int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(storage_generation), 0) + 1
@@ -294,6 +298,13 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	updated, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "read reserved Computer Storage reset")
+	}
+	updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+		computerID: computerID, hostNodeID: computerHostNodeID(computer),
+		verb: ComputerRevocationVerbReset, reason: "storage_generation_advanced", holdingAttempts: holding,
+	}, now)
+	if err != nil {
+		return Computer{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer Storage reset reservation")

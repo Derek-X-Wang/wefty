@@ -64,6 +64,7 @@ type StoreOptions struct {
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
 	db                                *sql.DB
+	settlementDB                      *sql.DB
 	clock                             Clock
 	restartJitter                     func(time.Duration) time.Duration
 	leaseDuration                     time.Duration
@@ -166,13 +167,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
-	query := make(url.Values)
-	query.Add("_pragma", "busy_timeout(5000)")
-	query.Add("_pragma", "foreign_keys(1)")
-	query.Add("_pragma", "secure_delete(1)")
-	query.Set("_txlock", "immediate")
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", sqliteDSN(path, sqliteBusyTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("l1: open SQLite: %w", err)
 	}
@@ -194,7 +189,36 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Owed-revocation settlement writes run inside a node heartbeat's budget,
+	// so they get their own handle whose lock wait is short and fixed. The
+	// main pool's connections keep sqliteBusyTimeout; nothing ever changes a
+	// shared connection's wait. WAL is a property of the database file, which
+	// initialize has already set.
+	settlementDB, err := sql.Open("sqlite", sqliteDSN(path, owedRevocationWriteWait))
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite owed-revocation handle: %w", err)
+	}
+	settlementDB.SetMaxOpenConns(1)
+	if err := settlementDB.PingContext(context.Background()); err != nil {
+		_ = settlementDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite owed-revocation handle: %w", err)
+	}
+	store.settlementDB = settlementDB
 	return store, nil
+}
+
+// sqliteDSN is the one way L1 opens its database file: foreign keys and
+// secure delete on, immediate write transactions, and busyTimeout as the
+// connection's wait on SQLite's write lock.
+func sqliteDSN(path string, busyTimeout time.Duration) string {
+	query := make(url.Values)
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "secure_delete(1)")
+	query.Set("_txlock", "immediate")
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 }
 
 func loadOrCreateDeploymentID(databasePath string) (string, error) {
@@ -843,6 +867,43 @@ CREATE TABLE IF NOT EXISTS computer_takeover_audit (
 );
 CREATE INDEX IF NOT EXISTS computer_takeover_audit_computer_time
   ON computer_takeover_audit(computer_id, occurred_ns, attempt_id, event_id);
+-- computer_owed_revocations keeps the explicit L3 revocation an
+-- authority-losing Computer mutation owes, written in that mutation's own
+-- transaction, until the run ledger takes it (#554). recorded_attempt_ids_json
+-- names the attempts whose passes it ends: those that could hold one when the
+-- mutation began. A late settlement revokes exactly those, one attempt-scoped
+-- request each, and gathers their receipts in attempt_receipts_json. A settled
+-- row is the audit record: immutable, never deleted.
+CREATE TABLE IF NOT EXISTS computer_owed_revocations (
+  revocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  computer_id TEXT NOT NULL,
+  host_node_id TEXT NOT NULL,
+  verb TEXT NOT NULL CHECK(verb IN ('stop', 'restart', 'reset', 'project', 'reimage', 'remove', 'grow_acknowledgement', 'attempt_completion')),
+  reason TEXT NOT NULL CHECK(reason <> ''),
+  scope TEXT NOT NULL CHECK(scope IN ('revoke_all', 'attempt')),
+  computer_attempt_id TEXT NOT NULL DEFAULT '',
+  recorded_attempt_ids_json BLOB NOT NULL,
+  attempt_receipts_json BLOB NOT NULL DEFAULT X'5B5D',
+  created_ns INTEGER NOT NULL,
+  settle_failures INTEGER NOT NULL DEFAULT 0 CHECK(settle_failures >= 0),
+  last_failure TEXT NOT NULL DEFAULT '',
+  last_failure_ns INTEGER,
+  settlement TEXT NOT NULL DEFAULT '' CHECK(settlement IN ('', 'revoked', 'nothing_to_revoke', 'no_run_ledger')),
+  settled_ns INTEGER,
+  receipt_json BLOB,
+  CHECK((scope = 'attempt') = (computer_attempt_id <> '')),
+  CHECK((settlement = '') = (settled_ns IS NULL)),
+  CHECK((settlement = 'revoked') = (receipt_json IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_computer
+  ON computer_owed_revocations(computer_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE INDEX IF NOT EXISTS computer_owed_revocations_host
+  ON computer_owed_revocations(host_node_id, revocation_id) WHERE settled_ns IS NULL;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_settled_immutable
+BEFORE UPDATE ON computer_owed_revocations WHEN OLD.settled_ns IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a settled Computer revocation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS computer_owed_revocations_no_delete
+BEFORE DELETE ON computer_owed_revocations BEGIN SELECT RAISE(ABORT, 'Computer revocation audit is immutable'); END;
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,
@@ -1815,7 +1876,13 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	var settlementErr error
+	if s.settlementDB != nil {
+		settlementErr = s.settlementDB.Close()
+	}
+	return errors.Join(s.db.Close(), settlementErr)
+}
 
 // CreateJob creates a job or returns the identical dispatch-key replay.
 // JobOrigin records who a job is created for. A root submission carries only
@@ -3655,6 +3722,9 @@ type CompletionOutcome struct {
 	// empty for an ordinary job. The completed attempt's Computer tokens are
 	// revoked, and only those.
 	ComputerID string
+	// owedRevocationID names the attempt-scoped revocation this completion
+	// committed as owed; zero for a replay or an ordinary job.
+	owedRevocationID int64
 }
 
 // CompleteAttemptOutcome is CompleteAttempt that additionally reports whether
@@ -3908,10 +3978,20 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err != nil {
 		return CompletionOutcome{}, err
 	}
+	var owedRevocationID int64
+	if computerID != "" {
+		owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+			computerID: computerID, hostNodeID: attempt.nodeID,
+			verb: ComputerRevocationVerbAttemptCompletion, reason: "attempt_terminal", attemptID: attemptID,
+		}, now)
+		if err != nil {
+			return CompletionOutcome{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return CompletionOutcome{}, internalError(err, "commit completion")
 	}
-	return CompletionOutcome{Job: job, ComputerID: computerID}, nil
+	return CompletionOutcome{Job: job, ComputerID: computerID, owedRevocationID: owedRevocationID}, nil
 }
 
 // computerForJob returns the Computer jobID was projected for, current or

@@ -367,6 +367,10 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 		computer.DesiredDiskBytes != row.OldDiskBytes {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer grow no longer owns the current Storage budget")
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
+	}
 	status, failure := "applied", ""
 	if request.Receipt.Applied {
 		if _, err := tx.ExecContext(ctx, `UPDATE computers SET desired_disk_bytes=? WHERE computer_id=?`,
@@ -411,6 +415,19 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 	updated, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, err
+	}
+	// The same condition the handler revokes on: a grow acknowledgement that
+	// finds the job already failed ends the attempt's authority. An online
+	// grow that fails without failing the job keeps its passes by design.
+	if updated.CurrentJob.State == contract.JobFailed {
+		updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+			computerID: computerID, hostNodeID: computerHostNodeID(computer),
+			verb: ComputerRevocationVerbGrowAcknowledgement, reason: "computer_grow_capacity_failed",
+			holdingAttempts: holding,
+		}, now)
+		if err != nil {
+			return Computer{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer grow acknowledgement")

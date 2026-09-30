@@ -125,17 +125,25 @@ func TestComputerAuthorityLossRefusesTypedWhenRunLedgerIsUnreachable(t *testing.
 				t.Fatal(err)
 			}
 			status, body := verb.mutate(t, h, client, computer)
-			// Post-commit: not retryable, because a retry cannot be relied on
-			// to perform the revocation, and it does not need to be, because
-			// L3's live-scope check already refuses the old tokens.
+			// Post-commit: not retryable, because nothing the caller repeats
+			// performs the revocation, and it does not need to: L3's
+			// live-scope check already refuses the old tokens. This Computer
+			// never ran, so no attempt could hold a pass and nothing is owed
+			// (#554); a running one's revocation stays owed instead (see
+			// owed_revocation_integration_test.go).
 			assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied",
-				"was not recorded", "retrying the request is not guaranteed to perform it",
-				"live-scope check already refuses")
+				"was not recorded", "nothing is owed", "live-scope check already refuses")
 			after, err := h.store.GetComputer(context.Background(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			verb.applied(t, after)
+			var settlement string
+			if err := h.store.db.QueryRow(`SELECT settlement FROM computer_owed_revocations WHERE computer_id=? AND verb=?`,
+				computer.ComputerID, verb.name).Scan(&settlement); err != nil || len(after.OwedRevocations) != 0 ||
+				settlement != owedRevocationSettledNothingToRevoke {
+				t.Fatalf("after a refused %s: settlement=%q err=%v owed=%#v", verb.name, settlement, err, after.OwedRevocations)
+			}
 			if strings.Contains(logs.text(), "event=l1_internal_error_scrubbed") {
 				t.Fatalf("a typed refusal was still logged as a scrubbed internal error: %s", logs.text())
 			}

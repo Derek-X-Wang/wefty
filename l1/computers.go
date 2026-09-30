@@ -102,19 +102,23 @@ type Computer struct {
 	LastGrowOperation         *ComputerStorageGrowOutcome        `json:"last_grow_operation,omitempty"`
 	LastRestoreRevocation     *ComputerRestoreRevocationReceipt  `json:"last_restore_revocation,omitempty"`
 	StorageCleanupQuarantines []ComputerStorageCleanupQuarantine `json:"storage_cleanup_quarantines,omitempty"`
-	DesiredDiskBytes          int64                              `json:"desired_disk_bytes"`
-	DesiredState              contract.ServiceDesiredState       `json:"desired_state"`
-	IntentRevision            int64                              `json:"intent_revision"`
-	AppliedRevision           int64                              `json:"applied_revision"`
-	CurrentJobID              string                             `json:"current_job_id"`
-	CurrentSpecRevision       int64                              `json:"current_spec_revision"`
-	ReconfigurationPhase      ComputerReconfigurationPhase       `json:"reconfiguration_phase"`
-	ReconfigurationRevision   *int64                             `json:"reconfiguration_revision,omitempty"`
-	SubmitEnabled             bool                               `json:"submit_enabled"`
-	SubmitIntentRevision      int64                              `json:"submit_intent_revision"`
-	SubmitMaxInflight         int                                `json:"submit_max_inflight"`
-	SubmitPolicyRevision      int64                              `json:"submit_policy_revision"`
-	RemovalOutcome            string                             `json:"removal_outcome,omitempty"`
+	// OwedRevocations lists the explicit L3 revocations authority-losing
+	// mutations of this Computer committed and the run ledger has not yet
+	// taken, oldest first (#554). Empty once every one is settled.
+	OwedRevocations         []OwedComputerRevocation     `json:"owed_revocations,omitempty"`
+	DesiredDiskBytes        int64                        `json:"desired_disk_bytes"`
+	DesiredState            contract.ServiceDesiredState `json:"desired_state"`
+	IntentRevision          int64                        `json:"intent_revision"`
+	AppliedRevision         int64                        `json:"applied_revision"`
+	CurrentJobID            string                       `json:"current_job_id"`
+	CurrentSpecRevision     int64                        `json:"current_spec_revision"`
+	ReconfigurationPhase    ComputerReconfigurationPhase `json:"reconfiguration_phase"`
+	ReconfigurationRevision *int64                       `json:"reconfiguration_revision,omitempty"`
+	SubmitEnabled           bool                         `json:"submit_enabled"`
+	SubmitIntentRevision    int64                        `json:"submit_intent_revision"`
+	SubmitMaxInflight       int                          `json:"submit_max_inflight"`
+	SubmitPolicyRevision    int64                        `json:"submit_policy_revision"`
+	RemovalOutcome          string                       `json:"removal_outcome,omitempty"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
 	DisplayEndpoint  *string                             `json:"display_endpoint"`
@@ -122,6 +126,9 @@ type Computer struct {
 	CurrentJob       Job                                 `json:"current_job"`
 	CreatedAt        time.Time                           `json:"created_at"`
 	UpdatedAt        time.Time                           `json:"updated_at"`
+	// owedRevocationID names the owed revocation this call's mutation
+	// committed, for the handler to settle; zero when it committed none.
+	owedRevocationID int64
 }
 
 type CreateComputerRequest struct {
@@ -754,6 +761,10 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	if err != nil {
 		return Computer{}, fmt.Errorf("read Computer Storage cleanup quarantines: %w", err)
 	}
+	computer.OwedRevocations, err = readOwedComputerRevocations(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read owed Computer revocations: %w", err)
+	}
 	var displayEndpoint sql.NullString
 	err = q.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint
 		FROM service_jobs JOIN jobs ON jobs.job_id=service_jobs.job_id
@@ -1058,6 +1069,11 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if computer.DesiredState == request.DesiredState {
 		return computer, nil
 	}
+	// Read before the stop moves the Job or clears its current attempt.
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
+	}
 	nextRevision := computer.IntentRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?, updated_ns=?
 		WHERE computer_id=? AND intent_revision=?`, request.DesiredState, nextRevision, now.UnixNano(), computerID,
@@ -1088,6 +1104,15 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	updated, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer desired-state result")
+	}
+	if request.DesiredState == contract.ServiceDesiredStopped {
+		updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+			computerID: computerID, hostNodeID: computerHostNodeID(computer),
+			verb: ComputerRevocationVerbStop, reason: "computer_stopped", holdingAttempts: holding,
+		}, now)
+		if err != nil {
+			return Computer{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer desired state")
@@ -1233,6 +1258,10 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err := requireCurrentComputerStorage(ctx, tx, computer, "restart"); err != nil {
 		return Computer{}, false, err
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, false, err
+	}
 	var latchedFailure contract.SpawnFailure
 	activeResourceRestart := (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning) &&
 		json.Unmarshal(computer.CurrentJob.LastFailure, &latchedFailure) == nil &&
@@ -1297,6 +1326,13 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err != nil {
 		return Computer{}, false, internalError(err, "read Computer restart result")
 	}
+	updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+		computerID: computerID, hostNodeID: computerHostNodeID(computer),
+		verb: ComputerRevocationVerbRestart, reason: "computer_restarted", holdingAttempts: holding,
+	}, now)
+	if err != nil {
+		return Computer{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer restart")
 	}
@@ -1337,6 +1373,11 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		computer.ReconfigurationPhase != ComputerReconfigurationGrowing {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	}
+	// Read before the removal marks these attempts lost.
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
 	}
 	nextRevision := computer.IntentRevision + 1
 	if computer.ReconfigurationPhase == ComputerReconfigurationResetting {
@@ -1487,6 +1528,13 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	removed, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, internalError(err, "read removed Computer")
+	}
+	removed.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+		computerID: computerID, hostNodeID: computerHostNodeID(computer),
+		verb: ComputerRevocationVerbRemove, reason: "computer_removed", holdingAttempts: holding,
+	}, now)
+	if err != nil {
+		return Computer{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer removal intent")
@@ -1740,6 +1788,10 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
+	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
+	if err != nil {
+		return Computer{}, err
+	}
 	if _, _, dispatchErr := getJobByDispatchKey(ctx, tx, request.Spec.DispatchKey, now); dispatchErr == nil {
 		return Computer{}, protocolError(contract.ErrorDispatchKeyConflict,
 			"dispatch key %q is already in use", request.Spec.DispatchKey)
@@ -1824,6 +1876,17 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	updated, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, internalError(err, "read installed Computer projection")
+	}
+	verb := ComputerRevocationVerbProject
+	if phase == ComputerReconfigurationReimaging {
+		verb = ComputerRevocationVerbReimage
+	}
+	updated.owedRevocationID, err = recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{
+		computerID: computerID, hostNodeID: computerHostNodeID(computer), verb: verb, reason: "computer_reimaged",
+		holdingAttempts: holding,
+	}, now)
+	if err != nil {
+		return Computer{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer projection install")
