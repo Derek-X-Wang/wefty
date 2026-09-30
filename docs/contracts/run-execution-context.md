@@ -464,7 +464,13 @@ typed `submit_inflight_limit`. The guest bridge is transport-only defense in
 depth and never supplies or trusts provenance headers. Its method/path
 allowlist exactly mirrors L3's Computer-token surface: self, self-scoped Run
 list, root submission, scoped Run read (including accepted Envelopes), lineage,
-and logs. It closes and cancels in-flight traffic at attempt cancellation,
+and logs. Every allowlisted request must carry the pass as `Authorization:
+Bearer`, because the bridge dials L3 as the agent's own Node identity and a
+credential-free request would be authorized as the agent. Like the run bridge,
+it judges both rules on the request as it will leave for L3, after hop-by-hop
+headers are removed, so a request whose `Connection` header names
+`Authorization` is refused too. These refusals keep this surface's vocabulary:
+a typed `403 forbidden` that never reaches L3, never `unauthorized`. It closes and cancels in-flight traffic at attempt cancellation,
 policy/lease/authority/helper loss, agent restart, reimage/reset, and removal;
 L3 revocation remains the authority and closure only removes reachability.
 Bridge cancellation is a typed retryable `pass_unavailable` with an

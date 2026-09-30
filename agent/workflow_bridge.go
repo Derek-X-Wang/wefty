@@ -210,26 +210,9 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		// Computer path: the Computer pass has its own scope and its own door.
 		bridge.l1 = nil
 	}
-	proxyError := contract.ErrorInternal
-	if surface == workflowBridgeSurfaceComputer {
-		proxyError = contract.ErrorPassUnavailable
-	}
-	l3Proxy := workflowReverseProxy(bridge.l3, "/l3", proxyError)
 	var handler http.Handler
 	if surface == workflowBridgeSurfaceComputer {
-		l3Proxy.ErrorHandler = func(w http.ResponseWriter, request *http.Request, err error) {
-			message := err.Error()
-			if errors.Is(err, context.Canceled) {
-				cause := context.Cause(request.Context())
-				for _, known := range []error{errComputerSubmissionRevoked, errComputerSubmissionPolicyReminted, errComputerAttemptClosed} {
-					if errors.Is(cause, known) {
-						message = cause.Error()
-						break
-					}
-				}
-			}
-			writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorPassUnavailable, message)
-		}
+		l3Proxy := newComputerBridgeProxy(bridge.l3)
 		computer := bridge.computerHandler(l3Proxy)
 		handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 			if !strings.HasPrefix(request.URL.Path, "/l3/") {
@@ -277,10 +260,42 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	return bridge, nil
 }
 
+// newComputerBridgeProxy forwards to L3 through bridgeGuard. As on the run
+// surface, the guard judges the request L3 will receive. Its refusals keep
+// this surface's vocabulary: a bridge-originated 403 forbidden, never
+// unauthorized, which only L3 may return to a Computer tenant.
+func newComputerBridgeProxy(transport http.RoundTripper) *httputil.ReverseProxy {
+	proxy := workflowReverseProxy(bridgeGuard{next: transport, check: checkComputerBridgeRequest}, "/l3", contract.ErrorPassUnavailable)
+	proxy.ErrorHandler = func(w http.ResponseWriter, request *http.Request, err error) {
+		var refusal *bridgeRefusal
+		if errors.As(err, &refusal) {
+			writeWorkflowBridgeError(w, refusal.status, refusal.code, refusal.message)
+			return
+		}
+		message := err.Error()
+		if errors.Is(err, context.Canceled) {
+			cause := context.Cause(request.Context())
+			for _, known := range []error{errComputerSubmissionRevoked, errComputerSubmissionPolicyReminted, errComputerAttemptClosed} {
+				if errors.Is(cause, known) {
+					message = cause.Error()
+					break
+				}
+			}
+		}
+		writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorPassUnavailable, message)
+	}
+	return proxy
+}
+
 func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if !computerBridgeRouteAllowed(request.Method, strings.TrimPrefix(request.URL.Path, "/l3")) {
-			writeWorkflowBridgeError(w, http.StatusForbidden, contract.ErrorForbidden, "route is outside the Computer attempt bridge allowlist")
+		if refusal := checkComputerBridgeRequest(request.Method, strings.TrimPrefix(request.URL.Path, "/l3"), request.Header); refusal != nil {
+			writeWorkflowBridgeError(w, refusal.status, refusal.code, refusal.message)
+			return
+		}
+		if connectionNamesAuthorization(request.Header) {
+			writeWorkflowBridgeError(w, http.StatusForbidden, contract.ErrorForbidden,
+				"Computer attempt bridge refuses a Connection header that would drop Authorization")
 			return
 		}
 		requestContext, cancel, ok := b.reachableRequestContext(request.Context())
@@ -303,8 +318,8 @@ func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 //
 // This inbound check only refuses early. A request can name Authorization in
 // its Connection header, and the proxy then strips the credential after this
-// check has seen it; runLedgerGuard repeats both checks on the outbound
-// request, so a stripped credential fails closed there.
+// check has seen it; bridgeGuard repeats both checks on the outbound request,
+// so a stripped credential fails closed there.
 func runLedgerHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if connectionNamesAuthorization(request.Header) {
@@ -320,13 +335,13 @@ func runLedgerHandler(next http.Handler) http.Handler {
 	})
 }
 
-// newRunLedgerProxy forwards to L3 through runLedgerGuard. The inbound
+// newRunLedgerProxy forwards to L3 through bridgeGuard. The inbound
 // runLedgerHandler refuses early; the guard is the enforcement, because it
 // sees the request L3 will actually receive.
 func newRunLedgerProxy(transport http.RoundTripper) *httputil.ReverseProxy {
-	proxy := workflowReverseProxy(runLedgerGuard{next: transport}, "/l3", contract.ErrorInternal)
+	proxy := workflowReverseProxy(bridgeGuard{next: transport, check: checkRunLedgerRequest}, "/l3", contract.ErrorInternal)
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		var refusal *runLedgerRefusal
+		var refusal *bridgeRefusal
 		if errors.As(err, &refusal) {
 			writeWorkflowBridgeError(w, refusal.status, refusal.code, refusal.message)
 			return
@@ -336,19 +351,22 @@ func newRunLedgerProxy(transport http.RoundTripper) *httputil.ReverseProxy {
 	return proxy
 }
 
-// runLedgerGuard is the run surface's last check before the wire. It sees the
+// bridgeGuard is an /l3 surface's last check before the wire. It sees the
 // request exactly as the proxy will send it to L3: path already stripped of
 // /l3 and hop-by-hop headers already removed.
-type runLedgerGuard struct{ next http.RoundTripper }
+type bridgeGuard struct {
+	next  http.RoundTripper
+	check func(method, path string, header http.Header) *bridgeRefusal
+}
 
-func (g runLedgerGuard) RoundTrip(out *http.Request) (*http.Response, error) {
+func (g bridgeGuard) RoundTrip(out *http.Request) (*http.Response, error) {
 	path := out.URL.Path
 	if decoded, err := url.PathUnescape(out.URL.EscapedPath()); err != nil || decoded != path {
 		// The bytes on the wire would name a different path from the one
 		// checked; refuse rather than guess which one L3 routes.
 		path = ""
 	}
-	if refusal := checkRunLedgerRequest(out.Method, path, out.Header); refusal != nil {
+	if refusal := g.check(out.Method, path, out.Header); refusal != nil {
 		if out.Body != nil {
 			_ = out.Body.Close()
 		}
@@ -357,25 +375,45 @@ func (g runLedgerGuard) RoundTrip(out *http.Request) (*http.Response, error) {
 	return g.next.RoundTrip(out)
 }
 
-type runLedgerRefusal struct {
+type bridgeRefusal struct {
 	status  int
 	code    contract.ErrorCode
 	message string
 }
 
-func (r *runLedgerRefusal) Error() string { return r.message }
+func (r *bridgeRefusal) Error() string { return r.message }
 
-func checkRunLedgerRequest(method, path string, header http.Header) *runLedgerRefusal {
+func checkRunLedgerRequest(method, path string, header http.Header) *bridgeRefusal {
 	if !bridgeRouteAllowed(runBridgeRoutes, method, path) {
-		return &runLedgerRefusal{status: http.StatusForbidden, code: contract.ErrorForbidden,
+		return &bridgeRefusal{status: http.StatusForbidden, code: contract.ErrorForbidden,
 			message: "route is outside the run bridge allowlist"}
 	}
-	token, ok := strings.CutPrefix(header.Get("Authorization"), "Bearer ")
-	if !ok || strings.TrimSpace(token) == "" {
-		return &runLedgerRefusal{status: http.StatusUnauthorized, code: contract.ErrorUnauthorized,
+	if !hasBearer(header) {
+		return &bridgeRefusal{status: http.StatusUnauthorized, code: contract.ErrorUnauthorized,
 			message: "run bridge requires Authorization: Bearer <WEFTY_RUN_TOKEN>"}
 	}
 	return nil
+}
+
+// checkComputerBridgeRequest requires the Computer pass on every allowlisted
+// route: without a bearer L3 would authorize the request by the agent's own
+// Fabric identity. The refusal is forbidden, not unauthorized, so a tenant
+// never reads a bridge answer as L3's verdict on its pass.
+func checkComputerBridgeRequest(method, path string, header http.Header) *bridgeRefusal {
+	if !computerBridgeRouteAllowed(method, path) {
+		return &bridgeRefusal{status: http.StatusForbidden, code: contract.ErrorForbidden,
+			message: "route is outside the Computer attempt bridge allowlist"}
+	}
+	if !hasBearer(header) {
+		return &bridgeRefusal{status: http.StatusForbidden, code: contract.ErrorForbidden,
+			message: "Computer attempt bridge requires Authorization: Bearer <Computer pass>"}
+	}
+	return nil
+}
+
+func hasBearer(header http.Header) bool {
+	token, ok := strings.CutPrefix(header.Get("Authorization"), "Bearer ")
+	return ok && strings.TrimSpace(token) != ""
 }
 
 func connectionNamesAuthorization(header http.Header) bool {

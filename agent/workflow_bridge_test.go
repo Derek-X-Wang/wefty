@@ -207,7 +207,7 @@ func TestStartWorkflowBridgeSelectsComputerSurfaceOnForcedMacFallback(t *testing
 	if bridge.surface != workflowBridgeSurfaceComputer || !bridge.hostBridgeFallback {
 		t.Fatalf("production bridge surface=%v fallback=%t", bridge.surface, bridge.hostBridgeFallback)
 	}
-	response, err := http.Get(bridge.l3Endpoint + "/v1/computer/self")
+	response, err := computerPassGet(bridge.l3Endpoint + "/v1/computer/self")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestWorkflowBridgeIsClosedWithAttempt(t *testing.T) {
 	if err := bridge.close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := http.Get(endpoint + "/v1/runs/run-1"); err == nil {
+	if _, err := computerPassGet(endpoint + "/v1/runs/run-1"); err == nil {
 		t.Fatal("workflow bridge remained reachable after close")
 	}
 }
@@ -407,6 +407,7 @@ func TestComputerAttemptBridgeProjectsOnlyTheL3OwnedSurface(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		request.Header.Set("Authorization", "Bearer test-pass")
 		if test.method == http.MethodPost {
 			request.Header.Set("X-Wefty-Computer-ID", "forged")
 			request.Header.Set("X-Wefty-Computer-Attempt-ID", "forged")
@@ -557,7 +558,7 @@ func TestComputerAttemptBridgeUnavailableIsTyped(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer bridge.close()
-	response, err := http.Get(bridge.l3Endpoint + "/v1/computer/self")
+	response, err := computerPassGet(bridge.l3Endpoint + "/v1/computer/self")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +622,7 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	}
 	requestDone := make(chan bridgeResponse, 1)
 	go func() {
-		response, err := http.Get(endpoint + "/v1/runs/run-1")
+		response, err := computerPassGet(endpoint + "/v1/runs/run-1")
 		result := bridgeResponse{err: err}
 		if response != nil {
 			result.status = response.StatusCode
@@ -657,7 +658,7 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	updates <- ComputerSubmissionAuthority{ComputerID: "computer-1", Enabled: true, SubmitIntentRevision: 3, SubmitMaxInflight: 20}
 	assertTokenFileWrite(t, runtime.writes, "", "")
 	reenabled := assertTokenFileWrite(t, runtime.writes, "replacement-pass", "")
-	response, err := http.Get(reenabled.endpoint + "/v1/computer/self")
+	response, err := computerPassGet(reenabled.endpoint + "/v1/computer/self")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -823,7 +824,7 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nAuthorization: Bearer test-pass\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -1201,7 +1202,7 @@ func TestComputerSubmissionPolicyRemintReturnsTypedFailureToActiveRequest(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nAuthorization: Bearer test-pass\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -1289,7 +1290,7 @@ func TestComputerSubmissionPolicyRemintReportsUndrainedActiveRequest(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(guest, "POST /l3/v1/runs HTTP/1.1\r\nHost: wefty.invalid\r\nAuthorization: Bearer test-pass\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -1349,7 +1350,7 @@ func TestComputerBridgeNeverSynthesizesAuthorizationAfterUpstreamCommit(t *testi
 	}
 	requestDone := make(chan bridgeResponse, 1)
 	go func() {
-		response, requestErr := http.Get(bridge.l3Endpoint + "/v1/runs/run-committed")
+		response, requestErr := computerPassGet(bridge.l3Endpoint + "/v1/runs/run-committed")
 		result := bridgeResponse{err: requestErr}
 		if response != nil {
 			result.status = response.StatusCode
@@ -1395,4 +1396,15 @@ func TestWorkflowBridgeRejectsWildcardListener(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unspecified") {
 		t.Fatalf("wildcard binding error = %v", err)
 	}
+}
+
+// computerPassGet is what a Computer tenant sends: every call through the
+// Computer bridge carries its pass as a bearer.
+func computerPassGet(url string) (*http.Response, error) {
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer test-pass")
+	return http.DefaultClient.Do(request)
 }
