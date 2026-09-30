@@ -31,8 +31,10 @@ const (
 	// was #394, the Lima vz bridge-bind defect, until that was fixed; the
 	// attempts now die on #408, the arm64 image-platform disagreement.
 	computerMatrixBlockerIssue = 408
-	// The Linux lane's own standing skip: the complete M3 OCI matrix root result.
-	computerMatrixLinuxSkipIssue = 157
+	// The Linux lane's own standing skip: no lane yet drives a Computer-submitted
+	// root Run to its execution result. #157 closed without publishing one, so
+	// the open Computer matrix ticket owns it.
+	computerMatrixLinuxSkipIssue = 196
 )
 
 // computerMatrixBlockedRows need a booted Computer, so the current blocker is
@@ -118,11 +120,11 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 				}
 			})
 
-			t.Run("the Linux standing skip stays owned by #157", func(t *testing.T) {
+			t.Run("the Linux standing skip stays owned by #196", func(t *testing.T) {
 				matrix := assembleComputerMatrix(t, shell, linux, "none", "published-artifact", "github-hosted")
 				row := matrix["rows"].(map[string]any)["linux.guest_authority"].(map[string]any)
 				if row["status"] != "NOT-RUN" || int(row["not_run_issue"].(float64)) != computerMatrixLinuxSkipIssue {
-					t.Fatalf("row = %#v, want the Linux receipt's own #157 skip carried through", row)
+					t.Fatalf("row = %#v, want the Linux receipt's own #196 skip carried through", row)
 				}
 				if strings.TrimSpace(row["reason"].(string)) == "" {
 					t.Fatal("the Linux skip lost its reason on the way into the matrix")
@@ -481,7 +483,7 @@ func conformantLinuxComputerEvidence(t *testing.T) string {
 		guest := rows["linux.guest_authority"].(map[string]any)
 		guest["status"] = "NOT-RUN"
 		guest["not_run_issue"] = computerMatrixLinuxSkipIssue
-		guest["not_run_reason"] = "the complete M3 OCI matrix does not publish the candidate-bound root Run result"
+		guest["not_run_reason"] = "no lane yet drives a Computer-submitted root Run to a root Run execution result"
 	})
 }
 

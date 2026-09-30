@@ -31,7 +31,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
   .candidate_sha == $candidate and
   .image.variant == $image and
   (.candidate_sha | test("^[0-9a-f]{40}$")) and
-  (if $mutated == "" then .status == "NOT-RUN" and .not_run_issue == 157 else .status == "FAIL" end) and
+  (if $mutated == "" then .status == "NOT-RUN" and .not_run_issue == 196 else .status == "FAIL" end) and
   (.image.index_digest | test("^sha256:[0-9a-f]{64}$")) and
   (.image.platform_digest | test("^sha256:[0-9a-f]{64}$")) and
   (.fabric_identities | length >= 2) and
@@ -204,8 +204,8 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.guest_authority"].status == "FAIL"
    else
     .rows["linux.guest_authority"].status == "NOT-RUN" and
-    .rows["linux.guest_authority"].not_run_issue == 157 and
-    (.rows["linux.guest_authority"].not_run_reason | contains("complete M3 OCI matrix")) and
+    .rows["linux.guest_authority"].not_run_issue == 196 and
+    (.rows["linux.guest_authority"].not_run_reason | contains("root Run execution result")) and
     (.rows["linux.guest_authority"].evidence.blocked_assertion | contains("root Run"))
    end) and
   (.rows["linux.removal"].evidence.inventory_source == "helper VerifyNamespaceReadOnly route") and
