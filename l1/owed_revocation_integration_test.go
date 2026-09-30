@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
 
 // outageLedger is a run ledger for one Computer that can be taken down (it
@@ -760,24 +762,43 @@ func TestOwedRevocationWriteBudgetAdmitsOnlyAFullLockWait(t *testing.T) {
 // however a settlement pass ends -- against a held lock, out of budget, or
 // canceled mid-write when the agent drops the heartbeat -- every connection
 // of L1's main pool keeps waiting sqliteBusyTimeout on SQLite's write lock,
-// and only the settlement handle waits owedRevocationWriteWait.
+// and only the settlement handle waits owedRevocationWriteWait. The store is
+// never served: holding the main pool or its write lock would otherwise
+// starve L1's reconcile loop, which stops the server.
 func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
-	h, _, node, _ := computerCompletionHarness(t)
-	newOutageLedger(h)
 	ctx := t.Context()
-	tx, err := h.store.db.BeginTx(ctx, nil)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{
+		Clock: &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	server, err := NewServer(plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "control-plane"}), store, ServerConfig{
+		ComputerTokenRevoker: recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+			return contract.ComputerTokenRevocationReceipt{}, errors.New("the run ledger is down")
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.logf = nil
+	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := recordOwedComputerRevocation(ctx, tx, owedRevocationRecord{computerID: "computer-pool",
-		hostNodeID: node.NodeID, verb: ComputerRevocationVerbStop, reason: "computer_stopped",
-		holdingAttempts: []string{"attempt-pool"}}, h.clock.Now()); err != nil {
+		hostNodeID: "node-pool", verb: ComputerRevocationVerbStop, reason: "computer_stopped",
+		holdingAttempts: []string{"attempt-pool"}}, store.clock.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := h.store.listNodeOwedComputerRevocations(ctx, node.NodeID, MaxOwedRevocationsPerHeartbeat)
+	rows, err := store.listNodeOwedComputerRevocations(ctx, "node-pool", MaxOwedRevocationsPerHeartbeat)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("owed rows = %d err=%v", len(rows), err)
 	}
@@ -789,10 +810,10 @@ func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
 			time.Sleep(time.Duration(pass%200) * time.Microsecond)
 			cancel()
 		}()
-		h.server.recordOwedRevocationSettlements(passContext, settlements, answers)
+		server.recordOwedRevocationSettlements(passContext, settlements, answers)
 		cancel()
 	}
-	lock, err := h.store.db.Conn(ctx)
+	lock, err := store.db.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +821,7 @@ func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	passContext, cancel := context.WithTimeout(context.Background(), 2*owedRevocationWriteWait)
-	h.server.recordOwedRevocationSettlements(passContext, settlements, answers)
+	server.recordOwedRevocationSettlements(passContext, settlements, answers)
 	cancel()
 
 	// Every main-pool connection, held at once so none is reused.
@@ -816,7 +837,7 @@ func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
 	}
 	conns := []*sql.Conn{}
 	for range 15 {
-		conn, err := h.store.db.Conn(ctx)
+		conn, err := store.db.Conn(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -828,21 +849,26 @@ func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
 	for _, conn := range conns {
 		conn.Close()
 	}
-	if wait := busyTimeout(h.store.settlementDB); wait != owedRevocationWriteWait {
+	if wait := busyTimeout(store.settlementDB); wait != owedRevocationWriteWait {
 		t.Fatalf("the settlement handle waits %s, want %s", wait, owedRevocationWriteWait)
 	}
 
 	// And behaviourally: an unrelated main-pool write outlasts a lock held
 	// well past the settlement wait.
 	const held = 3 * owedRevocationWriteWait
+	released := make(chan error, 1)
 	go func() {
 		time.Sleep(held)
-		_, _ = lock.ExecContext(context.Background(), `ROLLBACK`)
+		_, err := lock.ExecContext(context.Background(), `ROLLBACK`)
 		lock.Close()
+		released <- err
 	}()
 	started := time.Now()
-	if _, err := h.store.db.ExecContext(ctx, `UPDATE computer_owed_revocations SET last_failure='' WHERE revocation_id=?`,
+	if _, err := store.db.ExecContext(ctx, `UPDATE computer_owed_revocations SET last_failure='' WHERE revocation_id=?`,
 		rows[0].owed.RevocationID); err != nil {
 		t.Fatalf("an unrelated main-pool write failed after %s against a lock held %s: %v", time.Since(started), held, err)
+	}
+	if err := <-released; err != nil {
+		t.Fatal(err)
 	}
 }
