@@ -33,7 +33,9 @@ func TestL1SerializedTransientDispatchRetries(t *testing.T) {
 	}
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "authority"})
-	callerFabric := network.NewFabric(fabric.Identity{NodeID: "ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
+	// The caller is the ledger L1 trusts by default: every run it dispatches
+	// names its run, which only the run ledger may do (wefty #583).
+	callerFabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
 	server, err := l1.NewServer(serverFabric, authority, l1.ServerConfig{})
 	if err != nil {
 		t.Fatal(err)

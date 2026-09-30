@@ -428,7 +428,8 @@ func validJobSpec(dispatchKey string, tags []string) contract.JobSpec {
 
 func TestL1AcceptsOCIForCapabilityAwareClaiming(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
-	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	// The run ledger: the one root submitter entitled to name a run (#583).
+	client := h.client(fabric.Identity{NodeID: "run-ledger", Tags: []string{DefaultClientPrincipalTag}})
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "oci-contract",
@@ -463,7 +464,9 @@ func TestL1AcceptsOCIForCapabilityAwareClaiming(t *testing.T) {
 // only it: every shape that can run without a run identity is still accepted.
 func TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
-	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	// It submits as the run ledger, the one root submitter entitled to name a
+	// run (wefty #583), so what is refused here is only what is missing.
+	client := h.client(fabric.Identity{NodeID: "run-ledger", Tags: []string{DefaultClientPrincipalTag}})
 	ociOneShot := func(dispatchKey string, labels map[string]string) contract.JobSpec {
 		return contract.JobSpec{
 			SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey,

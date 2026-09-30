@@ -37,6 +37,7 @@ const (
 	ErrorComputerResourceRequired    ErrorCode = "computer_resource_required"
 	ErrorComputerTraitRequired       ErrorCode = "computer_trait_required"
 	ErrorRunIdentityRequired         ErrorCode = "run_identity_required"
+	ErrorRunIdentityNotEntitled      ErrorCode = "run_identity_not_entitled"
 	ErrorPersonIdentityRequired      ErrorCode = "person_identity_required"
 	ErrorAdminRequired               ErrorCode = "admin_required"
 	ErrorAdminBootstrapInvalid       ErrorCode = "admin_bootstrap_invalid"

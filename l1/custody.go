@@ -628,6 +628,11 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return ComputerCustodyImport{}, false, internalError(replayErr, "read Custody import replay")
 	}
+	// The manifest is the caller's, digest and all, so its Job specification
+	// is checked as a Computer creation's is (wefty #583), after replay.
+	if err := refuseComputerRunIdentity(manifest.JobSpec); err != nil {
+		return ComputerCustodyImport{}, false, err
+	}
 	var rootID string
 	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, request.NodeID).Scan(&rootID); errors.Is(err, sql.ErrNoRows) {
 		return ComputerCustodyImport{}, false, protocolError(contract.ErrorNotFound, "destination Node %q was not found", request.NodeID)

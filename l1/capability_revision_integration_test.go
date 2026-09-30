@@ -54,7 +54,7 @@ func assertCapabilityRevisionProtocol(t *testing.T) {
 		node.CapabilityReasonCode != contract.CapabilityReasonProbeFailed || !node.CapabilityObservedAt.Equal(observedAt.Add(time.Second)) {
 		t.Fatalf("withdrawn capability state = %#v", node)
 	}
-	job, _, err := h.store.CreateJob(ctx, capabilityJobSpec("revisioned-oci", contract.JobKindOCI, contract.JobClassOneShot, "", nil))
+	job, _, err := h.store.CreateJobAs(ctx, capabilityJobSpec("revisioned-oci", contract.JobKindOCI, contract.JobClassOneShot, "", nil), runLedgerOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
