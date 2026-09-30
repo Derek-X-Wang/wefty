@@ -320,7 +320,10 @@ stop is not a startup-recovery completion barrier; the safety guarantee is that
 recovery re-suppresses the row before publication.
 
 The suppression lock order is completion-gate read side, then the spool's sole
-database connection. The database transaction, including any retention
+synchronous=FULL database connection. Output-event appends use a second,
+synchronous=NORMAL connection and take no lock the suppression path holds, so
+they wait at most SQLite's 5 s busy timeout for the FULL connection's write
+transaction and never form a cycle with it. The database transaction, including any retention
 compaction, uses the lesser of the configured agent operation timeout (ten
 seconds by default) and the OCI control server's 10m5s response-drain budget,
 and retries only within that window. Database connection contention therefore

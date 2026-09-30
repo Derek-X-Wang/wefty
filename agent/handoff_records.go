@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 )
 
 // A retained run's authority lives here, on the agent's side of the boundary,
@@ -223,7 +224,7 @@ func (m *handoffManager) recordUpload(runID, nodeID, attemptID string, result at
 		Uploaded: len(result.document) > 0 && result.skip == "",
 		Reason:   result.skip, At: m.now().UTC(),
 	}
-	return writeStateDocument(m.uploadRecordRoot(), recordComponent(runID), record)
+	return writeStateDocument(m.stateRoot, uploadRecordDirectoryName, recordComponent(runID), record)
 }
 
 // readUploadRecord reads one run's upload outcome back. Nothing in the agent
@@ -461,14 +462,20 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 	// able to produce. Either way the record standing there is deletion
 	// authority over some other run's directory, and overwriting it would take
 	// that run's expiry away silently.
-	if standing, err := m.readRecord(m.recordPath(record.RunID)); err == nil &&
-		standing.RunID != "" && standing.RunID != record.RunID {
+	standing, err := m.readRecord(m.recordPath(record.RunID))
+	if errors.Is(err, errRecordUnidentifiable) {
+		m.log("agent: refuse to write run %s's retention record: %q holds a record this agent cannot identify (%v); it may be another run's, so it is left as it is and this run is not recorded",
+			record.RunID, m.recordPath(record.RunID), err)
+		return fmt.Errorf("%w: %q holds a record this agent cannot identify: %w",
+			errRecordBelongsToAnotherRun, m.recordPath(record.RunID), err)
+	}
+	if err == nil && standing.RunID != "" && standing.RunID != record.RunID {
 		m.log("agent: refuse to write run %s's retention record: %q already belongs to run %q; that run keeps its own expiry and this one is not recorded",
 			record.RunID, m.recordPath(record.RunID), standing.RunID)
 		return fmt.Errorf("%w: %q belongs to run %q, not %q",
 			errRecordBelongsToAnotherRun, m.recordPath(record.RunID), standing.RunID, record.RunID)
 	}
-	if err := writeStateDocument(m.recordRoot(), recordComponent(record.RunID), record); err != nil {
+	if err := writeStateDocument(m.stateRoot, retentionRecordDirectoryName, recordComponent(record.RunID), record); err != nil {
 		return err
 	}
 	// A record that arrived under the old name is now at the new one. Leaving
@@ -486,35 +493,35 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 	return nil
 }
 
-// writeStateDocument writes one small agent-owned JSON document by
-// write-then-rename. The staging name is removed first rather than truncated,
-// so a name that is anything but the file the agent expects is replaced rather
-// than written through.
-func writeStateDocument(root, name string, value any) error {
-	if err := os.MkdirAll(root, 0o700); err != nil {
+// writeStateDocument writes one small agent-owned JSON document durably:
+// staged, synced, renamed over the name, and the directory synced. A record
+// torn by power loss is one loadRecords skips and adoption must repair, so the
+// name holds the old document or the new one and never a partial one (#599).
+// The staging name is removed first rather than truncated, so a name that is
+// anything but the file the agent expects is replaced rather than written
+// through.
+//
+// The document lives in stateRoot/subdirectory. stateRoot is the configured
+// state root, the base whose entry and everything below it are made durable
+// once per process; nothing above it is touched.
+func writeStateDocument(stateRoot, subdirectory, name string, value any) error {
+	root := filepath.Join(stateRoot, subdirectory)
+	if err := durable.MkdirAll(stateRoot, subdirectory, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", root, err)
 	}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("encode agent state document: %w", err)
 	}
-	path := filepath.Join(root, name)
-	staging := path + ".tmp"
-	if err := os.Remove(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	file, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	directory, err := os.OpenRoot(root)
 	if err != nil {
+		return fmt.Errorf("open %s: %w", root, err)
+	}
+	defer directory.Close()
+	if err := durable.WriteFile(directory, name, payload, 0o600); err != nil {
 		return fmt.Errorf("write agent state document: %w", err)
 	}
-	if _, err := file.Write(payload); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return os.Rename(staging, path)
+	return nil
 }
 
 // removeRecord drops both names a run's record can be under. Removing only the
@@ -605,10 +612,25 @@ func (m *handoffManager) readRecord(path string) (retentionRecord, error) {
 	}
 	var record retentionRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
-		return retentionRecord{}, err
+		var syntax *json.SyntaxError
+		if len(payload) == 0 || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &syntax) {
+			return retentionRecord{}, fmt.Errorf("%w: %w", errRecordTorn, err)
+		}
+		return retentionRecord{}, fmt.Errorf("%w: %w", errRecordUnidentifiable, err)
 	}
 	return record, nil
 }
+
+// errRecordTorn is a regular record file whose bytes are not JSON at all --
+// empty, or cut short -- which is what power loss leaves of a record an agent
+// that did not sync its writes was replacing. It names no run.
+var errRecordTorn = errors.New("retention record is torn")
+
+// errRecordUnidentifiable is a record file holding well-formed JSON that does
+// not decode as a record -- a field of the wrong type, a timestamp that does
+// not parse. That is not a tear: it may be another run's record from an agent
+// that wrote it differently, so no writer replaces it.
+var errRecordUnidentifiable = errors.New("retention record is well-formed JSON but not a record this agent can identify")
 
 // readStateDocument reads one small agent-owned JSON document. It refuses
 // anything that is not a regular file, never follows a link, opens

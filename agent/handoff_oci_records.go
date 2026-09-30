@@ -142,7 +142,7 @@ func (m *handoffManager) admitOCIHandoff(lease *handoffLease, spec contract.JobS
 	if !m.holdsOCIHandoffLease(lease, ownerKey) {
 		return errors.New("admitting an OCI handoff volume requires that volume's lease")
 	}
-	return writeStateDocument(m.ociRecordRoot(), recordComponent(ownerKey), ociHandoffRecord{
+	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), ociHandoffRecord{
 		OwnerKey: ownerKey, NodeID: strings.TrimSpace(nodeID),
 		RunID: strings.TrimSpace(spec.Labels["run_id"]), AttemptID: strings.TrimSpace(attemptID),
 		AdmittedAt: m.now().UTC(),
@@ -192,7 +192,7 @@ func (m *handoffManager) finishOCIHandoff(spec contract.JobSpec, nodeID, attempt
 	}
 	record.RetainedAt = m.now().UTC()
 	record.Succeeded, record.Published = succeeded, published
-	return writeStateDocument(m.ociRecordRoot(), recordComponent(ownerKey), record)
+	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), record)
 }
 
 // noteOCIHandoffUpload binds the result upload's outcome to the attempt that
@@ -211,7 +211,7 @@ func (m *handoffManager) noteOCIHandoffUpload(ownerKey, attemptID string, upload
 		return nil
 	}
 	record.Uploaded = true
-	return writeStateDocument(m.ociRecordRoot(), recordComponent(ownerKey), record)
+	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), record)
 }
 
 func (m *handoffManager) readOCIRecord(ownerKey string) (ociHandoffRecord, bool, error) {
@@ -338,7 +338,7 @@ func (m *handoffManager) reconcileOCIAdmissions() {
 			upload.AttemptID == record.AttemptID && upload.Uploaded {
 			record.Uploaded = true
 		}
-		if err := writeStateDocument(m.ociRecordRoot(), recordComponent(record.OwnerKey), record); err != nil {
+		if err := writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(record.OwnerKey), record); err != nil {
 			m.log("agent: reconcile the OCI handoff admission for run %s: %v", record.OwnerKey, err)
 			continue
 		}

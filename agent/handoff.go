@@ -15,11 +15,15 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 const (
 	handoffMarkerName = ".wefty-handoff.json"
+	// handoffMarkerStagingName is where writeHandoffMarker stages a marker
+	// before renaming it into place.
+	handoffMarkerStagingName = handoffMarkerName + durable.StagingSuffix
 	// handoffResultName is the one file the per-run bound will not drop. It is
 	// the contract's name for a run's result document.
 	handoffResultName = "result.json"
@@ -351,12 +355,13 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 			errUnmanagedHandoffDirectory, path, managed)
 	}
 	runID := handoffOwnerRunID(spec)
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
-	if err := root.Mkdir(runID, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+	// Durable: the record written below names this directory.
+	if err := durable.Mkdir(root, runID, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, err
 	}
 	run, err := openHandoffDirectory(root, runID)
@@ -535,7 +540,7 @@ func (m *handoffManager) pinnedDirectoryDrift(owner *handoffOwnership, runID, pa
 		m.log("agent: run %s: %q was prepared without a recorded identity; the per-run bound is not applied", runID, path)
 		return handoffBoundDirectoryUnverifiable
 	}
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		m.log("agent: run %s: open the handoff root to check %q before trimming: %v", runID, path, err)
 		return handoffBoundDirectoryUnverifiable
@@ -634,12 +639,28 @@ func (m *handoffManager) openRun(runID string) (*os.Root, error) {
 	if !validRunMailboxSegment(runID) {
 		return nil, errors.New("handoff run ID must be one safe component")
 	}
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
 	return openHandoffDirectory(root, runID)
+}
+
+// openHandoffRoot opens this node's handoff root and makes its entry durable
+// once per process: the records and markers under it are durable, and so must
+// be the directory they live in. Startup's adoption pass is the first caller,
+// so the root's entry is synced before any run is prepared.
+func (m *handoffManager) openHandoffRoot() (*os.Root, error) {
+	root, err := openPrivateHandoffDirectory(m.root)
+	if err != nil {
+		return nil, err
+	}
+	if err := durable.MkdirAll(m.root, "", 0o700); err != nil {
+		root.Close()
+		return nil, fmt.Errorf("make handoff root %q durable: %w", m.root, err)
+	}
+	return root, nil
 }
 
 // openPrivateHandoffDirectory anchors the configured directory in its trusted
@@ -761,7 +782,7 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 func (m *handoffManager) collect() error {
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return err
 	}
@@ -1190,7 +1211,9 @@ func handoffHasFiles(run *os.Root) (bool, error) {
 		return false, fmt.Errorf("read handoff directory: %w", err)
 	}
 	for _, entry := range entries {
-		if entry.Name() != handoffMarkerName {
+		// A marker write that crashed before its rename leaves its staging
+		// file; it is the agent's own, and the next marker write replaces it.
+		if name := entry.Name(); name != handoffMarkerName && name != handoffMarkerStagingName {
 			return true, nil
 		}
 	}
@@ -1250,21 +1273,19 @@ func readHandoffMarker(run *os.Root) (handoffMarker, bool, error) {
 
 // writeHandoffMarker replaces the name rather than writing through it, so a
 // link planted there is destroyed instead of truncating its target.
+//
+// The replacement is one rename of a synced staging file, followed by a sync
+// of the run directory. Deleting the old marker and then creating the new one
+// left a window with no marker at all, and a crash in it made the next
+// preparation refuse the directory as unmanaged until retention expired
+// (#599).
 func writeHandoffMarker(run *os.Root, marker handoffMarker) error {
 	payload, err := json.Marshal(marker)
 	if err != nil {
 		return fmt.Errorf("encode handoff marker: %w", err)
 	}
-	if err := run.Remove(handoffMarkerName); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("replace handoff marker: %w", err)
-	}
-	file, err := openHandoffFile(run, handoffMarkerName, os.O_WRONLY|os.O_CREATE|os.O_EXCL|noFollowOpenFlag, 0o600)
-	if err != nil {
+	if err := durable.WriteFile(run, handoffMarkerName, payload, 0o600); err != nil {
 		return fmt.Errorf("write handoff marker: %w", err)
 	}
-	if _, err := file.Write(payload); err != nil {
-		file.Close()
-		return fmt.Errorf("write handoff marker: %w", err)
-	}
-	return file.Close()
+	return nil
 }
