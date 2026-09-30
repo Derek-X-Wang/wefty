@@ -33,6 +33,7 @@ detection, which is on by default from 22.7. An older Node fails with
 | `package.json` | the build: esbuild bundles `src/{{.Name}}.ts` to `dist/{{.Name}}.mjs` |
 | `package-lock.json` | the pinned toolchain (esbuild, TypeScript, Node types) |
 | `tsconfig.json` | strict type checking; `npm run typecheck` |
+| `params.json` | the params the submit command below sends |
 | `{{.TestFile}}` | runs the built bundle the way a node does and asserts the four events |
 
 The workflow depends on no package at run time. The writer at the top of
@@ -88,7 +89,8 @@ wefty results <run_id>            # the result document
 it a job that exits 0 having reported nothing still looks like a success, which
 is the one failure this whole reporting shape exists to prevent.
 
-`params.json` is an ordinary JSON object; this starter reads `subject`:
+`params.json` is an ordinary JSON object, scaffolded next to this README; this
+starter reads `subject`:
 
 ```json
 {"subject": "wefty"}

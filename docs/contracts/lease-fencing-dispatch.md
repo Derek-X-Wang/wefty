@@ -264,8 +264,9 @@ back to `alive`, while a dead node must register its boot session again.
 `POST /v1/agent/nodes/{node_id}/drain` changes an alive or stale boot session
 to `draining` idempotently. Draining nodes continue heartbeating and retain
 authority for attempts they already own, but cannot claim another job. On
-SIGINT or SIGTERM the agent invokes this verb and waits up to 30 seconds for
-its claim loops to finish the resident attempts they are already waiting on. A
+SIGINT or SIGTERM the agent invokes this verb, bounded at 30 seconds, and then
+waits for its claim loops to finish the resident attempts they are already
+waiting on, which is bounded only by each attempt's max runtime. A
 second signal forces cancellation during that wait and emits typed
 `forced_shutdown` evidence; a single signal continues to prove graceful drain
 to completion. This is only

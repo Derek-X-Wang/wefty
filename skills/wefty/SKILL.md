@@ -50,8 +50,10 @@ them to fix it. Single-machine setup is in
 
 Every CLI call that reaches the cluster needs the endpoints:
 `--l1=<host:port> --l3=<host:port>` (plain fabric) — or the tsnet flags on a
-fleet. Set them once per shell; `status` prints the ones it resolved, which is
-how you check you set them right. `wefty run ...` and `wefty workflow init` are
+fleet. Set them once per shell: `export WEFTY_L1_ADDR=<host:port>
+WEFTY_L3_ADDR=<host:port>` makes them the defaults, and a flag still wins.
+`status` prints the ones it resolved, which is how you check you set them
+right. `wefty run ...` and `wefty workflow init` are
 the exceptions: they only write files, so they need no endpoint, no identity and
 no credential — see "Reporting from a workflow".
 
@@ -102,11 +104,14 @@ Each of those proves something different, and the difference matters:
 | Exit | Meaning |
 | --- | --- |
 | 0 | the run succeeded |
-| 10 | the run reached a terminal state that is not success |
+| 10 | the run reached a terminal state that is not success; stderr names why in one line (exit code, signal, refused dispatch, or the ledger gate such as a missing required envelope) |
 | 11 | `--timeout` elapsed while the run was still going |
 
 - `--tag` routes by subset matching: the job runs on a node carrying ALL its
-  tags. Use a node-reserved tag (`wefty:node:<id>`) to pin.
+  tags. Use a node-reserved tag (`wefty:node:<id>`) to pin. When no alive node
+  matches, `submit` still accepts the run but warns (stderr, and `warnings` in
+  `--json`); the run stays queued until a matching node joins, so treat the
+  warning as a wrong tag unless you expect that node.
 - `--required-envelope`: exit 0 without an envelope fails the run — use for
   agent workflows so "process exited" never masquerades as "step succeeded".
 - Always guard the pipeline: `set -o pipefail` and `jq -er '.run_id'`.
