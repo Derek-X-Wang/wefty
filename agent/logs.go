@@ -98,6 +98,15 @@ func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, spo
 }
 
 func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.LogEvent) error {
+	// Every event reaching the spool carries a real wall time. A zero one
+	// has no nanosecond encoding: it would be spooled as a date in 1754,
+	// pass L1's missing-timestamp check, and be evicted by the next
+	// age-retention sweep moments after it was acknowledged. This is the
+	// only way into the spool (the late-event retry re-appends the event it
+	// is handed from here), so stamping here covers every path.
+	if event.Timestamp.IsZero() {
+		event.Timestamp = wallNow(sink.clock).UTC()
+	}
 	select {
 	case <-sink.done:
 		return sink.err()

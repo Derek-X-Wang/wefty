@@ -2224,6 +2224,72 @@ func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
 	}
 }
 
+// A workload runtime that hands the agent an event without a timestamp must
+// not lose it to L1's age retention. Before the sink stamped it, the unset
+// time was spooled as a date in 1754, acknowledged by L1, and evicted by the
+// next reconcile sweep: a read racing the one-second tick saw no logs (#163).
+func TestUnstampedLogEventSurvivesTheRetentionSweep(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	job := createAgentTestJob(t, store, "unstamped-log-event")
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:     map[string]bool{"kind:process": true},
+		WorkloadRuntimes: testRuntimeSet(unstampedLogRunner{}), LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	if _, err := waitForFailureJobState(store, job.JobID, contract.JobSucceeded, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("agent shutdown = %v", err)
+	}
+	before := time.Now().Add(-time.Minute)
+	// The sweep the server would run within a second, run now.
+	if _, err := store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.GetJobLogs(t.Context(), job.JobID, "", l1.MaxLogPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "unstamped evidence\n" {
+		t.Fatalf("logs after the retention sweep = %#v, want the one unstamped event", page.Events)
+	}
+	if stamped := page.Events[0].Timestamp; stamped.Before(before) || stamped.After(time.Now()) {
+		t.Fatalf("event timestamp = %s, want the agent's wall clock at spool time", stamped)
+	}
+}
+
+// unstampedLogRunner writes one event without a timestamp, as a runtime
+// that forgets to stamp would, and exits zero. The line is terminated so the
+// credential redactor emits it whole.
+type unstampedLogRunner struct{}
+
+func (unstampedLogRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("unstamped evidence\n"),
+	}); err != nil {
+		return contract.ProcessResult{}, err
+	}
+	exitCode := 0
+	return contract.ProcessResult{ExitCode: &exitCode}, nil
+}
+
 func TestFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 	assertFinalizationTimeoutStartsAfterServicePayloadStops(t)
 }
@@ -3448,7 +3514,7 @@ func (runner *finalizationAnchorRunner) Run(ctx context.Context, request process
 	case <-runner.killed:
 	}
 	if err := sink.WriteOutput(ctx, contract.LogEvent{
-		AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("final service event"),
+		AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Timestamp: time.Now().UTC(), Bytes: []byte("final service event"),
 	}); err != nil {
 		return contract.ProcessResult{}, err
 	}
