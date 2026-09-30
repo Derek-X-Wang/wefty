@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -71,10 +72,18 @@ type logSpool struct {
 	// db is the synchronous=FULL handle: every write L1 or recovery relies
 	// on. appendDB is the synchronous=NORMAL handle for output-event appends
 	// only; see logSpoolDSN.
-	db              *sql.DB
-	appendDB        *sql.DB
-	maxOneShotBytes int64
-	maxServiceBytes int64
+	db       *sql.DB
+	appendDB *sql.DB
+	// barrierMu guards durableThroughOrdinal: every event with an ordinal at
+	// or below it is covered by a FULL commit this process made, so an upload
+	// batch that ends there needs no new barrier. It starts at zero in every
+	// process, so the first batch after a restart always pays one.
+	barrierMu             sync.Mutex
+	durableThroughOrdinal int64
+	// durabilityBarriers counts barrier commits, for tests.
+	durabilityBarriers atomic.Int64
+	maxOneShotBytes    int64
+	maxServiceBytes    int64
 	// appendCheckpoint is a test-only scheduling seam for contention before a
 	// durable append transaction; production construction always leaves it nil.
 	appendCheckpoint func(context.Context)
@@ -327,6 +336,10 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	  operation_revision INTEGER NOT NULL,
 	  cleanup_fence TEXT NOT NULL,
 	  acknowledged_ns INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS spool_durability_barrier (
+	  id INTEGER PRIMARY KEY CHECK(id = 1),
+	  commits INTEGER NOT NULL
 	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
@@ -1054,7 +1067,46 @@ FROM spool_events WHERE attempt_id=? ORDER BY ordinal LIMIT ?`, attemptID, limit
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("agent: iterate pending log spool: %w", err)
 	}
+	// Release the spool's one FULL connection before the barrier needs it.
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("agent: close pending log spool: %w", err)
+	}
+	if len(events) != 0 {
+		if err := spool.durabilityBarrier(ctx, events[len(events)-1].ordinal); err != nil {
+			return nil, err
+		}
+	}
 	return events, nil
+}
+
+// durabilityBarrier makes every event read so far durable before any of it
+// leaves the agent: L1 never holds an event the spool could lose (#599).
+//
+// Output appends commit on the NORMAL handle without a sync, so an event read
+// here may still be only in the page cache. Uploading it and then losing it
+// to power loss would put the spool's high water behind L1's, and the next
+// append at that sequence -- a loss or lifecycle event after restart -- would
+// be an idempotency conflict that never clears. So pendingBatch, the one read
+// both upload paths (the live sink and evidence recovery) go through, ends in
+// one FULL commit after its read: the WAL is append-only, so that commit's
+// sync persists every frame committed before it, which is every event read.
+// That is one full sync per upload batch, not per event, and none for a batch
+// an earlier barrier in this process already covered (a retried batch).
+func (spool *logSpool) durabilityBarrier(ctx context.Context, throughOrdinal int64) error {
+	spool.barrierMu.Lock()
+	defer spool.barrierMu.Unlock()
+	if throughOrdinal <= spool.durableThroughOrdinal {
+		return nil
+	}
+	// A commit that changes nothing writes no WAL frame and syncs nothing, so
+	// the barrier really writes: one counter row on the FULL handle.
+	if _, err := spool.db.ExecContext(ctx, `INSERT INTO spool_durability_barrier(id, commits) VALUES(1, 1)
+ON CONFLICT(id) DO UPDATE SET commits=commits+1`); err != nil {
+		return wrapLogSpoolContextError(ctx, "agent: commit log spool durability barrier", err)
+	}
+	spool.durableThroughOrdinal = throughOrdinal
+	spool.durabilityBarriers.Add(1)
+	return nil
 }
 
 func (spool *logSpool) acknowledge(ctx context.Context, attemptID string, acknowledged map[contract.LogStream]uint64) error {

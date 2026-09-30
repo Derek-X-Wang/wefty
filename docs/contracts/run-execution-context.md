@@ -289,7 +289,12 @@ synchronous=FULL connection. The WAL is one append-only file, so the sync
 behind any FULL commit also makes every earlier appended output durable: power
 loss can lose only output appended after the last FULL commit or checkpoint,
 whose acknowledgement the spool had therefore not yet recorded, never a
-completion, and never output that precedes a record that survived. L1's authority instance
+completion, and never output that precedes a record that survived. L1 never
+holds an event the spool could lose: every upload batch, from the live sink or
+from evidence recovery, is read and then covered by one FULL commit before it
+leaves the agent, so power loss cannot put the spool's high water behind L1's
+and make a later append at the same sequence conflict. That is one full sync
+per upload batch, not per event. L1's authority instance
 identity file is published whole, synced, by a link that never replaces, so two
 racing first boots agree on one identity and power loss leaves either no file
 or the whole identity; an empty file an older L1 left is treated as a first
