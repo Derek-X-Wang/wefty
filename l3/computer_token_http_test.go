@@ -37,6 +37,10 @@ type controlledComputerGrantVerifier struct {
 	blocked      chan struct{}
 	release      chan struct{}
 	transientErr error
+	// proofAtRelease makes the blocked call answer with the proof as it is
+	// when released (the pause is before L1 answers), not as it was when
+	// the call arrived (the pause is after L1 answered).
+	proofAtRelease bool
 }
 
 func (verifier *controlledComputerGrantVerifier) ProveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error) {
@@ -51,6 +55,11 @@ func (verifier *controlledComputerGrantVerifier) ProveComputerTokenScope(context
 	if block {
 		close(blocked)
 		<-release
+		if verifier.proofAtRelease {
+			verifier.mu.Lock()
+			proof = verifier.proof
+			verifier.mu.Unlock()
+		}
 	}
 	if err != nil {
 		return ComputerTokenScopeProof{}, err
@@ -591,6 +600,116 @@ func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	if runs != 0 {
 		t.Fatalf("paused submission committed %d Runs after disable", runs)
 	}
+}
+
+// TestComputerRunIsAuthorizedByItsFinalL1Proof pins down the authorization
+// property wefty #600 relies on. L1 commits a submission change before it
+// revokes, and that revocation may land late or never. A Computer Run is
+// authorized by the final live L1 proof L3 takes inside the Run's write
+// transaction, just before the insert. A Run whose final proof follows the
+// change's commit is refused, whether or not any revocation landed. A Run
+// whose final proof preceded the commit may still complete, bounded by that
+// one request; the revision-bound revocation waits for it and then fences the
+// grant, and every later request with the old pass is refused.
+func TestComputerRunIsAuthorizedByItsFinalL1Proof(t *testing.T) {
+	proof := ComputerTokenScopeProof{ComputerID: "computer-committed", ComputerAttemptID: "attempt-committed",
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 4, HostNodeID: "fabric-node-committed", SubmitMaxInflight: 2}
+	advanced := proof
+	advanced.SubmitIntentRevision = 5
+	type response struct {
+		status int
+		body   []byte
+	}
+	// Call 1 is the mint, call 2 the bearer check, call 3 the final proof.
+	submitPausedAtFinalProof := func(t *testing.T, proofAtRelease bool) (*computerHTTPHarness, *controlledComputerGrantVerifier, *http.Client, ComputerTokenGrant, <-chan response) {
+		t.Helper()
+		verifier := &controlledComputerGrantVerifier{proof: proof, blockCall: 3, proofAtRelease: proofAtRelease,
+			blocked: make(chan struct{}), release: make(chan struct{})}
+		h := newComputerHTTPHarness(t, verifier)
+		client := h.client(proof.HostNodeID)
+		old := mintComputerHTTPToken(t, h, client, proof)
+		result := make(chan response, 1)
+		go func() {
+			status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", old.Token, "final-proof", computerHTTPRunRequest("exit 0\n"))
+			result <- response{status: status, body: body}
+		}()
+		select {
+		case <-verifier.blocked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the Run never reached its final L1 proof")
+		}
+		return h, verifier, client, old, result
+	}
+	commit := func(verifier *controlledComputerGrantVerifier) {
+		verifier.mu.Lock()
+		verifier.proof = advanced
+		verifier.mu.Unlock()
+	}
+	runs := func(t *testing.T, h *computerHTTPHarness) int {
+		t.Helper()
+		var count int
+		if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM run_triggers WHERE computer_id=?`, proof.ComputerID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	t.Run("a final proof after the change commits refuses the Run", func(t *testing.T) {
+		h, verifier, client, old, result := submitPausedAtFinalProof(t, true)
+		commit(verifier) // L1 commits revision 5; no revocation reaches L3.
+		close(verifier.release)
+		if got := <-result; got.status != http.StatusUnauthorized {
+			t.Fatalf("a Run whose final proof followed the commit: status=%d body=%s", got.status, got.body)
+		}
+		for _, request := range []struct {
+			method, path string
+			body         any
+		}{{http.MethodGet, "/v1/computer/self", nil}, {http.MethodPost, "/v1/runs", computerHTTPRunRequest("exit 0\n")}} {
+			status, _, body := doComputerHTTP(t, client, request.method, request.path, old.Token, "after-commit", request.body)
+			if status != http.StatusUnauthorized {
+				t.Fatalf("unrevoked old pass %s %s status=%d body=%s", request.method, request.path, status, body)
+			}
+		}
+		if count := runs(t, h); count != 0 {
+			t.Fatalf("the old pass committed %d Runs after the change", count)
+		}
+		// The agent re-mints at the new revision, and the revision-bound
+		// revocation that lands afterwards spares that pass.
+		current := mintComputerHTTPToken(t, h, client, advanced)
+		if _, err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
+			ComputerID: proof.ComputerID, SubmitIntentRevision: advanced.SubmitIntentRevision, Reason: "submission_intent_advanced"}); err != nil {
+			t.Fatal(err)
+		}
+		status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", current.Token, "re-minted", computerHTTPRunRequest("exit 0\n"))
+		if status != http.StatusCreated {
+			t.Fatalf("the revision-bound revocation ended the re-minted pass: status=%d body=%s", status, body)
+		}
+	})
+
+	t.Run("a final proof before the change commits lets that one Run complete", func(t *testing.T) {
+		h, verifier, client, old, result := submitPausedAtFinalProof(t, false)
+		commit(verifier) // L1 commits revision 5 after the Run's final proof.
+		revoked := make(chan error, 1)
+		go func() {
+			_, err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
+				ComputerID: proof.ComputerID, SubmitIntentRevision: advanced.SubmitIntentRevision, Reason: "submission_intent_advanced"})
+			revoked <- err
+		}()
+		close(verifier.release)
+		if got := <-result; got.status != http.StatusCreated {
+			t.Fatalf("a Run whose final proof preceded the commit: status=%d body=%s", got.status, got.body)
+		}
+		if err := <-revoked; err != nil {
+			t.Fatal(err)
+		}
+		if count := runs(t, h); count != 1 {
+			t.Fatalf("Runs committed = %d, want exactly the one authorized before the commit", count)
+		}
+		status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", old.Token, "after-revocation", computerHTTPRunRequest("exit 0\n"))
+		if status != http.StatusUnauthorized {
+			t.Fatalf("the old pass submitted again after the change: status=%d body=%s", status, body)
+		}
+	})
 }
 
 func TestComputerTransientScopeProofFailureDoesNotRevokeGrant(t *testing.T) {

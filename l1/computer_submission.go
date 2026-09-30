@@ -42,21 +42,27 @@ type ComputerSubmissionAudit struct {
 // drive CAS mutations without exposing grants or other Computer lifecycle
 // authority through the submission command family.
 type ComputerSubmissionState struct {
-	ComputerID           string                 `json:"computer_id"`
-	SubmitEnabled        bool                   `json:"submit_enabled"`
-	SubmitIntentRevision int64                  `json:"submit_intent_revision"`
-	SubmitMaxInflight    int                    `json:"submit_max_inflight"`
-	InflightCount        int                    `json:"inflight_count"`
-	PolicyRevision       int64                  `json:"policy_revision"`
-	Ready                *bool                  `json:"ready"`
-	Status               string                 `json:"status,omitempty"`
-	PassUnavailable      *contract.SpawnFailure `json:"pass_unavailable,omitempty"`
+	ComputerID           string `json:"computer_id"`
+	SubmitEnabled        bool   `json:"submit_enabled"`
+	SubmitIntentRevision int64  `json:"submit_intent_revision"`
+	SubmitMaxInflight    int    `json:"submit_max_inflight"`
+	// InflightCount is null only in the answer to an applied change whose
+	// run ledger could not be read after the commit.
+	InflightCount   *int                   `json:"inflight_count"`
+	PolicyRevision  int64                  `json:"policy_revision"`
+	Ready           *bool                  `json:"ready"`
+	Status          string                 `json:"status,omitempty"`
+	PassUnavailable *contract.SpawnFailure `json:"pass_unavailable,omitempty"`
 }
 
 type ComputerSubmissionMutationResult struct {
 	ComputerSubmissionState
 	MutationApplied bool                                     `json:"mutation_applied"`
 	Revoked         *contract.ComputerTokenRevocationReceipt `json:"revoked"`
+	// RevocationNotice is set when an applied change's L3 revocation was not
+	// recorded. The change still stands, and L3's live-scope check already
+	// refuses the superseded passes; revoked is then null.
+	RevocationNotice string `json:"revocation_notice,omitempty"`
 }
 
 func projectComputerSubmissionState(computer Computer, policyRevision int64) ComputerSubmissionState {
@@ -157,54 +163,6 @@ func computerSubmissionRequestHash(request ComputerSubmissionRequest) (string, e
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func (s *Store) PrepareComputerSubmissionMutation(ctx context.Context, identity fabric.Identity, computerID string, request ComputerSubmissionRequest) (Computer, bool, bool, error) {
-	if err := validateComputerSubmissionRequest(request); err != nil {
-		return Computer{}, false, false, err
-	}
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
-		return Computer{}, false, false, err
-	}
-	requestHash, err := computerSubmissionRequestHash(request)
-	if err != nil {
-		return Computer{}, false, false, err
-	}
-	computer, err := readComputerAuthority(ctx, s.db, computerID, canonicalTime(s.clock.Now()))
-	if errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
-	}
-	if err != nil {
-		return Computer{}, false, false, internalError(err, "read Computer submission authority")
-	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, false, false, protocolError(contract.ErrorConflict,
-			"Computer submission authority cannot change during reconfiguration")
-	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, false, false, protocolError(contract.ErrorConflict, "removed Computer cannot submit Runs")
-	}
-	var storedHash string
-	if err := s.db.QueryRowContext(ctx, `SELECT request_hash FROM computer_submission_audit
-		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {
-		if storedHash != requestHash {
-			return Computer{}, false, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
-		}
-		return computer, true, false, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, false, internalError(err, "read Computer submission replay")
-	}
-	if computer.SubmitIntentRevision != request.SubmitIntentRevision {
-		return Computer{}, false, false, protocolError(contract.ErrorStalePolicyRevision, "Computer submission revision changed")
-	}
-	var policyRevision int64
-	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policyRevision); err != nil {
-		return Computer{}, false, false, internalError(err, "read admin policy revision")
-	}
-	if err := validatePolicyRevision(policyRevision, request.PolicyRevision); err != nil {
-		return Computer{}, false, false, err
-	}
-	return computer, false, computerSubmissionChanges(computer, request), nil
-}
-
 func computerSubmissionChanges(computer Computer, request ComputerSubmissionRequest) bool {
 	if request.SubmitEnabled != nil {
 		return computer.SubmitEnabled != *request.SubmitEnabled
@@ -212,6 +170,10 @@ func computerSubmissionChanges(computer Computer, request ComputerSubmissionRequ
 	return computer.SubmitMaxInflight != *request.SubmitMaxInflight
 }
 
+// MutateComputerSubmission applies one submission change as a single CAS
+// transaction. It revokes nothing: the route revokes the superseded passes at
+// L3 only after this commits, so a change that loses its CAS leaves the
+// Computer's live pass alone (wefty #600).
 func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Identity, computerID string, request ComputerSubmissionRequest) (Computer, bool, bool, error) {
 	if err := validateComputerSubmissionRequest(request); err != nil {
 		return Computer{}, false, false, err
@@ -229,23 +191,29 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return Computer{}, false, false, err
 	}
-	var storedHash string
-	if err := tx.QueryRowContext(ctx, `SELECT request_hash FROM computer_submission_audit
-		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {
-		if storedHash != requestHash {
-			return Computer{}, false, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
-		}
-		computer, readErr := readComputerAuthority(ctx, tx, computerID, now)
-		return computer, true, false, readErr
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, false, internalError(err, "read Computer submission replay")
-	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
 	if err != nil {
 		return Computer{}, false, false, internalError(err, "read Computer submission authority")
+	}
+	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
+		return Computer{}, false, false, protocolError(contract.ErrorConflict,
+			"Computer submission authority cannot change during reconfiguration")
+	}
+	if computer.DesiredState == contract.ServiceDesiredRemoved {
+		return Computer{}, false, false, protocolError(contract.ErrorConflict, "removed Computer cannot submit Runs")
+	}
+	var storedHash string
+	if err := tx.QueryRowContext(ctx, `SELECT request_hash FROM computer_submission_audit
+		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {
+		if storedHash != requestHash {
+			return Computer{}, false, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
+		}
+		return computer, true, false, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Computer{}, false, false, internalError(err, "read Computer submission replay")
 	}
 	if computer.SubmitIntentRevision != request.SubmitIntentRevision {
 		return Computer{}, false, false, protocolErrorWithDetails(contract.ErrorStalePolicyRevision,

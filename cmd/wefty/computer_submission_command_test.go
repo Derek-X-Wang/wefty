@@ -431,3 +431,81 @@ func computerRunRequest(content string) l3.CreateRunRequest {
 	digest := sha256.Sum256([]byte(content))
 	return l3.CreateRunRequest{InlineScript: &l3.InlineScriptInput{Content: content, SHA256: hex.EncodeToString(digest[:]), Interpreter: []string{"/bin/sh"}}, Params: json.RawMessage(`{}`)}
 }
+
+// downRunLedger answers nothing: no revocation and no inflight count.
+type downRunLedger struct{}
+
+func (downRunLedger) RevokeComputerTokens(context.Context, l1.ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+	return contract.ComputerTokenRevocationReceipt{}, &l1.Error{Code: contract.ErrorRunLedgerUnavailable, Message: "run ledger unreachable"}
+}
+
+func (downRunLedger) CountComputerInflight(context.Context, string) (int, error) {
+	return 0, &l1.Error{Code: contract.ErrorRunLedgerUnavailable, Message: "run ledger unreachable"}
+}
+
+// TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorded
+// covers wefty #600: L1 commits a submission change before it revokes, so a
+// run ledger that is down after the commit leaves the change applied with no
+// revocation and no inflight count. The CLI reports it as applied and warns;
+// it never calls it a failure to retry.
+func TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	network := plain.NewNetwork()
+	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	adminFabric := network.NewFabric(fabric.Identity{NodeID: "admin-device", UserID: "admin-one", DeviceID: "device-one"})
+	l1Store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
+		AllowSelfAssertedPersonIdentities: true, ComputerTokenRevoker: downRunLedger{}, RunLedgerNodeID: "run-ledger",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := controlFabric.Listen("tcp", l3.DefaultL1Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := serveTestServer(ctx, func() error { return l1Server.Serve(ctx, listener) })
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("L1 server: %v", err)
+		}
+		if err := l1Store.Close(); err != nil {
+			t.Errorf("close L1: %v", err)
+		}
+	})
+	clients := mustTestAPIClients(t, adminFabric)
+	defer clients.close()
+	challenge, err := l1Store.InitiateAdminBootstrap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execute(ctx, clients, true, []string{"admin", "bootstrap", challenge.Nonce}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("bootstrap admin: %v", err)
+	}
+	computer, _, err := l1Store.CreateComputer(ctx, l1.CreateComputerRequest{
+		Name: "cli-unrecorded", Spec: cliComputerSpec("computer:cli-unrecorded"), Actor: "acceptance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var human, warning bytes.Buffer
+	if err := execute(ctx, clients, false, []string{"services", "submission", "enable", computer.ComputerID,
+		"--policy-revision", "1", "--submit-intent-revision", "0"}, &human, &warning); err != nil {
+		t.Fatalf("enable with an unrecorded revocation: %v", err)
+	}
+	if !strings.Contains(human.String(), "unknown/20") || !strings.Contains(human.String(), "none") ||
+		!strings.Contains(warning.String(), "warning: the submission change applied, but its L3 revocation was not recorded") ||
+		!strings.Contains(warning.String(), "could not report Computer "+computer.ComputerID+"'s inflight count") {
+		t.Fatalf("human output=%q warning=%q", human.String(), warning.String())
+	}
+	disabled := executeComputerSubmissionJSON(t, ctx, clients, "disable", computer.ComputerID,
+		"--policy-revision", "2", "--submit-intent-revision", "1")
+	if !disabled.MutationApplied || disabled.Revoked != nil || disabled.RevocationNotice == "" || disabled.InflightCount != nil ||
+		disabled.SubmitEnabled || disabled.SubmitIntentRevision != 2 {
+		t.Fatalf("disable with an unrecorded revocation = %#v", disabled)
+	}
+}

@@ -276,7 +276,29 @@ or when the run becomes terminal first. L1 keeps the bearer in the job's spec
 only until the one-shot is terminal with no retry left, and then scrubs it with
 the inline script bytes and the `run_params_json` label (`state-machines.md`).
 L1, L3 and the node agent's spool all open SQLite with `secure_delete`, so a
-cleared or deleted value is zeroed on disk.
+cleared or deleted value is zeroed on disk. Every connection of the three also
+opens with `fullfsync` and `checkpoint_fullfsync` on darwin, where a plain
+fsync leaves a commit in the drive's cache: a commit any of them acknowledged
+survives power loss or a kernel panic, not only a process crash. Linux fsync
+already reaches stable storage and adds nothing. The one exception is the
+agent spool's output-event appends, which commit on a synchronous=NORMAL
+connection so a chatty workload does not pay a full sync per output line.
+Everything L1 or recovery relies on -- attempts, completions,
+acknowledgements, dispositions and removals -- commits on the spool's
+synchronous=FULL connection. The WAL is one append-only file, so the sync
+behind any FULL commit also makes every earlier appended output durable: power
+loss can lose only output appended after the last FULL commit or checkpoint,
+whose acknowledgement the spool had therefore not yet recorded, never a
+completion, and never output that precedes a record that survived. L1 never
+holds an event the spool could lose: every upload batch, from the live sink or
+from evidence recovery, is read and then covered by one FULL commit before it
+leaves the agent, so power loss cannot put the spool's high water behind L1's
+and make a later append at the same sequence conflict. That is one full sync
+per upload batch, not per event. L1's authority instance
+identity file is published whole, synced, by a link that never replaces, so two
+racing first boots agree on one identity and power loss leaves either no file
+or the whole identity; an empty file an older L1 left is treated as a first
+boot that never finished, while any other invalid content still fails startup.
 
 The scope is:
 
@@ -328,8 +350,10 @@ to be running now: desired state `running`, current Job `claimed` or
 own attempt still live on its host. A Computer that is stopping — after stop,
 or after a restart of a running resource latch — is refused even while its old
 attempt drains, and so is one that is reset, reimaged, restoring, removed, or
-whose attempt is terminal. L1 submission-intent mutation revokes older L3
-grants before reporting success.
+whose attempt is terminal. A submission-intent change commits first and
+then revokes the Computer's L3 grants below its new revision; an applied
+change whose revocation the run ledger did not take still reports success,
+with `revoked: null` and `revocation_notice` (#600; see `state-machines.md`).
 
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
@@ -349,7 +373,9 @@ An online grow that fails without failing the job keeps its running attempt
 and returns to `stable`, so its passes stay valid by design and nothing is
 revoked. That revocation is
 defense in depth plus audit, not the gate: the live-scope check above already
-refuses the old passes the moment the mutation commits.
+refuses the old passes at every final L1 proof taken after the mutation
+commits (see `state-machines.md` for the one request whose final proof
+preceded the commit).
 
 Each of those mutations writes the revocation it owes as a row in L1's
 `computer_owed_revocations`, in the mutation's own transaction (#554): the
@@ -408,9 +434,10 @@ ledger answers.
 When L1 cannot reach the run ledger to perform a revocation it says so by
 name: typed `run_ledger_unavailable`, HTTP 503. It is never reported as
 `internal`, because the remedy is a deployment address, not an L1 fix, and a
-scrubbed message hides the only fact that leads to it. Before a submission
-enable or disable commits, the refusal is `retryable: true`: nothing applied,
-and a retry performs both. After an authority-losing Computer mutation
+scrubbed message hides the only fact that leads to it. A control plane
+that names no run ledger refuses a submission change `retryable: true` before
+applying anything. A submission change never refuses over its revocation
+once it has committed: it answers 200 with `revocation_notice` instead. After an authority-losing Computer mutation
 commits, the refusal is `retryable: false`, and its message says that the
 mutation applied, that the explicit revocation is owed and L1 will retry it
 until the run ledger takes it, that the request should not be retried for it,
@@ -421,7 +448,14 @@ that could not re-drive its revocation says that the revocation was not
 recorded. The owed row above is the durable record. The node heartbeat is the
 one surface that does not refuse: a pre-restore revocation the run ledger will
 not take is left owed and re-listed next pass, and only that Computer's
-restore directive is withheld. The heartbeat asks for all owed pre-restore
+restore directive is withheld. Recording the run ledger's receipt afterwards
+is per-Computer the same way (#600): when that write fails, including
+`stale_intent_revision` because the operator removed the Computer or its
+restore was superseded while the run ledger answered, L1 logs
+`event=l1_restore_revocation_receipt_deferred`, withholds that one restore
+directive, and still answers the heartbeat with every other directive. The
+next pass lists the revocation again only if the restore is still current;
+a removed or superseded restore is owed nothing. The heartbeat asks for all owed pre-restore
 revocations at once and waits for them at most
 `HeartbeatRestoreRevocationBudget` (3s), well inside the agent's 10s heartbeat
 deadline; a revocation that has not answered by then is owed exactly like a
@@ -440,7 +474,8 @@ older passes.
 
 `POST /v1/runs` rechecks the digest grant, revocation state, exact live L1
 attempt proof, and bound revisions after entering its immediate SQLite write
-transaction. Administrative revocation therefore serializes with the Run
+transaction, taking the live L1 proof last, just before the Run row is
+written. Administrative revocation therefore serializes with the Run
 commit: whichever write acquires the fence first wins. A transient L1 proof
 failure returns unauthorized or service unavailable without mutating the
 grant. Definitive attempt, policy, Storage, Computer, host, helper, agent, or
@@ -770,6 +805,10 @@ keeps the directory it was dispatched with, and has no retained results, no
 retention record and no result row on the node either way. Before execution, the
 node agent rejects symlinks and non-directories, creates the directory when it
 is absent, forces mode `0700`, and writes an ownership marker at mode `0600`.
+The marker and the agent's retention records are replaced by renaming a synced
+staging file over the name and then syncing the directory, so after power loss
+each name holds the old document or the new one, never a partial one, and a
+marker is never absent while it is being rewritten.
 For `kind=oci`, the agent instead requests a helper-owned
 managed volume keyed by the job's stable run ID or `handoff_owner_run_id`; the
 helper hashes that opaque key and mounts the resulting source at
@@ -949,7 +988,15 @@ names: a directory a workload made under this node's handoff root, carrying a
 marker naming this node and that run, qualifies. What adoption may do with it
 is bounded instead. It only ever creates a record, never replaces one that
 already stands at that run's name, and it gives no authority beyond an expiry
-schedule over a directory under this node's own root. The deadline it takes
+schedule over a directory under this node's own root. The one exception is a
+torn regular file at that run's own name -- empty, or JSON cut short, as an
+older agent's unsynced write could be left by power loss. It names no run and
+the sweep already skips it, so adoption replaces it rather than leaving the
+directory unsweepable. A name that is not a regular file, cannot be read, or
+holds another run's record is still refused, and so is well-formed JSON that
+does not decode as a record (a mistyped field, an unparsable timestamp): that
+may be another run's record, so no writer replaces it, preparation and finish
+included. The deadline it takes
 from the marker is at most one retention window **after the adoption**, so a
 forged marker may shorten its own run's retention freely and may extend nothing
 past a window from the moment the node adopted it. A record whose run was
