@@ -123,6 +123,12 @@ wefty rerun <run_id>                      # NEW run from the stored immutable sn
 Every command above accepts `--json`, and `--json` is what a script should use:
 the table forms are for people and their columns are not a contract.
 
+Logs are not kept forever: L1 keeps a one-shot run's logs for 30 days and
+32 MiB, and all jobs' logs under a 5 GB total, deleting the oldest first. A
+trimmed run says so — `wefty logs` prints a `logs trimmed by L1 retention` line
+on stderr, and `--json` carries a `truncation` object — so anything a later
+step needs belongs in `result.json` or an envelope, not only in the log.
+
 Steps: a workflow brackets its work with `wefty run step --name NAME` and
 `--end`, and the ledger derives the intervals from those envelopes. `runs list`
 shows the run's current step — the most recently started step that has not

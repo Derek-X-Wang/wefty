@@ -531,6 +531,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	runID := flags.Arg(0)
 	cursor := ""
+	announcedTruncation := false
 	for {
 		page, err := clients.getRunLogs(ctx, runID, cursor, limit)
 		if err != nil {
@@ -546,8 +547,16 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			} else {
 				return writeJSON(stdout, page)
 			}
-		} else if err := writeLogEvents(stdout, stderr, page.Events); err != nil {
-			return err
+		} else {
+			if !announcedTruncation && page.Truncation != nil {
+				announcedTruncation = true
+				if err := writeLogTruncationNotice(stderr, page.Truncation); err != nil {
+					return err
+				}
+			}
+			if err := writeLogEvents(stdout, stderr, page.Events); err != nil {
+				return err
+			}
 		}
 		cursor = page.NextCursor
 		if !follow {

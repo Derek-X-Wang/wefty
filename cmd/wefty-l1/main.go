@@ -92,6 +92,9 @@ func run() error {
 		serviceStabilityWindow   = flag.Duration("service-stability-window", l1.DefaultServiceStabilityWindow, "continuous service stability required to reset the restart streak")
 		serviceLogRetentionBytes = flag.Int64("service-log-retention-bytes", l1.DefaultServiceLogRetentionBytes, "maximum retained raw log payload per active service")
 		serviceLogRetentionAge   = flag.Duration("service-log-retention-age", l1.DefaultServiceLogRetentionAge, "maximum retained service log age")
+		oneshotLogRetentionBytes = flag.Int64("oneshot-log-retention-bytes", l1.DefaultOneshotLogRetentionBytes, "maximum retained raw log payload per one-shot job")
+		oneshotLogRetentionAge   = flag.Duration("oneshot-log-retention-age", l1.DefaultOneshotLogRetentionAge, "maximum retained one-shot log age, by each event's timestamp")
+		logRetentionTotalBytes   = flag.Int64("log-retention-total-bytes", l1.DefaultLogRetentionTotalBytes, "cluster-wide ceiling on retained raw log payload across all jobs, one-shot and service")
 		computerBackupCap        = flag.Int64("computer-backup-cap", 0, "maximum retained cold Backups per Computer; 0 disables creation")
 		fabricName               = flag.String("fabric-name", "wefty://control-plane", "tsnet logical service name")
 		stateDirectory           = flag.String("state-dir", "", "tsnet state directory")
@@ -117,6 +120,9 @@ func run() error {
 		ServiceStabilityWindow:       *serviceStabilityWindow,
 		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
 		ServiceLogRetentionAge:       *serviceLogRetentionAge,
+		OneshotLogRetentionBytes:     *oneshotLogRetentionBytes,
+		OneshotLogRetentionAge:       *oneshotLogRetentionAge,
+		LogRetentionTotalBytes:       *logRetentionTotalBytes,
 		ComputerBackupCap:            *computerBackupCap,
 	}
 	if *initiateAdminBootstrap && *resetAdminPolicy {

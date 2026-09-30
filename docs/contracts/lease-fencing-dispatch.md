@@ -224,9 +224,10 @@ fencing token, but is not gated by the current job attempt, authority
 generation, or lease validity. A `lost` attempt accepts new in-sequence events
 as non-authoritative observation for 48 hours after authority loss. After that
 explicit window, L1 replaces each received raw event with a truthful per-stream
-`late_evidence_window_expired` gap; the independent 7-day service-log retention
-age remains a storage bound and therefore binds later. Neither path changes the
-job verdict, attempt verdict, current attempt, or authority generation.
+`late_evidence_window_expired` gap; the independent log retention ages (7 days
+for services, 30 days for one-shots) remain storage bounds and therefore bind
+later. Neither path changes the job verdict, attempt verdict, current attempt,
+or authority generation.
 
 The claimed-to-running promotion block inside a log append remains in place
 for `kind=process` because it is authority-changing. It runs only while the
@@ -276,6 +277,45 @@ For `kind=process`, first renewal retains the legacy claimed-to-running
 acknowledgement. For `kind=oci`, renewal changes only the lease and directive;
 it never acknowledges execution or starts the portless-service stability
 clock. Successful completion likewise never supplies a missing OCI `Started`.
+
+## Log retention
+
+L1 bounds the log bytes it keeps; the job record (spec, status, attempts,
+result) is not a log and is not trimmed by these bounds. Every bound is an L1
+flag, measured in raw payload bytes (`LENGTH(bytes)`, not the stored JSON):
+
+| Bound | Services | One-shots | Enforced |
+| --- | --- | --- | --- |
+| Per-job bytes | 32 MiB (`--service-log-retention-bytes`) | 32 MiB (`--oneshot-log-retention-bytes`) | in the append transaction, and again by the reconcile sweep |
+| Age, by each event's own timestamp | 7 days (`--service-log-retention-age`) | 30 days (`--oneshot-log-retention-age`) | by the reconcile sweep |
+| Cluster-wide total, all jobs together | 5 GB = 5,000,000,000 bytes (`--log-retention-total-bytes`) | same ceiling | by the reconcile sweep |
+
+Whichever bound binds first trims oldest-first: per-job bounds in insertion
+order within the job, the one-shot age bound and the total ceiling by event
+timestamp across jobs. Trimmed bytes are deleted, not archived. No bound ever
+evicts the newest row for a stream of a claimed, running, or awaiting-input
+attempt: it is the provenance watermark continuity is checked against, so a
+live stream keeps accepting in-sequence batches however far it was trimmed.
+
+Per-job and total retained bytes are trigger-maintained counters over
+`log_events` (`job_log_usage`, `log_usage_total`), so neither the append path
+nor the sweep sums the table. Services are few and are swept job by job, as
+before. One-shots are kept as records forever and are never walked: the sweep
+re-trims only one-shots the usage index shows over their cap (at most 16 per
+pass), and one-shot age and the total ceiling walk the `(timestamp_ns,
+ordinal)` index with at most 4096 evictions per pass between them, so a
+backlog is worked off across passes instead of stalling the reconcile
+transaction.
+
+A trimmed job carries one aggregate `LogTruncation` marker
+(`job_log_truncations`) on every log page, one-shot and service alike, so
+trimmed logs never read as empty ones. `bound_kind` names the bound that most
+recently evicted (`bytes`, `age`, or `total`); the event and byte counts only
+grow; `earliest_retained_at` is null once nothing remains. It is distinct from
+`LogGap`, which declares loss before L1 accepted evidence. The marker replaced
+#49's service-only `service_log_truncations`, whose rows an existing database
+carries over on first open; the wire shape is unchanged and `ServiceLogTruncation`
+remains an alias of `LogTruncation` in the OpenAPI.
 
 ## OCI image, start, and pre-start retry truth
 

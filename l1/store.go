@@ -49,6 +49,9 @@ type StoreOptions struct {
 	ServiceStabilityWindow            time.Duration
 	ServiceLogRetentionBytes          int64
 	ServiceLogRetentionAge            time.Duration
+	OneshotLogRetentionBytes          int64
+	OneshotLogRetentionAge            time.Duration
+	LogRetentionTotalBytes            int64
 	PrestartInfrastructureBudget      time.Duration
 	RemovalStallBound                 time.Duration
 	AdminBootstrapTTL                 time.Duration
@@ -74,6 +77,7 @@ type Store struct {
 	serviceStabilityWindow            time.Duration
 	serviceLogRetentionBytes          int64
 	serviceLogRetentionAge            time.Duration
+	logRetention                      logRetentionLimits
 	prestartInfrastructureBudget      time.Duration
 	removalStallBound                 time.Duration
 	adminBootstrapTTL                 time.Duration
@@ -137,6 +141,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if serviceLogRetentionAge == 0 {
 		serviceLogRetentionAge = DefaultServiceLogRetentionAge
 	}
+	logRetention, err := resolveLogRetentionLimits(options)
+	if err != nil {
+		return nil, err
+	}
 	prestartInfrastructureBudget := options.PrestartInfrastructureBudget
 	if prestartInfrastructureBudget <= 0 {
 		prestartInfrastructureBudget = DefaultPrestartInfrastructureBudget
@@ -176,6 +184,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
+		logRetention:                      logRetention,
 		prestartInfrastructureBudget:      prestartInfrastructureBudget,
 		removalStallBound:                 removalStallBound,
 		adminBootstrapTTL:                 adminBootstrapTTL,
@@ -924,6 +933,9 @@ CREATE TABLE IF NOT EXISTS log_events (
   UNIQUE(attempt_id, stream, sequence)
 );
 CREATE INDEX IF NOT EXISTS log_events_job_order ON log_events(job_id, ordinal);
+-- Oldest-first eviction across jobs (the one-shot age bound and the
+-- cluster-wide ceiling) walks this index instead of every job.
+CREATE INDEX IF NOT EXISTS log_events_age_order ON log_events(timestamp_ns, ordinal);
 -- job_results holds one result document per job: the run's own verdict,
 -- uploaded by the node that produced it. It is one row, not a log: a retry
 -- replaces it, because the result of a job is whatever its latest attempt
@@ -937,15 +949,46 @@ CREATE TABLE IF NOT EXISTS job_results (
   skip_reason TEXT NOT NULL DEFAULT '',
   uploaded_ns INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS service_log_truncations (
-  job_id TEXT PRIMARY KEY REFERENCES service_jobs(job_id) ON DELETE CASCADE,
-  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age')),
+-- job_log_truncations is the one aggregate retention marker per job, one-shot
+-- or service. It replaced #49's service-only service_log_truncations, whose
+-- rows migrateServiceLogTruncations carries over on an existing database.
+CREATE TABLE IF NOT EXISTS job_log_truncations (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age', 'total')),
   evicted_event_count INTEGER NOT NULL CHECK(evicted_event_count >= 0),
   evicted_byte_count INTEGER NOT NULL CHECK(evicted_byte_count >= 0),
   evicted_through_ordinal INTEGER NOT NULL CHECK(evicted_through_ordinal >= 0),
   earliest_retained_ns INTEGER,
   updated_ns INTEGER NOT NULL
 );
+-- Retained raw log payload, maintained by triggers so neither the per-job cap
+-- at append nor the cluster-wide ceiling in the sweep has to SUM log_events.
+-- The counters are a cache of SUM(LENGTH(bytes)); ensureLogUsageCounters
+-- rebuilds them from log_events when the singleton total row is absent.
+CREATE TABLE IF NOT EXISTS job_log_usage (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  retained_bytes INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS job_log_usage_retained ON job_log_usage(retained_bytes);
+CREATE TABLE IF NOT EXISTS log_usage_total (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  retained_bytes INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS log_events_usage_insert AFTER INSERT ON log_events BEGIN
+  INSERT INTO job_log_usage(job_id, retained_bytes) VALUES(NEW.job_id, LENGTH(NEW.bytes))
+    ON CONFLICT(job_id) DO UPDATE SET retained_bytes=job_log_usage.retained_bytes+excluded.retained_bytes;
+  UPDATE log_usage_total SET retained_bytes=retained_bytes+LENGTH(NEW.bytes) WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS log_events_usage_delete AFTER DELETE ON log_events BEGIN
+  UPDATE job_log_usage SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes), 0) WHERE job_id=OLD.job_id;
+  UPDATE log_usage_total SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes), 0) WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS log_events_usage_update AFTER UPDATE OF bytes, job_id ON log_events BEGIN
+  UPDATE job_log_usage SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes), 0) WHERE job_id=OLD.job_id;
+  INSERT INTO job_log_usage(job_id, retained_bytes) VALUES(NEW.job_id, LENGTH(NEW.bytes))
+    ON CONFLICT(job_id) DO UPDATE SET retained_bytes=job_log_usage.retained_bytes+excluded.retained_bytes;
+  UPDATE log_usage_total SET retained_bytes=MAX(retained_bytes-LENGTH(OLD.bytes)+LENGTH(NEW.bytes), 0) WHERE singleton=1;
+END;
 CREATE TABLE IF NOT EXISTS job_log_jsonl (
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   jsonl BLOB NOT NULL
@@ -992,6 +1035,12 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if err := s.migrateServiceLogTruncations(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureLogUsageCounters(ctx); err != nil {
+		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
 		return err
@@ -3515,7 +3564,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
 		attempt.state = contract.AttemptRunning
 	}
-	if _, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now); err != nil {
+	if _, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now); err != nil {
 		return AppendLogsResponse{}, err
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
@@ -3579,7 +3628,7 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 		return LogPage{}, internalError(err, "iterate job logs")
 	}
 	page.NextCursor = encodeLogCursor(last)
-	page.Truncation, err = readServiceLogTruncation(ctx, s.db, jobID)
+	page.Truncation, err = readLogTruncation(ctx, s.db, jobID)
 	if err != nil {
 		return LogPage{}, err
 	}

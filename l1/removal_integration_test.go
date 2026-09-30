@@ -137,8 +137,8 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 		t.Fatalf("attempt state = %q, want lost", attemptState)
 	}
 	for table, query := range map[string]string{
-		"log_events":              `SELECT COUNT(*) FROM log_events WHERE job_id=?`,
-		"service_log_truncations": `SELECT COUNT(*) FROM service_log_truncations WHERE job_id=?`,
+		"log_events":          `SELECT COUNT(*) FROM log_events WHERE job_id=?`,
+		"job_log_truncations": `SELECT COUNT(*) FROM job_log_truncations WHERE job_id=?`,
 	} {
 		var count int
 		if err := h.store.db.QueryRow(query, job.JobID).Scan(&count); err != nil {

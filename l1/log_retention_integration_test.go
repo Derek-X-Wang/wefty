@@ -53,7 +53,7 @@ func assertServiceLogByteRetentionAndDerivedJSONL(t *testing.T) {
 		t.Fatalf("earliest retained timestamp = %v, want %s", page.Truncation.EarliestRetainedAt, page.Events[0].Timestamp)
 	}
 	var markerRows int
-	if err := h.store.db.QueryRow("SELECT COUNT(*) FROM service_log_truncations WHERE job_id=?", job.JobID).Scan(&markerRows); err != nil {
+	if err := h.store.db.QueryRow("SELECT COUNT(*) FROM job_log_truncations WHERE job_id=?", job.JobID).Scan(&markerRows); err != nil {
 		t.Fatal(err)
 	}
 	if markerRows != 1 {

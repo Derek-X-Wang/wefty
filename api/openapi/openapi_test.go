@@ -502,19 +502,32 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	if len(gapReasons) != len(contract.LogGapReasons()) {
 		t.Errorf("LogGap reason enum = %v, want exactly %v", gapReasons, contract.LogGapReasons())
 	}
-	serviceTruncation := object(t, schemas["ServiceLogTruncation"], "ServiceLogTruncation")
-	truncationRequired := stringSet(t, serviceTruncation["required"])
+	truncation := object(t, schemas["LogTruncation"], "LogTruncation")
+	truncationRequired := stringSet(t, truncation["required"])
 	for _, field := range []string{"bound_kind", "evicted_event_count", "evicted_byte_count", "evicted_through_ordinal", "earliest_retained_at", "updated_at"} {
 		if !truncationRequired[field] {
-			t.Errorf("ServiceLogTruncation missing required field %q", field)
+			t.Errorf("LogTruncation missing required field %q", field)
 		}
 	}
-	truncationBound := object(t, object(t, serviceTruncation["properties"], "ServiceLogTruncation.properties")["bound_kind"], "ServiceLogTruncation.bound_kind")
+	truncationBound := object(t, object(t, truncation["properties"], "LogTruncation.properties")["bound_kind"], "LogTruncation.bound_kind")
 	truncationBounds := stringSet(t, truncationBound["enum"])
-	for _, bound := range []string{"bytes", "age"} {
+	for _, bound := range []string{"bytes", "age", "total"} {
 		if !truncationBounds[bound] {
-			t.Errorf("ServiceLogTruncation bound_kind is missing %q", bound)
+			t.Errorf("LogTruncation bound_kind is missing %q", bound)
 		}
+	}
+	if len(truncationBounds) != 3 {
+		t.Errorf("LogTruncation bound_kind = %v, want exactly bytes, age, total", truncationBounds)
+	}
+	// #52 generalised the service-only marker; the old name must keep
+	// resolving to the same shape for existing clients.
+	legacyTruncation := object(t, schemas["ServiceLogTruncation"], "ServiceLogTruncation")
+	if legacyTruncation["$ref"] != "#/components/schemas/LogTruncation" {
+		t.Errorf("ServiceLogTruncation = %v, want a reference to LogTruncation", legacyTruncation)
+	}
+	logPage := object(t, object(t, schemas["LogPage"], "LogPage")["properties"], "LogPage.properties")
+	if ref := object(t, logPage["truncation"], "LogPage.truncation")["$ref"]; ref != "#/components/schemas/LogTruncation" {
+		t.Errorf("LogPage.truncation = %v, want LogTruncation", ref)
 	}
 	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
 	if len(processResult["oneOf"].([]any)) != 5 {

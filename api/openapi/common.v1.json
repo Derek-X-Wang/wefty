@@ -1042,14 +1042,14 @@
         },
         "description": "One ordered raw chunk or gap declaration. Continuity and gap ranges are independent for stdout and stderr."
       },
-      "ServiceLogTruncation": {
+      "LogTruncation": {
         "type": "object",
         "additionalProperties": false,
         "required": ["bound_kind", "evicted_event_count", "evicted_byte_count", "evicted_through_ordinal", "earliest_retained_at", "updated_at"],
         "properties": {
           "bound_kind": {
-            "enum": ["bytes", "age"],
-            "description": "The retention bound that most recently caused eviction."
+            "enum": ["bytes", "age", "total"],
+            "description": "The retention bound that most recently caused eviction: the job's per-job byte cap (bytes), its class's age bound measured by each event's own timestamp (age), or the cluster-wide ceiling on all jobs' logs (total). Clients should treat an unknown value as a truncation of unknown cause, not an error."
           },
           "evicted_event_count": { "type": "integer", "minimum": 0 },
           "evicted_byte_count": { "type": "integer", "minimum": 0 },
@@ -1058,10 +1058,19 @@
             "minimum": 0,
             "description": "Internal monotonic ordering watermark; clients must not use it as a reader cursor."
           },
-          "earliest_retained_at": { "type": ["string", "null"], "format": "date-time" },
+          "earliest_retained_at": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "Timestamp of the oldest event still retained; null when every event was evicted."
+          },
           "updated_at": { "type": "string", "format": "date-time" }
         },
-        "description": "One aggregate L1 history-truncation marker per service job. This is distinct from LogGap, which declares loss before L1 accepted evidence."
+        "description": "One aggregate L1 history-truncation marker per job, one-shot or service: retained log history was evicted by a retention bound and the bytes are deleted. Counts only grow. A trimmed job carries it on every page, so trimmed logs never read as empty ones. This is distinct from LogGap, which declares loss before L1 accepted evidence."
+      },
+      "ServiceLogTruncation": {
+        "$ref": "#/components/schemas/LogTruncation",
+        "deprecated": true,
+        "description": "Pre-#52 name of LogTruncation, kept so existing references resolve. The wire shape is identical."
       },
       "ProcessResult": {
         "type": "object",
@@ -1174,7 +1183,7 @@
             "type": "string",
             "description": "Opaque cursor; clients must not infer SQLite row IDs."
           },
-          "truncation": { "$ref": "#/components/schemas/ServiceLogTruncation" }
+          "truncation": { "$ref": "#/components/schemas/LogTruncation" }
         }
       },
       "ResultUploadSkipReason": {

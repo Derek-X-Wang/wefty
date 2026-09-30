@@ -150,7 +150,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		// Ingest is the mandatory byte-enforcement site. Reconciliation also
 		// applies it so a tighter configuration takes effect for an idle
 		// service after restart without waiting for another batch.
-		byteStats, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now)
+		byteStats, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now)
 		if err != nil {
 			return ReconcileResult{}, err
 		}
@@ -162,6 +162,22 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		}
 		result.PrunedAttempts += pruned
 	}
+	// One-shots are kept forever as records, so their logs are never swept
+	// job by job: the per-job cap re-trims only jobs the usage index shows
+	// over it, and age and the cluster-wide ceiling walk the timestamp index
+	// oldest-first within one bounded budget per pass.
+	oneshotStats, budget, err := s.enforceOneshotLogRetention(ctx, tx, now, logRetentionSweepEventBudget)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	result.EvictedLogEvents += oneshotStats.events
+	result.EvictedLogBytes += oneshotStats.bytes
+	totalStats, err := s.enforceLogRetentionTotal(ctx, tx, now, budget)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	result.EvictedLogEvents += totalStats.events
+	result.EvictedLogBytes += totalStats.bytes
 
 	// Take-over audit has its own age bound. This sweep is intentionally not
 	// nested in service attempt-summary retention, and the audit table has no

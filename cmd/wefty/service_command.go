@@ -665,6 +665,7 @@ func executeServiceLogs(
 	jobID := flags.Arg(0)
 	cursor := ""
 	lastAttemptID := ""
+	announcedTruncation := false
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
 		if err != nil {
@@ -683,8 +684,16 @@ func executeServiceLogs(
 			} else {
 				return writeJSON(stdout, page)
 			}
-		} else if err := writeServiceLogEvents(stdout, stderr, page.Events, &lastAttemptID); err != nil {
-			return err
+		} else {
+			if !announcedTruncation && page.Truncation != nil {
+				announcedTruncation = true
+				if err := writeLogTruncationNotice(stderr, page.Truncation); err != nil {
+					return err
+				}
+			}
+			if err := writeServiceLogEvents(stdout, stderr, page.Events, &lastAttemptID); err != nil {
+				return err
+			}
 		}
 		cursor = page.NextCursor
 		if !follow {
