@@ -16,8 +16,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
-	"sync/atomic"
+	"syscall"
 )
 
 // StagingSuffix is appended to a name to form the fixed staging name
@@ -91,6 +92,57 @@ func CreateFile(dir *os.Root, name string, payload []byte, mode os.FileMode) err
 	return syncDirectory(dir)
 }
 
+// MkdirAll is os.MkdirAll whose every newly created directory is durable: each
+// missing component is created and then its parent is synced, so power loss
+// cannot drop the entry of a directory a later durable write lands in. A
+// component that already exists is left as it is.
+func MkdirAll(path string, mode os.FileMode) error {
+	path = filepath.Clean(path)
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+		}
+		return nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if parent != path {
+		if err := MkdirAll(parent, mode); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(path, mode); err != nil {
+		// A racing creator made it; its parent sync may not have happened
+		// yet, so this caller syncs too before relying on it.
+		if info, statErr := os.Stat(path); errors.Is(err, fs.ErrExist) && statErr == nil && info.IsDir() {
+			return syncDirectoryPath(parent)
+		}
+		return err
+	}
+	return syncDirectoryPath(parent)
+}
+
+// Mkdir creates name in dir and syncs dir, so the new entry is durable. It
+// returns os.Mkdir's errors unchanged, including fs.ErrExist.
+func Mkdir(dir *os.Root, name string, mode os.FileMode) error {
+	if err := dir.Mkdir(name, mode); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+func syncDirectoryPath(path string) error {
+	dir, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return syncDirectory(dir)
+}
+
 // SyncDir syncs dir itself, which is what makes a rename, link or removal in
 // it durable.
 func SyncDir(dir *os.Root) error {
@@ -127,31 +179,11 @@ func writeStaged(dir *os.Root, staging string, payload []byte, mode os.FileMode)
 // F_FULLFSYNC for commits and for checkpoints. Elsewhere fsync reaches stable
 // storage and there is nothing to add.
 func SQLitePragmas() []string {
-	if sqliteFullFsyncDisabledForTests.Load() {
+	if sqliteFullFsyncDisabled() {
 		return nil
 	}
 	return sqlitePragmas(runtime.GOOS)
 }
-
-// sqliteFullFsyncDisabledForTests is set only by
-// DisableSQLiteFullFsyncForTests. No production code path sets it.
-var sqliteFullFsyncDisabledForTests atomic.Bool
-
-// DisableSQLiteFullFsyncForTests drops the durability pragmas from every
-// SQLite DSN this process opens afterwards, and EnableSQLiteFullFsyncForTests
-// puts them back. They exist for package tests' TestMain only: F_FULLFSYNC per
-// commit makes the L1, L3 and agent suites several times slower on darwin and
-// proves nothing a test asserts, since no test cuts power.
-//
-// They are Go calls, never an environment variable or flag, so nothing outside
-// a compiled test can reach them, and the package is internal, so nothing
-// outside this module can either. TestTheTestSwitchIsCalledOnlyFromTests
-// fails if any non-test file calls them.
-func DisableSQLiteFullFsyncForTests() { sqliteFullFsyncDisabledForTests.Store(true) }
-
-// EnableSQLiteFullFsyncForTests undoes DisableSQLiteFullFsyncForTests, for a
-// test that must open a store exactly as production does.
-func EnableSQLiteFullFsyncForTests() { sqliteFullFsyncDisabledForTests.Store(false) }
 
 func sqlitePragmas(goos string) []string {
 	if goos == "darwin" {

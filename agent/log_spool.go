@@ -68,7 +68,11 @@ type incompleteEvidenceTombstone struct {
 }
 
 type logSpool struct {
+	// db is the synchronous=FULL handle: every write L1 or recovery relies
+	// on. appendDB is the synchronous=NORMAL handle for output-event appends
+	// only; see logSpoolDSN.
 	db              *sql.DB
+	appendDB        *sql.DB
 	maxOneShotBytes int64
 	maxServiceBytes int64
 	// appendCheckpoint is a test-only scheduling seam for contention before a
@@ -104,27 +108,11 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 	if maxOneShotBytes <= 0 || maxServiceBytes <= 0 {
 		return nil, errors.New("agent: log spool class budgets must be positive")
 	}
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := durable.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("agent: create log spool directory: %w", err)
 	}
 	path := filepath.Join(directory, spoolFileName(nodeID))
-	query := make(url.Values)
-	query.Add("_pragma", "busy_timeout(5000)")
-	query.Add("_pragma", "foreign_keys(1)")
-	query.Add("_pragma", "synchronous(FULL)")
-	// Spooled log bytes and completion results are deleted once delivered;
-	// secure_delete zeroes them on disk rather than leaving them in a free
-	// page (#52), as L1 does.
-	query.Add("_pragma", "secure_delete(1)")
-	// Rows L1 acknowledged are deleted and never re-sent, so a commit the
-	// spool reported must survive power loss; on darwin that takes
-	// F_FULLFSYNC (#599).
-	for _, pragma := range durable.SQLitePragmas() {
-		query.Add("_pragma", pragma)
-	}
-	query.Set("_txlock", "immediate")
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", logSpoolDSN(path, "FULL"))
 	if err != nil {
 		return nil, fmt.Errorf("agent: open log spool: %w", err)
 	}
@@ -137,7 +125,51 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 		_ = db.Close()
 		return nil, err
 	}
+	appendDB, err := sql.Open("sqlite", logSpoolDSN(path, "NORMAL"))
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("agent: open log spool append handle: %w", err)
+	}
+	appendDB.SetMaxOpenConns(1)
+	if err := appendDB.PingContext(context.Background()); err != nil {
+		_ = appendDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("agent: open log spool append handle: %w", err)
+	}
+	spool.appendDB = appendDB
 	return spool, nil
+}
+
+// logSpoolDSN is the spool's one DSN shape; only the commit sync level
+// differs between its two handles.
+//
+// The FULL handle carries everything L1 or recovery relies on: attempts,
+// completions, acknowledgements, dispositions, removals. Output-event appends
+// alone use the NORMAL handle, whose commits do not wait for a sync. Paying
+// F_FULLFSYNC (~4 ms on darwin) per output event would throttle a chatty
+// workload to a few hundred lines a second (#599). The WAL is one
+// append-only file, so the sync behind any FULL commit also makes every
+// earlier NORMAL frame durable: power loss can lose only output appended after
+// the last FULL commit or checkpoint, never a completion, and never output
+// before a record that survived. Both handles carry the platform durability
+// pragmas, which also govern checkpoints.
+func logSpoolDSN(path, synchronous string) string {
+	query := make(url.Values)
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "synchronous("+synchronous+")")
+	// Spooled log bytes and completion results are deleted once delivered;
+	// secure_delete zeroes them on disk rather than leaving them in a free
+	// page (#52), as L1 does.
+	query.Add("_pragma", "secure_delete(1)")
+	// Rows L1 acknowledged are deleted and never re-sent, so a commit the
+	// spool reported must survive power loss; on darwin that takes
+	// F_FULLFSYNC (#599).
+	for _, pragma := range durable.SQLitePragmas() {
+		query.Add("_pragma", pragma)
+	}
+	query.Set("_txlock", "immediate")
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 }
 
 func resolveLogSpoolDirectory(directory string) (string, error) {
@@ -492,7 +524,13 @@ ALTER TABLE spool_completion_receipts_next RENAME TO spool_completion_receipts;`
 	return nil
 }
 
-func (spool *logSpool) Close() error { return spool.db.Close() }
+func (spool *logSpool) Close() error {
+	var appendErr error
+	if spool.appendDB != nil {
+		appendErr = spool.appendDB.Close()
+	}
+	return errors.Join(spool.db.Close(), appendErr)
+}
 
 func (spool *logSpool) ListOCIImageBindingPins(ctx context.Context) ([]workloadrunner.OCIImageBindingPin, error) {
 	rows, err := spool.db.QueryContext(ctx, `SELECT job_id, reference, digest, platform_os,
@@ -773,7 +811,9 @@ func (spool *logSpool) append(ctx context.Context, event contract.LogEvent) erro
 	if spool.appendCheckpoint != nil {
 		spool.appendCheckpoint(ctx)
 	}
-	tx, err := spool.db.BeginTx(ctx, nil)
+	// The NORMAL handle: an output append is the one write that does not
+	// wait for a sync (logSpoolDSN).
+	tx, err := spool.appendDB.BeginTx(ctx, nil)
 	if err != nil {
 		return wrapLogSpoolContextError(ctx, "agent: begin log spool append", err)
 	}

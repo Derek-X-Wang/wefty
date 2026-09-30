@@ -284,6 +284,10 @@ func sqliteDSN(path string, busyTimeout time.Duration) string {
 // discarded and the identity created as on first boot. A file that holds bytes
 // and is not an identity stays a hard failure: that is damage, not a first boot
 // that never finished.
+// syncIdentityDirectory is durable.SyncDir, behind a seam so a test can prove
+// an identity read from disk is made durable before it is used.
+var syncIdentityDirectory = durable.SyncDir
+
 func loadOrCreateDeploymentID(databasePath string) (string, error) {
 	path := databasePath + ".authority-instance"
 	dir, err := os.OpenRoot(filepath.Dir(path))
@@ -322,6 +326,12 @@ func loadOrCreateDeploymentID(databasePath string) (string, error) {
 			decoded, err := hex.DecodeString(identity)
 			if err != nil || len(decoded) != 32 {
 				return "", fmt.Errorf("l1: authority instance identity is invalid")
+			}
+			// The boot that published this identity may have died before
+			// syncing the directory, so its name may not be durable yet.
+			// Nothing builds on an identity that power loss could still take.
+			if err := syncIdentityDirectory(dir); err != nil {
+				return "", fmt.Errorf("l1: sync authority instance identity directory: %w", err)
 			}
 			return identity, nil
 		}

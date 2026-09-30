@@ -1040,13 +1040,13 @@ func (m *handoffManager) adoptDirectory(runID string, now time.Time) {
 // Its own untrustworthy record is not a refusal. That file already belongs to
 // this run, so re-deriving this run's window replaces nothing else.
 //
-// Nor is a regular file at this run's own name whose bytes do not decode as a
-// record at all -- empty or cut short, which is what power loss leaves of an
-// unsynced write (#599). It names no run, so it is no run's expiry, and
-// loadRecords already skips it: refusing it left the directory unsweepable for
-// as long as the node lived. Only this run's own name is ever replaced this
-// way. A file that is not regular, that could not be read, or that decodes and
-// names another run is still refused.
+// Nor is a regular file at this run's own name that is torn -- empty, or JSON
+// cut short, which is what power loss leaves of an unsynced write (#599). It
+// names no run, so it is no run's expiry, and loadRecords already skips it:
+// refusing it left the directory unsweepable for as long as the node lived.
+// Only this run's own name is ever replaced this way. A file that is not
+// regular, that could not be read, that is well-formed JSON but not a record
+// this agent can identify, or that names another run is still refused.
 func (m *handoffManager) recordKeyIsThisRuns(runID, path string) bool {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return true
@@ -1056,8 +1056,8 @@ func (m *handoffManager) recordKeyIsThisRuns(runID, path string) bool {
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return true
-	case errors.Is(err, errRecordUndecodable):
-		m.log("agent: %q holds no decodable record (%v); adopting %q replaces it with run %s's",
+	case errors.Is(err, errRecordTorn):
+		m.log("agent: %q holds a torn record (%v); adopting %q replaces it with run %s's",
 			file, err, path, runID)
 		return true
 	case err != nil:

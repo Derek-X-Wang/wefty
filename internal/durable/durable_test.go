@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -163,6 +164,52 @@ func TestCreateFileHasExactlyOneWinnerAmongRacers(t *testing.T) {
 	assertOnly(t, path, "identity")
 }
 
+// TestMkdirAllSyncsTheParentOfEveryDirectoryItCreates: a directory entry is
+// durable only once its parent is synced, and a later durable write inside a
+// directory whose own entry power loss can drop is not durable at all.
+func TestMkdirAllSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
+	base := t.TempDir()
+	syncs := countDirectorySyncs(t)
+	target := filepath.Join(base, "a", "b", "c")
+	if err := MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(target); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("%s = %v, %v", target, info, err)
+	}
+	if *syncs != 3 {
+		t.Fatalf("creating three directories synced %d parents, want 3", *syncs)
+	}
+	if err := MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if *syncs != 3 {
+		t.Fatalf("an existing path synced %d more parents, want none", *syncs-3)
+	}
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MkdirAll(filepath.Join(file, "below"), 0o700); err == nil {
+		t.Fatal("MkdirAll created a directory below a file")
+	}
+}
+
+func TestMkdirSyncsItsParent(t *testing.T) {
+	root, path := openRoot(t)
+	syncs := countDirectorySyncs(t)
+	if err := Mkdir(root, "run", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if *syncs != 1 {
+		t.Fatalf("Mkdir synced its parent %d times, want once", *syncs)
+	}
+	if err := Mkdir(root, "run", 0o700); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("a second Mkdir = %v, want fs.ErrExist", err)
+	}
+	assertOnly(t, path, "run")
+}
+
 func TestSyncDirOnARealDirectory(t *testing.T) {
 	root, _ := openRoot(t)
 	if err := SyncDir(root); err != nil {
@@ -207,8 +254,9 @@ func TestTheTestSwitchDropsOnlyTheSwitchablePragmas(t *testing.T) {
 }
 
 // TestTheTestSwitchIsCalledOnlyFromTests: the full-fsync switch must never
-// reach a production binary. Only _test.go files may name it, apart from its
-// definition here.
+// reach a production binary. Only testswitch.go, which declares it and nothing
+// else, and _test.go files may name it -- so an init() anywhere else,
+// durable.go included, fails here.
 func TestTheTestSwitchIsCalledOnlyFromTests(t *testing.T) {
 	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
@@ -217,10 +265,11 @@ func TestTheTestSwitchIsCalledOnlyFromTests(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(moduleRoot, "go.mod")); err != nil {
 		t.Fatalf("module root %q not found: %v", moduleRoot, err)
 	}
-	self, err := filepath.Abs("durable.go")
+	declaration, err := filepath.Abs("testswitch.go")
 	if err != nil {
 		t.Fatal(err)
 	}
+	switchName := regexp.MustCompile(`FullFsync\w*ForTests`)
 	var offenders []string
 	err = filepath.WalkDir(moduleRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -232,14 +281,14 @@ func TestTheTestSwitchIsCalledOnlyFromTests(t *testing.T) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") || path == self {
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") || path == declaration {
 			return nil
 		}
 		payload, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		if strings.Contains(string(payload), "SQLiteFullFsyncForTests") {
+		if switchName.Match(payload) {
 			offenders = append(offenders, path)
 		}
 		return nil
@@ -249,5 +298,32 @@ func TestTheTestSwitchIsCalledOnlyFromTests(t *testing.T) {
 	}
 	if len(offenders) != 0 {
 		t.Fatalf("non-test files name the full-fsync test switch: %v", offenders)
+	}
+}
+
+// switchDisabledAtStart and pragmasAtStart are read by TestMain, after every
+// init() in the package has run and before any test can touch the switch.
+var (
+	switchDisabledAtStart bool
+	pragmasAtStart        []string
+)
+
+// TestMain records the switch before any test runs. It must never disable it:
+// this package is where the default is proved.
+func TestMain(main *testing.M) {
+	switchDisabledAtStart = sqliteFullFsyncDisabled()
+	pragmasAtStart = SQLitePragmas()
+	os.Exit(main.Run())
+}
+
+// TestTheFullFsyncSwitchDefaultsToOn: a binary that never calls the switch
+// opens SQLite with the production pragmas. It reads what TestMain recorded
+// and resets nothing.
+func TestTheFullFsyncSwitchDefaultsToOn(t *testing.T) {
+	if switchDisabledAtStart {
+		t.Fatal("the full-fsync switch was already disabled before any test ran")
+	}
+	if want := sqlitePragmas(runtime.GOOS); !slices.Equal(pragmasAtStart, want) {
+		t.Fatalf("pragmas before any test = %v, want %v", pragmasAtStart, want)
 	}
 }

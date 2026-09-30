@@ -125,6 +125,59 @@ func TestAdoptionStillRefusesWhatItCannotIdentify(t *testing.T) {
 	})
 }
 
+// TestWellFormedRecordsThatDoNotDecodeAreNotTorn: only an empty file or JSON
+// cut short is a tear. A well-formed document that fails to decode -- here an
+// older agent's record for run.planted, filed under the shared name that is
+// run_planted's current one, with a timestamp this agent cannot parse, or a
+// mistyped field -- may be another run's record. Adoption refuses it and no
+// writer replaces it.
+func TestWellFormedRecordsThatDoNotDecodeAreNotTorn(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		planted string
+	}{
+		{
+			name:    "a legacy foreign record with a bad timestamp",
+			planted: `{"run_id":"run.planted","node_id":"node-1","directory":"/handoffs/run.planted","retained_at":"not-a-time","retain_until":"2026-09-17T12:30:00Z"}`,
+		},
+		{name: "a record with a mistyped field", planted: `{"run_id":7,"node_id":"node-1"}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newRetentionHarness(t, time.Hour)
+			if legacyRecordComponent("run.planted") != recordComponent("run_planted") {
+				t.Fatal("the fixture needs run.planted's older name to be run_planted's current one")
+			}
+			path := harness.plantDirectory("run_planted", &handoffMarker{
+				RunID: "run_planted", NodeID: "node-1", RetainUntil: harness.now.Add(time.Hour).UTC(),
+			})
+			file := harness.manager.recordPath("run_planted")
+			if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(testCase.planted), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.manager.readRecord(file); !errors.Is(err, errRecordUnidentifiable) || errors.Is(err, errRecordTorn) {
+				t.Fatalf("readRecord = %v, want an unidentifiable record that is not torn", err)
+			}
+
+			if err := harness.manager.adoptResidue(); err != nil {
+				t.Fatal(err)
+			}
+			if !harness.logged("could not be read") {
+				t.Fatalf("adoption did not refuse: %v", harness.logs)
+			}
+			err := harness.manager.writeRecord(retentionRecord{RunID: "run_planted", NodeID: "node-1", Directory: path})
+			if !errors.Is(err, errRecordBelongsToAnotherRun) {
+				t.Fatalf("writeRecord over an unidentifiable record = %v, want a refusal", err)
+			}
+			if payload, err := os.ReadFile(file); err != nil || string(payload) != testCase.planted {
+				t.Fatalf("the unidentifiable record was replaced: %q, %v", payload, err)
+			}
+		})
+	}
+}
+
 // TestHandoffMarkerRewriteNeverLeavesTheNameEmpty: the marker used to be
 // replaced by deleting it and then creating it, and a crash between the two
 // made the next preparation refuse the directory as unmanaged (#599). A

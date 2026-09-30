@@ -75,9 +75,21 @@ func TestTheAuthorityInstanceIdentityIsCreatedOnceAndKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertIdentity(t, created)
+	// A boot that reads an identity syncs its directory before using it: the
+	// boot that published it may have died before its own directory sync.
+	syncs := 0
+	previous := syncIdentityDirectory
+	syncIdentityDirectory = func(dir *os.Root) error {
+		syncs++
+		return previous(dir)
+	}
+	t.Cleanup(func() { syncIdentityDirectory = previous })
 	again, err := loadOrCreateDeploymentID(database)
 	if err != nil || again != created {
 		t.Fatalf("second boot read %q, %v; want the identity the first boot created (%q)", again, err, created)
+	}
+	if syncs != 1 {
+		t.Fatalf("reading an existing identity synced its directory %d times, want once", syncs)
 	}
 	assertOnlyIdentityFile(t, database)
 }

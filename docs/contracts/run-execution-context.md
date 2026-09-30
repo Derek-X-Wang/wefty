@@ -280,7 +280,16 @@ cleared or deleted value is zeroed on disk. Every connection of the three also
 opens with `fullfsync` and `checkpoint_fullfsync` on darwin, where a plain
 fsync leaves a commit in the drive's cache: a commit any of them acknowledged
 survives power loss or a kernel panic, not only a process crash. Linux fsync
-already reaches stable storage and adds nothing. L1's authority instance
+already reaches stable storage and adds nothing. The one exception is the
+agent spool's output-event appends, which commit on a synchronous=NORMAL
+connection so a chatty workload does not pay a full sync per output line.
+Everything L1 or recovery relies on -- attempts, completions,
+acknowledgements, dispositions and removals -- commits on the spool's
+synchronous=FULL connection. The WAL is one append-only file, so the sync
+behind any FULL commit also makes every earlier appended output durable: power
+loss can lose only output appended after the last FULL commit or checkpoint,
+whose acknowledgement the spool had therefore not yet recorded, never a
+completion, and never output that precedes a record that survived. L1's authority instance
 identity file is published whole, synced, by a link that never replaces, so two
 racing first boots agree on one identity and power loss leaves either no file
 or the whole identity; an empty file an older L1 left is treated as a first
@@ -957,11 +966,14 @@ marker naming this node and that run, qualifies. What adoption may do with it
 is bounded instead. It only ever creates a record, never replaces one that
 already stands at that run's name, and it gives no authority beyond an expiry
 schedule over a directory under this node's own root. The one exception is a
-regular file at that run's own name whose bytes are not a record at all --
-empty or cut short, as an older agent's unsynced write could be left by power
-loss. It names no run and the sweep already skips it, so adoption replaces it
-rather than leaving the directory unsweepable; a name that is not a regular
-file, cannot be read, or holds another run's record is still refused. The deadline it takes
+torn regular file at that run's own name -- empty, or JSON cut short, as an
+older agent's unsynced write could be left by power loss. It names no run and
+the sweep already skips it, so adoption replaces it rather than leaving the
+directory unsweepable. A name that is not a regular file, cannot be read, or
+holds another run's record is still refused, and so is well-formed JSON that
+does not decode as a record (a mistyped field, an unparsable timestamp): that
+may be another run's record, so no writer replaces it, preparation and finish
+included. The deadline it takes
 from the marker is at most one retention window **after the adoption**, so a
 forged marker may shorten its own run's retention freely and may extend nothing
 past a window from the moment the node adopted it. A record whose run was

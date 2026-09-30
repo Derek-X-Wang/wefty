@@ -462,8 +462,14 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 	// able to produce. Either way the record standing there is deletion
 	// authority over some other run's directory, and overwriting it would take
 	// that run's expiry away silently.
-	if standing, err := m.readRecord(m.recordPath(record.RunID)); err == nil &&
-		standing.RunID != "" && standing.RunID != record.RunID {
+	standing, err := m.readRecord(m.recordPath(record.RunID))
+	if errors.Is(err, errRecordUnidentifiable) {
+		m.log("agent: refuse to write run %s's retention record: %q holds a record this agent cannot identify (%v); it may be another run's, so it is left as it is and this run is not recorded",
+			record.RunID, m.recordPath(record.RunID), err)
+		return fmt.Errorf("%w: %q holds a record this agent cannot identify: %w",
+			errRecordBelongsToAnotherRun, m.recordPath(record.RunID), err)
+	}
+	if err == nil && standing.RunID != "" && standing.RunID != record.RunID {
 		m.log("agent: refuse to write run %s's retention record: %q already belongs to run %q; that run keeps its own expiry and this one is not recorded",
 			record.RunID, m.recordPath(record.RunID), standing.RunID)
 		return fmt.Errorf("%w: %q belongs to run %q, not %q",
@@ -495,7 +501,7 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 // anything but the file the agent expects is replaced rather than written
 // through.
 func writeStateDocument(root, name string, value any) error {
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := durable.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", root, err)
 	}
 	payload, err := json.Marshal(value)
@@ -601,15 +607,25 @@ func (m *handoffManager) readRecord(path string) (retentionRecord, error) {
 	}
 	var record retentionRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
-		return retentionRecord{}, fmt.Errorf("%w: %w", errRecordUndecodable, err)
+		var syntax *json.SyntaxError
+		if len(payload) == 0 || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &syntax) {
+			return retentionRecord{}, fmt.Errorf("%w: %w", errRecordTorn, err)
+		}
+		return retentionRecord{}, fmt.Errorf("%w: %w", errRecordUnidentifiable, err)
 	}
 	return record, nil
 }
 
-// errRecordUndecodable is a regular record file whose bytes are not a record
-// at all -- empty, or cut short -- which is what power loss leaves of a record
-// an agent that did not sync its writes was replacing. It names no run.
-var errRecordUndecodable = errors.New("retention record is not a decodable record")
+// errRecordTorn is a regular record file whose bytes are not JSON at all --
+// empty, or cut short -- which is what power loss leaves of a record an agent
+// that did not sync its writes was replacing. It names no run.
+var errRecordTorn = errors.New("retention record is torn")
+
+// errRecordUnidentifiable is a record file holding well-formed JSON that does
+// not decode as a record -- a field of the wrong type, a timestamp that does
+// not parse. That is not a tear: it may be another run's record from an agent
+// that wrote it differently, so no writer replaces it.
+var errRecordUnidentifiable = errors.New("retention record is well-formed JSON but not a record this agent can identify")
 
 // readStateDocument reads one small agent-owned JSON document. It refuses
 // anything that is not a regular file, never follows a link, opens

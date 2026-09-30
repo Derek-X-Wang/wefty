@@ -360,7 +360,8 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 		return nil, err
 	}
 	defer root.Close()
-	if err := root.Mkdir(runID, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+	// Durable: the record written below names this directory.
+	if err := durable.Mkdir(root, runID, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, err
 	}
 	run, err := openHandoffDirectory(root, runID)
@@ -666,7 +667,7 @@ func openPrivateHandoffDirectory(path string) (*os.Root, error) {
 	}
 	defer parent.Close()
 	name := filepath.Base(path)
-	if err := parent.Mkdir(name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err := durable.Mkdir(parent, name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, err
 	}
 	root, err := openHandoffDirectory(parent, name)
