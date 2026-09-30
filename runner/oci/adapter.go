@@ -1247,9 +1247,10 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		bridgeContext, cancelBridge := context.WithCancel(ctx)
 		const bridgeConcurrency = 4
 		bridgeDone := make(chan struct{}, bridgeConcurrency)
+		var bridgeLimitRefusals ocihelper.ConnectionLimitLog
 		for range bridgeConcurrency {
 			go func() {
-				pumpHostBridge(bridgeContext, session, authority, runResponse.BridgeCapability, request.HostBridgeDial)
+				pumpHostBridge(bridgeContext, session, authority, runResponse.BridgeCapability, request.HostBridgeDial, &bridgeLimitRefusals)
 				bridgeDone <- struct{}{}
 			}()
 		}
@@ -1704,12 +1705,26 @@ func pumpHostBridge(
 	authority ocihelper.AttemptAuthority,
 	capability string,
 	dialHost func(context.Context) (net.Conn, error),
+	limitRefusals *ocihelper.ConnectionLimitLog,
 ) {
 	for {
 		helper, err := session.DialHostBridge(ctx, ocihelper.DialHostBridgeRequest{Authority: authority, BridgeCapability: capability})
 		if err != nil {
 			if ctx.Err() != nil {
 				return
+			}
+			// The helper out of stream slots is Node-wide pressure, not a
+			// fault in this bridge: say so once per burst rather than 40
+			// times a second per pump, and wait long enough for a stream to
+			// close instead of spinning on the refusal (#597).
+			if ocihelper.IsConnectionLimitRefusal(err) {
+				if report, suppressed := limitRefusals.Note(time.Now()); report {
+					log.Printf("OCI host bridge connection retry: the OCI helper's connection budget is full (%d more refusals since the last report): %v", suppressed, err)
+				}
+				if !waitBridgeRetryAfter(ctx, bridgeConnectionLimitBackoff) {
+					return
+				}
+				continue
 			}
 			log.Printf("OCI host bridge connection retry: open constrained helper stream: %v", err)
 			if !waitBridgeRetry(ctx) {
@@ -1741,8 +1756,16 @@ func pumpHostBridge(
 	}
 }
 
+// bridgeConnectionLimitBackoff paces a host-bridge pump the helper refused
+// for want of a stream slot; a slot frees only when some stream closes.
+const bridgeConnectionLimitBackoff = 250 * time.Millisecond
+
 func waitBridgeRetry(ctx context.Context) bool {
-	timer := time.NewTimer(25 * time.Millisecond)
+	return waitBridgeRetryAfter(ctx, 25*time.Millisecond)
+}
+
+func waitBridgeRetryAfter(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

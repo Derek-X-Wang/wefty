@@ -971,6 +971,13 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 	if err.Code == CodeSessionStale {
 		return true
 	}
+	// A connection_limit refusal is the helper answering on a fresh
+	// connection that it has no slot for this one request. It proves the
+	// helper and its session are alive; reading it as loss is exactly how one
+	// busy service used to reap every OCI workload on the Node (#597).
+	if err.Code == CodeConnectionLimit {
+		return false
+	}
 	if err.Code == CodeEngineFailure {
 		// A Run the helper refused after positively reaping that attempt, with
 		// its exclusive session still live, is bounded by the attempt. Without

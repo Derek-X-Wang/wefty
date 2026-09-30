@@ -1021,3 +1021,150 @@ func waitReadinessState[T any](t *testing.T, states <-chan T) T {
 		return zero
 	}
 }
+
+// The OCI helper refusing one proxied client's stream for want of a
+// connection slot costs that client its connection and nothing else: the
+// established tunnel keeps flowing, the front door keeps forwarding and
+// reports no failure, and the burst is logged once rather than per client
+// (#597).
+func TestServiceFrontDoorHelperConnectionLimitClosesOnlyThatClient(t *testing.T) {
+	published, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dials atomic.Int32
+	frontDoor := newServiceFrontDoor(published, func(context.Context) (net.Conn, error) {
+		if dials.Add(1) == 1 {
+			agentSide, serviceSide := net.Pipe()
+			go func() {
+				_, _ = io.Copy(serviceSide, serviceSide)
+				_ = serviceSide.Close()
+			}()
+			return agentSide, nil
+		}
+		return nil, &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit, Message: "OCI helper data-stream budget is full; retry this stream"}
+	}, time.Second)
+	var logMu sync.Mutex
+	var logs []string
+	frontDoor.logf = func(format string, args ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+	frontDoor.SetForwarding(true)
+	defer frontDoor.Close()
+	go frontDoor.Serve(t.Context())
+
+	held, err := net.Dial("tcp4", published.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	_ = held.SetDeadline(time.Now().Add(5 * time.Second))
+	echo := func(value byte) {
+		t.Helper()
+		if _, err := held.Write([]byte{value}); err != nil {
+			t.Fatal(err)
+		}
+		var got [1]byte
+		if _, err := io.ReadFull(held, got[:]); err != nil || got[0] != value {
+			t.Fatalf("held tunnel echo = %q, %v", got, err)
+		}
+	}
+	echo('a')
+
+	for index := range 3 {
+		refused, err := net.Dial("tcp4", published.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = refused.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var buffer [1]byte
+		if _, err := refused.Read(buffer[:]); err == nil || isTimeout(err) {
+			t.Fatalf("refused client %d was not closed: %v", index, err)
+		}
+		_ = refused.Close()
+	}
+
+	echo('b')
+	select {
+	case err := <-frontDoor.Errors():
+		t.Fatalf("a connection_limit refusal failed the front door: %v", err)
+	default:
+	}
+	frontDoor.mu.Lock()
+	forwarding := frontDoor.forwarding
+	frontDoor.mu.Unlock()
+	if !forwarding {
+		t.Fatal("a connection_limit refusal stopped forwarding")
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if len(logs) != 1 || !strings.Contains(logs[0], "connection budget is full") {
+		t.Fatalf("connection_limit logs = %q, want exactly one for the burst", logs)
+	}
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// A readiness probe the OCI helper refused for want of a stream slot is
+// inconclusive, not a failed probe: flipping to unready would withdraw
+// publication and sever every client the refusal was protecting (#597).
+func TestOpaqueReadinessTreatsHelperConnectionLimitAsInconclusive(t *testing.T) {
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	started := make(chan struct{})
+	close(started)
+	var mode atomic.Int32 // 0 healthy, 1 connection_limit, 2 service down
+	dial := func(context.Context) (net.Conn, error) {
+		switch mode.Load() {
+		case 1:
+			return nil, &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit, Message: "OCI helper data-stream budget is full; retry this stream"}
+		case 2:
+			return nil, errors.New("service refused the connection")
+		}
+		agentSide, serviceSide := net.Pipe()
+		_ = serviceSide.Close()
+		return agentSide, nil
+	}
+	observed := make(chan bool, 4)
+	outcomes := make(chan serviceRunOutcome, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan opaqueReadinessResult, 1)
+	go func() {
+		done <- monitorOpaqueServiceReadiness(ctx, clock, started, dial, 10*time.Second, time.Second, time.Minute,
+			func(_ bool, ready bool) { observed <- ready }, outcomes)
+	}()
+	wantReady := func(want bool) {
+		t.Helper()
+		select {
+		case got := <-observed:
+			if got != want {
+				t.Fatalf("readiness = %t, want %t", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for readiness=%t", want)
+		}
+	}
+	wantReady(true)
+
+	mode.Store(1)
+	clock.waitForDeadline(t, clock.Now().Add(time.Second))
+	clock.Advance(time.Second)
+	// The next interval timer exists only once the refused probe has finished.
+	clock.waitForDeadline(t, clock.Now().Add(time.Second))
+	select {
+	case got := <-observed:
+		t.Fatalf("a connection_limit probe changed readiness to %t", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	mode.Store(2)
+	clock.Advance(time.Second)
+	wantReady(false)
+	cancel()
+	outcomes <- serviceRunOutcome{}
+	<-done
+}

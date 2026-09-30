@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -366,6 +367,14 @@ func monitorOpaqueServiceReadiness(
 				}
 			}
 			nextReady := probe.err == nil
+			// A connection_limit refusal is the OCI helper out of stream
+			// slots, not the service failing to accept. Reading it as unready
+			// would withdraw publication and close every client connection
+			// the refusal was protecting, so the probe is inconclusive and
+			// readiness stays where it was (#597).
+			if ocihelper.IsConnectionLimitRefusal(probe.err) {
+				nextReady = ready
+			}
 			if nextReady != ready {
 				ready = nextReady
 				if ready {
@@ -401,6 +410,11 @@ type serviceFrontDoor struct {
 	closed     bool
 	active     map[net.Conn]net.Conn
 	closeOnce  sync.Once
+
+	// limitRefusals reports the OCI helper's connection_limit refusals once
+	// per burst; logf is log.Printf outside tests.
+	limitRefusals ocihelper.ConnectionLimitLog
+	logf          func(string, ...any)
 }
 
 func newServiceFrontDoor(
@@ -411,6 +425,7 @@ func newServiceFrontDoor(
 	return &serviceFrontDoor{
 		listener: listener, dial: dial, connectTimeout: connectTimeout,
 		errors: make(chan error, 1), active: make(map[net.Conn]net.Conn),
+		logf: log.Printf,
 	}
 }
 
@@ -471,6 +486,12 @@ func (frontDoor *serviceFrontDoor) forward(ctx context.Context, published net.Co
 	backend, err := frontDoor.dial(dialContext)
 	cancel()
 	if err != nil {
+		// A connection_limit refusal costs this one client its connection
+		// and nothing else: the helper answered, its session and every
+		// attempt on the Node are intact, and no OCI embargo follows (#597).
+		if ocihelper.IsConnectionLimitRefusal(err) {
+			frontDoor.noteConnectionLimit()
+		}
 		_ = published.Close()
 		return
 	}
@@ -504,6 +525,12 @@ func (frontDoor *serviceFrontDoor) forward(ctx context.Context, published net.Co
 	frontDoor.mu.Lock()
 	delete(frontDoor.active, published)
 	frontDoor.mu.Unlock()
+}
+
+func (frontDoor *serviceFrontDoor) noteConnectionLimit() {
+	if report, suppressed := frontDoor.limitRefusals.Note(time.Now()); report {
+		frontDoor.logf("service front door closed a client connection: the OCI helper's connection budget is full (%d more refusals since the last report); the service and every other workload are unaffected", suppressed)
+	}
 }
 
 func closeServiceWrite(connection net.Conn) {

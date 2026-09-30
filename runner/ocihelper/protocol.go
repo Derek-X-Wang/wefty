@@ -127,6 +127,16 @@ const (
 	// the caller learns the bound from the handshake instead of discovering a
 	// closed connection.
 	CodeStartupBoundTripped ErrorCode = "startup_bound_tripped"
+	// CodeConnectionLimit refuses one request because the helper's connection
+	// budget is full: either every connection slot is taken, or the request is
+	// a long-lived data stream (DialAttemptPort, DialHostBridge) and the slots
+	// data streams may hold are taken. It is a fact about Node-wide connection
+	// pressure, never about the session or the runtime: the helper answered on
+	// a fresh connection, nothing was admitted, and the identical request can
+	// succeed once a stream closes. It is therefore never runtime-loss
+	// evidence -- a bare close in its place read as EOF and reaped every OCI
+	// workload on the Node (#597).
+	CodeConnectionLimit ErrorCode = "connection_limit"
 )
 
 // ErrorDetail is a closed, stable token that narrows one ErrorCode without

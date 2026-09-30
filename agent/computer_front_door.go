@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"github.com/coder/websocket"
 )
 
@@ -254,6 +256,9 @@ type computerFrontDoor struct {
 	closedOrder   []string
 	sessionCond   *sync.Cond
 	sessionCount  int
+	// limitRefusals reports the OCI helper's connection_limit refusals of a
+	// view leg once per burst.
+	limitRefusals ocihelper.ConnectionLimitLog
 }
 
 // newComputerFrontDoor deliberately requires the deny-by-default policy cache.
@@ -579,7 +584,16 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	backend, backendWebSocket, banner, err := dialComputerBackend(sessionContext, frontDoor.config.dial, workloadrunner.AttemptEndpointView)
 	if err != nil {
 		frontDoor.recordDenial(request.Context(), identity, l1.ComputerTakeoverViewBackendUnavailable)
-		frontDoor.report(fmt.Errorf("dial Computer view backend: %w", err))
+		// A connection_limit refusal is the OCI helper out of stream slots:
+		// the display is fine and so is the Computer, so this one viewer is
+		// turned away and the attempt keeps running (#597).
+		if ocihelper.IsConnectionLimitRefusal(err) {
+			if report, suppressed := frontDoor.limitRefusals.Note(time.Now()); report {
+				log.Printf("Computer front door refused a take-over view: the OCI helper's connection budget is full (%d more refusals since the last report); the Computer is unaffected", suppressed)
+			}
+		} else {
+			frontDoor.report(fmt.Errorf("dial Computer view backend: %w", err))
+		}
 		http.Error(writer, "Computer display unavailable", http.StatusServiceUnavailable)
 		return
 	}
