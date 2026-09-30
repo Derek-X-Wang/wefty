@@ -91,10 +91,14 @@ const (
 	NodeDead     NodeState = "dead"
 )
 
+// NodeTransitions lists the node liveness transitions. The table cannot carry
+// the boot-session condition on draining → alive: only a new boot session's
+// registration takes it, while the draining boot session re-registering keeps
+// draining (docs/contracts/state-machines.md, Node).
 var NodeTransitions = map[NodeState][]NodeState{
 	NodeAlive:    {NodeStale, NodeDraining, NodeDead},
 	NodeStale:    {NodeAlive, NodeDraining, NodeDead},
-	NodeDraining: {NodeDead},
+	NodeDraining: {NodeAlive, NodeDead},
 	NodeDead:     {NodeAlive},
 }
 

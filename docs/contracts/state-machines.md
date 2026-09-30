@@ -949,8 +949,9 @@ writes `alive`, so the next boot session after a graceful drain returns the
 node to `alive`. The one exception is a drain: a re-registration from the same
 boot session that asked for it keeps `draining`, because that rejoin is the
 draining process itself and must not silently undo its own drain. Heartbeat
-never leaves `draining` or `dead`. The Go `NodeTransitions` table does not yet list
-`draining → alive`; registration writes the state directly. Routing
+never leaves `draining` or `dead`. The Go `NodeTransitions` table lists
+`draining → alive` but cannot express its new-boot-session condition; that
+lives in registration. Routing
 tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness and may atomically replace the current
 boot's full capability observation with a higher Capability revision; it does
