@@ -686,21 +686,27 @@ func TestCapabilityReasonVocabularyMatchesOpenAPIEnums(t *testing.T) {
 	}
 }
 
+// Service-only routes require class=service outright. Job reads serve both
+// classes, so there the selector is conditional (#601): the server demands it
+// for a service job and refuses it for a one-shot, which a required parameter
+// could not express.
 func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 	t.Parallel()
 	doc := readObject(t, "l1-client.v1.json")
 	paths := object(t, doc["paths"], "paths")
 	operations := []struct {
-		path   string
-		method string
+		path     string
+		method   string
+		required bool
 	}{
-		{path: "/v1/jobs", method: "get"},
-		{path: "/v1/jobs/{job_id}", method: "get"},
-		{path: "/v1/jobs/{job_id}/logs", method: "get"},
-		{path: "/v1/jobs/{job_id}/desired-state", method: "put"},
-		{path: "/v1/jobs/{job_id}/restart", method: "post"},
-		{path: "/v1/jobs/{job_id}/remove", method: "post"},
-		{path: "/v1/jobs/{job_id}/forget", method: "post"},
+		{path: "/v1/jobs", method: "get", required: true},
+		{path: "/v1/jobs/{job_id}/desired-state", method: "put", required: true},
+		{path: "/v1/jobs/{job_id}/restart", method: "post", required: true},
+		{path: "/v1/jobs/{job_id}/remove", method: "post", required: true},
+		{path: "/v1/jobs/{job_id}/forget", method: "post", required: true},
+		{path: "/v1/jobs/{job_id}", method: "get", required: false},
+		{path: "/v1/jobs/{job_id}/logs", method: "get", required: false},
+		{path: "/v1/jobs/{job_id}/result", method: "get", required: false},
 	}
 	for _, expected := range operations {
 		path := object(t, paths[expected.path], expected.path)
@@ -716,12 +722,19 @@ func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 				continue
 			}
 			found = true
-			if parameter["required"] != true || parameter["in"] != "query" {
-				t.Fatalf("%s %s class selector = %#v", expected.method, expected.path, parameter)
+			required, _ := parameter["required"].(bool)
+			if required != expected.required || parameter["in"] != "query" {
+				t.Fatalf("%s %s class selector = %#v, want required=%v", expected.method, expected.path, parameter, expected.required)
 			}
 			schema := object(t, parameter["schema"], expected.path+" class schema")
 			if schema["const"] != "service" {
 				t.Fatalf("%s %s class const = %v", expected.method, expected.path, schema["const"])
+			}
+			if !expected.required {
+				description, _ := parameter["description"].(string)
+				if !strings.Contains(description, "service") || !strings.Contains(description, "one-shot") {
+					t.Fatalf("%s %s conditional class selector does not state both rules: %q", expected.method, expected.path, description)
+				}
 			}
 		}
 		if !found {

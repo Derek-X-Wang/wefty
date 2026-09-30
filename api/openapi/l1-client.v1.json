@@ -254,14 +254,14 @@
       ],
       "get": {
         "operationId": "getJob",
-        "summary": "Read service job status",
+        "summary": "Read one job's status",
         "description": "The class selector is mechanically required for a service job and must be absent for a one-shot; an unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found. A request carrying Authorization: Bearer <attempt credential> reads the credential's own job or one of that job's children under exactly that same rule: a service target still requires class=service and a one-shot target still omits it. An attempt credential addressing any other job, or one that does not exist, receives the identical forbidden answer.",
         "security": [
           { "fabricIdentity": [] },
           { "fabricIdentity": [], "attemptCredential": [] }
         ],
         "parameters": [
-          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
+          { "name": "class", "in": "query", "required": false, "schema": { "const": "service" }, "description": "Required, as class=service, when the job is a service; must be absent when it is a one-shot. An unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found." }
         ],
         "responses": {
           "200": {
@@ -341,7 +341,7 @@
         "operationId": "getJobLogs",
         "summary": "Poll ordered job logs",
         "parameters": [
-          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } },
+          { "name": "class", "in": "query", "required": false, "schema": { "const": "service" }, "description": "Required, as class=service, when the job is a service; must be absent when it is a one-shot. An unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found." },
           {
             "name": "cursor",
             "in": "query",
@@ -384,7 +384,10 @@
       "get": {
         "operationId": "getJobResult",
         "summary": "Read the result document the job's latest attempt uploaded",
-        "description": "Authorized exactly as the job's logs are. The row is replaced by a retry and removed with the job, so it answers for the job's latest attempt only.",
+        "description": "Authorized exactly as the job's logs are, including the class selector. The row is replaced by a retry and removed with the job, so it answers for the job's latest attempt only.",
+        "parameters": [
+          { "name": "class", "in": "query", "required": false, "schema": { "const": "service" }, "description": "Required, as class=service, when the job is a service; must be absent when it is a one-shot. An unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found." }
+        ],
         "responses": {
           "200": {
             "description": "The stored result document, or the reason a result that exists on the node did not travel.",
@@ -1100,7 +1103,7 @@
       "post": {
         "operationId": "abortComputerReconfiguration",
         "summary": "Release a reconfiguration stranded on a dead bound Node",
-        "description": "Typed escape hatch for backing_up, resetting, or reimaging. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery.",
+        "description": "Typed escape hatch for a Computer stranded in backing_up, resetting, reimaging, growing, exporting, or importing. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
@@ -1188,7 +1191,7 @@
       "get": {
         "operationId": "listComputerStorageProvenance",
         "summary": "Project Storage provenance, managed custody forks, external taint, and exact removal outcomes",
-        "description": "Returns durable L1 ledger facts only. A committed Custody export or import keeps custody_tainted true even after operator_attested_deleted; each managed branch independently reports removed_reduced versus removed_verified.",
+        "description": "Returns durable L1 ledger facts only. A Custody import, or a Custody export that may have placed bytes outside managed custody, keeps custody_tainted true even after operator_attested_deleted; an export the helper refused before touching the destination (managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount) does not taint; each managed branch independently reports removed_reduced versus removed_verified.",
         "responses": {
           "200": { "description": "Storage provenance and custody graph facts.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageProvenance" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -1313,8 +1316,8 @@
       ],
       "post": {
         "operationId": "cloneComputerBackup",
-        "summary": "Create a stopped Computer with fresh Computer, Storage, and OS identities",
-        "description": "Copies no grants, requires a new name, rejects a smaller destination, fully allocates and expands a larger destination, narrowly rekeys machine-id and SSH host keys, preserves browser profile bytes, and records a Storage provenance custody fork.",
+        "summary": "Create a stopped Computer with fresh Computer and Storage identities and a fresh machine-id",
+        "description": "Copies no grants, requires a new name, rejects a smaller destination, fully allocates and expands a larger destination, rekeys only the machine-id (SSH host keys and every other identity file are copied unchanged), preserves browser profile bytes, and records a Storage provenance custody fork.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["intent_revision", "storage_id", "storage_generation", "name", "disk_bytes", "idempotency_key"],
@@ -1361,7 +1364,7 @@
         } } } },
         "responses": {
           "200": { "description": "Identical Custody export replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
-          "202": { "description": "Custody event committed before external bytes; the branch is already permanently tainted.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "202": { "description": "Custody event committed before external bytes. From here the source Storage counts as custody-tainted, permanently, unless the helper refuses the export before touching the destination (managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount).", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
@@ -1497,7 +1500,7 @@
       "post": {
         "operationId": "removeComputer",
         "summary": "Irreversibly foreclose a Computer's Jobs and attempts",
-        "description": "CAS-records removed intent, revokes live attempt authority, and prevents every existing or future Job projection from being claimed. A bound current Job enters the ordinary durable service-removal directive protocol so authenticated agent cleanup releases its Slot; composite Storage cleanup is a later contract layer.",
+        "description": "CAS-records removed intent, revokes live attempt authority, deletes the Computer's grants, and prevents every existing or future Job projection from being claimed. Removal is composite: L1 plans deletion of every retained Backup copy, and a bound current Job enters the durable service-removal directive protocol, whose authenticated agent cleanup also deletes the Computer's managed Storage (or reports a typed cleanup quarantine) before its Slot is released. When cleanup finishes, or at once when no Node is bound, L1 records removal_outcome: removed_verified, or removed_reduced while another clone branch or external Custody may still hold the Storage's bytes.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
