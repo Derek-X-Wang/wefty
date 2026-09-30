@@ -3470,3 +3470,83 @@ func TestAdapterRetriesRefusedWatchStartUntilASlotFrees(t *testing.T) {
 		t.Fatalf("a refused Watch start asked for OCI runtime recovery %d times", recoveries)
 	}
 }
+
+// Saturation that outlasts any fixed retry budget still does not fail a
+// running attempt: Watch start keeps retrying for as long as the attempt
+// lives, and attaches once a slot frees. A 60 s cap here reaped healthy
+// attempts under sustained pressure (#597 review round 2).
+func TestAdapterWatchStartOutlastsSaturationBeyondAnyFixedBudget(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, _, _, socketPath, closeAdapter := startAdapterTestServerWithConfig(t, engine, ImagePolicy{}, ocihelper.ServerConfig{ConnectionLimit: 4})
+	defer closeAdapter()
+
+	// A fake clock lets each backoff pass at once while time moves on by it,
+	// so minutes of saturation take milliseconds of test.
+	var clockMu sync.Mutex
+	origin := time.Unix(1_700_000_000, 0)
+	fakeNow := origin
+	elapsed := func() time.Duration {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return fakeNow.Sub(origin)
+	}
+	previousClock := connectionLimitClock
+	connectionLimitClock.now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return fakeNow
+	}
+	connectionLimitClock.sleep = func(ctx context.Context, delay time.Duration) bool {
+		clockMu.Lock()
+		fakeNow = fakeNow.Add(delay)
+		clockMu.Unlock()
+		time.Sleep(time.Millisecond)
+		return ctx.Err() == nil
+	}
+	defer func() { connectionLimitClock = previousClock }()
+	const saturation = 3 * connectionLimitRetryBudget / 2
+
+	var held []net.Conn
+	defer func() {
+		for _, connection := range held {
+			_ = connection.Close()
+		}
+	}()
+	released := make(chan time.Duration, 1)
+	request := adapterTestRequest()
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		for range 4 {
+			connection, err := net.Dial("unix", socketPath)
+			if err != nil {
+				return err
+			}
+			held = append(held, connection)
+		}
+		go func() {
+			deadline := time.Now().Add(4 * time.Second)
+			for elapsed() < saturation && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			for _, connection := range held {
+				_ = connection.Close()
+			}
+			released <- elapsed()
+		}()
+		return nil
+	}
+	result, err := adapter.Run(t.Context(), request, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
+	if err != nil {
+		t.Fatalf("saturation beyond the old budget failed the attempt: %v", err)
+	}
+	if result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 || result.Outcome.RuntimeFailure != nil {
+		t.Fatalf("outcome after sustained saturation = %+v", result.Outcome)
+	}
+	if saturated := <-released; saturated < saturation {
+		t.Fatalf("slots were held for only %s of simulated saturation, want at least %s", saturated, saturation)
+	}
+	if recoveries != 0 {
+		t.Fatalf("sustained saturation asked for OCI runtime recovery %d times", recoveries)
+	}
+}

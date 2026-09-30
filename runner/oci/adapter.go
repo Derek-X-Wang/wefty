@@ -1222,9 +1222,10 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	go func() {
 		// A refused Watch start is Node-wide stream pressure, not this
 		// attempt failing: nothing was admitted and no event was delivered,
-		// so it is retried rather than turned into a runtime failure that
-		// reaps a healthy attempt (#597).
-		watchDone <- retryOnConnectionLimit(watchContext, "Watch", connectionLimitRetryBudget, func() error {
+		// so it is retried for as long as the attempt itself lives rather
+		// than turned into a runtime failure that reaps a healthy attempt
+		// (#597).
+		watchDone <- retryWatchStartOnConnectionLimit(watchContext, request.Authority.AttemptID, func() error {
 			return session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 				if event.Seal != nil && request.OCILogSealObserved != nil {
 					request.OCILogSealObserved(workloadrunner.OCILogSealObservation{
@@ -2817,7 +2818,8 @@ const (
 	// connectionLimitRetryBudget bounds how long an RPC on an admitted
 	// attempt keeps retrying the helper's connection_limit refusal before the
 	// refusal is returned to its caller as not done. Every retry is also
-	// bounded by the caller's own context.
+	// bounded by the caller's own context. Watch start on a running attempt
+	// has no budget of its own; see retryWatchStartOnConnectionLimit.
 	connectionLimitRetryBudget = 60 * time.Second
 	// terminationSignalRefusalBudget is the same bound for a stop's TERM and
 	// KILL, which sit inside the service stop budget.
@@ -2840,7 +2842,62 @@ var observeConnectionLimitRetry = func(string) {}
 // other result, when ctx ends, or after budget, and then returns the last
 // result as is: a refusal that outlived the budget still reads as not done.
 func retryOnConnectionLimit(ctx context.Context, operation string, budget time.Duration, call func() error) error {
-	deadline := time.Now().Add(budget)
+	return retryOnConnectionLimitWhile(ctx, operation, budget, nil, call)
+}
+
+// retryWatchStartOnConnectionLimit retries a refused Watch start on a running
+// attempt with no budget of its own. The attempt is running whether or not it
+// is observed, so giving up would only turn Node-wide stream pressure into a
+// runtime failure that reaps it. What ends the wait is what ends the attempt:
+// its context (cancellation, its runtime bound, agent stop) or a Watch result
+// other than a refusal, which includes real session loss and helper shutdown.
+func retryWatchStartOnConnectionLimit(ctx context.Context, attemptID string, call func() error) error {
+	err := retryOnConnectionLimitWhile(ctx, "Watch", 0, func(waited time.Duration) {
+		log.Printf("OCI helper still has no connection slot to observe attempt %s after %s; the attempt keeps running and Watch keeps retrying", attemptID, waited.Round(time.Second))
+	}, call)
+	// A wait the attempt's own context ended reads as that ending, exactly as
+	// an attached Watch would report it, never as the refusal.
+	if ocihelper.IsConnectionLimitRefusal(err) && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// connectionLimitClock is the retry loop's clock; tests replace it to ride out
+// long saturation without waiting for it.
+var connectionLimitClock = struct {
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) bool
+}{
+	now: time.Now,
+	sleep: func(ctx context.Context, delay time.Duration) bool {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		}
+	},
+}
+
+// connectionLimitStillWaitingInterval paces the reminder an unbudgeted retry
+// logs while the refusals last.
+const connectionLimitStillWaitingInterval = 30 * time.Second
+
+// retryOnConnectionLimitWhile repeats call while the helper refuses it with
+// connection_limit, backing off from 100 ms to 1 s. A refusal means the helper
+// admitted nothing -- no signal delivered, no delete done, no event streamed
+// -- so repeating the identical request is always safe. It stops at the first
+// other result, when ctx ends, or after budget when budget is positive, and
+// then returns the last result as is: a refusal that outlived its bound still
+// reads as not done. stillWaiting, when set, is called about every
+// connectionLimitStillWaitingInterval of refusals.
+func retryOnConnectionLimitWhile(ctx context.Context, operation string, budget time.Duration, stillWaiting func(time.Duration), call func() error) error {
+	clock := connectionLimitClock
+	started := clock.now()
+	lastReminder := started
 	backoff := connectionLimitRetryInitial
 	for {
 		err := call()
@@ -2848,19 +2905,23 @@ func retryOnConnectionLimit(ctx context.Context, operation string, budget time.D
 			return err
 		}
 		observeConnectionLimitRetry(operation)
-		if report, suppressed := connectionLimitRetries.Note(time.Now()); report {
-			log.Printf("OCI helper refused %s for want of a connection slot (%d more refusals since the last report); retrying for up to %s", operation, suppressed, budget)
+		now := clock.now()
+		if report, suppressed := connectionLimitRetries.Note(now); report {
+			log.Printf("OCI helper refused %s for want of a connection slot (%d more refusals since the last report); retrying", operation, suppressed)
 		}
-		wait := min(backoff, time.Until(deadline))
-		if wait <= 0 {
-			return err
+		if stillWaiting != nil && now.Sub(lastReminder) >= connectionLimitStillWaitingInterval {
+			lastReminder = now
+			stillWaiting(now.Sub(started))
 		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		wait := backoff
+		if budget > 0 {
+			wait = min(wait, started.Add(budget).Sub(now))
+			if wait <= 0 {
+				return err
+			}
+		}
+		if !clock.sleep(ctx, wait) {
 			return err
-		case <-timer.C:
 		}
 		backoff = min(2*backoff, connectionLimitRetryCeiling)
 	}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -317,4 +318,56 @@ func TestConnectionLimitLogReportsOncePerBurst(t *testing.T) {
 	if report, _ := burst.Note(now.Add(connectionLimitBurstQuiet)); !report {
 		t.Fatal("a new burst after a quiet gap was not reported")
 	}
+}
+
+// Honest overload -- many real agent requests while every slot is taken --
+// is answered at once: each request's frame is already on the wire, so a
+// refusal worker is busy for microseconds and the accept loop's wait for one
+// is just as short. Only a silent peer, which can only be an allowlisted and
+// therefore trusted one, can make that wait approach the refusal deadline.
+// A burst far wider than the refusal budget must therefore get every typed
+// answer well inside a Signal's one-second delivery bound.
+func TestHonestOverloadIsAnsweredWellInsideTheSignalDeadline(t *testing.T) {
+	engine, session, authority := startHoldingSession(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
+	generation := session.Handshake().SessionGeneration
+	_ = holdStreams(t, session, authority, 5)
+
+	const requests = 8 * connectionLimitRefusalBudget
+	const bound = 250 * time.Millisecond // a quarter of the 1 s signal deadline
+	latencies := make(chan time.Duration, requests)
+	failures := make(chan error, requests)
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	for range requests {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			began := time.Now()
+			err := session.Signal(ctx, SignalRequest{Authority: authority, Signal: SignalTERM})
+			latencies <- time.Since(began)
+			if !IsConnectionLimitRefusal(err) {
+				failures <- err
+			}
+		}()
+	}
+	start.Done()
+	done.Wait()
+	close(latencies)
+	close(failures)
+	for err := range failures {
+		t.Fatalf("a request under honest overload got %v, want a typed connection_limit refusal", err)
+	}
+	var slowest time.Duration
+	for latency := range latencies {
+		slowest = max(slowest, latency)
+	}
+	if slowest >= bound {
+		t.Fatalf("the slowest of %d refusals took %s, want under %s", requests, slowest, bound)
+	}
+	t.Logf("slowest of %d refusals under honest overload: %s", requests, slowest)
+	requireSessionSurvived(t, engine, session, generation)
 }

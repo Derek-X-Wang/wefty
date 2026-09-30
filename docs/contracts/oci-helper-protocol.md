@@ -227,6 +227,17 @@ loop waits for a worker or a slot instead of closing; each worker finishes
 within its deadline, so later connections wait in the kernel backlog and the
 client sees latency, not EOF.
 
+The threat model for this path is explicit. Peers on the UID allowlist -- root
+and the agent's own UID -- are trusted: they can already stop the helper
+outright, so the refusal path does not defend against them. It defends against
+foreign local peers, which are closed before they hold anything, and against
+honest overload. Under honest overload every request's frame is already on the
+wire, so a refusal worker is busy for microseconds and a burst far wider than
+the 8 workers is answered within milliseconds. That is well inside the agent's
+one-second signal delivery bound, past which an unanswered signal is read as
+runtime loss. Only a silent peer can hold a worker for its full deadline and
+stretch that wait, and a silent allowlisted peer is outside this model.
+
 The closed wire error-code vocabulary is `invalid_request`,
 `peer_unauthenticated`, `version_mismatch`, `checksum_mismatch`, `session_busy`,
 `session_stale`, `computer_storage_busy`, `computer_storage_retired`,
@@ -280,7 +291,13 @@ clients the budget protects. An RPC on an admitted attempt that must not fail
 for want of a slot -- `Watch` start, `Signal`, `Delete`, clearing the driver
 signal, and `SetComputerToken` -- is retried with backoff from 100 ms to 1 s
 for up to 60 s, and for up to 5 s for a stop's TERM and KILL, each also bounded
-by its caller's context. A refusal admitted nothing, so the retry is always
+by its caller's context. `Watch` start on a running attempt has no budget of
+its own. The attempt runs whether or not it is observed, so the retry lasts as
+long as the attempt does: its context (cancellation, its runtime bound, agent
+stop) or a `Watch` result other than a refusal, such as real session loss,
+ends it. A still-refused `Watch` is never turned into a runtime failure. It is
+logged once per burst, with a reminder every 30 s that the attempt is still
+unobserved. A refusal admitted nothing, so the retry is always
 safe. A refusal that outlives its bound is returned as not done -- a signal not
 delivered, a delete not performed -- and never as done or as runtime loss. A
 refused `Run` is a definitive rejection: nothing was admitted, so no `Delete`
