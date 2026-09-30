@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"time"
-
-	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // logRetentionLimits are the #52 bounds beside #49's service bounds: one-shot
@@ -51,16 +49,41 @@ func resolveLogRetentionLimits(options StoreOptions) (logRetentionLimits, error)
 const (
 	// logEvictionBatch is how many candidate rows one query materializes.
 	logEvictionBatch = 512
-	// logRetentionSweepEventBudget bounds the cross-job evictions (one-shot
-	// age plus the total ceiling) in one reconcile pass, so a large backlog
-	// is worked off across passes instead of stalling the transaction every
-	// other L1 transition waits behind.
-	logRetentionSweepEventBudget = 4096
+	// The reconcile sweep evicts at most this much per pass across every
+	// bound and every job, so a backlog (an upgrade, a lowered cap) is worked
+	// off across passes instead of holding the write transaction that
+	// renewals, claims and completions wait behind.
+	sweepEvictionEvents       = 4096
+	sweepEvictionBytes  int64 = 64 << 20
+	// An append transaction evicts at most twice what one batch can add
+	// (MaxLogBatchEvents events inside a MaxLogUploadBodyBytes body), so a job
+	// at its cap stays there under steady ingest; anything left over is the
+	// sweep's.
+	appendEvictionEvents       = 2 * MaxLogBatchEvents
+	appendEvictionBytes  int64 = 2 * MaxLogUploadBodyBytes
 	// oneshotByteSweepJobBudget bounds how many over-cap one-shots one pass
-	// re-trims. Ingest is the mandatory byte site; this only catches a job
-	// left over a lowered cap after restart.
+	// looks at. Ingest is the first byte site; this catches a job left over a
+	// lowered cap or an append-bounded backlog.
 	oneshotByteSweepJobBudget = 16
 )
+
+// evictionBudget is what one transaction may still delete.
+type evictionBudget struct {
+	events int
+	bytes  int64
+}
+
+func sweepEvictionBudget() *evictionBudget {
+	return &evictionBudget{events: sweepEvictionEvents, bytes: sweepEvictionBytes}
+}
+
+func appendEvictionBudget() *evictionBudget {
+	return &evictionBudget{events: appendEvictionEvents, bytes: appendEvictionBytes}
+}
+
+func (budget *evictionBudget) exhausted() bool {
+	return budget.events <= 0 || budget.bytes <= 0
+}
 
 type logRetentionStats struct {
 	events         int64
@@ -82,18 +105,6 @@ type logEvictionCandidate struct {
 	bytes   int64
 }
 
-// liveWatermarkExclusion keeps the newest row for every stream of a
-// non-terminal attempt: it is the provenance watermark continuity is checked
-// against, so no retention bound may evict it. Sequences only grow within a
-// stream, so the newest row is the one with the highest sequence.
-const liveWatermarkExclusion = ` AND NOT EXISTS (
-		SELECT 1 FROM attempts live
-		WHERE live.attempt_id=e.attempt_id AND live.state IN (?, ?, ?)
-			AND e.sequence=(SELECT MAX(w.sequence) FROM log_events w WHERE w.attempt_id=e.attempt_id AND w.stream=e.stream)
-	)`
-
-var liveWatermarkStates = []any{contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput}
-
 func jobIsService(ctx context.Context, q queryer, jobID string) (bool, error) {
 	var service bool
 	if err := q.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM service_jobs WHERE job_id=?)", jobID).Scan(&service); err != nil {
@@ -102,10 +113,11 @@ func jobIsService(ctx context.Context, q queryer, jobID string) (bool, error) {
 	return service, nil
 }
 
-// enforceJobLogByteRetention applies the per-job byte cap of the job's class.
-// It runs inside the same immediate transaction that accepts a batch, and the
-// sweep applies it again so a lowered cap binds an idle job after restart.
-func (s *Store) enforceJobLogByteRetention(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) (logRetentionStats, error) {
+// enforceJobLogByteRetention applies the per-job byte cap of the job's class
+// within budget. The append transaction calls it with a bounded budget; the
+// sweep calls it again so a lowered cap, or what an append left over, is
+// worked off an idle job too.
+func (s *Store) enforceJobLogByteRetention(ctx context.Context, tx *sql.Tx, jobID string, now time.Time, budget *evictionBudget) (logRetentionStats, error) {
 	service, err := jobIsService(ctx, tx, jobID)
 	if err != nil {
 		return logRetentionStats{}, err
@@ -125,31 +137,11 @@ func (s *Store) enforceJobLogByteRetention(ctx context.Context, tx *sql.Tx, jobI
 		}
 		return logRetentionStats{}, nil
 	}
-
-	stats := logRetentionStats{}
-	for retainedBytes > limit {
-		candidates, err := logEvictionCandidates(ctx, tx, jobID, "", logEvictionBatch)
-		if err != nil {
-			return logRetentionStats{}, err
-		}
-		before := stats.events
-		for _, candidate := range candidates {
-			if retainedBytes <= limit {
-				break
-			}
-			if err := deleteLogEvent(ctx, tx, candidate, &stats); err != nil {
-				return logRetentionStats{}, err
-			}
-			retainedBytes -= candidate.bytes
-		}
-		if len(candidates) < logEvictionBatch || stats.events == before {
-			break
-		}
-	}
-	if err := recordLogTruncation(ctx, tx, jobID, LogRetentionBytes, stats, now); err != nil {
+	perJob := map[string]*logRetentionStats{}
+	if err := evictLogEvents(ctx, tx, jobID, "", nil, budget, retainedBytes-limit, perJob); err != nil {
 		return logRetentionStats{}, err
 	}
-	return stats, nil
+	return recordLogTruncations(ctx, tx, perJob, LogRetentionBytes, now)
 }
 
 func refreshLogTruncation(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) error {
@@ -166,141 +158,115 @@ func refreshLogTruncation(ctx context.Context, tx *sql.Tx, jobID string, now tim
 // enforceServiceLogAgeRetention is #49's per-service age sweep. Services are
 // few and each is walked; one-shots are many and kept forever as records, so
 // their age bound walks the timestamp index instead (enforceOneshotLogRetention).
-func (s *Store) enforceServiceLogAgeRetention(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) (logRetentionStats, error) {
+func (s *Store) enforceServiceLogAgeRetention(ctx context.Context, tx *sql.Tx, jobID string, now time.Time, budget *evictionBudget) (logRetentionStats, error) {
 	cutoff := now.Add(-s.serviceLogRetentionAge).UnixNano()
-	stats := logRetentionStats{}
-	for {
-		candidates, err := logEvictionCandidates(ctx, tx, jobID, " AND e.timestamp_ns < ?", logEvictionBatch, cutoff)
-		if err != nil {
-			return logRetentionStats{}, err
-		}
-		before := stats.events
-		for _, candidate := range candidates {
-			if err := deleteLogEvent(ctx, tx, candidate, &stats); err != nil {
-				return logRetentionStats{}, err
-			}
-		}
-		if len(candidates) < logEvictionBatch || stats.events == before {
-			break
-		}
-	}
-	if err := recordLogTruncation(ctx, tx, jobID, LogRetentionAge, stats, now); err != nil {
+	perJob := map[string]*logRetentionStats{}
+	if err := evictLogEvents(ctx, tx, jobID, " AND e.timestamp_ns < ?", []any{cutoff}, budget, -1, perJob); err != nil {
 		return logRetentionStats{}, err
 	}
-	return stats, nil
+	return recordLogTruncations(ctx, tx, perJob, LogRetentionAge, now)
 }
 
-// enforceOneshotLogRetention is the sweep's one-shot half: a bounded re-trim
-// of one-shots over their per-job cap, then age eviction oldest-first by each
-// event's own timestamp across every one-shot, within budget events.
-func (s *Store) enforceOneshotLogRetention(ctx context.Context, tx *sql.Tx, now time.Time, budget int) (logRetentionStats, int, error) {
+// enforceOneshotLogRetention is the sweep's one-shot half: a re-trim of
+// one-shots over their per-job cap, then age eviction oldest-first by each
+// event's own timestamp across every one-shot, all within budget.
+func (s *Store) enforceOneshotLogRetention(ctx context.Context, tx *sql.Tx, now time.Time, budget *evictionBudget) (logRetentionStats, error) {
 	total := logRetentionStats{}
+	if budget.exhausted() {
+		return total, nil
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT u.job_id FROM job_log_usage u
 		WHERE u.retained_bytes > ?
 			AND NOT EXISTS (SELECT 1 FROM service_jobs sj WHERE sj.job_id=u.job_id)
 		ORDER BY u.retained_bytes DESC, u.job_id LIMIT ?`, s.logRetention.oneshotBytes, oneshotByteSweepJobBudget)
 	if err != nil {
-		return logRetentionStats{}, budget, internalError(err, "select one-shots over their log byte cap")
+		return logRetentionStats{}, internalError(err, "select one-shots over their log byte cap")
 	}
 	overCap, err := scanJobIDs(rows, "one-shot over its log byte cap")
 	if err != nil {
-		return logRetentionStats{}, budget, err
+		return logRetentionStats{}, err
 	}
 	for _, jobID := range overCap {
-		stats, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now)
+		stats, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, budget)
 		if err != nil {
-			return logRetentionStats{}, budget, err
+			return logRetentionStats{}, err
 		}
 		total.add(stats)
 	}
 
 	cutoff := now.Add(-s.logRetention.oneshotAge).UnixNano()
 	perJob := map[string]*logRetentionStats{}
-	for budget > 0 {
-		candidates, err := logEvictionCandidates(ctx, tx, "", ` AND e.timestamp_ns < ?
-			AND NOT EXISTS (SELECT 1 FROM service_jobs sj WHERE sj.job_id=e.job_id)`, min(budget, logEvictionBatch), cutoff)
-		if err != nil {
-			return logRetentionStats{}, budget, err
-		}
-		evicted, err := deleteLogEventsForJobs(ctx, tx, candidates, perJob, -1)
-		if err != nil {
-			return logRetentionStats{}, budget, err
-		}
-		budget -= evicted
-		if len(candidates) < logEvictionBatch || evicted == 0 {
-			break
-		}
+	if err := evictLogEvents(ctx, tx, "", ` AND e.timestamp_ns < ?
+		AND NOT EXISTS (SELECT 1 FROM service_jobs sj WHERE sj.job_id=e.job_id)`, []any{cutoff}, budget, -1, perJob); err != nil {
+		return logRetentionStats{}, err
 	}
 	stats, err := recordLogTruncations(ctx, tx, perJob, LogRetentionAge, now)
 	if err != nil {
-		return logRetentionStats{}, budget, err
+		return logRetentionStats{}, err
 	}
 	total.add(stats)
-	return total, budget, nil
+	return total, nil
 }
 
 // enforceLogRetentionTotal applies the cluster-wide ceiling to every job's
 // logs, one-shot and service alike: while the maintained total exceeds it,
-// the oldest events by their own timestamp go first, within budget events.
-func (s *Store) enforceLogRetentionTotal(ctx context.Context, tx *sql.Tx, now time.Time, budget int) (logRetentionStats, error) {
+// the oldest events by their own timestamp go first, within budget.
+func (s *Store) enforceLogRetentionTotal(ctx context.Context, tx *sql.Tx, now time.Time, budget *evictionBudget) (logRetentionStats, error) {
 	var retained int64
 	err := tx.QueryRowContext(ctx, "SELECT retained_bytes FROM log_usage_total WHERE singleton=1").Scan(&retained)
 	if err != nil {
 		return logRetentionStats{}, internalError(err, "measure total retained log bytes")
 	}
 	excess := retained - s.logRetention.totalBytes
+	if excess <= 0 {
+		return logRetentionStats{}, nil
+	}
 	perJob := map[string]*logRetentionStats{}
-	for excess > 0 && budget > 0 {
-		candidates, err := logEvictionCandidates(ctx, tx, "", "", min(budget, logEvictionBatch))
-		if err != nil {
-			return logRetentionStats{}, err
-		}
-		before := sumEvictedBytes(perJob)
-		evicted, err := deleteLogEventsForJobs(ctx, tx, candidates, perJob, excess)
-		if err != nil {
-			return logRetentionStats{}, err
-		}
-		budget -= evicted
-		excess -= sumEvictedBytes(perJob) - before
-		if len(candidates) < logEvictionBatch || evicted == 0 {
-			break
-		}
+	if err := evictLogEvents(ctx, tx, "", "", nil, budget, excess, perJob); err != nil {
+		return logRetentionStats{}, err
 	}
 	return recordLogTruncations(ctx, tx, perJob, LogRetentionTotal, now)
 }
 
-func sumEvictedBytes(perJob map[string]*logRetentionStats) int64 {
-	var total int64
-	for _, stats := range perJob {
-		total += stats.bytes
-	}
-	return total
-}
-
-// deleteLogEventsForJobs evicts candidates in order, attributing each to its
-// job, and stops once byteTarget bytes are gone (a negative target means all).
-func deleteLogEventsForJobs(ctx context.Context, tx *sql.Tx, candidates []logEvictionCandidate, perJob map[string]*logRetentionStats, byteTarget int64) (int, error) {
-	evicted := 0
+// evictLogEvents deletes matching rows oldest-first, attributing each to its
+// job, until byteTarget bytes are gone (negative: every matching row) or the
+// budget is spent. Any row may go: upload continuity lives in
+// log_stream_continuity, never in the retained rows.
+func evictLogEvents(ctx context.Context, tx *sql.Tx, jobID, extraPredicate string, args []any, budget *evictionBudget, byteTarget int64, perJob map[string]*logRetentionStats) error {
 	var freed int64
-	for _, candidate := range candidates {
-		if byteTarget >= 0 && freed >= byteTarget {
-			break
+	done := func() bool { return budget.exhausted() || (byteTarget >= 0 && freed >= byteTarget) }
+	for !done() {
+		limit := min(budget.events, logEvictionBatch)
+		candidates, err := logEvictionCandidates(ctx, tx, jobID, extraPredicate, limit, args...)
+		if err != nil {
+			return err
 		}
-		stats := perJob[candidate.jobID]
-		if stats == nil {
-			stats = &logRetentionStats{}
-			perJob[candidate.jobID] = stats
+		deleted := 0
+		for _, candidate := range candidates {
+			if done() {
+				return nil
+			}
+			stats := perJob[candidate.jobID]
+			if stats == nil {
+				stats = &logRetentionStats{}
+				perJob[candidate.jobID] = stats
+			}
+			before := stats.events
+			if err := deleteLogEvent(ctx, tx, candidate, stats); err != nil {
+				return err
+			}
+			if stats.events > before {
+				deleted++
+				freed += candidate.bytes
+				budget.events--
+				budget.bytes -= candidate.bytes
+			}
 		}
-		before := stats.events
-		if err := deleteLogEvent(ctx, tx, candidate, stats); err != nil {
-			return evicted, err
-		}
-		if stats.events > before {
-			evicted++
-			freed += candidate.bytes
+		if len(candidates) < limit || deleted == 0 {
+			return nil
 		}
 	}
-	return evicted, nil
+	return nil
 }
 
 func recordLogTruncations(ctx context.Context, tx *sql.Tx, perJob map[string]*logRetentionStats, bound LogRetentionBound, now time.Time) (logRetentionStats, error) {
@@ -319,9 +285,8 @@ func recordLogTruncations(ctx context.Context, tx *sql.Tx, perJob map[string]*lo
 	return total, nil
 }
 
-// logEvictionCandidates lists evictable rows oldest-first, never a live
-// attempt's per-stream watermark. With a jobID it walks that job in insertion
-// order; without one it walks every job by event timestamp.
+// logEvictionCandidates lists rows oldest-first. With a jobID it walks that
+// job in insertion order; without one it walks every job by event timestamp.
 func logEvictionCandidates(ctx context.Context, tx *sql.Tx, jobID, extraPredicate string, limit int, args ...any) ([]logEvictionCandidate, error) {
 	query := `SELECT e.ordinal, e.job_id, LENGTH(e.bytes) FROM log_events e WHERE `
 	queryArgs := []any{}
@@ -333,9 +298,8 @@ func logEvictionCandidates(ctx context.Context, tx *sql.Tx, jobID, extraPredicat
 	} else {
 		query += `1=1`
 	}
-	query += extraPredicate + liveWatermarkExclusion + order + ` LIMIT ?`
+	query += extraPredicate + order + ` LIMIT ?`
 	queryArgs = append(queryArgs, args...)
-	queryArgs = append(queryArgs, liveWatermarkStates...)
 	queryArgs = append(queryArgs, limit)
 	rows, err := tx.QueryContext(ctx, query, queryArgs...)
 	if err != nil {

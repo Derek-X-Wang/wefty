@@ -936,6 +936,15 @@ CREATE INDEX IF NOT EXISTS log_events_job_order ON log_events(job_id, ordinal);
 -- Oldest-first eviction across jobs (the one-shot age bound and the
 -- cluster-wide ceiling) walks this index instead of every job.
 CREATE INDEX IF NOT EXISTS log_events_age_order ON log_events(timestamp_ns, ordinal);
+-- The highest sequence accepted per attempt stream. Upload continuity and
+-- replay idempotency read it, never the retained log_events rows, so log
+-- retention may delete any row.
+CREATE TABLE IF NOT EXISTS log_stream_continuity (
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+  stream TEXT NOT NULL,
+  accepted_through INTEGER NOT NULL CHECK(accepted_through >= 0),
+  PRIMARY KEY(attempt_id, stream)
+) WITHOUT ROWID;
 -- job_results holds one result document per job: the run's own verdict,
 -- uploaded by the node that produced it. It is one row, not a log: a retry
 -- replaces it, because the result of a job is whatever its latest attempt
@@ -1033,8 +1042,17 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 );
 INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
+	continuityExisted, err := s.logContinuityTableExists(ctx)
+	if err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if !continuityExisted {
+		if err := s.seedLogContinuity(ctx); err != nil {
+			return err
+		}
 	}
 	if err := s.migrateServiceLogTruncations(ctx); err != nil {
 		return err
@@ -3460,9 +3478,11 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		raw         []byte
 	}
 	seen := make(map[eventKey][]byte, len(request.Events))
-	streams := make(map[contract.LogStream]struct{}, 2)
+	// recorded is each stream's durable high-water mark before this batch;
+	// next is the sequence this batch must continue with. Neither reads the
+	// retained rows, which log retention may already have deleted.
+	recorded := make(map[contract.LogStream]int64, 2)
 	next := make(map[contract.LogStream]int64, 2)
-	acknowledged := make(map[contract.LogStream]uint64, 2)
 	newEvents := make([]preparedEvent, 0, len(request.Events))
 
 	for _, input := range request.Events {
@@ -3483,7 +3503,6 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 			return AppendLogsResponse{}, internalError(err, "encode log event")
 		}
 		key := eventKey{stream: event.Stream, sequence: event.Sequence}
-		streams[event.Stream] = struct{}{}
 		if prior, ok := seen[key]; ok {
 			if !bytes.Equal(prior, raw) {
 				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts within the batch", event.Stream, event.Sequence)
@@ -3492,41 +3511,48 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		}
 		seen[key] = raw
 
-		var stored []byte
-		err = tx.QueryRowContext(ctx, "SELECT event_json FROM log_events WHERE attempt_id=? AND stream=? AND sequence=?", attemptID, event.Stream, event.Sequence).Scan(&stored)
-		switch {
-		case err == nil:
-			if !bytes.Equal(stored, originalRaw) && !bytes.Equal(stored, raw) {
-				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts with the accepted event", event.Stream, event.Sequence)
+		through, ok := recorded[event.Stream]
+		if !ok {
+			through, err = readLogContinuity(ctx, tx, attemptID, event.Stream)
+			if err != nil {
+				return AppendLogsResponse{}, err
 			}
-			acknowledged[event.Stream] = maxSequence(acknowledged[event.Stream], event.Sequence)
+			recorded[event.Stream] = through
+		}
+		endSequence := logEventEndSequence(event)
+		if int64(event.Sequence) <= through {
+			// A replay of an accepted range. Content is compared wherever the
+			// accepted row is still retained; once retention has deleted it,
+			// the recorded high-water mark alone answers the replay.
+			if int64(endSequence) > through {
+				return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s event %d..%d extends past the accepted sequence %d", event.Stream, event.Sequence, endSequence, through)
+			}
+			if err := checkRetainedLogReplay(ctx, tx, attemptID, event, originalRaw, raw); err != nil {
+				return AppendLogsResponse{}, err
+			}
 			continue
-		case !errors.Is(err, sql.ErrNoRows):
-			return AppendLogsResponse{}, internalError(err, "read accepted log event")
 		}
 
 		expected, ok := next[event.Stream]
 		if !ok {
-			var maximum int64
-			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence_end), -1) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, event.Stream).Scan(&maximum); err != nil {
-				return AppendLogsResponse{}, internalError(err, "read log sequence acknowledgement")
-			}
-			expected = maximum + 1
+			expected = through + 1
 		}
 		if int64(event.Sequence) != expected {
 			return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s expected sequence %d, got %d", event.Stream, expected, event.Sequence)
 		}
-		endSequence := logEventEndSequence(event)
 		next[event.Stream] = int64(endSequence) + 1
-		acknowledged[event.Stream] = endSequence
 		newEvents = append(newEvents, preparedEvent{event: event, endSequence: endSequence, raw: raw})
+	}
+	acknowledged := make(map[contract.LogStream]uint64, len(recorded))
+	for stream, through := range recorded {
+		if following, ok := next[stream]; ok {
+			through = following - 1
+		}
+		acknowledged[stream] = uint64(through)
 	}
 
 	// Already-accepted events remain replayable after authority loss.
 	if len(newEvents) == 0 {
-		if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
-			return AppendLogsResponse{}, err
-		}
 		if err := tx.Commit(); err != nil {
 			return AppendLogsResponse{}, internalError(err, "commit log replay")
 		}
@@ -3548,6 +3574,11 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 			return AppendLogsResponse{}, internalError(err, "store log event")
 		}
 	}
+	for stream, following := range next {
+		if err := recordLogContinuity(ctx, tx, attemptID, stream, uint64(following-1)); err != nil {
+			return AppendLogsResponse{}, err
+		}
+	}
 	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
@@ -3564,30 +3595,16 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
 		attempt.state = contract.AttemptRunning
 	}
-	if _, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now); err != nil {
+	if _, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, appendEvictionBudget()); err != nil {
 		return AppendLogsResponse{}, err
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
-		return AppendLogsResponse{}, err
-	}
-	if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
 		return AppendLogsResponse{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return AppendLogsResponse{}, internalError(err, "commit log append")
 	}
 	return AppendLogsResponse{Acknowledged: acknowledged, AttemptState: attempt.state}, nil
-}
-
-func readLogAcknowledgements(ctx context.Context, q queryer, attemptID string, streams map[contract.LogStream]struct{}, acknowledgements map[contract.LogStream]uint64) error {
-	for stream := range streams {
-		var maximum int64
-		if err := q.QueryRowContext(ctx, "SELECT MAX(sequence_end) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, stream).Scan(&maximum); err != nil {
-			return internalError(err, "read log acknowledgement")
-		}
-		acknowledgements[stream] = uint64(maximum)
-	}
-	return nil
 }
 
 // GetJobLogs returns one polling page after an opaque reader cursor. The

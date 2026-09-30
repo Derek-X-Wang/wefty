@@ -271,6 +271,19 @@ func newIntegrationHarnessWithPersonIdentityMode(
 	allowSelfAsserted bool,
 ) *integrationHarness {
 	t.Helper()
+	return newIntegrationHarnessWithReconcileInterval(t, options, policies, allowSelfAsserted, 0)
+}
+
+// newIntegrationHarnessWithReconcileInterval lets a test that counts what one
+// transaction did keep the background reconcile loop out of its window.
+func newIntegrationHarnessWithReconcileInterval(
+	t *testing.T,
+	options StoreOptions,
+	policies map[string]NodePolicy,
+	allowSelfAsserted bool,
+	reconcileInterval time.Duration,
+) *integrationHarness {
+	t.Helper()
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
@@ -284,6 +297,7 @@ func newIntegrationHarnessWithPersonIdentityMode(
 	}
 	server, err := NewServer(serverFabric, store, ServerConfig{
 		NodePolicies: policies, AllowSelfAssertedPersonIdentities: allowSelfAsserted,
+		ReconcileInterval: reconcileInterval,
 	})
 	if err != nil {
 		store.Close()

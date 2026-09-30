@@ -292,10 +292,10 @@ flag, measured in raw payload bytes (`LENGTH(bytes)`, not the stored JSON):
 
 Whichever bound binds first trims oldest-first: per-job bounds in insertion
 order within the job, the one-shot age bound and the total ceiling by event
-timestamp across jobs. Trimmed bytes are deleted, not archived. No bound ever
-evicts the newest row for a stream of a claimed, running, or awaiting-input
-attempt: it is the provenance watermark continuity is checked against, so a
-live stream keeps accepting in-sequence batches however far it was trimmed.
+timestamp across jobs. Trimmed bytes are deleted, not archived. Any row may
+be evicted, including a live attempt's newest row per stream and rows of a
+`lost` attempt still inside its late-evidence window, because upload
+continuity does not live in the retained rows (see "Log upload continuity").
 
 Per-job and total retained bytes are trigger-maintained counters over
 `log_events` (`job_log_usage`, `log_usage_total`), so neither the append path
@@ -303,9 +303,15 @@ nor the sweep sums the table. Services are few and are swept job by job, as
 before. One-shots are kept as records forever and are never walked: the sweep
 re-trims only one-shots the usage index shows over their cap (at most 16 per
 pass), and one-shot age and the total ceiling walk the `(timestamp_ns,
-ordinal)` index with at most 4096 evictions per pass between them, so a
-backlog is worked off across passes instead of stalling the reconcile
-transaction.
+ordinal)` index.
+
+Every eviction is budgeted, so a backlog (an upgraded database, a lowered cap)
+is worked off in pieces instead of holding the write transaction that
+renewals, claims, and completions wait behind. One reconcile pass evicts at
+most 4096 rows and 64 MiB across every bound and every job together; the next
+pass continues. An append transaction evicts at most 512 rows and 40 MiB,
+twice what one batch can add, so a job at its cap stays there under steady
+ingest, and anything beyond that is left to the sweep.
 
 A trimmed job carries one aggregate `LogTruncation` marker
 (`job_log_truncations`) on every log page, one-shot and service alike, so
@@ -316,6 +322,36 @@ grow; `earliest_retained_at` is null once nothing remains. It is distinct from
 #49's service-only `service_log_truncations`, whose rows an existing database
 carries over on first open; the wire shape is unchanged and `ServiceLogTruncation`
 remains an alias of `LogTruncation` in the OpenAPI.
+
+## Log upload continuity
+
+Upload continuity and replay idempotency are durable and independent of
+retention. In the append transaction L1 records, per (attempt, stream), the
+highest sequence it has accepted (`log_stream_continuity`). Every check reads
+that record, never the retained rows:
+
+- An event whose sequence is past the record must be exactly the next one;
+  any other sequence is `conflict` (`expected sequence N, got M`).
+- An event whose whole range is at or below the record is a replay of an
+  accepted range and is acknowledged. Its content is compared only where the
+  accepted row is still retained: a retained row with the same key and
+  different content, or a retained multi-sequence row that covers it without
+  starting at it, is `idempotency_conflict`. Once retention has deleted the
+  row, the record alone answers the replay, and L1 cannot detect a replay
+  whose content differs from what it accepted.
+- An event that starts at or below the record and ends past it is `conflict`.
+- The acknowledgement for each stream in the batch is the record after the
+  batch.
+
+So an identical retry of a batch whose response was lost is acknowledged even
+when the same append transaction evicted it, and a `lost` attempt continues
+where it stopped for its whole late-evidence window, however much of it
+retention has deleted. On the first open of a database that predates the
+record, L1 seeds it from the highest retained sequence per attempt stream. #49
+never evicted a live attempt's newest row per stream, so every stream that can
+still grow is seeded exactly; a stream whose rows were all evicted before the
+upgrade belonged to an attempt that was no longer live, gets no record, and
+behaves as it did before.
 
 ## OCI image, start, and pre-start retry truth
 

@@ -93,16 +93,20 @@ func TestOneshotLogAgeRetentionRunsFromReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := getJobLogPage(t, h, client, job.JobID)
-	if len(page.Events) != 2 || page.Events[0].Stream != contract.LogStderr || string(page.Events[1].Bytes) != "fresh" {
-		t.Fatalf("one-shot events after live age sweep = %#v, want the stderr watermark and the fresh stdout event", page.Events)
+	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "fresh" {
+		t.Fatalf("one-shot events after live age sweep = %#v, want only the fresh stdout event", page.Events)
 	}
 	if page.Truncation == nil || page.Truncation.BoundKind != LogRetentionAge ||
-		page.Truncation.EvictedEventCount != 2 || page.Truncation.EvictedByteCount != 10 {
+		page.Truncation.EvictedEventCount != 3 || page.Truncation.EvictedByteCount != 17 {
 		t.Fatalf("one-shot age truncation marker = %#v", page.Truncation)
 	}
-	if page.Truncation.EarliestRetainedAt == nil || !page.Truncation.EarliestRetainedAt.Equal(events[1].Timestamp) {
-		t.Fatalf("earliest retained = %v, want the stderr watermark's %s", page.Truncation.EarliestRetainedAt, events[1].Timestamp)
+	if page.Truncation.EarliestRetainedAt == nil || !page.Truncation.EarliestRetainedAt.Equal(events[3].Timestamp) {
+		t.Fatalf("earliest retained = %v, want %s", page.Truncation.EarliestRetainedAt, events[3].Timestamp)
 	}
+	// The live stderr stream lost its only row, and still continues at 1.
+	nextErr := logEvent(claim.Lease.AttemptID, contract.LogStderr, 1, []byte("err-1"))
+	nextErr.Timestamp = now
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{nextErr})
 	assertRetainedRawBytes(t, h, serviceJob.JobID, 14)
 
 	exitCode := 0
@@ -117,7 +121,7 @@ func TestOneshotLogAgeRetentionRunsFromReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 	page = getJobLogPage(t, h, client, job.JobID)
-	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "fresh" || page.Truncation.EvictedEventCount != 3 {
+	if len(page.Events) != 2 || string(page.Events[0].Bytes) != "fresh" || page.Truncation.EvictedEventCount != 3 {
 		t.Fatalf("terminal one-shot after age sweep = %#v, truncation %#v", page.Events, page.Truncation)
 	}
 	if got, err := h.store.GetJob(context.Background(), job.JobID); err != nil || got.State != contract.JobSucceeded {
@@ -128,8 +132,8 @@ func TestOneshotLogAgeRetentionRunsFromReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 	page = getJobLogPage(t, h, client, job.JobID)
-	if len(page.Events) != 0 || page.Truncation == nil || page.Truncation.EvictedEventCount != 4 ||
-		page.Truncation.EvictedByteCount != 22 || page.Truncation.EarliestRetainedAt != nil {
+	if len(page.Events) != 0 || page.Truncation == nil || page.Truncation.EvictedEventCount != 5 ||
+		page.Truncation.EvictedByteCount != 27 || page.Truncation.EarliestRetainedAt != nil {
 		t.Fatalf("a fully aged-out one-shot must still say it was trimmed: %#v", page)
 	}
 	assertUsageCountersMatchLogEvents(t, h.store)
@@ -206,35 +210,219 @@ func TestLogRetentionTotalCeilingEvictsOldestAcrossJobs(t *testing.T) {
 	assertUsageCountersMatchLogEvents(t, h.store)
 }
 
-// No bound, not even the cluster-wide one, may evict the newest row for a
-// stream of a live attempt: it is the watermark continuity is checked against.
-func TestLogRetentionTotalCeilingNeverEvictsLiveWatermarks(t *testing.T) {
+// Any row may go, even a live attempt's newest per stream: upload continuity
+// is a durable record, not the retained rows.
+func TestLogRetentionTotalCeilingEvictsAnyRowWithoutBreakingContinuity(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{LogRetentionTotalBytes: 1}, map[string]NodePolicy{
 		"worker": DefaultNodePolicy("worker"),
 	})
 	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
 	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
 	node := h.register(agent, "worker")
-	job := h.submit(client, "oneshot-total-watermarks", nil)
+	job := h.submit(client, "oneshot-total-continuity", nil)
 	claim := claimOneshot(t, h, agent, node, job.JobID)
 	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", job.JobID, claim.Lease.AttemptID)
-	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+	batch := []contract.LogEvent{
 		logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("out-0")),
 		logEvent(claim.Lease.AttemptID, contract.LogStderr, 0, []byte("err-0")),
 		logEvent(claim.Lease.AttemptID, contract.LogStdout, 1, []byte("out-1")),
-	})
+	}
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, batch)
 	if _, err := h.store.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	assertRetainedPayloads(t, h, job.JobID, "err-0", "out-1")
-	// The watermark keeps continuity: the next in-sequence batch is accepted.
+	assertRetainedPayloads(t, h, job.JobID)
+	response := appendLogsExpectingOK(t, h, agent, path, claim.Lease.FencingToken, batch)
+	if response.Acknowledged[contract.LogStdout] != 1 || response.Acknowledged[contract.LogStderr] != 0 {
+		t.Fatalf("replay of an evicted batch acknowledged %#v, want stdout 1 and stderr 0", response.Acknowledged)
+	}
 	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
 		logEvent(claim.Lease.AttemptID, contract.LogStdout, 2, []byte("out-2")),
+		logEvent(claim.Lease.AttemptID, contract.LogStderr, 1, []byte("err-1")),
 	})
-	if _, err := h.store.Reconcile(context.Background()); err != nil {
+	assertRetainedPayloads(t, h, job.JobID, "out-2", "err-1")
+}
+
+// Review repro (#589): a per-job cap that evicts inside the append
+// transaction must not turn an identical retry of that batch, whose response
+// was lost, into a conflict. Both classes carry the cap at ingest.
+func TestAppendEvictionKeepsIdenticalRetryIdempotent(t *testing.T) {
+	for _, class := range []string{contract.JobClassOneShot, contract.JobClassService} {
+		t.Run(class, func(t *testing.T) {
+			h := newIntegrationHarnessWithOptions(t, StoreOptions{
+				OneshotLogRetentionBytes: 10, ServiceLogRetentionBytes: 10,
+			}, map[string]NodePolicy{"worker": DefaultNodePolicy("worker")})
+			client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+			agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+			node := h.register(agent, "worker")
+			var jobID string
+			var claim Claim
+			if class == contract.JobClassService {
+				jobID = submitRestartService(t, h, client, "retry-after-append-eviction", nil, nil).JobID
+				claim = claimRestartService(t, h, agent, node)
+			} else {
+				jobID = h.submit(client, "retry-after-append-eviction", nil).JobID
+				claim = claimOneshot(t, h, agent, node, jobID)
+			}
+			path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", jobID, claim.Lease.AttemptID)
+			batch := []contract.LogEvent{
+				logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("aaaaaa")),
+				logEvent(claim.Lease.AttemptID, contract.LogStdout, 1, []byte("bbbbbb")),
+				logEvent(claim.Lease.AttemptID, contract.LogStdout, 2, []byte("cccccc")),
+			}
+			appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, batch)
+			assertRetainedPayloads(t, h, jobID, "cccccc")
+			response := appendLogsExpectingOK(t, h, agent, path, claim.Lease.FencingToken, batch)
+			if response.Acknowledged[contract.LogStdout] != 2 {
+				t.Fatalf("identical retry acknowledged %#v, want stdout 2", response.Acknowledged)
+			}
+			// A retained row is still compared: the same sequence with other
+			// bytes is refused.
+			status, _, body := h.do(agent, http.MethodPost, path, AppendLogsRequest{
+				FencingToken: claim.Lease.FencingToken,
+				Events:       []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 2, []byte("zzzzzz"))},
+			})
+			if status != http.StatusConflict {
+				t.Fatalf("conflicting replay of a retained event status = %d body=%s", status, body)
+			}
+			assertRetainedPayloads(t, h, jobID, "cccccc")
+		})
+	}
+}
+
+// Review repro (#589): a lost attempt keeps its late-evidence window. Evicting
+// its last retained row must not reset the stream, or its next valid upload
+// inside the window is refused.
+func TestLostAttemptLateEvidenceSurvivesEvictedRows(t *testing.T) {
+	for _, class := range []string{contract.JobClassOneShot, contract.JobClassService} {
+		t.Run(class, func(t *testing.T) {
+			h := newIntegrationHarnessWithOptions(t, StoreOptions{LogRetentionTotalBytes: 1}, map[string]NodePolicy{
+				"worker": DefaultNodePolicy("worker"),
+			})
+			client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+			agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+			node := h.register(agent, "worker")
+			var jobID string
+			var claim Claim
+			if class == contract.JobClassService {
+				jobID = submitRestartService(t, h, client, "late-evidence-after-eviction", nil, nil).JobID
+				claim = claimRestartService(t, h, agent, node)
+			} else {
+				jobID = h.submit(client, "late-evidence-after-eviction", nil).JobID
+				claim = claimOneshot(t, h, agent, node, jobID)
+			}
+			path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", jobID, claim.Lease.AttemptID)
+			appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+				logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("before-loss")),
+			})
+			h.clock.Advance(time.Minute) // past the 30s lease: the attempt is lost
+			if _, err := h.store.Reconcile(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			assertAttemptState(t, h, claim.Lease.AttemptID, contract.AttemptLost)
+			assertRetainedPayloads(t, h, jobID)
+			late := logEvent(claim.Lease.AttemptID, contract.LogStdout, 1, []byte("late"))
+			late.Timestamp = h.clock.Now()
+			response := appendLogsExpectingOK(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{late})
+			if response.Acknowledged[contract.LogStdout] != 1 || response.AttemptState != contract.AttemptLost {
+				t.Fatalf("late upload after eviction = %#v", response)
+			}
+		})
+	}
+}
+
+// Review P2 (#589): a backlog far past the cap (an upgrade, a lowered cap) is
+// worked off in bounded pieces. The append transaction evicts at most its own
+// bound, each sweep pass at most the sweep budget, and a renewal issued while
+// a pass runs completes.
+func TestRetentionBacklogIsEvictedInBoundedPasses(t *testing.T) {
+	// The background loop stays out of the way so each count is one
+	// transaction's; the passes below are driven explicitly.
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{OneshotLogRetentionBytes: 10}, map[string]NodePolicy{
+		"worker": DefaultNodePolicy("worker"),
+	}, true, time.Hour)
+	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "worker")
+	job := h.submit(client, "retention-backlog", nil)
+	claim := claimOneshot(t, h, agent, node, job.JobID)
+	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", job.JobID, claim.Lease.AttemptID)
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+		logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("x")),
+	})
+
+	// 10,000 rows accepted under a looser cap, as an upgraded database has.
+	const backlog = 10_000
+	tx, err := h.store.db.Begin()
+	if err != nil {
 		t.Fatal(err)
 	}
-	assertRetainedPayloads(t, h, job.JobID, "err-0", "out-2")
+	for sequence := 1; sequence <= backlog; sequence++ {
+		if _, err := tx.Exec(`INSERT INTO log_events(job_id, attempt_id, stream, sequence, sequence_end, timestamp_ns, bytes, event_json)
+			VALUES(?, ?, 'stdout', ?, ?, ?, X'78', X'7B7D')`, job.JobID, claim.Lease.AttemptID, sequence, sequence,
+			h.clock.Now().UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE log_stream_continuity SET accepted_through=? WHERE attempt_id=? AND stream='stdout'`,
+		backlog, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	retained := func() int {
+		var count int
+		if err := h.store.db.QueryRow("SELECT COUNT(*) FROM log_events WHERE job_id=?", job.JobID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	before := retained()
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+		logEvent(claim.Lease.AttemptID, contract.LogStdout, backlog+1, []byte("y")),
+	})
+	if evicted := before + 1 - retained(); evicted != appendEvictionEvents {
+		t.Fatalf("append transaction evicted %d rows, want exactly its bound %d", evicted, appendEvictionEvents)
+	}
+
+	renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", job.JobID, claim.Lease.AttemptID)
+	passes := 0
+	for retained() > 10 {
+		passes++
+		if passes > 10 {
+			t.Fatalf("backlog not drained after %d passes: %d rows retained", passes-1, retained())
+		}
+		renewed := make(chan int, 1)
+		go func() {
+			status, _, _ := h.do(agent, http.MethodPost, renewPath, RenewalRequest{FencingToken: claim.Lease.FencingToken})
+			renewed <- status
+		}()
+		result, err := h.store.Reconcile(context.Background())
+		select {
+		case status := <-renewed:
+			if status != http.StatusOK {
+				t.Fatalf("renewal during pass %d status = %d", passes, status)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("renewal during pass %d did not complete", passes)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.EvictedLogEvents > sweepEvictionEvents {
+			t.Fatalf("pass %d evicted %d rows, over the %d-row sweep budget", passes, result.EvictedLogEvents, sweepEvictionEvents)
+		}
+	}
+	if passes < 2 {
+		t.Fatalf("a %d-row backlog drained in %d pass, so passes are not bounded", backlog, passes)
+	}
+	assertUsageCountersMatchLogEvents(t, h.store)
+	// Continuity survived the whole backlog's eviction.
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+		logEvent(claim.Lease.AttemptID, contract.LogStdout, backlog+2, []byte("z")),
+	})
 }
 
 // A database created by the #49 schema carries its service markers into the
@@ -275,6 +463,7 @@ func TestStoreUpgradesServiceLogTruncationsAndSeedsUsage(t *testing.T) {
 		DROP TABLE job_log_usage;
 		DROP TABLE log_usage_total;
 		DROP INDEX log_events_age_order;
+		DROP TABLE log_stream_continuity;
 		CREATE TABLE service_log_truncations (
 		  job_id TEXT PRIMARY KEY REFERENCES service_jobs(job_id) ON DELETE CASCADE,
 		  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age')),
@@ -320,6 +509,15 @@ func TestStoreUpgradesServiceLogTruncationsAndSeedsUsage(t *testing.T) {
 		t.Fatalf("migrated service marker = %#v", truncation)
 	}
 	assertUsageCountersMatchLogEvents(t, store)
+	for attemptID, want := range map[string]int64{"legacy-service-attempt": 7, "legacy-oneshot-attempt": 0} {
+		through, err := readLogContinuity(context.Background(), store.db, attemptID, contract.LogStdout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if through != want {
+			t.Fatalf("seeded continuity for %s = %d, want %d", attemptID, through, want)
+		}
+	}
 	var total int64
 	if err := store.db.QueryRow("SELECT retained_bytes FROM log_usage_total").Scan(&total); err != nil {
 		t.Fatal(err)
@@ -400,6 +598,19 @@ func TestOneshotLogByteRetentionSweepAppliesALoweredCap(t *testing.T) {
 		t.Fatalf("lowered-cap marker = %#v", truncation)
 	}
 	assertUsageCountersMatchLogEvents(t, store)
+}
+
+func appendLogsExpectingOK(t *testing.T, h *integrationHarness, agent *http.Client, path, fence string, events []contract.LogEvent) AppendLogsResponse {
+	t.Helper()
+	status, _, body := h.do(agent, http.MethodPost, path, AppendLogsRequest{FencingToken: fence, Events: events})
+	if status != http.StatusOK {
+		t.Fatalf("append status = %d body=%s", status, body)
+	}
+	var response AppendLogsResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
 }
 
 func submitDirect(store *Store, spec contract.JobSpec) (Job, error) {

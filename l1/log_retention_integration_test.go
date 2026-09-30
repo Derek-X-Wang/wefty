@@ -114,11 +114,11 @@ func assertServiceLogByteRetentionAndDerivedJSONL(t *testing.T) {
 	}
 }
 
-func TestServiceLogWatermarksPreserveStrictPerStreamContinuity(t *testing.T) {
-	assertServiceLogWatermarksPreserveStrictPerStreamContinuity(t)
+func TestServiceLogByteRetentionKeepsStrictPerStreamContinuity(t *testing.T) {
+	assertServiceLogByteRetentionKeepsStrictPerStreamContinuity(t)
 }
 
-func assertServiceLogWatermarksPreserveStrictPerStreamContinuity(t *testing.T) {
+func assertServiceLogByteRetentionKeepsStrictPerStreamContinuity(t *testing.T) {
 	t.Helper()
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{ServiceLogRetentionBytes: 6}, map[string]NodePolicy{
 		"service-node": DefaultNodePolicy("service"),
@@ -142,9 +142,26 @@ func assertServiceLogWatermarksPreserveStrictPerStreamContinuity(t *testing.T) {
 	page := getRetentionPage(t, h, client, job.JobID)
 	if len(page.Events) != 2 || page.Events[0].Stream != contract.LogStdout || page.Events[0].Sequence != 1 ||
 		page.Events[1].Stream != contract.LogStderr || page.Events[1].Sequence != 1 {
-		t.Fatalf("retained per-stream watermarks = %#v", page.Events)
+		t.Fatalf("retained per-stream events = %#v", page.Events)
 	}
 	assertRetainedRawBytes(t, h, job.JobID, 6)
+	// Evicted sequences are still accepted ones: a replay is acknowledged, a
+	// skip or a restart from zero is not, and the stream continues at 2.
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+		logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("aaa")),
+		logEvent(claim.Lease.AttemptID, contract.LogStderr, 0, []byte("bbb")),
+	})
+	for _, rejected := range []contract.LogEvent{
+		logEvent(claim.Lease.AttemptID, contract.LogStdout, 3, []byte("skip")),
+	} {
+		status, _, body := h.do(agent, http.MethodPost, path, AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{rejected}})
+		if status != http.StatusConflict {
+			t.Fatalf("out-of-sequence upload after eviction status = %d body=%s", status, body)
+		}
+	}
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{
+		logEvent(claim.Lease.AttemptID, contract.LogStdout, 2, []byte("eee")),
+	})
 }
 
 func TestServiceLogAgeRetentionRunsFromReconcile(t *testing.T) {
@@ -176,12 +193,20 @@ func assertServiceLogAgeRetentionRunsFromReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.EvictedLogEvents != 1 || result.EvictedLogBytes != 5 {
-		t.Fatalf("active age sweep result = %#v, want one evicted event and one retained watermark", result)
+	// #52: continuity is durable, so no row of a live attempt is exempt.
+	if result.EvictedLogEvents != 2 || result.EvictedLogBytes != 10 {
+		t.Fatalf("active age sweep result = %#v, want both aged events evicted", result)
 	}
 	if got := getRestartService(t, h, job.JobID).State; got != contract.JobRunning {
 		t.Fatalf("service state after active age eviction = %q, want running", got)
 	}
+	// The stream continues where it left off, and the evicted batch still
+	// replays as the accepted one.
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, events)
+	fresh := logEvent(claim.Lease.AttemptID, contract.LogStdout, 2, []byte("live-c"))
+	fresh.Timestamp = h.clock.Now()
+	appendRetentionLogs(t, h, agent, path, claim.Lease.FencingToken, []contract.LogEvent{fresh})
+	assertRetainedRawBytes(t, h, job.JobID, 6)
 
 	exitCode := 1
 	completionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, claim.Lease.AttemptID)
@@ -195,7 +220,7 @@ func assertServiceLogAgeRetentionRunsFromReconcile(t *testing.T) {
 	waitForRetainedEventCount(t, h, job.JobID, 0)
 	page := getRetentionPage(t, h, client, job.JobID)
 	if len(page.Events) != 0 || page.Truncation == nil || page.Truncation.BoundKind != ServiceLogRetentionAge ||
-		page.Truncation.EvictedEventCount != 2 || page.Truncation.EvictedByteCount != 10 || page.Truncation.EarliestRetainedAt != nil {
+		page.Truncation.EvictedEventCount != 3 || page.Truncation.EvictedByteCount != 16 || page.Truncation.EarliestRetainedAt != nil {
 		t.Fatalf("final age retention page = %#v", page)
 	}
 	if got := getRestartService(t, h, job.JobID).State; got != contract.JobQueued {
