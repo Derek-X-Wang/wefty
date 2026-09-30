@@ -665,7 +665,7 @@ func executeServiceLogs(
 	jobID := flags.Arg(0)
 	cursor := ""
 	lastAttemptID := ""
-	announcedTruncation := false
+	var truncation truncationAnnouncer
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
 		if err != nil {
@@ -676,6 +676,11 @@ func executeServiceLogs(
 		}
 		if jsonOutput {
 			if follow {
+				// stdout stays one event per line; the notice goes to stderr,
+				// so a fully trimmed run never follows as a silent one.
+				if err := truncation.announce(stderr, page.Truncation); err != nil {
+					return err
+				}
 				for _, event := range page.Events {
 					if err := writeJSONLine(stdout, event); err != nil {
 						return err
@@ -685,11 +690,8 @@ func executeServiceLogs(
 				return writeJSON(stdout, page)
 			}
 		} else {
-			if !announcedTruncation && page.Truncation != nil {
-				announcedTruncation = true
-				if err := writeLogTruncationNotice(stderr, page.Truncation); err != nil {
-					return err
-				}
+			if err := truncation.announce(stderr, page.Truncation); err != nil {
+				return err
 			}
 			if err := writeServiceLogEvents(stdout, stderr, page.Events, &lastAttemptID); err != nil {
 				return err

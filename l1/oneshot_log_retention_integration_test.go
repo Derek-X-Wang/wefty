@@ -464,6 +464,7 @@ func TestStoreUpgradesServiceLogTruncationsAndSeedsUsage(t *testing.T) {
 		DROP TABLE log_usage_total;
 		DROP INDEX log_events_age_order;
 		DROP TABLE log_stream_continuity;
+		DROP TABLE l1_data_migrations;
 		CREATE TABLE service_log_truncations (
 		  job_id TEXT PRIMARY KEY REFERENCES service_jobs(job_id) ON DELETE CASCADE,
 		  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age')),

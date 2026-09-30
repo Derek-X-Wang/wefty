@@ -531,7 +531,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	runID := flags.Arg(0)
 	cursor := ""
-	announcedTruncation := false
+	var truncation truncationAnnouncer
 	for {
 		page, err := clients.getRunLogs(ctx, runID, cursor, limit)
 		if err != nil {
@@ -539,6 +539,11 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		}
 		if jsonOutput {
 			if follow {
+				// stdout stays one event per line; the notice goes to stderr,
+				// so a fully trimmed run never follows as a silent one.
+				if err := truncation.announce(stderr, page.Truncation); err != nil {
+					return err
+				}
 				for _, event := range page.Events {
 					if err := writeJSONLine(stdout, event); err != nil {
 						return err
@@ -548,11 +553,8 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 				return writeJSON(stdout, page)
 			}
 		} else {
-			if !announcedTruncation && page.Truncation != nil {
-				announcedTruncation = true
-				if err := writeLogTruncationNotice(stderr, page.Truncation); err != nil {
-					return err
-				}
+			if err := truncation.announce(stderr, page.Truncation); err != nil {
+				return err
 			}
 			if err := writeLogEvents(stdout, stderr, page.Events); err != nil {
 				return err

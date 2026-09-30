@@ -156,6 +156,22 @@ func writeLogTruncationNotice(w io.Writer, truncation *l1.LogTruncation) error {
 	return err
 }
 
+// truncationAnnouncer prints the retention notice once, and again whenever
+// L1 reports more history trimmed, for a reader that stays on the logs.
+type truncationAnnouncer struct {
+	announced bool
+	events    int64
+}
+
+func (announcer *truncationAnnouncer) announce(w io.Writer, truncation *l1.LogTruncation) error {
+	if truncation == nil || (announcer.announced && truncation.EvictedEventCount <= announcer.events) {
+		return nil
+	}
+	announcer.announced = true
+	announcer.events = truncation.EvictedEventCount
+	return writeLogTruncationNotice(w, truncation)
+}
+
 type serviceOutput struct {
 	l1.Job
 	Status                 string                       `json:"status"`

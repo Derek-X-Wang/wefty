@@ -311,7 +311,14 @@ renewals, claims, and completions wait behind. One reconcile pass evicts at
 most 4096 rows and 64 MiB across every bound and every job together; the next
 pass continues. An append transaction evicts at most 512 rows and 40 MiB,
 twice what one batch can add, so a job at its cap stays there under steady
-ingest, and anything beyond that is left to the sweep.
+ingest, and anything beyond that is left to the sweep. A row is evicted whole
+or not at all: one that does not fit what is left of the byte budget ends the
+transaction's eviction, so the budget is never exceeded.
+
+`wefty logs` and `wefty services logs` report a marker on stderr, never on
+stdout: once when first seen and again whenever more history is trimmed while
+following, in human and `--json --follow` output alike (whose stdout stays one
+log event per line). Plain `--json` output carries the `truncation` object.
 
 A trimmed job carries one aggregate `LogTruncation` marker
 (`job_log_truncations`) on every log page, one-shot and service alike, so
@@ -333,12 +340,13 @@ that record, never the retained rows:
 - An event whose sequence is past the record must be exactly the next one;
   any other sequence is `conflict` (`expected sequence N, got M`).
 - An event whose whole range is at or below the record is a replay of an
-  accepted range and is acknowledged. Its content is compared only where the
-  accepted row is still retained: a retained row with the same key and
-  different content, or a retained multi-sequence row that covers it without
-  starting at it, is `idempotency_conflict`. Once retention has deleted the
-  row, the record alone answers the replay, and L1 cannot detect a replay
-  whose content differs from what it accepted.
+  accepted range. It is checked against every retained row that intersects
+  its range. If none does, the accepted rows were evicted and the record alone
+  acknowledges it; L1 then cannot detect a replay whose content differs from
+  what it accepted. If exactly one does, with exactly this range and this
+  content, it is an idempotent replay. Anything else (a partial overlap with
+  a retained row, several retained rows, other content) is
+  `idempotency_conflict`.
 - An event that starts at or below the record and ends past it is `conflict`.
 - The acknowledgement for each stream in the batch is the record after the
   batch.
@@ -346,8 +354,16 @@ that record, never the retained rows:
 So an identical retry of a batch whose response was lost is acknowledged even
 when the same append transaction evicted it, and a `lost` attempt continues
 where it stopped for its whole late-evidence window, however much of it
-retention has deleted. On the first open of a database that predates the
-record, L1 seeds it from the highest retained sequence per attempt stream. #49
+retention has deleted. Service attempt-summary pruning decides whether an
+attempt can still send evidence from the attempt's own state, never from
+whether rows of it are retained: a live attempt, and a `lost` one whose
+late-evidence window is still open, are never pruned, so neither loses its
+record to a cascade.
+
+On the first open of a database that predates the record, L1 seeds it from
+the highest retained sequence per attempt stream, in one transaction with a
+`l1_data_migrations` marker, so a crash before that commit seeds again on the
+next open. #49
 never evicted a live attempt's newest row per stream, so every stream that can
 still grow is seeded exactly; a stream whose rows were all evicted before the
 upgrade belonged to an attempt that was no longer live, gets no record, and

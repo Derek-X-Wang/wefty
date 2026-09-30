@@ -159,7 +159,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		}
 		result.EvictedLogEvents += byteStats.events
 		result.EvictedLogBytes += byteStats.bytes
-		pruned, err := pruneServiceAttemptSummaries(ctx, tx, jobID)
+		pruned, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now)
 		if err != nil {
 			return ReconcileResult{}, err
 		}

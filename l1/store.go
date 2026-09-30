@@ -945,6 +945,13 @@ CREATE TABLE IF NOT EXISTS log_stream_continuity (
   accepted_through INTEGER NOT NULL CHECK(accepted_through >= 0),
   PRIMARY KEY(attempt_id, stream)
 ) WITHOUT ROWID;
+-- One row per one-time data migration, written in the same transaction as
+-- the migration's rows, so a crash before the commit leaves the migration to
+-- run again on the next open instead of being skipped for good.
+CREATE TABLE IF NOT EXISTS l1_data_migrations (
+  name TEXT PRIMARY KEY,
+  applied_ns INTEGER NOT NULL
+);
 -- job_results holds one result document per job: the run's own verdict,
 -- uploaded by the node that produced it. It is one row, not a log: a retry
 -- replaces it, because the result of a job is whatever its latest attempt
@@ -1042,17 +1049,11 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 );
 INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
-	continuityExisted, err := s.logContinuityTableExists(ctx)
-	if err != nil {
-		return err
-	}
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
-	if !continuityExisted {
-		if err := s.seedLogContinuity(ctx); err != nil {
-			return err
-		}
+	if err := s.seedLogContinuity(ctx); err != nil {
+		return err
 	}
 	if err := s.migrateServiceLogTruncations(ctx); err != nil {
 		return err
@@ -2879,7 +2880,7 @@ AND state=@job_queued
 			computerStorage = &storage
 		}
 	}
-	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return nil, err
 	}
 	if err := pruneAttemptCredentials(ctx, tx); err != nil {
@@ -3527,7 +3528,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 			if int64(endSequence) > through {
 				return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s event %d..%d extends past the accepted sequence %d", event.Stream, event.Sequence, endSequence, through)
 			}
-			if err := checkRetainedLogReplay(ctx, tx, attemptID, event, originalRaw, raw); err != nil {
+			if err := checkRetainedLogReplay(ctx, tx, attemptID, event, endSequence, originalRaw, raw); err != nil {
 				return AppendLogsResponse{}, err
 			}
 			continue
@@ -3598,7 +3599,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	if _, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, appendEvictionBudget()); err != nil {
 		return AppendLogsResponse{}, err
 	}
-	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return AppendLogsResponse{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -3742,13 +3743,6 @@ func lateEvidenceGap(event contract.LogEvent, source []byte) contract.LogEvent {
 		SourceEventSHA256: hex.EncodeToString(hash[:]),
 	}
 	return event
-}
-
-func maxSequence(left, right uint64) uint64 {
-	if right > left {
-		return right
-	}
-	return left
 }
 
 func encodeLogCursor(after int64) string {
@@ -4033,7 +4027,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 			return CompletionOutcome{}, internalError(updateErr, "record runtime resource failure")
 		}
 	}
-	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return CompletionOutcome{}, err
 	}
 	job, err := getJobByID(ctx, tx, jobID, now)

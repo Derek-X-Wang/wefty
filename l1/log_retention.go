@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // logRetentionLimits are the #52 bounds beside #49's service bounds: one-shot
@@ -246,6 +248,13 @@ func evictLogEvents(ctx context.Context, tx *sql.Tx, jobID, extraPredicate strin
 			if done() {
 				return nil
 			}
+			// A row is deleted whole or not at all, so one that does not fit
+			// what is left of the byte budget ends the pass; no row exceeds a
+			// fresh budget (MaxLogEventBytes), so every pass makes progress.
+			if candidate.bytes > budget.bytes {
+				budget.bytes = 0
+				return nil
+			}
 			stats := perJob[candidate.jobID]
 			if stats == nil {
 				stats = &logRetentionStats{}
@@ -391,12 +400,21 @@ func nullableInt64(value sql.NullInt64) any {
 
 // pruneServiceAttemptSummaries treats attempt cleanup as a consequence of log
 // retention, never as a third log-eviction cause. The current attempt and last
-// 32 summaries are a floor, and any older attempt with retained logs remains.
-func pruneServiceAttemptSummaries(ctx context.Context, tx *sql.Tx, jobID string) (int64, error) {
+// 32 summaries are a floor, and any older attempt with retained logs remains
+// (deleting it would cascade those logs). Whether an attempt can still send
+// evidence is decided from its own state, never from whether rows of it are
+// retained: retention may have deleted every row of a live or lost attempt,
+// and pruning such an attempt would cascade its continuity record and refuse
+// its next upload as attempt_not_found. So a live attempt, and a lost one
+// whose late-evidence window is still open, are never pruned.
+func (s *Store) pruneServiceAttemptSummaries(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) (int64, error) {
+	lateEvidenceOpenSince := now.Add(-s.lateEvidenceWindow).UnixNano()
 	result, err := tx.ExecContext(ctx, `DELETE FROM attempts
 		WHERE job_id=?
 			AND EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=attempts.job_id)
 			AND attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
+			AND state NOT IN (?, ?, ?)
+			AND NOT (state=? AND updated_ns>=?)
 			AND NOT EXISTS (SELECT 1 FROM log_events WHERE log_events.attempt_id=attempts.attempt_id)
 			AND attempt_id NOT IN (
 				SELECT attempt_id FROM attempts recent
@@ -404,7 +422,10 @@ func pruneServiceAttemptSummaries(ctx context.Context, tx *sql.Tx, jobID string)
 					AND recent.attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
 				ORDER BY recent.created_ns DESC, recent.attempt_id DESC
 				LIMIT ?
-			)`, jobID, jobID, jobID, jobID, DefaultServiceAttemptSummaries)
+			)`, jobID, jobID,
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
+		contract.AttemptLost, lateEvidenceOpenSince,
+		jobID, jobID, DefaultServiceAttemptSummaries)
 	if err != nil {
 		return 0, internalError(err, "prune empty service attempt summaries")
 	}

@@ -45,60 +45,93 @@ func recordLogContinuity(ctx context.Context, tx *sql.Tx, attemptID string, stre
 	return nil
 }
 
-// logContinuityTableExists is read before the schema is applied, so the seed
-// runs exactly once: on the open that creates the table.
-func (s *Store) logContinuityTableExists(ctx context.Context) (bool, error) {
-	var exists bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master
-		WHERE type='table' AND name='log_stream_continuity')`).Scan(&exists); err != nil {
-		return false, fmt.Errorf("l1: inspect log stream continuity schema: %w", err)
-	}
-	return exists, nil
-}
+const logContinuitySeedMigration = "log_stream_continuity_seed"
 
 // seedLogContinuity derives the record for a database that predates it from
 // the rows still retained: the highest accepted sequence per attempt stream.
-// #49 never evicted a live attempt's newest row per stream, so every stream
-// that can still grow is seeded exactly. A stream whose rows were all evicted
-// before the upgrade can only belong to an attempt that was no longer live;
-// it gets no record and behaves as it did before the upgrade.
+// The seed rows and its l1_data_migrations marker commit together, so a crash
+// between creating the table and seeding it seeds on the next open. A new
+// database seeds nothing and records the marker. #49 never evicted a live
+// attempt's newest row per stream, so every stream that can still grow is
+// seeded exactly. A stream whose rows were all evicted before the upgrade can
+// only belong to an attempt that was no longer live; it gets no record and
+// behaves as it did before the upgrade. INSERT OR IGNORE never lowers a record
+// an append already wrote.
 func (s *Store) seedLogContinuity(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO log_stream_continuity(attempt_id, stream, accepted_through)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin log stream continuity seed: %w", err)
+	}
+	defer tx.Rollback()
+	var seeded bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM l1_data_migrations WHERE name=?)`,
+		logContinuitySeedMigration).Scan(&seeded); err != nil {
+		return fmt.Errorf("l1: inspect log stream continuity seed: %w", err)
+	}
+	if seeded {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO log_stream_continuity(attempt_id, stream, accepted_through)
 		SELECT attempt_id, stream, MAX(sequence_end) FROM log_events GROUP BY attempt_id, stream`); err != nil {
 		return fmt.Errorf("l1: seed log stream continuity: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
+		logContinuitySeedMigration, s.clock.Now().UnixNano()); err != nil {
+		return fmt.Errorf("l1: record log stream continuity seed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit log stream continuity seed: %w", err)
 	}
 	return nil
 }
 
-// checkRetainedLogReplay compares a replayed event with the accepted row it
-// names, if that row is still retained. A replay that lands inside a retained
-// multi-sequence row without starting it is not the event L1 accepted. When
-// neither is retained, the replay is acknowledged on the high-water mark.
-func checkRetainedLogReplay(ctx context.Context, tx *sql.Tx, attemptID string, event contract.LogEvent, originalRaw, raw []byte) error {
-	var stored []byte
-	err := tx.QueryRowContext(ctx, "SELECT event_json FROM log_events WHERE attempt_id=? AND stream=? AND sequence=?",
-		attemptID, event.Stream, event.Sequence).Scan(&stored)
-	switch {
-	case err == nil:
-		if !bytes.Equal(stored, originalRaw) && !bytes.Equal(stored, raw) {
-			return protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts with the accepted event", event.Stream, event.Sequence)
-		}
-		return nil
-	case !errors.Is(err, sql.ErrNoRows):
-		return internalError(err, "read accepted log event")
-	}
-	// Accepted rows never overlap, so only the nearest earlier row can cover it.
+// checkRetainedLogReplay decides a replay of an accepted range
+// [event.Sequence, end] against every retained row that intersects it.
+// Accepted rows never overlap, so those are the rows starting inside the
+// range plus at most the one row starting before it. The rule:
+//   - no retained row intersects: the accepted rows were evicted, and the
+//     continuity record alone acknowledges the replay;
+//   - exactly one intersects, it has exactly this range, and its content is
+//     this event: an idempotent replay;
+//   - anything else (a partial overlap, several rows, other content) is not
+//     the event L1 accepted: idempotency_conflict.
+func checkRetainedLogReplay(ctx context.Context, tx *sql.Tx, attemptID string, event contract.LogEvent, end uint64, originalRaw, raw []byte) error {
+	conflict := protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d..%d) conflicts with the accepted event", event.Stream, event.Sequence, end)
 	var previousEnd int64
-	err = tx.QueryRowContext(ctx, `SELECT sequence_end FROM log_events
+	err := tx.QueryRowContext(ctx, `SELECT sequence_end FROM log_events
 		WHERE attempt_id=? AND stream=? AND sequence<? ORDER BY sequence DESC LIMIT 1`,
 		attemptID, event.Stream, event.Sequence).Scan(&previousEnd)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return nil
 	case err != nil:
-		return internalError(err, "read covering accepted log event")
+		return internalError(err, "read retained log row before a replay")
 	case previousEnd >= int64(event.Sequence):
-		return protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts with the accepted event", event.Stream, event.Sequence)
+		return conflict
 	}
-	return nil
+	rows, err := tx.QueryContext(ctx, `SELECT sequence, sequence_end, event_json FROM log_events
+		WHERE attempt_id=? AND stream=? AND sequence>=? AND sequence<=? ORDER BY sequence LIMIT 2`,
+		attemptID, event.Stream, event.Sequence, end)
+	if err != nil {
+		return internalError(err, "read retained log rows inside a replay")
+	}
+	defer rows.Close()
+	intersecting := 0
+	matched := false
+	for rows.Next() {
+		var start, stop int64
+		var stored []byte
+		if err := rows.Scan(&start, &stop, &stored); err != nil {
+			return internalError(err, "scan retained log row inside a replay")
+		}
+		intersecting++
+		matched = start == int64(event.Sequence) && stop == int64(end) &&
+			(bytes.Equal(stored, originalRaw) || bytes.Equal(stored, raw))
+	}
+	if err := rows.Err(); err != nil {
+		return internalError(err, "iterate retained log rows inside a replay")
+	}
+	if intersecting == 0 || (intersecting == 1 && matched) {
+		return nil
+	}
+	return conflict
 }

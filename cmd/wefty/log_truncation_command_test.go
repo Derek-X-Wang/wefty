@@ -78,3 +78,87 @@ func TestLogsCommandsAnnounceRetentionTruncation(t *testing.T) {
 		t.Fatalf("JSON logs page dropped the truncation marker: %s", jsonOut.String())
 	}
 }
+
+// Review (#589): `logs --json --follow` printed event lines only, so a run
+// whose logs were all trimmed followed as an empty one. The notice goes to
+// stderr, once at the start and again when more is trimmed while following;
+// stdout stays pure event lines.
+func TestFollowedLogsAnnounceTruncationOnStderr(t *testing.T) {
+	earliest := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	marker := func(events int64) *l1.LogTruncation {
+		return &l1.LogTruncation{BoundKind: l1.LogRetentionTotal, EvictedEventCount: events, EvictedByteCount: events * 10, UpdatedAt: earliest}
+	}
+	for _, test := range []struct {
+		name       string
+		pages      []l1.LogPage
+		wantEvents int
+		wantNotice []string
+	}{
+		{
+			name:       "fully trimmed terminal run",
+			pages:      []l1.LogPage{{Events: []contract.LogEvent{}, NextCursor: "c1", Truncation: marker(9)}},
+			wantNotice: []string{"9 earlier events (90 bytes)"},
+		},
+		{
+			name: "trimmed further while following",
+			pages: []l1.LogPage{
+				{Events: []contract.LogEvent{{AttemptID: "a", Stream: contract.LogStdout, Sequence: 9, Timestamp: earliest, Bytes: []byte("x\n")}}, NextCursor: "c1", Truncation: marker(9)},
+				{Events: []contract.LogEvent{}, NextCursor: "c1", Truncation: marker(9)},
+				{Events: []contract.LogEvent{}, NextCursor: "c1", Truncation: marker(12)},
+			},
+			wantEvents: 1,
+			wantNotice: []string{"9 earlier events (90 bytes)", "12 earlier events (120 bytes)"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			served := 0
+			serve := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(request.URL.Path, "/logs") {
+					page := test.pages[min(served, len(test.pages)-1)]
+					served++
+					_ = json.NewEncoder(writer).Encode(page)
+					return
+				}
+				// The run is terminal; follow ends at the first empty page after
+				// the last scripted one.
+				status := contract.RunRunning
+				if served >= len(test.pages) {
+					status = contract.RunSucceeded
+				}
+				_ = json.NewEncoder(writer).Encode(contract.RunRecord{RunID: "run-1", Status: status})
+			})
+			client := &http.Client{Transport: handlerTransport{handler: serve}}
+			clients := &apiClients{
+				l1: &apiClient{name: "L1", flag: "l1", client: client},
+				l3: &apiClient{name: "L3", flag: "l3", client: client},
+			}
+			var stdout, stderr bytes.Buffer
+			if err := execute(context.Background(), clients, true, []string{"logs", "run-1", "--follow", "--poll-interval", "1ms"}, &stdout, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+			if stdout.Len() == 0 {
+				lines = nil
+			}
+			if len(lines) != test.wantEvents {
+				t.Fatalf("stdout = %q, want %d event lines", stdout.String(), test.wantEvents)
+			}
+			for _, line := range lines {
+				var event contract.LogEvent
+				if err := json.Unmarshal([]byte(line), &event); err != nil || strings.Contains(line, "truncation") {
+					t.Fatalf("stdout line %q is not a pure log event", line)
+				}
+			}
+			notices := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+			if len(notices) != len(test.wantNotice) {
+				t.Fatalf("stderr = %q, want %d notices", stderr.String(), len(test.wantNotice))
+			}
+			for index, want := range test.wantNotice {
+				if !strings.Contains(notices[index], want) || !strings.Contains(notices[index], "cluster-wide log ceiling") {
+					t.Fatalf("notice %d = %q, want it to report %q", index, notices[index], want)
+				}
+			}
+		})
+	}
+}
