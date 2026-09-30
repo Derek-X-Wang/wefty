@@ -21,6 +21,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // The drift test pins the Go wire types to the published schemas (#601).
@@ -36,7 +37,12 @@ import (
 //   - every field the schema declares is a Go field, so the schema promises
 //     nothing the server never sends and accepts nothing it would refuse;
 //   - where the Go field has a closed vocabulary (a named string type with
-//     constants), the schema enum is exactly that vocabulary.
+//     constants), the schema publishes an enum and it is exactly that
+//     vocabulary.
+//
+// References are followed the way a validator follows them, $dynamicRef
+// included; a reference the walk cannot follow fails the test instead of
+// ending the comparison quietly.
 //
 // Every object schema a protocol file publishes must be reached by a row, by
 // recursion from a row, or be listed in driftUnmapped with the reason it is
@@ -314,6 +320,21 @@ var driftEnumExceptions = map[string]string{
 		"are projected from audit events, whose role is view or control",
 	"l1.ComputerStorageGenerationPhase@" + component(commonDoc, "ComputerStorageGeneration") + "/properties/phase": "absent " +
 		"names a missing generation row in a refusal's error details; it is never a stored phase",
+	"contract.ErrorCode@" + component(commonDoc, "Error") + "/properties/code": "deliberately open: the one error " +
+		"envelope serves L1 and L3 and gains codes with new refusals, so a client acts on the codes it knows and on " +
+		"retryable for the rest",
+	"contract.SpawnFailureCode@" + component(commonDoc, "SpawnFailure") + "/properties/code": "deliberately open: " +
+		"the schema tells readers that unknown codes default to terminal service policy",
+	"contract.RuntimeFailureCode@" + component(commonDoc, "RuntimeFailure") + "/properties/code": "deliberately open: " +
+		"the schema tells readers that unknown codes default to terminal",
+}
+
+// driftMustCompare names Go type and schema pairs the walk has to reach. They
+// sit behind references a weaker resolver would silently stop at, such as the
+// $dynamicRef that lets JobRecordSpec widen JobSpec's executable.
+var driftMustCompare = []string{
+	"contract.ExecutableSpec@../../contract/schemas/v1/job-spec.schema.json#/$defs/executable",
+	"contract.ExecutableSpec@" + component(commonDoc, "JobRecordSpec") + "/$defs/executable",
 }
 
 // driftValidatorEnums pins schema enums to validator functions whose single
@@ -336,21 +357,26 @@ func TestGoWireTypesMatchPublishedSchemas(t *testing.T) {
 
 	set := newSchemaSet(t)
 	checker := &driftChecker{
-		set:    set,
-		consts: loadGoConstants(t),
-		done:   map[string]bool{},
-		seen:   map[string]bool{},
+		set:      set,
+		consts:   loadGoConstants(t),
+		done:     map[string]bool{},
+		compared: map[string]bool{},
+		seen:     map[string]bool{},
 	}
 	for _, row := range driftRows {
-		location := set.location(row.schema)
-		if location.node == nil {
+		if set.location(row.schema).node == nil {
 			t.Errorf("drift row %s names no schema", row.schema)
 			continue
 		}
-		checker.compare(row.schema, row.goType, location)
+		checker.compare(row.schema, row.goType, set.root(row.schema))
 	}
 	for _, problem := range checker.problems {
 		t.Error(problem)
+	}
+	for _, pair := range driftMustCompare {
+		if !checker.compared[pair] {
+			t.Errorf("the drift walk never compared %s", pair)
+		}
 	}
 
 	// Every published object schema is pinned by a row, reached from one, or
@@ -400,12 +426,11 @@ func TestValidatorVocabulariesMatchPublishedEnums(t *testing.T) {
 	constants := loadGoConstants(t)
 	for _, entry := range driftValidatorEnums {
 		accepted := validatorCases(t, entry.source, entry.function, constants)
-		location := set.location(entry.schema)
-		if location.node == nil {
+		if set.location(entry.schema).node == nil {
 			t.Errorf("%s names no schema", entry.schema)
 			continue
 		}
-		published, ok := set.enumValues(location)
+		published, ok := set.enumValues(set.root(entry.schema))
 		if !ok {
 			t.Errorf("%s publishes no enum for %s.%s", entry.schema, entry.source, entry.function)
 			continue
@@ -413,6 +438,109 @@ func TestValidatorVocabulariesMatchPublishedEnums(t *testing.T) {
 		if missing, extra := setDifference(accepted, published); len(missing)+len(extra) > 0 {
 			t.Errorf("%s enum differs from %s.%s: accepted but unpublished %v, published but refused %v",
 				entry.schema, entry.source, entry.function, missing, extra)
+		}
+	}
+}
+
+// TestComposedSchemasCloseAtTheComposingLevel forbids a closed member inside
+// allOf. additionalProperties (and unevaluatedProperties) only see the member's
+// own properties, so a closed member refuses every field its siblings add: Node
+// was allOf[NodeRegistration (closed), ...] and no real Node validated (#601).
+// A composite closes itself with unevaluatedProperties over open members. The
+// only closed member allowed is a lone one, which has no siblings to refuse.
+func TestComposedSchemasCloseAtTheComposingLevel(t *testing.T) {
+	t.Parallel()
+
+	set := newSchemaSet(t)
+	documents := []string{commonDoc, agentDoc, clientDoc, l3Doc}
+	for _, name := range []string{"job-spec", "envelope", "gate-result", "run-record"} {
+		documents = append(documents, "../../contract/schemas/v1/"+name+".schema.json")
+	}
+	composites := 0
+	for _, document := range documents {
+		var walk func(value any, pointer string)
+		walk = func(value any, pointer string) {
+			switch node := value.(type) {
+			case map[string]any:
+				if members, ok := node["allOf"].([]any); ok && len(members) > 1 {
+					composites++
+					for index := range members {
+						member := set.resolve(set.root(document+"#"+pointer+"/allOf/"+strconv.Itoa(index)), nil)
+						if member.loc.node["additionalProperties"] == false || member.loc.node["unevaluatedProperties"] == false {
+							t.Errorf("%s#%s: allOf member %d (%s) is closed and refuses its siblings' fields; "+
+								"leave members open and close the composite with unevaluatedProperties",
+								document, pointer, index, member.loc.key())
+						}
+					}
+				}
+				for key, child := range node {
+					walk(child, pointer+"/"+escapePointer(key))
+				}
+			case []any:
+				for index, child := range node {
+					walk(child, pointer+"/"+strconv.Itoa(index))
+				}
+			}
+		}
+		walk(set.document(document), "")
+	}
+	if composites == 0 {
+		t.Fatal("found no allOf composition to check")
+	}
+}
+
+// TestNodeProjectionsValidateAgainstPublishedSchemas checks the composed Node
+// schemas semantically with a real validator, on instances built from the Go
+// types with every field set, and checks that each still refuses a stray field.
+func TestNodeProjectionsValidateAgainstPublishedSchemas(t *testing.T) {
+	t.Parallel()
+
+	observed := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	registration := contract.NodeRegistration{
+		NodeID: "node-1", BootSessionID: "boot-1", ConnectHost: "node-1.example", RootInstanceID: "root-1",
+		OS: "linux", Architecture: "arm64", AgentVersion: "0.1.0",
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": false}, CapabilityRevision: 3,
+		CapabilityObservedAt: observed, MissingCapabilities: []string{"kind:oci"},
+		CapabilityReasonCode: contract.CapabilityReasonCodes()[0], SupersedeCapabilityRevision: true,
+	}
+	node := l1.Node{
+		NodeRegistration: registration, State: contract.NodeAlive, AuthoritativeTags: []string{"gpu"},
+		MaxOneshotSlots: 2, MaxServiceSlots: 1, OneshotOccupancy: 1, ServiceOccupancy: 1, Overcommitted: false,
+		AuthorityGeneration: 4, ClaimsEnabled: true, IntentRevision: 2, IntentReason: "maintenance done",
+		IntentUpdatedAt: &observed, IntentActor: "operator", LastHeartbeatAt: observed,
+	}
+	heartbeat := l1.HeartbeatResponse{
+		Node: node, RemovalDirectives: []l1.RemovalDirective{}, StorageResetDirectives: []l1.ComputerStorageResetDirective{},
+		StorageGrowDirectives: []l1.ComputerStorageGrowDirective{}, ReimageDirectives: []l1.ComputerReimagePreflightDirective{},
+		BackupDirectives: []l1.ComputerBackupDirective{}, BackupPruneDirectives: []l1.ComputerBackupPruneDirective{},
+		StorageCopyDirectives: []l1.ComputerStorageCopyDirective{}, CustodyExportDirectives: []l1.ComputerCustodyExportDirective{},
+	}
+	for _, check := range []struct {
+		schema string
+		value  any
+	}{
+		{"NodeRegistration", registration},
+		{"Node", node},
+		{"HeartbeatResponse", heartbeat},
+	} {
+		compiled := compileProtocolSchema(t, "file:///api/openapi/common.v1.json#/components/schemas/"+check.schema)
+		payload, err := json.Marshal(check.value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := jsonschema.UnmarshalJSON(strings.NewReader(string(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := compiled.Validate(instance); err != nil {
+			t.Errorf("a Go %s is refused by the published %s schema: %v", reflect.TypeOf(check.value), check.schema, err)
+		}
+		stray, err := jsonschema.UnmarshalJSON(strings.NewReader(strings.TrimSuffix(string(payload), "}") + `,"stray_field":true}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := compiled.Validate(stray); err == nil {
+			t.Errorf("the published %s schema accepts an undeclared field", check.schema)
 		}
 	}
 }
@@ -502,6 +630,16 @@ type schemaLocation struct {
 
 func (l schemaLocation) key() string { return l.doc + "#" + l.pointer }
 
+// schemaRef is a schema location together with its dynamic scope: the schema
+// resources evaluation passed through to reach it, outermost first. A
+// $dynamicRef resolves against that scope, which is how one JobSpec property
+// means the strict executable under JobSpec and the scrubbed-or-strict one
+// under JobRecordSpec.
+type schemaRef struct {
+	loc   schemaLocation
+	scope []schemaLocation
+}
+
 func newSchemaSet(t *testing.T) *schemaSet {
 	return &schemaSet{t: t, docs: map[string]any{}}
 }
@@ -547,41 +685,161 @@ func (s *schemaSet) location(reference string) schemaLocation {
 	return schemaLocation{doc: document, pointer: pointer, node: node}
 }
 
-func (s *schemaSet) child(l schemaLocation, tokens ...string) schemaLocation {
-	pointer := l.pointer
+// root starts a walk at a location, inside its document's resource.
+func (s *schemaSet) root(reference string) schemaRef {
+	l := s.location(reference)
+	return schemaRef{loc: l, scope: []schemaLocation{s.location(l.doc + "#")}}
+}
+
+func (s *schemaSet) child(r schemaRef, tokens ...string) schemaRef {
+	pointer := r.loc.pointer
 	for _, token := range tokens {
 		pointer += "/" + escapePointer(token)
 	}
-	return s.location(l.doc + "#" + pointer)
+	return schemaRef{loc: s.location(r.loc.doc + "#" + pointer), scope: r.scope}
 }
 
-// resolve follows $ref chains, reporting every hop to visit.
-func (s *schemaSet) resolve(l schemaLocation, visit func(schemaLocation)) schemaLocation {
-	for range 16 {
-		if visit != nil {
-			visit(l)
-		}
-		reference, ok := l.node["$ref"].(string)
-		if !ok {
-			return l
-		}
-		file, fragment, _ := strings.Cut(reference, "#")
-		document := l.doc
-		if file != "" {
-			document = path.Clean(path.Join(path.Dir(l.doc), file))
-		}
-		next := s.location(document + "#" + fragment)
-		if next.node == nil {
-			s.t.Fatalf("%s: unresolvable $ref %q", l.key(), reference)
-		}
-		l = next
+func enterResource(scope []schemaLocation, resource schemaLocation) []schemaLocation {
+	if len(scope) > 0 && scope[len(scope)-1].key() == resource.key() {
+		return scope
 	}
-	s.t.Fatalf("%s: $ref chain too deep", l.key())
-	return l
+	return append(append([]schemaLocation(nil), scope...), resource)
+}
+
+// resolve follows $ref and $dynamicRef chains, reporting every hop to visit.
+// A reference kind it cannot follow is a test failure, never an empty shape:
+// an unfollowed reference is exactly where drift would hide.
+func (s *schemaSet) resolve(r schemaRef, visit func(schemaLocation)) schemaRef {
+	for range 32 {
+		if r.loc.node == nil {
+			s.t.Fatalf("%s: no schema at this location", r.loc.key())
+		}
+		if visit != nil {
+			visit(r.loc)
+		}
+		if _, ok := r.loc.node["$id"]; ok {
+			r.scope = enterResource(r.scope, r.loc)
+		}
+		for _, unsupported := range []string{"$recursiveRef", "$recursiveAnchor"} {
+			if _, ok := r.loc.node[unsupported]; ok {
+				s.t.Fatalf("%s: the drift resolver does not follow %s", r.loc.key(), unsupported)
+			}
+		}
+		if reference, ok := r.loc.node["$ref"]; ok {
+			text, isString := reference.(string)
+			if !isString {
+				s.t.Fatalf("%s: $ref is not a string", r.loc.key())
+			}
+			r = s.follow(r, text)
+			continue
+		}
+		if reference, ok := r.loc.node["$dynamicRef"]; ok {
+			text, isString := reference.(string)
+			if !isString {
+				s.t.Fatalf("%s: $dynamicRef is not a string", r.loc.key())
+			}
+			r = s.dynamic(r, text)
+			continue
+		}
+		return r
+	}
+	s.t.Fatalf("%s: reference chain too deep", r.loc.key())
+	return r
+}
+
+func (s *schemaSet) follow(r schemaRef, reference string) schemaRef {
+	file, fragment, _ := strings.Cut(reference, "#")
+	document, scope := r.loc.doc, r.scope
+	if file != "" {
+		if strings.Contains(file, ":") {
+			s.t.Fatalf("%s: the drift resolver does not follow absolute reference %q", r.loc.key(), reference)
+		}
+		document = path.Clean(path.Join(path.Dir(r.loc.doc), file))
+		scope = enterResource(scope, s.location(document+"#"))
+	}
+	var target schemaLocation
+	switch {
+	case fragment == "" || strings.HasPrefix(fragment, "/"):
+		target = s.location(document + "#" + fragment)
+	default:
+		found, _, ok := s.anchor(s.location(document+"#"), fragment)
+		if !ok {
+			s.t.Fatalf("%s: $ref %q names no anchor", r.loc.key(), reference)
+		}
+		target = found
+	}
+	if target.node == nil {
+		s.t.Fatalf("%s: unresolvable $ref %q", r.loc.key(), reference)
+	}
+	return schemaRef{loc: target, scope: scope}
+}
+
+// dynamic resolves "#name" as JSON Schema 2020-12 does: first inside the
+// current resource, and when that lands on a $dynamicAnchor, at the outermost
+// resource in the dynamic scope that declares the same $dynamicAnchor.
+func (s *schemaSet) dynamic(r schemaRef, reference string) schemaRef {
+	name, isFragment := strings.CutPrefix(reference, "#")
+	if !isFragment || name == "" || strings.HasPrefix(name, "/") {
+		s.t.Fatalf("%s: the drift resolver follows only same-resource \"#name\" $dynamicRef, not %q", r.loc.key(), reference)
+	}
+	initial, isDynamic, ok := s.anchor(r.scope[len(r.scope)-1], name)
+	if !ok {
+		s.t.Fatalf("%s: $dynamicRef %q names no anchor in its resource", r.loc.key(), reference)
+	}
+	if isDynamic {
+		for _, resource := range r.scope {
+			if found, dynamicAnchor, ok := s.anchor(resource, name); ok && dynamicAnchor {
+				return schemaRef{loc: found, scope: r.scope}
+			}
+		}
+	}
+	return schemaRef{loc: initial, scope: r.scope}
+}
+
+// anchor finds "$anchor" or "$dynamicAnchor" name inside one resource, not
+// descending into nested resources (subschemas with their own $id).
+func (s *schemaSet) anchor(resource schemaLocation, name string) (schemaLocation, bool, bool) {
+	var walk func(value any, pointer string, top bool) (string, bool, bool)
+	walk = func(value any, pointer string, top bool) (string, bool, bool) {
+		switch node := value.(type) {
+		case map[string]any:
+			if _, nested := node["$id"]; nested && !top {
+				return "", false, false
+			}
+			if node["$dynamicAnchor"] == name {
+				return pointer, true, true
+			}
+			if node["$anchor"] == name {
+				return pointer, false, true
+			}
+			keys := make([]string, 0, len(node))
+			for key := range node {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				if found, dynamicAnchor, ok := walk(node[key], pointer+"/"+escapePointer(key), false); ok {
+					return found, dynamicAnchor, true
+				}
+			}
+		case []any:
+			for index, item := range node {
+				if found, dynamicAnchor, ok := walk(item, pointer+"/"+strconv.Itoa(index), false); ok {
+					return found, dynamicAnchor, true
+				}
+			}
+		}
+		return "", false, false
+	}
+	found, dynamicAnchor, ok := walk(resource.node, resource.pointer, true)
+	if !ok {
+		return schemaLocation{}, false, false
+	}
+	return s.location(resource.doc + "#" + found), dynamicAnchor, true
 }
 
 type objectShape struct {
-	properties map[string]schemaLocation
+	properties map[string]schemaRef
 	required   map[string]bool
 	closed     bool
 }
@@ -591,17 +849,17 @@ func (shape objectShape) isObject() bool { return len(shape.properties) > 0 || s
 // shape merges what an object schema declares. allOf members contribute
 // required fields and closure; oneOf, anyOf and conditional branches only
 // contribute properties, since what they require holds on one arm alone.
-func (s *schemaSet) shape(l schemaLocation, visit func(schemaLocation)) objectShape {
-	shape := objectShape{properties: map[string]schemaLocation{}, required: map[string]bool{}}
+func (s *schemaSet) shape(r schemaRef, visit func(schemaLocation)) objectShape {
+	shape := objectShape{properties: map[string]schemaRef{}, required: map[string]bool{}}
 	seen := map[string]bool{}
-	var walk func(schemaLocation, bool)
-	walk = func(l schemaLocation, unconditional bool) {
-		l = s.resolve(l, visit)
-		if seen[l.key()] {
+	var walk func(schemaRef, bool)
+	walk = func(r schemaRef, unconditional bool) {
+		r = s.resolve(r, visit)
+		if seen[r.loc.key()] {
 			return
 		}
-		seen[l.key()] = true
-		if properties, ok := l.node["properties"].(map[string]any); ok {
+		seen[r.loc.key()] = true
+		if properties, ok := r.loc.node["properties"].(map[string]any); ok {
 			names := make([]string, 0, len(properties))
 			for name := range properties {
 				names = append(names, name)
@@ -609,64 +867,80 @@ func (s *schemaSet) shape(l schemaLocation, visit func(schemaLocation)) objectSh
 			sort.Strings(names)
 			for _, name := range names {
 				if _, present := shape.properties[name]; !present {
-					shape.properties[name] = s.child(l, "properties", name)
+					shape.properties[name] = s.child(r, "properties", name)
 				}
 			}
 		}
 		if unconditional {
-			if required, ok := l.node["required"].([]any); ok {
+			if required, ok := r.loc.node["required"].([]any); ok {
 				for _, name := range required {
 					if value, ok := name.(string); ok {
 						shape.required[value] = true
 					}
 				}
 			}
-			if l.node["additionalProperties"] == false || l.node["unevaluatedProperties"] == false {
+			if r.loc.node["additionalProperties"] == false || r.loc.node["unevaluatedProperties"] == false {
 				shape.closed = true
 			}
 		}
 		for _, keyword := range []string{"allOf", "oneOf", "anyOf"} {
-			if members, ok := l.node[keyword].([]any); ok {
+			if members, ok := r.loc.node[keyword].([]any); ok {
 				for index := range members {
-					walk(s.child(l, keyword, strconv.Itoa(index)), unconditional && keyword == "allOf")
+					walk(s.child(r, keyword, strconv.Itoa(index)), unconditional && keyword == "allOf")
 				}
 			}
 		}
 		for _, keyword := range []string{"then", "else"} {
-			if _, ok := l.node[keyword].(map[string]any); ok {
-				walk(s.child(l, keyword), false)
+			if _, ok := r.loc.node[keyword].(map[string]any); ok {
+				walk(s.child(r, keyword), false)
 			}
 		}
 	}
-	walk(l, true)
+	walk(r, true)
 	return shape
+}
+
+// declaresFreeFormObject reports a schema that deliberately publishes an
+// object without a shape, such as {"type": "object"}.
+func declaresFreeFormObject(node map[string]any) bool {
+	switch value := node["type"].(type) {
+	case string:
+		return value == "object"
+	case []any:
+		for _, item := range value {
+			if item == "object" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // nested finds the schema for array items ("items") or map values
 // ("additionalProperties"), looking through composition keywords.
-func (s *schemaSet) nested(l schemaLocation, keyword string) (schemaLocation, bool) {
-	l = s.resolve(l, nil)
-	if _, ok := l.node[keyword].(map[string]any); ok {
-		return s.child(l, keyword), true
+func (s *schemaSet) nested(r schemaRef, keyword string) (schemaRef, bool) {
+	r = s.resolve(r, nil)
+	if _, ok := r.loc.node[keyword].(map[string]any); ok {
+		return s.child(r, keyword), true
 	}
 	for _, composition := range []string{"allOf", "oneOf", "anyOf"} {
-		if members, ok := l.node[composition].([]any); ok {
+		if members, ok := r.loc.node[composition].([]any); ok {
 			for index := range members {
-				if found, ok := s.nested(s.child(l, composition, strconv.Itoa(index)), keyword); ok {
+				if found, ok := s.nested(s.child(r, composition, strconv.Itoa(index)), keyword); ok {
 					return found, true
 				}
 			}
 		}
 	}
-	return schemaLocation{}, false
+	return schemaRef{}, false
 }
 
 // enumValues is the string vocabulary a schema admits, through composition.
-func (s *schemaSet) enumValues(l schemaLocation) (map[string]bool, bool) {
-	l = s.resolve(l, nil)
+func (s *schemaSet) enumValues(r schemaRef) (map[string]bool, bool) {
+	r = s.resolve(r, nil)
 	values := map[string]bool{}
 	found := false
-	if list, ok := l.node["enum"].([]any); ok {
+	if list, ok := r.loc.node["enum"].([]any); ok {
 		found = true
 		for _, value := range list {
 			if text, ok := value.(string); ok {
@@ -674,14 +948,14 @@ func (s *schemaSet) enumValues(l schemaLocation) (map[string]bool, bool) {
 			}
 		}
 	}
-	if value, ok := l.node["const"].(string); ok {
+	if value, ok := r.loc.node["const"].(string); ok {
 		found = true
 		values[value] = true
 	}
 	for _, composition := range []string{"allOf", "oneOf", "anyOf"} {
-		if members, ok := l.node[composition].([]any); ok {
+		if members, ok := r.loc.node[composition].([]any); ok {
 			for index := range members {
-				if branch, ok := s.enumValues(s.child(l, composition, strconv.Itoa(index))); ok {
+				if branch, ok := s.enumValues(s.child(r, composition, strconv.Itoa(index))); ok {
 					found = true
 					for value := range branch {
 						values[value] = true
@@ -704,7 +978,7 @@ func (s *schemaSet) publishedObjectSchemas() []schemaLocation {
 		if _, isRef := l.node["$ref"]; isRef && !strings.Contains(l.pointer, "/components/") {
 			return // an inline body that points at a component is covered by that component
 		}
-		if s.shape(l, nil).isObject() {
+		if s.shape(s.root(l.key()), nil).isObject() {
 			out = append(out, l)
 		}
 	}
@@ -833,6 +1107,7 @@ type driftChecker struct {
 	set                   *schemaSet
 	consts                goConstants
 	done                  map[string]bool
+	compared              map[string]bool
 	seen                  map[string]bool
 	problems              []string
 	usedRequiredOmittable map[string]bool
@@ -854,12 +1129,12 @@ func (c *driftChecker) use(table *map[string]bool, key string) {
 	(*table)[key] = true
 }
 
-func (c *driftChecker) compare(where string, t reflect.Type, l schemaLocation) {
+func (c *driftChecker) compare(where string, t reflect.Type, r schemaRef) {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() == reflect.String {
-		c.compareEnum(where, t, l)
+		c.compareEnum(where, t, r)
 		return
 	}
 	if opaque(t) {
@@ -870,12 +1145,12 @@ func (c *driftChecker) compare(where string, t reflect.Type, l schemaLocation) {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return // base64 bytes
 		}
-		if items, ok := c.set.nested(l, "items"); ok {
+		if items, ok := c.set.nested(r, "items"); ok {
 			c.compare(where+"[]", t.Elem(), items)
 		}
 		return
 	case reflect.Map:
-		if values, ok := c.set.nested(l, "additionalProperties"); ok {
+		if values, ok := c.set.nested(r, "additionalProperties"); ok {
 			c.compare(where+"{}", t.Elem(), values)
 		}
 		return
@@ -884,13 +1159,24 @@ func (c *driftChecker) compare(where string, t reflect.Type, l schemaLocation) {
 		return
 	}
 
-	shape := c.set.shape(l, c.visit)
-	resolved := c.set.resolve(l, nil)
-	pair := t.String() + "@" + resolved.key()
-	if c.done[pair] || !shape.isObject() {
+	shape := c.set.shape(r, c.visit)
+	resolved := c.set.resolve(r, nil)
+	pair := t.String() + "@" + resolved.loc.key()
+	c.compared[pair] = true
+	// The same location can mean different schemas under different dynamic
+	// scopes, so a pair is done only for the scope it was compared in.
+	scoped := pair + "|" + scopeKey(resolved.scope)
+	if c.done[scoped] {
 		return
 	}
-	c.done[pair] = true
+	c.done[scoped] = true
+	if !shape.isObject() {
+		if !declaresFreeFormObject(resolved.loc.node) {
+			c.problem("%s: schema %s gives Go %s no object shape and does not declare a free-form object",
+				where, resolved.loc.key(), t)
+		}
+		return
+	}
 
 	fields := jsonFields(t)
 	byName := make(map[string]goField, len(fields))
@@ -899,13 +1185,13 @@ func (c *driftChecker) compare(where string, t reflect.Type, l schemaLocation) {
 	}
 	for _, field := range fields {
 		if _, declared := shape.properties[field.name]; !declared && shape.closed {
-			key := t.String() + "." + field.name + "@" + resolved.key()
+			key := t.String() + "." + field.name + "@" + resolved.loc.key()
 			if _, allowed := driftGoOnly[key]; allowed {
 				c.use(&c.usedGoOnly, key)
 				continue
 			}
 			c.problem("%s: Go %s writes %q, which the closed schema %s does not declare",
-				where, t, field.name, resolved.key())
+				where, t, field.name, resolved.loc.key())
 		}
 	}
 	for name := range shape.required {
@@ -913,14 +1199,14 @@ func (c *driftChecker) compare(where string, t reflect.Type, l schemaLocation) {
 		key := t.String() + "." + name
 		switch {
 		case !present:
-			c.problem("%s: schema %s requires %q, which Go %s never writes", where, resolved.key(), name, t)
+			c.problem("%s: schema %s requires %q, which Go %s never writes", where, resolved.loc.key(), name, t)
 		case field.omittable:
 			if _, allowed := driftRequiredOmittable[key]; allowed {
 				c.use(&c.usedRequiredOmittable, key)
 				continue
 			}
 			c.problem("%s: schema %s requires %q, but Go %s may omit it (omitempty/omitzero)",
-				where, resolved.key(), name, t)
+				where, resolved.loc.key(), name, t)
 		}
 	}
 	names := make([]string, 0, len(shape.properties))
@@ -936,14 +1222,17 @@ func (c *driftChecker) compare(where string, t reflect.Type, l schemaLocation) {
 				c.use(&c.usedSchemaOnly, key)
 				continue
 			}
-			c.problem("%s: schema %s declares %q, which Go %s does not carry", where, resolved.key(), name, t)
+			c.problem("%s: schema %s declares %q, which Go %s does not carry", where, resolved.loc.key(), name, t)
 			continue
 		}
 		c.compare(where+"."+name, field.typ, shape.properties[name])
 	}
 }
 
-func (c *driftChecker) compareEnum(where string, t reflect.Type, l schemaLocation) {
+// compareEnum holds a Go closed vocabulary (a named string type with
+// constants) to the schema at that location. A schema that publishes no enum
+// there is drift too: it admits values the server never writes or refuses.
+func (c *driftChecker) compareEnum(where string, t reflect.Type, r schemaRef) {
 	if t.PkgPath() == "" {
 		return // a plain string has no closed vocabulary to compare
 	}
@@ -951,20 +1240,39 @@ func (c *driftChecker) compareEnum(where string, t reflect.Type, l schemaLocatio
 	if len(vocabulary) == 0 {
 		return
 	}
-	published, ok := c.set.enumValues(l)
-	if !ok {
-		return
-	}
-	resolved := c.set.resolve(l, nil)
-	key := t.String() + "@" + resolved.key()
+	resolved := c.set.resolve(r, nil)
+	key := t.String() + "@" + resolved.loc.key()
 	if _, allowed := driftEnumExceptions[key]; allowed {
 		c.use(&c.usedEnumExceptions, key)
 		return
 	}
+	published, ok := c.set.enumValues(r)
+	if !ok {
+		c.problem("%s: Go %s is a closed vocabulary %v, but schema %s publishes no enum",
+			where, t, sortedKeys(vocabulary), resolved.loc.key())
+		return
+	}
 	if missing, extra := setDifference(vocabulary, published); len(missing)+len(extra) > 0 {
 		c.problem("%s: Go %s vocabulary and schema %s enum differ: Go-only %v, schema-only %v",
-			where, t, resolved.key(), missing, extra)
+			where, t, resolved.loc.key(), missing, extra)
 	}
+}
+
+func scopeKey(scope []schemaLocation) string {
+	keys := make([]string, len(scope))
+	for index, resource := range scope {
+		keys[index] = resource.key()
+	}
+	return strings.Join(keys, ",")
+}
+
+func sortedKeys(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func setDifference(left, right map[string]bool) (leftOnly, rightOnly []string) {

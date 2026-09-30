@@ -1344,7 +1344,7 @@
         "properties": {
           "run_id": { "type": "string" },
           "parent_run_id": { "type": "string" },
-          "status": { "type": "string" },
+          "status": { "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"], "description": "The run's status, from the same vocabulary as RunRecord.status." },
           "trigger": {
             "type": "object",
             "description": "The Run's immutable trigger provenance, the same projection RunRecord carries.",
@@ -1389,8 +1389,12 @@
         }
       },
       "NodeRegistration": {
+        "allOf": [{ "$ref": "#/components/schemas/NodeRegistrationFields" }],
+        "unevaluatedProperties": false,
+        "description": "The registration request: exactly NodeRegistrationFields and nothing else."
+      },
+      "NodeRegistrationFields": {
         "type": "object",
-        "additionalProperties": false,
         "required": [
           "node_id", "boot_session_id", "os", "architecture", "agent_version",
           "capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"
@@ -1444,7 +1448,7 @@
             "description": "Asks L1 to assign the stored capability_revision + 1 to this restrictive same-boot observation atomically. Reserved for a runtime authority barrier that must revoke stale advertised capability before it can learn the stored revision."
           }
         },
-        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection."
+        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection. Open on purpose: NodeRegistration, Node, and HeartbeatResponse compose it and close at their own level with unevaluatedProperties, since a closed member inside allOf would refuse its siblings' fields."
       },
     "ComputerStorageClaim": {
     "type": "object",
@@ -1599,8 +1603,14 @@
         }
       },
       "Node": {
+        "allOf": [{ "$ref": "#/components/schemas/NodeFields" }],
+        "unevaluatedProperties": false,
+        "description": "The operator-visible Node projection: exactly NodeFields and nothing else."
+      },
+      "NodeFields": {
+        "description": "NodeRegistrationFields plus L1's authoritative Node facts. Open on purpose so HeartbeatResponse can extend it; Node closes it.",
         "allOf": [
-          { "$ref": "#/components/schemas/NodeRegistration" },
+          { "$ref": "#/components/schemas/NodeRegistrationFields" },
           {
             "type": "object",
             "required": [
@@ -1673,8 +1683,9 @@
         ]
       },
       "HeartbeatResponse": {
+        "unevaluatedProperties": false,
         "allOf": [
-          { "$ref": "#/components/schemas/Node" },
+          { "$ref": "#/components/schemas/NodeFields" },
           {
             "type": "object",
             "required": ["removal_directives", "storage_reset_directives", "storage_grow_directives", "reimage_preflight_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives", "custody_export_directives"],

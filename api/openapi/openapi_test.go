@@ -588,7 +588,7 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 		t.Error("Job response exposes the internal publication marker instead of computed readiness")
 	}
 
-	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
+	nodeRegistration := object(t, schemas["NodeRegistrationFields"], "NodeRegistrationFields")
 	properties := object(t, nodeRegistration["properties"], "NodeRegistration.properties")
 	if _, ok := properties["connect_host"]; !ok {
 		t.Fatal("NodeRegistration must carry the non-authoritative Fabric connect_host projection")
@@ -601,9 +601,9 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 			t.Fatalf("NodeRegistration must not accept self-reported %s", field)
 		}
 	}
-	node := object(t, schemas["Node"], "Node")
+	node := object(t, schemas["NodeFields"], "NodeFields")
 	nodeParts := node["allOf"].([]any)
-	nodeProjection := object(t, nodeParts[1], "Node.allOf[1]")
+	nodeProjection := object(t, nodeParts[1], "NodeFields.allOf[1]")
 	nodeProperties := object(t, nodeProjection["properties"], "Node.properties")
 	for _, field := range []string{
 		"max_oneshot_slots", "max_service_slots", "authority_generation", "claims_enabled",
@@ -634,7 +634,7 @@ func TestAgentProtocolCarriesFullCapabilityObservations(t *testing.T) {
 
 	common := readObject(t, "common.v1.json")
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
-	registration := object(t, schemas["NodeRegistration"], "NodeRegistration")
+	registration := object(t, schemas["NodeRegistrationFields"], "NodeRegistrationFields")
 	registrationRequired := stringSet(t, registration["required"])
 	for _, field := range []string{"capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"} {
 		if !registrationRequired[field] {
@@ -674,7 +674,7 @@ func TestCapabilityReasonVocabularyMatchesOpenAPIEnums(t *testing.T) {
 		enum any
 	}{
 		{name: "common.v1.json NodeRegistration", enum: object(t, object(t, object(t,
-			object(t, readObject(t, "common.v1.json")["components"], "common components")["schemas"], "common schemas")["NodeRegistration"], "NodeRegistration")["properties"], "NodeRegistration properties")["capability_reason_code"]},
+			object(t, readObject(t, "common.v1.json")["components"], "common components")["schemas"], "common schemas")["NodeRegistrationFields"], "NodeRegistrationFields")["properties"], "NodeRegistration properties")["capability_reason_code"]},
 		{name: "l1-agent.v1.json heartbeat", enum: object(t, object(t, object(t, object(t, object(t,
 			object(t, object(t, object(t, readObject(t, "l1-agent.v1.json")["paths"], "agent paths")["/v1/agent/nodes/{node_id}/heartbeat"], "heartbeat path")["post"], "heartbeat post")["requestBody"], "heartbeat request body")["content"], "heartbeat content")["application/json"], "heartbeat media")["schema"], "heartbeat schema")["properties"], "heartbeat properties")["capability_reason_code"]},
 	} {
