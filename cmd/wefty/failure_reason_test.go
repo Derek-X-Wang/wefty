@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -112,5 +113,70 @@ func TestInspectPrintsTheFailureReason(t *testing.T) {
 	}
 	if inspection.FailureReason != "exit 3" || inspection.Runs[0].FailureReason != "exit 3" {
 		t.Fatalf("inspect --json failure = %q / %q", inspection.FailureReason, inspection.Runs[0].FailureReason)
+	}
+}
+
+// stallingExecutionLedger answers the run read with a failed run that has no
+// recorded reason, and never answers the execution read the legacy fallback
+// makes.
+func stallingExecutionLedger(t *testing.T) *apiClients {
+	t.Helper()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/execution") {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(contract.RunRecord{RunID: "run-legacy", Status: contract.RunFailed})
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &redirectingTransport{target: target, inner: server.Client().Transport}}
+	return &apiClients{l3: &apiClient{name: "L3", flag: "l3", address: "stub", client: client}}
+}
+
+// TestWaitBoundsTheLegacyReasonLookup is the #604 review P2: the fallback read
+// for a run failed before reasons were recorded used the caller's context, so
+// a stalled /execution held `wait --timeout` open forever. It is bounded by
+// the wait's deadline and by its own cap, and a lookup that does not answer
+// leaves the reason out without changing the outcome.
+//
+// Not parallel: the no-deadline case shortens the lookup cap, a package
+// variable.
+func TestWaitBoundsTheLegacyReasonLookup(t *testing.T) {
+	previous := failureReasonLookupBudget
+	t.Cleanup(func() { failureReasonLookupBudget = previous })
+
+	for name, test := range map[string]struct {
+		args   []string
+		budget time.Duration
+	}{
+		"bounded by --timeout": {args: []string{"run-legacy", "--timeout", "1s"}, budget: time.Hour},
+		"bounded by the cap":   {args: []string{"run-legacy"}, budget: 300 * time.Millisecond},
+	} {
+		t.Run(name, func(t *testing.T) {
+			failureReasonLookupBudget = test.budget
+			var out bytes.Buffer
+			started := time.Now()
+			err := executeWait(t.Context(), stallingExecutionLedger(t), false, test.args, &out, &bytes.Buffer{})
+			if elapsed := time.Since(started); elapsed > 5*time.Second {
+				t.Fatalf("a stalled reason lookup held wait for %s", elapsed)
+			}
+			if code := commandExitCode(err); code != exitRunFailed {
+				t.Fatalf("exit %d (%v), want %d: the outcome must not change", code, err, exitRunFailed)
+			}
+			if strings.TrimSpace(out.String()) != string(contract.RunFailed) ||
+				!strings.Contains(err.Error(), "no reason was recorded") {
+				t.Fatalf("stdout %q, error %q", out.String(), err.Error())
+			}
+		})
 	}
 }

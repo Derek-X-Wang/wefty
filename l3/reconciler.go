@@ -124,9 +124,10 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 				continue
 			}
 		}
-		// jobNodeID falls back to the last attempt: a job that finished
-		// between two passes has no current attempt, and so no NodeID.
-		if err := r.store.recordRunNode(ctx, run.RunID, jobNodeID(job)); err != nil {
+		// A terminal job has no current attempt, so jobNodeID reads the
+		// attempt that settled it; that answer replaces a provisional one.
+		nodeID, settled := jobNodeID(job)
+		if err := r.store.recordRunNode(ctx, run.RunID, nodeID, settled); err != nil {
 			passErrors = append(passErrors, err)
 			continue
 		}

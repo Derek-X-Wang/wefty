@@ -2118,12 +2118,26 @@ func nullableReason(reason string) any {
 	return reason
 }
 
-func (s *Store) recordRunNode(ctx context.Context, runID, nodeID string) error {
+// recordRunNode attributes a run to a node. A provisional answer -- the node
+// of a live job's current attempt -- only fills an empty attribution. A
+// settled one -- the attempt that ended the job -- replaces a different
+// provisional node, because an attempt that failed before it started and was
+// requeued elsewhere is not where the run ran. Either way a terminal run's
+// attribution is never rewritten.
+func (s *Store) recordRunNode(ctx context.Context, runID, nodeID string, settled bool) error {
 	if nodeID == "" {
 		return nil
 	}
 	now := canonicalTime(s.clock.Now())
-	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=? AND COALESCE(node_id, '')='' AND status NOT IN (?, ?)`, nodeID, now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed); err != nil {
+	// A provisional answer matches only an empty attribution; a settled one
+	// matches any attribution that differs from it.
+	replaceable := ""
+	if settled {
+		replaceable = nodeID
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=?
+  AND (COALESCE(node_id, '')='' OR (?<>'' AND node_id<>?)) AND status NOT IN (?, ?)`,
+		nodeID, now.UnixNano(), runID, replaceable, replaceable, contract.RunSucceeded, contract.RunFailed); err != nil {
 		return internalError(err, "record run node attribution")
 	}
 	return nil

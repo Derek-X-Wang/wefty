@@ -122,7 +122,14 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			}
 			last = record.Status
 			if runIsTerminal(record.Status) {
-				return reportTerminalRun(stdout, record, runFailureReason(ctx, clients, record), jsonOutput)
+				// The reason lookup is bounded like every other read here:
+				// by what is left of --timeout, and by its own cap. A lookup
+				// that does not answer leaves the reason out; the outcome
+				// and its exit code stand either way.
+				reasonCtx := requestContext(ctx, deadline, &cancelRequest)
+				reason := runFailureReason(reasonCtx, clients, record)
+				cancelRequest()
+				return reportTerminalRun(stdout, record, reason, jsonOutput)
 			}
 		}
 		sleep := delay
@@ -224,15 +231,22 @@ func runFailureReason(ctx context.Context, clients *apiClients, record contract.
 	if record.FailureReason != "" {
 		return record.FailureReason
 	}
-	if clients == nil {
+	if clients == nil || ctx.Err() != nil {
 		return ""
 	}
-	execution, err := clients.getRunExecution(ctx, record.RunID)
+	lookupCtx, cancel := context.WithTimeout(ctx, failureReasonLookupBudget)
+	defer cancel()
+	execution, err := clients.getRunExecution(lookupCtx, record.RunID)
 	if err != nil {
 		return ""
 	}
 	return executionFailureReason(execution)
 }
+
+// failureReasonLookupBudget caps the one extra read a legacy failed run
+// costs. The reason is a courtesy on top of the outcome; it must never be
+// what keeps `wait` or `inspect` from returning.
+var failureReasonLookupBudget = statusProbeBudget
 
 func executionFailureReason(execution l3.RunExecution) string {
 	if execution.Job != nil && execution.Job.State == contract.JobFailed {

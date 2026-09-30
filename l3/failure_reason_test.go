@@ -97,6 +97,20 @@ func TestFailedRunRecordsWhyItFailed(t *testing.T) {
 				State: contract.AttemptFailed, Result: &l1.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}}}},
 			want: "signal terminated (agent)",
 		},
+		// L1 failed the job for the lease loss; the attempt's late exit 0
+		// is evidence, not the cause (#604 review).
+		"lease lost with a late result": {
+			job: l1.Job{State: contract.JobFailed, Attempts: []l1.Attempt{{AttemptID: "a", NodeID: "node-a",
+				State: contract.AttemptLost, LateResult: &l1.LateResultEvidence{Kind: l1.LateResultObservation, Late: true,
+					Result: &l1.ProcessResult{ExitCode: exitCode(0)}}}}},
+			want: "the attempt on node node-a lost its lease (late result: exit 0)",
+		},
+		"lease lost with no late result": {
+			job: l1.Job{State: contract.JobFailed, Attempts: []l1.Attempt{{AttemptID: "a", NodeID: "node-a",
+				State: contract.AttemptLost, LateResult: &l1.LateResultEvidence{Kind: l1.LateResultGapKind,
+					Gap: &l1.LateResultGap{Reason: l1.LateResultGapObservationWindowExpired}}}}},
+			want: "the attempt on node node-a lost its lease (late result unavailable: observation_window_expired)",
+		},
 		"pre-start failure": {
 			job:  l1.Job{State: contract.JobFailed, FailureReason: "image_unavailable"},
 			want: "L1: image_unavailable",
@@ -164,5 +178,80 @@ func TestDispatchRefusalAndLostJobRecordAReason(t *testing.T) {
 	}
 	if !strings.Contains(lost.FailureReason, "L1 lost the dispatched job") {
 		t.Fatalf("lost job reason = %q", lost.FailureReason)
+	}
+}
+
+// TestRequeuedRunIsAttributedToTheNodeThatSettledIt is the #604 review case:
+// an attempt on node A fails before it starts and the job is requeued, and a
+// later attempt on node B succeeds. The run ran on B, whatever an earlier pass
+// recorded while A held the job.
+func TestRequeuedRunIsAttributedToTheNodeThatSettledIt(t *testing.T) {
+	s, _, _ := recoveryStore(t)
+	run, _ := dispatchedRecoveryRun(t, s, "requeued")
+	client := &fixedJobClient{jobs: map[string]l1.Job{}}
+	reconciler, err := NewReconciler(s, client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributed := func() string {
+		t.Helper()
+		record, err := s.GetRun(context.Background(), run.RunID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record.NodeID
+	}
+	failedOnA := l1.Attempt{AttemptID: "attempt-a", NodeID: "node-a", State: contract.AttemptFailed,
+		Result: &l1.ProcessResult{SpawnError: &contract.SpawnFailure{Code: "image_unavailable", Message: "pull failed"}}}
+
+	// Claimed on A: provisional attribution to A.
+	client.jobs[run.JobID] = l1.Job{JobID: run.JobID, State: contract.JobClaimed, NodeID: "node-a",
+		Attempts: []l1.Attempt{{AttemptID: "attempt-a", NodeID: "node-a", State: contract.AttemptClaimed}}}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := attributed(); got != "node-a" {
+		t.Fatalf("claimed on A: node_id = %q", got)
+	}
+
+	// Requeued: no current attempt, and the failed attempt on A is not an
+	// answer for a job that is still live.
+	client.jobs[run.JobID] = l1.Job{JobID: run.JobID, State: contract.JobQueued, Attempts: []l1.Attempt{failedOnA}}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Succeeded on B: the settled answer replaces the provisional one.
+	client.jobs[run.JobID] = l1.Job{JobID: run.JobID, State: contract.JobSucceeded, Attempts: []l1.Attempt{
+		failedOnA,
+		{AttemptID: "attempt-b", NodeID: "node-b", State: contract.AttemptSucceeded, Result: &l1.ProcessResult{ExitCode: exitCode(0)}},
+	}}
+	record := reconcileUntilTerminal(t, s, client, run.RunID)
+	if record.Status != contract.RunSucceeded || record.NodeID != "node-b" {
+		t.Fatalf("run = %s on %q, want succeeded on node-b", record.Status, record.NodeID)
+	}
+}
+
+// TestRequeuedJobIsNotAttributedToTheAttemptThatFailed: while the job is live
+// and has no current attempt, nothing is recorded.
+func TestRequeuedJobIsNotAttributedToTheAttemptThatFailed(t *testing.T) {
+	s, _, _ := recoveryStore(t)
+	run, _ := dispatchedRecoveryRun(t, s, "requeued-live")
+	client := &fixedJobClient{jobs: map[string]l1.Job{run.JobID: {JobID: run.JobID, State: contract.JobQueued,
+		Attempts: []l1.Attempt{{AttemptID: "attempt-a", NodeID: "node-a", State: contract.AttemptFailed,
+			Result: &l1.ProcessResult{SpawnError: &contract.SpawnFailure{Code: "image_unavailable", Message: "pull failed"}}}}}}}
+	reconciler, err := NewReconciler(s, client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := s.GetRun(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.NodeID != "" {
+		t.Fatalf("a requeued job's failed attempt attributed the run to %q", record.NodeID)
 	}
 }
