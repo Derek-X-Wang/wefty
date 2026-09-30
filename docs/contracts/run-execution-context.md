@@ -416,7 +416,14 @@ that could not re-drive its revocation says that the revocation was not
 recorded. The owed row above is the durable record. The node heartbeat is the
 one surface that does not refuse: a pre-restore revocation the run ledger will
 not take is left owed and re-listed next pass, and only that Computer's
-restore directive is withheld. The heartbeat asks for all owed pre-restore
+restore directive is withheld. Recording the run ledger's receipt afterwards
+is per-Computer the same way (#600): when that write fails, including
+`stale_intent_revision` because the operator removed the Computer or its
+restore was superseded while the run ledger answered, L1 logs
+`event=l1_restore_revocation_receipt_deferred`, withholds that one restore
+directive, and still answers the heartbeat with every other directive. The
+next pass lists the revocation again only if the restore is still current;
+a removed or superseded restore is owed nothing. The heartbeat asks for all owed pre-restore
 revocations at once and waits for them at most
 `HeartbeatRestoreRevocationBudget` (3s), well inside the agent's 10s heartbeat
 deadline; a revocation that has not answered by then is owed exactly like a

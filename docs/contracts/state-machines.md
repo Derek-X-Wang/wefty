@@ -425,7 +425,9 @@ that inner Computer/revision binding as well as its current-operation CAS;
 `committed_at` remains L3 audit time and is never compared with L1's reservation
 clock. Missing or mismatched inner binding cannot authorize a successor, even
 with a future timestamp. Same-operation replay preserves the first bound
-receipt. A current reserved/prepared restore with missing receipt JSON or valid
+receipt. A receipt L1 cannot record -- the restore was removed or superseded
+while L3 answered, or the write itself failed -- leaves only that restore
+un-receipted and blocked; it never fails the node heartbeat (#600). A current reserved/prepared restore with missing receipt JSON or valid
 legacy unbound JSON reissues revocation and blocks helper admission/publication
 until L1 transactionally replaces that legacy receipt and recorded time with a
 bound acknowledgement. Malformed or wrong nonzero bindings remain fail closed;

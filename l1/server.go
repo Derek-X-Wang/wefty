@@ -1924,6 +1924,14 @@ func (s *Server) logRunLedgerRevocationDeferred(computerID string, err error) {
 	s.logf("event=l1_restore_revocation_deferred computer_id=%s cause=%q", computerID, scrubbedCause(err))
 }
 
+func (s *Server) logRestoreReceiptDeferred(computerID string, operationRevision int64, err error) {
+	if s.logf == nil {
+		return
+	}
+	s.logf("event=l1_restore_revocation_receipt_deferred computer_id=%s operation_revision=%d cause=%q",
+		computerID, operationRevision, scrubbedCause(err))
+}
+
 func (s *Server) revokeComputerAuthority(ctx context.Context, computerID, reason string) error {
 	_, err := s.revokeComputerAuthorityWithReceipt(ctx, computerID, reason)
 	return err
@@ -2234,11 +2242,18 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 			s.logRunLedgerRevocationDeferred(outcome.revocation.ComputerID, outcome.err)
 			continue
 		}
+		// The receipt write is per-Computer too (wefty #600). Its CAS fails
+		// stale when the Computer was removed or left restoring while the
+		// run ledger answered, and any other failure is one Computer's write.
+		// Either way the restore stays un-receipted, so its copy directive is
+		// withheld and the next heartbeat lists it again if it is still owed;
+		// a removed or superseded restore is owed nothing. The run ledger's
+		// revoke-all is idempotent, so repeating it is harmless.
 		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), outcome.revocation.ComputerID, outcome.revocation.OperationRevision, ComputerRestoreRevocationEvidence{
 			RevokeAll: true, TokenRevocation: outcome.receipt,
 		}); err != nil {
-			writeError(w, err)
-			return
+			authorityStillOwed[outcome.revocation.ComputerID] = struct{}{}
+			s.logRestoreReceiptDeferred(outcome.revocation.ComputerID, outcome.revocation.OperationRevision, err)
 		}
 	}
 	// Restore receipts first: they gate directives. Owed-revocation writes
