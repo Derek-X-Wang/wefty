@@ -74,12 +74,6 @@ type logSpool struct {
 	// only; see logSpoolDSN.
 	db       *sql.DB
 	appendDB *sql.DB
-	// barrierMu guards durableThroughOrdinal: every event with an ordinal at
-	// or below it is covered by a FULL commit this process made, so an upload
-	// batch that ends there needs no new barrier. It starts at zero in every
-	// process, so the first batch after a restart always pays one.
-	barrierMu             sync.Mutex
-	durableThroughOrdinal int64
 	// durabilityBarriers counts barrier commits, for tests.
 	durabilityBarriers atomic.Int64
 	maxOneShotBytes    int64
@@ -1072,7 +1066,7 @@ FROM spool_events WHERE attempt_id=? ORDER BY ordinal LIMIT ?`, attemptID, limit
 		return nil, fmt.Errorf("agent: close pending log spool: %w", err)
 	}
 	if len(events) != 0 {
-		if err := spool.durabilityBarrier(ctx, events[len(events)-1].ordinal); err != nil {
+		if err := spool.durabilityBarrier(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -1090,21 +1084,19 @@ FROM spool_events WHERE attempt_id=? ORDER BY ordinal LIMIT ?`, attemptID, limit
 // both upload paths (the live sink and evidence recovery) go through, ends in
 // one FULL commit after its read: the WAL is append-only, so that commit's
 // sync persists every frame committed before it, which is every event read.
-// That is one full sync per upload batch, not per event, and none for a batch
-// an earlier barrier in this process already covered (a retried batch).
-func (spool *logSpool) durabilityBarrier(ctx context.Context, throughOrdinal int64) error {
-	spool.barrierMu.Lock()
-	defer spool.barrierMu.Unlock()
-	if throughOrdinal <= spool.durableThroughOrdinal {
-		return nil
-	}
+// That is one full sync per upload batch, not per event.
+//
+// Every non-empty batch pays it, retries included. Nothing remembers what an
+// earlier barrier covered: a NORMAL append can rewrite an event at an ordinal
+// already covered -- service eviction turns an older payload into a gap in
+// place -- so "this ordinal was covered" does not mean "these bytes are".
+func (spool *logSpool) durabilityBarrier(ctx context.Context) error {
 	// A commit that changes nothing writes no WAL frame and syncs nothing, so
 	// the barrier really writes: one counter row on the FULL handle.
 	if _, err := spool.db.ExecContext(ctx, `INSERT INTO spool_durability_barrier(id, commits) VALUES(1, 1)
 ON CONFLICT(id) DO UPDATE SET commits=commits+1`); err != nil {
 		return wrapLogSpoolContextError(ctx, "agent: commit log spool durability barrier", err)
 	}
-	spool.durableThroughOrdinal = throughOrdinal
 	spool.durabilityBarriers.Add(1)
 	return nil
 }

@@ -175,7 +175,8 @@ func TestEveryUploadBatchIsCoveredByAFullCommitBeforeItIsSent(t *testing.T) {
 			if err := outbox.spool.db.QueryRowContext(t.Context(), "SELECT commits FROM spool_durability_barrier WHERE id=1").Scan(&commits); err != nil || commits != events/batchSize {
 				t.Fatalf("barrier row = %d, %v; want %d commits on the FULL handle", commits, err, events/batchSize)
 			}
-			// A batch an earlier barrier covered -- a retry -- pays nothing more.
+			// Every non-empty read pays its own barrier, a retry included:
+			// nothing remembers what an earlier barrier covered.
 			if err := outbox.spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, events, "tail")); err != nil {
 				t.Fatal(err)
 			}
@@ -184,9 +185,49 @@ func TestEveryUploadBatchIsCoveredByAFullCommitBeforeItIsSent(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if barriers := outbox.spool.durabilityBarriers.Load(); barriers != events/batchSize+1 {
-				t.Fatalf("re-reading a covered batch committed another barrier: %d, want %d", barriers, events/batchSize+1)
+			if barriers := outbox.spool.durabilityBarriers.Load(); barriers != events/batchSize+2 {
+				t.Fatalf("two re-reads committed %d barriers in all, want %d", barriers, events/batchSize+2)
 			}
 		})
+	}
+}
+
+// TestAnEvictionGapGetsItsOwnBarrier: service eviction rewrites an older
+// payload into a gap at the same ordinal on the NORMAL handle, after a later
+// batch's barrier covered that ordinal. Uploading the gap must still be
+// preceded by a barrier of its own, or L1 could hold a gap the spool loses.
+func TestAnEvictionGapGetsItsOwnBarrier(t *testing.T) {
+	spool, err := openLogSpoolWithBudgets(t.TempDir(), "node-eviction-barrier", 1024, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	first, second := serviceSpoolTestClaim("service-a"), serviceSpoolTestClaim("service-b")
+	for _, claim := range []l1.Claim{first, second} {
+		if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := spool.append(t.Context(), spoolTestEvent("service-a", contract.LogStdout, 0, "aaaaaaaa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.append(t.Context(), spoolTestEvent("service-b", contract.LogStdout, 0, "bbbbbbbb")); err != nil {
+		t.Fatal(err)
+	}
+	// Upload B: its barrier covers every ordinal so far, A's included.
+	if batch, err := spool.pending(t.Context(), "service-b", 8); err != nil || len(batch) != 1 {
+		t.Fatalf("B's batch = %#v, %v", batch, err)
+	}
+	covered := spool.durabilityBarriers.Load()
+	// B's next line needs A's bytes: A's event becomes a gap in place.
+	if err := spool.append(t.Context(), spoolTestEvent("service-b", contract.LogStdout, 1, "cccccccc")); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := spool.pending(t.Context(), "service-a", 8)
+	if err != nil || len(batch) != 1 || batch[0].Gap == nil || batch[0].Gap.Reason != contract.LogGapSpoolEviction {
+		t.Fatalf("A's batch = %#v, %v; want the eviction gap", batch, err)
+	}
+	if barriers := spool.durabilityBarriers.Load(); barriers != covered+1 {
+		t.Fatalf("A's rewritten gap was returned for upload after %d new barriers, want 1", barriers-covered)
 	}
 }

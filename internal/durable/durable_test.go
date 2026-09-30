@@ -164,27 +164,32 @@ func TestCreateFileHasExactlyOneWinnerAmongRacers(t *testing.T) {
 	assertOnly(t, path, "identity")
 }
 
-// TestMkdirAllSyncsTheParentOfEveryDirectoryItCreates: a directory entry is
+// TestMkdirAllSyncsTheParentOfEveryComponent: a directory entry is
 // durable only once its parent is synced, and a later durable write inside a
 // directory whose own entry power loss can drop is not durable at all.
-func TestMkdirAllSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
+func TestMkdirAllSyncsTheParentOfEveryComponent(t *testing.T) {
 	base := t.TempDir()
 	syncs := countDirectorySyncs(t)
 	target := filepath.Join(base, "a", "b", "c")
+	// Every component below the filesystem root has its parent synced.
+	components := len(strings.Split(strings.Trim(target, string(filepath.Separator)), string(filepath.Separator)))
 	if err := MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Stat(target); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
 		t.Fatalf("%s = %v, %v", target, info, err)
 	}
-	if *syncs != 3 {
-		t.Fatalf("creating three directories synced %d parents, want 3", *syncs)
+	if *syncs != components {
+		t.Fatalf("MkdirAll synced %d parents for a %d-component path, want %d", *syncs, components, components)
 	}
+	// A directory that already exists -- perhaps left by a creation power
+	// loss interrupted -- still has its parent synced.
+	*syncs = 0
 	if err := MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if *syncs != 3 {
-		t.Fatalf("an existing path synced %d more parents, want none", *syncs-3)
+	if *syncs != components {
+		t.Fatalf("an existing path synced %d parents, want %d", *syncs, components)
 	}
 	file := filepath.Join(base, "file")
 	if err := os.WriteFile(file, nil, 0o600); err != nil {
@@ -206,6 +211,9 @@ func TestMkdirSyncsItsParent(t *testing.T) {
 	}
 	if err := Mkdir(root, "run", 0o700); !errors.Is(err, fs.ErrExist) {
 		t.Fatalf("a second Mkdir = %v, want fs.ErrExist", err)
+	}
+	if *syncs != 2 {
+		t.Fatalf("Mkdir of an existing directory did not sync its parent: %d syncs, want 2", *syncs)
 	}
 	assertOnly(t, path, "run")
 }

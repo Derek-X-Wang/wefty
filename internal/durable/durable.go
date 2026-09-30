@@ -92,46 +92,55 @@ func CreateFile(dir *os.Root, name string, payload []byte, mode os.FileMode) err
 	return syncDirectory(dir)
 }
 
-// MkdirAll is os.MkdirAll whose every newly created directory is durable: each
-// missing component is created and then its parent is synced, so power loss
-// cannot drop the entry of a directory a later durable write lands in. A
-// component that already exists is left as it is.
+// MkdirAll is os.MkdirAll whose every directory on the path is durable: each
+// missing component is created, and the parent of every component -- created
+// now or already there -- is synced. A directory an earlier, interrupted call
+// created may exist without its entry ever having been synced, and reusing it
+// as it is would leave a later durable write inside it hanging on an entry
+// power loss can still drop. It runs at directory-creation sites, where one
+// sync per path component is cheap next to the writes it protects.
 func MkdirAll(path string, mode os.FileMode) error {
 	path = filepath.Clean(path)
-	info, err := os.Stat(path)
-	if err == nil {
-		if !info.IsDir() {
-			return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
-		}
-		return nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
 	parent := filepath.Dir(path)
 	if parent != path {
 		if err := MkdirAll(parent, mode); err != nil {
 			return err
 		}
 	}
-	if err := os.Mkdir(path, mode); err != nil {
-		// A racing creator made it; its parent sync may not have happened
-		// yet, so this caller syncs too before relying on it.
-		if info, statErr := os.Stat(path); errors.Is(err, fs.ErrExist) && statErr == nil && info.IsDir() {
-			return syncDirectoryPath(parent)
+	info, err := os.Stat(path)
+	switch {
+	case err == nil && !info.IsDir():
+		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.Mkdir(path, mode); err != nil {
+			// A racing creator made it; this caller still syncs its parent
+			// below before relying on it.
+			if info, statErr := os.Stat(path); !errors.Is(err, fs.ErrExist) || statErr != nil || !info.IsDir() {
+				return err
+			}
 		}
+	case err != nil:
 		return err
+	}
+	if parent == path {
+		return nil
 	}
 	return syncDirectoryPath(parent)
 }
 
-// Mkdir creates name in dir and syncs dir, so the new entry is durable. It
-// returns os.Mkdir's errors unchanged, including fs.ErrExist.
+// Mkdir creates name in dir and syncs dir, so the entry is durable. It syncs
+// dir when name already exists too -- an interrupted earlier creation may
+// never have synced it -- and still returns os.Mkdir's error, fs.ErrExist
+// included.
 func Mkdir(dir *os.Root, name string, mode os.FileMode) error {
-	if err := dir.Mkdir(name, mode); err != nil {
+	mkdirErr := dir.Mkdir(name, mode)
+	if mkdirErr != nil && !errors.Is(mkdirErr, fs.ErrExist) {
+		return mkdirErr
+	}
+	if err := syncDirectory(dir); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	return mkdirErr
 }
 
 func syncDirectoryPath(path string) error {
