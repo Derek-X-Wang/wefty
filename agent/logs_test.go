@@ -132,3 +132,45 @@ func TestExpiredFinalizationWithNoPendingLogsIsCompleteEvidence(t *testing.T) {
 		t.Fatalf("empty sink close after finalization expiry = %v, want complete evidence", err)
 	}
 }
+
+// fixedWallClock reads a fixed wall time; its timers are real.
+type fixedWallClock struct {
+	systemClock
+	wall time.Time
+}
+
+func (clock fixedWallClock) Now() time.Time     { return clock.wall }
+func (clock fixedWallClock) WallNow() time.Time { return clock.wall }
+
+func TestLogSinkStampsAMissingTimestampAtSpoolTime(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "stamp-node", 1<<20)
+	defer spool.Close()
+	claim := spoolTestClaim("stamp-attempt")
+	wall := time.Date(2026, 9, 30, 12, 34, 56, 789, time.FixedZone("PDT", -7*60*60))
+	sink, err := newBatchingLogSink(t.Context(), nil, claim, spool, fixedWallClock{wall: wall}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	given := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	for _, event := range []contract.LogEvent{
+		{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("unstamped\n")},
+		{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 1, Timestamp: given, Bytes: []byte("stamped\n")},
+	} {
+		if err := sink.WriteOutput(t.Context(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := spool.pending(t.Context(), claim.Lease.AttemptID, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("spooled events = %d, want 2", len(pending))
+	}
+	if got := pending[0].Timestamp; !got.Equal(wall) {
+		t.Fatalf("unstamped event spooled at %s, want the sink clock's wall time %s", got, wall.UTC())
+	}
+	if got := pending[1].Timestamp; !got.Equal(given) {
+		t.Fatalf("stamped event spooled at %s, want its own %s", got, given)
+	}
+}
