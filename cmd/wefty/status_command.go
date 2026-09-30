@@ -226,9 +226,14 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 			return
 		}
 		l3Status.Reachable = true
+		runIDs := make([]string, 0, len(queued.Runs))
 		for _, run := range queued.Runs {
-			if reason := unschedulableReason(probeCtx, clients, run.RunID); reason != "" {
-				stuck = append(stuck, queuedRunNote{runID: run.RunID, reason: reason})
+			runIDs = append(runIDs, run.RunID)
+		}
+		reasons := queuedRunReasons(probeCtx, clients, runIDs)
+		for _, runID := range runIDs {
+			if reason := reasons[runID]; reason != "" {
+				stuck = append(stuck, queuedRunNote{runID: runID, reason: reason})
 			}
 		}
 	}()

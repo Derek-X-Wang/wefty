@@ -400,3 +400,31 @@ func TestLedgerFailedRunIsAttributedOnceItsJobSettles(t *testing.T) {
 		t.Fatalf("attribution still pending (%d, %v)", pending, err)
 	}
 }
+
+// TestPendingNodeAttributionsUseThePartialIndex keeps the per-pass lookup off
+// a scan of every run the ledger holds (#604 review P3).
+func TestPendingNodeAttributionsUseThePartialIndex(t *testing.T) {
+	s, _, _ := recoveryStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN ` + pendingNodeAttributionsQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(plan, "; ")
+	if !strings.Contains(joined, "runs_node_attribution_pending") {
+		t.Fatalf("pending attribution query plan does not use the partial index: %s", joined)
+	}
+	t.Logf("plan: %s", joined)
+}

@@ -304,7 +304,16 @@ the run is created. A rejected envelope or gate is stored in the immutable
 protocol-rejection ledger and fails the run. Gate `fail` and `error` outcomes
 also fail the run; gate evaluation itself remains workflow-owned.
 
-`GET /v1/runs/{run_id}` includes accepted envelopes and gates. `GET
+`GET /v1/runs/{run_id}` includes accepted envelopes and gates. A failed run's
+record also carries `failure_reason`: one line of at most 200 characters,
+folded from whitespace and control characters, written by the transition that
+failed the run. A rejected envelope or gate is summarized by its kind and, for
+a schema failure, the JSON pointer of the offending field, never the rejected
+value; the full refusal stays in the protocol-rejection ledger. Because it is
+part of the run record, `failure_reason` is visible to every caller that may
+read the record, including a Computer pass reading its own Runs, while
+`GET /v1/runs/{run_id}/execution` and its L1 job evidence stay denied to
+Computer passes. `GET
 /v1/runs/{run_id}/lineage` returns root-first ancestors and depth-ordered
 descendants. Run tokens receive only entries within their own descendant
 scope; an ancestor or sibling target is rejected before the query is served.

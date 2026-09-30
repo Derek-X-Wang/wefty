@@ -79,15 +79,39 @@ func queuedRunIsWaiting(status contract.RunState) bool {
 }
 
 // unschedulableReason is L1's own statement that no tag-eligible node can run
-// this queued run, or empty when L1 has none or cannot be asked.
-func unschedulableReason(ctx context.Context, clients *apiClients, runID string) string {
+// this queued run, or empty when L1 has none. The error says it could not be
+// asked, so a caller asking about several runs can stop at the first.
+func unschedulableReason(ctx context.Context, clients *apiClients, runID string) (string, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, statusProbeBudget)
 	defer cancel()
 	execution, err := clients.getRunExecution(probeCtx, runID)
-	if err != nil || execution.Job == nil || execution.Job.State != contract.JobQueued {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return execution.Job.UnschedulableReason
+	if execution.Job == nil || execution.Job.State != contract.JobQueued {
+		return "", nil
+	}
+	return execution.Job.UnschedulableReason, nil
+}
+
+// queuedRunReasons asks about each queued run under one shared budget and
+// stops at the first read that fails or runs out. It is an annotation on a
+// listing that already answered: an unreachable L1 must cost a listing at
+// most one probe budget, never one per queued run.
+func queuedRunReasons(ctx context.Context, clients *apiClients, runIDs []string) map[string]string {
+	budgetCtx, cancel := context.WithTimeout(ctx, statusProbeBudget)
+	defer cancel()
+	reasons := make(map[string]string, len(runIDs))
+	for _, runID := range runIDs {
+		reason, err := unschedulableReason(budgetCtx, clients, runID)
+		if err != nil {
+			break
+		}
+		if reason != "" {
+			reasons[runID] = reason
+		}
+	}
+	return reasons
 }
 
 // maxAnnotatedQueuedRuns bounds how many queued runs one listing asks about.
@@ -107,15 +131,16 @@ type runListingPage struct {
 }
 
 func annotateRunListing(ctx context.Context, clients *apiClients, page l3.RunListPage) runListingPage {
-	annotated := runListingPage{Runs: make([]runListingRow, 0, len(page.Runs))}
-	asked := 0
+	var queued []string
 	for _, run := range page.Runs {
-		row := runListingRow{RunSummary: run}
-		if run.Status == contract.RunQueued && asked < maxAnnotatedQueuedRuns {
-			asked++
-			row.UnschedulableReason = unschedulableReason(ctx, clients, run.RunID)
+		if run.Status == contract.RunQueued && len(queued) < maxAnnotatedQueuedRuns {
+			queued = append(queued, run.RunID)
 		}
-		annotated.Runs = append(annotated.Runs, row)
+	}
+	reasons := queuedRunReasons(ctx, clients, queued)
+	annotated := runListingPage{Runs: make([]runListingRow, 0, len(page.Runs))}
+	for _, run := range page.Runs {
+		annotated.Runs = append(annotated.Runs, runListingRow{RunSummary: run, UnschedulableReason: reasons[run.RunID]})
 	}
 	return annotated
 }

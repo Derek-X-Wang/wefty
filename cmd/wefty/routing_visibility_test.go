@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,5 +213,63 @@ func TestFollowingAQueuedRunSaysItIsWaiting(t *testing.T) {
 	if strings.Count(errOut.String(), "waiting for a node") != 1 ||
 		!strings.Contains(errOut.String(), "no eligible node: "+noEligibleNode) {
 		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+// TestRunsListAnnotationSharesOneBudget is the #604 review P3: each queued
+// run's execution read had its own 3 s budget, so with L1 unreachable a
+// listing of queued runs blocked for up to a minute. The annotations share one
+// probe budget and stop at the first read that fails or runs out.
+func TestRunsListAnnotationSharesOneBudget(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	executionReads := 0
+	release := make(chan struct{})
+	created := time.Now().UTC()
+	page := l3.RunListPage{}
+	for index := 0; index < 5; index++ {
+		page.Runs = append(page.Runs, l3.RunSummary{RunID: fmt.Sprintf("run-q%d", index), Status: contract.RunQueued,
+			Trigger: contract.Trigger{Type: "manual"}, CreatedAt: created})
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/execution") {
+			mu.Lock()
+			executionReads++
+			mu.Unlock()
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(page)
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &redirectingTransport{target: target, inner: server.Client().Transport}}
+	clients := &apiClients{l3: &apiClient{name: "L3", flag: "l3", address: "stub", client: client}}
+
+	var out bytes.Buffer
+	started := time.Now()
+	if err := executeRuns(t.Context(), clients, false, []string{"list"}, &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > statusProbeBudget+2*time.Second {
+		t.Fatalf("runs list took %s with a hanging execution view; want about one %s budget", elapsed, statusProbeBudget)
+	}
+	mu.Lock()
+	reads := executionReads
+	mu.Unlock()
+	if reads != 1 {
+		t.Fatalf("execution was read %d times; the annotation must stop at the first failure", reads)
+	}
+	if strings.Count(out.String(), "run-q") != 5 || strings.Contains(out.String(), "no eligible node") {
+		t.Fatalf("listing = %s", out.String())
 	}
 }

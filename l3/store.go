@@ -322,6 +322,13 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_attribution_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("l3: migrate run node attribution pending: %w", err)
 	}
+	// Every reconcile pass asks for the pending attributions; the partial
+	// index keeps that a lookup of the few pending rows, not a scan of every
+	// run the ledger has ever held.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_node_attribution_pending
+ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
+		return fmt.Errorf("l3: index pending run node attributions: %w", err)
+	}
 	// A ledger written before credential delivery became opt-in has no column.
 	// Defaulting it to 0 is the safe direction: an old run reads as one that
 	// did not declare dispatch authority, so nothing is granted retroactively.
@@ -2145,9 +2152,13 @@ type pendingNodeAttribution struct {
 	JobID string
 }
 
+// pendingNodeAttributionsQuery names node_attribution_pending=1 literally so
+// SQLite can answer it from the runs_node_attribution_pending partial index.
+const pendingNodeAttributionsQuery = `SELECT run_id, l1_job_id FROM runs
+WHERE node_attribution_pending=1 AND l1_job_id IS NOT NULL ORDER BY created_ns, run_id`
+
 func (s *Store) pendingNodeAttributions(ctx context.Context) ([]pendingNodeAttribution, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT run_id, l1_job_id FROM runs
-WHERE node_attribution_pending=1 AND l1_job_id IS NOT NULL ORDER BY created_ns, run_id`)
+	rows, err := s.db.QueryContext(ctx, pendingNodeAttributionsQuery)
 	if err != nil {
 		return nil, internalError(err, "list pending run node attributions")
 	}

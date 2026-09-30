@@ -639,7 +639,7 @@ var followWaitingNoticeAfter = 3 * time.Second
 // reads, with L1's reason when no node could ever take it as things stand.
 func announceWaitingForNode(ctx context.Context, clients *apiClients, stderr io.Writer, runID string, status contract.RunState) error {
 	line := fmt.Sprintf("wefty: run %s is %s; waiting for a node to start it", runID, status)
-	if reason := unschedulableReason(ctx, clients, runID); reason != "" {
+	if reason, _ := unschedulableReason(ctx, clients, runID); reason != "" {
 		line += " (no eligible node: " + reason + ")"
 	}
 	_, err := fmt.Fprintln(stderr, line)
