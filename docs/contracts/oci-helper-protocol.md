@@ -206,6 +206,38 @@ Every JSON message is a four-byte big-endian length followed by at most 1 MiB
 of JSON. Handshake and initial request reads have deadlines, the helper caps
 concurrent connections, and a decoder never reads beyond one frame.
 
+The connection cap is 64 slots, shared by the control connection and every
+request connection. Long-lived data streams -- `DialAttemptPort` and
+`DialHostBridge`, which hold their connection for the life of one proxied
+service client, one take-over view or control leg, or one Computer bridge
+pump -- may hold at most the cap minus a control reserve of 8, so 56. The
+control connection, each live attempt's `Watch`, and control RPCs such as
+`Signal`, `Delete`, and `Run` always keep the remaining 8 however busy a
+published service is. A data stream over its budget is refused after session
+authorization with `connection_limit`. A connection accepted while all 64
+slots are taken has its peer credentials read on the accept loop, which is one
+non-blocking socket option. A peer outside the UID allowlist is closed at once
+and never holds a slot or a refusal worker. An allowed peer -- the agent -- is
+answered, never dropped: one of at most 8 refusal workers consumes its one
+request frame under a 1-second deadline and answers `connection_limit`.
+Reading the frame first is what makes the answer reachable: closing on an
+unread request fails the client's write or read with EPIPE or EOF, which is
+indistinguishable from a dead helper. When all 8 workers are busy, the accept
+loop waits for a worker or a slot instead of closing; each worker finishes
+within its deadline, so later connections wait in the kernel backlog and the
+client sees latency, not EOF.
+
+The threat model for this path is explicit. Peers on the UID allowlist -- root
+and the agent's own UID -- are trusted: they can already stop the helper
+outright, so the refusal path does not defend against them. It defends against
+foreign local peers, which are closed before they hold anything, and against
+honest overload. Under honest overload every request's frame is already on the
+wire, so a refusal worker is busy for microseconds and a burst far wider than
+the 8 workers is answered within milliseconds. That is well inside the agent's
+one-second signal delivery bound, past which an unanswered signal is read as
+runtime loss. Only a silent peer can hold a worker for its full deadline and
+stretch that wait, and a silent allowlisted peer is outside this model.
+
 The closed wire error-code vocabulary is `invalid_request`,
 `peer_unauthenticated`, `version_mismatch`, `checksum_mismatch`, `session_busy`,
 `session_stale`, `computer_storage_busy`, `computer_storage_retired`,
@@ -214,8 +246,8 @@ The closed wire error-code vocabulary is `invalid_request`,
 `attempt_outside_session`, `unauthorized_port`, `unauthorized_bridge`,
 `oci_spec_rejected`, `image_unavailable`, `insufficient_memory`,
 `insufficient_disk`, `engine_failure`, `diagnostic_failure`,
-`unsupported_operation`, `sweep_required`, `handoff_volume_live`, and
-`startup_bound_tripped`.
+`unsupported_operation`, `sweep_required`, `handoff_volume_live`,
+`startup_bound_tripped`, and `connection_limit`.
 Adding a code requires changing
 this contract in the same commit as the wire implementation.
 
@@ -242,6 +274,38 @@ naming the attempt, whether the deadman guardian performed it, and its outcome
 with a sanitized reason, because that outcome is what decides whether a failed
 `Run` is attempt-scoped. Those lines carry no capability, no host path, and no
 raw privileged error text.
+
+`connection_limit` is never runtime-loss evidence: the helper answered on a
+fresh connection that it has no slot for one request, and the session and
+every attempt are untouched. Before it existed the overflow was a bare close,
+the client read EOF as loss, and one service with about 60 keep-alive clients
+reaped every OCI workload on the Node (#597). The agent turns the refusal into
+the smallest failure it names: a service front door closes only that client's
+TCP connection, a Computer take-over view is refused with 503 and the Computer
+keeps running, a take whose driver-signal set or control leg meets it is
+refused `503 tenure_unavailable` like any unavailable replacement backend
+(signal cleared, tenure Free) without failing the attempt, a host-bridge pump backs off 250 ms and retries, and a
+readiness probe that meets it is inconclusive and leaves readiness where it
+was -- flipping to unready would withdraw publication and sever the very
+clients the budget protects. An RPC on an admitted attempt that must not fail
+for want of a slot -- `Watch` start, `Signal`, `Delete`, clearing the driver
+signal, and `SetComputerToken` -- is retried with backoff from 100 ms to 1 s
+for up to 60 s, and for up to 5 s for a stop's TERM and KILL, each also bounded
+by its caller's context. `Watch` start on a running attempt has no budget of
+its own. The attempt runs whether or not it is observed, so the retry lasts as
+long as the attempt does: its context (cancellation, its runtime bound, agent
+stop) or a `Watch` result other than a refusal, such as real session loss,
+ends it. A still-refused `Watch` is never turned into a runtime failure. It is
+logged once per burst, with a reminder every 30 s that the attempt is still
+unobserved. A refusal admitted nothing, so the retry is always
+safe. A refusal that outlives its bound is returned as not done -- a signal not
+delivered, a delete not performed -- and never as done or as runtime loss. A
+refused `Run` is a definitive rejection: nothing was admitted, so no `Delete`
+is owed. None of these embargo OCI, and each logs the
+refusal once per burst (a run of refusals with no 30-second gap, re-reported
+at most once a minute with the count since), not once per connection. A new
+agent against a helper without this code still meets the bare close and
+behaves as before.
 
 The client boundary exposes runtime loss as a typed error only for an active
 session's transport disappearance, `session_stale`, an explicit image

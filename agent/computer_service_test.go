@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"github.com/coder/websocket"
 )
 
@@ -573,3 +574,48 @@ func (value *recordingComputerServiceFabric) WhoIs(context.Context, string) (fab
 func (*recordingComputerServiceFabric) ConnectHost() string { return "127.0.0.1" }
 
 var _ WorkloadRuntime = (*opaqueEndpointRuntime)(nil)
+
+// The OCI helper refusing a probe's stream for want of a connection slot says
+// nothing about the display. Reading it as unready would end every take-over
+// session the budget was protecting, so steady-state readiness holds; a real
+// backend failure still withdraws it (#597).
+func TestComputerReadinessTreatsHelperConnectionLimitAsInconclusive(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	backend := newComputerBackend(t, computerBackendOptions{})
+	defer backend.Close()
+	var mode atomic.Int32 // 0 healthy, 1 connection_limit, 2 backend down
+	dial := func(ctx context.Context, _ string) (net.Conn, error) {
+		switch mode.Load() {
+		case 1:
+			return nil, &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit, Message: "OCI helper data-stream budget is full"}
+		case 2:
+			return nil, errors.New("display backend refused")
+		}
+		return backend.dial(ctx)
+	}
+	started := make(chan time.Time, 1)
+	started <- now
+	observations := make(chan bool, 4)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+	}()
+	wantComputerReadinessObservation(t, observations, true)
+
+	mode.Store(1)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	// The next interval timer exists only once the refused probe has finished.
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	wantNoComputerReadinessObservation(t, observations)
+
+	mode.Store(2)
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, false)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

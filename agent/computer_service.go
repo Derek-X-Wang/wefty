@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 type computerServiceConfig struct {
@@ -550,8 +551,15 @@ func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan t
 		case <-timer.C():
 		}
 		probeContext, cancel := contextWithClockTimeout(ctx, clock, DefaultComputerReadinessConnectTimeout)
-		nextReady := probeComputerBackendPairOnce(probeContext, dial) == nil
+		probeErr := probeComputerBackendPairOnce(probeContext, dial)
 		cancel()
+		nextReady := probeErr == nil
+		// The OCI helper out of stream slots says nothing about the display;
+		// reading it as unready would end every take-over session, so the
+		// probe is inconclusive (#597).
+		if ocihelper.IsConnectionLimitRefusal(probeErr) {
+			nextReady = ready
+		}
 		if nextReady != ready {
 			ready = nextReady
 			observe(ready)

@@ -42,10 +42,17 @@ type ServerConfig struct {
 	ReapTimeout           time.Duration
 	RequestTimeout        time.Duration
 	ConnectionLimit       int
-	AllowedUIDs           []uint32
-	AllowedMountRoots     []string
-	Clock                 Clock
-	Logf                  func(string, ...any)
+	// ControlConnectionReserve is how many of ConnectionLimit's slots
+	// long-lived data streams (DialAttemptPort, DialHostBridge) may never
+	// occupy, so the session control connection and control RPCs such as
+	// Signal, Delete, and Watch always find a slot however busy a published
+	// service is. Zero selects defaultControlConnectionReserve; a reserve that
+	// would leave data streams no slot is clamped to half the limit.
+	ControlConnectionReserve int
+	AllowedUIDs              []uint32
+	AllowedMountRoots        []string
+	Clock                    Clock
+	Logf                     func(string, ...any)
 	// StartupFailureStateDirectory holds the durable consecutive-startup-
 	// barrier-failure ledger that bounds the helper's restart loop. Empty
 	// disables the bound; the installed helper always sets it to its runtime
@@ -67,6 +74,13 @@ type Server struct {
 	instanceID  string
 	createSweep sync.RWMutex
 	connections chan struct{}
+	// dataStreams bounds the connection slots long-lived data streams may hold
+	// to ConnectionLimit minus ControlConnectionReserve.
+	dataStreams chan struct{}
+	// limitRefusals bounds the goroutines that answer a connection accepted
+	// over ConnectionLimit with a typed connection_limit frame.
+	limitRefusals   chan struct{}
+	limitRefusalLog ConnectionLimitLog
 
 	sessionMu               sync.Mutex
 	active                  *serverSession
@@ -248,6 +262,12 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 	if config.ConnectionLimit <= 0 {
 		config.ConnectionLimit = defaultConnectionLimit
 	}
+	if config.ControlConnectionReserve <= 0 {
+		config.ControlConnectionReserve = defaultControlConnectionReserve
+	}
+	if config.ControlConnectionReserve >= config.ConnectionLimit {
+		config.ControlConnectionReserve = config.ConnectionLimit / 2
+	}
 	if config.Clock == nil {
 		config.Clock = systemClock{}
 	}
@@ -264,6 +284,8 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 		engine: engine, config: config,
 		instanceID:         instanceID,
 		connections:        make(chan struct{}, config.ConnectionLimit),
+		dataStreams:        make(chan struct{}, config.ConnectionLimit-config.ControlConnectionReserve),
+		limitRefusals:      make(chan struct{}, connectionLimitRefusalBudget),
 		startupDone:        make(chan struct{}),
 		reapedBootSessions: make(map[SessionIdentity]uint64),
 	}, nil
@@ -324,12 +346,9 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 		}
 		select {
 		case server.connections <- struct{}{}:
-			go func() {
-				defer func() { <-server.connections }()
-				server.handleConnection(ctx, connection)
-			}()
+			server.serveAdmitted(ctx, connection)
 		default:
-			_ = connection.Close()
+			server.refuseOverLimit(ctx, connection)
 		}
 	}
 }
@@ -530,6 +549,15 @@ func (server *Server) handleConnection(ctx context.Context, connection net.Conn)
 	if rpcErr != nil {
 		_ = writeRPCError(wire, rpcErr)
 		return
+	}
+	if dataStreamMethod(request.Method) {
+		release, admitted := server.admitDataStream()
+		if !admitted {
+			server.noteConnectionLimit("data_stream_budget")
+			_ = writeFailure(wire, CodeConnectionLimit, "OCI helper data-stream budget is full; retry this stream")
+			return
+		}
+		defer release()
 	}
 	operation, rpcErr := session.beginOperation(ctx, connection)
 	if rpcErr != nil {
