@@ -215,15 +215,17 @@ control connection, each live attempt's `Watch`, and control RPCs such as
 `Signal`, `Delete`, and `Run` always keep the remaining 8 however busy a
 published service is. A data stream over its budget is refused after session
 authorization with `connection_limit`. A connection accepted while all 64
-slots are taken is answered, not dropped: a bounded refusal path (at most 8 in
-flight) captures peer credentials, consumes the one request frame under a
-1-second deadline, and answers `connection_limit`, or `peer_unauthenticated`
-for a peer outside the allowlist, exactly as an admitted connection would.
+slots are taken has its peer credentials read on the accept loop, which is one
+non-blocking socket option. A peer outside the UID allowlist is closed at once
+and never holds a slot or a refusal worker. An allowed peer -- the agent -- is
+answered, never dropped: one of at most 8 refusal workers consumes its one
+request frame under a 1-second deadline and answers `connection_limit`.
 Reading the frame first is what makes the answer reachable: closing on an
 unread request fails the client's write or read with EPIPE or EOF, which is
-indistinguishable from a dead helper. A peer that never sends is dropped at
-that deadline without delaying the accept loop; only past the 8 in-flight
-refusals does the helper fall back to a bare close.
+indistinguishable from a dead helper. When all 8 workers are busy, the accept
+loop waits for a worker or a slot instead of closing; each worker finishes
+within its deadline, so later connections wait in the kernel backlog and the
+client sees latency, not EOF.
 
 The closed wire error-code vocabulary is `invalid_request`,
 `peer_unauthenticated`, `version_mismatch`, `checksum_mismatch`, `session_busy`,
@@ -269,12 +271,20 @@ the client read EOF as loss, and one service with about 60 keep-alive clients
 reaped every OCI workload on the Node (#597). The agent turns the refusal into
 the smallest failure it names: a service front door closes only that client's
 TCP connection, a Computer take-over view is refused with 503 and the Computer
-keeps running, a take whose control leg meets it is refused `503
-tenure_unavailable` like any unavailable replacement backend (signal cleared,
-tenure Free) without failing the attempt, a host-bridge pump backs off 250 ms and retries, and a
+keeps running, a take whose driver-signal set or control leg meets it is
+refused `503 tenure_unavailable` like any unavailable replacement backend
+(signal cleared, tenure Free) without failing the attempt, a host-bridge pump backs off 250 ms and retries, and a
 readiness probe that meets it is inconclusive and leaves readiness where it
 was -- flipping to unready would withdraw publication and sever the very
-clients the budget protects. None of these embargo OCI, and each logs the
+clients the budget protects. An RPC on an admitted attempt that must not fail
+for want of a slot -- `Watch` start, `Signal`, `Delete`, clearing the driver
+signal, and `SetComputerToken` -- is retried with backoff from 100 ms to 1 s
+for up to 60 s, and for up to 5 s for a stop's TERM and KILL, each also bounded
+by its caller's context. A refusal admitted nothing, so the retry is always
+safe. A refusal that outlives its bound is returned as not done -- a signal not
+delivered, a delete not performed -- and never as done or as runtime loss. A
+refused `Run` is a definitive rejection: nothing was admitted, so no `Delete`
+is owed. None of these embargo OCI, and each logs the
 refusal once per burst (a run of refusals with no 30-second gap, re-reported
 at most once a minute with the count since), not once per connection. A new
 agent against a helper without this code still meets the bare close and

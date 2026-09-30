@@ -751,7 +751,7 @@ func (adapter *Adapter) Probe(ctx context.Context, nodeID, bootSessionID, refere
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = session.Delete(cleanupCtx, ocihelper.DeleteRequest{Authority: authority})
+		_, _ = deleteRetryingConnectionLimit(cleanupCtx, session, authority)
 	}()
 	if !response.Started || response.Image == nil {
 		return errors.New("OCI functional probe did not receive truthful Started evidence")
@@ -761,19 +761,21 @@ func (adapter *Adapter) Probe(ctx context.Context, nodeID, bootSessionID, refere
 		return err
 	}
 	var completion *ocihelper.WatchResponse
-	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
-		if event.Result != nil {
-			copy := *event.Result
-			completion = &copy
-		}
-		return nil
+	if err := retryOnConnectionLimit(ctx, "Watch", connectionLimitRetryBudget, func() error {
+		return session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
+			if event.Result != nil {
+				copy := *event.Result
+				completion = &copy
+			}
+			return nil
+		})
 	}); err != nil {
 		return err
 	}
 	if completion == nil || completion.ExitCode == nil || *completion.ExitCode != 0 || completion.Signal != "" || completion.RuntimeFailure != "" {
 		return fmt.Errorf("OCI functional probe returned %+v", completion)
 	}
-	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
+	deleted, err := deleteRetryingConnectionLimit(ctx, session, authority)
 	if err != nil {
 		return err
 	}
@@ -821,9 +823,20 @@ func (adapter *Adapter) SetComputerControlState(ctx context.Context, authority w
 	if err != nil {
 		return err
 	}
-	return session.SetComputerControlState(ctx, ocihelper.SetComputerControlStateRequest{
-		Authority: HelperAuthority(authority), HumanDriving: humanDriving,
-	})
+	set := func() error {
+		return session.SetComputerControlState(ctx, ocihelper.SetComputerControlStateRequest{
+			Authority: HelperAuthority(authority), HumanDriving: humanDriving,
+		})
+	}
+	// Setting the signal true is the first step of a take, and a refusal
+	// there refuses only that take (the caller answers 503). Clearing it is
+	// not optional: an unconfirmed clear reaps the Computer, so a refused
+	// clear -- which changed nothing -- is retried within the caller's
+	// bound instead (#597).
+	if humanDriving {
+		return set()
+	}
+	return retryOnConnectionLimit(ctx, "SetComputerControlState", connectionLimitRetryBudget, set)
 }
 
 func (adapter *Adapter) SetComputerSubmission(ctx context.Context, authority workloadrunner.AttemptAuthority, token, endpoint string) error {
@@ -834,7 +847,9 @@ func (adapter *Adapter) SetComputerSubmission(ctx context.Context, authority wor
 	if err != nil {
 		return err
 	}
-	return session.SetComputerToken(ctx, ocihelper.SetComputerTokenRequest{Authority: HelperAuthority(authority), Token: token, L3Endpoint: endpoint})
+	return retryOnConnectionLimit(ctx, "SetComputerToken", connectionLimitRetryBudget, func() error {
+		return session.SetComputerToken(ctx, ocihelper.SetComputerTokenRequest{Authority: HelperAuthority(authority), Token: token, L3Endpoint: endpoint})
+	})
 }
 
 // ProbedRuntimePlatform reports the platform the currently pinned helper proved
@@ -1205,31 +1220,37 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	var completion *ocihelper.WatchResponse
 	watchDone := make(chan error, 1)
 	go func() {
-		watchDone <- session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
-			if event.Seal != nil && request.OCILogSealObserved != nil {
-				request.OCILogSealObserved(workloadrunner.OCILogSealObservation{
-					Stream: contract.LogStream(event.Seal.Stream), Complete: event.Seal.Complete,
-					Reason: event.Seal.Reason, ReleaseReason: event.Seal.ReleaseReason,
-				})
-			}
-			if event.Log != nil && sink != nil {
-				logEvent := contract.LogEvent{
-					AttemptID: request.Authority.AttemptID, Stream: contract.LogStream(event.Log.Stream),
-					Sequence: event.Log.Sequence, Timestamp: time.Now().UTC(), Bytes: event.Log.Bytes,
+		// A refused Watch start is Node-wide stream pressure, not this
+		// attempt failing: nothing was admitted and no event was delivered,
+		// so it is retried rather than turned into a runtime failure that
+		// reaps a healthy attempt (#597).
+		watchDone <- retryOnConnectionLimit(watchContext, "Watch", connectionLimitRetryBudget, func() error {
+			return session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
+				if event.Seal != nil && request.OCILogSealObserved != nil {
+					request.OCILogSealObserved(workloadrunner.OCILogSealObservation{
+						Stream: contract.LogStream(event.Seal.Stream), Complete: event.Seal.Complete,
+						Reason: event.Seal.Reason, ReleaseReason: event.Seal.ReleaseReason,
+					})
 				}
-				if event.Log.Gap != nil {
-					logEvent.Gap = &contract.LogGap{ThroughSequence: event.Log.Gap.ThroughSequence, LostEventCount: event.Log.Gap.LostEventCount, LostByteCount: event.Log.Gap.LostByteCount, Reason: contract.LogGapLoggerSourceIncomplete}
+				if event.Log != nil && sink != nil {
+					logEvent := contract.LogEvent{
+						AttemptID: request.Authority.AttemptID, Stream: contract.LogStream(event.Log.Stream),
+						Sequence: event.Log.Sequence, Timestamp: time.Now().UTC(), Bytes: event.Log.Bytes,
+					}
+					if event.Log.Gap != nil {
+						logEvent.Gap = &contract.LogGap{ThroughSequence: event.Log.Gap.ThroughSequence, LostEventCount: event.Log.Gap.LostEventCount, LostByteCount: event.Log.Gap.LostByteCount, Reason: contract.LogGapLoggerSourceIncomplete}
+					}
+					if err := sink.WriteOutput(watchContext, logEvent); err != nil {
+						return &outputSinkError{err: err}
+					}
+					return nil
 				}
-				if err := sink.WriteOutput(watchContext, logEvent); err != nil {
-					return &outputSinkError{err: err}
+				if event.Result != nil {
+					copy := *event.Result
+					completion = &copy
 				}
 				return nil
-			}
-			if event.Result != nil {
-				copy := *event.Result
-				completion = &copy
-			}
-			return nil
+			})
 		})
 	}()
 	waitForWatch := func() error {
@@ -1462,12 +1483,22 @@ func terminateAndWaitObserved(
 		}
 	}
 	signal := func(value ocihelper.Signal) (ocihelper.SignalResponse, error) {
-		signalContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminationSignalTimeout)
-		defer cancel()
-		response, err := session.SignalResult(signalContext, ocihelper.SignalRequest{Authority: authority, Signal: value})
-		contextErr := signalContext.Err()
+		var response ocihelper.SignalResponse
+		var err, contextErr error
+		// Each delivery keeps its own one-second bound, which is what proves
+		// a silent helper. A connection_limit refusal is not silence -- the
+		// helper answered that it had no slot -- so it is retried for a
+		// bounded while and, if it persists, returned as a signal that was
+		// not delivered, never as delivered and never as runtime loss (#597).
+		_ = retryOnConnectionLimit(context.WithoutCancel(ctx), "Signal", terminationSignalRefusalBudget, func() error {
+			signalContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminationSignalTimeout)
+			defer cancel()
+			response, err = session.SignalResult(signalContext, ocihelper.SignalRequest{Authority: authority, Signal: value})
+			contextErr = signalContext.Err()
+			return err
+		})
 		effectiveErr := err
-		if errors.Is(contextErr, context.DeadlineExceeded) {
+		if errors.Is(contextErr, context.DeadlineExceeded) && !ocihelper.IsConnectionLimitRefusal(err) {
 			effectiveErr = &ocihelper.RuntimeLossError{Cause: err}
 		}
 		if trace != nil && value == ocihelper.SignalTERM {
@@ -1555,7 +1586,7 @@ func helperRunDefinitivelyRejected(err error) bool {
 	case ocihelper.CodeEngineFailure, ocihelper.CodeOCISpecRejected, ocihelper.CodeImageUnavailable,
 		ocihelper.CodeInsufficientMemory, ocihelper.CodeInsufficientDisk, ocihelper.CodeInvalidRequest,
 		ocihelper.CodeSweepRequired, ocihelper.CodeUnsupportedOperation, ocihelper.CodeComputerStorageBusy,
-		ocihelper.CodeComputerStorageRetired:
+		ocihelper.CodeComputerStorageRetired, ocihelper.CodeConnectionLimit:
 		return true
 	default:
 		return false
@@ -1796,7 +1827,7 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 	if err != nil {
 		return workloadrunner.ReapReceipt{}, reapRuntimeLoss(entry.sweep.helper, err)
 	}
-	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: HelperAuthority(request.Authority)})
+	deleted, err := deleteRetryingConnectionLimit(ctx, session, HelperAuthority(request.Authority))
 	if err != nil {
 		var rpcErr *ocihelper.RPCError
 		if tracked && errors.As(err, &rpcErr) && rpcErr.Code == ocihelper.CodeAttemptOutsideSession {
@@ -2775,9 +2806,74 @@ func runtimeFailure(err error) workloadrunner.Result {
 func reapAfterFailedStart(session *ocihelper.Session, authority ocihelper.AttemptAuthority) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = session.Signal(ctx, ocihelper.SignalRequest{Authority: authority, Signal: ocihelper.SignalKILL})
-	_, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
+	_ = retryOnConnectionLimit(ctx, "Signal", connectionLimitRetryBudget, func() error {
+		return session.Signal(ctx, ocihelper.SignalRequest{Authority: authority, Signal: ocihelper.SignalKILL})
+	})
+	_, err := deleteRetryingConnectionLimit(ctx, session, authority)
 	return err
+}
+
+const (
+	// connectionLimitRetryBudget bounds how long an RPC on an admitted
+	// attempt keeps retrying the helper's connection_limit refusal before the
+	// refusal is returned to its caller as not done. Every retry is also
+	// bounded by the caller's own context.
+	connectionLimitRetryBudget = 60 * time.Second
+	// terminationSignalRefusalBudget is the same bound for a stop's TERM and
+	// KILL, which sit inside the service stop budget.
+	terminationSignalRefusalBudget = 5 * time.Second
+	connectionLimitRetryInitial    = 100 * time.Millisecond
+	connectionLimitRetryCeiling    = time.Second
+)
+
+// connectionLimitRetries reports refusals the adapter is riding out once per
+// burst, Node-wide.
+var connectionLimitRetries ocihelper.ConnectionLimitLog
+
+// observeConnectionLimitRetry is a test seam called on every refusal retried.
+var observeConnectionLimitRetry = func(string) {}
+
+// retryOnConnectionLimit repeats call while the helper refuses it with
+// connection_limit, backing off from 100 ms to 1 s. A refusal means the helper
+// admitted nothing -- no signal delivered, no delete done, no event streamed
+// -- so repeating the identical request is always safe. It stops at the first
+// other result, when ctx ends, or after budget, and then returns the last
+// result as is: a refusal that outlived the budget still reads as not done.
+func retryOnConnectionLimit(ctx context.Context, operation string, budget time.Duration, call func() error) error {
+	deadline := time.Now().Add(budget)
+	backoff := connectionLimitRetryInitial
+	for {
+		err := call()
+		if !ocihelper.IsConnectionLimitRefusal(err) {
+			return err
+		}
+		observeConnectionLimitRetry(operation)
+		if report, suppressed := connectionLimitRetries.Note(time.Now()); report {
+			log.Printf("OCI helper refused %s for want of a connection slot (%d more refusals since the last report); retrying for up to %s", operation, suppressed, budget)
+		}
+		wait := min(backoff, time.Until(deadline))
+		if wait <= 0 {
+			return err
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
+		backoff = min(2*backoff, connectionLimitRetryCeiling)
+	}
+}
+
+func deleteRetryingConnectionLimit(ctx context.Context, session *ocihelper.Session, authority ocihelper.AttemptAuthority) (ocihelper.DeleteResponse, error) {
+	var response ocihelper.DeleteResponse
+	err := retryOnConnectionLimit(ctx, "Delete", connectionLimitRetryBudget, func() error {
+		var err error
+		response, err = session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
+		return err
+	})
+	return response, err
 }
 
 var _ workloadrunner.WorkloadRuntime = (*Adapter)(nil)

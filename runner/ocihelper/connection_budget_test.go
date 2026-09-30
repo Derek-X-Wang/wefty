@@ -26,6 +26,11 @@ func (engine *holdingDialEngine) DialAttemptPort(_ context.Context, _ DialAttemp
 }
 
 func startHoldingSession(t *testing.T, config ServerConfig) (*holdingDialEngine, *Session, AttemptAuthority) {
+	engine, session, authority, _ := startHoldingSessionWithClient(t, config)
+	return engine, session, authority
+}
+
+func startHoldingSessionWithClient(t *testing.T, config ServerConfig) (*holdingDialEngine, *Session, AttemptAuthority, *Client) {
 	t.Helper()
 	base := newFakeEngine()
 	base.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}})
@@ -45,7 +50,7 @@ func startHoldingSession(t *testing.T, config ServerConfig) (*holdingDialEngine,
 	if _, err := session.Run(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
-	return engine, session, authority
+	return engine, session, authority, client
 }
 
 func holdStreams(t *testing.T, session *Session, authority AttemptAuthority, count int) []net.Conn {
@@ -213,13 +218,12 @@ func requestRaw(t *testing.T, connection net.Conn) (frame, error) {
 	return response, err
 }
 
-// The overflow answer is bounded on both sides: a peer that never sends its
-// frame is dropped after a short deadline without holding up the answer to a
-// well-formed one, an unauthorized peer gets the same refusal it would get
-// anywhere else, and past the refusal budget the helper falls back to a bare
-// close rather than spawning without bound.
+// The overflow answer is bounded on both sides. A peer outside the allowlist
+// is closed on the accept loop and never holds a refusal worker; an allowed
+// peer is never bare-closed, and one that never sends its frame delays the
+// next answer by at most the refusal deadline (#597 review).
 func TestOverLimitRefusalIsBoundedAndAuthenticated(t *testing.T) {
-	t.Run("authorized peer gets connection_limit, even behind a silent one", func(t *testing.T) {
+	t.Run("allowed peer gets connection_limit, even behind a silent one", func(t *testing.T) {
 		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid())}})
 		_ = dialRaw(t, path) // holds the only slot, never writes
 		_ = dialRaw(t, path) // overflow peer that never writes
@@ -233,30 +237,61 @@ func TestOverLimitRefusalIsBoundedAndAuthenticated(t *testing.T) {
 			t.Fatalf("a silent overflow peer delayed the next refusal by %s", elapsed)
 		}
 	})
-	t.Run("unauthorized peer gets peer_unauthenticated", func(t *testing.T) {
-		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid()) + 1}})
-		_ = dialRaw(t, path)
-		response, err := requestRaw(t, dialRaw(t, path))
-		if err != nil || response.Error == nil || response.Error.Code != CodePeerUnauthenticated {
-			t.Fatalf("unauthorized overflow response = %+v err=%v, want peer_unauthenticated", response, err)
-		}
-	})
-	t.Run("past the refusal budget the helper closes", func(t *testing.T) {
+	t.Run("allowed peer past a full refusal budget waits for a typed answer", func(t *testing.T) {
 		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid())}})
 		_ = dialRaw(t, path)
 		for range connectionLimitRefusalBudget {
-			_ = dialRaw(t, path)
+			_ = dialRaw(t, path) // each holds a refusal worker until its deadline
 		}
-		_, err := requestRaw(t, dialRaw(t, path))
-		if err == nil || !(errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) || isConnectionReset(err)) {
-			t.Fatalf("connection past the refusal budget = %v, want a bare close", err)
+		response, err := requestRaw(t, dialRaw(t, path))
+		if err != nil || response.Error == nil || response.Error.Code != CodeConnectionLimit {
+			t.Fatalf("allowed peer past the refusal budget = %+v err=%v, want connection_limit, never a bare close", response, err)
+		}
+	})
+	t.Run("peers outside the allowlist are closed at once and hold nothing", func(t *testing.T) {
+		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid()) + 1}})
+		_ = dialRaw(t, path)
+		started := time.Now()
+		for index := range 3 * connectionLimitRefusalBudget {
+			silent := dialRaw(t, path)
+			_ = silent.SetReadDeadline(time.Now().Add(3 * time.Second))
+			var buffer [1]byte
+			if _, err := silent.Read(buffer[:]); err == nil || isTimeout(err) {
+				t.Fatalf("foreign overflow peer %d was not closed: %v", index, err)
+			}
+		}
+		// Had any of them held a refusal worker until its deadline, the
+		// ninth would have waited at least that long.
+		if elapsed := time.Since(started); elapsed >= connectionLimitRefusalTimeout {
+			t.Fatalf("foreign overflow peers took %s to close; they held refusal workers", elapsed)
 		}
 	})
 }
 
-func isConnectionReset(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && !opErr.Timeout()
+// With every slot taken and every refusal worker held by silent local peers,
+// the agent's next RPC still gets a typed answer and the session survives:
+// the old bare close at that point was read as EOF and reaped everything.
+func TestAgentRequestBehindSilentOverflowPeersGetsATypedAnswer(t *testing.T) {
+	engine, session, authority, client := startHoldingSessionWithClient(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
+	generation := session.Handshake().SessionGeneration
+	_ = holdStreams(t, session, authority, 5)
+	for range connectionLimitRefusalBudget + 2 {
+		silent, err := client.Dial(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = silent.Close() })
+	}
+	err := session.Signal(t.Context(), SignalRequest{Authority: authority, Signal: SignalTERM})
+	if !IsConnectionLimitRefusal(err) {
+		t.Fatalf("Signal behind silent overflow peers = %v, want a typed connection_limit refusal", err)
+	}
+	requireSessionSurvived(t, engine, session, generation)
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func TestConnectionLimitLogReportsOncePerBurst(t *testing.T) {

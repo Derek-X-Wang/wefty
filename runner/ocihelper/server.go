@@ -346,12 +346,9 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 		}
 		select {
 		case server.connections <- struct{}{}:
-			go func() {
-				defer func() { <-server.connections }()
-				server.handleConnection(ctx, connection)
-			}()
+			server.serveAdmitted(ctx, connection)
 		default:
-			server.refuseOverLimit(connection)
+			server.refuseOverLimit(ctx, connection)
 		}
 	}
 }

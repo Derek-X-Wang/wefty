@@ -1164,7 +1164,7 @@ func waitForControllerFree(t *testing.T, tenure *controllerTenure) {
 // Computer attempt (#597). Now the take is refused with 503
 // tenure_unavailable, the signal is cleared, the viewer's session keeps
 // relaying, and a later take succeeds once a slot is free.
-func TestComputerFrontDoorHelperConnectionLimitOnControlLegRefusesOnlyTheTake(t *testing.T) {
+func TestComputerFrontDoorHelperConnectionLimitRefusesOnlyTheTake(t *testing.T) {
 	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	originalServer.Close()
 	viewBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "view:", rfbHandshake: true})
@@ -1190,11 +1190,15 @@ func TestComputerFrontDoorHelperConnectionLimitOnControlLegRefusesOnlyTheTake(t 
 	}
 	var signalMu sync.Mutex
 	var signals []bool
+	var signalRefused atomic.Bool
 	tenure, err := newControllerTenure(controllerTenureConfig{
 		authorityContext: config.authorityContext,
 		clock:            config.clock,
 		dial:             config.dial,
 		setControlState: func(_ context.Context, value bool) error {
+			if value && signalRefused.Load() {
+				return &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit, Message: "OCI helper connection limit is full; retry this operation"}
+			}
 			signalMu.Lock()
 			signals = append(signals, value)
 			signalMu.Unlock()
@@ -1226,16 +1230,23 @@ func TestComputerFrontDoorHelperConnectionLimitOnControlLegRefusesOnlyTheTake(t 
 	completeInitialRFBHandshake(t, client)
 	assertRelayRoundTrip(t, client, "before", "view:before")
 
-	refused := postComputerControlFailure(t, server.URL, computerControlTakePath, token)
-	if refused.status != http.StatusServiceUnavailable || refused.body.Error.Code != contract.ErrorTenureUnavailable {
-		t.Fatalf("refused take = %d %#v, want 503 %s", refused.status, refused.body.Error, contract.ErrorTenureUnavailable)
+	// The refusal can land on either helper call a take makes: setting the
+	// driver signal true, or dialing the control leg. Either one refuses only
+	// the take.
+	for _, refusal := range []string{"signal", "control leg"} {
+		signalRefused.Store(refusal == "signal")
+		refused := postComputerControlFailure(t, server.URL, computerControlTakePath, token)
+		if refused.status != http.StatusServiceUnavailable || refused.body.Error.Code != contract.ErrorTenureUnavailable {
+			t.Fatalf("take refused at the %s = %d %#v, want 503 %s", refusal, refused.status, refused.body.Error, contract.ErrorTenureUnavailable)
+		}
+		select {
+		case err := <-frontDoor.Errors():
+			t.Fatalf("a connection_limit refusal at the %s failed the Computer front door: %v (pending: %v)", refusal, err, frontDoor.takeErrors())
+		case <-time.After(50 * time.Millisecond):
+		}
+		assertRelayRoundTrip(t, client, "still-viewing", "view:still-viewing")
 	}
-	select {
-	case err := <-frontDoor.Errors():
-		t.Fatalf("a connection_limit control leg failed the Computer front door: %v (pending: %v)", err, frontDoor.takeErrors())
-	case <-time.After(50 * time.Millisecond):
-	}
-	assertRelayRoundTrip(t, client, "still-viewing", "view:still-viewing")
+	signalRefused.Store(false)
 
 	controlRefused.Store(false)
 	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
@@ -1248,6 +1259,8 @@ func TestComputerFrontDoorHelperConnectionLimitOnControlLegRefusesOnlyTheTake(t 
 	signalMu.Lock()
 	gotSignals := append([]bool(nil), signals...)
 	signalMu.Unlock()
+	// The refused signal wrote nothing; the refused control leg set and
+	// cleared it; the successful take set it and its release cleared it.
 	if len(gotSignals) != 4 || !gotSignals[0] || gotSignals[1] || !gotSignals[2] || gotSignals[3] {
 		t.Fatalf("signal writes = %v, want the refused take cleared before the successful one", gotSignals)
 	}

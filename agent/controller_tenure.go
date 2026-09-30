@@ -146,7 +146,10 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 	} else {
 		if err := tenure.config.setControlState(operationContext, true); err != nil {
 			tenure.finishOperation(operation, nil)
-			return nil, "", &ComputerTenureError{Code: ComputerTenureUnavailable, Err: fmt.Errorf("set driver signal true: %w", err)}
+			// A connection_limit refusal changed no helper state, so it
+			// refuses this take and nothing more (#597).
+			return nil, "", &ComputerTenureError{Code: ComputerTenureUnavailable, Err: fmt.Errorf("set driver signal true: %w", err),
+				HelperConnectionLimit: ocihelper.IsConnectionLimitRefusal(err)}
 		}
 		signalTrue = true
 	}

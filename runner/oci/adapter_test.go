@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2524,6 +2525,14 @@ func startAdapterTestServerWithPolicy(t *testing.T, engine ocihelper.Engine, pol
 
 func startAdapterTestServerWithSnapshots(t *testing.T, engine ocihelper.Engine, policy ImagePolicy) (*Adapter, *ocihelper.BootBarrier, *adapterSnapshotSource, func()) {
 	t.Helper()
+	adapter, barrier, source, _, closeAdapter := startAdapterTestServerWithConfig(t, engine, policy, ocihelper.ServerConfig{})
+	return adapter, barrier, source, closeAdapter
+}
+
+// startAdapterTestServerWithConfig also returns the helper socket path, so a
+// test can hold raw connections against the helper's connection budget.
+func startAdapterTestServerWithConfig(t *testing.T, engine ocihelper.Engine, policy ImagePolicy, config ocihelper.ServerConfig) (*Adapter, *ocihelper.BootBarrier, *adapterSnapshotSource, string, func()) {
+	t.Helper()
 	directory, err := os.MkdirTemp("", "woci-")
 	if err != nil {
 		t.Fatal(err)
@@ -2534,7 +2543,10 @@ func startAdapterTestServerWithSnapshots(t *testing.T, engine ocihelper.Engine, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := ocihelper.NewServer(engine, ocihelper.ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid())}, HelperChecksum: "adapter-test", HeartbeatTimeout: time.Minute})
+	config.AllowedUIDs = []uint32{uint32(os.Getuid())}
+	config.HelperChecksum = "adapter-test"
+	config.HeartbeatTimeout = time.Minute
+	server, err := ocihelper.NewServer(engine, config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2556,7 +2568,7 @@ func startAdapterTestServerWithSnapshots(t *testing.T, engine ocihelper.Engine, 
 		t.Fatal(err)
 	}
 	adapter.probePlatforms[helperSession(session)] = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
-	return adapter, barrier, source, func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
+	return adapter, barrier, source, socketPath, func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
 }
 
 func adapterTestRequest() workloadrunner.Request {
@@ -3395,5 +3407,66 @@ func TestTerminationObservationPrivacyAndClassification(t *testing.T) {
 		if got := classifyTerminationContext(test.err); got != test.want {
 			t.Fatalf("context class=%d want=%d", got, test.want)
 		}
+	}
+}
+
+// A Watch start the helper refuses for want of a connection slot -- another
+// connection took the slot Run just freed -- is retried until a slot frees.
+// Failing it instead turned Node-wide stream pressure into a runtime failure
+// whose finalization reaped a healthy attempt (#597 review).
+func TestAdapterRetriesRefusedWatchStartUntilASlotFrees(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, _, _, socketPath, closeAdapter := startAdapterTestServerWithConfig(t, engine, ImagePolicy{}, ocihelper.ServerConfig{ConnectionLimit: 4})
+	defer closeAdapter()
+	var refusals atomic.Int32
+	observeConnectionLimitRetry = func(operation string) {
+		if operation == "Watch" {
+			refusals.Add(1)
+		}
+	}
+	defer func() { observeConnectionLimitRetry = func(string) {} }()
+
+	var held []net.Conn
+	defer func() {
+		for _, connection := range held {
+			_ = connection.Close()
+		}
+	}()
+	request := adapterTestRequest()
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		// Run has returned; take every slot before Watch can, and give them
+		// back only after Watch has been refused.
+		for range 4 {
+			connection, err := net.Dial("unix", socketPath)
+			if err != nil {
+				return err
+			}
+			held = append(held, connection)
+		}
+		go func() {
+			deadline := time.Now().Add(5 * time.Second)
+			for refusals.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			for _, connection := range held {
+				_ = connection.Close()
+			}
+		}()
+		return nil
+	}
+	result, err := adapter.Run(t.Context(), request, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
+	if err != nil {
+		t.Fatalf("refused Watch start failed the attempt: %v", err)
+	}
+	if result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 || result.Outcome.RuntimeFailure != nil {
+		t.Fatalf("outcome after a refused Watch start = %+v", result.Outcome)
+	}
+	if refusals.Load() == 0 {
+		t.Fatal("the test never made the helper refuse Watch")
+	}
+	if recoveries != 0 {
+		t.Fatalf("a refused Watch start asked for OCI runtime recovery %d times", recoveries)
 	}
 }

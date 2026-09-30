@@ -1,6 +1,7 @@
 package ocihelper
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,13 +23,13 @@ const (
 	// Delete for several attempts at once, while leaving 56 slots -- 14
 	// Computers' bridge pumps, or dozens of keep-alive clients -- to data.
 	defaultControlConnectionReserve = 8
-	// connectionLimitRefusalBudget bounds the goroutines answering connections
-	// accepted over the whole connection limit. Each one reads at most one
-	// request frame under connectionLimitRefusalTimeout, so a well-formed
-	// agent request is answered in microseconds, and a slow or unauthenticated
-	// peer can pin at most this many goroutines for at most that long. The
-	// accept loop itself never waits on a refusal. Past this budget the helper
-	// falls back to the bare close it always used.
+	// connectionLimitRefusalBudget bounds the goroutines answering allowed
+	// peers accepted over the whole connection limit. Each one reads at most
+	// one request frame under connectionLimitRefusalTimeout, so a well-formed
+	// agent request is answered in microseconds, and a silent allowed peer
+	// holds a worker for at most that long. Peers outside the allowlist never
+	// reach a worker. With every worker busy, the accept loop waits for one
+	// rather than closing on an allowed peer.
 	connectionLimitRefusalBudget  = 8
 	connectionLimitRefusalTimeout = time.Second
 	// A refusal burst ends after this long without a refusal; a burst that
@@ -57,16 +58,43 @@ func (server *Server) admitDataStream() (func(), bool) {
 	}
 }
 
-// refuseOverLimit answers a connection accepted while every connection slot is
-// taken. The peer has already written, or is about to write, its one request
-// frame; closing without reading it made the client's write or read fail with
-// EOF or EPIPE, which it rightly reads as runtime loss. So a bounded goroutine
-// consumes that frame and answers with a typed connection_limit refusal, which
-// the client does not read as loss.
-func (server *Server) refuseOverLimit(connection net.Conn) {
+// serveAdmitted serves a connection that already holds a connection slot.
+func (server *Server) serveAdmitted(ctx context.Context, connection net.Conn) {
+	go func() {
+		defer func() { <-server.connections }()
+		server.handleConnection(ctx, connection)
+	}()
+}
+
+// refuseOverLimit handles a connection accepted while every connection slot is
+// taken. It runs on the accept loop.
+//
+// The peer's credentials are read first, synchronously: that is one
+// non-blocking getsockopt, so it cannot stall the loop. A peer outside the UID
+// allowlist is closed at once and never holds a slot or a refusal worker, so
+// no number of foreign local connections can crowd out the agent.
+//
+// An allowed peer is the agent, and it must never see a bare close: closing on
+// an unread request fails the client's write or read with EPIPE or EOF, which
+// it rightly reads as runtime loss (#597). So a refusal worker consumes its one
+// request frame and answers with a typed connection_limit refusal. When all
+// refusal workers are busy, the loop waits for a worker or a connection slot
+// rather than closing. Each worker finishes within
+// connectionLimitRefusalTimeout, so the wait is bounded by that deadline; the
+// connections behind it wait in the kernel backlog, and the client sees
+// latency, never EOF.
+func (server *Server) refuseOverLimit(ctx context.Context, connection net.Conn) {
+	peer, peerErr := authenticateUnixPeer(connection)
+	if peerErr != nil || !slices.Contains(server.config.AllowedUIDs, peer.UID) {
+		_ = connection.Close()
+		return
+	}
 	select {
 	case server.limitRefusals <- struct{}{}:
-	default:
+	case server.connections <- struct{}{}:
+		server.serveAdmitted(ctx, connection)
+		return
+	case <-ctx.Done():
 		_ = connection.Close()
 		return
 	}
@@ -78,19 +106,10 @@ func (server *Server) refuseOverLimit(connection net.Conn) {
 		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
 			return
 		}
-		// Peer credentials are captured before the frame is read, exactly as
-		// for an admitted connection, so an unauthorized peer learns nothing
-		// here that it would not learn from the ordinary refusal.
-		peer, peerErr := authenticateUnixPeer(connection)
 		if err := discardRequestFrame(connection); err != nil {
 			return
 		}
-		wire := newFramedConn(connection)
-		if peerErr != nil || !slices.Contains(server.config.AllowedUIDs, peer.UID) {
-			_ = writeFailure(wire, CodePeerUnauthenticated, "peer authentication failed")
-			return
-		}
-		_ = writeFailure(wire, CodeConnectionLimit, "OCI helper connection limit is full; retry this operation")
+		_ = writeFailure(newFramedConn(connection), CodeConnectionLimit, "OCI helper connection limit is full; retry this operation")
 	}()
 }
 
