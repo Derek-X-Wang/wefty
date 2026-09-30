@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -155,6 +156,30 @@ func (s *Store) truncateSecretWAL(ctx context.Context) (bool, error) {
 		return false, internalError(err, "truncate secret-bearing SQLite WAL")
 	}
 	return busy == 0, nil
+}
+
+// markSecretWALTruncationDue advances the secret scrub generation inside a
+// removal's scrub transaction, so the sweep owes a WAL truncation from the
+// moment that scrub commits, exactly as it does for a terminal one-shot's.
+// A removal that cannot truncate at once, or a process that exits before it
+// tries, still has the reconcile loop truncate the WAL within a tick of the
+// reader leaving.
+func markSecretWALTruncationDue(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE secret_scrub_state SET generation=generation+1 WHERE singleton=1`); err != nil {
+		return internalError(err, "advance secret scrub generation")
+	}
+	return nil
+}
+
+// truncateRemovalSecretWAL is a removal's best-effort truncation of the WAL
+// its committed scrub wrote into. It makes the sweep's one attempt on the
+// sweep's short-wait handle. A reader holding the WAL defers it: the removal
+// responds instead of waiting, and the writers queued behind the checkpoint
+// are held off only that handle's wait, never the main pool's (#598). The
+// removal transaction marked the truncation due, so the sweep finishes it.
+func (s *Store) truncateRemovalSecretWAL(ctx context.Context) error {
+	_, err := s.truncateSecretWAL(ctx)
+	return err
 }
 
 func (s *Store) backfillTerminalOneShotSecrets(ctx context.Context) (int64, error) {

@@ -561,7 +561,8 @@ func assertRemovedServiceRows(t *testing.T, h *integrationHarness, jobID string)
 
 func TestServiceRemovalWALCheckpointRetriesBlockedReaders(t *testing.T) {
 	// A reader that predates deletion can keep old WAL frames visible. Removal
-	// must wait and retry TRUNCATE rather than treating SQLITE_BUSY as success.
+	// still succeeds; the sweep truncates once the reader leaves
+	// (TestServiceRemovalDefersWALTruncationPastAHeldReader).
 	h := newIntegrationHarness(t, nil)
 	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
 	job := submitRemovalService(t, h, client, removalServiceSpec("wal-reader", nil))
