@@ -456,9 +456,43 @@ func (s *Store) ComputerCloneOperationForKey(ctx context.Context, backupID, idem
 
 // ComputerCloneOperation reads one clone's own observed state.
 func (s *Store) ComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerCloneOperation, error) {
+	return readComputerCloneOperation(ctx, s.db, computerID, operationRevision)
+}
+
+// GetComputerWithCloneOperation reads the destination Computer and one clone's
+// own record in a single read transaction. A terminal clone commits its status
+// together with the destination's latched Job failure and `stable` phase, so
+// reading them separately could pair a `failed` clone with the Computer as it
+// was before that commit -- still `cloning`, with no failure or byte counts
+// to report.
+func (s *Store) GetComputerWithCloneOperation(ctx context.Context, computerID string, operationRevision int64) (Computer, error) {
+	if strings.TrimSpace(computerID) == "" {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Computer{}, internalError(err, "begin Computer clone read")
+	}
+	defer tx.Rollback()
+	computer, err := readComputerAuthority(ctx, tx, computerID, canonicalTime(s.clock.Now()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
+	}
+	if err != nil {
+		return Computer{}, internalError(err, "read Computer")
+	}
+	operation, err := readComputerCloneOperation(ctx, tx, computer.ComputerID, operationRevision)
+	if err != nil {
+		return Computer{}, err
+	}
+	computer.CloneOperation = &operation
+	return computer, nil
+}
+
+func readComputerCloneOperation(ctx context.Context, q queryer, computerID string, operationRevision int64) (ComputerCloneOperation, error) {
 	outcome := ComputerCloneOperation{DestinationComputerID: computerID}
 	var completedNS sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT operation_revision, source_computer_id, backup_id, status, failure_code, completed_ns
+	err := q.QueryRowContext(ctx, `SELECT operation_revision, source_computer_id, backup_id, status, failure_code, completed_ns
 		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='clone'`,
 		computerID, operationRevision).Scan(&outcome.OperationRevision, &outcome.SourceComputerID, &outcome.BackupID,
 		&outcome.Status, &outcome.FailureCode, &completedNS)

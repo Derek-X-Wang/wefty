@@ -885,7 +885,7 @@
         "summary": "Read durable Computer intent and its current Job observation",
         "parameters": [
           { "name": "restore_operation_revision", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "description": "Also return that restore's own observed state as `restore_operation`, so a caller follows the restore it started rather than the Computer's latest operation. 404 when the Computer has no such restore." },
-          { "name": "clone_operation_revision", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "description": "Also return that clone's own observed state as `clone_operation`, so a caller follows the clone that created this Computer rather than its latest operation or Job failure. 404 when the Computer has no such clone." }
+          { "name": "clone_operation_revision", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "description": "Also return that clone's own observed state as `clone_operation`, read in the same snapshot as the Computer, so a caller follows the clone that created this Computer rather than its latest operation or Job failure. 404 when the Computer has no such clone." }
         ],
         "responses": {
           "200": {

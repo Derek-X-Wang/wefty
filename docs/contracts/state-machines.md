@@ -511,7 +511,9 @@ inventory a refused clone uses.
 The clone response, fresh or replayed, names the clone its idempotency key
 started in `Clone-Computer-Id` and `Clone-Operation-Revision` headers, and
 `GET /v1/computers/{id}?clone_operation_revision=N` returns that clone's own
-`status`, `failure_code`, and `completed_at` as `clone_operation`. A client
+`status`, `failure_code`, and `completed_at` as `clone_operation`, read in the
+same snapshot as the Computer it is returned with, so a terminal clone is never
+paired with its destination as it was before that clone ended. A client
 waiting on a clone follows that record, never the destination's latest
 revision or Job `last_failure`: a later operation on a completed clone, such
 as a refused grow, latches its own failure there. `reserved` and `prepared`
