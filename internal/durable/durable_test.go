@@ -167,35 +167,112 @@ func TestCreateFileHasExactlyOneWinnerAmongRacers(t *testing.T) {
 // TestMkdirAllSyncsTheParentOfEveryComponent: a directory entry is
 // durable only once its parent is synced, and a later durable write inside a
 // directory whose own entry power loss can drop is not durable at all.
-func TestMkdirAllSyncsTheParentOfEveryComponent(t *testing.T) {
+// recordDirectorySyncs records the path of every directory SyncDir syncs, and
+// starts the test from an empty per-process memo, as a fresh process would.
+func recordDirectorySyncs(t *testing.T) *[]string {
+	t.Helper()
+	synced := new([]string)
+	previous, previousMemo := syncDirectory, durableDirectories
+	durableDirectories = &sync.Map{}
+	syncDirectory = func(dir *os.Root) error {
+		*synced = append(*synced, filepath.Clean(dir.Name()))
+		return SyncDir(dir)
+	}
+	t.Cleanup(func() { syncDirectory, durableDirectories = previous, previousMemo })
+	return synced
+}
+
+// TestMkdirAllMakesEveryEntryAtAndBelowBaseDurableOncePerProcess: base's
+// own entry and every component below it has its parent synced -- whether
+// it was created now or already existed, since a crashed predecessor may
+// have created it without a sync -- once per process, and nothing above
+// base's parent is ever opened.
+func TestMkdirAllMakesEveryEntryAtAndBelowBaseDurableOncePerProcess(t *testing.T) {
+	for _, start := range []string{"absent", "already there"} {
+		t.Run(start, func(t *testing.T) {
+			parent := t.TempDir()
+			base := filepath.Join(parent, "state")
+			if start == "already there" {
+				if err := os.MkdirAll(filepath.Join(base, "a", "b"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			synced := recordDirectorySyncs(t)
+			if err := MkdirAll(base, filepath.Join("a", "b"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if info, err := os.Stat(filepath.Join(base, "a", "b")); err != nil || !info.IsDir() {
+				t.Fatalf("base/a/b = %v, %v", info, err)
+			}
+			want := []string{parent, base, filepath.Join(base, "a")}
+			if !slices.Equal(*synced, want) {
+				t.Fatalf("synced %v, want %v: base's entry once in its parent, then each component's parent", *synced, want)
+			}
+			*synced = nil
+			if err := MkdirAll(base, filepath.Join("a", "b"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := MkdirAll(base, "", 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if len(*synced) != 0 {
+				t.Fatalf("a second call in the same process synced %v, want nothing", *synced)
+			}
+		})
+	}
+}
+
+// TestMkdirAllNeverOpensAboveBasesParent: base's missing ancestors are
+// created as os.MkdirAll creates them, but nothing above base's parent is
+// opened or synced.
+func TestMkdirAllNeverOpensAboveBasesParent(t *testing.T) {
+	top := t.TempDir()
+	base := filepath.Join(top, "x", "y", "state")
+	synced := recordDirectorySyncs(t)
+	if err := MkdirAll(base, "records", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range *synced {
+		if path != filepath.Dir(base) && path != base && !strings.HasPrefix(path, base+string(filepath.Separator)) {
+			t.Fatalf("synced %q, above base's parent %q (all: %v)", path, filepath.Dir(base), *synced)
+		}
+	}
+	if want := []string{filepath.Dir(base), base}; !slices.Equal(*synced, want) {
+		t.Fatalf("synced %v, want %v", *synced, want)
+	}
+}
+
+// TestMkdirAllSyncsADirectoryItRecreates: the memo says an entry was made
+// durable, not that the directory is still there; one this process has to
+// create again is synced again.
+func TestMkdirAllSyncsADirectoryItRecreates(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "state")
+	synced := recordDirectorySyncs(t)
+	if err := MkdirAll(base, "records", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(base, "records")); err != nil {
+		t.Fatal(err)
+	}
+	*synced = nil
+	if err := MkdirAll(base, "records", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{base}; !slices.Equal(*synced, want) {
+		t.Fatalf("recreating records synced %v, want %v", *synced, want)
+	}
+}
+
+func TestMkdirAllRefusesWhatIsNotADirectoryBelowBase(t *testing.T) {
 	base := t.TempDir()
-	syncs := countDirectorySyncs(t)
-	target := filepath.Join(base, "a", "b", "c")
-	// Every component below the filesystem root has its parent synced.
-	components := len(strings.Split(strings.Trim(target, string(filepath.Separator)), string(filepath.Separator)))
-	if err := MkdirAll(target, 0o700); err != nil {
+	recordDirectorySyncs(t)
+	if err := MkdirAll(base, filepath.Join("..", "escape"), 0o700); err == nil {
+		t.Fatal("MkdirAll accepted a path that leaves base")
+	}
+	if err := os.WriteFile(filepath.Join(base, "file"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(target); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
-		t.Fatalf("%s = %v, %v", target, info, err)
-	}
-	if *syncs != components {
-		t.Fatalf("MkdirAll synced %d parents for a %d-component path, want %d", *syncs, components, components)
-	}
-	// A directory that already exists -- perhaps left by a creation power
-	// loss interrupted -- still has its parent synced.
-	*syncs = 0
-	if err := MkdirAll(target, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if *syncs != components {
-		t.Fatalf("an existing path synced %d parents, want %d", *syncs, components)
-	}
-	file := filepath.Join(base, "file")
-	if err := os.WriteFile(file, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := MkdirAll(filepath.Join(file, "below"), 0o700); err == nil {
+	if err := MkdirAll(base, filepath.Join("file", "below"), 0o700); err == nil {
 		t.Fatal("MkdirAll created a directory below a file")
 	}
 }

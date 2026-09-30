@@ -224,7 +224,7 @@ func (m *handoffManager) recordUpload(runID, nodeID, attemptID string, result at
 		Uploaded: len(result.document) > 0 && result.skip == "",
 		Reason:   result.skip, At: m.now().UTC(),
 	}
-	return writeStateDocument(m.uploadRecordRoot(), recordComponent(runID), record)
+	return writeStateDocument(m.stateRoot, uploadRecordDirectoryName, recordComponent(runID), record)
 }
 
 // readUploadRecord reads one run's upload outcome back. Nothing in the agent
@@ -475,7 +475,7 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 		return fmt.Errorf("%w: %q belongs to run %q, not %q",
 			errRecordBelongsToAnotherRun, m.recordPath(record.RunID), standing.RunID, record.RunID)
 	}
-	if err := writeStateDocument(m.recordRoot(), recordComponent(record.RunID), record); err != nil {
+	if err := writeStateDocument(m.stateRoot, retentionRecordDirectoryName, recordComponent(record.RunID), record); err != nil {
 		return err
 	}
 	// A record that arrived under the old name is now at the new one. Leaving
@@ -500,8 +500,13 @@ func (m *handoffManager) writeRecord(record retentionRecord) error {
 // The staging name is removed first rather than truncated, so a name that is
 // anything but the file the agent expects is replaced rather than written
 // through.
-func writeStateDocument(root, name string, value any) error {
-	if err := durable.MkdirAll(root, 0o700); err != nil {
+//
+// The document lives in stateRoot/subdirectory. stateRoot is the configured
+// state root, the base whose entry and everything below it are made durable
+// once per process; nothing above it is touched.
+func writeStateDocument(stateRoot, subdirectory, name string, value any) error {
+	root := filepath.Join(stateRoot, subdirectory)
+	if err := durable.MkdirAll(stateRoot, subdirectory, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", root, err)
 	}
 	payload, err := json.Marshal(value)

@@ -355,7 +355,7 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 			errUnmanagedHandoffDirectory, path, managed)
 	}
 	runID := handoffOwnerRunID(spec)
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return nil, err
 	}
@@ -540,7 +540,7 @@ func (m *handoffManager) pinnedDirectoryDrift(owner *handoffOwnership, runID, pa
 		m.log("agent: run %s: %q was prepared without a recorded identity; the per-run bound is not applied", runID, path)
 		return handoffBoundDirectoryUnverifiable
 	}
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		m.log("agent: run %s: open the handoff root to check %q before trimming: %v", runID, path, err)
 		return handoffBoundDirectoryUnverifiable
@@ -639,12 +639,28 @@ func (m *handoffManager) openRun(runID string) (*os.Root, error) {
 	if !validRunMailboxSegment(runID) {
 		return nil, errors.New("handoff run ID must be one safe component")
 	}
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
 	return openHandoffDirectory(root, runID)
+}
+
+// openHandoffRoot opens this node's handoff root and makes its entry durable
+// once per process: the records and markers under it are durable, and so must
+// be the directory they live in. Startup's adoption pass is the first caller,
+// so the root's entry is synced before any run is prepared.
+func (m *handoffManager) openHandoffRoot() (*os.Root, error) {
+	root, err := openPrivateHandoffDirectory(m.root)
+	if err != nil {
+		return nil, err
+	}
+	if err := durable.MkdirAll(m.root, "", 0o700); err != nil {
+		root.Close()
+		return nil, fmt.Errorf("make handoff root %q durable: %w", m.root, err)
+	}
+	return root, nil
 }
 
 // openPrivateHandoffDirectory anchors the configured directory in its trusted
@@ -667,7 +683,7 @@ func openPrivateHandoffDirectory(path string) (*os.Root, error) {
 	}
 	defer parent.Close()
 	name := filepath.Base(path)
-	if err := durable.Mkdir(parent, name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err := parent.Mkdir(name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, err
 	}
 	root, err := openHandoffDirectory(parent, name)
@@ -766,7 +782,7 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 func (m *handoffManager) collect() error {
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return err
 	}

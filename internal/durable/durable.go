@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -92,26 +94,67 @@ func CreateFile(dir *os.Root, name string, payload []byte, mode os.FileMode) err
 	return syncDirectory(dir)
 }
 
-// MkdirAll is os.MkdirAll whose every directory on the path is durable: each
-// missing component is created, and the parent of every component -- created
-// now or already there -- is synced. A directory an earlier, interrupted call
-// created may exist without its entry ever having been synced, and reusing it
-// as it is would leave a later durable write inside it hanging on an entry
-// power loss can still drop. It runs at directory-creation sites, where one
-// sync per path component is cheap next to the writes it protects.
-func MkdirAll(path string, mode os.FileMode) error {
-	path = filepath.Clean(path)
-	parent := filepath.Dir(path)
-	if parent != path {
-		if err := MkdirAll(parent, mode); err != nil {
+// durableDirectories memoizes, per process, the cleaned absolute paths of
+// directories whose entry this process has made durable by syncing the
+// parent after the directory existed. The first MkdirAll in a process syncs
+// even a directory that already exists -- a crashed predecessor may have
+// created it without syncing -- and later calls skip it. A pointer so tests
+// can start from an empty memo.
+var durableDirectories = &sync.Map{}
+
+// MkdirAll makes base/rel exist with every entry at and below base durable.
+//
+// base is a configured root: a state, spool or handoff directory. Its own
+// entry is synced in its parent once per process, and each component of rel
+// is created if missing and has its parent synced once per process, whether
+// it was just created or already there. Nothing above base's parent is ever
+// opened or synced: base's missing ancestors are created as os.MkdirAll
+// creates them, and their durability is the operator's configuration, not
+// this helper's. rel must be local to base ("" or "." for base alone).
+func MkdirAll(base, rel string, mode os.FileMode) error {
+	if rel == "" {
+		rel = "."
+	}
+	if !filepath.IsLocal(rel) {
+		return fmt.Errorf("durable: %q is not a path below %q", rel, base)
+	}
+	base, err := filepath.Abs(base)
+	if err != nil {
+		return err
+	}
+	if err := ensureDurableDirectory(base, mode, true); err != nil {
+		return err
+	}
+	current := base
+	for _, component := range strings.Split(filepath.Clean(rel), string(filepath.Separator)) {
+		if component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		if err := ensureDurableDirectory(current, mode, false); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// ensureDurableDirectory makes path exist as a directory and makes its entry
+// durable, syncing its parent unless this process already did so for a
+// directory that has existed since.
+func ensureDurableDirectory(path string, mode os.FileMode, isBase bool) error {
 	info, err := os.Stat(path)
+	created := false
 	switch {
-	case err == nil && !info.IsDir():
-		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+	case err == nil:
+		if !info.IsDir() {
+			return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+		}
 	case errors.Is(err, fs.ErrNotExist):
+		if isBase {
+			if err := os.MkdirAll(filepath.Dir(path), mode); err != nil {
+				return err
+			}
+		}
 		if err := os.Mkdir(path, mode); err != nil {
 			// A racing creator made it; this caller still syncs its parent
 			// below before relying on it.
@@ -119,13 +162,23 @@ func MkdirAll(path string, mode os.FileMode) error {
 				return err
 			}
 		}
-	case err != nil:
+		created = true
+	default:
 		return err
 	}
-	if parent == path {
-		return nil
+	if !created {
+		if _, done := durableDirectories.Load(path); done {
+			return nil
+		}
 	}
-	return syncDirectoryPath(parent)
+	parent := filepath.Dir(path)
+	if parent != path {
+		if err := syncDirectoryPath(parent); err != nil {
+			return err
+		}
+	}
+	durableDirectories.Store(path, struct{}{})
+	return nil
 }
 
 // Mkdir creates name in dir and syncs dir, so the entry is durable. It syncs

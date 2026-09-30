@@ -781,7 +781,7 @@ func (m *handoffManager) measureNodeOnly(ctx context.Context) error {
 }
 
 func (m *handoffManager) accountNodeEnforcing(ctx context.Context, enforce bool) error {
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return err
 	}
@@ -869,7 +869,7 @@ func (m *handoffManager) adoptResidue() error {
 	m.reconcileOCIAdmissions()
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
-	root, err := openPrivateHandoffDirectory(m.root)
+	root, err := m.openHandoffRoot()
 	if err != nil {
 		return err
 	}

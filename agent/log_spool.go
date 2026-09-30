@@ -111,7 +111,7 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 	if maxOneShotBytes <= 0 || maxServiceBytes <= 0 {
 		return nil, errors.New("agent: log spool class budgets must be positive")
 	}
-	if err := durable.MkdirAll(directory, 0o700); err != nil {
+	if err := durable.MkdirAll(directory, "", 0o700); err != nil {
 		return nil, fmt.Errorf("agent: create log spool directory: %w", err)
 	}
 	path := filepath.Join(directory, spoolFileName(nodeID))
