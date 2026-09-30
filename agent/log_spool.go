@@ -111,6 +111,10 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 	query.Add("_pragma", "busy_timeout(5000)")
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", "synchronous(FULL)")
+	// Spooled log bytes and completion results are deleted once delivered;
+	// secure_delete zeroes them on disk rather than leaving them in a free
+	// page (#52), as L1 does.
+	query.Add("_pragma", "secure_delete(1)")
 	query.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)

@@ -68,6 +68,7 @@ type StoreOptions struct {
 type Store struct {
 	db                                *sql.DB
 	settlementDB                      *sql.DB
+	checkpointDB                      *sql.DB
 	clock                             Clock
 	restartJitter                     func(time.Duration) time.Duration
 	leaseDuration                     time.Duration
@@ -87,6 +88,14 @@ type Store struct {
 	deploymentID                      string
 	policyChangeMu                    sync.Mutex
 	policyChanged                     chan struct{}
+	// secretWALMu serializes SweepScrubbedSecrets. secretWALGeneration is the
+	// secret_scrub_state generation the last successful WAL truncation
+	// covered; secretWALTruncated is false until one has run in this process,
+	// so the first sweep always truncates: a previous process may have
+	// committed a scrub and exited before its sweep ran.
+	secretWALMu         sync.Mutex
+	secretWALGeneration int64
+	secretWALTruncated  bool
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -215,6 +224,26 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("l1: open SQLite owed-revocation handle: %w", err)
 	}
 	store.settlementDB = settlementDB
+	// The scrubbed-secret sweep's WAL truncation waits for every reader to
+	// leave the WAL and holds off writers while it waits, so it gets a handle
+	// of its own whose wait is short and fixed (#52). It does not share the
+	// settlement handle: that handle's one connection belongs to a
+	// heartbeat's budget, and a sweep holding it would make heartbeats skip
+	// their settlement writes.
+	checkpointDB, err := sql.Open("sqlite", sqliteDSN(path, secretWALCheckpointWait))
+	if err != nil {
+		_ = settlementDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite secret WAL checkpoint handle: %w", err)
+	}
+	checkpointDB.SetMaxOpenConns(1)
+	if err := checkpointDB.PingContext(context.Background()); err != nil {
+		_ = checkpointDB.Close()
+		_ = settlementDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite secret WAL checkpoint handle: %w", err)
+	}
+	store.checkpointDB = checkpointDB
 	return store, nil
 }
 
@@ -1265,7 +1294,7 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	), desired_disk_bytes) WHERE desired_disk_bytes=1`); err != nil {
 		return fmt.Errorf("l1: backfill Computer desired disk budget: %w", err)
 	}
-	return nil
+	return s.initializeSecretScrub(ctx)
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
@@ -1945,11 +1974,14 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 }
 
 func (s *Store) Close() error {
-	var settlementErr error
+	var settlementErr, checkpointErr error
 	if s.settlementDB != nil {
 		settlementErr = s.settlementDB.Close()
 	}
-	return errors.Join(s.db.Close(), settlementErr)
+	if s.checkpointDB != nil {
+		checkpointErr = s.checkpointDB.Close()
+	}
+	return errors.Join(s.db.Close(), settlementErr, checkpointErr)
 }
 
 // CreateJob creates a job or returns the identical dispatch-key replay.
@@ -4399,12 +4431,13 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now
 	var createdNS, updatedNS int64
 	var requestHash string
 	var failureReason sql.NullString
+	var secretsScrubbedNS sql.NullInt64
 	var serviceColumns serviceJobColumns
 	var spawnColumns jobSpawnColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason,
+state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason, secrets_scrubbed_ns,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.lease_loss_count, service_jobs.next_restart_at, service_jobs.published_port,
 service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
@@ -4429,6 +4462,7 @@ jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spa
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append(append([]any{
 		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
+		&secretsScrubbedNS,
 	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, "", err
@@ -4438,6 +4472,10 @@ WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql
 	}
 	if failureReason.Valid {
 		job.FailureReason = failureReason.String
+	}
+	if secretsScrubbedNS.Valid {
+		scrubbedAt := time.Unix(0, secretsScrubbedNS.Int64).UTC()
+		job.SecretsScrubbedAt = &scrubbedAt
 	}
 	if removal, removalErr := readServiceRemoval(ctx, q, job.JobID); removalErr == nil {
 		applyServiceRemoval(&job, removal)
@@ -4453,12 +4491,13 @@ func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Jo
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
 	var failureReason sql.NullString
+	var secretsScrubbedNS sql.NullInt64
 	var serviceColumns serviceJobColumns
 	var spawnColumns jobSpawnColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason,
+state, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason, secrets_scrubbed_ns,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.lease_loss_count, service_jobs.next_restart_at, service_jobs.published_port,
 service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
@@ -4483,6 +4522,7 @@ jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spa
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append(append([]any{
 		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
+		&secretsScrubbedNS,
 	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, err
@@ -4492,6 +4532,10 @@ WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_
 	}
 	if failureReason.Valid {
 		job.FailureReason = failureReason.String
+	}
+	if secretsScrubbedNS.Valid {
+		scrubbedAt := time.Unix(0, secretsScrubbedNS.Int64).UTC()
+		job.SecretsScrubbedAt = &scrubbedAt
 	}
 	if removal, removalErr := readServiceRemoval(ctx, q, job.JobID); removalErr == nil {
 		applyServiceRemoval(&job, removal)

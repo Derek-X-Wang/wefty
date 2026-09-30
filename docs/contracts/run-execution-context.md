@@ -245,7 +245,12 @@ A token is minted once when L3 first dispatches its run and is bound in the
 ledger to that run and dispatch attempt. L3 stores the SHA-256 token digest for
 verification, not the bearer value. Crash-safe delivery briefly stages the
 bearer value in the dispatch outbox and sends it through L1 `SensitiveEnv`; L3
-clears its staged delivery value as soon as L1 acknowledges the idempotent job.
+clears its staged delivery value as soon as L1 acknowledges the idempotent job,
+or when the run becomes terminal first. L1 keeps the bearer in the job's spec
+only until the one-shot is terminal with no retry left, and then scrubs it with
+the inline script bytes and the `run_params_json` label (`state-machines.md`).
+L1, L3 and the node agent's spool all open SQLite with `secure_delete`, so a
+cleared or deleted value is zeroed on disk.
 
 The scope is:
 

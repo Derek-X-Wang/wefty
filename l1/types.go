@@ -95,8 +95,13 @@ type Job struct {
 	Attempts             []Attempt `json:"attempts,omitempty"`
 	UnschedulableReason  string    `json:"unschedulable_reason,omitempty"`
 	FailureReason        string    `json:"failure_reason,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	// SecretsScrubbedAt is when a terminal one-shot's spec lost its sensitive
+	// environment, inline executable bytes, and run parameter label (#52).
+	// What remains of the spec is the permanent record, not a resubmittable
+	// job.
+	SecretsScrubbedAt *time.Time `json:"secrets_scrubbed_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 	*ServiceJob
 	Removal *ServiceRemoval `json:"removal,omitempty"`
 }

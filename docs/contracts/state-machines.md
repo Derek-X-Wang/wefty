@@ -36,6 +36,28 @@ fresh attempt and fence. A stopping service whose quiescence cannot be
 confirmed latches `failed`. The job does not itself use a `lost` state because
 `lost` describes what is known about one execution attempt.
 
+A one-shot job's secrets do not outlive its execution. The transaction that
+moves a one-shot to `succeeded` or `failed` -- completion, lease expiry, an
+exhausted pre-start budget, or any later path -- also removes from its stored
+spec the three things only an execution needed: `execution.sensitive_env` (the
+L3 run token among them), `execution.executable.inline_base64`, and the
+`run_params_json` label. L1 enforces this with a trigger on the job's state, so
+no terminal path can skip it, and records the moment as `secrets_scrubbed_at`.
+The rest of the spec, including the executable's `sha256`, stays as the
+permanent record; it is no longer a resubmittable request. Responses describe
+it with the OpenAPI `JobRecordSpec`, which admits an executable with only its
+`sha256`, `interpreter` and `mode` when the job carries `secrets_scrubbed_at`;
+a submitted `JobSpec` still needs `path` or `inline_base64`. A one-shot that
+still has a retry (`claimed → queued` above) keeps them for its next attempt.
+Services are unaffected and keep scrubbing on removal. After the transaction
+commits, the L1 reconcile loop truncates the SQLite WAL within one tick, on a
+handle whose lock wait is a fixed 250 ms so a reader holding the WAL defers the
+truncation to a later tick rather than stalling writers, and
+the database runs with `secure_delete`, so the replaced bytes leave the files
+as well as the row. The same pass scrubs, a bounded batch at a time, any
+terminal one-shot stored before this rule existed. L3's program snapshot, not
+the L1 spec, is what a rerun is built from.
+
 A job created through an attempt credential additionally records its parent
 job, the parent attempt that submitted it, the originating submitter inherited
 from that parent, and a spawn depth one greater than the parent's. All four are

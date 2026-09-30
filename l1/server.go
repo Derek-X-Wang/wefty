@@ -76,6 +76,7 @@ type Server struct {
 	runLedgerNodeID         string
 	handler                 http.Handler
 	reconcile               func(context.Context) (ReconcileResult, error)
+	sweepScrubbedSecrets    func(context.Context) (SecretScrubSweep, error)
 	logf                    func(string, ...any)
 }
 
@@ -136,6 +137,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		restoreRevocationBudget: HeartbeatRestoreRevocationBudget,
 		runLedgerNodeID:         runLedgerNodeID,
 		reconcile:               store.Reconcile,
+		sweepScrubbedSecrets:    store.SweepScrubbedSecrets,
 		logf:                    log.Printf,
 	}
 	s.handler = s.routes()
@@ -174,6 +176,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		}
 		return fmt.Errorf("l1: initial recovery: %w", err)
 	}
+	s.sweepSecrets(ctx)
 	httpServer := &http.Server{Handler: s.handler}
 	reconcileFailures := make(chan error, 1)
 	reconcileContext, stopReconcile := context.WithCancel(ctx)
@@ -202,6 +205,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 					_ = httpServer.Close()
 					return
 				}
+				s.sweepSecrets(reconcileContext)
 			}
 		}
 	}()
@@ -228,7 +232,34 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	return err
 }
 
-const sqliteInterruptPrimaryCode = 9
+// sweepSecrets runs one scrubbed-secret sweep after a reconcile pass. A
+// failed sweep is logged and retried on the next tick rather than stopping
+// the server: every scrub it would finish has already committed with its
+// terminal transition, and what it leaves for later is a WAL truncation or a
+// bounded backfill batch, both of which the next pass redoes.
+func (s *Server) sweepSecrets(ctx context.Context) {
+	if s.sweepScrubbedSecrets == nil {
+		return
+	}
+	sweep, err := s.sweepScrubbedSecrets(ctx)
+	if err != nil {
+		if ctx.Err() == nil && s.logf != nil {
+			s.logf("event=l1_secret_scrub_sweep_failed action=retry_next_tick error=%v", err)
+		}
+		return
+	}
+	if sweep.Backfilled > 0 && s.logf != nil {
+		s.logf("event=l1_secret_scrub_backfilled jobs=%d", sweep.Backfilled)
+	}
+	if sweep.TruncationDeferred && s.logf != nil {
+		s.logf("event=l1_secret_wal_truncation_deferred action=retry_next_tick wait=%s", secretWALCheckpointWait)
+	}
+}
+
+const (
+	sqliteBusyPrimaryCode      = 5
+	sqliteInterruptPrimaryCode = 9
+)
 
 type sqliteErrorCoder interface {
 	Code() int

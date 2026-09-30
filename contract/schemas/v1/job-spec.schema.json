@@ -37,35 +37,8 @@
       "additionalProperties": false,
       "properties": {
         "executable": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "path": { "type": "string", "minLength": 1 },
-            "inline_base64": { "type": "string", "contentEncoding": "base64" },
-            "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-            "interpreter": {
-              "type": "array",
-              "items": { "type": "string" },
-              "minItems": 1
-            },
-            "mode": { "type": "integer", "minimum": 0, "maximum": 4095 }
-          },
-          "oneOf": [
-            {
-              "required": ["path"],
-              "not": {
-                "properties": { "inline_base64": true },
-                "required": ["inline_base64"]
-              }
-            },
-            {
-              "required": ["inline_base64", "sha256"],
-              "not": {
-                "properties": { "path": true },
-                "required": ["path"]
-              }
-            }
-          ]
+          "description": "Exactly one of path or inline_base64 (with its sha256). A dynamic reference so that a response schema for a stored record can widen it (see api/openapi JobRecordSpec); a submitted spec is always held to this definition.",
+          "$dynamicRef": "#executable"
         },
         "argv": {
           "type": "array",
@@ -263,6 +236,38 @@
     }
   ],
   "$defs": {
+    "executable": {
+      "$dynamicAnchor": "executable",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "inline_base64": { "type": "string", "contentEncoding": "base64" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "interpreter": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "mode": { "type": "integer", "minimum": 0, "maximum": 4095 }
+      },
+      "oneOf": [
+        {
+          "required": ["path"],
+          "not": {
+            "properties": { "inline_base64": true },
+            "required": ["inline_base64"]
+          }
+        },
+        {
+          "required": ["inline_base64", "sha256"],
+          "not": {
+            "properties": { "path": true },
+            "required": ["path"]
+          }
+        }
+      ]
+    },
     "environment": {
       "type": "object",
       "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },

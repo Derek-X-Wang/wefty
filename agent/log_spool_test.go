@@ -1057,3 +1057,17 @@ func TestDeliveredCleanupRequiresPositiveEvidenceAndEmptyBacklog(t *testing.T) {
 		})
 	}
 }
+
+// Delivered log bytes and results are zeroed on disk when the spool deletes
+// them, as L1 does (#52).
+func TestLogSpoolOpensWithSecureDelete(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "node-secure-delete", 1<<20)
+	defer spool.Close()
+	var secureDelete int
+	if err := spool.db.QueryRow(`PRAGMA secure_delete`).Scan(&secureDelete); err != nil {
+		t.Fatal(err)
+	}
+	if secureDelete != 1 {
+		t.Fatalf("secure_delete = %d, want 1", secureDelete)
+	}
+}

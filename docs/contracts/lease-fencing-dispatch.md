@@ -532,6 +532,11 @@ the control plane and stored with a canonical request hash.
 - Reusing the key with a different canonical request returns `409
   dispatch_key_conflict`, non-retryable.
 
+The request hash is computed once, from the submitted request, and is never
+recomputed from the stored spec. A terminal one-shot whose secrets L1 has
+since scrubbed (see `state-machines.md`) therefore still replays: the
+identical request returns the stored job, whose spec is the scrubbed record.
+
 L3 commits the run row and dispatch intent atomically. The outbox reconciler
 uses a stable dispatch key derived from that intent for every retry. A crash
 between the L3 commit and L1 response therefore converges on exactly one L1
