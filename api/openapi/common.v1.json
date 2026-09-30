@@ -761,7 +761,8 @@
         "required": ["backups"],
         "properties": {
           "backups": { "type": "array", "items": { "$ref": "#/components/schemas/Backup" } },
-          "last_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" }
+          "last_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
+          "operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome", "description": "Present only when the request named a backup_id: that operation's own state." }
         }
       },
       "ComputerBackupOperationOutcome": {
@@ -772,7 +773,7 @@
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["planned", "published", "failed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch"] },
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached"] },
           "completed_at": { "type": "string", "format": "date-time" }
         },
         "description": "Latest Computer Backup operation observation. A planned status is still running; failed always carries a typed failure_code."

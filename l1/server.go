@@ -1319,6 +1319,13 @@ func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	operation, err := s.store.ComputerBackupOperationForKey(r.Context(), r.PathValue("computer_id"), request.IdempotencyKey)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	w.Header().Set("Backup-Operation-Revision", strconv.FormatInt(operation.OperationRevision, 10))
+	w.Header().Set("Backup-Id", operation.BackupID)
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
@@ -1332,6 +1339,14 @@ func (s *Server) listComputerBackups(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if backupID := strings.TrimSpace(r.URL.Query().Get("backup_id")); backupID != "" {
+		operation, err := s.store.ComputerBackupOperation(r.Context(), r.PathValue("computer_id"), backupID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		backups.Operation = &operation
 	}
 	writeJSON(w, http.StatusOK, backups)
 }

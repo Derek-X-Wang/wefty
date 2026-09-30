@@ -518,16 +518,27 @@ func (c *apiClients) setComputerBackupCap(ctx context.Context, computerID string
 	return computer, err
 }
 
-func (c *apiClients) createComputerBackup(ctx context.Context, computerID string, request l1.ComputerBackupCreateRequest) (l1.Computer, bool, error) {
+// createComputerBackup also returns the Backup ID L1 names as the operation
+// this key started, on a fresh call and on any replay.
+func (c *apiClients) createComputerBackup(ctx context.Context, computerID string, request l1.ComputerBackupCreateRequest) (l1.Computer, string, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
 	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
-	return computer, responseWasIdempotentReplay(headers), err
+	return computer, headers.Get("Backup-Id"), responseWasIdempotentReplay(headers), err
 }
 
 func (c *apiClients) listComputerBackups(ctx context.Context, computerID string) (l1.BackupList, error) {
+	return c.listComputerBackupsFor(ctx, computerID, "")
+}
+
+// listComputerBackupsFor additionally reads one Backup operation's own state
+// when backupID is set.
+func (c *apiClients) listComputerBackupsFor(ctx context.Context, computerID, backupID string) (l1.BackupList, error) {
 	var backups l1.BackupList
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
+	if backupID != "" {
+		path += "?backup_id=" + url.QueryEscape(backupID)
+	}
 	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &backups, http.StatusOK)
 	return backups, err
 }
