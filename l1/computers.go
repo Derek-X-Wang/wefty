@@ -101,6 +101,7 @@ type Computer struct {
 	LastBackupOperation       *ComputerBackupOperationOutcome    `json:"last_backup_operation,omitempty"`
 	LastGrowOperation         *ComputerStorageGrowOutcome        `json:"last_grow_operation,omitempty"`
 	LastRestoreRevocation     *ComputerRestoreRevocationReceipt  `json:"last_restore_revocation,omitempty"`
+	RestoreOperation          *ComputerRestoreOperation          `json:"restore_operation,omitempty"`
 	StorageCleanupQuarantines []ComputerStorageCleanupQuarantine `json:"storage_cleanup_quarantines,omitempty"`
 	// OwedRevocations lists the explicit L3 revocations authority-losing
 	// mutations of this Computer committed and the run ledger has not yet

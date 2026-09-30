@@ -403,7 +403,7 @@ func executeComputerRestore(ctx context.Context, clients *apiClients, jsonOutput
 	if err != nil {
 		return err
 	}
-	computer, replayed, err := clients.restoreComputerBackup(ctx, computerID, backupID, l1.ComputerRestoreRequest{
+	computer, operationRevision, replayed, err := clients.restoreComputerBackup(ctx, computerID, backupID, l1.ComputerRestoreRequest{
 		ComputerMutationPrecondition: precondition, KeepOldBackup: keepOld, IdempotencyKey: key,
 	})
 	if err != nil {
@@ -412,8 +412,14 @@ func executeComputerRestore(ctx context.Context, clients *apiClients, jsonOutput
 	output := storageMutationOutput{MutationApplied: !replayed && computer.IntentRevision > precondition.IntentRevision,
 		IdempotentReplay: replayed, Computer: &computer}
 	if wait.timeout > 0 {
-		observed, observation, waitErr := waitForComputerRevision(ctx, clients, computer.ComputerID, computer.IntentRevision, wait)
+		if operationRevision == 0 {
+			return errors.New("L1 did not identify the restore operation this request started")
+		}
+		observed, observation, waitErr := waitForComputerRestore(ctx, clients, computer.ComputerID, operationRevision, wait)
 		output.Computer, output.Observation = &observed, &observation
+		if waitErr == nil {
+			waitErr = awaitedComputerRestoreFailure(observed)
+		}
 		waitErr = attachStorageProvenance(ctx, clients, computer.ComputerID, &output, waitErr)
 		return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
 	}
@@ -521,6 +527,32 @@ func awaitedBackupFailure(computerID string, backups l1.BackupList) error {
 		code = contract.ErrorCapacityExhausted
 	}
 	message := "Computer Backup failed"
+	if outcome.FailureCode != "" {
+		message += ": " + string(outcome.FailureCode)
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: code, Message: message, Retryable: false, Details: details,
+	}}
+}
+
+// awaitedComputerRestoreFailure reports a restore that did not complete. A
+// restore aborted because its precommitted predecessor Backup copy failed
+// returns the Computer to `stable` exactly as a completed one does, so only the
+// restore's own record says it failed (#592). A removal that overtook the
+// restore is no success either.
+func awaitedComputerRestoreFailure(computer l1.Computer) error {
+	outcome := computer.RestoreOperation
+	if outcome == nil || (outcome.Status != "failed" && outcome.Status != "superseded") {
+		return nil
+	}
+	details := map[string]any{"computer_id": computer.ComputerID, "backup_id": outcome.BackupID,
+		"operation_revision": outcome.OperationRevision, "status": outcome.Status,
+		"failure_code": string(outcome.FailureCode)}
+	code := contract.ErrorConflict
+	if outcome.FailureCode == l1.ComputerBackupFailureInsufficientDisk {
+		code = contract.ErrorCapacityExhausted
+	}
+	message := "Computer restore " + outcome.Status
 	if outcome.FailureCode != "" {
 		message += ": " + string(outcome.FailureCode)
 	}
@@ -768,6 +800,29 @@ func waitForComputerRevision(ctx context.Context, clients *apiClients, computerI
 			return false, readErr
 		}
 		return observed.AppliedRevision >= operationRevision && observed.ReconfigurationPhase == l1.ComputerReconfigurationStable, nil
+	})
+	return observed, observation, err
+}
+
+// waitForComputerRestore follows one restore until its own record is
+// terminal. It never judges the Computer's latest operation: replaying an
+// older restore after a newer one ended must report the older one.
+func waitForComputerRestore(ctx context.Context, clients *apiClients, computerID string, operationRevision int64, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
+	var observed l1.Computer
+	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
+		var readErr error
+		observed, readErr = clients.getComputerRestoreOperation(ctx, computerID, operationRevision)
+		if readErr != nil {
+			return false, readErr
+		}
+		if observed.RestoreOperation == nil {
+			return false, fmt.Errorf("L1 did not return restore operation %d of Computer %q", operationRevision, computerID)
+		}
+		switch observed.RestoreOperation.Status {
+		case "retired", "failed", "superseded":
+			return true, nil
+		}
+		return false, nil
 	})
 	return observed, observation, err
 }
