@@ -1082,6 +1082,95 @@ func stringSet(t *testing.T, value any) map[string]bool {
 	return set
 }
 
+// compileProtocolSchema compiles one schema location of the published protocol
+// documents. They reach the ratified contract schemas, which name themselves
+// by URL, so every one of them is registered before compiling. Nothing here is
+// fetched: a validator that went to the network would be testing the network.
+func compileProtocolSchema(t *testing.T, location string) *jsonschema.Schema {
+	t.Helper()
+	compiler := jsonschema.NewCompiler()
+	resources := map[string]string{
+		"file:///api/openapi/l3.v1.json":        "l3.v1.json",
+		"file:///api/openapi/common.v1.json":    "common.v1.json",
+		"file:///api/openapi/l1-client.v1.json": "l1-client.v1.json",
+	}
+	for _, name := range []string{"job-spec", "envelope", "gate-result", "run-record"} {
+		resources["file:///contract/schemas/v1/"+name+".schema.json"] =
+			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
+		resources["https://wefty.dev/schemas/v1/"+name+".schema.json"] =
+			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
+	}
+	for id, path := range resources {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := compiler.AddResource(id, decoded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compiled, err := compiler.Compile(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compiled
+}
+
+// A terminal one-shot's stored spec has lost its inline script bytes with its
+// secrets (#52). Every response that returns it -- GET, completion, and the
+// dispatch-key replay -- still conforms, while a submitted spec is held to
+// path or inline bytes exactly as before, and a job that does not say it was
+// scrubbed may not carry a scrubbed executable.
+func TestScrubbedJobResponsesConformWhileSubmitStillRequiresTheBytes(t *testing.T) {
+	t.Parallel()
+	const sha = "1566834a88c8b6313ed3f7567dac2a227f4a85fe1bb67677a04073a425890ae8"
+	scrubbedSpec := `{"schema_version":1,"dispatch_key":"run:1","kind":"process","class":"one-shot",` +
+		`"execution":{"executable":{"sha256":"` + sha + `","interpreter":["/bin/sh"],"mode":448},` +
+		`"argv":["wefty-inline-run_1"],"working_directory":"/tmp","handoff_directory":"/tmp/handoff"},` +
+		`"labels":{"run_id":"run_1"}}`
+	inlineSpec := `{"schema_version":1,"dispatch_key":"run:1","kind":"process","class":"one-shot",` +
+		`"execution":{"executable":{"inline_base64":"ZWNobwo=","sha256":"` + sha + `","interpreter":["/bin/sh"],"mode":448},` +
+		`"argv":["wefty-inline-run_1"],"working_directory":"/tmp","handoff_directory":"/tmp/handoff"},` +
+		`"labels":{"run_id":"run_1"}}`
+	job := func(spec, extra string) string {
+		return `{"job_id":"job_1","state":"succeeded","spec":` + spec + extra +
+			`,"created_at":"2026-09-29T12:00:00Z","updated_at":"2026-09-29T12:00:01Z"}`
+	}
+	scrubbedAt := `,"secrets_scrubbed_at":"2026-09-29T12:00:01Z"`
+
+	jobSchema := compileProtocolSchema(t, "file:///api/openapi/common.v1.json#/components/schemas/Job")
+	submitSchema := compileProtocolSchema(t,
+		"file:///api/openapi/l1-client.v1.json#/paths/~1v1~1jobs/post/requestBody/content/application~1json/schema")
+	for _, check := range []struct {
+		name    string
+		schema  *jsonschema.Schema
+		payload string
+		valid   bool
+	}{
+		{"a scrubbed job response", jobSchema, job(scrubbedSpec, scrubbedAt), true},
+		{"a live job response", jobSchema, job(inlineSpec, ""), true},
+		{"a scrubbed executable on a job that was not scrubbed", jobSchema, job(scrubbedSpec, ""), false},
+		{"a submitted spec with inline bytes", submitSchema, inlineSpec, true},
+		{"a submitted spec without its bytes", submitSchema, scrubbedSpec, false},
+	} {
+		instance, err := jsonschema.UnmarshalJSON(strings.NewReader(check.payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = check.schema.Validate(instance)
+		if check.valid && err != nil {
+			t.Errorf("%s is refused by the published schema: %v", check.name, err)
+		}
+		if !check.valid && err == nil {
+			t.Errorf("%s is accepted by the published schema", check.name)
+		}
+	}
+}
+
 // TestRunListResponseAdmitsBothArmsIncludingEmptyPages is finding 2 turned into
 // a check. `GET /v1/runs` serves two shapes, and an empty page satisfies both,
 // so the response schema has to be a union that accepts rather than a choice
@@ -1105,39 +1194,8 @@ func TestRunListResponseAdmitsBothArmsIncludingEmptyPages(t *testing.T) {
 		t.Fatal("the list response does not union its two arms")
 	}
 
-	// The protocol documents reach the ratified contract schemas, which name
-	// themselves by URL, so every one of them is registered before compiling.
-	// Nothing here is fetched: a validator that went to the network would be
-	// testing the network.
-	compiler := jsonschema.NewCompiler()
-	resources := map[string]string{
-		"file:///api/openapi/l3.v1.json":     "l3.v1.json",
-		"file:///api/openapi/common.v1.json": "common.v1.json",
-	}
-	for _, name := range []string{"job-spec", "envelope", "gate-result", "run-record"} {
-		resources["file:///contract/schemas/v1/"+name+".schema.json"] =
-			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
-		resources["https://wefty.dev/schemas/v1/"+name+".schema.json"] =
-			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
-	}
-	for id, path := range resources {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		decoded, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := compiler.AddResource(id, decoded); err != nil {
-			t.Fatal(err)
-		}
-	}
-	compiled, err := compiler.Compile(
+	compiled := compileProtocolSchema(t,
 		"file:///api/openapi/l3.v1.json#/paths/~1v1~1runs/get/responses/200/content/application~1json/schema")
-	if err != nil {
-		t.Fatal(err)
-	}
 	for name, payload := range map[string]string{
 		"an empty general page":     `{"runs":[]}`,
 		"an empty origin page":      `{"runs":[],"next_cursor":""}`,

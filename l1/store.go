@@ -65,6 +65,7 @@ type StoreOptions struct {
 type Store struct {
 	db                                *sql.DB
 	settlementDB                      *sql.DB
+	checkpointDB                      *sql.DB
 	clock                             Clock
 	restartJitter                     func(time.Duration) time.Duration
 	leaseDuration                     time.Duration
@@ -214,6 +215,26 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("l1: open SQLite owed-revocation handle: %w", err)
 	}
 	store.settlementDB = settlementDB
+	// The scrubbed-secret sweep's WAL truncation waits for every reader to
+	// leave the WAL and holds off writers while it waits, so it gets a handle
+	// of its own whose wait is short and fixed (#52). It does not share the
+	// settlement handle: that handle's one connection belongs to a
+	// heartbeat's budget, and a sweep holding it would make heartbeats skip
+	// their settlement writes.
+	checkpointDB, err := sql.Open("sqlite", sqliteDSN(path, secretWALCheckpointWait))
+	if err != nil {
+		_ = settlementDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite secret WAL checkpoint handle: %w", err)
+	}
+	checkpointDB.SetMaxOpenConns(1)
+	if err := checkpointDB.PingContext(context.Background()); err != nil {
+		_ = checkpointDB.Close()
+		_ = settlementDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("l1: open SQLite secret WAL checkpoint handle: %w", err)
+	}
+	store.checkpointDB = checkpointDB
 	return store, nil
 }
 
@@ -1885,11 +1906,14 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 }
 
 func (s *Store) Close() error {
-	var settlementErr error
+	var settlementErr, checkpointErr error
 	if s.settlementDB != nil {
 		settlementErr = s.settlementDB.Close()
 	}
-	return errors.Join(s.db.Close(), settlementErr)
+	if s.checkpointDB != nil {
+		checkpointErr = s.checkpointDB.Close()
+	}
+	return errors.Join(s.db.Close(), settlementErr, checkpointErr)
 }
 
 // CreateJob creates a job or returns the identical dispatch-key replay.

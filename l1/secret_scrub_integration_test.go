@@ -408,3 +408,79 @@ func TestSweepBackfillsTerminalOneShotsFromBeforeTheScrub(t *testing.T) {
 		t.Fatalf("replay of backfilled job = %+v replay=%v err %v", replayed, wasReplay, err)
 	}
 }
+
+// A reader holding the WAL cannot hold the sweep, or the writers queued behind
+// its checkpoint, for longer than the checkpoint handle's short wait. The
+// truncation is deferred, and a later pass does it once the reader is gone.
+func TestHeldReaderDefersTruncationWithinTheShortWait(t *testing.T) {
+	path := t.TempDir() + "/held-reader.sqlite"
+	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
+	store, err := OpenStore(path, StoreOptions{Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	spec := secretBearingOneShot("scrub-held-reader")
+	job, _, err := store.CreateJobAs(context.Background(), spec, runLedgerOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE jobs SET state=? WHERE job_id=?`, contract.JobFailed, job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	assertScrubbedSpec(t, store, job.JobID, scrubSecrets(spec))
+
+	reader, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	held, err := reader.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := held.QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+
+	// A writer that arrives while the checkpoint waits is held off at most
+	// that wait, not the main pool's five-second lock wait.
+	bound := 2 * time.Second
+	writerDone := make(chan time.Duration, 1)
+	start := time.Now()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		began := time.Now()
+		_, _, err := store.CreateJobAs(context.Background(), validJobSpec("scrub-held-reader-writer", nil), JobOrigin{})
+		if err != nil {
+			t.Error(err)
+		}
+		writerDone <- time.Since(began)
+	}()
+	sweep, err := store.SweepScrubbedSecrets(context.Background())
+	elapsed := time.Since(start)
+	if err != nil || sweep.TruncatedWAL || !sweep.TruncationDeferred {
+		t.Fatalf("sweep under a held reader = %+v err %v, want the truncation deferred", sweep, err)
+	}
+	if elapsed > bound {
+		t.Fatalf("sweep under a held reader took %v, want at most about the %v checkpoint wait", elapsed, secretWALCheckpointWait)
+	}
+	if waited := <-writerDone; waited > bound {
+		t.Fatalf("a writer behind the checkpoint waited %v, want at most about the %v checkpoint wait", waited, secretWALCheckpointWait)
+	}
+	if err := held.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	later, err := store.SweepScrubbedSecrets(context.Background())
+	if err != nil || !later.TruncatedWAL || later.TruncationDeferred {
+		t.Fatalf("sweep after the reader left = %+v err %v, want the WAL truncated", later, err)
+	}
+	files := databaseFiles(t, store)
+	for _, secret := range scrubSecrets(spec) {
+		if bytes.Contains(files, secret) {
+			t.Fatalf("database files still hold %q after the later sweep", secret)
+		}
+	}
+}

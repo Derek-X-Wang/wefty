@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -59,10 +60,14 @@ END;`
 // rather than in one long write transaction at startup.
 const secretScrubBackfillBatch = 256
 
-// secretWALTruncationWait bounds how long one sweep waits for readers to
-// leave the WAL. A sweep that cannot truncate in time leaves its generation
-// unrecorded, so the next tick tries again.
-const secretWALTruncationWait = 2 * time.Second
+// secretWALCheckpointWait is the fixed lock wait of the handle the sweep
+// truncates the WAL on (Store.checkpointDB). A TRUNCATE checkpoint waits,
+// through that wait, for every reader to leave the WAL and holds off new
+// writers meanwhile, so this bounds what a held reader costs the writers and
+// the reconcile loop. The driver does not interrupt the wait when a context
+// ends, which is why the bound is the handle's and not a deadline's. A
+// truncation that cannot finish within it is deferred to the next tick.
+const secretWALCheckpointWait = 250 * time.Millisecond
 
 // SecretScrubSweep reports one pass of SweepScrubbedSecrets.
 type SecretScrubSweep struct {
@@ -72,6 +77,10 @@ type SecretScrubSweep struct {
 	// TruncatedWAL is true when this pass truncated the WAL because a scrub
 	// had committed since the last truncation.
 	TruncatedWAL bool
+	// TruncationDeferred is true when a truncation was due but a reader or
+	// another checkpoint held the WAL past secretWALCheckpointWait. Nothing
+	// is recorded, so the next pass tries again.
+	TruncationDeferred bool
 }
 
 func (s *Store) initializeSecretScrub(ctx context.Context) error {
@@ -95,7 +104,9 @@ func (s *Store) initializeSecretScrub(ctx context.Context) error {
 // checkpoint must wait for every reader to leave the WAL and blocks new
 // writers while it waits; doing it inside each completion would put that wait
 // on the agent's completion call. The L1 server runs this after every
-// reconcile tick, so a scrubbed secret leaves the WAL within about one tick.
+// reconcile tick, so a scrubbed secret leaves the WAL within about one tick
+// unless a reader holds the WAL for longer; a deferred truncation is retried
+// on the next tick.
 func (s *Store) SweepScrubbedSecrets(ctx context.Context) (SecretScrubSweep, error) {
 	s.secretWALMu.Lock()
 	defer s.secretWALMu.Unlock()
@@ -115,15 +126,35 @@ func (s *Store) SweepScrubbedSecrets(ctx context.Context) (SecretScrubSweep, err
 	// The generation was read before the checkpoint, so every scrub it counts
 	// had committed into the WAL this checkpoint empties. A scrub committing
 	// after the read advances the generation past it and is caught next pass.
-	truncateCtx, cancel := context.WithTimeout(ctx, secretWALTruncationWait)
-	defer cancel()
-	if err := s.checkpointSecretWAL(truncateCtx); err != nil {
+	truncated, err := s.truncateSecretWAL(ctx)
+	if err != nil {
 		return sweep, err
+	}
+	if !truncated {
+		sweep.TruncationDeferred = true
+		return sweep, nil
 	}
 	s.secretWALGeneration = generation
 	s.secretWALTruncated = true
 	sweep.TruncatedWAL = true
 	return sweep, nil
+}
+
+// truncateSecretWAL makes one TRUNCATE checkpoint attempt on the short-wait
+// handle. It reports false, without error, when SQLite could not finish
+// within that handle's wait: the checkpoint answers busy, or refuses with
+// SQLITE_BUSY because another checkpoint is running.
+func (s *Store) truncateSecretWAL(ctx context.Context) (bool, error) {
+	var busy, logFrames, checkpointedFrames int
+	err := s.checkpointDB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames)
+	var sqliteErr sqliteErrorCoder
+	if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteBusyPrimaryCode {
+		return false, nil
+	}
+	if err != nil {
+		return false, internalError(err, "truncate secret-bearing SQLite WAL")
+	}
+	return busy == 0, nil
 }
 
 func (s *Store) backfillTerminalOneShotSecrets(ctx context.Context) (int64, error) {

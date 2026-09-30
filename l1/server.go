@@ -251,9 +251,15 @@ func (s *Server) sweepSecrets(ctx context.Context) {
 	if sweep.Backfilled > 0 && s.logf != nil {
 		s.logf("event=l1_secret_scrub_backfilled jobs=%d", sweep.Backfilled)
 	}
+	if sweep.TruncationDeferred && s.logf != nil {
+		s.logf("event=l1_secret_wal_truncation_deferred action=retry_next_tick wait=%s", secretWALCheckpointWait)
+	}
 }
 
-const sqliteInterruptPrimaryCode = 9
+const (
+	sqliteBusyPrimaryCode      = 5
+	sqliteInterruptPrimaryCode = 9
+)
 
 type sqliteErrorCoder interface {
 	Code() int
