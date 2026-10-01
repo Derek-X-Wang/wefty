@@ -61,7 +61,12 @@ func (server *Server) admitDataStream() (func(), bool) {
 // serveAdmitted serves a connection that already holds a connection slot.
 func (server *Server) serveAdmitted(ctx context.Context, connection net.Conn) {
 	go func() {
-		defer func() { <-server.connections }()
+		defer func() {
+			<-server.connections
+			if server.config.connectionReleased != nil {
+				server.config.connectionReleased()
+			}
+		}()
 		server.handleConnection(ctx, connection)
 	}()
 }
@@ -91,18 +96,30 @@ func (server *Server) refuseOverLimit(ctx context.Context, connection net.Conn) 
 	}
 	select {
 	case server.limitRefusals <- struct{}{}:
-	case server.connections <- struct{}{}:
-		server.serveAdmitted(ctx, connection)
-		return
-	case <-ctx.Done():
-		_ = connection.Close()
-		return
+	default:
+		// Every refusal worker is busy: wait for one, or for a slot, rather
+		// than close on an allowed peer.
+		if server.config.refusalWaiting != nil {
+			server.config.refusalWaiting()
+		}
+		select {
+		case server.limitRefusals <- struct{}{}:
+		case server.connections <- struct{}{}:
+			server.serveAdmitted(ctx, connection)
+			return
+		case <-ctx.Done():
+			_ = connection.Close()
+			return
+		}
 	}
 	server.noteConnectionLimit("connection_limit")
 	go func() {
 		defer func() { <-server.limitRefusals }()
 		defer connection.Close()
 		timeout := min(server.config.RequestTimeout, connectionLimitRefusalTimeout)
+		if server.config.limitRefusalTimeout > 0 {
+			timeout = server.config.limitRefusalTimeout
+		}
 		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
 			return
 		}
