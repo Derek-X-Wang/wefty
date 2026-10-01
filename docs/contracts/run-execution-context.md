@@ -1372,7 +1372,13 @@ acknowledged ID. A job L1 still holds is linked, because the scoped lookup
 cannot see a job L1 stored before it recorded run-ledger provenance. Only that
 read's authoritative absence records the existing `l1_regressed` diagnostic
 for the ID. Transport, authentication and malformed answers remain retryable
-pass errors. A complete authoritative answer settles the lookup once, and only
+pass errors, and back that run off before it is asked again: 30 seconds after
+the first consecutive failure, doubling to at most 30 minutes. Recovery runs
+after dispatch, projection and node attribution in each pass, reads at most 16
+of the oldest runs that are not backed off, and stops starting L1 reads once
+its per-pass budget (5 seconds by default) is spent; a read the budget cuts
+short counts as a transient failure. An unavailable L1 therefore costs at most
+one budget per pass and cannot hold live runs' dispatch behind ended ones. A complete authoritative answer settles the lookup once, and only
 if the outbox still holds the acknowledgement recovery read before asking L1;
 an acknowledgement recorded meanwhile is linked instead. An acknowledgement
 that arrives after the settlement still links the run and clears the settled

@@ -133,6 +133,8 @@ CREATE TABLE IF NOT EXISTS runs (
   failure_reason TEXT,
   node_attribution_pending INTEGER NOT NULL DEFAULT 0,
   job_link_settled INTEGER NOT NULL DEFAULT 0,
+  job_link_failures INTEGER NOT NULL DEFAULT 0,
+  job_link_retry_ns INTEGER NOT NULL DEFAULT 0,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
@@ -361,6 +363,14 @@ ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_settled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("l3: migrate run job-link settlement: %w", err)
+	}
+	// Recovery backs a row off after a transient L1 failure so an unavailable
+	// L1 cannot hold every unsettled row in every pass.
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_failures", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run job-link failures: %w", err)
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_retry_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run job-link retry time: %w", err)
 	}
 	// Old rows default to unsettled so the reconciler can recover historical
 	// crash windows. The partial index keeps each pass proportional to the few
@@ -2061,14 +2071,26 @@ type unrecordedDispatch struct {
 
 // unrecordedDispatchesQuery repeats the partial-index predicate literally so
 // SQLite can select only unsettled terminal runs instead of scanning history.
+// It returns the oldest rows not backed off, a bounded batch per pass.
 const unrecordedDispatchesQuery = `SELECT r.run_id, o.dispatch_key, COALESCE(o.job_id, '')
 FROM runs r INDEXED BY runs_unrecorded_dispatch JOIN dispatch_outbox o ON o.run_id=r.run_id
 WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed')
-  AND o.attempt_count>0
-ORDER BY r.created_ns, r.run_id`
+  AND o.attempt_count>0 AND r.job_link_retry_ns<=?
+ORDER BY r.created_ns, r.run_id
+LIMIT ?`
 
-func (s *Store) unrecordedDispatches(ctx context.Context) ([]unrecordedDispatch, error) {
-	rows, err := s.db.QueryContext(ctx, unrecordedDispatchesQuery)
+const (
+	// unrecordedDispatchBatch bounds the rows one recovery pass reads.
+	unrecordedDispatchBatch = 16
+	// A row whose L1 reads failed transiently waits unrecordedDispatchRetryBase,
+	// doubling per consecutive failure up to unrecordedDispatchRetryCap.
+	unrecordedDispatchRetryBase = 30 * time.Second
+	unrecordedDispatchRetryCap  = 30 * time.Minute
+)
+
+func (s *Store) unrecordedDispatches(ctx context.Context, limit int) ([]unrecordedDispatch, error) {
+	now := canonicalTime(s.clock.Now())
+	rows, err := s.db.QueryContext(ctx, unrecordedDispatchesQuery, now.UnixNano(), limit)
 	if err != nil {
 		return nil, internalError(err, "list unrecorded dispatches")
 	}
@@ -2085,6 +2107,32 @@ func (s *Store) unrecordedDispatches(ctx context.Context) ([]unrecordedDispatch,
 		return nil, internalError(err, "iterate unrecorded dispatches")
 	}
 	return pending, nil
+}
+
+// deferUnrecordedDispatch backs one row off after a transient L1 failure.
+func (s *Store) deferUnrecordedDispatch(ctx context.Context, runID string) error {
+	now := canonicalTime(s.clock.Now())
+	var failures int
+	if err := s.db.QueryRowContext(ctx, `SELECT job_link_failures FROM runs WHERE run_id=?`, runID).Scan(&failures); err != nil {
+		return internalError(err, "read unrecorded dispatch failures")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET job_link_failures=job_link_failures+1, job_link_retry_ns=?
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND job_link_failures=?`,
+		now.Add(unrecordedDispatchBackoff(failures)).UnixNano(), runID, failures)
+	if err != nil {
+		return internalError(err, "defer unrecorded dispatch")
+	}
+	return nil
+}
+
+// unrecordedDispatchBackoff is the wait after failures earlier consecutive
+// transient failures plus this one.
+func unrecordedDispatchBackoff(failures int) time.Duration {
+	delay := unrecordedDispatchRetryBase
+	for i := 0; i < failures && delay < unrecordedDispatchRetryCap; i++ {
+		delay *= 2
+	}
+	return min(delay, unrecordedDispatchRetryCap)
 }
 
 // unrecordedDispatchFor rereads one run's recovery state after a settlement

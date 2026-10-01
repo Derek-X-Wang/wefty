@@ -334,7 +334,7 @@ func (c *failRunAfterSubmitClient) SubmitJob(ctx context.Context, spec contract.
 
 func TestUnrecordedDispatchesUseThePartialIndex(t *testing.T) {
 	store, _, _ := recoveryStore(t)
-	rows, err := store.db.Query(`EXPLAIN QUERY PLAN ` + unrecordedDispatchesQuery)
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN `+unrecordedDispatchesQuery, int64(0), unrecordedDispatchBatch)
 	if err != nil {
 		t.Fatal(err)
 	}
