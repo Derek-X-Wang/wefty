@@ -70,7 +70,25 @@ func isMissingL1Job(err error, jobID string) bool {
 	return jobID != "" && errors.As(err, &missing) && missing.JobID == jobID
 }
 
+// DispatchNotFoundError is authoritative absence from the lookup-only
+// dispatch-key endpoint. Alternate clients must emit it only for a complete
+// not_found envelope from that exact route, bound to the requested key.
+type DispatchNotFoundError struct {
+	DispatchKey string
+	Cause       error
+}
+
+func (e *DispatchNotFoundError) Error() string {
+	return fmt.Sprintf("L1 dispatch %q was not found", e.DispatchKey)
+}
+func (e *DispatchNotFoundError) Unwrap() error { return e.Cause }
+func isMissingDispatch(err error, dispatchKey string) bool {
+	var missing *DispatchNotFoundError
+	return dispatchKey != "" && errors.As(err, &missing) && missing.DispatchKey == dispatchKey
+}
+
 const l1RegressedReason = "l1_regressed"
+const dispatchNotFoundReason = "dispatch_not_found"
 
 func isL1Regression(cause *contract.APIError, jobID string) bool {
 	return cause != nil && cause.Code == contract.ErrorNotFound && !cause.Retryable &&

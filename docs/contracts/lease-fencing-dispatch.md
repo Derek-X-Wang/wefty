@@ -580,9 +580,22 @@ since scrubbed (see `state-machines.md`) therefore still replays: the
 identical request returns the stored job, whose spec is the scrubbed record.
 
 L3 commits the run row and dispatch intent atomically. The outbox reconciler
-uses a stable dispatch key derived from that intent for every retry. A crash
-between the L3 commit and L1 response therefore converges on exactly one L1
-job and one recorded run-to-job association.
+uses a stable dispatch key derived from that intent for every retry while the
+run remains pending or dispatching. A crash between the L3 commit and L1
+response therefore converges on exactly one L1 job and one recorded run-to-job
+association while the run can still be dispatched.
+
+`GET /v1/dispatch-keys/{dispatch_key}/job` is a lookup-only recovery read for
+the configured run-ledger principal. It returns only a root one-shot job L1
+recorded as submitted by that ledger. An unknown key, a child, a service, or a
+job submitted by another client receives the same `404 not_found`; the read
+never creates, replays, or changes a job.
+
+If a run becomes terminal before L3 records the submit response, L3 recovers
+the association only through that lookup. It never replays `SubmitJob`: the
+terminal transition has cleared the staged bearer, and an L1 that lost its
+database could otherwise accept the replay as new work and repeat side
+effects for an ended run.
 
 ## Workload support and reserved operations
 

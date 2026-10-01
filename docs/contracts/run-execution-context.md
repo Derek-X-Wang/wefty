@@ -275,6 +275,8 @@ clears its staged delivery value as soon as L1 acknowledges the idempotent job,
 or when the run becomes terminal first. L1 keeps the bearer in the job's spec
 only until the one-shot is terminal with no retry left, and then scrubs it with
 the inline script bytes and the `run_params_json` label (`state-machines.md`).
+Once termination clears the staged bearer, an accepted dispatch whose job ID
+was not recorded is recovered by dispatch-key lookup only, never by replay.
 L1, L3 and the node agent's spool all open SQLite with `secure_delete`, so a
 cleared or deleted value is zeroed on disk. Every connection of the three also
 opens with `fullfsync` and `checkpoint_fullfsync` on darwin, where a plain
@@ -1347,6 +1349,27 @@ count, preserves the started timestamp, and applies existing terminal token
 grace. The first committed terminal result wins against concurrent projections;
 repeated passes and restarts cannot replace that result or extend token expiry.
 Other runs and parent/child settlement continue normally.
+
+A terminal run with no `l1_job_id` is eligible for lookup recovery when its
+dispatch outbox records at least one attempt and the recovery answer has not
+already been settled. This includes a submit that was still in flight when the
+run ended: `dispatched_ns` may already be set even though the guarded run update
+could not record the job. A found job fills only `l1_job_id`, keeps the run's
+terminal state, reason and timestamps unchanged, and marks node attribution
+pending when no node is known so the ordinary terminal-attribution pass can
+name it.
+
+An authoritative absence for a dispatch L1 never acknowledged is recorded as
+a nonretryable `not_found` dispatch error with details `{reason:
+dispatch_not_found, dispatch_key: <key>}`. An existing nonretryable dispatch
+refusal is retained instead of being replaced. If the outbox already records
+an acknowledged job ID, absence or a different lookup result records the
+existing `l1_regressed` diagnostic for that ID. Transport, authentication and
+malformed answers remain retryable pass errors. A complete authoritative
+answer settles the lookup once; later passes do not ask again. A new L3 talking
+to an older L1 receives that server's plain route-level 404, not the complete
+error envelope from this endpoint, so version skew can never establish
+absence. None of these paths resubmits the job.
 
 `GET /v1/runs/{run_id}/execution` exposes the recorded diagnostic and retained
 `l1_job_id` without a `job` only when the failed ledger run and diagnostic match

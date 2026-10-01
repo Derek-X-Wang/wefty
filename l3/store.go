@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS runs (
   node_id TEXT,
   failure_reason TEXT,
   node_attribution_pending INTEGER NOT NULL DEFAULT 0,
+  job_link_settled INTEGER NOT NULL DEFAULT 0,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
@@ -357,6 +358,16 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_node_attribution_pending
 ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
 		return fmt.Errorf("l3: index pending run node attributions: %w", err)
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_settled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run job-link settlement: %w", err)
+	}
+	// Old rows default to unsettled so the reconciler can recover historical
+	// crash windows. The partial index keeps each pass proportional to the few
+	// terminal runs still awaiting an authoritative lookup.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_unrecorded_dispatch
+ON runs(status, created_ns, run_id) WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','failed')`); err != nil {
+		return fmt.Errorf("l3: index unrecorded dispatches: %w", err)
 	}
 	// A ledger written before credential delivery became opt-in has no column.
 	// Defaulting it to 0 is the safe direction: an old run reads as one that
@@ -1968,6 +1979,121 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		return internalError(err, "commit dispatch completion")
 	}
 	return nil
+}
+
+// unrecordedDispatch is a terminal run for which at least one dispatch began
+// but L3 never recorded the L1 job association.
+type unrecordedDispatch struct {
+	RunID, DispatchKey, OutboxJobID string
+}
+
+// unrecordedDispatchesQuery repeats the partial-index predicate literally so
+// SQLite can select only unsettled terminal runs instead of scanning history.
+const unrecordedDispatchesQuery = `SELECT r.run_id, o.dispatch_key, COALESCE(o.job_id, '')
+FROM runs r INDEXED BY runs_unrecorded_dispatch JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed')
+  AND o.attempt_count>0
+ORDER BY r.created_ns, r.run_id`
+
+func (s *Store) unrecordedDispatches(ctx context.Context) ([]unrecordedDispatch, error) {
+	rows, err := s.db.QueryContext(ctx, unrecordedDispatchesQuery)
+	if err != nil {
+		return nil, internalError(err, "list unrecorded dispatches")
+	}
+	defer rows.Close()
+	var pending []unrecordedDispatch
+	for rows.Next() {
+		var item unrecordedDispatch
+		if err := rows.Scan(&item.RunID, &item.DispatchKey, &item.OutboxJobID); err != nil {
+			return nil, internalError(err, "scan unrecorded dispatch")
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate unrecorded dispatches")
+	}
+	return pending, nil
+}
+
+// linkUnrecordedDispatch records only the missing association. The terminal
+// state, reason and timestamps are deliberately outside both updates.
+func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, jobID string) error {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin unrecorded dispatch link")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET
+  l1_job_id=?, job_link_settled=1,
+  node_attribution_pending=CASE WHEN COALESCE(node_id, '')='' THEN 1 ELSE node_attribution_pending END
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)`,
+		jobID, item.RunID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return internalError(err, "link unrecorded dispatch")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read unrecorded dispatch link result")
+	}
+	if changed == 1 {
+		if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
+  job_id=COALESCE(job_id, ?), dispatched_ns=COALESCE(dispatched_ns, ?), last_error=NULL, token_delivery=NULL
+WHERE run_id=?`, jobID, now.UnixNano(), item.RunID); err != nil {
+			return internalError(err, "complete recovered dispatch outbox")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit unrecorded dispatch link")
+	}
+	return nil
+}
+
+// settleUnrecordedDispatch records one authoritative absence and stops future
+// lookups without changing the already-terminal run.
+func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) (bool, error) {
+	cause := contract.APIError{
+		Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
+		Details: map[string]any{"reason": dispatchNotFoundReason, "dispatch_key": item.DispatchKey},
+	}
+	if item.OutboxJobID != "" {
+		cause = contract.APIError{
+			Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed",
+			Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": item.OutboxJobID},
+		}
+	}
+	payload, err := json.Marshal(cause)
+	if err != nil {
+		return false, internalError(err, "encode unrecorded dispatch settlement")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, internalError(err, "begin unrecorded dispatch settlement")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)`,
+		item.RunID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return false, internalError(err, "settle unrecorded dispatch")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, internalError(err, "read unrecorded dispatch settlement result")
+	}
+	if changed == 0 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
+  last_error=CASE WHEN last_error IS NULL OR json_extract(last_error, '$.retryable')=1 THEN ? ELSE last_error END,
+  token_delivery=NULL
+WHERE run_id=?`, string(payload), item.RunID); err != nil {
+		return false, internalError(err, "record unrecorded dispatch settlement")
+	}
+	if err := tx.Commit(); err != nil {
+		return false, internalError(err, "commit unrecorded dispatch settlement")
+	}
+	return true, nil
 }
 
 type projectedRun struct {

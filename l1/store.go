@@ -2407,6 +2407,30 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (Job, error) {
 	return job, nil
 }
 
+// LookupRunLedgerJob returns the root one-shot job L1 accepted from its
+// configured run ledger under dispatchKey. It is a read only recovery seam:
+// it never creates, replays, or changes a job, and every out-of-scope key is
+// reported with the same absence.
+func (s *Store) LookupRunLedgerJob(ctx context.Context, dispatchKey string) (Job, error) {
+	var jobID string
+	err := s.db.QueryRowContext(ctx, `SELECT job_id FROM jobs
+		WHERE dispatch_key=? AND COALESCE(parent_job_id, '')='' AND submitted_by_run_ledger=1`, dispatchKey).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, protocolError(contract.ErrorNotFound, "run-ledger dispatch was not found")
+	}
+	if err != nil {
+		return Job{}, internalError(err, "look up run-ledger dispatch")
+	}
+	job, err := getJobByID(ctx, s.db, jobID, canonicalTime(s.clock.Now()))
+	if err != nil {
+		return Job{}, internalError(err, "read run-ledger dispatch")
+	}
+	if job.Spec.Class != contract.JobClassOneShot {
+		return Job{}, protocolError(contract.ErrorNotFound, "run-ledger dispatch was not found")
+	}
+	return job, nil
+}
+
 // ListJobAttempts returns the retained execution summaries in chronological
 // order. Service retention may prune old empty summaries; a one-shot keeps its
 // sole attempt. Authority-bearing columns never cross this operator boundary.

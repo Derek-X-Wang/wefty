@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -348,6 +349,7 @@ type attemptCredentialContextKey struct{}
 func (s *Server) routes() http.Handler {
 	client := http.NewServeMux()
 	client.HandleFunc("POST /v1/jobs", s.createJob)
+	client.HandleFunc("GET /v1/dispatch-keys/{dispatch_key}/job", s.lookupJobByDispatchKey)
 	client.HandleFunc("GET /v1/jobs", s.listJobs)
 	client.HandleFunc("GET /v1/jobs/{$}", s.listJobs)
 	client.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
@@ -449,6 +451,7 @@ func (s *Server) routes() http.Handler {
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
+	root.Handle("/v1/dispatch-keys/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/jobs", s.authorizeJobProtocol(client, credential))
 	root.Handle("/v1/jobs/", s.authorizeJobProtocol(client, credential))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
@@ -2035,6 +2038,24 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	s.writeJobProjection(w, r, job)
+}
+
+func (s *Server) lookupJobByDispatchKey(w http.ResponseWriter, r *http.Request) {
+	if identityFromRequest(r).NodeID != s.runLedgerNodeID {
+		writeError(w, protocolError(contract.ErrorForbidden, "only the L3 run ledger may look up a dispatch"))
+		return
+	}
+	dispatchKey := r.PathValue("dispatch_key")
+	if strings.TrimSpace(dispatchKey) == "" || utf8.RuneCountInString(dispatchKey) > 255 {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "dispatch_key must contain between 1 and 255 characters"))
+		return
+	}
+	job, err := s.store.LookupRunLedgerJob(r.Context(), dispatchKey)
 	if err != nil {
 		writeError(w, err)
 		return

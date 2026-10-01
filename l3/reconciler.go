@@ -12,9 +12,10 @@ import (
 const DefaultReconcileInterval = time.Second
 
 type ReconcilerConfig struct {
-	Interval      time.Duration
-	OnError       func(error)
-	ImageEvidence JobImageEvidenceClient
+	Interval       time.Duration
+	OnError        func(error)
+	ImageEvidence  JobImageEvidenceClient
+	DispatchLookup JobDispatchLookupClient
 }
 
 // Reconciler drains durable dispatch intents and projects L1 job states. It is
@@ -23,6 +24,7 @@ type Reconciler struct {
 	store    *Store
 	jobs     JobClient
 	images   JobImageEvidenceClient
+	lookup   JobDispatchLookupClient
 	interval time.Duration
 	onError  func(error)
 }
@@ -42,7 +44,11 @@ func NewReconciler(store *Store, jobs JobClient, config ReconcilerConfig) (*Reco
 	if images == nil {
 		images, _ = jobs.(JobImageEvidenceClient)
 	}
-	return &Reconciler{store: store, jobs: jobs, images: images, interval: interval, onError: config.OnError}, nil
+	lookup := config.DispatchLookup
+	if lookup == nil {
+		lookup, _ = jobs.(JobDispatchLookupClient)
+	}
+	return &Reconciler{store: store, jobs: jobs, images: images, lookup: lookup, interval: interval, onError: config.OnError}, nil
 }
 
 // ReconcileOnce makes one complete pass over every outstanding dispatch and
@@ -139,8 +145,53 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 			passErrors = append(passErrors, err)
 		}
 	}
+	passErrors = append(passErrors, r.recoverUnrecordedDispatches(ctx)...)
 	passErrors = append(passErrors, r.settlePendingNodeAttributions(ctx)...)
 	return errors.Join(passErrors...)
+}
+
+// recoverUnrecordedDispatches links terminal runs by lookup only. Replaying
+// SubmitJob is impossible after #52 cleared the staged bearer, and unsafe when
+// L1 has regressed because it could recreate side effects for an ended run.
+func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
+	if r.lookup == nil {
+		return nil
+	}
+	pending, err := r.store.unrecordedDispatches(ctx)
+	if err != nil {
+		return []error{err}
+	}
+	var passErrors []error
+	for _, item := range pending {
+		job, err := r.lookup.LookupJobByDispatchKey(ctx, item.DispatchKey)
+		if err != nil {
+			if isMissingDispatch(err, item.DispatchKey) {
+				changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
+				if storeErr != nil {
+					passErrors = append(passErrors, errors.Join(err, storeErr))
+				} else if changed {
+					passErrors = append(passErrors, err)
+				}
+				continue
+			}
+			passErrors = append(passErrors, err)
+			continue
+		}
+		if item.OutboxJobID != "" && item.OutboxJobID != job.JobID {
+			changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
+			mismatch := fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
+			if storeErr != nil {
+				passErrors = append(passErrors, errors.Join(mismatch, storeErr))
+			} else if changed {
+				passErrors = append(passErrors, mismatch)
+			}
+			continue
+		}
+		if err := r.store.linkUnrecordedDispatch(ctx, item, job.JobID); err != nil {
+			passErrors = append(passErrors, err)
+		}
+	}
+	return passErrors
 }
 
 // settlePendingNodeAttributions names the node of runs the ledger failed while

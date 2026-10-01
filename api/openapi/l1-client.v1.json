@@ -153,6 +153,24 @@
         }
       }
     },
+    "/v1/dispatch-keys/{dispatch_key}/job": {
+      "parameters": [
+        { "name": "dispatch_key", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 255 } }
+      ],
+      "get": {
+        "operationId": "lookupJobByDispatchKey",
+        "summary": "Look up a run-ledger job by dispatch key",
+        "description": "L3-only Fabric client seam for recovery after L1 accepted a dispatch that L3 did not record. Only the configured run ledger may call it. It returns only a root one-shot job that L1 recorded as submitted by that ledger; every unknown or out-of-scope key receives the identical not_found response. The operation is read-only and never creates or replays a job.",
+        "responses": {
+          "200": { "description": "Current redacted job projection, including retained attempts.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/jobs": {
       "post": {
         "operationId": "createJob",
