@@ -26,19 +26,80 @@ func (engine *holdingDialEngine) DialAttemptPort(_ context.Context, _ DialAttemp
 	return nil
 }
 
-func startHoldingSession(t *testing.T, config ServerConfig) (*holdingDialEngine, *Session, AttemptAuthority) {
-	engine, session, authority, _ := startHoldingSessionWithClient(t, config)
-	return engine, session, authority
+// budgetServer is a helper whose own slot bookkeeping a test can wait on.
+// Slots are freed asynchronously, after the handler that held one returns, so
+// a test that needs a slot free waits for that release, never for time.
+type budgetServer struct {
+	server  *Server
+	path    string
+	changed chan struct{}
 }
 
-func startHoldingSessionWithClient(t *testing.T, config ServerConfig) (*holdingDialEngine, *Session, AttemptAuthority, *Client) {
+func startBudgetServer(t *testing.T, engine Engine, config ServerConfig) *budgetServer {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "wefty-oci-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	path := filepath.Join(directory, "helper.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.HelperChecksum == "" {
+		config.HelperChecksum = "checksum-test"
+	}
+	if len(config.AllowedUIDs) == 0 {
+		config.AllowedUIDs = []uint32{uint32(os.Getuid())}
+	}
+	budget := &budgetServer{path: path, changed: make(chan struct{}, 1)}
+	// A coalescing wakeup is enough: the waiter re-reads the counts after
+	// every wake, so a release between its read and its wait is never lost.
+	config.connectionReleased = func() {
+		select {
+		case budget.changed <- struct{}{}:
+		default:
+		}
+	}
+	server, err := NewServer(engine, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget.server = server
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		<-done
+	})
+	return budget
+}
+
+// awaitHeld waits until exactly slots connection slots, of which dataStreams
+// are data streams, are held.
+func (budget *budgetServer) awaitHeld(t *testing.T, slots, dataStreams int) {
+	t.Helper()
+	for len(budget.server.connections) != slots || len(budget.server.dataStreams) != dataStreams {
+		select {
+		case <-budget.changed:
+		case <-t.Context().Done():
+			t.Fatalf("helper never settled at %d slots and %d data streams", slots, dataStreams)
+		}
+	}
+}
+
+func startHoldingSession(t *testing.T, config ServerConfig) (*holdingDialEngine, *Session, AttemptAuthority, *budgetServer) {
 	t.Helper()
 	base := newFakeEngine()
 	base.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}})
 	engine := &holdingDialEngine{fakeEngine: base}
 	config.HeartbeatTimeout = 5 * time.Second
-	client, stop := startTestServer(t, engine, config)
-	t.Cleanup(stop)
+	budget := startBudgetServer(t, engine, config)
+	client := NewUnixClient(budget.path, "checksum-test")
+	client.disableHeartbeatPump = true
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +112,10 @@ func startHoldingSessionWithClient(t *testing.T, config ServerConfig) (*holdingD
 	if _, err := session.Run(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
-	return engine, session, authority, client
+	// Sweep and Run each held a slot until their handlers returned. Only
+	// the control connection may remain before a test counts slots.
+	budget.awaitHeld(t, 1, 0)
+	return engine, session, authority, budget
 }
 
 func holdStreams(t *testing.T, session *Session, authority AttemptAuthority, count int) []net.Conn {
@@ -100,7 +164,7 @@ func requireSessionSurvived(t *testing.T, engine *holdingDialEngine, session *Se
 func TestDataStreamOverBudgetIsRefusedAndTheSessionSurvives(t *testing.T) {
 	// A limit of 6 clamps the default reserve of 8 to 3, leaving 3 slots to
 	// data streams and 3 to the control connection and control RPCs.
-	engine, session, authority := startHoldingSession(t, ServerConfig{ConnectionLimit: 6})
+	engine, session, authority, budget := startHoldingSession(t, ServerConfig{ConnectionLimit: 6})
 	generation := session.Handshake().SessionGeneration
 	streams := holdStreams(t, session, authority, 3)
 
@@ -109,11 +173,16 @@ func TestDataStreamOverBudgetIsRefusedAndTheSessionSurvives(t *testing.T) {
 		t.Fatalf("data stream over its budget = %v, want a typed connection_limit refusal", err)
 	}
 	requireSessionSurvived(t, engine, session, generation)
+	// The refused stream was admitted to a slot before its data budget
+	// refused it; wait for that slot back, so the reserve below is exactly
+	// what the control connection and three streams leave.
+	budget.awaitHeld(t, 4, 3)
 
 	// Control RPCs are not data streams: the reserve keeps them a slot.
 	if err := session.Signal(t.Context(), SignalRequest{Authority: authority, Signal: SignalTERM}); err != nil {
 		t.Fatalf("Signal while data streams are at budget: %v", err)
 	}
+	budget.awaitHeld(t, 4, 3)
 	var completed bool
 	if err := session.Watch(t.Context(), WatchRequest{Authority: authority}, func(event WatchEvent) error {
 		completed = completed || event.Result != nil
@@ -124,20 +193,15 @@ func TestDataStreamOverBudgetIsRefusedAndTheSessionSurvives(t *testing.T) {
 	requireSessionSurvived(t, engine, session, generation)
 
 	// The budget is a live count, not a latch: closing one stream admits the
-	// next.
+	// next. Once the closed stream's handler, and the Watch's, have given
+	// their slots back, the control connection and two streams remain.
 	_ = streams[0].Close()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		next, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "service"})
-		if err == nil {
-			_ = next.Close()
-			break
-		}
-		if !IsConnectionLimitRefusal(err) || time.Now().After(deadline) {
-			t.Fatalf("data stream after one closed = %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	budget.awaitHeld(t, 3, 2)
+	next, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "service"})
+	if err != nil {
+		t.Fatalf("data stream after one closed = %v", err)
 	}
+	_ = next.Close()
 	requireSessionSurvived(t, engine, session, generation)
 }
 
@@ -147,7 +211,7 @@ func TestDataStreamOverBudgetIsRefusedAndTheSessionSurvives(t *testing.T) {
 func TestConnectionOverTheWholeLimitIsATypedRefusal(t *testing.T) {
 	// A reserve of 1 lets data streams take 5 of 6 slots; with the control
 	// connection that fills the helper.
-	engine, session, authority := startHoldingSession(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
+	engine, session, authority, budget := startHoldingSession(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
 	generation := session.Handshake().SessionGeneration
 	streams := holdStreams(t, session, authority, 5)
 
@@ -159,41 +223,26 @@ func TestConnectionOverTheWholeLimitIsATypedRefusal(t *testing.T) {
 	}
 	requireSessionSurvived(t, engine, session, generation)
 
+	// The refused requests never held a slot, so once the closed stream's
+	// handler gives its slot back exactly one is free.
 	_ = streams[0].Close()
-	waitFor(t, 2*time.Second, func() bool {
-		return session.Signal(t.Context(), SignalRequest{Authority: authority, Signal: SignalTERM}) == nil
-	}, "Signal after one stream closed")
+	budget.awaitHeld(t, 5, 4)
+	if err := session.Signal(t.Context(), SignalRequest{Authority: authority, Signal: SignalTERM}); err != nil {
+		t.Fatalf("Signal after one stream closed = %v", err)
+	}
 	requireSessionSurvived(t, engine, session, generation)
 }
 
+// startRawHelper starts a helper for raw-socket tests. Admitted silent peers
+// and refusal workers hold for an hour unless a test says otherwise, so what a
+// test observes never depends on a deadline expiring under it.
 func startRawHelper(t *testing.T, config ServerConfig) string {
 	t.Helper()
-	directory, err := os.MkdirTemp("", "wefty-oci-")
-	if err != nil {
-		t.Fatal(err)
+	config.RequestTimeout = time.Hour
+	if config.limitRefusalTimeout == 0 {
+		config.limitRefusalTimeout = time.Hour
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	path := filepath.Join(directory, "helper.sock")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if config.HelperChecksum == "" {
-		config.HelperChecksum = "checksum-test"
-	}
-	server, err := NewServer(newFakeEngine(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener) }()
-	t.Cleanup(func() {
-		cancel()
-		_ = listener.Close()
-		<-done
-	})
-	return path
+	return startBudgetServer(t, newFakeEngine(), config).path
 }
 
 func dialRaw(t *testing.T, path string) net.Conn {
@@ -209,7 +258,9 @@ func dialRaw(t *testing.T, path string) net.Conn {
 // requestRaw sends one request frame and reads the one response frame.
 func requestRaw(t *testing.T, connection net.Conn) (frame, error) {
 	t.Helper()
-	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	// A hang guard only: every answer here is immediate or waits on an event
+	// the test itself causes.
+	_ = connection.SetDeadline(time.Now().Add(30 * time.Second))
 	wire := newFramedConn(connection)
 	if err := wire.write(frame{Version: ProtocolVersion, Method: MethodSignal, SessionCapability: "capability"}); err != nil {
 		return frame{}, err
@@ -221,50 +272,71 @@ func requestRaw(t *testing.T, connection net.Conn) (frame, error) {
 
 // The overflow answer is bounded on both sides. A peer outside the allowlist
 // is closed on the accept loop and never holds a refusal worker; an allowed
-// peer is never bare-closed, and one that never sends its frame delays the
-// next answer by at most the refusal deadline (#597 review).
+// peer is never bare-closed, and a silent one holding a worker does not hold
+// up the next answer (#597 review). Silent peers here hold their slot or
+// worker for an hour, so none of this depends on a deadline expiring.
 func TestOverLimitRefusalIsBoundedAndAuthenticated(t *testing.T) {
 	t.Run("allowed peer gets connection_limit, even behind a silent one", func(t *testing.T) {
-		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid())}})
+		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1})
 		_ = dialRaw(t, path) // holds the only slot, never writes
-		_ = dialRaw(t, path) // overflow peer that never writes
-		answered := dialRaw(t, path)
-		started := time.Now()
-		response, err := requestRaw(t, answered)
+		_ = dialRaw(t, path) // holds a refusal worker, never writes
+		response, err := requestRaw(t, dialRaw(t, path))
 		if err != nil || response.Error == nil || response.Error.Code != CodeConnectionLimit {
 			t.Fatalf("overflow response = %+v err=%v, want connection_limit", response, err)
 		}
-		if elapsed := time.Since(started); elapsed >= connectionLimitRefusalTimeout {
-			t.Fatalf("a silent overflow peer delayed the next refusal by %s", elapsed)
-		}
 	})
 	t.Run("allowed peer past a full refusal budget waits for a typed answer", func(t *testing.T) {
-		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid())}})
+		waiting := make(chan struct{}, 1)
+		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, refusalWaiting: func() {
+			select {
+			case waiting <- struct{}{}:
+			default:
+			}
+		}})
 		_ = dialRaw(t, path)
+		silent := make([]net.Conn, 0, connectionLimitRefusalBudget)
 		for range connectionLimitRefusalBudget {
-			_ = dialRaw(t, path) // each holds a refusal worker until its deadline
+			silent = append(silent, dialRaw(t, path)) // each holds a refusal worker
 		}
-		response, err := requestRaw(t, dialRaw(t, path))
-		if err != nil || response.Error == nil || response.Error.Code != CodeConnectionLimit {
-			t.Fatalf("allowed peer past the refusal budget = %+v err=%v, want connection_limit, never a bare close", response, err)
+		type answer struct {
+			response frame
+			err      error
+		}
+		answered := make(chan answer, 1)
+		requester := dialRaw(t, path)
+		go func() {
+			response, err := requestRaw(t, requester)
+			answered <- answer{response, err}
+		}()
+		// The requester is the first connection to find every worker busy,
+		// so the accept loop reaching its wait is the requester waiting.
+		// Only then is a worker freed: freeing one earlier would let the
+		// requester skip the wait this subtest is about.
+		select {
+		case <-waiting:
+		case <-time.After(30 * time.Second): // hang guard only
+			t.Fatal("the accept loop never waited for a refusal worker")
+		}
+		// Freeing one worker is what lets the accept loop answer the waiting
+		// peer; nothing else would within the hour the workers hold.
+		_ = silent[0].Close()
+		got := <-answered
+		if got.err != nil || got.response.Error == nil || got.response.Error.Code != CodeConnectionLimit {
+			t.Fatalf("allowed peer past the refusal budget = %+v err=%v, want connection_limit, never a bare close", got.response, got.err)
 		}
 	})
 	t.Run("peers outside the allowlist are closed at once and hold nothing", func(t *testing.T) {
 		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, AllowedUIDs: []uint32{uint32(os.Getuid()) + 1}})
 		_ = dialRaw(t, path)
-		started := time.Now()
+		// Each must be closed outright: one that took a refusal worker would
+		// sit there for the worker's hour and trip the read guard.
 		for index := range 3 * connectionLimitRefusalBudget {
 			silent := dialRaw(t, path)
-			_ = silent.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_ = silent.SetReadDeadline(time.Now().Add(30 * time.Second))
 			var buffer [1]byte
 			if _, err := silent.Read(buffer[:]); err == nil || isTimeout(err) {
 				t.Fatalf("foreign overflow peer %d was not closed: %v", index, err)
 			}
-		}
-		// Had any of them held a refusal worker until its deadline, the
-		// ninth would have waited at least that long.
-		if elapsed := time.Since(started); elapsed >= connectionLimitRefusalTimeout {
-			t.Fatalf("foreign overflow peers took %s to close; they held refusal workers", elapsed)
 		}
 	})
 }
@@ -273,11 +345,11 @@ func TestOverLimitRefusalIsBoundedAndAuthenticated(t *testing.T) {
 // the agent's next RPC still gets a typed answer and the session survives:
 // the old bare close at that point was read as EOF and reaped everything.
 func TestAgentRequestBehindSilentOverflowPeersGetsATypedAnswer(t *testing.T) {
-	engine, session, authority, client := startHoldingSessionWithClient(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
+	engine, session, authority, budget := startHoldingSession(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
 	generation := session.Handshake().SessionGeneration
 	_ = holdStreams(t, session, authority, 5)
 	for range connectionLimitRefusalBudget + 2 {
-		silent, err := client.Dial(t.Context())
+		silent, err := net.Dial("unix", budget.path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -328,7 +400,7 @@ func TestConnectionLimitLogReportsOncePerBurst(t *testing.T) {
 // A burst far wider than the refusal budget must therefore get every typed
 // answer well inside a Signal's one-second delivery bound.
 func TestHonestOverloadIsAnsweredWellInsideTheSignalDeadline(t *testing.T) {
-	engine, session, authority := startHoldingSession(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
+	engine, session, authority, _ := startHoldingSession(t, ServerConfig{ConnectionLimit: 6, ControlConnectionReserve: 1})
 	generation := session.Handshake().SessionGeneration
 	_ = holdStreams(t, session, authority, 5)
 
