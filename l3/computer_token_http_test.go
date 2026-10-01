@@ -116,6 +116,14 @@ type computerHTTPHarness struct {
 }
 
 func newComputerHTTPHarness(t *testing.T, verifier ComputerGrantVerifier) *computerHTTPHarness {
+	return newComputerHTTPHarnessWithBootSessions(t, verifier, nil)
+}
+
+func newComputerHTTPHarnessWithBootSessions(
+	t *testing.T,
+	verifier ComputerGrantVerifier,
+	bootSessions HostBootSessionVerifier,
+) *computerHTTPHarness {
 	t.Helper()
 	network := plain.NewNetwork()
 	ledger := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
@@ -123,7 +131,9 @@ func newComputerHTTPHarness(t *testing.T, verifier ComputerGrantVerifier) *compu
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(ledger, store, ServerConfig{ComputerGrants: verifier, Logs: emptyComputerJobLogs{}})
+	server, err := NewServer(ledger, store, ServerConfig{
+		ComputerGrants: verifier, HostBootSessions: bootSessions, Logs: emptyComputerJobLogs{},
+	})
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -148,6 +158,24 @@ func newComputerHTTPHarness(t *testing.T, verifier ComputerGrantVerifier) *compu
 		}
 	})
 	return h
+}
+
+type controlledHostBootSessionVerifier struct {
+	mu    sync.Mutex
+	calls []hostBootSessionClaim
+	err   error
+}
+
+type hostBootSessionClaim struct {
+	hostIdentityNodeID string
+	bootSessionID      string
+}
+
+func (verifier *controlledHostBootSessionVerifier) ProveHostBootSession(_ context.Context, hostIdentityNodeID, bootSessionID string) error {
+	verifier.mu.Lock()
+	defer verifier.mu.Unlock()
+	verifier.calls = append(verifier.calls, hostBootSessionClaim{hostIdentityNodeID: hostIdentityNodeID, bootSessionID: bootSessionID})
+	return verifier.err
 }
 
 func (h *computerHTTPHarness) client(nodeID string) *http.Client {
@@ -215,9 +243,41 @@ func mintComputerHTTPToken(t *testing.T, h *computerHTTPHarness, client *http.Cl
 	return grant
 }
 
+func TestRevokeHostRequiresAndProvesBootSession(t *testing.T) {
+	proof := testComputerScope()
+	verifier := &controlledHostBootSessionVerifier{}
+	h := newComputerHTTPHarnessWithBootSessions(t, &controlledComputerGrantVerifier{proof: proof}, verifier)
+	node := h.client(proof.HostNodeID)
+	grant := mintComputerHTTPToken(t, h, node, proof)
+
+	status, _, body := doComputerHTTP(t, node, http.MethodPost, "/v1/computer-token/revoke-host", "", "",
+		HostComputerTokenRevocationRequest{Reason: "agent_restart"})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	if _, err := h.store.AuthenticateComputerToken(context.Background(), grant.Token); err != nil {
+		t.Fatalf("missing boot session changed grant: %v", err)
+	}
+
+	verifier.mu.Lock()
+	verifier.err = protocolError(contract.ErrorForbidden, "boot session is not the host's current registration")
+	verifier.mu.Unlock()
+	status, _, body = doComputerHTTP(t, node, http.MethodPost, "/v1/computer-token/revoke-host", "", "",
+		HostComputerTokenRevocationRequest{Reason: "agent_restart", BootSessionID: "boot-replaced"})
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	if _, err := h.store.AuthenticateComputerToken(context.Background(), grant.Token); err != nil {
+		t.Fatalf("refused boot-session proof changed grant: %v", err)
+	}
+
+	verifier.mu.Lock()
+	calls := append([]hostBootSessionClaim(nil), verifier.calls...)
+	verifier.mu.Unlock()
+	if len(calls) != 1 || calls[0].hostIdentityNodeID != proof.HostNodeID || calls[0].bootSessionID != "boot-replaced" {
+		t.Fatalf("host boot-session proof calls = %#v", calls)
+	}
+}
+
 func TestComputerHTTPAuthoritySurfaceAndNodeBinding(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-http", ComputerAttemptID: "attempt-current",
-		ComputerStorageGeneration: 7, SubmitIntentRevision: 4, HostNodeID: "fabric-node-1", SubmitMaxInflight: 3}
+		ComputerStorageGeneration: 7, SubmitIntentRevision: 4, HostNodeID: "fabric-node-1", HostBootSessionID: "boot-node-1", SubmitMaxInflight: 3}
 	verifier := &controlledComputerGrantVerifier{proof: proof}
 	h := newComputerHTTPHarness(t, verifier)
 	node := h.client("fabric-node-1")
@@ -351,7 +411,7 @@ func TestComputerHTTPAuthoritySurfaceAndNodeBinding(t *testing.T) {
 
 func TestComputerRootRunListIsPaginatedAndCurrentGenerationScoped(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-list", ComputerAttemptID: "attempt-current",
-		ComputerStorageGeneration: 7, SubmitIntentRevision: 4, HostNodeID: "fabric-node-1", SubmitMaxInflight: 20}
+		ComputerStorageGeneration: 7, SubmitIntentRevision: 4, HostNodeID: "fabric-node-1", HostBootSessionID: "boot-node-1", SubmitMaxInflight: 20}
 	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
 	client := h.client(proof.HostNodeID)
 	grant := mintComputerHTTPToken(t, h, client, proof)
@@ -452,7 +512,7 @@ func TestComputerRootRunListIsPaginatedAndCurrentGenerationScoped(t *testing.T) 
 
 func TestComputerHTTPInflightLimitErrorKeepsTypedCountAndLimit(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-limit", ComputerAttemptID: "attempt-limit",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-limit", SubmitMaxInflight: 1}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-limit", HostBootSessionID: "boot-limit", SubmitMaxInflight: 1}
 	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
 	client := h.client(proof.HostNodeID)
 	grant := mintComputerHTTPToken(t, h, client, proof)
@@ -478,7 +538,7 @@ func TestComputerHTTPInflightLimitErrorKeepsTypedCountAndLimit(t *testing.T) {
 
 func TestCallerComputerOriginRunListSpansGenerationsAndKeepsExactTriggers(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-origin", ComputerAttemptID: "attempt-one",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node", SubmitMaxInflight: 20}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node", HostBootSessionID: "boot-node", SubmitMaxInflight: 20}
 	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
 	created := make([]contract.RunRecord, 0, 2)
 	for generation := int64(1); generation <= 2; generation++ {
@@ -603,7 +663,7 @@ func TestCallerComputerOriginRunListSpansGenerationsAndKeepsExactTriggers(t *tes
 
 func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-race", ComputerAttemptID: "attempt-race",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-race", SubmitMaxInflight: 2}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-race", HostBootSessionID: "boot-race", SubmitMaxInflight: 2}
 	verifier := &controlledComputerGrantVerifier{proof: proof, blockAt: computerProofBearer, blocked: make(chan struct{}), release: make(chan struct{})}
 	h := newComputerHTTPHarness(t, verifier)
 	client := h.client(proof.HostNodeID)
@@ -651,7 +711,7 @@ func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 // grant, and every later request with the old pass is refused.
 func TestComputerRunIsAuthorizedByItsFinalL1Proof(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-committed", ComputerAttemptID: "attempt-committed",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 4, HostNodeID: "fabric-node-committed", SubmitMaxInflight: 2}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 4, HostNodeID: "fabric-node-committed", HostBootSessionID: "boot-committed", SubmitMaxInflight: 2}
 	advanced := proof
 	advanced.SubmitIntentRevision = 5
 	type response struct {
@@ -751,7 +811,7 @@ func TestComputerRunIsAuthorizedByItsFinalL1Proof(t *testing.T) {
 
 func TestComputerTransientScopeProofFailureDoesNotRevokeGrant(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "computer-transient", ComputerAttemptID: "attempt-transient",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-transient", SubmitMaxInflight: 2}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-transient", HostBootSessionID: "boot-transient", SubmitMaxInflight: 2}
 	verifier := &controlledComputerGrantVerifier{proof: proof}
 	h := newComputerHTTPHarness(t, verifier)
 	client := h.client(proof.HostNodeID)
@@ -774,7 +834,7 @@ func TestComputerTransientScopeProofFailureDoesNotRevokeGrant(t *testing.T) {
 
 func TestRunTokenLineageFilterErrorNeverReturnsUnfilteredDescendants(t *testing.T) {
 	proof := ComputerTokenScopeProof{ComputerID: "unused", ComputerAttemptID: "unused", ComputerStorageGeneration: 1,
-		SubmitIntentRevision: 1, HostNodeID: "unused", SubmitMaxInflight: 1}
+		SubmitIntentRevision: 1, HostNodeID: "unused", HostBootSessionID: "boot-unused", SubmitMaxInflight: 1}
 	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
 	root, _, err := h.store.CreateRun(context.Background(), CreateRunInput{IdempotencyKey: "lineage-root", Actor: "caller",
 		Request: computerHTTPRunRequest("exit 0\n")})
@@ -820,6 +880,7 @@ func TestRunTokenLineageFilterErrorNeverReturnsUnfilteredDescendants(t *testing.
 }
 
 var _ ComputerGrantVerifier = (*controlledComputerGrantVerifier)(nil)
+var _ HostBootSessionVerifier = (*controlledHostBootSessionVerifier)(nil)
 
 // The L1 client carries an attempt-scoped revocation to the control-plane
 // route: the completed attempt's pass is revoked even though it arrives after

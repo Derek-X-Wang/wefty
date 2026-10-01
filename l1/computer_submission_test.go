@@ -340,7 +340,8 @@ func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing
 	proof, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"fabric-computer-node", "")
 	if err != nil || proof.ComputerStorageGeneration != computer.StorageGeneration ||
-		proof.SubmitIntentRevision != computer.SubmitIntentRevision || proof.SubmitMaxInflight != 20 {
+		proof.SubmitIntentRevision != computer.SubmitIntentRevision || proof.SubmitMaxInflight != 20 ||
+		proof.HostBootSessionID != node.BootSessionID {
 		t.Fatalf("scope proof = (%#v, %v)", proof, err)
 	}
 	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,

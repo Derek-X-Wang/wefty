@@ -282,7 +282,8 @@ type ComputerAttemptTokenRevocationRequest struct {
 }
 
 type HostComputerTokenRevocationRequest struct {
-	Reason string `json:"reason"`
+	Reason        string `json:"reason"`
+	BootSessionID string `json:"boot_session_id"`
 }
 
 type ComputerSelf struct {
@@ -310,6 +311,7 @@ type ComputerTokenScopeProof struct {
 	ComputerStorageGeneration int64  `json:"computer_storage_generation"`
 	SubmitIntentRevision      int64  `json:"submit_intent_revision"`
 	HostNodeID                string `json:"host_node_id"`
+	HostBootSessionID         string `json:"host_boot_session_id"`
 	SubmitMaxInflight         int    `json:"submit_max_inflight"`
 }
 

@@ -153,7 +153,7 @@ func TestComputerBridgeNeverLendsTheAgentsFabricIdentityToATenant(t *testing.T) 
 	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "node-1", Tags: []string{l3.DefaultCallerPrincipalTag}})
 	proof := l3.ComputerTokenScopeProof{ComputerID: "computer-1", ComputerAttemptID: "attempt-1",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "node-1", SubmitMaxInflight: 4}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "node-1", HostBootSessionID: "boot-1", SubmitMaxInflight: 4}
 	store, err := l3.OpenStore(filepath.Join(t.TempDir(), "l3.sqlite"), l3.StoreOptions{ComputerAuthorityInstanceID: "computer-bridge-595"})
 	if err != nil {
 		t.Fatal(err)

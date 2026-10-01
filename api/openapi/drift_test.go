@@ -187,6 +187,8 @@ var driftRows = []driftRow{
 	{requestBody(clientDoc, "put", "/v1/computers/{computer_id}/submission"), typeOf[l1.ComputerSubmissionRequest]()},
 	{responseBody(clientDoc, "put", "/v1/computers/{computer_id}/submission", "200"), typeOf[l1.ComputerSubmissionMutationResult]()},
 	{responseBody(clientDoc, "post", "/v1/computers/{computer_id}/token-scope-proof", "200"), typeOf[l1.ComputerTokenScopeProof]()},
+	{requestBody(clientDoc, "post", "/v1/host-boot-session-proof"), typeOf[l1.HostBootSessionProof]()},
+	{responseBody(clientDoc, "post", "/v1/host-boot-session-proof", "200"), typeOf[l1.HostBootSessionProof]()},
 	{responseBody(clientDoc, "get", "/v1/jobs", "200"), typeOf[l1.JobList]()},
 	{responseBody(clientDoc, "get", "/v1/jobs/{job_id}/children", "200"), typeOf[l1.JobList]()},
 	{requestBody(clientDoc, "put", "/v1/jobs/{job_id}/desired-state"), typeOf[l1.ServiceDesiredStateRequest]()},

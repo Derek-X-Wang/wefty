@@ -230,7 +230,7 @@ func TestForgedProvenanceHeadersCannotChangeRealL3ComputerScopeThroughBridge(t *
 	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "agent-node"})
 	proof := l3.ComputerTokenScopeProof{ComputerID: "computer-real", ComputerAttemptID: "attempt-real",
-		ComputerStorageGeneration: 9, SubmitIntentRevision: 4, HostNodeID: "agent-node", SubmitMaxInflight: 20}
+		ComputerStorageGeneration: 9, SubmitIntentRevision: 4, HostNodeID: "agent-node", HostBootSessionID: "boot-real", SubmitMaxInflight: 20}
 	store, err := l3.OpenStore(filepath.Join(t.TempDir(), "l3.sqlite"), l3.StoreOptions{ComputerAuthorityInstanceID: "bridge-test"})
 	if err != nil {
 		t.Fatal(err)

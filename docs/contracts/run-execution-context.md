@@ -354,7 +354,9 @@ instant and afterward, authentication fails.
 A Computer pass is a distinct 256-bit bearer. L3 stores only its SHA-256
 digest and immutable issuance/revocation audit, binding it to Computer,
 attempt, current Storage generation, submit-intent revision, host Node, grant
-revision, and L3 authority generation. L3 revalidates the live L1 scope on
+revision, the host boot session that minted it, and L3 authority generation.
+The minting boot session is part of L1's proof, not a value asserted by the
+agent. L3 revalidates the live L1 scope on
 every bearer request. L1 proves that scope only for a Computer that is meant
 to be running now: desired state `running`, current Job `claimed` or
 `running`, reconfiguration phase `stable`, submission enabled, and the pass's
@@ -382,7 +384,8 @@ of its own first proof, which may be stale by the time it commits (#605). Its
 transaction revokes only the same attempt's earlier grants and inserts the new
 grant. After that commits, and before the bearer is returned, L3 proves the
 scope with L1 again. If that proof fails, or names a different Storage
-generation, submit-intent revision or host, the new grant is revoked
+generation, submit-intent revision, host, or host boot session, the new grant
+is revoked
 (`mint_scope_not_current`), the bearer is never returned, and the mint answers
 with the proof's refusal. If it succeeds, L3 revokes every grant of the
 Computer with a lower grant revision as `regranted`. This is safe because at
@@ -393,6 +396,28 @@ attempt fails its own re-proof and can revoke nothing but itself. A grant
 committed later is left for its own re-proof to settle, and every bearer use
 re-proves the live scope regardless. A same-attempt remint whose re-proof fails
 leaves that attempt with no pass until it mints again.
+
+The agent's startup `revoke-host` is fenced by both boot session and grant
+revision. After the agent's first successful registration, it sends its
+current `boot_session_id`; L3 snapshots the current grant-revision high-water
+mark, and then asks L1 to prove that the claimed boot is the current
+registration for the agent's authenticated Fabric identity. In one
+transaction L3 revokes only that host's still-active grants at or below the
+snapshot whose recorded boot differs from the proved boot. A legacy grant
+with no recorded boot session is included. A request without
+`boot_session_id` is refused with `invalid_request`; a claim L1 cannot prove is
+refused with `forbidden`. The boot comparison means a late request never ends
+the caller's current-boot grants. The revision bound means a stalled request
+also cannot end a grant that the current boot or a later boot minted after L3
+took the snapshot, even if registration changed between L1's answer and L3's
+commit.
+
+The agent retries this fenced revocation in the background until it succeeds
+or the agent shuts down. It waits for the first successful registration, then
+uses jittered exponential backoff from 250 ms to a 30 s cap. It logs the first
+failure of a continuous burst and one recovery line when a retry succeeds;
+shutdown cancels the pending request or timer and waits for the worker to
+stop.
 
 Every authority-losing Computer mutation (stop, restart, Storage reset,
 reimage, projection, remove, a grow acknowledgement that finds the job
@@ -460,14 +485,15 @@ as `host_dead`, with no receipt and no run-ledger call. The rows are moot.
 Every bearer use re-proves the live scope with L1, the mutation that owed the
 row already changed that scope, and that proof refuses every attempt on a dead
 host regardless of its lease, and every attempt of a registration the host has
-since replaced (above). The host's next boot sends `revoke-host`. A settled
+since replaced (above). The host's next boot sends the fenced startup
+`revoke-host` described above. A settled
 row is never reopened, even if the Node later returns.
 
 The owed record deliberately does not cover the grant of an attempt that was
 already `lost` when the mutation began (for example a lease that expired on a
 partitioned node). Such a grant is unusable, because every bearer use
 re-proves the live scope, and it is ended by the agent's attempt-end
-revocation or by its `revoke-host` on restart, not by the owed record. The
+revocation or by its fenced startup `revoke-host`, not by the owed record. The
 revoke-all sent right after the mutation still ends it whenever the run
 ledger answers.
 

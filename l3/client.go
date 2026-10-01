@@ -55,6 +55,13 @@ type ComputerGrantVerifier interface {
 	ProveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error)
 }
 
+// HostBootSessionVerifier is the L1 authority seam for host-wide startup
+// revocation. It stays separate from ComputerGrantVerifier so alternate L1
+// clients and test fakes can implement either capability independently.
+type HostBootSessionVerifier interface {
+	ProveHostBootSession(context.Context, string, string) error
+}
+
 // L1Client calls the L1 client protocol exclusively through Fabric.Dial.
 type L1Client struct {
 	client           *http.Client
@@ -183,7 +190,23 @@ func (c *L1Client) ProveComputerTokenScope(ctx context.Context, computerID, atte
 	}
 	return ComputerTokenScopeProof{ComputerID: proof.ComputerID, ComputerAttemptID: proof.ComputerAttemptID,
 		ComputerStorageGeneration: proof.ComputerStorageGeneration, SubmitIntentRevision: proof.SubmitIntentRevision,
-		HostNodeID: proof.HostNodeID, SubmitMaxInflight: proof.SubmitMaxInflight}, nil
+		HostNodeID: proof.HostNodeID, HostBootSessionID: proof.HostBootSessionID, SubmitMaxInflight: proof.SubmitMaxInflight}, nil
+}
+
+func (c *L1Client) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, bootSessionID string) error {
+	request := map[string]string{"host_identity_node_id": hostIdentityNodeID, "boot_session_id": bootSessionID}
+	var proof struct {
+		HostIdentityNodeID string `json:"host_identity_node_id"`
+		BootSessionID      string `json:"boot_session_id"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/host-boot-session-proof", request, &proof, http.StatusOK); err != nil {
+		return err
+	}
+	if proof.HostIdentityNodeID != hostIdentityNodeID || proof.BootSessionID != bootSessionID {
+		return internalError(fmt.Errorf("L1 echoed host boot session %q/%q, want %q/%q",
+			proof.HostIdentityNodeID, proof.BootSessionID, hostIdentityNodeID, bootSessionID), "validate L1 host boot session proof")
+	}
+	return nil
 }
 
 func (c *L1Client) do(ctx context.Context, method, path string, body any, target any, success ...int) error {
@@ -250,6 +273,7 @@ var _ JobImageEvidenceClient = (*L1Client)(nil)
 var _ JobLogClient = (*L1Client)(nil)
 var _ JobResultClient = (*L1Client)(nil)
 var _ ComputerGrantVerifier = (*L1Client)(nil)
+var _ HostBootSessionVerifier = (*L1Client)(nil)
 
 // Keep the response origin internal while preserving errors.As(*Error).
 type l1ResponseError struct {
