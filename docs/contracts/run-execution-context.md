@@ -354,9 +354,9 @@ instant and afterward, authentication fails.
 A Computer pass is a distinct 256-bit bearer. L3 stores only its SHA-256
 digest and immutable issuance/revocation audit, binding it to Computer,
 attempt, current Storage generation, submit-intent revision, host Node, grant
-revision, the host boot session that minted it, and L3 authority generation.
-The minting boot session is part of L1's proof, not a value asserted by the
-agent. L3 revalidates the live L1 scope on
+revision, the host's stable node ID and the boot session that minted it, and
+L3 authority generation. The minting stable node and boot session are part of
+L1's proof, not values asserted by the agent. L3 revalidates the live L1 scope on
 every bearer request. L1 proves that scope only for a Computer that is meant
 to be running now: desired state `running`, current Job `claimed` or
 `running`, reconfiguration phase `stable`, submission enabled, and the pass's
@@ -384,8 +384,8 @@ of its own first proof, which may be stale by the time it commits (#605). Its
 transaction revokes only the same attempt's earlier grants and inserts the new
 grant. After that commits, and before the bearer is returned, L3 proves the
 scope with L1 again. If that proof fails, or names a different Storage
-generation, submit-intent revision, host, or host boot session, the new grant
-is revoked
+generation, submit-intent revision, host, host stable node, or host boot
+session, the new grant is revoked
 (`mint_scope_not_current`), the bearer is never returned, and the mint answers
 with the proof's refusal. If it succeeds, L3 revokes every grant of the
 Computer with a lower grant revision as `regranted`. This is safe because at
@@ -397,20 +397,26 @@ committed later is left for its own re-proof to settle, and every bearer use
 re-proves the live scope regardless. A same-attempt remint whose re-proof fails
 leaves that attempt with no pass until it mints again.
 
-The agent's startup `revoke-host` is fenced by both boot session and grant
-revision. After the agent's first successful registration, it sends its
-current `boot_session_id`; L3 snapshots the current grant-revision high-water
-mark, and then asks L1 to prove that the claimed boot is the current
-registration for the agent's authenticated Fabric identity. In one
+The agent's startup `revoke-host` is scoped to one stable node and fenced by
+both boot session and grant revision. After the agent's first successful
+registration, it sends its `stable_node_id` and current `boot_session_id`; L3
+snapshots the current grant-revision high-water mark, and then asks L1 to
+prove that the claimed boot is the current boot of that exact stable node, and
+that the stable node is bound to the agent's authenticated Fabric identity.
+One Fabric identity may hold several stable node registrations, so a boot that
+is current for any other registration of the identity is not proof. In one
 transaction L3 revokes only that host's still-active grants at or below the
-snapshot whose recorded boot differs from the proved boot. A legacy grant
-with no recorded boot session is included. A request without
-`boot_session_id` is refused with `invalid_request`; a claim L1 cannot prove is
-refused with `forbidden`. The boot comparison means a late request never ends
-the caller's current-boot grants. The revision bound means a stalled request
-also cannot end a grant that the current boot or a later boot minted after L3
-took the snapshot, even if registration changed between L1's answer and L3's
-commit.
+snapshot that the same stable node minted under a different boot. A grant
+another stable node minted is never a candidate, even under the same Fabric
+identity. A legacy grant that records no stable node is included. A request
+without `stable_node_id` or `boot_session_id` is refused with
+`invalid_request`; a claim L1 cannot prove, including a boot the stable node
+has since replaced, is refused with `forbidden` and revokes nothing. The boot
+comparison means a late request never ends the caller's current-boot grants.
+The stable-node scope means a delayed request from one stable node never ends
+another's grants. The revision bound means a stalled request also cannot end a
+grant that the current boot or a later boot minted after L3 took the snapshot,
+even if registration changed between L1's answer and L3's commit.
 
 The agent retries this fenced revocation in the background until it succeeds
 or the agent shuts down. It waits for the first successful registration, then

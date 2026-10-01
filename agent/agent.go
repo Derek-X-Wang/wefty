@@ -626,7 +626,7 @@ func (a *Agent) startHostTokenRevocation(parent context.Context) {
 	a.hostRevocationCancel = cancel
 	a.hostRevocationDone = done
 	revocation := hostTokenRevocation{
-		revoker: revoker, bootSessionID: a.registration.BootSessionID, clock: a.clock,
+		revoker: revoker, stableNodeID: a.registration.NodeID, bootSessionID: a.registration.BootSessionID, clock: a.clock,
 		backoff: newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax), logf: a.logf,
 	}
 	registered := a.session.registrationSignal()

@@ -420,11 +420,11 @@ func (s *Server) revokeHostComputerTokens(w http.ResponseWriter, r *http.Request
 		writeError(w, err)
 		return
 	}
-	_, err := s.store.RevokeHostComputerTokens(r.Context(), identity.NodeID, request.BootSessionID, request.Reason, func(ctx context.Context) error {
+	_, err := s.store.RevokeHostComputerTokens(r.Context(), identity.NodeID, request.StableNodeID, request.BootSessionID, request.Reason, func(ctx context.Context) error {
 		if s.hostBootSessions == nil {
 			return internalError(errors.New("L1 host boot session verifier is not configured"), "revoke host Computer tokens")
 		}
-		err := s.hostBootSessions.ProveHostBootSession(ctx, identity.NodeID, request.BootSessionID)
+		err := s.hostBootSessions.ProveHostBootSession(ctx, identity.NodeID, request.StableNodeID, request.BootSessionID)
 		if code, _ := errorDetails(err); err != nil && (code == contract.ErrorForbidden || code == contract.ErrorNotFound) {
 			return protocolError(contract.ErrorForbidden, "host boot session is not current")
 		}

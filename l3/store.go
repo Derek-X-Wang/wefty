@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS computer_token_grants (
   computer_storage_generation INTEGER NOT NULL CHECK(computer_storage_generation > 0),
   submit_intent_revision INTEGER NOT NULL CHECK(submit_intent_revision > 0),
   host_node_id TEXT NOT NULL,
+  host_stable_node_id TEXT,
   host_boot_session_id TEXT,
   l3_authority_generation INTEGER NOT NULL CHECK(l3_authority_generation > 0),
   grant_revision INTEGER NOT NULL UNIQUE CHECK(grant_revision > 0),
@@ -424,6 +425,9 @@ WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','faile
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "computer_authority", "instance_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("l3: migrate Computer authority instance marker: %w", err)
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "computer_token_grants", "host_stable_node_id", "TEXT"); err != nil {
+		return fmt.Errorf("l3: migrate Computer grant stable node: %w", err)
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "computer_token_grants", "host_boot_session_id", "TEXT"); err != nil {
 		return fmt.Errorf("l3: migrate Computer grant boot session: %w", err)

@@ -8,6 +8,7 @@ import (
 
 type hostTokenRevocation struct {
 	revoker       ComputerTokenRevoker
+	stableNodeID  string
 	bootSessionID string
 	clock         Clock
 	backoff       *sessionBackoff
@@ -31,7 +32,7 @@ func (revocation hostTokenRevocation) run(ctx context.Context, registered <-chan
 	failed := false
 	for {
 		err := revocation.revoker.RevokeHostComputerTokens(ctx, l3.HostComputerTokenRevocationRequest{
-			Reason: "agent_restart", BootSessionID: revocation.bootSessionID,
+			Reason: "agent_restart", StableNodeID: revocation.stableNodeID, BootSessionID: revocation.bootSessionID,
 		})
 		if err == nil {
 			if failed && ctx.Err() == nil && revocation.logf != nil {

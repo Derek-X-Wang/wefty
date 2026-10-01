@@ -30,8 +30,10 @@ func validComputerScopeProof(proof ComputerTokenScopeProof) error {
 	if strings.TrimSpace(proof.ComputerID) == "" || proof.ComputerID != strings.TrimSpace(proof.ComputerID) ||
 		strings.TrimSpace(proof.ComputerAttemptID) == "" || proof.ComputerAttemptID != strings.TrimSpace(proof.ComputerAttemptID) ||
 		strings.TrimSpace(proof.HostNodeID) == "" || proof.HostNodeID != strings.TrimSpace(proof.HostNodeID) ||
+		strings.TrimSpace(proof.HostStableNodeID) == "" || proof.HostStableNodeID != strings.TrimSpace(proof.HostStableNodeID) ||
 		strings.TrimSpace(proof.HostBootSessionID) == "" || proof.HostBootSessionID != strings.TrimSpace(proof.HostBootSessionID) ||
-		len(proof.ComputerID) > 255 || len(proof.ComputerAttemptID) > 255 || len(proof.HostNodeID) > 255 || len(proof.HostBootSessionID) > 255 ||
+		len(proof.ComputerID) > 255 || len(proof.ComputerAttemptID) > 255 || len(proof.HostNodeID) > 255 ||
+		len(proof.HostStableNodeID) > 255 || len(proof.HostBootSessionID) > 255 ||
 		proof.ComputerStorageGeneration < 1 || proof.SubmitIntentRevision < 1 || proof.SubmitMaxInflight < 1 {
 		return protocolError(contract.ErrorInvalidRequest, "Computer token scope proof is incomplete")
 	}
@@ -124,7 +126,7 @@ func sameComputerGrantScope(current, minted ComputerTokenScopeProof) bool {
 	return current.ComputerID == minted.ComputerID && current.ComputerAttemptID == minted.ComputerAttemptID &&
 		current.ComputerStorageGeneration == minted.ComputerStorageGeneration &&
 		current.SubmitIntentRevision == minted.SubmitIntentRevision && current.HostNodeID == minted.HostNodeID &&
-		current.HostBootSessionID == minted.HostBootSessionID
+		current.HostStableNodeID == minted.HostStableNodeID && current.HostBootSessionID == minted.HostBootSessionID
 }
 
 func (s *Store) settleComputerGrantMint(ctx context.Context, grant ComputerTokenGrant, predicate string, args []any, reason string) error {
@@ -167,9 +169,11 @@ func (s *Store) insertComputerGrant(ctx context.Context, proof ComputerTokenScop
 	grantID := newID("computergrant")
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_token_grants(
 		grant_id, computer_id, computer_attempt_id, computer_storage_generation, submit_intent_revision,
-		host_node_id, host_boot_session_id, l3_authority_generation, grant_revision, submit_max_inflight, token_hash, issued_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, grantID, proof.ComputerID, proof.ComputerAttemptID,
-		proof.ComputerStorageGeneration, proof.SubmitIntentRevision, proof.HostNodeID, proof.HostBootSessionID, authorityGeneration,
+		host_node_id, host_stable_node_id, host_boot_session_id, l3_authority_generation, grant_revision, submit_max_inflight,
+		token_hash, issued_ns
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, grantID, proof.ComputerID, proof.ComputerAttemptID,
+		proof.ComputerStorageGeneration, proof.SubmitIntentRevision, proof.HostNodeID, proof.HostStableNodeID,
+		proof.HostBootSessionID, authorityGeneration,
 		grantRevision, proof.SubmitMaxInflight, digest[:], now.UnixNano()); err != nil {
 		return ComputerTokenGrant{}, internalError(err, "store Computer token digest")
 	}
@@ -309,15 +313,23 @@ func (s *Store) RevokeComputerAttemptTokens(ctx context.Context, computerID, att
 // with L1 after L3 snapshots the grant high-water mark.
 type HostBootSessionProver func(context.Context) error
 
+// RevokeHostComputerTokens is the startup revoke-host. It ends grants that
+// earlier boots of one stable node minted, and nothing else: the candidate
+// set is the Fabric identity's grants recorded for exactly that stable node
+// with a different boot session, plus legacy grants that record no stable
+// node, all at or below the grant revision read before L1 proves the boot.
+// A grant another stable node of the same Fabric identity minted is never a
+// candidate, so a delayed request from one stable node cannot end another's
+// current-boot grants.
 func (s *Store) RevokeHostComputerTokens(
 	ctx context.Context,
-	hostNodeID, bootSessionID, reason string,
+	hostNodeID, stableNodeID, bootSessionID, reason string,
 	prove HostBootSessionProver,
 ) (int, error) {
-	if hostNodeID == "" || hostNodeID != strings.TrimSpace(hostNodeID) || len(hostNodeID) > 255 ||
-		bootSessionID == "" || bootSessionID != strings.TrimSpace(bootSessionID) || len(bootSessionID) > 255 ||
-		reason == "" || reason != strings.TrimSpace(reason) || len(reason) > 255 {
-		return 0, protocolError(contract.ErrorInvalidRequest, "host Computer token revocation is incomplete")
+	for _, value := range []string{hostNodeID, stableNodeID, bootSessionID, reason} {
+		if value == "" || value != strings.TrimSpace(value) || len(value) > 255 {
+			return 0, protocolError(contract.ErrorInvalidRequest, "host Computer token revocation is incomplete")
+		}
 	}
 	if prove == nil {
 		return 0, internalError(errors.New("no host boot session prover"), "revoke host Computer tokens")
@@ -336,8 +348,8 @@ func (s *Store) RevokeHostComputerTokens(
 	defer tx.Rollback()
 	now := canonicalTime(s.clock.Now())
 	revoked, err := revokeComputerGrantRowsWithCount(ctx, tx, `host_node_id=? AND revoked_ns IS NULL AND grant_revision<=?
-		AND (host_boot_session_id IS NULL OR host_boot_session_id<>?)`,
-		[]any{hostNodeID, grantRevision, bootSessionID}, now.UnixNano(), reason)
+		AND (host_stable_node_id IS NULL OR (host_stable_node_id=? AND host_boot_session_id<>?))`,
+		[]any{hostNodeID, grantRevision, stableNodeID, bootSessionID}, now.UnixNano(), reason)
 	if err != nil {
 		return 0, err
 	}

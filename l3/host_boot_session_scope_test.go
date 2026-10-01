@@ -14,7 +14,16 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-func TestRevokeHostProvesCurrentBootWithL1(t *testing.T) {
+// hostRevocationHarness serves a real L1 and a real L3 over one plain Fabric
+// network, so revoke-host is proved by L1's own registration rows.
+type hostRevocationHarness struct {
+	network *plain.Network
+	l1Store *l1.Store
+	l3Store *Store
+}
+
+func newHostRevocationHarness(t *testing.T) *hostRevocationHarness {
+	t.Helper()
 	ctx := context.Background()
 	network := plain.NewNetwork()
 	control := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
@@ -76,46 +85,105 @@ func TestRevokeHostProvesCurrentBootWithL1(t *testing.T) {
 			t.Errorf("close L3 store: %v", err)
 		}
 	})
+	return &hostRevocationHarness{network: network, l1Store: l1Store, l3Store: l3Store}
+}
 
-	register := func(bootSessionID string) {
-		t.Helper()
-		_, err := l1Store.RegisterNode(ctx, fabric.Identity{NodeID: "host-fabric"}, contract.NodeRegistration{
-			NodeID: "stable-node", BootSessionID: bootSessionID, RootInstanceID: "root-" + bootSessionID,
-			OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true},
-			CapabilityRevision: 1, CapabilityObservedAt: time.Now(), MissingCapabilities: []string{},
-		}, l1.DefaultNodePolicy(), true)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	register("boot-a")
-	proof := testComputerScope()
-	proof.HostNodeID = "host-fabric"
-	proof.HostBootSessionID = "boot-a"
-	grant, err := l3Store.MintComputerToken(ctx, proof)
+func (h *hostRevocationHarness) register(t *testing.T, fabricNodeID, stableNodeID, bootSessionID string) {
+	t.Helper()
+	_, err := h.l1Store.RegisterNode(context.Background(), fabric.Identity{NodeID: fabricNodeID}, contract.NodeRegistration{
+		NodeID: stableNodeID, BootSessionID: bootSessionID, RootInstanceID: "root-" + bootSessionID,
+		OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now(), MissingCapabilities: []string{},
+	}, l1.DefaultNodePolicy(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	register("boot-b")
+}
 
-	host := network.NewFabric(fabric.Identity{NodeID: "host-fabric"})
-	httpClient := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+func (h *hostRevocationHarness) mint(t *testing.T, computerID, fabricNodeID, stableNodeID, bootSessionID string) ComputerTokenGrant {
+	t.Helper()
+	proof := testComputerScope()
+	proof.ComputerID = computerID
+	proof.ComputerAttemptID = "attempt-" + computerID
+	proof.HostNodeID = fabricNodeID
+	proof.HostStableNodeID = stableNodeID
+	proof.HostBootSessionID = bootSessionID
+	grant, err := h.l3Store.MintComputerToken(context.Background(), proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return grant
+}
+
+func (h *hostRevocationHarness) revokeHost(t *testing.T, fabricNodeID, stableNodeID, bootSessionID string) (int, []byte) {
+	t.Helper()
+	host := h.network.NewFabric(fabric.Identity{NodeID: fabricNodeID})
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return host.Dial(ctx, network, DefaultL3Address)
 	}}}
-	t.Cleanup(httpClient.CloseIdleConnections)
-	status, _, body := doComputerHTTP(t, httpClient, http.MethodPost, "/v1/computer-token/revoke-host", "", "",
-		HostComputerTokenRevocationRequest{Reason: "agent_restart", BootSessionID: "boot-a"})
+	defer client.CloseIdleConnections()
+	status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/computer-token/revoke-host", "", "",
+		HostComputerTokenRevocationRequest{Reason: "agent_restart", StableNodeID: stableNodeID, BootSessionID: bootSessionID})
+	return status, body
+}
+
+func (h *hostRevocationHarness) active(grant ComputerTokenGrant) bool {
+	_, err := h.l3Store.AuthenticateComputerToken(context.Background(), grant.Token)
+	return err == nil
+}
+
+func TestRevokeHostProvesCurrentBootWithL1(t *testing.T) {
+	h := newHostRevocationHarness(t)
+	h.register(t, "host-fabric", "stable-node", "boot-a")
+	grant := h.mint(t, "computer-1", "host-fabric", "stable-node", "boot-a")
+	h.register(t, "host-fabric", "stable-node", "boot-b")
+
+	status, body := h.revokeHost(t, "host-fabric", "stable-node", "boot-a")
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
-	if _, err := l3Store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
-		t.Fatalf("replaced boot claim changed the grant: %v", err)
+	if !h.active(grant) {
+		t.Fatal("replaced boot claim changed the grant")
 	}
 
-	status, _, body = doComputerHTTP(t, httpClient, http.MethodPost, "/v1/computer-token/revoke-host", "", "",
-		HostComputerTokenRevocationRequest{Reason: "agent_restart", BootSessionID: "boot-b"})
-	if status != http.StatusNoContent {
+	if status, body := h.revokeHost(t, "host-fabric", "stable-node", "boot-b"); status != http.StatusNoContent {
 		t.Fatalf("current boot revoke-host status=%d body=%s", status, body)
 	}
-	if _, err := l3Store.AuthenticateComputerToken(ctx, grant.Token); err == nil {
+	if h.active(grant) {
 		t.Fatal("current boot's revoke-host left the earlier boot grant active")
+	}
+}
+
+// One Fabric identity may hold several stable node registrations. A delayed
+// revoke-host from node-old's boot must never end grants that node-new's
+// current boot minted, even though node-old's boot is still current for
+// node-old and the two boots differ. It still ends node-old's own earlier-boot
+// grants, and once node-old boots again the stale claim is refused outright.
+func TestDelayedRevokeHostFromAnotherStableNodeKeepsItsGrants(t *testing.T) {
+	h := newHostRevocationHarness(t)
+	h.register(t, "host-fabric", "node-old", "boot-a0")
+	oldPriorBootGrant := h.mint(t, "computer-old", "host-fabric", "node-old", "boot-a0")
+	h.register(t, "host-fabric", "node-old", "boot-a")
+	h.register(t, "host-fabric", "node-new", "boot-b")
+	newBootGrant := h.mint(t, "computer-new", "host-fabric", "node-new", "boot-b")
+
+	if status, body := h.revokeHost(t, "host-fabric", "node-old", "boot-a"); status != http.StatusNoContent {
+		t.Fatalf("node-old revoke-host status=%d body=%s", status, body)
+	}
+	if !h.active(newBootGrant) {
+		t.Fatal("a delayed node-old revoke-host ended node-new's current-boot grant")
+	}
+	if h.active(oldPriorBootGrant) {
+		t.Fatal("node-old revoke-host left node-old's earlier-boot grant active")
+	}
+
+	// node-old's boot is not proof for node-new.
+	status, body := h.revokeHost(t, "host-fabric", "node-new", "boot-a")
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+
+	// node-old boots again: boot A's duplicated request is refused.
+	h.register(t, "host-fabric", "node-old", "boot-a2")
+	status, body = h.revokeHost(t, "host-fabric", "node-old", "boot-a")
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	if !h.active(newBootGrant) {
+		t.Fatal("a refused stale node-old revoke-host changed node-new's grant")
 	}
 }

@@ -523,7 +523,7 @@ func (s *Server) proveHostBootSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.store.ProveHostBootSession(r.Context(), proof.HostIdentityNodeID, proof.BootSessionID); err != nil {
+	if err := s.store.ProveHostBootSession(r.Context(), proof.HostIdentityNodeID, proof.HostStableNodeID, proof.BootSessionID); err != nil {
 		writeError(w, err)
 		return
 	}

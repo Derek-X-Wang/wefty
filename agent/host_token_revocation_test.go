@@ -78,7 +78,7 @@ func TestHostTokenRevocationRetriesWithBackoffUnderInjectedClock(t *testing.T) {
 	var logMu sync.Mutex
 	var logs []string
 	retry := hostTokenRevocation{
-		revoker: revoker, bootSessionID: "boot-current", clock: clock,
+		revoker: revoker, stableNodeID: "stable-node", bootSessionID: "boot-current", clock: clock,
 		backoff: newSessionBackoff(10*time.Second, 30*time.Second),
 		logf: func(format string, args ...any) {
 			logMu.Lock()
@@ -104,7 +104,7 @@ func TestHostTokenRevocationRetriesWithBackoffUnderInjectedClock(t *testing.T) {
 		{15 * time.Second, 30 * time.Second},
 	} {
 		call := nextHostRevokeCall(t, revoker.called)
-		if call.Reason != "agent_restart" || call.BootSessionID != "boot-current" {
+		if call.Reason != "agent_restart" || call.StableNodeID != "stable-node" || call.BootSessionID != "boot-current" {
 			t.Fatalf("attempt %d request = %#v", attempt+1, call)
 		}
 		delay := activeManualTimerDelay(t, clock)
@@ -150,7 +150,10 @@ func TestHostTokenRevocationStopsOnShutdown(t *testing.T) {
 	}
 	agent.startHostTokenRevocation(context.Background())
 	session.markRegistered()
-	nextHostRevokeCall(t, revoker.called)
+	// The agent proves its own registration: its stable node and current boot.
+	if call := nextHostRevokeCall(t, revoker.called); call.StableNodeID != "stable-node" || call.BootSessionID != "boot-current" {
+		t.Fatalf("agent revoke-host request = %#v", call)
+	}
 	delay := activeManualTimerDelay(t, clock)
 	agent.Close()
 	clock.Advance(delay + time.Hour)

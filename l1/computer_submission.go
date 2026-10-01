@@ -311,7 +311,7 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 	var submitEnabled bool
 	var leaseExpiresNS int64
 	err := s.db.QueryRowContext(ctx, `SELECT c.computer_id, a.attempt_id, c.storage_generation,
-		c.submit_intent_revision, host.identity_node_id, host.boot_session_id, c.submit_max_inflight, c.submit_enabled, a.lease_expires_ns
+		c.submit_intent_revision, host.identity_node_id, host.node_id, host.boot_session_id, c.submit_max_inflight, c.submit_enabled, a.lease_expires_ns
 		FROM computers c JOIN attempts a ON a.job_id=c.current_job_id
 		JOIN jobs j ON j.job_id=c.current_job_id
 		JOIN nodes host ON host.node_id=a.node_id
@@ -331,7 +331,7 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 		)`, computerID, attemptID, hostIdentityNodeID, hostIdentityNodeID, hostNodeID, hostNodeID,
 		contract.NodeDead).Scan(&proof.ComputerID,
 		&proof.ComputerAttemptID, &proof.ComputerStorageGeneration, &proof.SubmitIntentRevision,
-		&proof.HostNodeID, &proof.HostBootSessionID, &proof.SubmitMaxInflight, &submitEnabled, &leaseExpiresNS)
+		&proof.HostNodeID, &proof.HostStableNodeID, &proof.HostBootSessionID, &proof.SubmitMaxInflight, &submitEnabled, &leaseExpiresNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer submission authority is not current")
 	}
@@ -344,23 +344,27 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 	return proof, nil
 }
 
-// ProveHostBootSession verifies that the authenticated Fabric identity still
-// names the Node registration for the claimed boot session. L3 uses this
-// proof before a host-wide startup revocation and never trusts the agent's
-// boot-session claim by itself.
-func (s *Store) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, bootSessionID string) error {
-	if hostIdentityNodeID == "" || hostIdentityNodeID != strings.TrimSpace(hostIdentityNodeID) || len(hostIdentityNodeID) > 255 ||
-		bootSessionID == "" || bootSessionID != strings.TrimSpace(bootSessionID) || len(bootSessionID) > 255 {
-		return protocolError(contract.ErrorInvalidRequest, "host boot session proof is incomplete")
+// ProveHostBootSession verifies that the claimed boot session is the current
+// boot of one specific stable node, and that this stable node is bound to the
+// authenticated Fabric identity. L3 uses this proof before a startup
+// revocation scoped to that stable node and never trusts the agent's claim by
+// itself. Matching any registration of the Fabric identity is not enough: one
+// identity may hold several stable nodes, and a delayed request from one of
+// them must not be proved against another's registration.
+func (s *Store) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, hostStableNodeID, bootSessionID string) error {
+	for _, value := range []string{hostIdentityNodeID, hostStableNodeID, bootSessionID} {
+		if value == "" || value != strings.TrimSpace(value) || len(value) > 255 {
+			return protocolError(contract.ErrorInvalidRequest, "host boot session proof is incomplete")
+		}
 	}
 	var current int
 	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM nodes WHERE identity_node_id=? AND boot_session_id=?
-	)`, hostIdentityNodeID, bootSessionID).Scan(&current); err != nil {
+		SELECT 1 FROM nodes WHERE node_id=? AND identity_node_id=? AND boot_session_id=?
+	)`, hostStableNodeID, hostIdentityNodeID, bootSessionID).Scan(&current); err != nil {
 		return internalError(err, "prove host boot session")
 	}
 	if current != 1 {
-		return protocolError(contract.ErrorForbidden, "boot session is not the host's current registration")
+		return protocolError(contract.ErrorForbidden, "boot session is not the stable node's current registration")
 	}
 	return nil
 }

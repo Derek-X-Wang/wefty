@@ -55,11 +55,13 @@ type ComputerGrantVerifier interface {
 	ProveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error)
 }
 
-// HostBootSessionVerifier is the L1 authority seam for host-wide startup
-// revocation. It stays separate from ComputerGrantVerifier so alternate L1
-// clients and test fakes can implement either capability independently.
+// HostBootSessionVerifier is the L1 authority seam for startup revocation:
+// it proves that a boot session is the current boot of one stable node bound
+// to the given Fabric identity. It stays separate from ComputerGrantVerifier
+// so alternate L1 clients and test fakes can implement either capability
+// independently.
 type HostBootSessionVerifier interface {
-	ProveHostBootSession(context.Context, string, string) error
+	ProveHostBootSession(ctx context.Context, hostIdentityNodeID, hostStableNodeID, bootSessionID string) error
 }
 
 // L1Client calls the L1 client protocol exclusively through Fabric.Dial.
@@ -190,21 +192,25 @@ func (c *L1Client) ProveComputerTokenScope(ctx context.Context, computerID, atte
 	}
 	return ComputerTokenScopeProof{ComputerID: proof.ComputerID, ComputerAttemptID: proof.ComputerAttemptID,
 		ComputerStorageGeneration: proof.ComputerStorageGeneration, SubmitIntentRevision: proof.SubmitIntentRevision,
-		HostNodeID: proof.HostNodeID, HostBootSessionID: proof.HostBootSessionID, SubmitMaxInflight: proof.SubmitMaxInflight}, nil
+		HostNodeID: proof.HostNodeID, HostStableNodeID: proof.HostStableNodeID, HostBootSessionID: proof.HostBootSessionID,
+		SubmitMaxInflight: proof.SubmitMaxInflight}, nil
 }
 
-func (c *L1Client) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, bootSessionID string) error {
-	request := map[string]string{"host_identity_node_id": hostIdentityNodeID, "boot_session_id": bootSessionID}
+func (c *L1Client) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, hostStableNodeID, bootSessionID string) error {
+	request := map[string]string{"host_identity_node_id": hostIdentityNodeID, "host_stable_node_id": hostStableNodeID,
+		"boot_session_id": bootSessionID}
 	var proof struct {
 		HostIdentityNodeID string `json:"host_identity_node_id"`
+		HostStableNodeID   string `json:"host_stable_node_id"`
 		BootSessionID      string `json:"boot_session_id"`
 	}
 	if err := c.do(ctx, http.MethodPost, "/v1/host-boot-session-proof", request, &proof, http.StatusOK); err != nil {
 		return err
 	}
-	if proof.HostIdentityNodeID != hostIdentityNodeID || proof.BootSessionID != bootSessionID {
-		return internalError(fmt.Errorf("L1 echoed host boot session %q/%q, want %q/%q",
-			proof.HostIdentityNodeID, proof.BootSessionID, hostIdentityNodeID, bootSessionID), "validate L1 host boot session proof")
+	if proof.HostIdentityNodeID != hostIdentityNodeID || proof.HostStableNodeID != hostStableNodeID || proof.BootSessionID != bootSessionID {
+		return internalError(fmt.Errorf("L1 echoed host boot session %q/%q/%q, want %q/%q/%q",
+			proof.HostIdentityNodeID, proof.HostStableNodeID, proof.BootSessionID, hostIdentityNodeID, hostStableNodeID, bootSessionID),
+			"validate L1 host boot session proof")
 	}
 	return nil
 }

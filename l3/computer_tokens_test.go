@@ -19,7 +19,7 @@ import (
 func testComputerScope() ComputerTokenScopeProof {
 	return ComputerTokenScopeProof{ComputerID: "computer-1", ComputerAttemptID: "attempt-1",
 		ComputerStorageGeneration: 7, SubmitIntentRevision: 3, HostNodeID: "node-1",
-		HostBootSessionID: "boot-1", SubmitMaxInflight: 2}
+		HostStableNodeID: "stable-node", HostBootSessionID: "boot-1", SubmitMaxInflight: 2}
 }
 
 func TestComputerTokenIsHashOnlyRevocableAndPromotionInvalidated(t *testing.T) {
@@ -260,7 +260,7 @@ func TestComputerAttemptAndHostRevocationsAreIdentityScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RevokeHostComputerTokens(ctx, "foreign-node", "boot-foreign", "agent_restart", func(context.Context) error { return nil }); err != nil {
+	if _, err := store.RevokeHostComputerTokens(ctx, "foreign-node", proof.HostStableNodeID, "boot-foreign", "agent_restart", func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
@@ -272,7 +272,7 @@ func TestComputerAttemptAndHostRevocationsAreIdentityScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RevokeHostComputerTokens(ctx, proof.HostNodeID, proof.HostBootSessionID, "agent_restart", func(context.Context) error { return nil }); err != nil {
+	if _, err := store.RevokeHostComputerTokens(ctx, proof.HostNodeID, proof.HostStableNodeID, proof.HostBootSessionID, "agent_restart", func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err == nil {
@@ -288,12 +288,18 @@ func TestDelayedRevokeHostEndsOnlyEarlierBootsGrants(t *testing.T) {
 	}
 	defer store.Close()
 
+	var mintOnStableNode func(computerID, attemptID, hostNodeID, stableNodeID, bootSessionID string) ComputerTokenGrant
 	mint := func(computerID, attemptID, hostNodeID, bootSessionID string) ComputerTokenGrant {
+		t.Helper()
+		return mintOnStableNode(computerID, attemptID, hostNodeID, "stable-1", bootSessionID)
+	}
+	mintOnStableNode = func(computerID, attemptID, hostNodeID, stableNodeID, bootSessionID string) ComputerTokenGrant {
 		t.Helper()
 		proof := testComputerScope()
 		proof.ComputerID = computerID
 		proof.ComputerAttemptID = attemptID
 		proof.HostNodeID = hostNodeID
+		proof.HostStableNodeID = stableNodeID
 		proof.HostBootSessionID = bootSessionID
 		grant, err := store.MintComputerToken(ctx, proof)
 		if err != nil {
@@ -304,9 +310,11 @@ func TestDelayedRevokeHostEndsOnlyEarlierBootsGrants(t *testing.T) {
 	previous := mint("computer-previous", "attempt-previous", "node-1", "boot-previous")
 	current := mint("computer-current", "attempt-current", "node-1", "boot-current")
 	foreign := mint("computer-foreign", "attempt-foreign", "node-2", "boot-foreign")
+	// Same Fabric identity, another stable node: never a candidate.
+	sibling := mintOnStableNode("computer-sibling", "attempt-sibling", "node-1", "stable-2", "boot-sibling")
 
 	var next, currentAfterProof ComputerTokenGrant
-	revoked, err := store.RevokeHostComputerTokens(ctx, "node-1", "boot-current", "agent_restart", func(context.Context) error {
+	revoked, err := store.RevokeHostComputerTokens(ctx, "node-1", "stable-1", "boot-current", "agent_restart", func(context.Context) error {
 		// These grants commit after revoke-host read its high-water mark. The
 		// later boot simulates a successor taking over after L1 answered but
 		// before this delayed request reaches its L3 transaction.
@@ -321,7 +329,7 @@ func TestDelayedRevokeHostEndsOnlyEarlierBootsGrants(t *testing.T) {
 		t.Fatal("earlier boot's grant survived revoke-host")
 	}
 	for name, grant := range map[string]ComputerTokenGrant{
-		"current": current, "next": next, "current after proof": currentAfterProof, "foreign": foreign,
+		"current": current, "next": next, "current after proof": currentAfterProof, "foreign": foreign, "sibling": sibling,
 	} {
 		if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
 			t.Fatalf("%s grant was revoked: %v", name, err)
@@ -329,7 +337,7 @@ func TestDelayedRevokeHostEndsOnlyEarlierBootsGrants(t *testing.T) {
 	}
 
 	refusal := protocolError(contract.ErrorForbidden, "boot session is not the host's current registration")
-	if _, err := store.RevokeHostComputerTokens(ctx, "node-1", "boot-current", "agent_restart", func(context.Context) error {
+	if _, err := store.RevokeHostComputerTokens(ctx, "node-1", "stable-1", "boot-current", "agent_restart", func(context.Context) error {
 		return refusal
 	}); !errors.Is(err, refusal) {
 		t.Fatalf("replayed stale claim = %v, want L1 refusal", err)
@@ -357,8 +365,10 @@ func TestRevokeHostRevokesLegacyGrantsWithoutBootSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`ALTER TABLE computer_token_grants DROP COLUMN host_boot_session_id`); err != nil {
-		t.Fatal(err)
+	for _, column := range []string{"host_stable_node_id", "host_boot_session_id"} {
+		if _, err := store.db.Exec(`ALTER TABLE computer_token_grants DROP COLUMN ` + column); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -378,7 +388,7 @@ func TestRevokeHostRevokesLegacyGrantsWithoutBootSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	revoked, err := store.RevokeHostComputerTokens(ctx, currentProof.HostNodeID, currentProof.HostBootSessionID,
+	revoked, err := store.RevokeHostComputerTokens(ctx, currentProof.HostNodeID, currentProof.HostStableNodeID, currentProof.HostBootSessionID,
 		"agent_restart", func(context.Context) error { return nil })
 	if err != nil || revoked != 1 {
 		t.Fatalf("legacy revoke-host = (%d, %v), want one revoked grant", revoked, err)
