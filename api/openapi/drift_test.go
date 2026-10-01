@@ -556,7 +556,10 @@ func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
 		"refWithSibling": {"$ref": "#/$defs/ab", "enum": ["b", "z"]},
 		"aliasOnly": {"$ref": "#/$defs/ab", "description": "an annotation does not narrow"},
 		"plain": {"type": "string"},
-		"negated": {"type": "string", "not": {"enum": ["a"]}}
+		"nullableOpen": {"oneOf": [{"type": "null"}, {"type": "string"}]},
+		"negated": {"type": "string", "not": {"enum": ["a"]}},
+		"oneOfShared": {"oneOf": [{"enum": ["a", "b"]}, {"enum": ["b", "c"]}]},
+		"oneOfOpen": {"oneOf": [{"enum": ["a"]}, {"type": "string"}]}
 	}}`
 	var parsed any
 	if err := json.Unmarshal([]byte(document), &parsed); err != nil {
@@ -590,6 +593,7 @@ func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
 		{"refWithSibling", []string{"b"}, true},
 		{"aliasOnly", []string{"a", "b"}, true},
 		{"plain", []string{}, false},
+		{"nullableOpen", []string{}, false},
 	} {
 		values, closed, refused := read(check.name)
 		if refused != "" {
@@ -603,10 +607,18 @@ func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
 	if _, _, refused := read("negated"); !strings.Contains(refused, `"not"`) {
 		t.Errorf("a schema using not was read instead of refused (%q)", refused)
 	}
+	// A string two oneOf arms admit is one oneOf rejects, so overlapping arms
+	// are refused instead of read as their union (#620).
+	for _, name := range []string{"oneOfShared", "oneOfOpen"} {
+		if _, _, refused := read(name); !strings.Contains(refused, "oneOf arms") {
+			t.Errorf("%s: overlapping oneOf arms were read instead of refused (%q)", name, refused)
+		}
+	}
 }
 
 // TestMembersComposeAcrossArms pins how property, item, and map-value schemas
-// retain every declaration made through composition (#620).
+// retain every declaration made through composition, and that compositions the
+// reader cannot read exactly are refused rather than read leniently (#620).
 func TestMembersComposeAcrossArms(t *testing.T) {
 	t.Parallel()
 
@@ -623,11 +635,100 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 			{"type": "object", "properties": {"value": {"const": "a"}}},
 			{"type": "object", "properties": {"value": {"const": "a"}}}
 		]},
+		"overlappingArms": {"oneOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a", "b"]}}},
+			{"type": "object", "properties": {"value": {"enum": ["b", "c"]}}}
+		]},
+		"oneOfMissingArm": {"oneOf": [
+			{"type": "object", "properties": {"value": {"const": "a"}}},
+			{"type": "object"}
+		]},
+		"oneOfObjects": {"oneOf": [
+			{"type": "object", "properties": {"value": {"type": "object", "properties": {"kind": {"const": "a"}}}}},
+			{"type": "object", "properties": {"value": {"type": "object", "properties": {"kind": {"const": "b"}}}}}
+		]},
+		"oneOfForbiddingArm": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a", "b"]}},
+			"oneOf": [
+				{"not": {"required": ["value"]}},
+				{"properties": {"value": {"const": "a"}}, "not": {"anyOf": [{"required": ["other"]}]}}
+			]
+		},
+		"closedArmForbids": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "additionalProperties": false}
+		]},
+		"unevaluatedArmForbids": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "unevaluatedProperties": false}
+		]},
+		"notRequiredArmForbids": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "not": {"anyOf": [{"required": ["value"]}, {"required": ["other"]}]}}
+		]},
+		"pairRequiredDoesNotForbid": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "not": {"required": ["value", "other"]}}
+		]},
+		"everyArmForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"anyOf": [
+				{"additionalProperties": false},
+				{"not": {"required": ["value"]}}
+			]
+		},
+		"alwaysArmForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"allOf": [{"type": "object", "additionalProperties": false}]
+		},
+		"bothBranchesForbid": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"if": {"properties": {"mode": {"const": "a"}}},
+			"then": {"not": {"required": ["value"]}},
+			"else": {"additionalProperties": false}
+		},
+		"closedTwice": {"allOf": [
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}
+			}}},
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"b": {"type": "string"}}
+			}}}
+		]},
+		"closedBesideWider": {
+			"type": "object",
+			"properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}
+			}},
+			"then": {"properties": {"value": {"properties": {"b": {"type": "string"}}}}}
+		},
+		"closedAlternatives": {"anyOf": [
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}
+			}}},
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"b": {"type": "string"}}
+			}}}
+		]},
+		"closedAgreeing": {
+			"type": "object",
+			"properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}, "b": {"type": "string"}}
+			}},
+			"if": {"properties": {"mode": {"const": "a"}}},
+			"then": {"properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"const": "x"}, "b": {"type": "string"}}
+			}}}
+		},
 		"allArms": {"allOf": [
 			{"type": "object", "properties": {"value": {"enum": ["a", "b"]}}},
 			{"type": "object", "properties": {"value": {"enum": ["b", "c"]}}}
 		]},
-		"missingArm": {"oneOf": [
+		"missingArm": {"anyOf": [
 			{"type": "object", "properties": {"value": {"const": "a"}}},
 			{"type": "object"}
 		]},
@@ -654,7 +755,7 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 			{"type": "object", "additionalProperties": {"const": "a"}},
 			{"type": "object", "additionalProperties": {"const": "b"}}
 		]},
-		"nested": {"oneOf": [
+		"nested": {"anyOf": [
 			{"type": "object", "properties": {"value": {
 				"type": "object", "properties": {"kind": {"const": "a"}}
 			}}},
@@ -703,7 +804,11 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 		closed bool
 	}{
 		{"ownAndArms", []string{"properties", "value"}, []string{"a", "b"}, true},
-		{"sameArms", []string{"properties", "value"}, []string{"a"}, true},
+		{"oneOfForbiddingArm", []string{"properties", "value"}, []string{"a"}, true},
+		{"closedArmForbids", []string{"properties", "value"}, []string{"a"}, true},
+		{"unevaluatedArmForbids", []string{"properties", "value"}, []string{"a"}, true},
+		{"notRequiredArmForbids", []string{"properties", "value"}, []string{"a"}, true},
+		{"pairRequiredDoesNotForbid", []string{"properties", "value"}, nil, false},
 		{"allArms", []string{"properties", "value"}, []string{"b"}, true},
 		{"missingArm", []string{"properties", "value"}, nil, false},
 		{"nullable", []string{"properties", "value"}, []string{"a"}, true},
@@ -736,6 +841,38 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 	}
 	if _, _, refused := read("negated", "properties", "value"); !strings.Contains(refused, `"not"`) {
 		t.Errorf("a property narrowed by not was read instead of refused (%q)", refused)
+	}
+	// Shapes this reader does not model are refused, never read leniently.
+	for _, check := range []struct{ name, refusal string }{
+		// A value two oneOf arms admit is one oneOf rejects: identical arms
+		// admit nothing, so they are not read as their union.
+		{"sameArms", "oneOf arms"},
+		{"overlappingArms", "oneOf arms"},
+		{"oneOfMissingArm", "oneOf arms"},
+		{"oneOfObjects", "oneOf arms"},
+		// A property that some declaration admits and an arm that always
+		// applies, or every arm of a group, forbids.
+		{"everyArmForbids", "being forbidden by"},
+		{"alwaysArmForbids", "being forbidden by"},
+		{"bothBranchesForbid", "being forbidden by"},
+		// A closed declaration that omits a property another declaration of
+		// the same member declares rejects it, though the merge would admit it.
+		{"closedTwice", "closed declaration"},
+		{"closedBesideWider", "closed declaration"},
+		{"closedAlternatives", "closed declaration"},
+	} {
+		if _, _, refused := read(check.name, "properties", "value"); !strings.Contains(refused, check.refusal) {
+			t.Errorf("%s: was read instead of refused with %q (%q)", check.name, check.refusal, refused)
+		}
+	}
+	// Closed declarations that agree on their properties compose: each one
+	// admits exactly what the merged shape does.
+	agreeing, ok := set.member(set.root("inline.json#/$defs/closedAgreeing"), "properties", "value")
+	if !ok {
+		t.Fatal("closedAgreeing: value member was not found")
+	}
+	if shape := set.shape(agreeing, nil); !shape.closed || !reflect.DeepEqual(sortedKeys(shape.properties), []string{"a", "b"}) {
+		t.Errorf("closedAgreeing: shape = %v closed=%v, want [a b] closed=true", sortedKeys(shape.properties), shape.closed)
 	}
 }
 
@@ -1446,13 +1583,29 @@ func (s *schemaSet) notNarrowsMember(r schemaRef, tokens []string, seen map[stri
 // member combines every declaration of a property, array item, or map value
 // according to the composition that makes it apply. Missing alternative arms
 // are open placeholders; arms whose type excludes the containing value do not
-// participate. A negated declaration is refused because its admitted member
-// set cannot be recovered by this reader.
+// participate, and neither do arms that forbid the property (see forbids). A
+// negated declaration is refused because its admitted member set cannot be
+// recovered by this reader.
+//
+// This is a structural reader, not a validator: it models the compositions
+// the protocol schemas use and refuses the rest rather than guessing. It
+// refuses a property every arm of a group, or any arm that always applies,
+// forbids; oneOf arms whose admitted values it cannot show to be disjoint,
+// since a value two arms admit is one oneOf rejects; and a closed object
+// declaration that omits a property another declaration of the same member
+// declares, since merging the declarations would admit a value the closed one
+// rejects.
 func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 	container := "object"
 	if len(tokens) == 1 && tokens[0] == "items" {
 		container = "array"
 	}
+	property := ""
+	if len(tokens) == 2 && tokens[0] == "properties" {
+		property = tokens[1]
+	}
+	// forbidding reports an arm that rules the property out (see forbids).
+	forbidding := func(arm schemaRef) bool { return property != "" && s.forbids(arm, property) }
 	seen := map[string]bool{}
 	var read func(schemaRef) (schemaRef, bool)
 	read = func(r schemaRef) (schemaRef, bool) {
@@ -1506,31 +1659,44 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 			}
 		}
 
+		// forbidden names an arm or group that rules the property out wherever
+		// it applies; it matters only if some other declaration admits it.
+		forbidden := ""
 		always, groups, conditional := s.arms(r)
 		for _, arm := range always {
 			if member, ok := read(arm); ok {
 				mergeAlways(member)
+			} else if forbidding(arm) {
+				forbidden = s.resolve(arm, nil).loc.key()
 			}
 		}
 		for _, group := range groups {
+			exclusive := r.composed == nil && len(group) > 0 && path.Base(path.Dir(group[0].loc.pointer)) == "oneOf"
 			var members []schemaRef
-			groupDeclares := false
+			groupDeclares, participating := false, 0
 			for _, arm := range group {
 				resolved := s.resolve(arm, nil)
 				if kind, ok := resolved.loc.node["type"]; ok && !typeAdmits(kind, container) {
 					continue
 				}
+				participating++
 				if member, ok := read(arm); ok {
 					if !groupDeclares {
 						remember(member)
 					}
 					groupDeclares = true
 					members = append(members, member)
-				} else {
+				} else if !forbidding(arm) {
 					members = append(members, s.placeholder(arm))
 				}
 			}
+			if participating > 0 && len(members) == 0 {
+				forbidden = "every arm of " + path.Dir(group[0].loc.pointer)
+			}
 			if groupDeclares {
+				if exclusive {
+					s.disjoint(r, tokens, members)
+				}
 				alternatives = append(alternatives, members)
 			}
 		}
@@ -1553,9 +1719,12 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 					}
 					groupDeclares = true
 					members = append(members, member)
-				} else {
+				} else if !forbidding(arm) {
 					members = append(members, s.placeholder(arm))
 				}
+			}
+			if len(members) == 0 {
+				forbidden = "both then and else"
 			}
 			if groupDeclares {
 				alternatives = append(alternatives, members)
@@ -1565,6 +1734,10 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 		if !found {
 			return schemaRef{}, false
 		}
+		if forbidden != "" {
+			s.fatalf("%s: the drift member reader does not model %s, which another declaration admits, being forbidden by %s",
+				r.loc.key(), strings.Join(tokens, "/"), forbidden)
+		}
 		if len(all) == 1 && len(alternatives) == 0 && identity(first) == identity(all[0]) {
 			return all[0], true
 		}
@@ -1573,12 +1746,136 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 		combined.composed = &composedSchema{all: all, alternatives: alternatives}
 		return combined, true
 	}
-	return read(r)
+	member, ok := read(r)
+	if ok && member.composed != nil {
+		s.closures(member)
+	}
+	return member, ok
+}
+
+// forbids reports an arm that rules a property out without declaring it: an
+// arm closed by additionalProperties or unevaluatedProperties false, or one
+// whose own not (or an arm of it that always applies) requires the property
+// alone, directly or as one anyOf alternative. The caller has already found
+// that the arm declares no schema for the property.
+func (s *schemaSet) forbids(arm schemaRef, name string) bool {
+	if s.shape(arm, nil).closed {
+		return true
+	}
+	requiresOnly := func(node any) bool {
+		object, ok := node.(map[string]any)
+		if !ok {
+			return false
+		}
+		for key := range object {
+			if key != "required" && key != "description" {
+				return false
+			}
+		}
+		required, ok := object["required"].([]any)
+		return ok && len(required) == 1 && required[0] == name
+	}
+	seen := map[string]bool{}
+	var walk func(schemaRef) bool
+	walk = func(r schemaRef) bool {
+		r = s.resolve(r, nil)
+		key := identity(r)
+		if seen[key] {
+			return false
+		}
+		seen[key] = true
+		if negated, ok := r.loc.node["not"].(map[string]any); ok {
+			if requiresOnly(negated) {
+				return true
+			}
+			if alternatives, ok := negated["anyOf"].([]any); ok && len(negated) == 1 {
+				for _, alternative := range alternatives {
+					if requiresOnly(alternative) {
+						return true
+					}
+				}
+			}
+		}
+		all, _, _ := s.arms(r)
+		for _, arm := range all {
+			if walk(arm) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(arm)
+}
+
+// disjoint holds a oneOf group's members of one property to admitted values
+// the reader can show are disjoint: closed, non-empty vocabularies that share
+// no value. Anything else may admit a value through two arms, which oneOf
+// rejects, so it is refused rather than read as a union.
+func (s *schemaSet) disjoint(r schemaRef, tokens []string, members []schemaRef) {
+	if len(members) < 2 {
+		return
+	}
+	owner := map[string]string{}
+	for _, member := range members {
+		admitted, closed := s.vocabulary(member)
+		if !closed || len(admitted) == 0 {
+			s.fatalf("%s: the drift member reader does not model oneOf arms whose %s values it cannot show are disjoint (%s admits an open or non-string set)",
+				r.loc.key(), strings.Join(tokens, "/"), member.loc.key())
+		}
+		for value := range admitted {
+			if other, taken := owner[value]; taken {
+				s.fatalf("%s: the drift member reader does not model oneOf arms that both admit %s %q (%s and %s)",
+					r.loc.key(), strings.Join(tokens, "/"), value, other, member.loc.key())
+			}
+			owner[value] = member.loc.key()
+		}
+	}
+}
+
+// closures refuses a composed member whose closed object declarations do not
+// all declare every property the member declares. Each declaration applies on
+// its own, so a closed one rejects a property only another declaration
+// declares, which the merged shape would admit.
+func (s *schemaSet) closures(member schemaRef) {
+	names := sortedKeys(s.shape(member, nil).properties)
+	seen := map[string]bool{}
+	var walk func(schemaRef)
+	walk = func(r schemaRef) {
+		key := identity(r)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if r.composed != nil {
+			for _, declaration := range r.composed.all {
+				walk(declaration)
+			}
+			for _, group := range r.composed.alternatives {
+				for _, declaration := range group {
+					walk(declaration)
+				}
+			}
+			return
+		}
+		shape := s.shape(r, nil)
+		if !shape.closed {
+			return
+		}
+		for _, name := range names {
+			if !shape.properties[name] {
+				s.fatalf("%s: the drift member reader does not model the closed declaration %s, which omits %q that another declaration of the same member declares",
+					member.loc.key(), s.resolve(r, nil).loc.key(), name)
+			}
+		}
+	}
+	walk(member)
 }
 
 // vocabulary is the set of strings a schema admits, and whether that set is
 // closed. Every arm that always applies narrows it (intersection); an
 // alternative group admits the union of its arms, and is open when any arm is.
+// A oneOf group is read as that union only when no string can match two of
+// its arms; otherwise it is refused, since oneOf rejects such a string.
 // A schema whose type excludes string admits none. Keywords whose effect on
 // the set this reader does not model fail the test.
 func (s *schemaSet) vocabulary(r schemaRef) (map[string]bool, bool) {
@@ -1629,19 +1926,38 @@ func (s *schemaSet) vocabulary(r schemaRef) (map[string]bool, bool) {
 		}
 	}
 	for _, group := range alternatives {
+		exclusive := r.composed == nil && len(group) > 0 && path.Base(path.Dir(group[0].loc.pointer)) == "oneOf"
 		union := map[string]bool{}
-		open := false
+		owner := map[string]string{}
+		open, admitsSome := "", ""
 		for _, arm := range group {
 			admitted, armClosed := s.vocabulary(arm)
+			if exclusive && (!armClosed || len(admitted) > 0) {
+				// An open arm may admit any string, so beside any other arm that
+				// admits one, a value could match both and oneOf would reject it.
+				if admitsSome != "" && (open != "" || !armClosed) {
+					s.fatalf("%s: the drift enum reader does not model oneOf arms that may both admit a string (%s and %s)",
+						r.loc.key(), admitsSome, arm.loc.key())
+				}
+				admitsSome = arm.loc.key()
+			}
 			if !armClosed {
-				open = true
-				break
+				open = arm.loc.key()
+				if !exclusive {
+					break
+				}
+				continue
 			}
 			for value := range admitted {
+				if other, taken := owner[value]; taken && exclusive {
+					s.fatalf("%s: the drift enum reader does not model oneOf arms that both admit %q (%s and %s)",
+						r.loc.key(), value, other, arm.loc.key())
+				}
+				owner[value] = arm.loc.key()
 				union[value] = true
 			}
 		}
-		if !open {
+		if open == "" {
 			narrow(union)
 		}
 	}
