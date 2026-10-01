@@ -310,6 +310,7 @@ async function runPlan(context: Context, record: RunRecord, params: DogfoodParam
     logging: { type: "stdout" },
     prompt: [
       "Plan the coding task below without editing files.",
+      "Do not create, switch, or push branches.",
       "Inspect the repository and produce an implementation plan with verification steps.",
       "Keep the final plan in this session for a follow-up formatting turn.",
       `When the plan is complete, finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
@@ -360,6 +361,7 @@ async function runImplement(context: Context, record: RunRecord, params: Dogfood
     logging: { type: "stdout" },
     prompt: [
       "Implement the task using the approved plan below.",
+      `You are on branch ${branch}, checked out for this run. Commit there; do not create, switch, rename, or push branches. The run collects only commits on ${branch}.`,
       `Run appropriate checks, commit all intended changes with a DCO sign-off (git commit -s; every commit needs a Signed-off-by trailer per CONTRIBUTING.md), and finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
       `Task: ${params.task}`,
       "",
@@ -416,6 +418,7 @@ async function runReview(context: Context, params: DogfoodParams): Promise<void>
     logging: { type: "stdout" },
     prompt: [
       `Cross-review branch ${branch} against ${params.base_branch ?? "main"}.`,
+      `You are on branch ${branch}. Commit any fixes there; do not create, switch, rename, or push branches.`,
       "Inspect correctness, scope, tests, and the original plan. Verify every new commit carries a Signed-off-by trailer (CONTRIBUTING.md DCO rule); treat a missing trailer as a defect. Fix and commit worthwhile issues (with -s).",
       "Run appropriate verification and retain the final PASS or FAIL verdict in this session.",
       `When the review is complete, finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
