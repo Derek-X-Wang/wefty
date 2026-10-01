@@ -241,6 +241,68 @@ func TestRunEndedDuringItsInFlightSubmitIsLinked(t *testing.T) {
 	}
 }
 
+// An L1 job stored before L1 recorded run-ledger provenance is outside the
+// scoped lookup, but L1 still holds the job it acknowledged. Absence from the
+// lookup alone must not be recorded as a regression.
+func TestAcknowledgedJobOutsideTheLookupScopeIsLinkedNotRegressed(t *testing.T) {
+	h := newIntegrationHarness(t)
+	ctx := context.Background()
+	run := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "unrecorded-legacy")
+	token, err := h.l3Store.ensureRunToken(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.l3Store.beginDispatch(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := h.l3Store.pendingDispatches(ctx)
+	if err != nil || len(intents) != 1 || intents[0].RunID != run.RunID {
+		t.Fatalf("pending dispatches = %+v, %v", intents, err)
+	}
+	// A job no configured run ledger submitted has the provenance of one
+	// stored before submitted_by_run_ledger existed. Current L1 lets only the
+	// ledger name a run, so the fixture drops the run identity labels.
+	legacy, err := NewL1Client(h.network.NewFabric(fabric.Identity{NodeID: "legacy-submitter", Tags: []string{l1.DefaultClientPrincipalTag}}), DefaultL1Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(legacy.CloseIdleConnections)
+	spec := intents[0].jobSpec(token)
+	delete(spec.Labels, contract.LabelRunID)
+	delete(spec.Labels, contract.LabelHandoffOwnerRunID)
+	acknowledged, err := legacy.SubmitJob(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+	if err := h.l3Store.completeDispatch(ctx, run.RunID, acknowledged.JobID); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTerminalRun(t, h.l3Store, run.RunID)
+
+	client := &countingDispatchRecoveryClient{JobClient: h.l1Client, JobDispatchLookupClient: h.l1Client}
+	reconciler, err := NewReconciler(h.l3Store, client, ReconcilerConfig{DispatchLookup: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if client.submits != 0 || client.lookups != 1 {
+		t.Fatalf("recovery submitted/looked up = %d/%d, want 0/1", client.submits, client.lookups)
+	}
+	execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.L1JobID != acknowledged.JobID || execution.DispatchError != nil {
+		t.Fatalf("recovered execution = %+v, want job %q with no diagnostic", execution, acknowledged.JobID)
+	}
+	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); !reflect.DeepEqual(after, before) {
+		t.Fatalf("link changed terminal run: before=%+v after=%+v", before, after)
+	}
+}
+
 type failRunAfterSubmitClient struct {
 	JobClient
 	store   *Store

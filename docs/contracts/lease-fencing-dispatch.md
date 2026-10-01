@@ -592,7 +592,8 @@ job submitted by another client receives the same `404 not_found`; the read
 never creates, replays, or changes a job.
 
 If a run becomes terminal before L3 records the submit response, L3 recovers
-the association only through that lookup. It never replays `SubmitJob`: the
+the association only through that lookup, or by reading the job ID L1 already
+acknowledged when the lookup cannot return it. It never replays `SubmitJob`: the
 terminal transition has cleared the staged bearer, and an L1 that lost its
 database could otherwise accept the replay as new work and repeat side
 effects for an ended run.

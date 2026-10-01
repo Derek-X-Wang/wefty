@@ -150,9 +150,10 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	return errors.Join(passErrors...)
 }
 
-// recoverUnrecordedDispatches links terminal runs by lookup only. Replaying
-// SubmitJob is impossible after #52 cleared the staged bearer, and unsafe when
-// L1 has regressed because it could recreate side effects for an ended run.
+// recoverUnrecordedDispatches links terminal runs by read-only L1 reads only.
+// Replaying SubmitJob is impossible after #52 cleared the staged bearer, and
+// unsafe when L1 has regressed because it could recreate side effects for an
+// ended run.
 func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 	if r.lookup == nil {
 		return nil
@@ -164,31 +165,44 @@ func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 	var passErrors []error
 	for _, item := range pending {
 		job, err := r.lookup.LookupJobByDispatchKey(ctx, item.DispatchKey)
-		if err != nil {
-			if isMissingDispatch(err, item.DispatchKey) {
-				changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
-				if storeErr != nil {
-					passErrors = append(passErrors, errors.Join(err, storeErr))
-				} else if changed {
+		var absence error
+		switch {
+		case err == nil && (item.OutboxJobID == "" || job.JobID == item.OutboxJobID):
+			if err := r.store.linkUnrecordedDispatch(ctx, item, job.JobID); err != nil {
+				passErrors = append(passErrors, err)
+			}
+			continue
+		case err == nil:
+			absence = fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
+		case isMissingDispatch(err, item.DispatchKey):
+			absence = err
+		default:
+			passErrors = append(passErrors, err)
+			continue
+		}
+		if item.OutboxJobID != "" {
+			// L1 acknowledged this job, so only its authoritative absence by ID
+			// is a regression, the same evidence failMissingL1Job requires. The
+			// scoped lookup cannot see a job L1 stored before it recorded
+			// run-ledger provenance, and that job is still this run's to link.
+			_, err := r.jobs.GetJob(ctx, item.OutboxJobID)
+			if err == nil {
+				if err := r.store.linkUnrecordedDispatch(ctx, item, item.OutboxJobID); err != nil {
 					passErrors = append(passErrors, err)
 				}
 				continue
 			}
-			passErrors = append(passErrors, err)
-			continue
-		}
-		if item.OutboxJobID != "" && item.OutboxJobID != job.JobID {
-			changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
-			mismatch := fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
-			if storeErr != nil {
-				passErrors = append(passErrors, errors.Join(mismatch, storeErr))
-			} else if changed {
-				passErrors = append(passErrors, mismatch)
+			if !isMissingL1Job(err, item.OutboxJobID) {
+				passErrors = append(passErrors, errors.Join(absence, err))
+				continue
 			}
-			continue
+			absence = errors.Join(absence, err)
 		}
-		if err := r.store.linkUnrecordedDispatch(ctx, item, job.JobID); err != nil {
-			passErrors = append(passErrors, err)
+		changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
+		if storeErr != nil {
+			passErrors = append(passErrors, errors.Join(absence, storeErr))
+		} else if changed {
+			passErrors = append(passErrors, absence)
 		}
 	}
 	return passErrors
