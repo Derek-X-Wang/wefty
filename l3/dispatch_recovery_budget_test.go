@@ -150,3 +150,59 @@ func TestUnrecordedDispatchBackoffDoublesToItsCap(t *testing.T) {
 		t.Errorf("backoff after many failures = %v, want the cap", got)
 	}
 }
+
+// A ledger from before dispatch_attempt_ns recorded attempts only as a count.
+// Opening it backfills the attempt time from the run's finish, so its
+// historical crash windows still enter the recovery index.
+func TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime(t *testing.T) {
+	s, path, clock := recoveryStore(t)
+	keys := endedUnrecordedRuns(t, s, clock, 1)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX runs_job_link_recovery`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE runs DROP COLUMN dispatch_attempt_ns`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(path, StoreOptions{Clock: clock, RunTokenGrace: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	var attemptNS, finishedNS int64
+	if err := reopened.db.QueryRow(`SELECT dispatch_attempt_ns, finished_ns FROM runs WHERE dispatch_key=?`, keys[0]).Scan(&attemptNS, &finishedNS); err != nil {
+		t.Fatal(err)
+	}
+	if attemptNS != finishedNS {
+		t.Fatalf("backfilled attempt time = %d, want the run's finish %d", attemptNS, finishedNS)
+	}
+	pending, err := reopened.unrecordedDispatches(ctx, unrecordedDispatchBatch)
+	if err != nil || len(pending) != 1 || pending[0].DispatchKey != keys[0] {
+		t.Fatalf("recovery after migration = %+v, %v", pending, err)
+	}
+}
+
+// A run that ended before any submit attempt has nothing to recover and never
+// enters the recovery index.
+func TestRunEndedBeforeAnyAttemptIsNotRecoveryEligible(t *testing.T) {
+	s, _, _ := recoveryStore(t)
+	ctx := context.Background()
+	record, _, err := s.CreateRun(ctx, CreateRunInput{IdempotencyKey: "never-attempted", Actor: "test", Request: inlineRunRequest("#!/bin/sh\nexit 0\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rejectProtocolWrite(ctx, record.RunID, "envelope", "never-attempted", []byte(`{}`), "never-hash", "invalid envelope", errors.New("invalid envelope")); err != nil {
+		t.Fatal(err)
+	}
+	var indexed int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM runs INDEXED BY runs_job_link_recovery
+WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','failed') AND dispatch_attempt_ns IS NOT NULL`).Scan(&indexed); err != nil {
+		t.Fatal(err)
+	}
+	if indexed != 0 {
+		t.Fatalf("never-attempted run is in the recovery index (%d rows)", indexed)
+	}
+}

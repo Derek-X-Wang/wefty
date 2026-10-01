@@ -172,8 +172,8 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 // unsafe when L1 has regressed because it could recreate side effects for an
 // ended run.
 //
-// Each pass reads a bounded batch of the oldest rows that are not backed off
-// and stops starting L1 reads once its budget is spent. A row whose L1 reads
+// Each pass reads a bounded batch of the rows that are due, inside its budget,
+// and stops starting L1 reads once that budget is spent. A row whose L1 reads
 // fail transiently, including one the budget cut short, backs off
 // exponentially, so an unavailable L1 costs one budget per pass at most and
 // later rows still get their turn.
@@ -181,12 +181,12 @@ func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 	if r.lookup == nil {
 		return nil
 	}
-	pending, err := r.store.unrecordedDispatches(ctx, unrecordedDispatchBatch)
+	remote, cancel := context.WithTimeout(ctx, r.budget)
+	defer cancel()
+	pending, err := r.store.unrecordedDispatches(remote, unrecordedDispatchBatch)
 	if err != nil {
 		return []error{err}
 	}
-	remote, cancel := context.WithTimeout(ctx, r.budget)
-	defer cancel()
 	var passErrors []error
 	for _, item := range pending {
 		if remote.Err() != nil {

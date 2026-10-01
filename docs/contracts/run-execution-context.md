@@ -1356,9 +1356,9 @@ flight, the acknowledgement links the run directly. Linking fills only
 and marks node attribution pending when no node is known so the ordinary
 terminal-attribution pass can name it.
 
-A terminal run with no `l1_job_id` is eligible for lookup recovery when its
-dispatch outbox records at least one attempt and the recovery answer has not
-already been settled. This covers a submit whose response L3 never recorded,
+A terminal run with no `l1_job_id` is eligible for lookup recovery when L3
+recorded a submit attempt for it and the recovery answer has not already been
+settled. A run that ended before any attempt is never eligible. This covers a submit whose response L3 never recorded,
 and a ledger written before acknowledgements linked ended runs, whose outbox
 holds the acknowledged job ID while the run has none. A found job is linked as
 above.
@@ -1374,9 +1374,12 @@ read's authoritative absence records the existing `l1_regressed` diagnostic
 for the ID. Transport, authentication and malformed answers remain retryable
 pass errors, and back that run off before it is asked again: 30 seconds after
 the first consecutive failure, doubling to at most 30 minutes. Recovery runs
-after dispatch, projection and node attribution in each pass, reads at most 16
-of the oldest runs that are not backed off, and stops starting L1 reads once
-its per-pass budget (5 seconds by default) is spent; a read the budget cuts
+after dispatch, projection and node attribution in each pass. Within its
+per-pass budget (5 seconds by default) it reads at most 16 due runs, those
+never backed off first and oldest first, then backed-off runs in the order
+they came due, from an index that holds only eligible runs, so backed-off runs
+cost nothing until they are due. It stops starting L1 reads once the budget is
+spent; a read the budget cuts
 short counts as a transient failure. An unavailable L1 therefore costs at most
 one budget per pass and cannot hold live runs' dispatch behind ended ones. A complete authoritative answer settles the lookup once, and only
 if the outbox still holds the acknowledgement recovery read before asking L1;

@@ -351,9 +351,14 @@ func TestUnrecordedDispatchesUseThePartialIndex(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if joined := strings.Join(plan, "; "); !strings.Contains(joined, "runs_unrecorded_dispatch") {
-		t.Fatalf("unrecorded dispatch query does not use the partial index: %s", joined)
+	// The index must answer the eligibility predicate, the retry filter and
+	// the order on its own: a backed-off backlog is otherwise walked, and
+	// sorted, every pass even when no row is due.
+	joined := strings.Join(plan, "; ")
+	if !strings.Contains(joined, "runs_job_link_recovery") || strings.Contains(joined, "SCAN") || strings.Contains(joined, "TEMP B-TREE") {
+		t.Fatalf("unrecorded dispatch query is not a bounded walk of its partial index: %s", joined)
 	}
+	t.Logf("plan: %s", joined)
 }
 
 func TestPermanentRefusalKeepsItsDiagnosticWhenNoJobIsFound(t *testing.T) {

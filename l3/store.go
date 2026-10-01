@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS runs (
   job_link_settled INTEGER NOT NULL DEFAULT 0,
   job_link_failures INTEGER NOT NULL DEFAULT 0,
   job_link_retry_ns INTEGER NOT NULL DEFAULT 0,
+  dispatch_attempt_ns INTEGER,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
@@ -372,11 +373,37 @@ ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_retry_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("l3: migrate run job-link retry time: %w", err)
 	}
+	// dispatch_attempt_ns is the time of the run's last submit attempt, set by
+	// beginDispatch. It makes recovery eligibility a property of the run row,
+	// so the partial index below holds only runs that were ever submitted: a
+	// run that ended before any attempt can never gain one (beginDispatch
+	// refuses terminal runs) and never enters it.
+	hadAttemptTime, err := sqliteColumnExists(ctx, s.db, "runs", "dispatch_attempt_ns")
+	if err != nil {
+		return fmt.Errorf("l3: inspect run dispatch attempt time: %w", err)
+	}
+	if !hadAttemptTime {
+		if err := ensureSQLiteColumn(ctx, s.db, "runs", "dispatch_attempt_ns", "INTEGER"); err != nil {
+			return fmt.Errorf("l3: migrate run dispatch attempt time: %w", err)
+		}
+		// A ledger from before the column records attempts only as a count.
+		// The run's finish (or last update) is no earlier than its last
+		// attempt, so it stands in for the attempt time.
+		if _, err := s.db.ExecContext(ctx, `UPDATE runs SET dispatch_attempt_ns=COALESCE(finished_ns, updated_ns)
+WHERE l1_job_id IS NULL AND run_id IN (SELECT run_id FROM dispatch_outbox WHERE attempt_count>0)`); err != nil {
+			return fmt.Errorf("l3: backfill run dispatch attempt time: %w", err)
+		}
+	}
 	// Old rows default to unsettled so the reconciler can recover historical
-	// crash windows. The partial index keeps each pass proportional to the few
-	// terminal runs still awaiting an authoritative lookup.
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_unrecorded_dispatch
-ON runs(status, created_ns, run_id) WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','failed')`); err != nil {
+	// crash windows. The partial index holds exactly the rows recovery may
+	// read, keyed by when each is next due and then by age, so a pass is a
+	// bounded walk of the due prefix however many rows are backed off.
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS runs_unrecorded_dispatch`); err != nil {
+		return fmt.Errorf("l3: drop superseded unrecorded dispatch index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_job_link_recovery
+ON runs(job_link_retry_ns, created_ns, run_id)
+WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','failed') AND dispatch_attempt_ns IS NOT NULL`); err != nil {
 		return fmt.Errorf("l3: index unrecorded dispatches: %w", err)
 	}
 	// A ledger written before credential delivery became opt-in has no column.
@@ -406,6 +433,26 @@ ON runs(status, created_ns, run_id) WHERE l1_job_id IS NULL AND job_link_settled
 		return err
 	}
 	return nil
+}
+
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
@@ -1944,8 +1991,9 @@ func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error)
 		return "", internalError(err, "begin dispatch attempt")
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
-		contract.RunPending, contract.RunDispatching, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=?, dispatch_attempt_ns=?
+WHERE run_id=? AND status IN (?, ?)`,
+		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
 	if err != nil {
 		return "", internalError(err, "mark dispatch attempt")
 	}
@@ -2070,13 +2118,14 @@ type unrecordedDispatch struct {
 }
 
 // unrecordedDispatchesQuery repeats the partial-index predicate literally so
-// SQLite can select only unsettled terminal runs instead of scanning history.
-// It returns the oldest rows not backed off, a bounded batch per pass.
-const unrecordedDispatchesQuery = `SELECT r.run_id, o.dispatch_key, COALESCE(o.job_id, '')
-FROM runs r INDEXED BY runs_unrecorded_dispatch JOIN dispatch_outbox o ON o.run_id=r.run_id
-WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed')
-  AND o.attempt_count>0 AND r.job_link_retry_ns<=?
-ORDER BY r.created_ns, r.run_id
+// SQLite walks only the due prefix of runs_job_link_recovery, in index order:
+// rows never backed off first, oldest first, then backed-off rows as they
+// come due. CROSS JOIN keeps runs the outer loop so LIMIT stops the walk.
+const unrecordedDispatchesQuery = `SELECT r.run_id, r.dispatch_key, COALESCE(o.job_id, '')
+FROM runs r INDEXED BY runs_job_link_recovery CROSS JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed') AND r.dispatch_attempt_ns IS NOT NULL
+  AND r.job_link_retry_ns<=?
+ORDER BY r.job_link_retry_ns, r.created_ns, r.run_id
 LIMIT ?`
 
 const (
@@ -2141,7 +2190,7 @@ func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unreco
 	item := unrecordedDispatch{RunID: runID}
 	err := s.db.QueryRowContext(ctx, `SELECT o.dispatch_key, COALESCE(o.job_id, '')
 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
-WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN (?, ?) AND o.attempt_count>0`,
+WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN (?, ?) AND r.dispatch_attempt_ns IS NOT NULL`,
 		runID, contract.RunSucceeded, contract.RunFailed).Scan(&item.DispatchKey, &item.OutboxJobID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return unrecordedDispatch{}, false, nil
