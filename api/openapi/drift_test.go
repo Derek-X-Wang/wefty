@@ -875,6 +875,7 @@ func TestEveryServedRouteIsPublished(t *testing.T) {
 	l3Operations := published(l3Doc)
 
 	methodRoute := regexp.MustCompile(`\.Handle(?:Func)?\("([A-Z]+) (/[^"]*)"`)
+	pathOnlyRegistration := regexp.MustCompile(`\.Handle\("(/[^"]*)", s\.authenticateFabric\(http\.HandlerFunc\(`)
 	pathOnlyHandler := regexp.MustCompile(`\.Handle\("(/[^"]*)", s\.authenticateFabric\(http\.HandlerFunc\(s\.(\w+)\)\)\)`)
 	type guardedRoute struct {
 		path    string
@@ -897,24 +898,33 @@ func TestEveryServedRouteIsPublished(t *testing.T) {
 			}
 			routes.operations = append(routes.operations, match[1]+" "+match[2])
 		}
-		functions := map[string]*ast.FuncDecl{}
+		declarations := map[string][]*ast.FuncDecl{}
 		for _, file := range parseSources(t, filepath.Dir(source)) {
 			for _, declaration := range file.Decls {
-				if fn, ok := declaration.(*ast.FuncDecl); ok {
-					functions[fn.Name.Name] = fn
+				if fn, ok := declaration.(*ast.FuncDecl); ok && fn.Recv != nil {
+					declarations[fn.Name.Name] = append(declarations[fn.Name.Name], fn)
 				}
 			}
 		}
+		read := map[string]bool{}
 		for _, match := range pathOnlyHandler.FindAllStringSubmatch(string(raw), -1) {
-			fn := functions[match[2]]
-			if fn == nil {
-				t.Fatalf("%s registers handler %s, whose declaration was not found", source, match[2])
+			candidates := declarations[match[2]]
+			if len(candidates) != 1 {
+				t.Fatalf("%s registers handler %s, which names %d method declarations instead of one", source, match[2], len(candidates))
 			}
-			accepted, err := methodGuard(fn)
+			accepted, err := methodGuard(candidates[0])
 			if err != nil {
 				t.Fatalf("%s handler %s: %v", source, match[2], err)
 			}
+			read[match[1]] = true
 			routes.guarded = append(routes.guarded, guardedRoute{path: match[1], handler: match[2], methods: accepted})
+		}
+		// A method-less registration in any other handler form would drop out
+		// of the check entirely instead of being matched by path.
+		for _, match := range pathOnlyRegistration.FindAllStringSubmatch(string(raw), -1) {
+			if !read[match[1]] {
+				t.Errorf("%s registers %s without a method pattern through a handler whose method guard the drift test cannot read", source, match[1])
+			}
 		}
 		return routes
 	}
