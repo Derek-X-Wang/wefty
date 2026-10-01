@@ -96,12 +96,21 @@ func (server *Server) refuseOverLimit(ctx context.Context, connection net.Conn) 
 	}
 	select {
 	case server.limitRefusals <- struct{}{}:
-	case server.connections <- struct{}{}:
-		server.serveAdmitted(ctx, connection)
-		return
-	case <-ctx.Done():
-		_ = connection.Close()
-		return
+	default:
+		// Every refusal worker is busy: wait for one, or for a slot, rather
+		// than close on an allowed peer.
+		if server.config.refusalWaiting != nil {
+			server.config.refusalWaiting()
+		}
+		select {
+		case server.limitRefusals <- struct{}{}:
+		case server.connections <- struct{}{}:
+			server.serveAdmitted(ctx, connection)
+			return
+		case <-ctx.Done():
+			_ = connection.Close()
+			return
+		}
 	}
 	server.noteConnectionLimit("connection_limit")
 	go func() {

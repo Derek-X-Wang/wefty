@@ -286,7 +286,13 @@ func TestOverLimitRefusalIsBoundedAndAuthenticated(t *testing.T) {
 		}
 	})
 	t.Run("allowed peer past a full refusal budget waits for a typed answer", func(t *testing.T) {
-		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1})
+		waiting := make(chan struct{}, 1)
+		path := startRawHelper(t, ServerConfig{ConnectionLimit: 1, refusalWaiting: func() {
+			select {
+			case waiting <- struct{}{}:
+			default:
+			}
+		}})
 		_ = dialRaw(t, path)
 		silent := make([]net.Conn, 0, connectionLimitRefusalBudget)
 		for range connectionLimitRefusalBudget {
@@ -302,6 +308,15 @@ func TestOverLimitRefusalIsBoundedAndAuthenticated(t *testing.T) {
 			response, err := requestRaw(t, requester)
 			answered <- answer{response, err}
 		}()
+		// The requester is the first connection to find every worker busy,
+		// so the accept loop reaching its wait is the requester waiting.
+		// Only then is a worker freed: freeing one earlier would let the
+		// requester skip the wait this subtest is about.
+		select {
+		case <-waiting:
+		case <-time.After(30 * time.Second): // hang guard only
+			t.Fatal("the accept loop never waited for a refusal worker")
+		}
 		// Freeing one worker is what lets the accept loop answer the waiting
 		// peer; nothing else would within the hour the workers hold.
 		_ = silent[0].Close()
