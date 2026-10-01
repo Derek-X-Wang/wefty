@@ -47,7 +47,8 @@ const (
 	// because every bearer use re-proves the live scope with L1, the mutation
 	// that owed the row changed that scope, and that proof refuses every
 	// attempt on a dead host whatever its lease says (#623). The host's next
-	// boot revokes every grant L3 still holds for it (revoke-host).
+	// boot revokes every grant an earlier boot of it minted (the
+	// boot-session-fenced revoke-host).
 	owedRevocationSettledHostDead = "host_dead"
 	// MaxOwedRevocationsPerHeartbeat bounds the owed revocations one node
 	// heartbeat settles. They share the heartbeat's revocation budget with

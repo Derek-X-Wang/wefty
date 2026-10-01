@@ -13,10 +13,10 @@ import (
 )
 
 type retryingHostTokenRevoker struct {
-	mu        sync.Mutex
-	failures  int
-	calls     []l3.HostComputerTokenRevocationRequest
-	called    chan l3.HostComputerTokenRevocationRequest
+	mu       sync.Mutex
+	failures int
+	calls    []l3.HostComputerTokenRevocationRequest
+	called   chan l3.HostComputerTokenRevocationRequest
 }
 
 func (revoker *retryingHostTokenRevoker) RevokeComputerAttemptTokens(context.Context, l3.ComputerAttemptTokenRevocationRequest) error {
@@ -146,7 +146,7 @@ func TestHostTokenRevocationStopsOnShutdown(t *testing.T) {
 	session := &agentSession{}
 	agent := &Agent{
 		registration: contractNodeRegistration("boot-current"),
-		session: session, computerTokens: revoker, clock: clock,
+		session:      session, computerTokens: revoker, clock: clock,
 	}
 	agent.startHostTokenRevocation(context.Background())
 	session.markRegistered()
@@ -154,10 +154,12 @@ func TestHostTokenRevocationStopsOnShutdown(t *testing.T) {
 	delay := activeManualTimerDelay(t, clock)
 	agent.Close()
 	clock.Advance(delay + time.Hour)
+	// Give a worker that outlived Close time to fire on the advanced clock;
+	// a non-blocking check would pass before such a worker was scheduled.
 	select {
 	case call := <-revoker.called:
 		t.Fatalf("revoke-host ran after Close returned: %#v", call)
-	default:
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -189,8 +191,8 @@ func TestAgentCloseWaitsForHostTokenRevocation(t *testing.T) {
 	revoker := &blockingHostTokenRevoker{started: make(chan struct{}), release: make(chan struct{})}
 	session := &agentSession{}
 	agent := &Agent{
-		registration: contractNodeRegistration("boot-current"),
-		session:      session,
+		registration:   contractNodeRegistration("boot-current"),
+		session:        session,
 		computerTokens: revoker,
 		clock:          systemClock{},
 	}

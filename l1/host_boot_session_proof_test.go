@@ -30,11 +30,11 @@ func TestHostBootSessionProofAcceptsOnlyCurrentRegistration(t *testing.T) {
 
 	register("boot-a")
 	for name, claim := range map[string][2]string{
-		"blank identity":   {"", "boot-a"},
-		"padded identity":  {" fabric-node", "boot-a"},
-		"blank boot":       {"fabric-node", ""},
-		"padded boot":      {"fabric-node", "boot-a "},
-		"oversized boot":   {"fabric-node", strings.Repeat("b", 256)},
+		"blank identity":     {"", "boot-a"},
+		"padded identity":    {" fabric-node", "boot-a"},
+		"blank boot":         {"fabric-node", ""},
+		"padded boot":        {"fabric-node", "boot-a "},
+		"oversized boot":     {"fabric-node", strings.Repeat("b", 256)},
 		"oversized identity": {strings.Repeat("n", 256), "boot-a"},
 	} {
 		if err := h.store.ProveHostBootSession(ctx, claim[0], claim[1]); errorCode(err) != contract.ErrorInvalidRequest {
