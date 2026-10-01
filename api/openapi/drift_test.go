@@ -42,7 +42,8 @@ import (
 //
 // References are followed the way a validator follows them, $dynamicRef
 // included; a reference the walk cannot follow fails the test instead of
-// ending the comparison quietly.
+// ending the comparison quietly. Repeated property, item and map-value
+// declarations retain the composition semantics that made each one apply.
 //
 // Every object schema a protocol file publishes must be reached by a row, by
 // recursion from a row, or be listed in driftUnmapped with the reason it is
@@ -555,7 +556,10 @@ func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
 		"refWithSibling": {"$ref": "#/$defs/ab", "enum": ["b", "z"]},
 		"aliasOnly": {"$ref": "#/$defs/ab", "description": "an annotation does not narrow"},
 		"plain": {"type": "string"},
-		"negated": {"type": "string", "not": {"enum": ["a"]}}
+		"nullableOpen": {"oneOf": [{"type": "null"}, {"type": "string"}]},
+		"negated": {"type": "string", "not": {"enum": ["a"]}},
+		"oneOfShared": {"oneOf": [{"enum": ["a", "b"]}, {"enum": ["b", "c"]}]},
+		"oneOfOpen": {"oneOf": [{"enum": ["a"]}, {"type": "string"}]}
 	}}`
 	var parsed any
 	if err := json.Unmarshal([]byte(document), &parsed); err != nil {
@@ -589,6 +593,7 @@ func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
 		{"refWithSibling", []string{"b"}, true},
 		{"aliasOnly", []string{"a", "b"}, true},
 		{"plain", []string{}, false},
+		{"nullableOpen", []string{}, false},
 	} {
 		values, closed, refused := read(check.name)
 		if refused != "" {
@@ -601,6 +606,385 @@ func TestVocabularyFollowsCompositionSemantics(t *testing.T) {
 	}
 	if _, _, refused := read("negated"); !strings.Contains(refused, `"not"`) {
 		t.Errorf("a schema using not was read instead of refused (%q)", refused)
+	}
+	// A string two oneOf arms admit is one oneOf rejects, so overlapping arms
+	// are refused instead of read as their union (#620).
+	for _, name := range []string{"oneOfShared", "oneOfOpen"} {
+		if _, _, refused := read(name); !strings.Contains(refused, "oneOf arms") {
+			t.Errorf("%s: overlapping oneOf arms were read instead of refused (%q)", name, refused)
+		}
+	}
+}
+
+// TestMembersComposeAcrossArms pins how property, item, and map-value schemas
+// retain every declaration made through composition, and that compositions the
+// reader cannot read exactly are refused rather than read leniently (#620).
+func TestMembersComposeAcrossArms(t *testing.T) {
+	t.Parallel()
+
+	const document = `{"$defs": {
+		"ownAndArms": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a", "b"]}},
+			"oneOf": [
+				{"type": "object", "properties": {"value": {"const": "a"}}},
+				{"type": "object", "properties": {"value": {"const": "b"}}}
+			]
+		},
+		"sameArms": {"oneOf": [
+			{"type": "object", "properties": {"value": {"const": "a"}}},
+			{"type": "object", "properties": {"value": {"const": "a"}}}
+		]},
+		"overlappingArms": {"oneOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a", "b"]}}},
+			{"type": "object", "properties": {"value": {"enum": ["b", "c"]}}}
+		]},
+		"oneOfMissingArm": {"oneOf": [
+			{"type": "object", "properties": {"value": {"const": "a"}}},
+			{"type": "object"}
+		]},
+		"oneOfObjects": {"oneOf": [
+			{"type": "object", "properties": {"value": {"type": "object", "properties": {"kind": {"const": "a"}}}}},
+			{"type": "object", "properties": {"value": {"type": "object", "properties": {"kind": {"const": "b"}}}}}
+		]},
+		"oneOfForbiddingArm": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a", "b"]}},
+			"oneOf": [
+				{"not": {"required": ["value"]}},
+				{"properties": {"value": {"const": "a"}}, "not": {"anyOf": [{"required": ["other"]}]}}
+			]
+		},
+		"lateResultEvidence": {
+			"type": "object", "additionalProperties": false,
+			"required": ["kind", "late", "observed_at", "authority_lost_at"],
+			"properties": {
+				"kind": {"enum": ["observation", "gap"]},
+				"result": {"type": "object"},
+				"gap": {"type": "object", "additionalProperties": false, "required": ["reason"],
+					"properties": {"reason": {"const": "observation_window_expired"}}},
+				"late": {"const": true},
+				"observed_at": {"type": "string", "format": "date-time"},
+				"authority_lost_at": {"type": "string", "format": "date-time"}
+			},
+			"oneOf": [
+				{"properties": {"kind": {"const": "observation"}}, "required": ["result"], "not": {"required": ["gap"]}},
+				{"properties": {"kind": {"const": "gap"}}, "required": ["gap"], "not": {"required": ["result"]}}
+			]
+		},
+		"lateResultEvidenceKindForbidden": {
+			"type": "object", "additionalProperties": false,
+			"required": ["kind", "late", "observed_at", "authority_lost_at"],
+			"properties": {
+				"kind": {"enum": ["observation", "gap"]},
+				"result": {"type": "object"},
+				"gap": {"type": "object", "additionalProperties": false, "required": ["reason"],
+					"properties": {"reason": {"const": "observation_window_expired"}}},
+				"late": {"const": true},
+				"observed_at": {"type": "string", "format": "date-time"},
+				"authority_lost_at": {"type": "string", "format": "date-time"}
+			},
+			"oneOf": [
+				{"properties": {"kind": {"const": "observation"}}, "required": ["result"], "not": {"required": ["kind"]}},
+				{"properties": {"kind": {"const": "gap"}}, "required": ["gap"], "not": {"required": ["result"]}}
+			]
+		},
+		"declaringArmForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a", "b"]}},
+			"anyOf": [
+				{"properties": {"value": {"const": "a"}}, "not": {"anyOf": [{"required": ["value"]}]}},
+				{"properties": {"value": {"const": "b"}}}
+			]
+		},
+		"alwaysDeclaringArmForbids": {
+			"type": "object",
+			"allOf": [{"properties": {"value": {"const": "a"}}, "not": {"required": ["value"]}}],
+			"properties": {"value": {"enum": ["a"]}}
+		},
+		"ownNotForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"not": {"required": ["value"]}
+		},
+		"closedArmForbids": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "additionalProperties": false}
+		]},
+		"unevaluatedArmForbids": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "unevaluatedProperties": false}
+		]},
+		"notRequiredArmForbids": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "not": {"anyOf": [{"required": ["value"]}, {"required": ["other"]}]}}
+		]},
+		"pairRequiredDoesNotForbid": {"anyOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
+			{"type": "object", "not": {"required": ["value", "other"]}}
+		]},
+		"everyArmForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"anyOf": [
+				{"additionalProperties": false},
+				{"not": {"required": ["value"]}}
+			]
+		},
+		"alwaysArmForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"allOf": [{"type": "object", "additionalProperties": false}]
+		},
+		"bothBranchesForbid": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"if": {"properties": {"mode": {"const": "a"}}},
+			"then": {"not": {"required": ["value"]}},
+			"else": {"additionalProperties": false}
+		},
+		"closedTwice": {"allOf": [
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}
+			}}},
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"b": {"type": "string"}}
+			}}}
+		]},
+		"closedBesideWider": {
+			"type": "object",
+			"properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}
+			}},
+			"then": {"properties": {"value": {"properties": {"b": {"type": "string"}}}}}
+		},
+		"closedAlternatives": {"anyOf": [
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}
+			}}},
+			{"type": "object", "properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"b": {"type": "string"}}
+			}}}
+		]},
+		"closedAgreeing": {
+			"type": "object",
+			"properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}, "b": {"type": "string"}}
+			}},
+			"if": {"properties": {"mode": {"const": "a"}}},
+			"then": {"properties": {"value": {
+				"type": "object", "additionalProperties": false, "properties": {"a": {"const": "x"}, "b": {"type": "string"}}
+			}}}
+		},
+		"allArms": {"allOf": [
+			{"type": "object", "properties": {"value": {"enum": ["a", "b"]}}},
+			{"type": "object", "properties": {"value": {"enum": ["b", "c"]}}}
+		]},
+		"missingArm": {"anyOf": [
+			{"type": "object", "properties": {"value": {"const": "a"}}},
+			{"type": "object"}
+		]},
+		"nullable": {"oneOf": [
+			{"type": "null"},
+			{"type": "object", "properties": {"value": {"const": "a"}}}
+		]},
+		"conditional": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a", "b"]}},
+			"if": {"properties": {"mode": {"const": "a"}}},
+			"then": {"properties": {"value": {"const": "a"}}},
+			"else": {"properties": {"value": {"const": "b"}}}
+		},
+		"thenOnly": {
+			"if": {"properties": {"mode": {"const": "a"}}},
+			"then": {"properties": {"value": {"const": "a"}}}
+		},
+		"items": {"oneOf": [
+			{"type": "array", "items": {"const": "a"}},
+			{"type": "array", "items": {"const": "b"}}
+		]},
+		"values": {"oneOf": [
+			{"type": "object", "additionalProperties": {"const": "a"}},
+			{"type": "object", "additionalProperties": {"const": "b"}}
+		]},
+		"nested": {"anyOf": [
+			{"type": "object", "properties": {"value": {
+				"type": "object", "properties": {"kind": {"const": "a"}}
+			}}},
+			{"type": "object", "properties": {"value": {
+				"type": "object", "properties": {"kind": {"const": "b"}}
+			}}}
+		]},
+		"allowedNot": {
+			"type": "object",
+			"properties": {"value": {"const": "a"}},
+			"not": {"properties": {"value": true}}
+		},
+		"negated": {
+			"type": "object",
+			"not": {"properties": {"value": {"const": "a"}}}
+		}
+	}}`
+	var parsed any
+	if err := json.Unmarshal([]byte(document), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	type failure struct{ message string }
+	set := &schemaSet{docs: map[string]any{"inline.json": parsed}}
+	set.fatalf = func(format string, args ...any) { panic(failure{fmt.Sprintf(format, args...)}) }
+	read := func(name string, tokens ...string) (values []string, closed bool, refused string) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				caught, ok := recovered.(failure)
+				if !ok {
+					panic(recovered)
+				}
+				refused = caught.message
+			}
+		}()
+		member, ok := set.member(set.root("inline.json#/$defs/"+name), tokens...)
+		if !ok {
+			return nil, false, ""
+		}
+		admitted, closed := set.vocabulary(member)
+		return sortedKeys(admitted), closed, ""
+	}
+	for _, check := range []struct {
+		name   string
+		tokens []string
+		values []string
+		closed bool
+	}{
+		{"ownAndArms", []string{"properties", "value"}, []string{"a", "b"}, true},
+		{"oneOfForbiddingArm", []string{"properties", "value"}, []string{"a"}, true},
+		{"closedArmForbids", []string{"properties", "value"}, []string{"a"}, true},
+		{"unevaluatedArmForbids", []string{"properties", "value"}, []string{"a"}, true},
+		{"notRequiredArmForbids", []string{"properties", "value"}, []string{"a"}, true},
+		{"pairRequiredDoesNotForbid", []string{"properties", "value"}, nil, false},
+		// An arm that declares a property but requires it to be absent admits
+		// no value for it. lateResultEvidence copies common.v1.json
+		// LateResultEvidence (result's ProcessResult $ref reduced to an
+		// object); its KindForbidden twin names kind instead of gap in the
+		// observation arm's not, which forbids every observation.
+		{"lateResultEvidence", []string{"properties", "kind"}, []string{"gap", "observation"}, true},
+		{"lateResultEvidenceKindForbidden", []string{"properties", "kind"}, []string{"gap"}, true},
+		{"declaringArmForbids", []string{"properties", "value"}, []string{"b"}, true},
+		{"allArms", []string{"properties", "value"}, []string{"b"}, true},
+		{"missingArm", []string{"properties", "value"}, nil, false},
+		{"nullable", []string{"properties", "value"}, []string{"a"}, true},
+		{"conditional", []string{"properties", "value"}, []string{"a", "b"}, true},
+		{"thenOnly", []string{"properties", "value"}, nil, false},
+		{"items", []string{"items"}, []string{"a", "b"}, true},
+		{"values", []string{"additionalProperties"}, []string{"a", "b"}, true},
+		{"allowedNot", []string{"properties", "value"}, []string{"a"}, true},
+	} {
+		values, closed, refused := read(check.name, check.tokens...)
+		if refused != "" {
+			t.Errorf("%s: refused: %s", check.name, refused)
+			continue
+		}
+		if closed != check.closed || (closed && !reflect.DeepEqual(values, check.values)) {
+			t.Errorf("%s: member vocabulary = %v closed=%v, want %v closed=%v", check.name, values, closed, check.values, check.closed)
+		}
+	}
+	nested, ok := set.member(set.root("inline.json#/$defs/nested"), "properties", "value")
+	if !ok {
+		t.Fatal("nested: value member was not found")
+	}
+	kind, ok := set.member(nested, "properties", "kind")
+	if !ok {
+		t.Fatal("nested: kind member was not found")
+	}
+	values, closed := set.vocabulary(kind)
+	if got := sortedKeys(values); !closed || !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Errorf("nested: member vocabulary = %v closed=%v, want [a b] closed=true", got, closed)
+	}
+	if _, _, refused := read("negated", "properties", "value"); !strings.Contains(refused, `"not"`) {
+		t.Errorf("a property narrowed by not was read instead of refused (%q)", refused)
+	}
+	// Shapes this reader does not model are refused, never read leniently.
+	for _, check := range []struct{ name, refusal string }{
+		// A value two oneOf arms admit is one oneOf rejects: identical arms
+		// admit nothing, so they are not read as their union.
+		{"sameArms", "oneOf arms"},
+		{"overlappingArms", "oneOf arms"},
+		{"oneOfMissingArm", "oneOf arms"},
+		{"oneOfObjects", "oneOf arms"},
+		// A property that some declaration admits and an arm that always
+		// applies, or every arm of a group, forbids.
+		{"everyArmForbids", "being forbidden by"},
+		{"alwaysArmForbids", "being forbidden by"},
+		{"bothBranchesForbid", "being forbidden by"},
+		{"alwaysDeclaringArmForbids", "being forbidden by"},
+		{"ownNotForbids", "being forbidden by its own not"},
+		// A closed declaration that omits a property another declaration of
+		// the same member declares rejects it, though the merge would admit it.
+		{"closedTwice", "closed declaration"},
+		{"closedBesideWider", "closed declaration"},
+		{"closedAlternatives", "closed declaration"},
+	} {
+		if _, _, refused := read(check.name, "properties", "value"); !strings.Contains(refused, check.refusal) {
+			t.Errorf("%s: was read instead of refused with %q (%q)", check.name, check.refusal, refused)
+		}
+	}
+	// Closed declarations that agree on their properties compose: each one
+	// admits exactly what the merged shape does.
+	agreeing, ok := set.member(set.root("inline.json#/$defs/closedAgreeing"), "properties", "value")
+	if !ok {
+		t.Fatal("closedAgreeing: value member was not found")
+	}
+	if shape := set.shape(agreeing, nil); !shape.closed || !reflect.DeepEqual(sortedKeys(shape.properties), []string{"a", "b"}) {
+		t.Errorf("closedAgreeing: shape = %v closed=%v, want [a b] closed=true", sortedKeys(shape.properties), shape.closed)
+	}
+}
+
+// TestMethodGuardReader pins the deliberately small handler shape used by
+// method-less mux registrations. A handler that stops using that shape must be
+// made explicit here rather than silently weakening the route drift check.
+func TestMethodGuardReader(t *testing.T) {
+	t.Parallel()
+
+	const source = `package inline
+		import "net/http"
+		func post(r *http.Request) { if r.Method != http.MethodPost { return } }
+		func read(r *http.Request) { if r.Method != http.MethodGet && r.Method != http.MethodHead { return } }
+		func literal(r *http.Request) { if r.Method != "PATCH" { return } }
+		func switched(r *http.Request) { switch r.Method {} }
+		func equal(r *http.Request) { if r.Method == http.MethodPost { return } }
+		func late(r *http.Request) { _ = r.Method; if r.Method != http.MethodPost { return } }
+		func noReturn(r *http.Request) { if r.Method != http.MethodPost { _ = r.Method } }
+	`
+	file, err := parser.ParseFile(token.NewFileSet(), "inline.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions := map[string]*ast.FuncDecl{}
+	for _, declaration := range file.Decls {
+		if fn, ok := declaration.(*ast.FuncDecl); ok {
+			functions[fn.Name.Name] = fn
+		}
+	}
+	for _, check := range []struct {
+		name string
+		want []string
+	}{
+		{"post", []string{"POST"}},
+		{"read", []string{"GET", "HEAD"}},
+		{"literal", []string{"PATCH"}},
+	} {
+		got, err := methodGuard(functions[check.name])
+		if err != nil {
+			t.Errorf("%s: %v", check.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, check.want) {
+			t.Errorf("%s: accepted methods = %v, want %v", check.name, got, check.want)
+		}
+	}
+	for _, name := range []string{"switched", "equal", "late", "noReturn"} {
+		if _, err := methodGuard(functions[name]); err == nil {
+			t.Errorf("%s: unsupported method guard was accepted", name)
+		}
 	}
 }
 
@@ -662,15 +1046,24 @@ func TestNodeProjectionsValidateAgainstPublishedSchemas(t *testing.T) {
 
 // TestEveryServedRouteIsPublished keeps a handler from going live without an
 // OpenAPI operation, which is how the agent's service-binding-proof and
-// image-reconciliation-failure routes went unpublished (#601).
+// image-reconciliation-failure routes went unpublished (#601). Registrations
+// without a method pattern are held to the methods their handler guard accepts,
+// so publishing the right path under the wrong method is drift too (#620).
 func TestEveryServedRouteIsPublished(t *testing.T) {
 	t.Parallel()
 
+	methods := map[string]bool{
+		"get": true, "put": true, "post": true, "delete": true,
+		"options": true, "head": true, "patch": true, "trace": true,
+	}
 	published := func(documents ...string) map[string]bool {
 		operations := map[string]bool{}
 		for _, name := range documents {
 			for route, value := range object(t, readObject(t, name)["paths"], name+" paths") {
 				for method := range object(t, value, route) {
+					if !methods[method] {
+						continue
+					}
 					operations[strings.ToUpper(method)+" "+route] = true
 				}
 			}
@@ -681,51 +1074,89 @@ func TestEveryServedRouteIsPublished(t *testing.T) {
 	l3Operations := published(l3Doc)
 
 	methodRoute := regexp.MustCompile(`\.Handle(?:Func)?\("([A-Z]+) (/[^"]*)"`)
-	pathOnlyHandler := regexp.MustCompile(`\.Handle\("(/[^"]*)", s\.authenticateFabric\(http\.HandlerFunc\(`)
-	served := func(source string) []string {
+	pathOnlyRegistration := regexp.MustCompile(`\.Handle\("(/[^"]*)", s\.authenticateFabric\(http\.HandlerFunc\(`)
+	pathOnlyHandler := regexp.MustCompile(`\.Handle\("(/[^"]*)", s\.authenticateFabric\(http\.HandlerFunc\(s\.(\w+)\)\)\)`)
+	type guardedRoute struct {
+		path    string
+		handler string
+		methods []string
+	}
+	type servedRoutes struct {
+		operations []string
+		guarded    []guardedRoute
+	}
+	served := func(source string) servedRoutes {
 		raw, err := os.ReadFile(filepath.Join("..", "..", source))
 		if err != nil {
 			t.Fatal(err)
 		}
-		var routes []string
+		var routes servedRoutes
 		for _, match := range methodRoute.FindAllStringSubmatch(string(raw), -1) {
 			if strings.Contains(match[2], "{$}") {
 				continue // the trailing-slash alias of a published collection route
 			}
-			routes = append(routes, match[1]+" "+match[2])
+			routes.operations = append(routes.operations, match[1]+" "+match[2])
 		}
+		declarations := map[string][]*ast.FuncDecl{}
+		for _, file := range parseSources(t, filepath.Dir(source)) {
+			for _, declaration := range file.Decls {
+				if fn, ok := declaration.(*ast.FuncDecl); ok && fn.Recv != nil {
+					declarations[fn.Name.Name] = append(declarations[fn.Name.Name], fn)
+				}
+			}
+		}
+		read := map[string]bool{}
 		for _, match := range pathOnlyHandler.FindAllStringSubmatch(string(raw), -1) {
-			routes = append(routes, "* "+match[1])
+			candidates := declarations[match[2]]
+			if len(candidates) != 1 {
+				t.Fatalf("%s registers handler %s, which names %d method declarations instead of one", source, match[2], len(candidates))
+			}
+			accepted, err := methodGuard(candidates[0])
+			if err != nil {
+				t.Fatalf("%s handler %s: %v", source, match[2], err)
+			}
+			read[match[1]] = true
+			routes.guarded = append(routes.guarded, guardedRoute{path: match[1], handler: match[2], methods: accepted})
+		}
+		// A method-less registration in any other handler form would drop out
+		// of the check entirely instead of being matched by path.
+		for _, match := range pathOnlyRegistration.FindAllStringSubmatch(string(raw), -1) {
+			if !read[match[1]] {
+				t.Errorf("%s registers %s without a method pattern through a handler whose method guard the drift test cannot read", source, match[1])
+			}
 		}
 		return routes
 	}
-	check := func(source string, routes []string, operations map[string]bool) {
-		if len(routes) == 0 {
+	check := func(source string, routes servedRoutes, operations map[string]bool) {
+		if len(routes.operations)+len(routes.guarded) == 0 {
 			t.Fatalf("found no routes in %s", source)
 		}
-		for _, route := range routes {
-			method, pattern, _ := strings.Cut(route, " ")
-			if method == "*" {
-				found := false
-				for operation := range operations {
-					if strings.HasSuffix(operation, " "+pattern) {
-						found = true
-					}
-				}
-				if !found {
-					t.Errorf("%s serves %s, which no OpenAPI operation publishes", source, pattern)
-				}
-				continue
-			}
+		for _, route := range routes.operations {
 			if !operations[route] {
 				t.Errorf("%s serves %s, which no OpenAPI operation publishes", source, route)
+			}
+		}
+		for _, route := range routes.guarded {
+			accepted := map[string]bool{}
+			for _, method := range route.methods {
+				accepted[method] = true
+				operation := method + " " + route.path
+				if !operations[operation] {
+					t.Errorf("%s handler %s accepts %s, which no OpenAPI operation publishes", source, route.handler, operation)
+				}
+			}
+			for operation := range operations {
+				method, pattern, _ := strings.Cut(operation, " ")
+				if pattern == route.path && !accepted[method] {
+					t.Errorf("OpenAPI publishes %s, which %s handler %s refuses", operation, source, route.handler)
+				}
 			}
 		}
 	}
 	check("l1/server.go", served("l1/server.go"), l1Operations)
 	l3Routes := served("l3/server.go")
 	for _, route := range l3.ComputerTokenRoutes() {
-		l3Routes = append(l3Routes, route.Method+" "+route.Path)
+		l3Routes.operations = append(l3Routes.operations, route.Method+" "+route.Path)
 	}
 	check("l3/server.go", l3Routes, l3Operations)
 }
@@ -751,8 +1182,48 @@ func (l schemaLocation) key() string { return l.doc + "#" + l.pointer }
 // means the strict executable under JobSpec and the scrubbed-or-strict one
 // under JobRecordSpec.
 type schemaRef struct {
-	loc   schemaLocation
-	scope []schemaLocation
+	loc      schemaLocation
+	scope    []schemaLocation
+	composed *composedSchema
+}
+
+// composedSchema is a synthetic schema for one member declared in several
+// composition arms. Every schema in all applies; one schema in each
+// alternatives group applies. An empty composition is an open placeholder for
+// an arm that does not declare the member.
+type composedSchema struct {
+	all          []schemaRef
+	alternatives [][]schemaRef
+}
+
+func identity(r schemaRef) string {
+	var out strings.Builder
+	var write func(schemaRef)
+	write = func(r schemaRef) {
+		out.WriteString(r.loc.key())
+		out.WriteByte('@')
+		out.WriteString(scopeKey(r.scope))
+		if r.composed == nil {
+			return
+		}
+		out.WriteString("[all:")
+		for _, member := range r.composed.all {
+			write(member)
+			out.WriteByte(';')
+		}
+		out.WriteString("|alternatives:")
+		for _, group := range r.composed.alternatives {
+			out.WriteByte('(')
+			for _, member := range group {
+				write(member)
+				out.WriteByte(';')
+			}
+			out.WriteByte(')')
+		}
+		out.WriteByte(']')
+	}
+	write(r)
+	return out.String()
 }
 
 func newSchemaSet(t *testing.T) *schemaSet {
@@ -901,6 +1372,9 @@ func (s *schemaSet) reference(r schemaRef) (schemaRef, bool) {
 // of each alternative group applies (oneOf, anyOf); conditional arms apply
 // sometimes (then, else).
 func (s *schemaSet) arms(r schemaRef) (all []schemaRef, alternatives [][]schemaRef, conditional []schemaRef) {
+	if r.composed != nil {
+		return r.composed.all, r.composed.alternatives, nil
+	}
 	if members, ok := r.loc.node["allOf"].([]any); ok {
 		for index := range members {
 			all = append(all, s.child(r, "allOf", strconv.Itoa(index)))
@@ -1018,7 +1492,7 @@ func (s *schemaSet) anchor(resource schemaLocation, name string) (schemaLocation
 }
 
 type objectShape struct {
-	properties map[string]schemaRef
+	properties map[string]bool
 	required   map[string]bool
 	closed     bool
 }
@@ -1030,15 +1504,16 @@ func (shape objectShape) isObject() bool { return len(shape.properties) > 0 || s
 // alternative and conditional arms only contribute properties, since what
 // they require holds on one arm alone.
 func (s *schemaSet) shape(r schemaRef, visit func(schemaLocation)) objectShape {
-	shape := objectShape{properties: map[string]schemaRef{}, required: map[string]bool{}}
+	shape := objectShape{properties: map[string]bool{}, required: map[string]bool{}}
 	seen := map[string]bool{}
 	var walk func(schemaRef, bool)
 	walk = func(r schemaRef, unconditional bool) {
 		r = s.resolve(r, visit)
-		if seen[r.loc.key()] {
+		key := identity(r)
+		if seen[key] {
 			return
 		}
-		seen[r.loc.key()] = true
+		seen[key] = true
 		if properties, ok := r.loc.node["properties"].(map[string]any); ok {
 			names := make([]string, 0, len(properties))
 			for name := range properties {
@@ -1046,9 +1521,7 @@ func (s *schemaSet) shape(r schemaRef, visit func(schemaLocation)) objectShape {
 			}
 			sort.Strings(names)
 			for _, name := range names {
-				if _, present := shape.properties[name]; !present {
-					shape.properties[name] = s.child(r, "properties", name)
-				}
+				shape.properties[name] = true
 			}
 		}
 		if unconditional {
@@ -1080,9 +1553,9 @@ func (s *schemaSet) shape(r schemaRef, visit func(schemaLocation)) objectShape {
 	return shape
 }
 
-// declaresFreeFormObject reports a schema that deliberately publishes an
+// declaresFreeFormObjectNode reports a schema that deliberately publishes an
 // object without a shape, such as {"type": "object"}.
-func declaresFreeFormObject(node map[string]any) bool {
+func declaresFreeFormObjectNode(node map[string]any) bool {
 	switch value := node["type"].(type) {
 	case string:
 		return value == "object"
@@ -1096,28 +1569,392 @@ func declaresFreeFormObject(node map[string]any) bool {
 	return false
 }
 
-// nested finds the schema for array items ("items") or map values
-// ("additionalProperties"), looking through every arm.
-func (s *schemaSet) nested(r schemaRef, keyword string) (schemaRef, bool) {
-	r = s.resolve(r, nil)
-	if _, ok := r.loc.node[keyword].(map[string]any); ok {
-		return s.child(r, keyword), true
+func (s *schemaSet) declaresFreeFormObject(r schemaRef) bool {
+	seen := map[string]bool{}
+	var walk func(schemaRef) bool
+	walk = func(r schemaRef) bool {
+		r = s.resolve(r, nil)
+		key := identity(r)
+		if seen[key] {
+			return false
+		}
+		seen[key] = true
+		if declaresFreeFormObjectNode(r.loc.node) {
+			return true
+		}
+		all, _, _ := s.arms(r)
+		for _, arm := range all {
+			if walk(arm) {
+				return true
+			}
+		}
+		return false
 	}
-	all, alternatives, _ := s.arms(r)
+	return walk(r)
+}
+
+func memberValue(node map[string]any, tokens ...string) (any, bool) {
+	var current any = node
+	for _, token := range tokens {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current, ok = object[token]
+		if !ok {
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+func (s *schemaSet) placeholder(r schemaRef) schemaRef {
+	r = s.resolve(r, nil)
+	r.loc.node = map[string]any{}
+	r.composed = &composedSchema{}
+	return r
+}
+
+func (s *schemaSet) notNarrowsMember(r schemaRef, tokens []string, seen map[string]bool) bool {
+	r = s.resolve(r, nil)
+	key := identity(r) + "|" + strings.Join(tokens, "/")
+	if seen[key] {
+		return false
+	}
+	seen[key] = true
+	defer delete(seen, key)
+	if value, ok := memberValue(r.loc.node, tokens...); ok && value != true {
+		return true
+	}
+	all, alternatives, conditional := s.arms(r)
 	for _, group := range alternatives {
 		all = append(all, group...)
 	}
+	all = append(all, conditional...)
 	for _, arm := range all {
-		if found, ok := s.nested(arm, keyword); ok {
-			return found, true
+		if s.notNarrowsMember(arm, tokens, seen) {
+			return true
 		}
 	}
-	return schemaRef{}, false
+	if _, ok := r.loc.node["not"].(map[string]any); ok {
+		return s.notNarrowsMember(s.child(r, "not"), tokens, seen)
+	}
+	return false
+}
+
+// member combines every declaration of a property, array item, or map value
+// according to the composition that makes it apply. Missing alternative arms
+// are open placeholders; arms whose type excludes the containing value do not
+// participate, and neither do arms that forbid the property (see forbids). A
+// negated declaration is refused because its admitted member set cannot be
+// recovered by this reader.
+//
+// This is a structural reader, not a validator: it models the compositions
+// the protocol schemas use and refuses the rest rather than guessing. It
+// refuses a property every arm of a group, or any arm that always applies,
+// forbids; oneOf arms whose admitted values it cannot show to be disjoint,
+// since a value two arms admit is one oneOf rejects; and a closed object
+// declaration that omits a property another declaration of the same member
+// declares, since merging the declarations would admit a value the closed one
+// rejects.
+func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
+	container := "object"
+	if len(tokens) == 1 && tokens[0] == "items" {
+		container = "array"
+	}
+	property := ""
+	if len(tokens) == 2 && tokens[0] == "properties" {
+		property = tokens[1]
+	}
+	// forbidding reports an arm that rules the property out without declaring
+	// it (see forbids); absent, an arm that declares it but whose not still
+	// requires it to be absent, so the arm admits no value for it.
+	forbidding := func(arm schemaRef) bool { return property != "" && s.forbids(arm, property) }
+	absent := func(arm schemaRef) bool { return property != "" && s.requiresAbsent(arm, property) }
+	seen := map[string]bool{}
+	var read func(schemaRef) (schemaRef, bool)
+	read = func(r schemaRef) (schemaRef, bool) {
+		r = s.resolve(r, nil)
+		key := identity(r) + "|" + strings.Join(tokens, "/")
+		if seen[key] {
+			return schemaRef{}, false
+		}
+		seen[key] = true
+		defer delete(seen, key)
+
+		if _, ok := r.loc.node["not"].(map[string]any); ok &&
+			s.notNarrowsMember(s.child(r, "not"), tokens, map[string]bool{}) {
+			s.fatalf("%s: the drift member reader does not model %q narrowing %s", r.loc.key(), "not", strings.Join(tokens, "/"))
+		}
+
+		var all []schemaRef
+		var alternatives [][]schemaRef
+		var first schemaRef
+		found := false
+		remember := func(member schemaRef) {
+			if !found {
+				first = member
+			}
+			found = true
+		}
+		mergeAlways := func(member schemaRef) {
+			remember(member)
+			if member.composed == nil {
+				all = append(all, member)
+				return
+			}
+			all = append(all, member.composed.all...)
+			alternatives = append(alternatives, member.composed.alternatives...)
+		}
+
+		if value, ok := memberValue(r.loc.node, tokens...); ok {
+			switch value := value.(type) {
+			case map[string]any:
+				mergeAlways(s.child(r, tokens...))
+			case bool:
+				if !value {
+					s.fatalf("%s: the drift member reader does not model a false schema at %s", r.loc.key(), strings.Join(tokens, "/"))
+				}
+				open := s.child(r, tokens...)
+				open.loc.node = map[string]any{}
+				open.composed = &composedSchema{}
+				mergeAlways(open)
+			default:
+				s.fatalf("%s: %s is not a schema", r.loc.key(), strings.Join(tokens, "/"))
+			}
+		}
+
+		// forbidden names an arm or group that rules the property out wherever
+		// it applies; it matters only if some other declaration admits it.
+		forbidden := ""
+		always, groups, conditional := s.arms(r)
+		for _, arm := range always {
+			member, declared := read(arm)
+			switch {
+			case declared && !absent(arm):
+				mergeAlways(member)
+			case declared || forbidding(arm):
+				forbidden = s.resolve(arm, nil).loc.key()
+			}
+		}
+		for _, group := range groups {
+			exclusive := r.composed == nil && len(group) > 0 && path.Base(path.Dir(group[0].loc.pointer)) == "oneOf"
+			var members []schemaRef
+			groupDeclares, participating := false, 0
+			for _, arm := range group {
+				resolved := s.resolve(arm, nil)
+				if kind, ok := resolved.loc.node["type"]; ok && !typeAdmits(kind, container) {
+					continue
+				}
+				participating++
+				member, declared := read(arm)
+				switch {
+				case declared && !absent(arm):
+					if !groupDeclares {
+						remember(member)
+					}
+					groupDeclares = true
+					members = append(members, member)
+				case !declared && !forbidding(arm):
+					members = append(members, s.placeholder(arm))
+				}
+			}
+			if participating > 0 && len(members) == 0 {
+				forbidden = "every arm of " + path.Dir(group[0].loc.pointer)
+			}
+			if groupDeclares {
+				if exclusive {
+					s.disjoint(r, tokens, members)
+				}
+				alternatives = append(alternatives, members)
+			}
+		}
+		if len(conditional) > 0 {
+			byKeyword := map[string]schemaRef{}
+			for _, arm := range conditional {
+				byKeyword[path.Base(arm.loc.pointer)] = arm
+			}
+			members := make([]schemaRef, 0, 2)
+			groupDeclares := false
+			for _, keyword := range []string{"then", "else"} {
+				arm, ok := byKeyword[keyword]
+				if !ok {
+					members = append(members, s.placeholder(r))
+					continue
+				}
+				member, declared := read(arm)
+				switch {
+				case declared && !absent(arm):
+					if !groupDeclares {
+						remember(member)
+					}
+					groupDeclares = true
+					members = append(members, member)
+				case !declared && !forbidding(arm):
+					members = append(members, s.placeholder(arm))
+				}
+			}
+			if len(members) == 0 {
+				forbidden = "both then and else"
+			}
+			if groupDeclares {
+				alternatives = append(alternatives, members)
+			}
+		}
+
+		if !found {
+			return schemaRef{}, false
+		}
+		if forbidden != "" {
+			s.fatalf("%s: the drift member reader does not model %s, which another declaration admits, being forbidden by %s",
+				r.loc.key(), strings.Join(tokens, "/"), forbidden)
+		}
+		if len(all) == 1 && len(alternatives) == 0 && identity(first) == identity(all[0]) {
+			return all[0], true
+		}
+		combined := s.resolve(first, nil)
+		combined.loc.node = map[string]any{}
+		combined.composed = &composedSchema{all: all, alternatives: alternatives}
+		return combined, true
+	}
+	member, ok := read(r)
+	if ok && absent(r) {
+		s.fatalf("%s: the drift member reader does not model %s, which the schema declares, being forbidden by its own not",
+			r.loc.key(), strings.Join(tokens, "/"))
+	}
+	if ok && member.composed != nil {
+		s.closures(member)
+	}
+	return member, ok
+}
+
+// forbids reports an arm that rules a property out without declaring it: an
+// arm closed by additionalProperties or unevaluatedProperties false, or one
+// that requires the property to be absent. The caller has already found that
+// the arm declares no schema for the property.
+func (s *schemaSet) forbids(arm schemaRef, name string) bool {
+	return s.shape(arm, nil).closed || s.requiresAbsent(arm, name)
+}
+
+// requiresAbsent reports a schema whose own not (or the not of an arm of it
+// that always applies) requires the property alone, directly or as one anyOf
+// alternative: whatever the schema declares for the property, it admits no
+// instance that carries it.
+func (s *schemaSet) requiresAbsent(arm schemaRef, name string) bool {
+	requiresOnly := func(node any) bool {
+		object, ok := node.(map[string]any)
+		if !ok {
+			return false
+		}
+		for key := range object {
+			if key != "required" && key != "description" {
+				return false
+			}
+		}
+		required, ok := object["required"].([]any)
+		return ok && len(required) == 1 && required[0] == name
+	}
+	seen := map[string]bool{}
+	var walk func(schemaRef) bool
+	walk = func(r schemaRef) bool {
+		r = s.resolve(r, nil)
+		key := identity(r)
+		if seen[key] {
+			return false
+		}
+		seen[key] = true
+		if negated, ok := r.loc.node["not"].(map[string]any); ok {
+			if requiresOnly(negated) {
+				return true
+			}
+			if alternatives, ok := negated["anyOf"].([]any); ok && len(negated) == 1 {
+				for _, alternative := range alternatives {
+					if requiresOnly(alternative) {
+						return true
+					}
+				}
+			}
+		}
+		all, _, _ := s.arms(r)
+		for _, arm := range all {
+			if walk(arm) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(arm)
+}
+
+// disjoint holds a oneOf group's members of one property to admitted values
+// the reader can show are disjoint: closed, non-empty vocabularies that share
+// no value. Anything else may admit a value through two arms, which oneOf
+// rejects, so it is refused rather than read as a union.
+func (s *schemaSet) disjoint(r schemaRef, tokens []string, members []schemaRef) {
+	if len(members) < 2 {
+		return
+	}
+	owner := map[string]string{}
+	for _, member := range members {
+		admitted, closed := s.vocabulary(member)
+		if !closed || len(admitted) == 0 {
+			s.fatalf("%s: the drift member reader does not model oneOf arms whose %s values it cannot show are disjoint (%s admits an open or non-string set)",
+				r.loc.key(), strings.Join(tokens, "/"), member.loc.key())
+		}
+		for value := range admitted {
+			if other, taken := owner[value]; taken {
+				s.fatalf("%s: the drift member reader does not model oneOf arms that both admit %s %q (%s and %s)",
+					r.loc.key(), strings.Join(tokens, "/"), value, other, member.loc.key())
+			}
+			owner[value] = member.loc.key()
+		}
+	}
+}
+
+// closures refuses a composed member whose closed object declarations do not
+// all declare every property the member declares. Each declaration applies on
+// its own, so a closed one rejects a property only another declaration
+// declares, which the merged shape would admit.
+func (s *schemaSet) closures(member schemaRef) {
+	names := sortedKeys(s.shape(member, nil).properties)
+	seen := map[string]bool{}
+	var walk func(schemaRef)
+	walk = func(r schemaRef) {
+		key := identity(r)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if r.composed != nil {
+			for _, declaration := range r.composed.all {
+				walk(declaration)
+			}
+			for _, group := range r.composed.alternatives {
+				for _, declaration := range group {
+					walk(declaration)
+				}
+			}
+			return
+		}
+		shape := s.shape(r, nil)
+		if !shape.closed {
+			return
+		}
+		for _, name := range names {
+			if !shape.properties[name] {
+				s.fatalf("%s: the drift member reader does not model the closed declaration %s, which omits %q that another declaration of the same member declares",
+					member.loc.key(), s.resolve(r, nil).loc.key(), name)
+			}
+		}
+	}
+	walk(member)
 }
 
 // vocabulary is the set of strings a schema admits, and whether that set is
 // closed. Every arm that always applies narrows it (intersection); an
 // alternative group admits the union of its arms, and is open when any arm is.
+// A oneOf group is read as that union only when no string can match two of
+// its arms; otherwise it is refused, since oneOf rejects such a string.
 // A schema whose type excludes string admits none. Keywords whose effect on
 // the set this reader does not model fail the test.
 func (s *schemaSet) vocabulary(r schemaRef) (map[string]bool, bool) {
@@ -1158,7 +1995,7 @@ func (s *schemaSet) vocabulary(r schemaRef) (map[string]bool, bool) {
 		}
 		narrow(admitted)
 	}
-	if kind, ok := r.loc.node["type"]; ok && !typeAdmitsString(kind) {
+	if kind, ok := r.loc.node["type"]; ok && !typeAdmits(kind, "string") {
 		narrow(map[string]bool{})
 	}
 	all, alternatives, _ := s.arms(r)
@@ -1168,32 +2005,51 @@ func (s *schemaSet) vocabulary(r schemaRef) (map[string]bool, bool) {
 		}
 	}
 	for _, group := range alternatives {
+		exclusive := r.composed == nil && len(group) > 0 && path.Base(path.Dir(group[0].loc.pointer)) == "oneOf"
 		union := map[string]bool{}
-		open := false
+		owner := map[string]string{}
+		open, admitsSome := "", ""
 		for _, arm := range group {
 			admitted, armClosed := s.vocabulary(arm)
+			if exclusive && (!armClosed || len(admitted) > 0) {
+				// An open arm may admit any string, so beside any other arm that
+				// admits one, a value could match both and oneOf would reject it.
+				if admitsSome != "" && (open != "" || !armClosed) {
+					s.fatalf("%s: the drift enum reader does not model oneOf arms that may both admit a string (%s and %s)",
+						r.loc.key(), admitsSome, arm.loc.key())
+				}
+				admitsSome = arm.loc.key()
+			}
 			if !armClosed {
-				open = true
-				break
+				open = arm.loc.key()
+				if !exclusive {
+					break
+				}
+				continue
 			}
 			for value := range admitted {
+				if other, taken := owner[value]; taken && exclusive {
+					s.fatalf("%s: the drift enum reader does not model oneOf arms that both admit %q (%s and %s)",
+						r.loc.key(), value, other, arm.loc.key())
+				}
+				owner[value] = arm.loc.key()
 				union[value] = true
 			}
 		}
-		if !open {
+		if open == "" {
 			narrow(union)
 		}
 	}
 	return values, closed
 }
 
-func typeAdmitsString(kind any) bool {
+func typeAdmits(kind any, name string) bool {
 	switch value := kind.(type) {
 	case string:
-		return value == "string"
+		return value == name
 	case []any:
 		for _, item := range value {
-			if item == "string" {
+			if item == name {
 				return true
 			}
 		}
@@ -1380,12 +2236,12 @@ func (c *driftChecker) compare(where string, t reflect.Type, r schemaRef) {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return // base64 bytes
 		}
-		if items, ok := c.set.nested(r, "items"); ok {
+		if items, ok := c.set.member(r, "items"); ok {
 			c.compare(where+"[]", t.Elem(), items)
 		}
 		return
 	case reflect.Map:
-		if values, ok := c.set.nested(r, "additionalProperties"); ok {
+		if values, ok := c.set.member(r, "additionalProperties"); ok {
 			c.compare(where+"{}", t.Elem(), values)
 		}
 		return
@@ -1400,13 +2256,13 @@ func (c *driftChecker) compare(where string, t reflect.Type, r schemaRef) {
 	c.compared[pair] = true
 	// The same location can mean different schemas under different dynamic
 	// scopes, so a pair is done only for the scope it was compared in.
-	scoped := pair + "|" + scopeKey(resolved.scope)
+	scoped := t.String() + "@" + identity(resolved)
 	if c.done[scoped] {
 		return
 	}
 	c.done[scoped] = true
 	if !shape.isObject() {
-		if !declaresFreeFormObject(resolved.loc.node) {
+		if !c.set.declaresFreeFormObject(resolved) {
 			c.problem("%s: schema %s gives Go %s no object shape and does not declare a free-form object",
 				where, resolved.loc.key(), t)
 		}
@@ -1460,7 +2316,11 @@ func (c *driftChecker) compare(where string, t reflect.Type, r schemaRef) {
 			c.problem("%s: schema %s declares %q, which Go %s does not carry", where, resolved.loc.key(), name, t)
 			continue
 		}
-		c.compare(where+"."+name, field.typ, shape.properties[name])
+		member, ok := c.set.member(r, "properties", name)
+		if !ok {
+			c.set.fatalf("%s: property %q was found in the shape but has no member schema", resolved.loc.key(), name)
+		}
+		c.compare(where+"."+name, field.typ, member)
 	}
 }
 
@@ -1629,6 +2489,108 @@ func parseSources(t *testing.T, dir string) []*ast.File {
 		files = append(files, file)
 	}
 	return files
+}
+
+// methodGuard reads the fail-closed method guard used by a handler registered
+// without a method-bearing mux pattern. The first statement must return for
+// every method other than the listed alternatives.
+func methodGuard(fn *ast.FuncDecl) ([]string, error) {
+	if fn == nil || fn.Body == nil || len(fn.Body.List) == 0 {
+		return nil, fmt.Errorf("has no first-statement method guard")
+	}
+	guard, ok := fn.Body.List[0].(*ast.IfStmt)
+	if !ok {
+		return nil, fmt.Errorf("first statement is not a method guard")
+	}
+	if guard.Init != nil || guard.Else != nil {
+		return nil, fmt.Errorf("method guard has an init or else branch")
+	}
+	if len(guard.Body.List) == 0 {
+		return nil, fmt.Errorf("method guard body is empty")
+	}
+	if _, ok := guard.Body.List[len(guard.Body.List)-1].(*ast.ReturnStmt); !ok {
+		return nil, fmt.Errorf("method guard does not end in return")
+	}
+
+	httpMethods := map[string]string{
+		"MethodConnect": "CONNECT",
+		"MethodDelete":  "DELETE",
+		"MethodGet":     "GET",
+		"MethodHead":    "HEAD",
+		"MethodOptions": "OPTIONS",
+		"MethodPatch":   "PATCH",
+		"MethodPost":    "POST",
+		"MethodPut":     "PUT",
+		"MethodTrace":   "TRACE",
+	}
+	request := ""
+	accepted := map[string]bool{}
+	var read func(ast.Expr) error
+	read = func(expression ast.Expr) error {
+		if parenthesized, ok := expression.(*ast.ParenExpr); ok {
+			return read(parenthesized.X)
+		}
+		binary, ok := expression.(*ast.BinaryExpr)
+		if !ok {
+			return fmt.Errorf("method guard condition contains %T", expression)
+		}
+		if binary.Op == token.LAND {
+			if err := read(binary.X); err != nil {
+				return err
+			}
+			return read(binary.Y)
+		}
+		if binary.Op != token.NEQ {
+			return fmt.Errorf("method guard comparison uses %s instead of !=", binary.Op)
+		}
+		left, ok := binary.X.(*ast.SelectorExpr)
+		if !ok || left.Sel.Name != "Method" {
+			return fmt.Errorf("method guard comparison does not read a request Method")
+		}
+		receiver, ok := left.X.(*ast.Ident)
+		if !ok {
+			return fmt.Errorf("method guard request is not an identifier")
+		}
+		if request == "" {
+			request = receiver.Name
+		} else if request != receiver.Name {
+			return fmt.Errorf("method guard compares more than one request")
+		}
+
+		var method string
+		switch value := binary.Y.(type) {
+		case *ast.SelectorExpr:
+			pkg, ok := value.X.(*ast.Ident)
+			if !ok || pkg.Name != "http" {
+				return fmt.Errorf("method guard comparison is not against net/http")
+			}
+			method, ok = httpMethods[value.Sel.Name]
+			if !ok {
+				return fmt.Errorf("method guard uses unknown http.%s", value.Sel.Name)
+			}
+		case *ast.BasicLit:
+			if value.Kind != token.STRING {
+				return fmt.Errorf("method guard comparison uses a non-string literal")
+			}
+			var err error
+			method, err = strconv.Unquote(value.Value)
+			if err != nil || method == "" {
+				return fmt.Errorf("method guard comparison has an invalid string literal")
+			}
+		default:
+			return fmt.Errorf("method guard comparison uses %T", binary.Y)
+		}
+		accepted[method] = true
+		return nil
+	}
+	if err := read(guard.Cond); err != nil {
+		return nil, err
+	}
+	methods := sortedKeys(accepted)
+	if len(methods) == 0 {
+		return nil, fmt.Errorf("method guard accepts no methods")
+	}
+	return methods, nil
 }
 
 // validatorCases returns the string values a validator's switch accepts.
