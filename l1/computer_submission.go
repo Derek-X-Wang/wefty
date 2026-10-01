@@ -294,6 +294,15 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 // attempt drains. A successful stop already revokes every grant, so the
 // workload has no submission authority during its stop grace either way; this
 // makes a lost revocation fail closed the same way (wefty #548).
+//
+// The attempt must also still hold its host's current registration, on a
+// host L1 has not marked dead. A dead host's passes are refused whatever
+// their lease says: reconcile settles a dead host's owed revocations as moot
+// (owedRevocationSettledHostDead) on exactly that ground, and lease renewal
+// does not consult Node liveness, so the lease alone does not end them. A
+// dead Node returns only by registering again, which replaces the
+// registration its attempts were claimed under, so a pass refused for a dead
+// host is never proved again even after the Node is back (wefty #623).
 func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attemptID, hostIdentityNodeID, hostNodeID string) (ComputerTokenScopeProof, error) {
 	if computerID == "" || attemptID == "" || (hostIdentityNodeID == "") == (hostNodeID == "") {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer token scope proof is bound to the hosting Node")
@@ -309,6 +318,8 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 		WHERE c.computer_id=? AND a.attempt_id=? AND c.current_job_id=a.job_id
 		AND c.bound_node_id=a.node_id AND c.placement_node_id=a.node_id
 		AND (?='' OR host.identity_node_id=?) AND (?='' OR host.node_id=?)
+		AND host.state<>? AND a.boot_session_id=host.boot_session_id
+		AND a.authority_generation=host.authority_generation
 		AND c.desired_state='running' AND j.state IN ('claimed', 'running')
 		AND c.reconfiguration_phase='stable'
 		AND a.state IN ('claimed', 'running') AND EXISTS(
@@ -317,7 +328,8 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 			JOIN admin_policy p ON p.singleton=1
 			WHERE n.node_id=a.node_id AND i.policy_generation=p.authority_generation
 			AND i.policy_revision>=c.submit_policy_revision
-		)`, computerID, attemptID, hostIdentityNodeID, hostIdentityNodeID, hostNodeID, hostNodeID).Scan(&proof.ComputerID,
+		)`, computerID, attemptID, hostIdentityNodeID, hostIdentityNodeID, hostNodeID, hostNodeID,
+		contract.NodeDead).Scan(&proof.ComputerID,
 		&proof.ComputerAttemptID, &proof.ComputerStorageGeneration, &proof.SubmitIntentRevision,
 		&proof.HostNodeID, &proof.SubmitMaxInflight, &submitEnabled, &leaseExpiresNS)
 	if errors.Is(err, sql.ErrNoRows) {

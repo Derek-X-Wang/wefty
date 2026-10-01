@@ -359,7 +359,16 @@ to be running now: desired state `running`, current Job `claimed` or
 own attempt still live on its host. A Computer that is stopping — after stop,
 or after a restart of a running resource latch — is refused even while its old
 attempt drains, and so is one that is reset, reimaged, restoring, removed, or
-whose attempt is terminal. A submission-intent change commits first and
+whose attempt is terminal. The attempt must also still hold its host Node's
+current registration (boot session and authority generation), on a host L1
+has not marked `dead`. A dead host's passes are refused whatever their lease
+says, since lease renewal does not consult Node liveness and the lease alone
+does not end them. A dead Node returns only by registering again, which
+replaces the registration its attempts were claimed under, so a pass refused
+for a dead host is never proved again after the Node is back (#623). L3
+answers each of these refusals as it answers an expired lease: the bearer use
+fails with `unauthorized` (`Computer token scope is no longer
+authoritative`). A submission-intent change commits first and
 then revokes the Computer's L3 grants below its new revision; an applied
 change whose revocation the run ledger did not take still reports success,
 with `revoked: null` and `revocation_notice` (#600; see `state-machines.md`).
@@ -446,10 +455,11 @@ skipped, never fails the heartbeat, and is redone by the next one.
 A host Node that never heartbeats again cannot settle its rows, so when L1
 marks a Node dead its reconcile pass settles every row that Node still owes
 as `host_dead`, with no receipt and no run-ledger call. The rows are moot.
-Every bearer use re-proves the live scope with L1, and the mutation that owed
-the row already changed that scope. A dead host's attempts have also stopped
-renewing their leases, and the host's next boot sends `revoke-host`. A
-settled row is never reopened, even if the Node later returns.
+Every bearer use re-proves the live scope with L1, the mutation that owed the
+row already changed that scope, and that proof refuses every attempt on a dead
+host regardless of its lease, and every attempt of a registration the host has
+since replaced (above). The host's next boot sends `revoke-host`. A settled
+row is never reopened, even if the Node later returns.
 
 The owed record deliberately does not cover the grant of an attempt that was
 already `lost` when the mutation began (for example a lease that expired on a

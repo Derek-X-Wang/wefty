@@ -481,3 +481,57 @@ func TestComputerTokenScopeProofRefusesAStoppingComputer(t *testing.T) {
 		})
 	}
 }
+
+// TestComputerTokenScopeProofRefusesAnAttemptOnADeadHost pins #623. Reconcile
+// settles a dead host's owed revocations as moot on the ground that its passes
+// are already refused, but lease renewal does not consult Node liveness, so a
+// host marked dead can still hold an unexpired lease. The proof must refuse on
+// the Node's state, and a Node that comes back by registering again must not
+// revive the passes its earlier registration held.
+func TestComputerTokenScopeProofRefusesAnAttemptOnADeadHost(t *testing.T) {
+	h, computer, claim := liveComputerTokenScope(t, "dead-host")
+	ctx := context.Background()
+	prove := func() error {
+		_, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
+		if err != nil {
+			return err
+		}
+		_, err = h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "", "computer-node")
+		return err
+	}
+	// The workload keeps renewing its lease while the Node's heartbeats stop,
+	// until reconcile marks the Node dead.
+	var lease AttemptLease
+	for elapsed := time.Duration(0); elapsed <= DefaultNodeDeadAfter; elapsed += 40 * time.Second {
+		h.clock.Advance(40 * time.Second)
+		renewed, err := h.store.RenewLease(ctx, "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken)
+		if err != nil {
+			t.Fatalf("renew while heartbeats are silent: %v", err)
+		}
+		lease = renewed
+	}
+	result, err := h.store.Reconcile(ctx)
+	if err != nil || result.DeadNodes != 1 {
+		t.Fatalf("reconcile = (%#v, %v), want the host marked dead", result, err)
+	}
+	if !lease.LeaseExpires.After(h.clock.Now()) {
+		t.Fatalf("lease expires %s, not after now %s: the test needs a live lease", lease.LeaseExpires, h.clock.Now())
+	}
+	if err := prove(); errorCode(err) != contract.ErrorForbidden {
+		t.Fatalf("scope proof on a dead host with an unexpired lease = %v, want forbidden", err)
+	}
+
+	// The same boot session registers again: the Node is alive, but under a
+	// new registration the old attempt was never claimed under.
+	if node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"}); node.State != contract.NodeAlive {
+		t.Fatalf("rejoined node state = %q, want alive", node.State)
+	}
+	if !lease.LeaseExpires.After(h.clock.Now()) {
+		t.Fatal("the test needs the old lease still unexpired after the rejoin")
+	}
+	if err := prove(); errorCode(err) != contract.ErrorForbidden {
+		t.Fatalf("scope proof after the dead host rejoined = %v, want forbidden", err)
+	}
+}
