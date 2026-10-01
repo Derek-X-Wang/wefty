@@ -2,7 +2,9 @@ package l3
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 type clientTestFabric struct {
@@ -226,5 +229,74 @@ func TestL1ClientRedirectDoesNotInventJobAbsence(t *testing.T) {
 	var remote *l1ResponseError
 	if !errors.As(err, &remote) || remote.path != "/unknown" || calls != 2 {
 		t.Fatalf("lost redirect origin: %#v calls=%d", remote, calls)
+	}
+}
+
+func TestL1DispatchLookupAbsenceRequiresTheExactAuthoritativeResponse(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		status  int
+		body    string
+		missing bool
+	}{
+		{name: "authoritative", status: http.StatusNotFound, body: `{"error":{"code":"not_found","message":"absent","retryable":false}}`, missing: true},
+		{name: "html", status: http.StatusNotFound, body: `<html>not found</html>`},
+		{name: "older L1", status: http.StatusNotFound, body: "404 page not found\n"},
+		{name: "partial", status: http.StatusNotFound, body: `{"error":{"code":"not_found"}}`},
+		{name: "wrong code", status: http.StatusNotFound, body: `{"error":{"code":"job_not_found","message":"absent","retryable":false}}`},
+		{name: "auth", status: http.StatusForbidden, body: `{"error":{"code":"forbidden","message":"denied","retryable":false}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: testCase.status, Body: io.NopCloser(strings.NewReader(testCase.body)), Header: make(http.Header)}, nil
+			})}}
+			_, err := client.LookupJobByDispatchKey(context.Background(), "dispatch-1")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			wrapped := fmt.Errorf("wrapped: %w", err)
+			if got := isMissingDispatch(wrapped, "dispatch-1"); got != testCase.missing || isMissingDispatch(wrapped, "other") {
+				t.Fatalf("missing dispatch = %t for %v", got, err)
+			}
+		})
+	}
+}
+
+func TestL1DispatchLookupRejectsRedirectAndMismatchedIdentity(t *testing.T) {
+	t.Run("redirect", func(t *testing.T) {
+		client := &L1Client{operationTimeout: time.Second}
+		calls := 0
+		client.client = &http.Client{Transport: recoveryRoundTripper(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if r.URL.Path == "/v1/dispatch-keys/dispatch-1/job" {
+				return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"/unknown"}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+			}
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"code":"not_found","message":"missing route","retryable":false}}`)), Request: r}, nil
+		})}
+		_, err := client.LookupJobByDispatchKey(context.Background(), "dispatch-1")
+		if err == nil || isMissingDispatch(err, "dispatch-1") || calls != 2 {
+			t.Fatalf("redirect invented dispatch absence: %v calls=%d", err, calls)
+		}
+	})
+
+	for _, testCase := range []struct {
+		name string
+		job  l1.Job
+	}{
+		{name: "empty job id", job: l1.Job{Spec: contract.JobSpec{DispatchKey: "dispatch-1"}}},
+		{name: "different dispatch key", job: l1.Job{JobID: "job-1", Spec: contract.JobSpec{DispatchKey: "other"}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			body, err := json.Marshal(testCase.job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+			})}}
+			if _, err := client.LookupJobByDispatchKey(context.Background(), "dispatch-1"); err == nil {
+				t.Fatal("mismatched lookup response was accepted")
+			}
+		})
 	}
 }

@@ -25,6 +25,13 @@ type JobClient interface {
 	GetJob(context.Context, string) (l1.Job, error)
 }
 
+// JobDispatchLookupClient is the lookup-only recovery seam for a dispatch L1
+// accepted before L3 recorded its job ID. It stays separate from JobClient so
+// existing clients and test fakes do not acquire another required method.
+type JobDispatchLookupClient interface {
+	LookupJobByDispatchKey(context.Context, string) (l1.Job, error)
+}
+
 // JobImageEvidenceClient is the L1 result-ingestion seam for tag-only image
 // runs. It remains separate from JobClient so tests and alternate L1 clients
 // can implement the evidence projection independently.
@@ -99,11 +106,25 @@ func (c *L1Client) GetJob(ctx context.Context, jobID string) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID)
 	if err := c.do(ctx, http.MethodGet, path, nil, &job, http.StatusOK); err != nil {
-		var remote *l1ResponseError
-		if errors.As(err, &remote) && remote.status == http.StatusNotFound && remote.method == http.MethodGet && remote.path == path && remote.protocol.Code == contract.ErrorNotFound && remote.validEnvelope {
+		if authoritativeL1NotFound(err, http.MethodGet, path) {
 			return l1.Job{}, &JobNotFoundError{JobID: jobID, Cause: err}
 		}
 		return l1.Job{}, err
+	}
+	return job, nil
+}
+
+func (c *L1Client) LookupJobByDispatchKey(ctx context.Context, dispatchKey string) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/dispatch-keys/" + url.PathEscape(dispatchKey) + "/job"
+	if err := c.do(ctx, http.MethodGet, path, nil, &job, http.StatusOK); err != nil {
+		if authoritativeL1NotFound(err, http.MethodGet, path) {
+			return l1.Job{}, &DispatchNotFoundError{DispatchKey: dispatchKey, Cause: err}
+		}
+		return l1.Job{}, err
+	}
+	if job.JobID == "" || job.Spec.DispatchKey != dispatchKey {
+		return l1.Job{}, internalError(fmt.Errorf("L1 returned job %q for dispatch key %q", job.JobID, job.Spec.DispatchKey), "validate L1 dispatch lookup response")
 	}
 	return job, nil
 }
@@ -224,6 +245,7 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 }
 
 var _ JobClient = (*L1Client)(nil)
+var _ JobDispatchLookupClient = (*L1Client)(nil)
 var _ JobImageEvidenceClient = (*L1Client)(nil)
 var _ JobLogClient = (*L1Client)(nil)
 var _ JobResultClient = (*L1Client)(nil)
@@ -239,6 +261,12 @@ type l1ResponseError struct {
 
 func (e *l1ResponseError) Error() string { return e.protocol.Error() }
 func (e *l1ResponseError) Unwrap() error { return e.protocol }
+
+func authoritativeL1NotFound(err error, method, path string) bool {
+	var remote *l1ResponseError
+	return errors.As(err, &remote) && remote.status == http.StatusNotFound && remote.method == method && remote.path == path &&
+		remote.protocol.Code == contract.ErrorNotFound && remote.validEnvelope
+}
 
 // Absence is destructive evidence: require all mandatory envelope fields rather
 // than accepting a partial JSON object whose missing fields decode to zero.

@@ -35,7 +35,7 @@ func TestTerminalRunDropsItsStagedTokenDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.beginDispatch(ctx, record.RunID); err != nil {
+	if _, err := s.beginDispatch(ctx, record.RunID); err != nil {
 		t.Fatal(err)
 	}
 	var staged sql.NullString

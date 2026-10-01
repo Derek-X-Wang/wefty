@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS runs (
   node_id TEXT,
   failure_reason TEXT,
   node_attribution_pending INTEGER NOT NULL DEFAULT 0,
+  job_link_settled INTEGER NOT NULL DEFAULT 0,
+  job_link_failures INTEGER NOT NULL DEFAULT 0,
+  job_link_retry_ns INTEGER NOT NULL DEFAULT 0,
+  dispatch_attempt_ns INTEGER,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
@@ -358,6 +362,49 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
 		return fmt.Errorf("l3: index pending run node attributions: %w", err)
 	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_settled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run job-link settlement: %w", err)
+	}
+	// Recovery backs a row off after a transient L1 failure so an unavailable
+	// L1 cannot hold every unsettled row in every pass.
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_failures", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run job-link failures: %w", err)
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "job_link_retry_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run job-link retry time: %w", err)
+	}
+	// dispatch_attempt_ns is the time of the run's last submit attempt, set by
+	// beginDispatch. It makes recovery eligibility a property of the run row,
+	// so the partial index below holds only runs that were ever submitted: a
+	// run that ended before any attempt can never gain one (beginDispatch
+	// refuses terminal runs) and never enters it.
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "dispatch_attempt_ns", "INTEGER"); err != nil {
+		return fmt.Errorf("l3: migrate run dispatch attempt time: %w", err)
+	}
+	// A ledger from before the column records attempts only as a count. The
+	// run's finish (or last update) is no earlier than its last attempt, so
+	// it stands in for the attempt time. This runs on every open, so an
+	// upgrade interrupted after adding the column is healed on the next one;
+	// a run never attempted keeps no attempt time. Unrecorded runs are only
+	// pending, dispatching or terminal, so runs_projection bounds the search.
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET dispatch_attempt_ns=COALESCE(finished_ns, updated_ns)
+WHERE dispatch_attempt_ns IS NULL AND l1_job_id IS NULL AND status IN (?, ?, ?, ?)
+  AND EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.run_id=runs.run_id AND o.attempt_count>0)`,
+		contract.RunPending, contract.RunDispatching, contract.RunSucceeded, contract.RunFailed); err != nil {
+		return fmt.Errorf("l3: backfill run dispatch attempt time: %w", err)
+	}
+	// Old rows default to unsettled so the reconciler can recover historical
+	// crash windows. The partial index holds exactly the rows recovery may
+	// read, keyed by when each is next due and then by age, so a pass is a
+	// bounded walk of the due prefix however many rows are backed off.
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS runs_unrecorded_dispatch`); err != nil {
+		return fmt.Errorf("l3: drop superseded unrecorded dispatch index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_job_link_recovery
+ON runs(job_link_retry_ns, created_ns, run_id)
+WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','failed') AND dispatch_attempt_ns IS NOT NULL`); err != nil {
+		return fmt.Errorf("l3: index unrecorded dispatches: %w", err)
+	}
 	// A ledger written before credential delivery became opt-in has no column.
 	// Defaulting it to 0 is the safe direction: an old run reads as one that
 	// did not declare dispatch authority, so nothing is granted retroactively.
@@ -424,8 +471,21 @@ func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error
 		return "", internalError(err, "begin run token mint")
 	}
 	defer tx.Rollback()
+	token, err := ensureRunTokenTx(ctx, tx, runID, canonicalTime(s.clock.Now()))
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit run token mint")
+	}
+	return token, nil
+}
+
+// ensureRunTokenTx returns the bearer staged for the run's pending dispatch,
+// minting and staging one on the first attempt.
+func ensureRunTokenTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (string, error) {
 	var delivery sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT token_delivery FROM dispatch_outbox WHERE run_id=? AND dispatched_ns IS NULL`, runID).Scan(&delivery)
+	err := tx.QueryRowContext(ctx, `SELECT token_delivery FROM dispatch_outbox WHERE run_id=? AND dispatched_ns IS NULL`, runID).Scan(&delivery)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", protocolError(contract.ErrorConflict, "run %q has no pending dispatch", runID)
 	}
@@ -438,15 +498,11 @@ func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error
 	token := newToken()
 	digest := sha256.Sum256([]byte(token))
 	attemptID := newID("runattempt")
-	now := canonicalTime(s.clock.Now())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_tokens(run_id, attempt_id, token_hash, minted_ns) VALUES(?, ?, ?, ?)`, runID, attemptID, digest[:], now.UnixNano()); err != nil {
 		return "", internalError(err, "store run token hash")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=? WHERE run_id=? AND dispatched_ns IS NULL`, token, runID); err != nil {
 		return "", internalError(err, "stage run token delivery")
-	}
-	if err := tx.Commit(); err != nil {
-		return "", internalError(err, "commit run token mint")
 	}
 	return token, nil
 }
@@ -1895,24 +1951,49 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 	return intents, nil
 }
 
-func (s *Store) beginDispatch(ctx context.Context, runID string) error {
+// errDispatchAbandoned reports that the run was terminal when its dispatch
+// attempt would have begun. The caller must not submit: the terminal
+// transition cleared the staged bearer, and a submit L1 accepts as new work
+// (because it lost the original job) would start an ended run again.
+var errDispatchAbandoned = errors.New("l3: run is terminal; dispatch attempt abandoned")
+
+// beginDispatch starts one submit attempt and returns the bearer it carries.
+// The run-status guard, the bearer hand-out and the attempt count share one
+// transaction, so a run that is terminal when the attempt begins is never
+// handed a bearer to submit with. A run that ends after this commit, while the
+// submit is in flight, is linked by completeDispatch when L1 acknowledges the
+// job, or by lookup recovery when it does not.
+func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error) {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return internalError(err, "begin dispatch attempt")
+		return "", internalError(err, "begin dispatch attempt")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
-		contract.RunPending, contract.RunDispatching, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching); err != nil {
-		return internalError(err, "mark dispatch attempt")
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=?, dispatch_attempt_ns=?
+WHERE run_id=? AND status IN (?, ?)`,
+		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
+	if err != nil {
+		return "", internalError(err, "mark dispatch attempt")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return "", internalError(err, "read dispatch attempt result")
+	}
+	if changed == 0 {
+		return "", errDispatchAbandoned
+	}
+	token, err := ensureRunTokenTx(ctx, tx, runID, now)
+	if err != nil {
+		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET attempt_count=attempt_count+1, last_error=NULL WHERE run_id=? AND dispatched_ns IS NULL`, runID); err != nil {
-		return internalError(err, "increment dispatch attempt")
+		return "", internalError(err, "increment dispatch attempt")
 	}
 	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit dispatch attempt")
+		return "", internalError(err, "commit dispatch attempt")
 	}
-	return nil
+	return token, nil
 }
 
 func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchErr error) error {
@@ -1920,7 +2001,10 @@ func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchE
 	if err != nil {
 		return internalError(err, "encode dispatch error")
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID)
+	// A submit error that returns after recovery settled the run must not
+	// replace the settled diagnostic.
+	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1)`, string(payload), runID)
 	if err != nil {
 		return internalError(err, "record dispatch error")
 	}
@@ -1938,7 +2022,10 @@ func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr erro
 	if err != nil {
 		return internalError(err, "encode permanent dispatch error")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=CASE
+    WHEN EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1) THEN last_error ELSE ? END,
+  token_delivery=NULL
+WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 		return internalError(err, "record permanent dispatch error")
 	}
 	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, dispatchFailureReason(dispatchErr)); err != nil {
@@ -1950,6 +2037,11 @@ func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr erro
 	return nil
 }
 
+// completeDispatch records L1's acknowledgement. A run that ended while its
+// submit was in flight is linked here too, keeping its terminal state: the
+// acknowledgement is L1's own answer for this dispatch key, so it also
+// replaces a dispatch_not_found settlement recovery recorded before it
+// arrived.
 func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1957,17 +2049,261 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		return internalError(err, "begin dispatch completion")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID)
+	if err != nil {
 		return internalError(err, "complete dispatch outbox")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET l1_job_id=?, status=?, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
-		jobID, contract.RunQueued, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching); err != nil {
+	acknowledged, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read dispatch completion result")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE runs SET l1_job_id=?, status=?, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
+		jobID, contract.RunQueued, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
+	if err != nil {
 		return internalError(err, "associate run with job")
+	}
+	queued, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read run association result")
+	}
+	if acknowledged == 1 && queued == 0 {
+		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return internalError(err, "commit dispatch completion")
 	}
 	return nil
+}
+
+// linkTerminalRunTx records only the missing association of an ended run.
+// The terminal state, reason and timestamps are deliberately left alone; the
+// node is marked pending so the terminal-attribution pass can name it.
+func linkTerminalRunTx(ctx context.Context, tx *sql.Tx, runID, jobID string) (bool, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET
+  l1_job_id=?, job_link_settled=1,
+  node_attribution_pending=CASE WHEN COALESCE(node_id, '')='' THEN 1 ELSE node_attribution_pending END
+WHERE run_id=? AND l1_job_id IS NULL AND status IN (?, ?)`,
+		jobID, runID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return false, internalError(err, "link terminal run with job")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, internalError(err, "read terminal run link result")
+	}
+	return changed == 1, nil
+}
+
+// unrecordedDispatch is a terminal run for which at least one dispatch began
+// but L3 never recorded the L1 job association.
+type unrecordedDispatch struct {
+	RunID, DispatchKey, OutboxJobID string
+}
+
+// unrecordedDispatchesQuery repeats the partial-index predicate literally so
+// SQLite walks only the due prefix of runs_job_link_recovery, in index order:
+// rows never backed off first, oldest first, then backed-off rows as they
+// come due. CROSS JOIN keeps runs the outer loop so LIMIT stops the walk.
+const unrecordedDispatchesQuery = `SELECT r.run_id, r.dispatch_key, COALESCE(o.job_id, '')
+FROM runs r INDEXED BY runs_job_link_recovery CROSS JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed') AND r.dispatch_attempt_ns IS NOT NULL
+  AND r.job_link_retry_ns<=?
+ORDER BY r.job_link_retry_ns, r.created_ns, r.run_id
+LIMIT ?`
+
+const (
+	// unrecordedDispatchBatch bounds the rows one recovery pass reads.
+	unrecordedDispatchBatch = 16
+	// A row whose L1 reads failed transiently waits unrecordedDispatchRetryBase,
+	// doubling per consecutive failure up to unrecordedDispatchRetryCap.
+	unrecordedDispatchRetryBase = 30 * time.Second
+	unrecordedDispatchRetryCap  = 30 * time.Minute
+	// unrecordedDispatchSettleHorizon is how long after the run's last submit
+	// attempt a dispatch-key absence stays provisional. L1 may commit a submit
+	// after recovery first asks, with the response lost; only an absence at
+	// or after the horizon settles the run.
+	unrecordedDispatchSettleHorizon = time.Hour
+)
+
+func (s *Store) unrecordedDispatches(ctx context.Context, limit int) ([]unrecordedDispatch, error) {
+	now := canonicalTime(s.clock.Now())
+	rows, err := s.db.QueryContext(ctx, unrecordedDispatchesQuery, now.UnixNano(), limit)
+	if err != nil {
+		return nil, internalError(err, "list unrecorded dispatches")
+	}
+	defer rows.Close()
+	var pending []unrecordedDispatch
+	for rows.Next() {
+		var item unrecordedDispatch
+		if err := rows.Scan(&item.RunID, &item.DispatchKey, &item.OutboxJobID); err != nil {
+			return nil, internalError(err, "scan unrecorded dispatch")
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate unrecorded dispatches")
+	}
+	return pending, nil
+}
+
+// deferUnrecordedDispatch backs one row off after a transient L1 failure.
+func (s *Store) deferUnrecordedDispatch(ctx context.Context, runID string) error {
+	now := canonicalTime(s.clock.Now())
+	var failures int
+	if err := s.db.QueryRowContext(ctx, `SELECT job_link_failures FROM runs WHERE run_id=?`, runID).Scan(&failures); err != nil {
+		return internalError(err, "read unrecorded dispatch failures")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET job_link_failures=job_link_failures+1, job_link_retry_ns=?
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND job_link_failures=?`,
+		now.Add(unrecordedDispatchBackoff(failures)).UnixNano(), runID, failures)
+	if err != nil {
+		return internalError(err, "defer unrecorded dispatch")
+	}
+	return nil
+}
+
+// unrecordedDispatchBackoff is the wait after failures earlier consecutive
+// transient failures plus this one.
+func unrecordedDispatchBackoff(failures int) time.Duration {
+	delay := unrecordedDispatchRetryBase
+	for i := 0; i < failures && delay < unrecordedDispatchRetryCap; i++ {
+		delay *= 2
+	}
+	return min(delay, unrecordedDispatchRetryCap)
+}
+
+// recoveryNow is the ledger clock reading recovery stamps on an L1 read before
+// sending it.
+func (s *Store) recoveryNow() time.Time { return canonicalTime(s.clock.Now()) }
+
+// unrecordedDispatchFor rereads one run's recovery state after a settlement
+// compare-and-set missed. It reports false once the run is no longer waiting.
+func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unrecordedDispatch, bool, error) {
+	return unrecordedDispatchForTx(ctx, s.db, runID)
+}
+
+type rowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func unrecordedDispatchForTx(ctx context.Context, db rowQuerier, runID string) (unrecordedDispatch, bool, error) {
+	item := unrecordedDispatch{RunID: runID}
+	err := db.QueryRowContext(ctx, `SELECT r.dispatch_key, COALESCE(o.job_id, '')
+FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN (?, ?) AND r.dispatch_attempt_ns IS NOT NULL`,
+		runID, contract.RunSucceeded, contract.RunFailed).Scan(&item.DispatchKey, &item.OutboxJobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return unrecordedDispatch{}, false, nil
+	}
+	if err != nil {
+		return unrecordedDispatch{}, false, internalError(err, "reread unrecorded dispatch")
+	}
+	return item, true, nil
+}
+
+// linkUnrecordedDispatch records only the missing association. The terminal
+// state, reason and timestamps are deliberately outside both updates.
+func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, jobID string) error {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin unrecorded dispatch link")
+	}
+	defer tx.Rollback()
+	linked, err := linkTerminalRunTx(ctx, tx, item.RunID, jobID)
+	if err != nil {
+		return err
+	}
+	if linked {
+		if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
+  job_id=COALESCE(job_id, ?), dispatched_ns=COALESCE(dispatched_ns, ?), last_error=NULL, token_delivery=NULL
+WHERE run_id=?`, jobID, now.UnixNano(), item.RunID); err != nil {
+			return internalError(err, "complete recovered dispatch outbox")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit unrecorded dispatch link")
+	}
+	return nil
+}
+
+type settleOutcome int
+
+const (
+	settled settleOutcome = iota
+	// settleChanged: the row changed since it was read; reread it.
+	settleChanged
+	// settleNotDue: an unacknowledged dispatch's absence is still inside the
+	// settle horizon; ask again after the backoff.
+	settleNotDue
+)
+
+// settleUnrecordedDispatch records one authoritative absence and stops future
+// lookups without changing the already-terminal run. It settles nothing when
+// the row changed since item was read, or when the dispatch was never
+// acknowledged and lookupStarted, the time the absent answer was asked for,
+// is earlier than the settle horizon after the run's last submit attempt. A
+// lookup in flight across the horizon may have missed a submit L1 committed
+// meanwhile, so the answer counts from when it was asked, not received.
+func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, lookupStarted time.Time) (settleOutcome, error) {
+	horizon := canonicalTime(lookupStarted).Add(-unrecordedDispatchSettleHorizon)
+	cause := contract.APIError{
+		Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
+		Details: map[string]any{"reason": dispatchNotFoundReason, "dispatch_key": item.DispatchKey},
+	}
+	if item.OutboxJobID != "" {
+		cause = contract.APIError{
+			Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed",
+			Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": item.OutboxJobID},
+		}
+	}
+	payload, err := json.Marshal(cause)
+	if err != nil {
+		return settled, internalError(err, "encode unrecorded dispatch settlement")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return settled, internalError(err, "begin unrecorded dispatch settlement")
+	}
+	defer tx.Rollback()
+	// Compare-and-set on the acknowledgement recovery read before its L1
+	// reads: one recorded since then is L1's own answer, which the caller
+	// links instead of settling over it. An acknowledged job's absence by ID
+	// settles at once; L1 committed it before acknowledging it.
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)
+  AND (SELECT COALESCE(o.job_id, '') FROM dispatch_outbox o WHERE o.run_id=runs.run_id)=?
+  AND (?<>'' OR dispatch_attempt_ns<=?)`,
+		item.RunID, contract.RunSucceeded, contract.RunFailed, item.OutboxJobID, item.OutboxJobID, horizon.UnixNano())
+	if err != nil {
+		return settled, internalError(err, "settle unrecorded dispatch")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return settled, internalError(err, "read unrecorded dispatch settlement result")
+	}
+	if changed == 0 {
+		current, waiting, err := unrecordedDispatchForTx(ctx, tx, item.RunID)
+		if err != nil {
+			return settled, err
+		}
+		if waiting && current == item {
+			return settleNotDue, nil
+		}
+		return settleChanged, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
+  last_error=CASE WHEN last_error IS NULL OR json_extract(last_error, '$.retryable')=1 THEN ? ELSE last_error END,
+  token_delivery=NULL
+WHERE run_id=?`, string(payload), item.RunID); err != nil {
+		return settled, internalError(err, "record unrecorded dispatch settlement")
+	}
+	if err := tx.Commit(); err != nil {
+		return settled, internalError(err, "commit unrecorded dispatch settlement")
+	}
+	return settled, nil
 }
 
 type projectedRun struct {

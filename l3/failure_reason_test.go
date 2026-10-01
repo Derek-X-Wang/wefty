@@ -154,7 +154,7 @@ func TestDispatchRefusalAndLostJobRecordAReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.beginDispatch(ctx, record.RunID); err != nil {
+	if _, err := s.beginDispatch(ctx, record.RunID); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.failDispatch(ctx, record.RunID, &Error{Code: contract.ErrorInvalidRequest, Message: "no such kind"}); err != nil {

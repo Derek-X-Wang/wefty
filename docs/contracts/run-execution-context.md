@@ -275,6 +275,8 @@ clears its staged delivery value as soon as L1 acknowledges the idempotent job,
 or when the run becomes terminal first. L1 keeps the bearer in the job's spec
 only until the one-shot is terminal with no retry left, and then scrubs it with
 the inline script bytes and the `run_params_json` label (`state-machines.md`).
+Once termination clears the staged bearer, an accepted dispatch whose job ID
+was not recorded is recovered by dispatch-key lookup only, never by replay.
 L1, L3 and the node agent's spool all open SQLite with `secure_delete`, so a
 cleared or deleted value is zeroed on disk. Every connection of the three also
 opens with `fullfsync` and `checkpoint_fullfsync` on darwin, where a plain
@@ -1347,6 +1349,58 @@ count, preserves the started timestamp, and applies existing terminal token
 grace. The first committed terminal result wins against concurrent projections;
 repeated passes and restarts cannot replace that result or extend token expiry.
 Other runs and parent/child settlement continue normally.
+
+When L1 acknowledges a submit for a run that ended while the submit was in
+flight, the acknowledgement links the run directly. Linking fills only
+`l1_job_id`, keeps the run's terminal state, reason and timestamps unchanged,
+and marks node attribution pending when no node is known so the ordinary
+terminal-attribution pass can name it.
+
+A terminal run with no `l1_job_id` is eligible for lookup recovery when L3
+recorded a submit attempt for it and the recovery answer has not already been
+settled. A run that ended before any attempt is never eligible. This covers a submit whose response L3 never recorded,
+and a ledger written before acknowledgements linked ended runs, whose outbox
+holds the acknowledged job ID while the run has none. A found job is linked as
+above.
+
+An authoritative absence for a dispatch L1 never acknowledged is provisional
+until the settle horizon, one hour after the run's last submit attempt: L1 may
+commit a submit after recovery asked, with its response lost. Before the
+horizon the absence is not reported; the run backs off and is asked again, and
+is linked if the job has appeared. Only an absence from a lookup that started
+at or after the horizon settles it, since a lookup in flight across the
+horizon may miss a submit L1 commits meanwhile. It settles as a nonretryable `not_found` dispatch error with details `{reason:
+dispatch_not_found, dispatch_key: <key>}`. An existing nonretryable dispatch
+refusal is retained instead of being replaced. If the outbox already records an
+acknowledged job ID and the lookup does not return that job, L3 reads the
+acknowledged ID. A job L1 still holds is linked, because the scoped lookup
+cannot see a job L1 stored before it recorded run-ledger provenance. Only that
+read's authoritative absence records the existing `l1_regressed` diagnostic for
+the ID, at once: L1 committed that job before acknowledging it.
+
+Settlement happens once, and only if the outbox still holds the
+acknowledgement recovery read before asking L1; an acknowledgement recorded
+meanwhile is linked instead. An acknowledgement that arrives after the
+settlement still links the run and clears the settled diagnostic. A submit
+error recorded after the settlement never replaces it. Later passes do not ask
+again, so what remains unlinked is only a submit whose acknowledgement L3 never
+records and that L1 commits after the settling lookup, which starts no earlier
+than the horizon. A new L3 talking to an
+older L1 receives that server's plain route-level 404, not the complete error
+envelope from this endpoint, so version skew can never establish absence. None
+of these paths resubmits the job.
+
+Transport, authentication and malformed answers remain retryable pass errors.
+They, and an absence inside the horizon, back the run off before it is asked
+again: 30 seconds after the first consecutive failure, doubling to at most 30
+minutes. Recovery runs after dispatch, projection and node attribution in each
+pass. Within its per-pass budget (5 seconds by default) it reads at most 16 due
+runs, those never backed off first and oldest first, then backed-off runs in
+the order they came due, from an index that holds only eligible runs, so
+backed-off runs cost nothing until they are due. It stops starting L1 reads
+once the budget is spent; a read the budget cuts short counts as a transient
+failure. An unavailable L1 therefore costs at most one budget per pass and
+cannot hold live runs' dispatch behind ended ones.
 
 `GET /v1/runs/{run_id}/execution` exposes the recorded diagnostic and retained
 `l1_job_id` without a `job` only when the failed ledger run and diagnostic match
