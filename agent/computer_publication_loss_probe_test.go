@@ -133,6 +133,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	closed := make(chan struct{})
 	privateFabric := &publicationLossProbeFabric{Fabric: agentFabric, closed: closed, trace: trace}
 	var view *takeover.Session
+	forwarding := newComputerForwardingSignal()
 	// Registered before work starts: every failure releases gates and joins the
 	// service before the backend, policy cache, client, and SQLite store close.
 	defer func() {
@@ -170,7 +171,8 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 				trace("operation_anchored", operationDeadline.Format(time.RFC3339Nano))
 				return operationContext, func() { cancelOperation(); cancelParent() }
 			},
-			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: client,
+			forwardingChanged: forwarding.observe,
+			clock:             systemClock{}, fabric: privateFabric, authorizer: cache, auditor: client,
 			computerID: computer.ComputerID, jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID,
 			storageID: computer.StorageID, storageGeneration: computer.StorageGeneration, fencingToken: claim.Lease.FencingToken,
 			dial: func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
@@ -229,6 +231,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	if err := <-startedResult; err != nil {
 		t.Fatalf("real L1 Started: %v", err)
 	}
+	forwarding.await(t)
 	personFabric := network.NewFabric(identity)
 	view, err = takeover.OpenAtPolicyRevision(t.Context(), personFabric, endpoint, snapshot.PolicyRevision)
 	if err != nil {
