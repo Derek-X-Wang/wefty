@@ -381,7 +381,7 @@ func seedComputerOriginRuns(t *testing.T, store *l3.Store, computerID string) ([
 	roots := make([]contract.RunRecord, 0, 2)
 	for generation := int64(1); generation <= 2; generation++ {
 		proof := l3.ComputerTokenScopeProof{ComputerID: computerID, ComputerAttemptID: "attempt-" + strconv.FormatInt(generation, 10),
-			ComputerStorageGeneration: generation, SubmitIntentRevision: generation, HostNodeID: "computer-node", SubmitMaxInflight: 20}
+			ComputerStorageGeneration: generation, SubmitIntentRevision: generation, HostNodeID: "computer-node", HostStableNodeID: "stable-node", HostBootSessionID: "boot-computer-node", SubmitMaxInflight: 20}
 		grant, err := store.MintComputerToken(t.Context(), proof)
 		if err != nil {
 			t.Fatal(err)
@@ -407,7 +407,7 @@ func seedComputerOriginRuns(t *testing.T, store *l3.Store, computerID string) ([
 		t.Fatal(err)
 	}
 	foreignProof := l3.ComputerTokenScopeProof{ComputerID: "computer-foreign", ComputerAttemptID: "attempt-foreign",
-		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "computer-node", SubmitMaxInflight: 20}
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "computer-node", HostStableNodeID: "stable-node", HostBootSessionID: "boot-computer-node", SubmitMaxInflight: 20}
 	foreignGrant, err := store.MintComputerToken(t.Context(), foreignProof)
 	if err != nil {
 		t.Fatal(err)

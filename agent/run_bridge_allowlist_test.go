@@ -197,7 +197,7 @@ func TestOrdinaryRunBridgeCannotRevokeOrRemintNeighbourComputerPasses(t *testing
 	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "node-1"})
 	proof := l3.ComputerTokenScopeProof{ComputerID: "computer-neighbour", ComputerAttemptID: "attempt-neighbour",
-		ComputerStorageGeneration: 3, SubmitIntentRevision: 1, HostNodeID: "node-1", SubmitMaxInflight: 4}
+		ComputerStorageGeneration: 3, SubmitIntentRevision: 1, HostNodeID: "node-1", HostStableNodeID: "stable-node", HostBootSessionID: "boot-1", SubmitMaxInflight: 4}
 	store, err := l3.OpenStore(filepath.Join(t.TempDir(), "l3.sqlite"), l3.StoreOptions{ComputerAuthorityInstanceID: "run-bridge-595"})
 	if err != nil {
 		t.Fatal(err)

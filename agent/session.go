@@ -100,6 +100,9 @@ type agentSession struct {
 	drainOnce      sync.Once
 	drainRequested chan struct{}
 	attempts       sync.WaitGroup
+	registeredMu   sync.Mutex
+	registered     chan struct{}
+	registeredOnce sync.Once
 }
 
 type residentAttempt struct {
@@ -184,6 +187,20 @@ func (session *agentSession) close() {
 	if session != nil && session.client != nil {
 		session.client.Close()
 	}
+}
+
+func (session *agentSession) registrationSignal() chan struct{} {
+	session.registeredMu.Lock()
+	defer session.registeredMu.Unlock()
+	if session.registered == nil {
+		session.registered = make(chan struct{})
+	}
+	return session.registered
+}
+
+func (session *agentSession) markRegistered() {
+	registered := session.registrationSignal()
+	session.registeredOnce.Do(func() { close(registered) })
 }
 
 // suppressOCIBeforeBootSweep publishes the restrictive observation that must
@@ -773,6 +790,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 			continue
 		}
 		backoff.reset()
+		session.markRegistered()
 		session.markReady()
 		if session.removals != nil && session.ociBootBarrier == nil {
 			if err := session.removals.resume(runContext); err != nil && runContext.Err() == nil && session.logf != nil {

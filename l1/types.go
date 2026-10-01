@@ -409,7 +409,19 @@ type ComputerTokenScopeProof struct {
 	ComputerStorageGeneration int64  `json:"computer_storage_generation"`
 	SubmitIntentRevision      int64  `json:"submit_intent_revision"`
 	HostNodeID                string `json:"host_node_id"`
+	HostStableNodeID          string `json:"host_stable_node_id"`
+	HostBootSessionID         string `json:"host_boot_session_id"`
 	SubmitMaxInflight         int    `json:"submit_max_inflight"`
+}
+
+// HostBootSessionProof is the boot-session claim L3 asks L1 to verify before
+// revoking grants that earlier boots of one stable node minted. The stable
+// node is named explicitly because one Fabric identity may hold several
+// stable node registrations, each with its own current boot.
+type HostBootSessionProof struct {
+	HostIdentityNodeID string `json:"host_identity_node_id"`
+	HostStableNodeID   string `json:"host_stable_node_id"`
+	BootSessionID      string `json:"boot_session_id"`
 }
 
 // Node is the node projection shared by the operator list and agent protocol.

@@ -15,7 +15,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
-	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -151,6 +150,9 @@ type Agent struct {
 	collectorCancel       context.CancelFunc
 	collectorContext      context.Context
 	collectorDone         chan struct{}
+	hostRevocationMu      sync.Mutex
+	hostRevocationCancel  context.CancelFunc
+	hostRevocationDone    chan struct{}
 	logf                  func(string, ...any)
 	clock                 Clock
 	observer              *lifecycleObserver
@@ -495,6 +497,7 @@ func (adapter processClockAdapter) NewTimer(duration time.Duration) processrunne
 
 // Close releases idle protocol connections.
 func (a *Agent) Close() {
+	a.stopHostTokenRevocation()
 	if a.session != nil {
 		a.session.close()
 	}
@@ -545,11 +548,8 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
-	if revoker, ok := a.computerTokens.(ComputerTokenRevoker); ok {
-		if err := revoker.RevokeHostComputerTokens(ctx, l3.HostComputerTokenRevocationRequest{Reason: "agent_restart"}); err != nil && ctx.Err() == nil {
-			a.log("revoke prior-boot Computer tokens: %v", err)
-		}
-	}
+	a.startHostTokenRevocation(ctx)
+	defer a.stopHostTokenRevocation()
 	if a.handoffs != nil {
 		// One clock: the ticker above and the retention timestamps below have
 		// to move together, or a test can only ever exercise one of them.
@@ -609,6 +609,43 @@ func (a *Agent) Run(ctx context.Context) error {
 	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
+}
+
+func (a *Agent) startHostTokenRevocation(parent context.Context) {
+	revoker, ok := a.computerTokens.(ComputerTokenRevoker)
+	if !ok || a.session == nil {
+		return
+	}
+	a.hostRevocationMu.Lock()
+	defer a.hostRevocationMu.Unlock()
+	if a.hostRevocationCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	a.hostRevocationCancel = cancel
+	a.hostRevocationDone = done
+	revocation := hostTokenRevocation{
+		revoker: revoker, stableNodeID: a.registration.NodeID, bootSessionID: a.registration.BootSessionID, clock: a.clock,
+		backoff: newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax), logf: a.logf,
+	}
+	registered := a.session.registrationSignal()
+	go func() {
+		defer close(done)
+		revocation.run(ctx, registered)
+	}()
+}
+
+func (a *Agent) stopHostTokenRevocation() {
+	a.hostRevocationMu.Lock()
+	defer a.hostRevocationMu.Unlock()
+	if a.hostRevocationCancel == nil {
+		return
+	}
+	a.hostRevocationCancel()
+	<-a.hostRevocationDone
+	a.hostRevocationCancel = nil
+	a.hostRevocationDone = nil
 }
 
 func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {

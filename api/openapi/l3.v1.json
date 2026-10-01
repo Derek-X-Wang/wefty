@@ -75,10 +75,11 @@
         "security": [{ "fabricIdentity": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HostComputerTokenRevocationRequest" } } } },
         "responses": {
-          "204": { "description": "Every active grant owned by the authenticated host is revoked." },
+          "204": { "description": "Every active grant of the authenticated host that another boot session of the claimed stable node minted, or that records no stable node, before the request was proved is revoked. Grants another stable node minted are never revoked." },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
-          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
       }
     },
@@ -803,8 +804,12 @@
       },
       "HostComputerTokenRevocationRequest": {
         "type": "object", "additionalProperties": false,
-        "required": ["reason"],
-        "properties": { "reason": { "type": "string", "minLength": 1 } }
+        "required": ["reason", "stable_node_id", "boot_session_id"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1 },
+          "stable_node_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "boot_session_id": { "type": "string", "minLength": 1, "maxLength": 255 }
+        }
       },
       "ComputerSelf": {
         "type": "object", "additionalProperties": false,

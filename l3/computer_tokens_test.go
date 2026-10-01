@@ -18,7 +18,8 @@ import (
 
 func testComputerScope() ComputerTokenScopeProof {
 	return ComputerTokenScopeProof{ComputerID: "computer-1", ComputerAttemptID: "attempt-1",
-		ComputerStorageGeneration: 7, SubmitIntentRevision: 3, HostNodeID: "node-1", SubmitMaxInflight: 2}
+		ComputerStorageGeneration: 7, SubmitIntentRevision: 3, HostNodeID: "node-1",
+		HostStableNodeID: "stable-node", HostBootSessionID: "boot-1", SubmitMaxInflight: 2}
 }
 
 func TestComputerTokenIsHashOnlyRevocableAndPromotionInvalidated(t *testing.T) {
@@ -259,17 +260,144 @@ func TestComputerAttemptAndHostRevocationsAreIdentityScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RevokeHostComputerTokens(ctx, "foreign-node", "agent_restart"); err != nil {
+	if _, err := store.RevokeHostComputerTokens(ctx, "foreign-node", proof.HostStableNodeID, "boot-foreign", "agent_restart", func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
 		t.Fatalf("foreign host restart revoked grant: %v", err)
 	}
-	if err := store.RevokeHostComputerTokens(ctx, proof.HostNodeID, "agent_restart"); err != nil {
+	previousBootProof := proof
+	previousBootProof.HostBootSessionID = "boot-previous"
+	grant, err = store.MintComputerToken(ctx, previousBootProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevokeHostComputerTokens(ctx, proof.HostNodeID, proof.HostStableNodeID, proof.HostBootSessionID, "agent_restart", func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err == nil {
 		t.Fatal("host restart revocation left grant active")
+	}
+}
+
+func TestDelayedRevokeHostEndsOnlyEarlierBootsGrants(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "delayed-host-revoke.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var mintOnStableNode func(computerID, attemptID, hostNodeID, stableNodeID, bootSessionID string) ComputerTokenGrant
+	mint := func(computerID, attemptID, hostNodeID, bootSessionID string) ComputerTokenGrant {
+		t.Helper()
+		return mintOnStableNode(computerID, attemptID, hostNodeID, "stable-1", bootSessionID)
+	}
+	mintOnStableNode = func(computerID, attemptID, hostNodeID, stableNodeID, bootSessionID string) ComputerTokenGrant {
+		t.Helper()
+		proof := testComputerScope()
+		proof.ComputerID = computerID
+		proof.ComputerAttemptID = attemptID
+		proof.HostNodeID = hostNodeID
+		proof.HostStableNodeID = stableNodeID
+		proof.HostBootSessionID = bootSessionID
+		grant, err := store.MintComputerToken(ctx, proof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return grant
+	}
+	previous := mint("computer-previous", "attempt-previous", "node-1", "boot-previous")
+	current := mint("computer-current", "attempt-current", "node-1", "boot-current")
+	foreign := mint("computer-foreign", "attempt-foreign", "node-2", "boot-foreign")
+	// Same Fabric identity, another stable node: never a candidate.
+	sibling := mintOnStableNode("computer-sibling", "attempt-sibling", "node-1", "stable-2", "boot-sibling")
+
+	var next, currentAfterProof ComputerTokenGrant
+	revoked, err := store.RevokeHostComputerTokens(ctx, "node-1", "stable-1", "boot-current", "agent_restart", func(context.Context) error {
+		// These grants commit after revoke-host read its high-water mark. The
+		// later boot simulates a successor taking over after L1 answered but
+		// before this delayed request reaches its L3 transaction.
+		next = mint("computer-next", "attempt-next", "node-1", "boot-next")
+		currentAfterProof = mint("computer-current-2", "attempt-current-2", "node-1", "boot-current")
+		return nil
+	})
+	if err != nil || revoked != 1 {
+		t.Fatalf("revoke-host = (%d, %v), want one earlier-boot grant", revoked, err)
+	}
+	if _, err := store.AuthenticateComputerToken(ctx, previous.Token); err == nil {
+		t.Fatal("earlier boot's grant survived revoke-host")
+	}
+	for name, grant := range map[string]ComputerTokenGrant{
+		"current": current, "next": next, "current after proof": currentAfterProof, "foreign": foreign, "sibling": sibling,
+	} {
+		if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
+			t.Fatalf("%s grant was revoked: %v", name, err)
+		}
+	}
+
+	refusal := protocolError(contract.ErrorForbidden, "boot session is not the host's current registration")
+	if _, err := store.RevokeHostComputerTokens(ctx, "node-1", "stable-1", "boot-current", "agent_restart", func(context.Context) error {
+		return refusal
+	}); !errors.Is(err, refusal) {
+		t.Fatalf("replayed stale claim = %v, want L1 refusal", err)
+	}
+	for name, grant := range map[string]ComputerTokenGrant{"current": current, "next": next, "current after proof": currentAfterProof} {
+		if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err != nil {
+			t.Fatalf("%s grant changed after refused replay: %v", name, err)
+		}
+	}
+}
+
+func TestRevokeHostRevokesLegacyGrantsWithoutBootSession(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-host-revoke.sqlite")
+	open := func() *Store {
+		t.Helper()
+		store, err := OpenStore(path, StoreOptions{ComputerAuthorityInstanceID: "legacy-test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	store := open()
+	legacy, err := store.MintComputerToken(ctx, testComputerScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{"host_stable_node_id", "host_boot_session_id"} {
+		if _, err := store.db.Exec(`ALTER TABLE computer_token_grants DROP COLUMN ` + column); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Opening twice proves the additive migration is safe on every open.
+	store = open()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store = open()
+	defer store.Close()
+	currentProof := testComputerScope()
+	currentProof.ComputerID = "computer-current"
+	currentProof.ComputerAttemptID = "attempt-current"
+	current, err := store.MintComputerToken(ctx, currentProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := store.RevokeHostComputerTokens(ctx, currentProof.HostNodeID, currentProof.HostStableNodeID, currentProof.HostBootSessionID,
+		"agent_restart", func(context.Context) error { return nil })
+	if err != nil || revoked != 1 {
+		t.Fatalf("legacy revoke-host = (%d, %v), want one revoked grant", revoked, err)
+	}
+	if _, err := store.AuthenticateComputerToken(ctx, legacy.Token); err == nil {
+		t.Fatal("legacy grant without a boot session survived revoke-host")
+	}
+	if _, err := store.AuthenticateComputerToken(ctx, current.Token); err != nil {
+		t.Fatalf("current boot grant was revoked: %v", err)
 	}
 }
 

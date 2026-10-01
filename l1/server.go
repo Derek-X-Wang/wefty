@@ -389,6 +389,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
 	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
 	client.HandleFunc("POST /v1/computers/{computer_id}/token-scope-proof", s.proveComputerTokenScope)
+	client.HandleFunc("POST /v1/host-boot-session-proof", s.proveHostBootSession)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
@@ -465,6 +466,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computers/{computer_id}/takeover", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/submission", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/host-boot-session-proof", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/admin-bootstrap", s.authorize(personPrincipal, person))
@@ -505,6 +507,23 @@ func (s *Server) proveComputerTokenScope(w http.ResponseWriter, r *http.Request)
 	proof, err := s.store.ProveComputerTokenScope(r.Context(), r.PathValue("computer_id"),
 		request.ComputerAttemptID, request.HostIdentityNodeID, request.HostNodeID)
 	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, proof)
+}
+
+func (s *Server) proveHostBootSession(w http.ResponseWriter, r *http.Request) {
+	if identityFromRequest(r).NodeID != s.runLedgerNodeID {
+		writeError(w, protocolError(contract.ErrorForbidden, "only the L3 run ledger may request host boot session proof"))
+		return
+	}
+	var proof HostBootSessionProof
+	if err := decodeJSON(r, &proof); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.ProveHostBootSession(r.Context(), proof.HostIdentityNodeID, proof.HostStableNodeID, proof.BootSessionID); err != nil {
 		writeError(w, err)
 		return
 	}

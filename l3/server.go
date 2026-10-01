@@ -27,6 +27,7 @@ type ServerConfig struct {
 	Logs               JobLogClient
 	Results            JobResultClient
 	ComputerGrants     ComputerGrantVerifier
+	HostBootSessions   HostBootSessionVerifier
 }
 
 type Server struct {
@@ -39,6 +40,7 @@ type Server struct {
 	logs                JobLogClient
 	results             JobResultClient
 	computerGrants      ComputerGrantVerifier
+	hostBootSessions    HostBootSessionVerifier
 	filterRunVisibility func(context.Context, string, string) (bool, error)
 	handler             http.Handler
 }
@@ -75,8 +77,13 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if computerGrants == nil {
 		computerGrants, _ = jobs.(ComputerGrantVerifier)
 	}
+	hostBootSessions := config.HostBootSessions
+	if hostBootSessions == nil {
+		hostBootSessions, _ = jobs.(HostBootSessionVerifier)
+	}
 	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
-		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants}
+		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants,
+		hostBootSessions: hostBootSessions}
 	server.handler = server.routes()
 	return server, nil
 }
@@ -413,7 +420,17 @@ func (s *Server) revokeHostComputerTokens(w http.ResponseWriter, r *http.Request
 		writeError(w, err)
 		return
 	}
-	if err := s.store.RevokeHostComputerTokens(r.Context(), identity.NodeID, request.Reason); err != nil {
+	_, err := s.store.RevokeHostComputerTokens(r.Context(), identity.NodeID, request.StableNodeID, request.BootSessionID, request.Reason, func(ctx context.Context) error {
+		if s.hostBootSessions == nil {
+			return internalError(errors.New("L1 host boot session verifier is not configured"), "revoke host Computer tokens")
+		}
+		err := s.hostBootSessions.ProveHostBootSession(ctx, identity.NodeID, request.StableNodeID, request.BootSessionID)
+		if code, _ := errorDetails(err); err != nil && (code == contract.ErrorForbidden || code == contract.ErrorNotFound) {
+			return protocolError(contract.ErrorForbidden, "host boot session is not current")
+		}
+		return err
+	})
+	if err != nil {
 		writeError(w, err)
 		return
 	}
