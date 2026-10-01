@@ -46,13 +46,14 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 		endpoint string
 	}
 	publications := make(chan publication, 4)
+	forwarding := newComputerForwardingSignal()
 	ctx, cancel := context.WithCancel(t.Context())
 	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
 	result := make(chan error, 1)
 	go func() {
 		_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
-			publicationOperation: testComputerPublicationOperation,
-			clock:                systemClock{}, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
+			publicationOperation: testComputerPublicationOperation, forwardingChanged: forwarding.observe,
+			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
 			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 			fencingToken: "fence-1", dial: dial,
 			publish: func(_ context.Context, ready bool, endpoint string, _ int64) error {
@@ -71,6 +72,7 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	if !published.ready || published.endpoint == "" || privateFabric.listenNetwork != "tcp" || privateFabric.listenAddress != ":0" {
 		t.Fatalf("private publication=%#v listen=%q %q", published, privateFabric.listenNetwork, privateFabric.listenAddress)
 	}
+	forwarding.await(t)
 	connection, _, err := websocket.Dial(t.Context(), published.endpoint, &websocket.DialOptions{Subprotocols: []string{computerWebSocketSubprotocol}})
 	if err != nil {
 		t.Fatal(err)
@@ -363,11 +365,12 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 		ctx, cancel := context.WithCancel(t.Context())
 		runtime := &restartComputerRuntime{opaqueEndpointRuntime: &opaqueEndpointRuntime{release: make(chan struct{})}}
 		published := make(chan string, 2)
+		forwarding := newComputerForwardingSignal()
 		done := make(chan error, 1)
 		go func() {
 			_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
-				publicationOperation: testComputerPublicationOperation,
-				clock:                systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
+				publicationOperation: testComputerPublicationOperation, forwardingChanged: forwarding.observe,
+				clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
 				computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 				fencingToken: "fence-1", dial: dial,
 				publish: func(_ context.Context, ready bool, endpoint string, _ int64) error {
@@ -381,6 +384,7 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 		}()
 		select {
 		case endpoint := <-published:
+			forwarding.await(t)
 			return runningService{cancel: cancel, done: done, endpoint: endpoint, runtime: runtime}
 		case <-time.After(5 * time.Second):
 			cancel()
@@ -460,11 +464,12 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 	auditor := &failingComputerAuditor{}
 	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
 	published := make(chan string, 1)
+	forwarding := newComputerForwardingSignal()
 	done := make(chan error, 1)
 	go func() {
 		_, err := runComputerService(t.Context(), runtime, workloadrunner.Request{}, nil, computerServiceConfig{
-			publicationOperation: testComputerPublicationOperation,
-			clock:                systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
+			publicationOperation: testComputerPublicationOperation, forwardingChanged: forwarding.observe,
+			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
 			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
 			fencingToken: "fence-1",
 			dial:         func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
@@ -483,6 +488,7 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Computer service was not published")
 	}
+	forwarding.await(t)
 	base := "http" + strings.TrimSuffix(endpoint[len("ws"):], computerWebSocketPath)
 	connection, _ := dialComputerFrontDoorWithToken(t, base, nil)
 	defer connection.CloseNow()
@@ -502,6 +508,32 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 type recordingComputerServiceFabric struct {
 	identity                     fabric.Identity
 	listenNetwork, listenAddress string
+}
+
+// computerForwardingSignal observes the front door opening. The door opens
+// only after the ready publication is acknowledged, so a test that dials the
+// endpoint straight from its publish callback can reach a door that still
+// answers 503 "not ready" (#163); await opens before dialing.
+type computerForwardingSignal chan struct{}
+
+func newComputerForwardingSignal() computerForwardingSignal { return make(computerForwardingSignal, 1) }
+
+func (signal computerForwardingSignal) observe(enabled bool) {
+	if enabled {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (signal computerForwardingSignal) await(t *testing.T) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Computer front door did not open after its ready publication")
+	}
 }
 
 func testComputerPublicationOperation(parent context.Context) (context.Context, context.CancelFunc) {

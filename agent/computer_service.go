@@ -38,6 +38,11 @@ type computerServiceConfig struct {
 	dial                 computerEndpointDial
 	publish              func(ctx context.Context, ready bool, displayEndpoint string, submitIntentRevision int64) error
 	publicationOperation func(context.Context) (context.Context, context.CancelFunc)
+	// forwardingChanged, when set, observes the front door opening and closing.
+	// The door opens only after L1 acknowledges the ready publication, so the
+	// publish callback runs before the endpoint accepts a viewer. It runs
+	// under the publication controller's lock and must not block.
+	forwardingChanged func(enabled bool)
 }
 
 // computerAttemptBridgeController makes the transport follow Computer
@@ -271,7 +276,12 @@ func runComputerService(
 			}
 			publicationMu.Unlock()
 			return err
-		}, frontDoor.SetReady)
+		}, func(enabled bool) {
+			frontDoor.SetReady(enabled)
+			if config.forwardingChanged != nil {
+				config.forwardingChanged(enabled)
+			}
+		})
 	publicationDone := make(chan error, 1)
 	go func() { publicationDone <- publication.Run(publicationContext) }()
 

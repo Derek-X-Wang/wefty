@@ -474,3 +474,57 @@ func TestPublicationControllerParksStaleSubmissionRefusalUntilReassert(t *testin
 		t.Fatalf("publication controller stop: %v", err)
 	}
 }
+
+// A readiness signal can land between Run consuming pending signals and taking
+// its snapshot: the snapshot already carries the change while the signal stays
+// pending. The stale refusal for that publication must still park instead of
+// spending the leftover signal on a second identical request (wefty #163).
+func TestPublicationControllerStaleRefusalIgnoresSignalItAlreadyCarried(t *testing.T) {
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	actions := make(chan string, 16)
+	var refusals atomic.Int32
+	var controller *publicationController
+	controller = newPublicationController(clock, DefaultPublicationRecoveryWindow, DefaultPublicationRetryInterval,
+		func(_ context.Context, ready bool) error {
+			if ready {
+				refusal := refusals.Add(1)
+				if refusal > 2 {
+					actions <- "publish:true"
+					return nil
+				}
+				if refusal == 1 {
+					// The leftover signal of an Observe whose change this
+					// publication already carries.
+					controller.mu.Lock()
+					controller.signalLocked()
+					controller.mu.Unlock()
+				}
+				actions <- "refused:true"
+				return &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{
+					Code: contract.ErrorStalePolicyRevision, Message: "Computer readiness was earned under a superseded submission revision",
+				}}
+			}
+			actions <- "publish:" + boolString(ready)
+			return nil
+		},
+		func(ready bool) { actions <- "forward:" + boolString(ready) },
+	)
+	done := make(chan error, 1)
+	go func() { done <- controller.Run(context.Background()) }()
+
+	controller.Observe(true)
+	wantPublicationAction(t, actions, "refused:true")
+	wantNoPublicationAction(t, actions)
+
+	refusals.Store(2)
+	controller.Reassert()
+	wantPublicationAction(t, actions, "publish:true")
+	wantPublicationAction(t, actions, "forward:true")
+
+	controller.Stop()
+	wantPublicationAction(t, actions, "forward:false")
+	wantPublicationAction(t, actions, "publish:false")
+	if err := waitPublicationDone(t, done); err != nil {
+		t.Fatalf("publication controller stop: %v", err)
+	}
+}

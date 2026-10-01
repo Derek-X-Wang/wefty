@@ -124,9 +124,9 @@ func (controller *publicationController) Run(ctx context.Context) error {
 	var acknowledged *bool
 	requestedTrue := false
 	for {
-		// Everything a pending signal announces is visible in the snapshot
-		// below, so it is consumed here; a stale refusal then parks until a
-		// signal sent after this publication began.
+		// A pending signal is consumed before the snapshot. One sent between
+		// this drain and the snapshot stays pending although the snapshot
+		// already shows its change, so waits below compare state, not signals.
 		select {
 		case <-controller.notify:
 		default:
@@ -173,8 +173,10 @@ func (controller *publicationController) Run(ctx context.Context) error {
 			// readiness was earned under, and that commit cleared the
 			// publication. Nothing is published; wait for the agent to install
 			// the newer authority (Reassert) or for readiness to change
-			// (wefty #559). This is neither a failure nor a retry loop.
-			if !controller.waitForSignal(ctx) {
+			// (wefty #559). This is neither a failure nor a retry loop: a
+			// signal whose change this publication already carried does not
+			// send it again.
+			if !controller.waitForChange(ctx, requestedRevision) {
 				controller.forward(false)
 				return nil
 			}
@@ -305,13 +307,25 @@ func (controller *publicationController) wait(ctx context.Context, duration time
 	}
 }
 
-func (controller *publicationController) waitForSignal(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-controller.notify:
-		return true
+// waitForChange parks until readiness moves past revision or a Reassert
+// arrives. Signals for changes the caller's snapshot already held are absorbed.
+func (controller *publicationController) waitForChange(ctx context.Context, revision uint64) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-controller.notify:
+			if controller.changedSince(revision) {
+				return true
+			}
+		}
 	}
+}
+
+func (controller *publicationController) changedSince(revision uint64) bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.revision != revision || controller.reassert
 }
 
 func (controller *publicationController) signalLocked() {

@@ -1323,8 +1323,15 @@ func TestPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 	clock := newManualClock(time.Date(2026, 8, 9, 14, 0, 0, 0, time.UTC))
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServer(t, network, clock, map[string][]string{
-		"node-1": {"linux"}, "node-2": {"linux"},
+	// One one-shot slot: the only claim loop stays inside the expired attempt
+	// until the partition cancels it. With more slots an idle sibling loop's
+	// first poll can still be in flight when the fresh job is queued; it then
+	// claims that job before the partition, the partition expires its lease
+	// too, and the job fails for the test's own ordering (#163).
+	partitionedPolicy := l1.DefaultNodePolicy("linux")
+	partitionedPolicy.MaxOneshotSlots = 1
+	store, stopServer := startFailureServerWithPolicies(t, network, clock, map[string]l1.NodePolicy{
+		"node-1": partitionedPolicy, "node-2": l1.DefaultNodePolicy("linux"),
 	})
 	defer stopServer()
 
