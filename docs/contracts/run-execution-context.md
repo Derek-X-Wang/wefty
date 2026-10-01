@@ -1367,8 +1367,9 @@ An authoritative absence for a dispatch L1 never acknowledged is provisional
 until the settle horizon, one hour after the run's last submit attempt: L1 may
 commit a submit after recovery asked, with its response lost. Before the
 horizon the absence is not reported; the run backs off and is asked again, and
-is linked if the job has appeared. Only an absence at or after the horizon
-settles it as a nonretryable `not_found` dispatch error with details `{reason:
+is linked if the job has appeared. Only an absence from a lookup that started
+at or after the horizon settles it, since a lookup in flight across the
+horizon may miss a submit L1 commits meanwhile. It settles as a nonretryable `not_found` dispatch error with details `{reason:
 dispatch_not_found, dispatch_key: <key>}`. An existing nonretryable dispatch
 refusal is retained instead of being replaced. If the outbox already records an
 acknowledged job ID and the lookup does not return that job, L3 reads the
@@ -1383,7 +1384,8 @@ meanwhile is linked instead. An acknowledgement that arrives after the
 settlement still links the run and clears the settled diagnostic. A submit
 error recorded after the settlement never replaces it. Later passes do not ask
 again, so what remains unlinked is only a submit whose acknowledgement L3 never
-records and that L1 commits later than the horizon. A new L3 talking to an
+records and that L1 commits after the settling lookup, which starts no earlier
+than the horizon. A new L3 talking to an
 older L1 receives that server's plain route-level 404, not the complete error
 envelope from this endpoint, so version skew can never establish absence. None
 of these paths resubmits the job.

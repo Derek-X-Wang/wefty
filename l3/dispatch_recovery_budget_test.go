@@ -2,6 +2,7 @@ package l3
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
@@ -204,5 +205,50 @@ WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','faile
 	}
 	if indexed != 0 {
 		t.Fatalf("never-attempted run is in the recovery index (%d rows)", indexed)
+	}
+}
+
+// An upgrade interrupted after adding dispatch_attempt_ns leaves attempted
+// runs with no attempt time, outside the recovery index. Every open heals
+// them; a run never attempted stays without one.
+func TestOpeningALedgerHealsMissingDispatchAttemptTimes(t *testing.T) {
+	s, path, clock := recoveryStore(t)
+	ctx := context.Background()
+	attempted := endedUnrecordedRuns(t, s, clock, 1)[0]
+	never, _, err := s.CreateRun(ctx, CreateRunInput{IdempotencyKey: "heal-never-attempted", Actor: "test", Request: inlineRunRequest("#!/bin/sh\nexit 0\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rejectProtocolWrite(ctx, never.RunID, "envelope", "heal-never", []byte(`{}`), "heal-hash", "invalid envelope", errors.New("invalid envelope")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET dispatch_attempt_ns=NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(path, StoreOptions{Clock: clock, RunTokenGrace: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	var attemptNS sql.NullInt64
+	var finishedNS int64
+	if err := reopened.db.QueryRow(`SELECT dispatch_attempt_ns, finished_ns FROM runs WHERE dispatch_key=?`, attempted).Scan(&attemptNS, &finishedNS); err != nil {
+		t.Fatal(err)
+	}
+	if !attemptNS.Valid || attemptNS.Int64 != finishedNS {
+		t.Fatalf("healed attempt time = %v, want the run's finish %d", attemptNS, finishedNS)
+	}
+	if err := reopened.db.QueryRow(`SELECT dispatch_attempt_ns FROM runs WHERE run_id=?`, never.RunID).Scan(&attemptNS); err != nil {
+		t.Fatal(err)
+	}
+	if attemptNS.Valid {
+		t.Fatalf("never-attempted run was given an attempt time %d", attemptNS.Int64)
+	}
+	pending, err := reopened.unrecordedDispatches(ctx, unrecordedDispatchBatch)
+	if err != nil || len(pending) != 1 || pending[0].DispatchKey != attempted {
+		t.Fatalf("recovery after healing = %+v, %v", pending, err)
 	}
 }

@@ -378,21 +378,20 @@ ON runs(created_ns, run_id) WHERE node_attribution_pending=1`); err != nil {
 	// so the partial index below holds only runs that were ever submitted: a
 	// run that ended before any attempt can never gain one (beginDispatch
 	// refuses terminal runs) and never enters it.
-	hadAttemptTime, err := sqliteColumnExists(ctx, s.db, "runs", "dispatch_attempt_ns")
-	if err != nil {
-		return fmt.Errorf("l3: inspect run dispatch attempt time: %w", err)
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "dispatch_attempt_ns", "INTEGER"); err != nil {
+		return fmt.Errorf("l3: migrate run dispatch attempt time: %w", err)
 	}
-	if !hadAttemptTime {
-		if err := ensureSQLiteColumn(ctx, s.db, "runs", "dispatch_attempt_ns", "INTEGER"); err != nil {
-			return fmt.Errorf("l3: migrate run dispatch attempt time: %w", err)
-		}
-		// A ledger from before the column records attempts only as a count.
-		// The run's finish (or last update) is no earlier than its last
-		// attempt, so it stands in for the attempt time.
-		if _, err := s.db.ExecContext(ctx, `UPDATE runs SET dispatch_attempt_ns=COALESCE(finished_ns, updated_ns)
-WHERE l1_job_id IS NULL AND run_id IN (SELECT run_id FROM dispatch_outbox WHERE attempt_count>0)`); err != nil {
-			return fmt.Errorf("l3: backfill run dispatch attempt time: %w", err)
-		}
+	// A ledger from before the column records attempts only as a count. The
+	// run's finish (or last update) is no earlier than its last attempt, so
+	// it stands in for the attempt time. This runs on every open, so an
+	// upgrade interrupted after adding the column is healed on the next one;
+	// a run never attempted keeps no attempt time. Unrecorded runs are only
+	// pending, dispatching or terminal, so runs_projection bounds the search.
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET dispatch_attempt_ns=COALESCE(finished_ns, updated_ns)
+WHERE dispatch_attempt_ns IS NULL AND l1_job_id IS NULL AND status IN (?, ?, ?, ?)
+  AND EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.run_id=runs.run_id AND o.attempt_count>0)`,
+		contract.RunPending, contract.RunDispatching, contract.RunSucceeded, contract.RunFailed); err != nil {
+		return fmt.Errorf("l3: backfill run dispatch attempt time: %w", err)
 	}
 	// Old rows default to unsettled so the reconciler can recover historical
 	// crash windows. The partial index holds exactly the rows recovery may
@@ -433,26 +432,6 @@ WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','faile
 		return err
 	}
 	return nil
-}
-
-func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, dataType string
-		var defaultValue any
-		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return false, err
-		}
-		if name == column {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
 }
 
 func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
@@ -2195,6 +2174,10 @@ func unrecordedDispatchBackoff(failures int) time.Duration {
 	return min(delay, unrecordedDispatchRetryCap)
 }
 
+// recoveryNow is the ledger clock reading recovery stamps on an L1 read before
+// sending it.
+func (s *Store) recoveryNow() time.Time { return canonicalTime(s.clock.Now()) }
+
 // unrecordedDispatchFor rereads one run's recovery state after a settlement
 // compare-and-set missed. It reports false once the run is no longer waiting.
 func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unrecordedDispatch, bool, error) {
@@ -2260,9 +2243,12 @@ const (
 // settleUnrecordedDispatch records one authoritative absence and stops future
 // lookups without changing the already-terminal run. It settles nothing when
 // the row changed since item was read, or when the dispatch was never
-// acknowledged and its last submit attempt is within the settle horizon.
-func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) (settleOutcome, error) {
-	horizon := canonicalTime(s.clock.Now()).Add(-unrecordedDispatchSettleHorizon)
+// acknowledged and lookupStarted, the time the absent answer was asked for,
+// is earlier than the settle horizon after the run's last submit attempt. A
+// lookup in flight across the horizon may have missed a submit L1 committed
+// meanwhile, so the answer counts from when it was asked, not received.
+func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, lookupStarted time.Time) (settleOutcome, error) {
+	horizon := canonicalTime(lookupStarted).Add(-unrecordedDispatchSettleHorizon)
 	cause := contract.APIError{
 		Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
 		Details: map[string]any{"reason": dispatchNotFoundReason, "dispatch_key": item.DispatchKey},

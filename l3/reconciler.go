@@ -248,6 +248,7 @@ func (r *Reconciler) recoverUnrecordedDispatch(ctx, remote context.Context, item
 // acknowledgement that arrived meanwhile, and not due when an unacknowledged
 // dispatch's absence is still inside the settle horizon.
 func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item unrecordedDispatch) (recoveryOutcome, error) {
+	lookupStarted := r.store.recoveryNow()
 	job, err := r.lookup.LookupJobByDispatchKey(remote, item.DispatchKey)
 	var absence error
 	switch {
@@ -274,7 +275,7 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 		}
 		absence = errors.Join(absence, err)
 	}
-	outcome, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
+	outcome, storeErr := r.store.settleUnrecordedDispatch(ctx, item, lookupStarted)
 	switch {
 	case storeErr != nil:
 		return recoveryDone, errors.Join(absence, storeErr)

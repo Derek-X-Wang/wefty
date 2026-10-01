@@ -147,3 +147,55 @@ func TestLateSubmitErrorDoesNotClobberASettledDiagnostic(t *testing.T) {
 		t.Fatalf("late submit error replaced the settled diagnostic: %+v", execution.DispatchError)
 	}
 }
+
+// clockAdvancingLookupClient answers not_found, with the ledger clock moved
+// on while the request was in flight.
+type clockAdvancingLookupClient struct {
+	clock   *mutableClock
+	advance func(time.Time) time.Time
+	lookups int
+}
+
+func (c *clockAdvancingLookupClient) LookupJobByDispatchKey(_ context.Context, key string) (l1.Job, error) {
+	c.lookups++
+	if c.advance != nil {
+		c.clock.now = c.advance(c.clock.now)
+	}
+	return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
+}
+
+// The horizon is measured at the lookup's start, not when its answer is
+// settled: a lookup that began before the horizon may have missed a submit L1
+// committed while it was in flight, so its absence must not settle the run.
+func TestALookupThatStartedBeforeTheHorizonDoesNotSettle(t *testing.T) {
+	s, _, clock := recoveryStore(t)
+	key := endedUnrecordedRuns(t, s, clock, 1)[0]
+	runID := runIDForDispatchKey(t, s, key)
+	attempted := clock.now
+	lookup := &clockAdvancingLookupClient{clock: clock, advance: func(time.Time) time.Time {
+		return attempted.Add(unrecordedDispatchSettleHorizon + time.Second)
+	}}
+	reconciler, err := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.now = attempted.Add(unrecordedDispatchSettleHorizon - time.Second)
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("absence from a lookup started inside the horizon was reported: %v", err)
+	}
+	if jobLinkSettled(t, s, runID) {
+		t.Fatal("a lookup started before the horizon settled the run")
+	}
+	if failures, retryAt := jobLinkBackoff(t, s, key); failures != 1 || !retryAt.After(clock.now) {
+		t.Fatalf("unsettled absence backoff = %d failures, retry at %v (now %v)", failures, retryAt, clock.now)
+	}
+
+	lookup.advance = nil
+	clock.now = clock.now.Add(unrecordedDispatchRetryBase)
+	if err := reconciler.ReconcileOnce(context.Background()); err == nil {
+		t.Fatal("absence from a lookup started after the horizon was not reported")
+	}
+	if lookup.lookups != 2 || !jobLinkSettled(t, s, runID) {
+		t.Fatalf("lookup started after the horizon: lookups=%d settled=%v", lookup.lookups, jobLinkSettled(t, s, runID))
+	}
+}
