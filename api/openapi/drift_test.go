@@ -655,6 +655,58 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 				{"properties": {"value": {"const": "a"}}, "not": {"anyOf": [{"required": ["other"]}]}}
 			]
 		},
+		"lateResultEvidence": {
+			"type": "object", "additionalProperties": false,
+			"required": ["kind", "late", "observed_at", "authority_lost_at"],
+			"properties": {
+				"kind": {"enum": ["observation", "gap"]},
+				"result": {"type": "object"},
+				"gap": {"type": "object", "additionalProperties": false, "required": ["reason"],
+					"properties": {"reason": {"const": "observation_window_expired"}}},
+				"late": {"const": true},
+				"observed_at": {"type": "string", "format": "date-time"},
+				"authority_lost_at": {"type": "string", "format": "date-time"}
+			},
+			"oneOf": [
+				{"properties": {"kind": {"const": "observation"}}, "required": ["result"], "not": {"required": ["gap"]}},
+				{"properties": {"kind": {"const": "gap"}}, "required": ["gap"], "not": {"required": ["result"]}}
+			]
+		},
+		"lateResultEvidenceKindForbidden": {
+			"type": "object", "additionalProperties": false,
+			"required": ["kind", "late", "observed_at", "authority_lost_at"],
+			"properties": {
+				"kind": {"enum": ["observation", "gap"]},
+				"result": {"type": "object"},
+				"gap": {"type": "object", "additionalProperties": false, "required": ["reason"],
+					"properties": {"reason": {"const": "observation_window_expired"}}},
+				"late": {"const": true},
+				"observed_at": {"type": "string", "format": "date-time"},
+				"authority_lost_at": {"type": "string", "format": "date-time"}
+			},
+			"oneOf": [
+				{"properties": {"kind": {"const": "observation"}}, "required": ["result"], "not": {"required": ["kind"]}},
+				{"properties": {"kind": {"const": "gap"}}, "required": ["gap"], "not": {"required": ["result"]}}
+			]
+		},
+		"declaringArmForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a", "b"]}},
+			"anyOf": [
+				{"properties": {"value": {"const": "a"}}, "not": {"anyOf": [{"required": ["value"]}]}},
+				{"properties": {"value": {"const": "b"}}}
+			]
+		},
+		"alwaysDeclaringArmForbids": {
+			"type": "object",
+			"allOf": [{"properties": {"value": {"const": "a"}}, "not": {"required": ["value"]}}],
+			"properties": {"value": {"enum": ["a"]}}
+		},
+		"ownNotForbids": {
+			"type": "object",
+			"properties": {"value": {"enum": ["a"]}},
+			"not": {"required": ["value"]}
+		},
 		"closedArmForbids": {"anyOf": [
 			{"type": "object", "properties": {"value": {"enum": ["a"]}}},
 			{"type": "object", "additionalProperties": false}
@@ -809,6 +861,14 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 		{"unevaluatedArmForbids", []string{"properties", "value"}, []string{"a"}, true},
 		{"notRequiredArmForbids", []string{"properties", "value"}, []string{"a"}, true},
 		{"pairRequiredDoesNotForbid", []string{"properties", "value"}, nil, false},
+		// An arm that declares a property but requires it to be absent admits
+		// no value for it. lateResultEvidence copies common.v1.json
+		// LateResultEvidence (result's ProcessResult $ref reduced to an
+		// object); its KindForbidden twin names kind instead of gap in the
+		// observation arm's not, which forbids every observation.
+		{"lateResultEvidence", []string{"properties", "kind"}, []string{"gap", "observation"}, true},
+		{"lateResultEvidenceKindForbidden", []string{"properties", "kind"}, []string{"gap"}, true},
+		{"declaringArmForbids", []string{"properties", "value"}, []string{"b"}, true},
 		{"allArms", []string{"properties", "value"}, []string{"b"}, true},
 		{"missingArm", []string{"properties", "value"}, nil, false},
 		{"nullable", []string{"properties", "value"}, []string{"a"}, true},
@@ -855,6 +915,8 @@ func TestMembersComposeAcrossArms(t *testing.T) {
 		{"everyArmForbids", "being forbidden by"},
 		{"alwaysArmForbids", "being forbidden by"},
 		{"bothBranchesForbid", "being forbidden by"},
+		{"alwaysDeclaringArmForbids", "being forbidden by"},
+		{"ownNotForbids", "being forbidden by its own not"},
 		// A closed declaration that omits a property another declaration of
 		// the same member declares rejects it, though the merge would admit it.
 		{"closedTwice", "closed declaration"},
@@ -1604,8 +1666,11 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 	if len(tokens) == 2 && tokens[0] == "properties" {
 		property = tokens[1]
 	}
-	// forbidding reports an arm that rules the property out (see forbids).
+	// forbidding reports an arm that rules the property out without declaring
+	// it (see forbids); absent, an arm that declares it but whose not still
+	// requires it to be absent, so the arm admits no value for it.
 	forbidding := func(arm schemaRef) bool { return property != "" && s.forbids(arm, property) }
+	absent := func(arm schemaRef) bool { return property != "" && s.requiresAbsent(arm, property) }
 	seen := map[string]bool{}
 	var read func(schemaRef) (schemaRef, bool)
 	read = func(r schemaRef) (schemaRef, bool) {
@@ -1664,9 +1729,11 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 		forbidden := ""
 		always, groups, conditional := s.arms(r)
 		for _, arm := range always {
-			if member, ok := read(arm); ok {
+			member, declared := read(arm)
+			switch {
+			case declared && !absent(arm):
 				mergeAlways(member)
-			} else if forbidding(arm) {
+			case declared || forbidding(arm):
 				forbidden = s.resolve(arm, nil).loc.key()
 			}
 		}
@@ -1680,13 +1747,15 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 					continue
 				}
 				participating++
-				if member, ok := read(arm); ok {
+				member, declared := read(arm)
+				switch {
+				case declared && !absent(arm):
 					if !groupDeclares {
 						remember(member)
 					}
 					groupDeclares = true
 					members = append(members, member)
-				} else if !forbidding(arm) {
+				case !declared && !forbidding(arm):
 					members = append(members, s.placeholder(arm))
 				}
 			}
@@ -1713,13 +1782,15 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 					members = append(members, s.placeholder(r))
 					continue
 				}
-				if member, ok := read(arm); ok {
+				member, declared := read(arm)
+				switch {
+				case declared && !absent(arm):
 					if !groupDeclares {
 						remember(member)
 					}
 					groupDeclares = true
 					members = append(members, member)
-				} else if !forbidding(arm) {
+				case !declared && !forbidding(arm):
 					members = append(members, s.placeholder(arm))
 				}
 			}
@@ -1747,6 +1818,10 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 		return combined, true
 	}
 	member, ok := read(r)
+	if ok && absent(r) {
+		s.fatalf("%s: the drift member reader does not model %s, which the schema declares, being forbidden by its own not",
+			r.loc.key(), strings.Join(tokens, "/"))
+	}
 	if ok && member.composed != nil {
 		s.closures(member)
 	}
@@ -1755,13 +1830,17 @@ func (s *schemaSet) member(r schemaRef, tokens ...string) (schemaRef, bool) {
 
 // forbids reports an arm that rules a property out without declaring it: an
 // arm closed by additionalProperties or unevaluatedProperties false, or one
-// whose own not (or an arm of it that always applies) requires the property
-// alone, directly or as one anyOf alternative. The caller has already found
-// that the arm declares no schema for the property.
+// that requires the property to be absent. The caller has already found that
+// the arm declares no schema for the property.
 func (s *schemaSet) forbids(arm schemaRef, name string) bool {
-	if s.shape(arm, nil).closed {
-		return true
-	}
+	return s.shape(arm, nil).closed || s.requiresAbsent(arm, name)
+}
+
+// requiresAbsent reports a schema whose own not (or the not of an arm of it
+// that always applies) requires the property alone, directly or as one anyOf
+// alternative: whatever the schema declares for the property, it admits no
+// instance that carries it.
+func (s *schemaSet) requiresAbsent(arm schemaRef, name string) bool {
 	requiresOnly := func(node any) bool {
 		object, ok := node.(map[string]any)
 		if !ok {
