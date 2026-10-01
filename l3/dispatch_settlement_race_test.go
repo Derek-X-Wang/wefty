@@ -99,6 +99,7 @@ func TestAcknowledgementAfterSettlementLinksTheRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+	ageDispatchAttemptPastSettleHorizon(t, h.l3Store, run.RunID)
 	before := snapshotTerminalRun(t, h.l3Store, run.RunID)
 	reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
 	if err != nil {

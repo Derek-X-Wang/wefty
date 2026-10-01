@@ -2022,7 +2022,10 @@ func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchE
 	if err != nil {
 		return internalError(err, "encode dispatch error")
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID)
+	// A submit error that returns after recovery settled the run must not
+	// replace the settled diagnostic.
+	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1)`, string(payload), runID)
 	if err != nil {
 		return internalError(err, "record dispatch error")
 	}
@@ -2040,7 +2043,10 @@ func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr erro
 	if err != nil {
 		return internalError(err, "encode permanent dispatch error")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=CASE
+    WHEN EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1) THEN last_error ELSE ? END,
+  token_delivery=NULL
+WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 		return internalError(err, "record permanent dispatch error")
 	}
 	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, dispatchFailureReason(dispatchErr)); err != nil {
@@ -2135,6 +2141,11 @@ const (
 	// doubling per consecutive failure up to unrecordedDispatchRetryCap.
 	unrecordedDispatchRetryBase = 30 * time.Second
 	unrecordedDispatchRetryCap  = 30 * time.Minute
+	// unrecordedDispatchSettleHorizon is how long after the run's last submit
+	// attempt a dispatch-key absence stays provisional. L1 may commit a submit
+	// after recovery first asks, with the response lost; only an absence at
+	// or after the horizon settles the run.
+	unrecordedDispatchSettleHorizon = time.Hour
 )
 
 func (s *Store) unrecordedDispatches(ctx context.Context, limit int) ([]unrecordedDispatch, error) {
@@ -2187,8 +2198,16 @@ func unrecordedDispatchBackoff(failures int) time.Duration {
 // unrecordedDispatchFor rereads one run's recovery state after a settlement
 // compare-and-set missed. It reports false once the run is no longer waiting.
 func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unrecordedDispatch, bool, error) {
+	return unrecordedDispatchForTx(ctx, s.db, runID)
+}
+
+type rowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func unrecordedDispatchForTx(ctx context.Context, db rowQuerier, runID string) (unrecordedDispatch, bool, error) {
 	item := unrecordedDispatch{RunID: runID}
-	err := s.db.QueryRowContext(ctx, `SELECT o.dispatch_key, COALESCE(o.job_id, '')
+	err := db.QueryRowContext(ctx, `SELECT r.dispatch_key, COALESCE(o.job_id, '')
 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
 WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN (?, ?) AND r.dispatch_attempt_ns IS NOT NULL`,
 		runID, contract.RunSucceeded, contract.RunFailed).Scan(&item.DispatchKey, &item.OutboxJobID)
@@ -2227,10 +2246,23 @@ WHERE run_id=?`, jobID, now.UnixNano(), item.RunID); err != nil {
 	return nil
 }
 
+type settleOutcome int
+
+const (
+	settled settleOutcome = iota
+	// settleChanged: the row changed since it was read; reread it.
+	settleChanged
+	// settleNotDue: an unacknowledged dispatch's absence is still inside the
+	// settle horizon; ask again after the backoff.
+	settleNotDue
+)
+
 // settleUnrecordedDispatch records one authoritative absence and stops future
-// lookups without changing the already-terminal run. It reports false when
-// the row changed since item was read, and settles nothing.
-func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) (bool, error) {
+// lookups without changing the already-terminal run. It settles nothing when
+// the row changed since item was read, or when the dispatch was never
+// acknowledged and its last submit attempt is within the settle horizon.
+func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) (settleOutcome, error) {
+	horizon := canonicalTime(s.clock.Now()).Add(-unrecordedDispatchSettleHorizon)
 	cause := contract.APIError{
 		Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
 		Details: map[string]any{"reason": dispatchNotFoundReason, "dispatch_key": item.DispatchKey},
@@ -2243,40 +2275,49 @@ func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDis
 	}
 	payload, err := json.Marshal(cause)
 	if err != nil {
-		return false, internalError(err, "encode unrecorded dispatch settlement")
+		return settled, internalError(err, "encode unrecorded dispatch settlement")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, internalError(err, "begin unrecorded dispatch settlement")
+		return settled, internalError(err, "begin unrecorded dispatch settlement")
 	}
 	defer tx.Rollback()
 	// Compare-and-set on the acknowledgement recovery read before its L1
 	// reads: one recorded since then is L1's own answer, which the caller
-	// links instead of settling over it.
+	// links instead of settling over it. An acknowledged job's absence by ID
+	// settles at once; L1 committed it before acknowledging it.
 	result, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1
 WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)
-  AND (SELECT COALESCE(o.job_id, '') FROM dispatch_outbox o WHERE o.run_id=runs.run_id)=?`,
-		item.RunID, contract.RunSucceeded, contract.RunFailed, item.OutboxJobID)
+  AND (SELECT COALESCE(o.job_id, '') FROM dispatch_outbox o WHERE o.run_id=runs.run_id)=?
+  AND (?<>'' OR dispatch_attempt_ns<=?)`,
+		item.RunID, contract.RunSucceeded, contract.RunFailed, item.OutboxJobID, item.OutboxJobID, horizon.UnixNano())
 	if err != nil {
-		return false, internalError(err, "settle unrecorded dispatch")
+		return settled, internalError(err, "settle unrecorded dispatch")
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return false, internalError(err, "read unrecorded dispatch settlement result")
+		return settled, internalError(err, "read unrecorded dispatch settlement result")
 	}
 	if changed == 0 {
-		return false, nil
+		current, waiting, err := unrecordedDispatchForTx(ctx, tx, item.RunID)
+		if err != nil {
+			return settled, err
+		}
+		if waiting && current == item {
+			return settleNotDue, nil
+		}
+		return settleChanged, nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
   last_error=CASE WHEN last_error IS NULL OR json_extract(last_error, '$.retryable')=1 THEN ? ELSE last_error END,
   token_delivery=NULL
 WHERE run_id=?`, string(payload), item.RunID); err != nil {
-		return false, internalError(err, "record unrecorded dispatch settlement")
+		return settled, internalError(err, "record unrecorded dispatch settlement")
 	}
 	if err := tx.Commit(); err != nil {
-		return false, internalError(err, "commit unrecorded dispatch settlement")
+		return settled, internalError(err, "commit unrecorded dispatch settlement")
 	}
-	return true, nil
+	return settled, nil
 }
 
 type projectedRun struct {

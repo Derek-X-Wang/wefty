@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -58,6 +59,17 @@ func recordOutboxOnlyAcknowledgement(t *testing.T, store *Store, runID, jobID st
 	t.Helper()
 	if _, err := store.db.Exec(`UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`,
 		jobID, store.clock.Now().UnixNano(), runID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ageDispatchAttemptPastSettleHorizon moves the run's last submit attempt
+// beyond the settle horizon, and clears any backoff, so the next pass may
+// settle an unacknowledged dispatch's absence.
+func ageDispatchAttemptPastSettleHorizon(t *testing.T, store *Store, runID string) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE runs SET dispatch_attempt_ns=dispatch_attempt_ns-?, job_link_retry_ns=0 WHERE run_id=?`,
+		int64(unrecordedDispatchSettleHorizon+time.Minute), runID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -142,6 +154,7 @@ func TestRegressedOrEmptyL1CreatesNoJobAndLeavesTheRunUnchanged(t *testing.T) {
 					t.Fatalf("crash fixture = job %q, err %v", crashing.submitted.JobID, err)
 				}
 				failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+				ageDispatchAttemptPastSettleHorizon(t, h.l3Store, run.RunID)
 				return run
 			},
 		},
@@ -383,10 +396,27 @@ func TestPermanentRefusalKeepsItsDiagnosticWhenNoJobIsFound(t *testing.T) {
 	if lookup.lookups != 1 {
 		t.Fatalf("lookup calls = %d, want 1", lookup.lookups)
 	}
+	// Inside the settle horizon the absence only backs the run off; past it
+	// the absence settles and the refusal stays the recorded diagnostic.
+	ageDispatchAttemptPastSettleHorizon(t, h.l3Store, run.RunID)
+	if err := reconciler.ReconcileOnce(context.Background()); err == nil {
+		t.Fatal("settled absence was not reported")
+	}
+	execution, err = h.l3Store.GetRunExecution(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookup.lookups != 2 || execution.DispatchError == nil || execution.DispatchError.Code != contract.ErrorDispatchKeyConflict {
+		t.Fatalf("settled refusal: lookups=%d diagnostic=%+v", lookup.lookups, execution.DispatchError)
+	}
+	var settled int
+	if err := h.l3Store.db.QueryRow(`SELECT job_link_settled FROM runs WHERE run_id=?`, run.RunID).Scan(&settled); err != nil || settled != 1 {
+		t.Fatalf("refusal not settled: %d, %v", settled, err)
+	}
 	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if lookup.lookups != 1 {
+	if lookup.lookups != 2 {
 		t.Fatalf("settled refusal looked up again: %d", lookup.lookups)
 	}
 }

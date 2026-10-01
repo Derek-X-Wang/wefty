@@ -207,6 +207,10 @@ const (
 	recoveryTransient
 	// recoveryStale is a settlement compare-and-set miss: reread the row.
 	recoveryStale
+	// recoveryNotDue is an unacknowledged dispatch's absence inside the
+	// settle horizon: not an error yet, but asked again only after the
+	// backoff, the same as a transient failure.
+	recoveryNotDue
 )
 
 // maxRecoveryRereads bounds how often one row is reread after its settlement
@@ -220,7 +224,7 @@ func (r *Reconciler) recoverUnrecordedDispatch(ctx, remote context.Context, item
 	for rereads := 0; ; rereads++ {
 		outcome, err := r.resolveUnrecordedDispatch(ctx, remote, item)
 		switch {
-		case outcome == recoveryTransient:
+		case outcome == recoveryTransient || outcome == recoveryNotDue:
 			if ctx.Err() == nil {
 				if deferErr := r.store.deferUnrecordedDispatch(ctx, item.RunID); deferErr != nil {
 					err = errors.Join(err, deferErr)
@@ -241,7 +245,8 @@ func (r *Reconciler) recoverUnrecordedDispatch(ctx, remote context.Context, item
 // resolveUnrecordedDispatch links or settles one row from what L1 answers.
 // It reports stale when the settlement compare-and-set found the row changed
 // since it was read, so the caller rereads it rather than settle over an
-// acknowledgement that arrived meanwhile.
+// acknowledgement that arrived meanwhile, and not due when an unacknowledged
+// dispatch's absence is still inside the settle horizon.
 func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item unrecordedDispatch) (recoveryOutcome, error) {
 	job, err := r.lookup.LookupJobByDispatchKey(remote, item.DispatchKey)
 	var absence error
@@ -269,12 +274,14 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 		}
 		absence = errors.Join(absence, err)
 	}
-	changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
-	if storeErr != nil {
+	outcome, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
+	switch {
+	case storeErr != nil:
 		return recoveryDone, errors.Join(absence, storeErr)
-	}
-	if !changed {
+	case outcome == settleChanged:
 		return recoveryStale, nil
+	case outcome == settleNotDue:
+		return recoveryNotDue, nil
 	}
 	return recoveryDone, absence
 }
