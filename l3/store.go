@@ -435,8 +435,21 @@ func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error
 		return "", internalError(err, "begin run token mint")
 	}
 	defer tx.Rollback()
+	token, err := ensureRunTokenTx(ctx, tx, runID, canonicalTime(s.clock.Now()))
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit run token mint")
+	}
+	return token, nil
+}
+
+// ensureRunTokenTx returns the bearer staged for the run's pending dispatch,
+// minting and staging one on the first attempt.
+func ensureRunTokenTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (string, error) {
 	var delivery sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT token_delivery FROM dispatch_outbox WHERE run_id=? AND dispatched_ns IS NULL`, runID).Scan(&delivery)
+	err := tx.QueryRowContext(ctx, `SELECT token_delivery FROM dispatch_outbox WHERE run_id=? AND dispatched_ns IS NULL`, runID).Scan(&delivery)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", protocolError(contract.ErrorConflict, "run %q has no pending dispatch", runID)
 	}
@@ -449,15 +462,11 @@ func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error
 	token := newToken()
 	digest := sha256.Sum256([]byte(token))
 	attemptID := newID("runattempt")
-	now := canonicalTime(s.clock.Now())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_tokens(run_id, attempt_id, token_hash, minted_ns) VALUES(?, ?, ?, ?)`, runID, attemptID, digest[:], now.UnixNano()); err != nil {
 		return "", internalError(err, "store run token hash")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=? WHERE run_id=? AND dispatched_ns IS NULL`, token, runID); err != nil {
 		return "", internalError(err, "stage run token delivery")
-	}
-	if err := tx.Commit(); err != nil {
-		return "", internalError(err, "commit run token mint")
 	}
 	return token, nil
 }
@@ -1906,24 +1915,48 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 	return intents, nil
 }
 
-func (s *Store) beginDispatch(ctx context.Context, runID string) error {
+// errDispatchAbandoned reports that the run was terminal when its dispatch
+// attempt would have begun. The caller must not submit: the terminal
+// transition cleared the staged bearer, and a submit L1 accepts as new work
+// (because it lost the original job) would start an ended run again.
+var errDispatchAbandoned = errors.New("l3: run is terminal; dispatch attempt abandoned")
+
+// beginDispatch starts one submit attempt and returns the bearer it carries.
+// The run-status guard, the bearer hand-out and the attempt count share one
+// transaction, so a run that is terminal when the attempt begins is never
+// handed a bearer to submit with. A run that ends after this commit, while the
+// submit is in flight, is linked by completeDispatch when L1 acknowledges the
+// job, or by lookup recovery when it does not.
+func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error) {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return internalError(err, "begin dispatch attempt")
+		return "", internalError(err, "begin dispatch attempt")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
-		contract.RunPending, contract.RunDispatching, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching); err != nil {
-		return internalError(err, "mark dispatch attempt")
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
+		contract.RunPending, contract.RunDispatching, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
+	if err != nil {
+		return "", internalError(err, "mark dispatch attempt")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return "", internalError(err, "read dispatch attempt result")
+	}
+	if changed == 0 {
+		return "", errDispatchAbandoned
+	}
+	token, err := ensureRunTokenTx(ctx, tx, runID, now)
+	if err != nil {
+		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET attempt_count=attempt_count+1, last_error=NULL WHERE run_id=? AND dispatched_ns IS NULL`, runID); err != nil {
-		return internalError(err, "increment dispatch attempt")
+		return "", internalError(err, "increment dispatch attempt")
 	}
 	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit dispatch attempt")
+		return "", internalError(err, "commit dispatch attempt")
 	}
-	return nil
+	return token, nil
 }
 
 func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchErr error) error {

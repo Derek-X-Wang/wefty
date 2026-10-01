@@ -36,7 +36,7 @@ func dispatchedRecoveryRun(t *testing.T, s *Store, key string) (projectedRun, st
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.beginDispatch(ctx, record.RunID); err != nil {
+	if _, err = s.beginDispatch(ctx, record.RunID); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.completeDispatch(ctx, record.RunID, "job-"+key); err != nil {

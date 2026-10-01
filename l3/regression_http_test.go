@@ -223,7 +223,7 @@ func TestL1RegressionFailedChildReleasesParentAndHealthyPeer(t *testing.T) {
 	if _, err = s.ensureRunToken(ctx, child.RunID); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.beginDispatch(ctx, child.RunID); err != nil {
+	if _, err = s.beginDispatch(ctx, child.RunID); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.completeDispatch(ctx, child.RunID, "missing-child"); err != nil {

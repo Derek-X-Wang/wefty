@@ -61,12 +61,14 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		return err
 	}
 	for _, intent := range intents {
-		runToken, err := r.store.ensureRunToken(ctx, intent.RunID)
-		if err != nil {
-			passErrors = append(passErrors, err)
+		runToken, err := r.store.beginDispatch(ctx, intent.RunID)
+		if errors.Is(err, errDispatchAbandoned) {
+			// The run ended after this pass listed it. Its job, if an earlier
+			// attempt created one, is linked by lookup recovery, never by a
+			// new submit.
 			continue
 		}
-		if err := r.store.beginDispatch(ctx, intent.RunID); err != nil {
+		if err != nil {
 			passErrors = append(passErrors, err)
 			continue
 		}

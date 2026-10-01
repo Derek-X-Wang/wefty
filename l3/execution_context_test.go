@@ -196,7 +196,7 @@ func TestTerminalRunTokenGraceAndExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.beginDispatch(context.Background(), record.RunID); err != nil {
+	if _, err := store.beginDispatch(context.Background(), record.RunID); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.projectJobState(context.Background(), projectedRun{RunID: record.RunID, State: contract.RunDispatching}, contract.JobSucceeded); err != nil {

@@ -140,7 +140,7 @@ func TestRegressedOrEmptyL1CreatesNoJobAndLeavesTheRunUnchanged(t *testing.T) {
 				if _, err := h.l3Store.ensureRunToken(context.Background(), run.RunID); err != nil {
 					t.Fatal(err)
 				}
-				if err := h.l3Store.beginDispatch(context.Background(), run.RunID); err != nil {
+				if _, err := h.l3Store.beginDispatch(context.Background(), run.RunID); err != nil {
 					t.Fatal(err)
 				}
 				failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
@@ -252,7 +252,7 @@ func TestAcknowledgedJobOutsideTheLookupScopeIsLinkedNotRegressed(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.l3Store.beginDispatch(ctx, run.RunID); err != nil {
+	if _, err := h.l3Store.beginDispatch(ctx, run.RunID); err != nil {
 		t.Fatal(err)
 	}
 	intents, err := h.l3Store.pendingDispatches(ctx)
