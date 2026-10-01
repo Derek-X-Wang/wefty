@@ -66,6 +66,14 @@ type ServerConfig struct {
 	// it; the installed helper does not.
 	StartupFailureWindow time.Duration
 	beforeRunCreateLock  func()
+	// connectionReleased, when set, is called each time a connection slot is
+	// freed, so a test can wait for the helper's own bookkeeping instead of
+	// for time. The installed helper never sets it.
+	connectionReleased func()
+	// limitRefusalTimeout, when positive, replaces the refusal worker's read
+	// deadline. Tests use it to hold a worker for as long as they need, or to
+	// expire one at once. The installed helper never sets it.
+	limitRefusalTimeout time.Duration
 }
 
 type Server struct {
