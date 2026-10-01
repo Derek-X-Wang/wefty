@@ -1350,14 +1350,18 @@ grace. The first committed terminal result wins against concurrent projections;
 repeated passes and restarts cannot replace that result or extend token expiry.
 Other runs and parent/child settlement continue normally.
 
+When L1 acknowledges a submit for a run that ended while the submit was in
+flight, the acknowledgement links the run directly. Linking fills only
+`l1_job_id`, keeps the run's terminal state, reason and timestamps unchanged,
+and marks node attribution pending when no node is known so the ordinary
+terminal-attribution pass can name it.
+
 A terminal run with no `l1_job_id` is eligible for lookup recovery when its
 dispatch outbox records at least one attempt and the recovery answer has not
-already been settled. This includes a submit that was still in flight when the
-run ended: `dispatched_ns` may already be set even though the guarded run update
-could not record the job. A found job fills only `l1_job_id`, keeps the run's
-terminal state, reason and timestamps unchanged, and marks node attribution
-pending when no node is known so the ordinary terminal-attribution pass can
-name it.
+already been settled. This covers a submit whose response L3 never recorded,
+and a ledger written before acknowledgements linked ended runs, whose outbox
+holds the acknowledged job ID while the run has none. A found job is linked as
+above.
 
 An authoritative absence for a dispatch L1 never acknowledged is recorded as
 a nonretryable `not_found` dispatch error with details `{reason:
@@ -1368,9 +1372,12 @@ acknowledged ID. A job L1 still holds is linked, because the scoped lookup
 cannot see a job L1 stored before it recorded run-ledger provenance. Only that
 read's authoritative absence records the existing `l1_regressed` diagnostic
 for the ID. Transport, authentication and malformed answers remain retryable
-pass errors. A complete authoritative answer settles the lookup once; later
-passes do not ask again, so a submit from a crashed L3 process that L1 commits
-only after that answer stays unlinked. A new L3 talking to an older L1
+pass errors. A complete authoritative answer settles the lookup once, and only
+if the outbox still holds the acknowledgement recovery read before asking L1;
+an acknowledgement recorded meanwhile is linked instead. An acknowledgement
+that arrives after the settlement still links the run and clears the settled
+diagnostic. Later passes do not ask again, so a submit from a crashed L3
+process that L1 commits only after that answer stays unlinked. A new L3 talking to an older L1
 receives that server's plain route-level 404, not the complete error envelope
 from this endpoint, so version skew can never establish absence. None of these
 paths resubmits the job.

@@ -166,48 +166,71 @@ func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 	}
 	var passErrors []error
 	for _, item := range pending {
-		job, err := r.lookup.LookupJobByDispatchKey(ctx, item.DispatchKey)
-		var absence error
-		switch {
-		case err == nil && (item.OutboxJobID == "" || job.JobID == item.OutboxJobID):
-			if err := r.store.linkUnrecordedDispatch(ctx, item, job.JobID); err != nil {
-				passErrors = append(passErrors, err)
-			}
-			continue
-		case err == nil:
-			absence = fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
-		case isMissingDispatch(err, item.DispatchKey):
-			absence = err
-		default:
+		if err := r.recoverUnrecordedDispatch(ctx, item); err != nil {
 			passErrors = append(passErrors, err)
-			continue
-		}
-		if item.OutboxJobID != "" {
-			// L1 acknowledged this job, so only its authoritative absence by ID
-			// is a regression, the same evidence failMissingL1Job requires. The
-			// scoped lookup cannot see a job L1 stored before it recorded
-			// run-ledger provenance, and that job is still this run's to link.
-			_, err := r.jobs.GetJob(ctx, item.OutboxJobID)
-			if err == nil {
-				if err := r.store.linkUnrecordedDispatch(ctx, item, item.OutboxJobID); err != nil {
-					passErrors = append(passErrors, err)
-				}
-				continue
-			}
-			if !isMissingL1Job(err, item.OutboxJobID) {
-				passErrors = append(passErrors, errors.Join(absence, err))
-				continue
-			}
-			absence = errors.Join(absence, err)
-		}
-		changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
-		if storeErr != nil {
-			passErrors = append(passErrors, errors.Join(absence, storeErr))
-		} else if changed {
-			passErrors = append(passErrors, absence)
 		}
 	}
 	return passErrors
+}
+
+// maxRecoveryRereads bounds how often one row is reread after its settlement
+// compare-and-set missed. Each miss means an acknowledgement landed; a row
+// still contended after that is left for the next pass.
+const maxRecoveryRereads = 2
+
+func (r *Reconciler) recoverUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) error {
+	for rereads := 0; ; rereads++ {
+		stale, err := r.resolveUnrecordedDispatch(ctx, item)
+		if !stale || rereads == maxRecoveryRereads {
+			return err
+		}
+		next, waiting, err := r.store.unrecordedDispatchFor(ctx, item.RunID)
+		if err != nil || !waiting {
+			return err
+		}
+		item = next
+	}
+}
+
+// resolveUnrecordedDispatch links or settles one row from what L1 answers.
+// It reports stale when the settlement compare-and-set found the row changed
+// since it was read, so the caller rereads it rather than settle over an
+// acknowledgement that arrived meanwhile.
+func (r *Reconciler) resolveUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) (bool, error) {
+	job, err := r.lookup.LookupJobByDispatchKey(ctx, item.DispatchKey)
+	var absence error
+	switch {
+	case err == nil && (item.OutboxJobID == "" || job.JobID == item.OutboxJobID):
+		return false, r.store.linkUnrecordedDispatch(ctx, item, job.JobID)
+	case err == nil:
+		absence = fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
+	case isMissingDispatch(err, item.DispatchKey):
+		absence = err
+	default:
+		return false, err
+	}
+	if item.OutboxJobID != "" {
+		// L1 acknowledged this job, so only its authoritative absence by ID
+		// is a regression, the same evidence failMissingL1Job requires. The
+		// scoped lookup cannot see a job L1 stored before it recorded
+		// run-ledger provenance, and that job is still this run's to link.
+		_, err := r.jobs.GetJob(ctx, item.OutboxJobID)
+		if err == nil {
+			return false, r.store.linkUnrecordedDispatch(ctx, item, item.OutboxJobID)
+		}
+		if !isMissingL1Job(err, item.OutboxJobID) {
+			return false, errors.Join(absence, err)
+		}
+		absence = errors.Join(absence, err)
+	}
+	changed, storeErr := r.store.settleUnrecordedDispatch(ctx, item)
+	if storeErr != nil {
+		return false, errors.Join(absence, storeErr)
+	}
+	if !changed {
+		return true, nil
+	}
+	return false, absence
 }
 
 // settlePendingNodeAttributions names the node of runs the ledger failed while

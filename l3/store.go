@@ -1994,6 +1994,11 @@ func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr erro
 	return nil
 }
 
+// completeDispatch records L1's acknowledgement. A run that ended while its
+// submit was in flight is linked here too, keeping its terminal state: the
+// acknowledgement is L1's own answer for this dispatch key, so it also
+// replaces a dispatch_not_found settlement recovery recorded before it
+// arrived.
 func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -2001,17 +2006,51 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		return internalError(err, "begin dispatch completion")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID)
+	if err != nil {
 		return internalError(err, "complete dispatch outbox")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET l1_job_id=?, status=?, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
-		jobID, contract.RunQueued, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching); err != nil {
+	acknowledged, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read dispatch completion result")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE runs SET l1_job_id=?, status=?, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
+		jobID, contract.RunQueued, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
+	if err != nil {
 		return internalError(err, "associate run with job")
+	}
+	queued, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read run association result")
+	}
+	if acknowledged == 1 && queued == 0 {
+		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return internalError(err, "commit dispatch completion")
 	}
 	return nil
+}
+
+// linkTerminalRunTx records only the missing association of an ended run.
+// The terminal state, reason and timestamps are deliberately left alone; the
+// node is marked pending so the terminal-attribution pass can name it.
+func linkTerminalRunTx(ctx context.Context, tx *sql.Tx, runID, jobID string) (bool, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET
+  l1_job_id=?, job_link_settled=1,
+  node_attribution_pending=CASE WHEN COALESCE(node_id, '')='' THEN 1 ELSE node_attribution_pending END
+WHERE run_id=? AND l1_job_id IS NULL AND status IN (?, ?)`,
+		jobID, runID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return false, internalError(err, "link terminal run with job")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, internalError(err, "read terminal run link result")
+	}
+	return changed == 1, nil
 }
 
 // unrecordedDispatch is a terminal run for which at least one dispatch began
@@ -2048,6 +2087,23 @@ func (s *Store) unrecordedDispatches(ctx context.Context) ([]unrecordedDispatch,
 	return pending, nil
 }
 
+// unrecordedDispatchFor rereads one run's recovery state after a settlement
+// compare-and-set missed. It reports false once the run is no longer waiting.
+func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unrecordedDispatch, bool, error) {
+	item := unrecordedDispatch{RunID: runID}
+	err := s.db.QueryRowContext(ctx, `SELECT o.dispatch_key, COALESCE(o.job_id, '')
+FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN (?, ?) AND o.attempt_count>0`,
+		runID, contract.RunSucceeded, contract.RunFailed).Scan(&item.DispatchKey, &item.OutboxJobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return unrecordedDispatch{}, false, nil
+	}
+	if err != nil {
+		return unrecordedDispatch{}, false, internalError(err, "reread unrecorded dispatch")
+	}
+	return item, true, nil
+}
+
 // linkUnrecordedDispatch records only the missing association. The terminal
 // state, reason and timestamps are deliberately outside both updates.
 func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, jobID string) error {
@@ -2057,19 +2113,11 @@ func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispa
 		return internalError(err, "begin unrecorded dispatch link")
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE runs SET
-  l1_job_id=?, job_link_settled=1,
-  node_attribution_pending=CASE WHEN COALESCE(node_id, '')='' THEN 1 ELSE node_attribution_pending END
-WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)`,
-		jobID, item.RunID, contract.RunSucceeded, contract.RunFailed)
+	linked, err := linkTerminalRunTx(ctx, tx, item.RunID, jobID)
 	if err != nil {
-		return internalError(err, "link unrecorded dispatch")
+		return err
 	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return internalError(err, "read unrecorded dispatch link result")
-	}
-	if changed == 1 {
+	if linked {
 		if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
   job_id=COALESCE(job_id, ?), dispatched_ns=COALESCE(dispatched_ns, ?), last_error=NULL, token_delivery=NULL
 WHERE run_id=?`, jobID, now.UnixNano(), item.RunID); err != nil {
@@ -2083,7 +2131,8 @@ WHERE run_id=?`, jobID, now.UnixNano(), item.RunID); err != nil {
 }
 
 // settleUnrecordedDispatch records one authoritative absence and stops future
-// lookups without changing the already-terminal run.
+// lookups without changing the already-terminal run. It reports false when
+// the row changed since item was read, and settles nothing.
 func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch) (bool, error) {
 	cause := contract.APIError{
 		Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
@@ -2104,9 +2153,13 @@ func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDis
 		return false, internalError(err, "begin unrecorded dispatch settlement")
 	}
 	defer tx.Rollback()
+	// Compare-and-set on the acknowledgement recovery read before its L1
+	// reads: one recorded since then is L1's own answer, which the caller
+	// links instead of settling over it.
 	result, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1
-WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)`,
-		item.RunID, contract.RunSucceeded, contract.RunFailed)
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)
+  AND (SELECT COALESCE(o.job_id, '') FROM dispatch_outbox o WHERE o.run_id=runs.run_id)=?`,
+		item.RunID, contract.RunSucceeded, contract.RunFailed, item.OutboxJobID)
 	if err != nil {
 		return false, internalError(err, "settle unrecorded dispatch")
 	}

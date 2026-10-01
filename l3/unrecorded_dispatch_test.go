@@ -50,6 +50,18 @@ func snapshotTerminalRun(t *testing.T, store *Store, runID string) terminalRunSn
 	return snapshot
 }
 
+// recordOutboxOnlyAcknowledgement writes the state an L3 from before
+// completeDispatch linked ended runs left behind: L1's acknowledgement in the
+// outbox, and a terminal run with no l1_job_id. Recovery must still link or
+// settle these historical rows.
+func recordOutboxOnlyAcknowledgement(t *testing.T, store *Store, runID, jobID string) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`,
+		jobID, store.clock.Now().UnixNano(), runID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func failRunAfterDispatchAttempt(t *testing.T, store *Store, runID string) {
 	t.Helper()
 	if err := store.rejectProtocolWrite(context.Background(), runID, "envelope", "unrecorded-dispatch",
@@ -134,7 +146,7 @@ func TestRegressedOrEmptyL1CreatesNoJobAndLeavesTheRunUnchanged(t *testing.T) {
 			},
 		},
 		{
-			name: "acknowledged in-flight response", acknowledged: "job-acknowledged", wantReason: l1RegressedReason,
+			name: "acknowledgement recorded only in the outbox", acknowledged: "job-acknowledged", wantReason: l1RegressedReason,
 			prepare: func(t *testing.T, h *integrationHarness) RunAccepted {
 				run := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "empty-acknowledged")
 				if _, err := h.l3Store.ensureRunToken(context.Background(), run.RunID); err != nil {
@@ -144,9 +156,7 @@ func TestRegressedOrEmptyL1CreatesNoJobAndLeavesTheRunUnchanged(t *testing.T) {
 					t.Fatal(err)
 				}
 				failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
-				if err := h.l3Store.completeDispatch(context.Background(), run.RunID, "job-acknowledged"); err != nil {
-					t.Fatal(err)
-				}
+				recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, "job-acknowledged")
 				return run
 			},
 		},
@@ -275,9 +285,7 @@ func TestAcknowledgedJobOutsideTheLookupScopeIsLinkedNotRegressed(t *testing.T) 
 		t.Fatal(err)
 	}
 	failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
-	if err := h.l3Store.completeDispatch(ctx, run.RunID, acknowledged.JobID); err != nil {
-		t.Fatal(err)
-	}
+	recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, acknowledged.JobID)
 	before := snapshotTerminalRun(t, h.l3Store, run.RunID)
 
 	client := &countingDispatchRecoveryClient{JobClient: h.l1Client, JobDispatchLookupClient: h.l1Client}
