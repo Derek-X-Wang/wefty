@@ -366,7 +366,15 @@ func TestControlSocketCarriesTheExplicitImportReference(t *testing.T) {
 		if resultErr != nil {
 			t.Fatal(resultErr)
 		}
-		_ = result.Body.Close()
+		// Go 1.27 may drain an unread response asynchronously after Close.
+		// Consume it here so cancellation cannot race the completed exchange.
+		if _, readErr := io.Copy(io.Discard, result.Body); readErr != nil {
+			_ = result.Body.Close()
+			t.Fatal(readErr)
+		}
+		if closeErr := result.Body.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
 		if result.StatusCode != http.StatusBadRequest {
 			t.Fatalf("load-image query %q status=%d", query, result.StatusCode)
 		}
