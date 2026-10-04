@@ -187,8 +187,8 @@ Run `wefty help` for the complete command list and global flags.
 
 v0.1, the single-machine plain-fabric dogfood loop, is tagged. OCI workloads
 through containerd on Linux and through Lima on macOS have shipped since, along
-with persistent Computers built on them. The build order next adds a Daytona
-sandbox connector and a Fly Machines node connector. These are pre-release
+with persistent Computers built on them. The build order next adds a Fly
+connector (M4) and then a Daytona sandbox connector (M5). These are pre-release
 milestones, not compatibility promises.
 
 ## Project decisions and contributions
