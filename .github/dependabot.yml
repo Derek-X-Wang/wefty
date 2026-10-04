@@ -4,6 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Stay on the containerd 2.3 line (patches still flow) until a 2.4+
+    # feature is needed or 2.3 nears end of support (owner, 2026-10-03, #518).
+    ignore:
+      - dependency-name: github.com/containerd/containerd/v2
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: github.com/containerd/containerd/api
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       go-deps:
         patterns: ["*"]
