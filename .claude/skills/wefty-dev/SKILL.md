@@ -13,7 +13,7 @@ description: Development conventions for working on the wefty codebase itself �
 2. `docs/adr/` — standing decisions. ADR-0001 (the brain stays home) governs
    the OSS/cloud boundary: nothing cloud-specific lands in this repo.
 3. `docs/2026-08-06-wefty-v1-design.md` — the locked v1 architecture and
-   build order (M3 oci → M4 Daytona → M5 Fly). Do not relitigate silently;
+   build order (M3 oci → M4 Fly → M5 Daytona, swapped 2026-10-03). Do not relitigate silently;
    contradicting it needs an explicit new decision.
 4. `docs/contracts/` — state machines, lease/fencing/dispatch-key rules, the
    run execution context. Implementation must match; changing a contract
