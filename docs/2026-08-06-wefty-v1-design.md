@@ -118,7 +118,7 @@ tsnet `WhoIs` authenticates the node; a **per-run scoped token minted at dispatc
 
 ### 2.2 L2 — Connectors
 
-v1 ships **exactly two connectors: Daytona and Fly Machines** (Daytona built first). Two maximally different shapes stress the wire contract honestly; both are the only providers with clean REST + official Go SDKs ([#6](https://github.com/Derek-X-Wang/wefty/issues/6)).
+v1 ships **exactly two connectors: Daytona and Fly Machines** (Fly built first since 2026-10-03; see §4). Two maximally different shapes stress the wire contract honestly; both are the only providers with clean REST + official Go SDKs ([#6](https://github.com/Derek-X-Wang/wefty/issues/6)).
 
 #### Two connector classes
 
@@ -224,7 +224,7 @@ The anchor scenario traced through the committed contracts (as of M2, `kind=proc
 5. **Failure path.** A failed gate in v1 means a cold re-run seeded from the handoff files. The warm alternative — job parks in `awaiting-input`, is re-prompted via `POST /jobs/{id}/prompt` — is reserved in the API shape, unimplemented ([#12](https://github.com/Derek-X-Wang/wefty/issues/12)).
 6. **Observe.** Claude Code polls the run and tails logs via rowid-style polling; raw jsonl stays authoritative ([#12](https://github.com/Derek-X-Wang/wefty/issues/12)).
 
-From M4 the implement/review steps can land on Daytona capacity instead — same tags, same queue, the sandbox-provider pool dispatcher claims and translates to API calls; the script itself does not change shape ([#11](https://github.com/Derek-X-Wang/wefty/issues/11)).
+From M5 the implement/review steps can land on Daytona capacity instead — same tags, same queue, the sandbox-provider pool dispatcher claims and translates to API calls; the script itself does not change shape ([#11](https://github.com/Derek-X-Wang/wefty/issues/11)).
 
 ---
 
@@ -261,13 +261,15 @@ From M4 the implement/review steps can land on Daytona capacity instead — same
 | **M2 — L3 minimal + dogfood** | `POST /v1/runs`, run ledger, envelope/gate storage, poll logs, manual + chain triggers, dogfood script (sandcastle `noSandbox()`). **Loop closes; daily dogfood starts; tag `v0.1`.** |
 | **M3 — `kind=oci`** | Lima + containerd on Macs, native containerd on Linux. Cron trigger. |
 | **M3.5 — Agent computers** | Persistent headful OCI service Computers on owned Nodes; take-over, Storage provenance, and removal proof. |
-| **M3.6 — A usable L3 workflow experience** | L3 becomes the thing a person reaches for to run agent work on their own machines: write a workflow, run it, watch it, retry it, and get the result back without reading Go. First jobs are branch gates and issue-to-draft-PR ([map #392](https://github.com/Derek-X-Wang/wefty/issues/392)). Connectors (M4 Daytona, M5 Fly) and L2 provider capacity wait behind it. |
-| **M4 — Daytona connector** | Proves the sandbox-provider contract; script may switch to sandcastle's Daytona provider. |
-| **M5 — Fly connector** | Converged agent image + reconciler/reaper — structurally last (depends on a mature agent). Webhook trigger last. |
+| **M3.6 — A usable L3 workflow experience** | L3 becomes the thing a person reaches for to run agent work on their own machines: write a workflow, run it, watch it, retry it, and get the result back without reading Go. First jobs are branch gates and issue-to-draft-PR ([map #392](https://github.com/Derek-X-Wang/wefty/issues/392)). Connectors (M4 Fly, M5 Daytona) and L2 provider capacity wait behind it. |
+| **M4 — Fly connector** | Fly capacity under wefty's scheduling model. The original shape: a converged agent image plus reconciler/reaper (node-provider). Exact scope is re-mapped in its wayfinder map; see the amendment below. |
+| **M5 — Daytona connector** | Proves the sandbox-provider contract; script may switch to sandcastle's Daytona provider. Webhook trigger last. |
 
 > **Amended:** Cron left M3 for a future effort; see [map #101](https://github.com/Derek-X-Wang/wefty/issues/101).
 
 > **Amended (2026-09-16):** M3.6 inserted per [map #392](https://github.com/Derek-X-Wang/wefty/issues/392) ([#480](https://github.com/Derek-X-Wang/wefty/issues/480)); defers two seams: a cron trigger (unlocks a nightly matrix job) and L3 deriving its scope from the attempt credential (the L3 half of ADR-0006; the multi-user unlock).
+
+> **Amended (2026-10-03):** M4 and M5 swap: **Fly is M4, Daytona is M5** (owner decision). Fly sat last only because the node-provider shape depends on a mature node agent, which M3–M3.6 delivered. Fly has also launched a computer product the owner wants evaluated against wefty's own Computers. M4's exact shape (node-provider, Computer substrate, or both) is decided in its wayfinder map after that research.
 
 UI: none until post-M4 (CLI + API + polled logs; capacity view and saved filters are the first UI).
 
