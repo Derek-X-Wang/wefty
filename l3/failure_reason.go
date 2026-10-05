@@ -19,8 +19,9 @@ import (
 // there was nothing to find there at all (#604). So the ledger records the
 // reason where it decides the failure, once, and the record carries it.
 
-// JobFailureReason reads the one-line reason a failed L1 job gives: the last
-// attempt's own result when it has one, else L1's pre-start terminal reason,
+// JobFailureReason reads the one-line reason a failed L1 job gives: a job-level
+// cancellation decision first, then the last attempt's own result when it has
+// one, else L1's pre-start terminal reason,
 // else the attempt's state. It never invents a cause; a job that left no
 // evidence says so.
 //
@@ -34,6 +35,9 @@ func JobFailureReason(job l1.Job) string {
 }
 
 func jobFailureReason(job l1.Job) string {
+	if job.Outcome == contract.JobOutcomeCanceled {
+		return "the L1 job was canceled"
+	}
 	if len(job.Attempts) == 0 {
 		if job.FailureReason != "" {
 			return "L1: " + job.FailureReason

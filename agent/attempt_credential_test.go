@@ -127,7 +127,7 @@ func TestServiceAttemptReceivesNoAttemptCredentialYet(t *testing.T) {
 	}
 }
 
-// The bridge is transport only. Anything outside the published three routes is
+// The bridge is transport only. Anything outside the published credential routes is
 // refused before it can reach the agent's authenticated Fabric connection.
 func TestControlPlaneBridgeAllowsOnlyTheAttemptCredentialRoutes(t *testing.T) {
 	for _, probe := range []struct {
@@ -138,6 +138,7 @@ func TestControlPlaneBridgeAllowsOnlyTheAttemptCredentialRoutes(t *testing.T) {
 		{http.MethodPost, "/v1/jobs", true},
 		{http.MethodGet, "/v1/jobs/job_1", true},
 		{http.MethodGet, "/v1/jobs/job_1/children", true},
+		{http.MethodPost, "/v1/jobs/job_1/cancel", true},
 		{http.MethodGet, "/v1/jobs", false},
 		{http.MethodPost, "/v1/jobs/job_1/remove", false},
 		{http.MethodDelete, "/v1/jobs/job_1", false},

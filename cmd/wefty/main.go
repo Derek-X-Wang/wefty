@@ -46,7 +46,7 @@ func commandExitCodeForArgs(err error, args []string) int {
 // typedExitCommands are the single-word commands whose exit code is part of
 // what they promise. `status` answers with 12 when a cluster cannot take work
 // and `wait` with 10 or 11; both are useless if the process exits 1 instead.
-var typedExitCommands = []string{"whoami", "status", "wait"}
+var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
 
 func isTypedExitCLIArgs(args []string) bool {
 	for _, arg := range args {
@@ -185,7 +185,7 @@ func commandExitCode(err error) int {
 		return exitUnauthorized
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		return exitNotFound
-	case contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
+	case contract.ErrorCancelService, contract.ErrorCancelNotQueued, contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
 		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict, contract.ErrorFinalAdmin,
 		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,
 		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld:
@@ -476,6 +476,7 @@ Commands:
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
+  cancel JOB_ID              Cancel a queued one-shot job
   wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout
   results RUN_ID [--out FILE]
                              Read the result document the run uploaded

@@ -132,3 +132,8 @@ func CanTransition[S ~string](table map[S][]S, from, to S) bool {
 	}
 	return false
 }
+
+// JobOutcome records a job-level decision independently of attempt evidence.
+type JobOutcome string
+
+const JobOutcomeCanceled JobOutcome = "canceled"

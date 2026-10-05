@@ -383,7 +383,6 @@ func TestReservedRoutesExplicitlyReturn501(t *testing.T) {
 		path string
 	}{
 		{"l1-client.v1.json", "/v1/jobs/{job_id}/prompt"},
-		{"l1-client.v1.json", "/v1/jobs/{job_id}/cancel"},
 		{"l3.v1.json", "/v1/runs/{run_id}/cancel"},
 	}
 
@@ -1269,4 +1268,29 @@ func TestRunListLimitDocumentsBothRegimes(t *testing.T) {
 		return
 	}
 	t.Fatal("/v1/runs get publishes no limit parameter")
+}
+
+func TestQueuedCancelPublishesOutcomeAndRefusals(t *testing.T) {
+	client := readObject(t, "l1-client.v1.json")
+	paths := object(t, client["paths"], "paths")
+	route := object(t, paths["/v1/jobs/{job_id}/cancel"], "cancel")
+	post := object(t, route["post"], "post")
+	responses := object(t, post["responses"], "responses")
+	if responses["200"] == nil || responses["409"] == nil || responses["404"] == nil || responses["501"] != nil {
+		t.Fatalf("cancel responses=%#v", responses)
+	}
+	for _, code := range []string{"cancel_service", "cancel_not_queued"} {
+		if !strings.Contains(post["description"].(string), code) {
+			t.Fatalf("cancel does not document %s", code)
+		}
+	}
+	common := readObject(t, "common.v1.json")
+	components := object(t, common["components"], "components")
+	schemas := object(t, components["schemas"], "schemas")
+	job := object(t, schemas["Job"], "Job")
+	properties := object(t, job["properties"], "properties")
+	outcome := object(t, properties["outcome"], "outcome")
+	if !reflect.DeepEqual(outcome["enum"], []any{"canceled"}) {
+		t.Fatalf("outcome enum=%#v", outcome["enum"])
+	}
 }

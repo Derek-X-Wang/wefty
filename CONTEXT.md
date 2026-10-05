@@ -91,9 +91,10 @@ _Avoid_: try, execution instance
 **Attempt credential**:
 An opaque bearer L1 mints when a node agent claims an attempt and delivers to
 the workload. It lets the workload act as a delegate of the job's original
-submitter for exactly three things: submit a child job, read its own job, and
-list or read its children. It is valid only while that attempt is the job's
-live attempt and only from the node holding it.
+submitter for exactly four things: submit a child job, read its own job,
+list or read its children, and cancel a queued one-shot child. It is valid
+only while that attempt is the job's live attempt and only from the node
+holding it.
 _Avoid_: attempt token, job token, run token, in-job identity
 
 **Parent job**:

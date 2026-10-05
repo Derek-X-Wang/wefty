@@ -340,6 +340,7 @@ const (
 	clientPrincipal principal = iota
 	agentPrincipal
 	personPrincipal
+	cancelPrincipal
 )
 
 type identityContextKey struct{}
@@ -361,7 +362,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/jobs/{job_id}/remove", s.removeService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/forget", s.forceForgetService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
-	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
+	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.cancelJob)
 	client.HandleFunc("POST /v1/computers", s.createComputer)
 	client.HandleFunc("GET /v1/computers", s.listComputers)
 	client.HandleFunc("GET /v1/computers/{$}", s.listComputers)
@@ -441,18 +442,20 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("GET /v1/computers/{computer_id}/takeover", s.getComputerTakeoverAccess)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/submission", s.mutateComputerSubmission)
 
-	// The attempt credential reaches a separate three-route protocol rather
+	// The attempt credential reaches a separate credential protocol rather
 	// than the client mux. Scope is structural: a route added to the client
 	// protocol later cannot become reachable with a credential by accident.
 	credential := http.NewServeMux()
 	credential.HandleFunc("POST /v1/jobs", s.createChildJob)
 	credential.HandleFunc("GET /v1/jobs/{job_id}", s.getAttemptScopedJob)
 	credential.HandleFunc("GET /v1/jobs/{job_id}/children", s.listAttemptScopedChildJobs)
+	credential.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.cancelJob)
 	credential.HandleFunc("/", s.attemptCredentialOutOfScope)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
 	root.Handle("/v1/dispatch-keys/", s.authorize(clientPrincipal, client))
+	root.Handle("POST /v1/jobs/{job_id}/cancel", s.authorizeCancelProtocol(client, credential))
 	root.Handle("/v1/jobs", s.authorizeJobProtocol(client, credential))
 	root.Handle("/v1/jobs/", s.authorizeJobProtocol(client, credential))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
@@ -770,7 +773,7 @@ func attemptCredentialFromRequest(r *http.Request) AttemptCredentialScope {
 // not publish. It is the reason no operator verb is reachable in-job.
 func (s *Server) attemptCredentialOutOfScope(w http.ResponseWriter, _ *http.Request) {
 	writeError(w, protocolError(contract.ErrorPrincipalForbidden,
-		"an attempt credential may only submit a child job, read its own job, and list or read its children"))
+		"an attempt credential may only submit a child job, read its own job, list or read its children, and cancel its children"))
 }
 
 // createChildJob is POST /v1/jobs presented with an attempt credential. Every
@@ -863,7 +866,7 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
 			return
 		}
-		if principal == personPrincipal {
+		if principal == personPrincipal || principal == cancelPrincipal && !slices.Contains(NormalizeTags(identity.Tags), s.clientPrincipalTag) {
 			if !s.allowPersonIdentities {
 				writeError(w, protocolError(contract.ErrorPrincipalForbidden,
 					"this Fabric does not authenticate person identities"))
@@ -2090,6 +2093,12 @@ func (s *Server) writeJobProjection(w http.ResponseWriter, r *http.Request, job 
 		writeError(w, err)
 		return
 	}
+	s.writeJobResource(w, r, job)
+}
+
+// writeJobResource also serves cancel, whose transaction determines the class
+// and whose committed response must not be rejected by a read-route selector.
+func (s *Server) writeJobResource(w http.ResponseWriter, r *http.Request, job Job) {
 	job, err := s.store.projectJob(r.Context(), job)
 	if err != nil {
 		writeError(w, err)
