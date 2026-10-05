@@ -209,3 +209,51 @@ func TestCancelOCIRequeuedCompletionEvidenceReplay(t *testing.T) {
 		t.Fatalf("requeued evidence replay=%+v %v", replay, err)
 	}
 }
+
+func TestCancelOCIImageObservationRace(t *testing.T) {
+	for _, observationFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("observation_first_%t", observationFirst), func(t *testing.T) {
+			h, job, claim := directCancelOCI(t)
+			agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+			path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/image", job.JobID, claim.Lease.AttemptID)
+			observation := testImageObservation(claim.Lease.FencingToken)
+			if observationFirst {
+				status, _, body := h.do(agent, http.MethodPut, path, observation)
+				if status != http.StatusOK {
+					t.Fatalf("first observation=%d %s", status, body)
+				}
+			}
+			if _, err := h.store.CancelJob(t.Context(), job.JobID, JobCancelCaller{Submitter: "ordinary-app"}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := h.store.GetJob(t.Context(), job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, _, body := h.do(agent, http.MethodPut, path, observation)
+			if observationFirst {
+				if status != http.StatusOK || !reflect.DeepEqual(decodeJob(t, body), before) {
+					t.Fatalf("pre-cancel observation replay=%d %s", status, body)
+				}
+			} else {
+				assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+				var response contract.ErrorResponse
+				if err := json.Unmarshal(body, &response); err != nil || response.Error.Retryable {
+					t.Fatalf("cancel refusal must be non-retryable: %s err=%v", body, err)
+				}
+			}
+			after, err := h.store.GetJob(t.Context(), job.JobID)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("observation after cancel mutated job: before=%+v after=%+v err=%v", before, after, err)
+			}
+			var observed, started bool
+			if err := h.store.db.QueryRowContext(t.Context(),
+				"SELECT image_observation_hash IS NOT NULL, started_ns IS NOT NULL FROM attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&observed, &started); err != nil {
+				t.Fatal(err)
+			}
+			if observed != observationFirst || started {
+				t.Fatalf("observation/start persisted after cancel: observed=%t started=%t", observed, started)
+			}
+		})
+	}
+}

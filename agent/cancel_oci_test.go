@@ -23,7 +23,7 @@ import (
 )
 
 func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
-	for _, phase := range []string{"image_preparation", "helper_admission", "started"} {
+	for _, phase := range []string{"image_preparation", "observation", "helper_admission", "started"} {
 		t.Run(phase, func(t *testing.T) {
 			network := plain.NewNetwork()
 			_, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"oci-result"}})
@@ -46,9 +46,15 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			runtime := &cancelResultOCIRuntime{phase: phase, ready: make(chan struct{}), publicationOCIRuntime: publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime()}}
+			runtime := &cancelResultOCIRuntime{phase: phase, ready: make(chan struct{}), release: make(chan struct{}), publicationOCIRuntime: publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime()}}
 			if phase == "image_preparation" {
 				runtime.readErr = errors.New("helper attempt not admitted during image preparation")
+			}
+			heartbeatInterval := 10 * time.Millisecond
+			if phase == "observation" {
+				// Pull finishes before either directive channel can deliver;
+				// only the committing image checkpoint can prevent helper Run.
+				heartbeatInterval = time.Hour
 			}
 			nodeAgent, err := New(Config{
 				Fabric: network.NewFabric(fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
@@ -62,7 +68,7 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 					return OCIIntentObservation{Enabled: true, Revision: 1}, nil
 				},
 				WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime}, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(),
-				HeartbeatInterval: 10 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: time.Hour, Logf: t.Logf,
+				HeartbeatInterval: heartbeatInterval, ClaimInterval: 5 * time.Millisecond, RenewalInterval: time.Hour, Logf: t.Logf,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -86,6 +92,7 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 			if err := submitter.post(t.Context(), "/v1/jobs/"+job.JobID+"/cancel", nil, &pending); err != nil {
 				t.Fatal(err)
 			}
+			close(runtime.release)
 			if pending.Outcome != "canceled" {
 				t.Fatalf("pending=%+v", pending)
 			}
@@ -105,6 +112,13 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 				if result.SkipReason != contract.ResultUploadSkipUnreadable || len(result.Document) != 0 {
 					t.Fatalf("unadmitted handoff=%+v", result)
 				}
+			} else if phase == "observation" {
+				if runtime.payloadRuns.Load() != 0 {
+					t.Fatalf("canceled observation called helper Run %d times", runtime.payloadRuns.Load())
+				}
+				if result.SkipReason != contract.ResultUploadSkipAbsent || len(result.Document) != 0 {
+					t.Fatalf("never-started payload result=%+v", result)
+				}
 			} else {
 				if string(result.Document) != `{"ok":true}` || result.SkipReason != "" || result.JobID != job.JobID || result.AttemptID == "" {
 					t.Fatalf("L1 result=%+v", result)
@@ -121,7 +135,7 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 			if !reflect.DeepEqual(finished.Spec.Labels, spec.Labels) {
 				t.Fatalf("submitted labels changed: %+v", finished.Spec.Labels)
 			}
-			if finished.State != contract.JobFailed || finished.Outcome != "canceled" || !runtime.reaped.Load() || !runtime.resultRead.Load() {
+			if finished.State != contract.JobFailed || finished.Outcome != "canceled" || !runtime.reaped.Load() || runtime.resultRead.Load() != (phase != "observation") {
 				t.Fatalf("job=%+v; reaped=%t read=%t", finished, runtime.reaped.Load(), runtime.resultRead.Load())
 			}
 			for {
@@ -141,9 +155,11 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 
 type cancelResultOCIRuntime struct {
 	publicationOCIRuntime
-	phase     string
-	ready     chan struct{}
-	readyOnce sync.Once
+	phase       string
+	ready       chan struct{}
+	release     chan struct{}
+	payloadRuns atomic.Int32
+	readyOnce   sync.Once
 }
 
 func (r *cancelResultOCIRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
@@ -151,7 +167,10 @@ func (r *cancelResultOCIRuntime) Run(ctx context.Context, request workloadrunner
 	if request.RunMailbox != nil {
 		return workloadrunner.Result{}, errors.New("direct cancellation unexpectedly requires L3")
 	}
-	if r.phase != "started" {
+	if r.phase == "observation" {
+		r.readyOnce.Do(func() { close(r.ready) })
+		<-r.release // Cancel is committed before image preparation finishes.
+	} else if r.phase != "started" {
 		r.readyOnce.Do(func() { close(r.ready) })
 		<-ctx.Done()
 		if r.phase == "image_preparation" {
@@ -162,6 +181,12 @@ func (r *cancelResultOCIRuntime) Run(ctx context.Context, request workloadrunner
 	observation := workloadrunner.OCIImageObservation{SubmittedReference: request.Execution.OCI.Image.Reference,
 		TopLevelDigest: digest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json", PlatformManifestDigest: digest,
 		PlatformOS: "linux", PlatformArchitecture: "amd64", RuntimeHandler: request.RuntimeHandler, Snapshotter: "overlayfs"}
+	if r.phase == "observation" {
+		if err := request.OCIImageResolved(context.WithoutCancel(ctx), observation); err != nil {
+			return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureProcessRequest, Message: err.Error()}}}, err
+		}
+	}
+	r.payloadRuns.Add(1) // Fake helper Run: only reachable after image observation.
 	if err := request.OCIStarted(context.WithoutCancel(ctx), observation); err != nil {
 		return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureProcessRequest, Message: err.Error()}}}, err
 	}

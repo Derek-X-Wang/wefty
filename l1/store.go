@@ -3315,6 +3315,13 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 		}
 		return getJobByID(ctx, tx, jobID, canonicalTime(s.clock.Now()))
 	}
+	canceled, _, err := cancellationDeadline(ctx, tx, jobID)
+	if err != nil {
+		return Job{}, err
+	}
+	if canceled {
+		return Job{}, protocolError(contract.ErrorConflict, "pending cancellation forbids image observation")
+	}
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
 	}

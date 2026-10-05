@@ -422,9 +422,14 @@ top-level media type; platform manifest, platform, runtime handler, and
 snapshotter remain attempt-local. Immutable attempt ownership and fence are
 authenticated before replay: an identical stored attempt hash succeeds even
 after authority advances, while changed replay is `idempotency_conflict`.
-Current authority, lease, and claimed state gate only the first write. A
-changed job-scoped identity is also `idempotency_conflict`, and a pinned job
-digest must match the observation.
+Current authority, lease, claimed state, and absence of pending cancellation
+gate only the first write. A committed one-shot cancellation refuses a new
+observation with HTTP 409 `conflict`, `retryable=false`, without recording
+image identity or promoting the attempt. An identical observation recorded
+before cancellation still replays with HTTP 200 and the current stored job,
+including `outcome=canceled`. The agent must not invoke helper `Run` after
+a pre-Run observation refusal. A changed job-scoped identity is also
+`idempotency_conflict`, and a pinned job digest must match the observation.
 
 `POST .../attempts/{attempt_id}/started` is fenced and idempotent for process
 and OCI. For OCI it requires an accepted or copied image observation, records

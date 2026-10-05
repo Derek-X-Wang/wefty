@@ -682,7 +682,16 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if errors.As(failure.err, &abandoned) && errors.Is(abandoned.cause, errAttemptDirectiveCancel) {
 			deliveryContext, cancel := context.WithTimeout(context.WithoutCancel(attemptContext), lifecycle.dependencies.client.operationTimeout)
 			defer cancel()
-			return lifecycle.completeWithRetry(deliveryContext, claim, request)
+			retryFailure := lifecycle.completeWithRetry(deliveryContext, claim, request)
+			if lifecycle.dependencies.outbox != nil && (errors.Is(retryFailure.err, context.DeadlineExceeded) || retryFailure.destination == errorDestinationTransient) {
+				// The bounded retry did not obtain a completion verdict. The
+				// identical result is already durable; release it to recovery
+				// instead of promoting a delivery outage to a node-session exit.
+				reconcileCompletion = true
+				lifecycle.log("attempt %s cancel completion retry released to outbox: %v", claim.Lease.AttemptID, retryFailure.err)
+				return destinationError{}
+			}
+			return retryFailure
 		}
 		return failure
 	}
@@ -935,6 +944,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	var ociRuntimeLoss ociRuntimeLossLatch
+	preRunObservationRefused := false
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
 		if lifecycle.dependencies.currentOCIGeneration != nil {
 			if generation, ok := lifecycle.dependencies.currentOCIGeneration(); ok {
@@ -996,7 +1006,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			}
 			return nil
 		}
-		request.OCIImageResolved = observeImage
+		request.OCIImageResolved = func(imageContext context.Context, observation workloadrunner.OCIImageObservation) error {
+			err := observeImage(imageContext, observation)
+			var refusal *workloadrunner.OCIObservationRefusal
+			preRunObservationRefused = errors.As(err, &refusal)
+			return err
+		}
 		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			// The helper already proved payload start. Cancellation must not
 			// abandon a response for a Started transaction that committed: L1
@@ -1119,6 +1134,18 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			recoverRuntime(generation)
 		}
 		finalizationContext, cancelFinalization := finalization.begin()
+		if preRunObservationRefused && claim.Job.Spec.Class == contract.JobClassOneShot {
+			// The adapter did not call helper Run, so this attempt has no
+			// result or mailbox to read. In particular, never publish an older
+			// document from the same handoff owner as this attempt's result.
+			absent := attemptResult{skip: contract.ResultUploadSkipAbsent}
+			lifecycle.capturedResult.Store(&absent)
+			handoffReader = nil
+			if mailbox.readsThroughRuntime() {
+				lifecycle.mailbox.Store(nil)
+				mailbox = nil
+			}
+		}
 		// A mailbox the agent reads through the runtime is authorized against
 		// the live attempt, and ReapAndVerify is what ends that attempt. The
 		// drain therefore happens here, with the workload already returned and

@@ -961,8 +961,11 @@ agent replays the observation, performs fenced L1 `StartAttempt`, and only after
 both succeed marks its local observer running. Lease renewal, log append, and
 completion remain incapable of implicitly promoting the attempt. If the
 pre-Run observation is refused, no runtime resource is created; if either
-post-start mutation is refused, the adapter kills and verifies deletion of the
-real task before returning a spawn failure.
+post-start mutation is refused for a service, the adapter kills and verifies
+deletion of the real task before returning a spawn failure. For a one-shot, it
+stops the real task with TERM, grace and KILL before returning a spawn failure;
+the caller captures any available result and then calls `ReapAndVerify` to
+delete the task and verify cleanup.
 
 Image lifetime is represented by four different holds rather than one
 overloaded reference count. The helper owns the short operation lease around
@@ -1013,17 +1016,34 @@ mailbox rule, including accepted `absent` when no result was written.
 ### OCI one-shot cancellation
 
 Renewal and heartbeat cancellation address the exact resident Job, Attempt and
-fence, including image preparation and helper startup. After the helper proves
-payload start, the image observation and `Started` acknowledgement use a bounded
-uncanceled context: an execution cancel cannot erase a response for a transaction
+fence, including image preparation and helper startup. L1 checks pending
+cancellation in the image-observation transaction after identical-replay
+handling: a new observation after committed cancellation is refused with
+HTTP 409 `conflict`, `retryable=false`. The adapter does not invoke helper
+`Run` after that refusal. The node settles with pre-start refusal evidence,
+releases any attached image pin through `ReapAndVerify`, and uploads accepted
+`absent` result evidence without reading a handoff or mailbox that this
+never-started payload could not have written. Existing contents belonging to
+the same handoff owner cannot become this attempt's result. Normal publication
+and retention rules apply to that absence.
+
+After the helper proves payload start, the image observation and `Started`
+acknowledgement use a bounded uncanceled context: an execution cancel cannot erase a response for a transaction
 that already committed. L1 still refuses a new start after cancellation and
 returns the stored job for an earlier durable start. OCI one-shots keep Watch
 alive across execution cancellation to observe the existing TERM, five-second
 grace and KILL path. Failed signal delivery remains runtime-failure evidence,
-not a manufactured agent signal or confirmed termination. If cancellation wins
-before durable `Started` but the helper already admitted the attempt, the node
-stops it and records pre-start refusal evidence; it reads any available result
-before the normal `ReapAndVerify`. A canceled attempt uses the same result upload,
+not a manufactured agent signal or confirmed termination. Cancellation can
+still commit after the pre-Run observation was accepted. If the helper then
+admits the attempt before durable `Started`, the node stops it and records
+pre-start refusal evidence; it reads any available result before the normal
+`ReapAndVerify`. A canceled attempt uses the same result upload,
 publication and handoff retention rules, including unpublished retention when
-capture or upload fails. L1's 30-second settlement deadline remains independent
-of runtime confirmation, so a silent node still settles without inventing a stop.
+capture or upload fails. If heartbeat or renewal cancellation abandons an
+in-flight completion, the node retries the identical durable completion under
+the existing bounded delivery budget. A transport outage, unavailability or
+deadline that exhausts that retry releases the completion to the outbox without
+ending the agent session; recovery later delivers the same evidence. A distinct
+L1 authority/session verdict or local persistence failure keeps its own error
+scope. L1's 30-second settlement deadline remains independent of runtime
+confirmation, so a silent node still settles without inventing a stop.

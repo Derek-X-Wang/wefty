@@ -413,6 +413,7 @@
       "put": {
         "operationId": "observeAttemptImage",
         "summary": "Record one fenced, write-once OCI image observation",
+        "description": "The last L1 checkpoint before helper Run. After immutable ownership and fence checks, an identical observation recorded before cancellation replays with HTTP 200 and the current stored job, including outcome=canceled. Otherwise a pending one-shot cancellation refuses a new observation inside the transaction with HTTP 409 conflict, retryable=false, without recording image identity or promoting the attempt. The agent does not call helper Run after a pre-Run refusal; it settles the never-started attempt with pre-start evidence and absent result evidence. Cancellation after an accepted pre-Run observation can still race helper admission; a refused Started acknowledgement then stops the one-shot with TERM, grace and KILL, followed by result capture and caller ReapAndVerify.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
