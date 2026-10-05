@@ -2206,12 +2206,14 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	hash := sha256.Sum256(specJSON)
 	requestHash := hex.EncodeToString(hash[:])
 
-	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, false, internalError(err, "begin job creation")
 	}
 	defer tx.Rollback()
+	// Beginning an immediate transaction can wait behind another writer. Read
+	// time after acquiring it so a lease that expired while waiting is refused.
+	now := canonicalTime(s.clock.Now())
 
 	// Authorization ran before this transaction opened. Re-prove the credential
 	// against the snapshot the write will commit on, so an attempt that lost
@@ -2245,11 +2247,7 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 		return Job{}, false, internalError(err, "read removed dispatch key")
 	}
 	if spec.InstanceKey != nil {
-		if origin.Parent != nil {
-			return Job{}, false, protocolError(contract.ErrorInstanceKeyNotSupported,
-				"keyed attempt-credential submissions are not supported until parent-scoped instance keys are available")
-		}
-		if originatingSubmitter == "" {
+		if origin.Parent == nil && originatingSubmitter == "" {
 			return Job{}, false, protocolError(contract.ErrorInvalidRequest, "instance_key requires an authenticated Fabric submitter")
 		}
 		if err := instanceKeyConflict(ctx, tx, spec, origin); err != nil {

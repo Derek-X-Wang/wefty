@@ -30,9 +30,30 @@ func TestInstanceKeyContractPublished(t *testing.T) {
 	}
 	route := object(t, object(t, object(t, client["paths"], "paths")["/v1/jobs"], "jobs")["post"], "post")
 	description, _ := route["description"].(string)
-	for _, promise := range []string{"instance_key_conflict", "instance_key_not_supported", "Fabric", "tombstones", "canceled", "stalled_cleanup_unverified", "Computers"} {
+	for _, promise := range []string{"instance_key_conflict", "Fabric", "tombstones", "canceled", "stalled_cleanup_unverified", "Computers"} {
 		if !strings.Contains(description, promise) {
 			t.Fatalf("submission contract missing %q", promise)
 		}
+	}
+}
+
+func TestChildInstanceKeyContractPublished(t *testing.T) {
+	raw, err := os.ReadFile("l1-client.v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var client map[string]any
+	if err := json.Unmarshal(raw, &client); err != nil {
+		t.Fatal(err)
+	}
+	route := object(t, object(t, object(t, client["paths"], "paths")["/v1/jobs"], "jobs")["post"], "post")
+	description, _ := route["description"].(string)
+	for _, promise := range []string{"authenticated parent job namespace", "Successive attempts", "creation transaction", "child-read scope", "Dispatch replay keeps its existing"} {
+		if !strings.Contains(description, promise) {
+			t.Fatalf("child submission contract missing %q", promise)
+		}
+	}
+	if strings.Contains(description, "instance_key_not_supported") {
+		t.Fatal("child keys still documented as unsupported")
 	}
 }
