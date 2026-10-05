@@ -1444,7 +1444,7 @@ fi`},
 		if receipt, reapErr := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); reapErr != nil || !receipt.RuntimeQuiesced {
 			t.Fatalf("Computer L1 adapter reap = %+v err=%v", receipt, reapErr)
 		}
-		if _, completeErr := store.CompleteAttempt(ctx, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "complete-" + claim.Lease.AttemptID, Result: l1.ProcessResult(result.Outcome)}); completeErr != nil {
+		if _, completeErr := store.CompleteAttempt(ctx, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "complete-" + claim.Lease.AttemptID, Result: l1Result(result.Outcome)}); completeErr != nil {
 			t.Fatal(completeErr)
 		}
 		return result
@@ -2743,7 +2743,7 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 		t.Fatalf("pre-start cleanup = receipt %+v err %v", receipt, err)
 	}
 	requeued, err := store.CompleteAttempt(ctx, "native-agent", job.JobID, first.Lease.AttemptID, l1.CompletionRequest{
-		FencingToken: first.Lease.FencingToken, IdempotencyKey: "native-prestart-loss", Result: l1.ProcessResult(firstResult.Outcome),
+		FencingToken: first.Lease.FencingToken, IdempotencyKey: "native-prestart-loss", Result: l1Result(firstResult.Outcome),
 	})
 	if err != nil || requeued.State != contract.JobQueued {
 		t.Fatalf("pre-start completion requeue = job %+v err %v", requeued, err)
@@ -2786,7 +2786,7 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 		t.Fatalf("retry cleanup = receipt %+v err %v", receipt, err)
 	}
 	completed, err := store.CompleteAttempt(ctx, "native-agent", job.JobID, second.Lease.AttemptID, l1.CompletionRequest{
-		FencingToken: second.Lease.FencingToken, IdempotencyKey: "native-retry-success", Result: l1.ProcessResult(secondResult.Outcome),
+		FencingToken: second.Lease.FencingToken, IdempotencyKey: "native-retry-success", Result: l1Result(secondResult.Outcome),
 	})
 	if err != nil || completed.State != contract.JobSucceeded {
 		t.Fatalf("retry completion = job %+v err %v", completed, err)
@@ -2965,4 +2965,14 @@ func containsLog(events []contract.LogEvent, stream contract.LogStream, value st
 		}
 	}
 	return false
+}
+
+// l1Result mirrors the agent's conversion. The termination initiator travels
+// on the completion request, and these fixtures never ask the payload to stop.
+func l1Result(result contract.ProcessResult) l1.ProcessResult {
+	return l1.ProcessResult{
+		SpawnError: result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
+		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM, DiskExhausted: result.DiskExhausted,
+		LogEvidenceIncomplete: result.LogEvidenceIncomplete,
+	}
 }
