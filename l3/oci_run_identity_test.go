@@ -11,12 +11,11 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// TestAnOCIOneShotIsAcceptedAsARunAndRefusedWithoutOne is the other side of
-// wefty #578's L1 refusal. The same image one-shot is accepted when the ledger
-// dispatches it, because every dispatch names its run and the run is what the
-// node keys the handoff volume by; posted straight to L1 without that identity
-// it is refused with the typed code instead of being queued to fail forever.
-func TestAnOCIOneShotIsAcceptedAsARunAndRefusedWithoutOne(t *testing.T) {
+// TestAnOCIOneShotIsOwnedByItsRunOrItsJob accepts the ledger's dispatch with
+// run-owned handoff and an ordinary client's labels-free direct submission
+// with handoff owned by its server-assigned job ID (wefty #643, #647). The job
+// fallback grants no entitlement to borrow the ledger's run identity (#583).
+func TestAnOCIOneShotIsOwnedByItsRunOrItsJob(t *testing.T) {
 	h := newIntegrationHarness(t)
 	run := h.submit(CreateRunRequest{
 		Image:  &contract.ImageProgram{Reference: "ghcr.io/example/echo:v1", Argv: []string{"echo", "once"}},
@@ -56,12 +55,26 @@ func TestAnOCIOneShotIsAcceptedAsARunAndRefusedWithoutOne(t *testing.T) {
 	direct.Labels = nil
 	operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{l1.DefaultClientPrincipalTag}}, DefaultL1Address)
 	status, _, body = h.do(operator, http.MethodPost, "/v1/jobs", direct, nil)
-	var refusal contract.ErrorResponse
-	if err := json.Unmarshal(body, &refusal); err != nil {
+	if status != http.StatusCreated {
+		t.Fatalf("direct submission status = %d body=%s, want 201", status, body)
+	}
+	var created l1.Job
+	if err := json.Unmarshal(body, &created); err != nil {
 		t.Fatalf("decode direct submission response %s: %v", body, err)
 	}
-	if status != http.StatusConflict || refusal.Error.Code != contract.ErrorRunIdentityRequired {
-		t.Fatalf("direct submission status = %d body=%s, want 409 %s", status, body, contract.ErrorRunIdentityRequired)
+	if created.JobID == "" {
+		t.Fatal("direct submission has no server-assigned job ID")
+	}
+	accepted, err := h.l1Store.GetJob(context.Background(), created.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := contract.ExecutionHandoffOwnerKey(accepted.Spec, accepted.JobID)
+	if owner != created.JobID || owner == run.RunID {
+		t.Fatalf("direct submission owner = %q, want job %s and not run %s", owner, created.JobID, run.RunID)
+	}
+	if len(accepted.Spec.Labels) != 0 {
+		t.Fatalf("direct submission labels = %v, want no labels", accepted.Spec.Labels)
 	}
 
 	// Nor can the operator borrow the run's identity (wefty #583): the same
@@ -70,7 +83,7 @@ func TestAnOCIOneShotIsAcceptedAsARunAndRefusedWithoutOne(t *testing.T) {
 	borrowed := dispatched.Spec
 	borrowed.DispatchKey = "borrowed-" + borrowed.DispatchKey
 	status, _, body = h.do(operator, http.MethodPost, "/v1/jobs", borrowed, nil)
-	refusal = contract.ErrorResponse{}
+	var refusal contract.ErrorResponse
 	if err := json.Unmarshal(body, &refusal); err != nil {
 		t.Fatalf("decode borrowed submission response %s: %v", body, err)
 	}

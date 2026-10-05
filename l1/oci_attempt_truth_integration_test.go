@@ -314,7 +314,7 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 
 // TestOCIHandoffPreparationFailureIsTerminalNotRequeued pins the classification
 // the node relies on for wefty #578: an OCI one-shot whose attempt ends with
-// handoff_preparation_failed -- as one naming no handoff owner now does, before
+// handoff_preparation_failed -- as a malformed explicit owner does, before
 // the runtime is asked -- fails once instead of entering the pre-start retry
 // loop that runtime_unavailable does.
 func TestOCIHandoffPreparationFailureIsTerminalNotRequeued(t *testing.T) {

@@ -470,13 +470,9 @@ func TestL1AcceptsOCIForCapabilityAwareClaiming(t *testing.T) {
 	}
 }
 
-// TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission is wefty #578. An OCI
-// one-shot's handoff volume is named from its run identity, which only its
-// labels carry. One submitted straight to /v1/jobs without it was accepted,
-// refused by the node's helper on every attempt, and requeued without end. It
-// is now refused here, once, with a code that says what is missing -- and
-// only it: every shape that can run without a run identity is still accepted.
-func TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission(t *testing.T) {
+// Direct OCI jobs use server-owned output; malformed explicit run keys remain
+// typed refusals, and entitled run/rerun ownership is unchanged.
+func TestOCIOneShotHandoffOwnerAdmission(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	// It submits as the run ledger, the one root submitter entitled to name a
 	// run (wefty #583), so what is refused here is only what is missing.
@@ -503,9 +499,6 @@ func TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission(t *testing.T) {
 		name   string
 		labels map[string]string
 	}{
-		{name: "no labels"},
-		{name: "unrelated labels only", labels: map[string]string{"team": "infra"}},
-		{name: "blank run identity", labels: map[string]string{contract.LabelRunID: "  ", contract.LabelHandoffOwnerRunID: ""}},
 		{name: "owner key past the helper's bound", labels: map[string]string{contract.LabelRunID: strings.Repeat("r", contract.MaxHandoffOwnerKeyBytes+1)}},
 		{name: "owner key with a NUL byte", labels: map[string]string{contract.LabelRunID: "run\x00x"}},
 	} {
@@ -534,6 +527,9 @@ func TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission(t *testing.T) {
 		name string
 		spec contract.JobSpec
 	}{
+		{name: "no labels", spec: ociOneShot("oci-no-labels", nil)},
+		{name: "unrelated labels", spec: ociOneShot("oci-unrelated-labels", map[string]string{"app": "direct"})},
+		{name: "blank run identity", spec: ociOneShot("oci-blank-labels", map[string]string{contract.LabelRunID: "  "})},
 		{name: "OCI one-shot naming its run", spec: ociOneShot("oci-with-run", map[string]string{contract.LabelRunID: "run-1"})},
 		{name: "OCI rerun naming only its handoff owner", spec: ociOneShot("oci-with-owner", map[string]string{contract.LabelHandoffOwnerRunID: "run-0"})},
 		{name: "OCI service", spec: contract.JobSpec{
@@ -554,10 +550,8 @@ func TestAnOCIOneShotWithNoRunIdentityIsRefusedAtSubmission(t *testing.T) {
 	}
 }
 
-// TestAnOwnerlessOCIOneShotStoredBeforeTheRefusalStillReplays keeps #578's
-// refusal from breaking dispatch-key replay. A job accepted before L1 refused
-// ownerless OCI one-shots is still stored; an identical replay returns it, as
-// every replay does, and only a genuinely new job of that shape is refused.
+// Previously stored ownerless jobs retain dispatch-key replay semantics; new
+// direct submissions are accepted too, without synthetic run labels.
 func TestAnOwnerlessOCIOneShotStoredBeforeTheRefusalStillReplays(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
@@ -611,17 +605,17 @@ VALUES(?, ?, ?, ?, ?, NULL, NULL, 'caller', 0, 0, ?, ?)`, storedJobID, stored.Di
 	fresh := spec
 	fresh.DispatchKey = "ownerless-after-upgrade"
 	status, _, body = h.do(client, http.MethodPost, "/v1/jobs", fresh)
-	var refusal contract.ErrorResponse
-	if err := json.Unmarshal(body, &refusal); err != nil {
-		t.Fatalf("decode new submission response %s: %v", body, err)
+	if status != http.StatusCreated {
+		t.Fatalf("new direct submission status=%d body=%s", status, body)
 	}
-	if status != http.StatusConflict || refusal.Error.Code != contract.ErrorRunIdentityRequired {
-		t.Fatalf("new ownerless submission status = %d body=%s, want 409 %s", status, body, contract.ErrorRunIdentityRequired)
+	var created Job
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
 	}
-	var count int
-	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE dispatch_key=?`, fresh.DispatchKey).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("a refused new submission stored %d jobs (err %v)", count, err)
+	if created.JobID == storedJobID || contract.HandoffOwnerKey(created.Spec) != "" {
+		t.Fatalf("new job=%+v", created)
 	}
+
 }
 
 func TestL1RequiresServiceImageDigestBeforeRuntimeSupportCheck(t *testing.T) {

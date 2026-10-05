@@ -34,13 +34,15 @@ func HandoffOwnerKey(spec JobSpec) string {
 // ExecutionHandoffOwnerKey resolves execution ownership from the immutable
 // submission and the server-assigned job ID. It must not be used for run
 // entitlement: HandoffOwnerKey remains the label-only resolver for that check.
-// A process one-shot without an explicit directory owns its managed output by
-// job ID when it names no run. Explicit paths without a run remain unowned.
+// An OCI one-shot, or a process one-shot without an explicit directory, owns
+// managed output by job ID when it names no run. Explicit process paths
+// without a run remain unowned.
 func ExecutionHandoffOwnerKey(spec JobSpec, jobID string) string {
 	if owner := HandoffOwnerKey(spec); owner != "" {
 		return owner
 	}
-	if spec.Kind == JobKindProcess && spec.Class == JobClassOneShot && spec.Execution.HandoffDirectory == "" {
+	if spec.Class == JobClassOneShot && (spec.Kind == JobKindOCI ||
+		(spec.Kind == JobKindProcess && spec.Execution.HandoffDirectory == "")) {
 		return jobID
 	}
 	return ""
@@ -49,25 +51,21 @@ func ExecutionHandoffOwnerKey(spec JobSpec, jobID string) string {
 // RequiresHandoffOwner reports whether a job cannot execute without a handoff
 // owner key. Only an OCI one-shot needs one: its handoff is a helper-owned
 // volume named from the key, and the helper refuses to create one without it.
-// A process one-shot can use job-owned output without a run identity. A
-// service's data is keyed by its own job ID, and a Computer is a service.
+// OCI and managed process one-shots can use job-owned output without run
+// identity. Service data is keyed by the job ID, and a Computer is a service.
 func RequiresHandoffOwner(spec JobSpec) bool {
 	return spec.Kind == JobKindOCI && spec.Class == JobClassOneShot
 }
 
-// ValidateHandoffOwner refuses a job that needs a handoff owner key and can
-// never produce one the helper accepts. The key is derived from labels that
-// never change after submission, so a job refused here would be refused on
-// every attempt; the error names what the submitter has to supply.
+// ValidateHandoffOwner checks an explicit OCI handoff owner against the helper's
+// key bounds. An absent run identity is valid: execution resolves the owner
+// from L1's server-assigned job ID without changing the submitted labels.
 func ValidateHandoffOwner(spec JobSpec) error {
 	if !RequiresHandoffOwner(spec) {
 		return nil
 	}
 	owner := HandoffOwnerKey(spec)
 	switch {
-	case owner == "":
-		return errors.New("a kind=oci one-shot job needs a run identity to own its handoff volume: " +
-			"submit it as an L3 run, whose dispatch names its run in run_id")
 	case len(owner) > MaxHandoffOwnerKeyBytes:
 		return errors.New("a kind=oci one-shot job's handoff owner key (handoff_owner_run_id, else run_id) exceeds 255 bytes")
 	case strings.IndexByte(owner, 0) >= 0:

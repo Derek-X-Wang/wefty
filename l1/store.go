@@ -2275,13 +2275,9 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	if err := authorizeRunIdentity(ctx, tx, spec, submittedByRunLedger, origin.Parent, now); err != nil {
 		return Job{}, false, err
 	}
-	// An OCI one-shot's handoff volume is named from its run identity, which
-	// only its immutable labels carry. One that names none would be refused by
-	// the node's helper on every attempt, and requeued each time as runtime
-	// unavailability, so it is refused here, once, in terms the submitter can
-	// act on (wefty #578). Only a new job is: the check follows replay
-	// resolution, so an identical replay of one stored before L1 refused them
-	// still returns the stored job, as every replay does.
+	// Explicit malformed OCI owners are refused after replay. Missing run
+	// labels are valid: execution uses the server-assigned Job ID, leaving the
+	// immutable submission and run-identity entitlement untouched.
 	if err := contract.ValidateHandoffOwner(spec); err != nil {
 		return Job{}, false, protocolErrorWithDetails(contract.ErrorRunIdentityRequired,
 			map[string]any{"kind": spec.Kind, "class": spec.Class},

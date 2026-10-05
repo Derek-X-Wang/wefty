@@ -896,12 +896,8 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		err := errors.New("Computer claim is missing its durable Storage identity")
 		return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
 	}
-	// A job that needs a handoff owner and names none the helper would accept
-	// is refused before the runtime is asked, with a code L1 treats as
-	// terminal: its labels cannot change, so every attempt would be refused
-	// the same way, and the helper's refusal would read as runtime
-	// unavailability, which L1 requeues (wefty #578). L1 refuses such a job at
-	// submission; this covers one it stored before it did.
+	// Explicit malformed owners cannot become valid on a retry. Direct OCI
+	// one-shots instead use L1's server-assigned job identity.
 	if err := contract.ValidateHandoffOwner(claim.Job.Spec); err != nil {
 		return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
 	}
@@ -913,7 +909,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request := workloadrunner.Request{
 		Authority: authority, RuntimeHandler: claim.Job.Spec.RuntimeHandler,
 		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
-		ManagedVolumes: runtimeManagedVolumes(claim),
+		ManagedVolumes: runtimeManagedVolumes(claim, lifecycle.executionOwnerKey(claim.Job.Spec)),
 		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	var ociRuntimeLoss ociRuntimeLossLatch
@@ -1234,7 +1230,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	// held for as long as the process root's are: through the workload, the
 	// verdict, and the result upload that binds this attempt's publication.
 	if handoffs := lifecycle.dependencies.handoffs; handoffs != nil && usesOCIHandoffLifecycle(claim.Job.Spec) {
-		lease, err := handoffs.lockOCIHandoff(ctx, handoffOwnerRunID(claim.Job.Spec))
+		lease, err := handoffs.lockOCIHandoff(ctx, lifecycle.executionOwnerKey(claim.Job.Spec))
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
@@ -1244,7 +1240,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			defer lease.release()
 			defer lifecycle.retainResultsFallback(claim)
 		}
-		if err := handoffs.admitOCIHandoff(lease, claim.Job.Spec,
+		if err := handoffs.admitOCIHandoff(lease, *lifecycle.executionHandoff,
 			lifecycle.dependencies.nodeID, claim.Lease.AttemptID); err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
@@ -1379,7 +1375,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	if usesOCIHandoffLifecycle(claim.Job.Spec) {
 		if runtime, served := runtimeAdapter.(workloadrunner.HandoffFileRuntime); served {
 			handoffReader = &helperHandoffReader{runtime: runtime, reference: workloadrunner.HandoffFileReference{
-				Authority: authority, OwnerKey: handoffOwnerRunID(claim.Job.Spec),
+				Authority: authority, OwnerKey: lifecycle.executionOwnerKey(claim.Job.Spec),
 			}}
 		} else if reader, served := mailbox.handoffFiles(); served {
 			// Existing mailbox runtimes can still serve their original read path.
@@ -1606,8 +1602,9 @@ func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
 	return spec.Kind == contract.JobKindProcess && spec.Class == contract.JobClassOneShot
 }
 
-// adoptHandoffDirectory rewrites a dispatched handoff path onto the root this
-// node manages, once, before anything in the attempt uses it.
+// adoptHandoffDirectory resolves execution ownership once before the attempt
+// uses it. OCI keeps its opaque volume key; a process path is adopted onto the
+// root this node manages.
 //
 // It happens at the claim rather than inside the handoff manager because the
 // path is not only the agent's: the workload is told it in WEFTY_HANDOFF_DIR
@@ -1622,6 +1619,11 @@ func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
 // unexplained refusal from here.
 func (lifecycle *attemptLifecycle) adoptHandoffDirectory(claim l1.Claim) l1.Claim {
 	handoffs := lifecycle.dependencies.handoffs
+	if usesOCIHandoffLifecycle(claim.Job.Spec) {
+		execution := handoffs.resolveExecutionHandoff(claim.Job.Spec, claim.Job.JobID)
+		lifecycle.executionHandoff = &execution
+		return claim
+	}
 	if handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return claim
 	}
@@ -1640,23 +1642,23 @@ func (lifecycle *attemptLifecycle) adoptHandoffDirectory(claim l1.Claim) l1.Clai
 	return claim
 }
 
-// executionOwnerKey names process uploads with the same resolved identity as
-// execution and retention. OCI keeps its existing owner resolution.
+// executionOwnerKey names uploads with the same resolved identity as execution
+// and retention, for both process directories and OCI volumes.
 func (lifecycle *attemptLifecycle) executionOwnerKey(spec contract.JobSpec) string {
-	if usesAgentHandoffLifecycle(spec) && lifecycle.executionHandoff != nil {
+	if lifecycle.executionHandoff != nil {
 		return lifecycle.executionHandoff.ownerKey
 	}
 	return handoffOwnerRunID(spec)
 }
 
-func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
+func runtimeManagedVolumes(claim l1.Claim, ownerKey string) []workloadrunner.ManagedVolume {
 	spec := claim.Job.Spec
 	if spec.Kind != contract.JobKindOCI {
 		return nil
 	}
 	switch spec.Class {
 	case contract.JobClassOneShot:
-		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: handoffOwnerRunID(spec)}}
+		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: ownerKey}}
 	case contract.JobClassService:
 		if contract.IsComputerExecution(spec.Execution) {
 			if claim.ComputerStorage == nil {
@@ -1729,7 +1731,7 @@ func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, publ
 			return nil
 		}
 		return lifecycle.dependencies.handoffs.finishOCIHandoff(
-			claim.Job.Spec, lifecycle.dependencies.nodeID, claim.Lease.AttemptID, succeeded, published)
+			executionHandoff{spec: claim.Job.Spec, ownerKey: lifecycle.executionOwnerKey(claim.Job.Spec)}, lifecycle.dependencies.nodeID, claim.Lease.AttemptID, succeeded, published)
 	}
 	if lifecycle.handoffOwnership == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return nil
@@ -1811,10 +1813,10 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 		// has seen.
 		if usesOCIHandoffLifecycle(claim.Job.Spec) {
 			if noteErr := lifecycle.dependencies.handoffs.noteOCIHandoffUpload(
-				handoffOwnerRunID(claim.Job.Spec), claim.Lease.AttemptID,
+				lifecycle.executionOwnerKey(claim.Job.Spec), claim.Lease.AttemptID,
 				published); noteErr != nil {
 				lifecycle.log("agent: record the result upload on run %s's OCI handoff record: %v",
-					handoffOwnerRunID(claim.Job.Spec), noteErr)
+					lifecycle.executionOwnerKey(claim.Job.Spec), noteErr)
 			}
 		}
 	}

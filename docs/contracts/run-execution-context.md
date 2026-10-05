@@ -924,30 +924,33 @@ The marker and the agent's retention records are replaced by renaming a synced
 staging file over the name and then syncing the directory, so after power loss
 each name holds the old document or the new one, never a partial one, and a
 marker is never absent while it is being rewritten.
-For `kind=oci`, the agent instead requests a helper-owned
-managed volume keyed by the job's stable run ID or `handoff_owner_run_id`; the
-helper hashes that opaque key and mounts the resulting source at
-`/wefty/handoff`. Attempt IDs never enter the OCI handoff identity.
+For `kind=oci`, the agent requests a helper-owned managed volume keyed by
+`contract.ExecutionHandoffOwnerKey`: non-blank `handoff_owner_run_id`, else
+`run_id`, trimmed, else the server-assigned Job ID. The helper hashes that
+opaque key and mounts the source at `/wefty/handoff`. Attempt IDs never enter
+the OCI handoff identity. An ordinary L1 client can submit an OCI one-shot
+without L3, a run identity, token or mailbox. Its result is captured through
+`HandoffFileRuntime` before runtime reap and uploaded to the L1 Job result.
 
-That key is not optional for an OCI one-shot, as the directory's run identity
-is for a process one: the volume has no name without it, and the helper refuses
-to create one. The owner key is `handoff_owner_run_id` when it is non-blank,
-else `run_id`, trimmed; it must be non-empty, at most 255 bytes and free of NUL
-(`contract.ValidateHandoffOwner`). Both labels are immutable after submission,
-so a job without a usable key could never run. L1 therefore refuses it at
-`POST /v1/jobs` — root or child submission alike — with HTTP 409
-`run_identity_required`, `retryable: false`, and stores nothing. The refusal
-applies to a new job only: it follows dispatch-key resolution, so an identical
-replay of such a job stored before L1 refused them returns the stored job, as
-every replay does. Every run the ledger dispatches names its run and is
-unaffected; a direct root submitter cannot supply one (below), so an OCI
-one-shot reaches L1 as an L3 run or as a child of one. Process one-shots and
-services (whose data is keyed by their job ID, Computers included) need no run
-identity and are not checked. A node
-that claims such a job anyway — one stored before L1 refused them — completes
-the attempt once with the terminal spawn failure `handoff_preparation_failed`
-before asking the runtime, instead of letting the helper's refusal read as
-`runtime_unavailable`, which L1 requeues (wefty #578).
+The same execution owner governs the managed volume, admission record, volume
+lock, result capture, upload record, retention and eviction. Job ownership is
+never written into submitted labels or the canonical request hash and creates
+no run-identity entitlement, including for children of a job-owned parent.
+An absent or blank run identity needs no refusal. A malformed explicit owner
+(over 255 bytes or containing NUL) still receives HTTP 409
+`run_identity_required`, `retryable: false`, with nothing stored when the
+submitter is entitled to name that run. Run-identity entitlement is checked
+first and is unchanged. Dispatch-key replay and removal tombstones still
+resolve before either owner or entitlement checks. The node also refuses a
+malformed explicit owner before runtime admission with terminal spawn failure
+`handoff_preparation_failed`.
+
+A handoff is published only after the producing attempt's result upload
+succeeds and its run mailbox drains. An attempt with no mailbox has nothing to
+drain; that alone is never upload success. A failed upload leaves the
+job-owned volume unpublished and protects it from eviction ahead of published
+output. The existing per-attempt publication rule for a shared run-owned
+volume is unchanged.
 
 Naming a run is a claim to speak for it: the node keys a one-shot's retained
 handoff directory or volume by the owner key and attributes the attempt's

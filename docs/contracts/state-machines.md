@@ -1155,3 +1155,13 @@ stopped/failed, removal pending, agent cleaned, forgotten and stalled, until
 removal finalization deletes the ordinary job. Releasing a Slot does not release
 an Instance key. Computers are excluded. See [instance-key concurrency and
 validation](lease-fencing-dispatch.md#instance-keys).
+
+## Direct OCI one-shot output
+
+An ordinary L1 client may submit a one-shot OCI Job without run labels. This
+changes no Job or Attempt state transition: the server Job ID owns the managed
+handoff volume, and exact-attempt capture precedes reap. Result upload is
+best-effort and independent of terminal Job success. A failed upload leaves
+that attempt's handoff unpublished; an absent run mailbox does not publish it.
+Run-identity entitlement, dispatch replay and tombstones keep their existing
+ordering and authority rules.
