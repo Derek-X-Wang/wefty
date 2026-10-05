@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,30 +23,43 @@ import (
 // drain. Its success says nothing about the separate result-document upload.
 func TestHandoffPublicationProcess(t *testing.T) {
 	for _, tc := range []struct {
-		name              string
-		mailbox, document bool
-		status            int
-		published         bool
-		reason            contract.ResultUploadSkipReason
+		name      string
+		mailbox   bool
+		wrote     string // "", "json", "not_json" or "directory" at result.json
+		status    int
+		published bool
+		reason    contract.ResultUploadSkipReason
 	}{
-		{"missing_result", false, false, 0, false, contract.ResultUploadSkipAbsent},
-		{"unusable_result", false, true, 0, false, contract.ResultUploadSkipNotJSON},
-		{"failed_without_mailbox", false, true, http.StatusConflict, false, contract.ResultUploadSkipTransport},
-		{"failed_after_mailbox_drain", true, true, http.StatusConflict, false, contract.ResultUploadSkipTransport},
-		{"uploaded_without_mailbox", false, true, 0, true, ""},
-		{"uploaded_after_mailbox_drain", true, true, 0, true, ""},
+		// A run that wrote no result.json has no document to lose once L1
+		// has recorded that it wrote none.
+		{"missing_result", false, "", 0, true, contract.ResultUploadSkipAbsent},
+		{"missing_result_after_mailbox_drain", true, "", 0, true, contract.ResultUploadSkipAbsent},
+		{"missing_result_refused", false, "", http.StatusConflict, false, contract.ResultUploadSkipTransport},
+		// Every other skip names a file that is on this node and nowhere else.
+		{"unusable_result", false, "not_json", 0, false, contract.ResultUploadSkipNotJSON},
+		{"result_not_a_file", false, "directory", 0, false, contract.ResultUploadSkipNotFile},
+		{"failed_without_mailbox", false, "json", http.StatusConflict, false, contract.ResultUploadSkipTransport},
+		{"failed_after_mailbox_drain", true, "json", http.StatusConflict, false, contract.ResultUploadSkipTransport},
+		{"uploaded_without_mailbox", false, "json", 0, true, ""},
+		{"uploaded_after_mailbox_drain", true, "json", 0, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRetentionHarness(t, time.Hour)
 			path := filepath.Join(h.root, "run_publication")
 			claim := retentionClaim(t, "run_publication", path)
 			run := successfulRetentionRun
-			if tc.document {
-				document := []byte(`{"ok":true}`)
-				if tc.reason == contract.ResultUploadSkipNotJSON {
-					document = []byte("not JSON")
+			switch tc.wrote {
+			case "json":
+				run = writingRun(path, "result.json", []byte(`{"ok":true}`))
+			case "not_json":
+				run = writingRun(path, "result.json", []byte("not JSON"))
+			case "directory":
+				run = func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+					if err := os.Mkdir(filepath.Join(path, "result.json"), 0o700); err != nil {
+						return contract.ProcessResult{}, err
+					}
+					return successfulRetentionRun(ctx, request, sink)
 				}
-				run = writingRun(path, "result.json", document)
 			}
 			lifecycle := uploadingLifecycle(t, h.manager, &resultUploadRecorder{status: tc.status}, run)
 			if tc.mailbox {
@@ -68,15 +82,22 @@ func TestHandoffPublicationProcess(t *testing.T) {
 				t.Fatal(err)
 			}
 			mailbox := lifecycle.mailbox.Load()
-			if (mailbox != nil) != tc.mailbox || mailbox.publicationIncomplete() {
+			if (mailbox != nil) != tc.mailbox || !lifecycle.mailboxDrained() {
 				t.Fatal("mailbox did not drain as arranged")
 			}
-			if got := requireRetentionRecord(t, h.manager, "run_publication"); got.Published != tc.published {
-				t.Fatalf("publication = %t, want %t", got.Published, tc.published)
+			if got := requireRetentionRecord(t, h.manager, "run_publication"); got.evidenceReachedLedger() != tc.published {
+				t.Fatalf("publication = %+v, want %t", got, tc.published)
 			}
 			upload := requireUploadRecord(t, h.manager, "run_publication")
-			if upload.Uploaded != tc.published || upload.Reason != tc.reason {
+			if upload.Uploaded != (tc.published && tc.reason == "") || upload.Reason != tc.reason || !upload.MailboxDrained {
 				t.Fatalf("upload fact = %+v", upload)
+			}
+			// Bytes to charge, so the record is a candidate whatever the run wrote.
+			if err := os.WriteFile(filepath.Join(path, "payload.bin"), make([]byte, 4096), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if published, _ := h.manager.evictionCandidates(h.account()); (len(published) == 1) != tc.published {
+				t.Fatalf("evict-first candidates = %v, want published=%t", published, tc.published)
 			}
 			// Restart must preserve the observed fact, not infer it from success.
 			reopened := newHandoffManager(h.root, h.manager.stateRoot, "node-1", time.Hour, nil)
@@ -84,10 +105,118 @@ func TestHandoffPublicationProcess(t *testing.T) {
 			if err := reopened.adoptResidue(); err != nil {
 				t.Fatal(err)
 			}
-			if got := requireRetentionRecord(t, reopened, "run_publication"); got.Published != tc.published {
+			if got := requireRetentionRecord(t, reopened, "run_publication"); got.evidenceReachedLedger() != tc.published {
 				t.Fatalf("restart publication = %+v", got)
 			}
 		})
+	}
+}
+
+// TestHandoffPublicationNeedsACompleteMailboxDrain is the #494 invariant at the
+// publication rule: L1 holding the result says nothing about L3 holding the
+// events. When the drain fails, the pending events in the handoff are the only
+// copy, so a successful upload must not make the handoff evict-first.
+func TestHandoffPublicationNeedsACompleteMailboxDrain(t *testing.T) {
+	const event = "wefty-protocol: 1\nkind: gate\nname: test\noutcome: fail\n--\nboom\n"
+	t.Run("process", func(t *testing.T) {
+		h := newRetentionHarness(t, time.Hour)
+		path := filepath.Join(h.root, "run_undrained")
+		claim := retentionClaim(t, "run_undrained", path)
+		claim.SubmittedByRunLedger = true
+		claim.Job.Spec.Execution.Env = map[string]string{contract.EnvRunID: "run_undrained", contract.EnvL3Endpoint: "http://ledger.invalid"}
+		claim.Job.Spec.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: mailboxTestToken}
+		recorder := &resultUploadRecorder{}
+		run := writingRun(path, "result.json", []byte(`{"ok":true}`))
+		lifecycle := uploadingLifecycle(t, h.manager, recorder, run)
+		appender := newRecordingAppender(path)
+		appender.failWith(errors.New("run ledger is unreachable"))
+		lifecycle.dependencies.runLedger = appender
+		lifecycle.dependencies.runtimes = testRuntimeSet(completionDirectiveRunFunc(func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+			writeMailboxEvent(t, request.Execution.Env[contract.EnvRunDir], "0001-gate-test", event)
+			return run(ctx, request, sink)
+		}))
+		if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if requests, _ := recorder.observed(); len(requests) != 1 || len(requests[0].Document) == 0 {
+			t.Fatalf("the fixture did not upload the document: %+v", requests)
+		}
+		if !lifecycle.mailbox.Load().publicationIncomplete() {
+			t.Fatal("the fixture's refused events did not leave the drain incomplete")
+		}
+		if got := requireRetentionRecord(t, h.manager, "run_undrained"); got.Published || got.evidenceReachedLedger() {
+			t.Fatalf("an upload hid a failed mailbox drain: %+v", got)
+		}
+		if upload := requireUploadRecord(t, h.manager, "run_undrained"); !upload.Uploaded || upload.MailboxDrained {
+			t.Fatalf("upload record = %+v, want the upload and the failed drain both recorded", upload)
+		}
+		pending := filepath.Join(path, runMailboxDirectoryName, "run_undrained", runMailboxEventsDirectoryName, "0001-gate-test")
+		if _, err := os.Stat(pending); err != nil {
+			t.Fatalf("the only copy of the event is gone: %v", err)
+		}
+		published, unpublished := h.manager.evictionCandidates(h.account())
+		if len(published) != 0 || len(unpublished) != 1 {
+			t.Fatalf("evict-first candidates = %v, unpublished = %v", published, unpublished)
+		}
+	})
+	t.Run("oci", func(t *testing.T) {
+		h := newRetentionHarness(t, time.Hour)
+		claim := remoteMailboxClaim("")
+		claim.Job.Spec.Labels["run_id"] = "run_oci_undrained"
+		claim.Job.Spec.Execution.Env[contract.EnvRunID] = "run_oci_undrained"
+		claim.Lease.AttemptID, claim.Lease.FencingToken, claim.Lease.LeaseTTL = "attempt-1", "fence-1", time.Minute
+		claim.SubmittedByRunLedger = true
+		recorder := &resultUploadRecorder{}
+		lifecycle := uploadingLifecycle(t, h.manager, recorder, successfulRetentionRun)
+		runtime := &publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime()}
+		lifecycle.dependencies.runtimes = workloadRuntimeSet{contract.JobKindOCI: runtime}
+		appender := newRecordingAppender("")
+		appender.failWith(errors.New("run ledger is unreachable"))
+		lifecycle.dependencies.runLedger = appender
+		lifecycle.dependencies.mailboxStateRoot = t.TempDir()
+		runtime.put("0001-gate-test", event)
+		if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if requests, _ := recorder.observed(); len(requests) != 1 || len(requests[0].Document) == 0 {
+			t.Fatalf("the fixture did not upload the document: %+v", requests)
+		}
+		if !lifecycle.mailbox.Load().publicationIncomplete() || len(runtime.remaining()) != 1 {
+			t.Fatal("the fixture's refused event did not stay pending in the volume")
+		}
+		record, found, err := h.manager.readOCIRecord("run_oci_undrained")
+		if err != nil || !found || record.Published || record.evidenceReachedLedger() {
+			t.Fatalf("an upload hid a failed mailbox drain: %+v found=%t err=%v", record, found, err)
+		}
+		if upload := requireUploadRecord(t, h.manager, "run_oci_undrained"); !upload.Uploaded || upload.MailboxDrained {
+			t.Fatalf("upload record = %+v, want the upload and the failed drain both recorded", upload)
+		}
+		h.manager.ociHandoffs = &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+			ociVolume(t, "run_oci_undrained", 4096, 2, h.now)}}
+		published, unpublished := h.manager.evictionCandidates(h.account())
+		if len(published) != 0 || len(unpublished) != 1 {
+			t.Fatalf("evict-first candidates = %v, unpublished = %v", published, unpublished)
+		}
+	})
+}
+
+// A drain counts only once finalization has observed it. Until then the
+// pending events may be the only copy, whatever the incomplete flag says.
+func TestHandoffPublicationDrainIsObservedNotAssumed(t *testing.T) {
+	appender := newRecordingAppender("")
+	mailbox, _, _ := newTestMailbox(t, appender, "")
+	writeMailboxEvent(t, mailbox.directory, "0001-step-work", "wefty-protocol: 1\nkind: step\nname: work\n--\n")
+	lifecycle := &attemptLifecycle{}
+	if !lifecycle.mailboxDrained() {
+		t.Fatal("an attempt with no mailbox has something to drain")
+	}
+	lifecycle.storeMailbox(mailbox)
+	if mailbox.publicationIncomplete() || lifecycle.mailboxDrained() {
+		t.Fatal("an unfinalized mailbox counted as drained")
+	}
+	mailbox.finalize(t.Context())
+	if len(appender.snapshot()) != 1 || !lifecycle.mailboxDrained() {
+		t.Fatal("a finalized mailbox that published everything did not count as drained")
 	}
 }
 
@@ -95,12 +224,16 @@ func TestHandoffPublicationOCI(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		captured  bool
+		absent    bool
 		status    int
 		published bool
+		reason    contract.ResultUploadSkipReason
 	}{
-		{"missing_mailbox", false, 0, false},
-		{"failed_after_mailbox_drain", true, http.StatusConflict, false},
-		{"uploaded", true, 0, true},
+		// No mailbox is no read path: nothing was read, nothing uploaded.
+		{"missing_mailbox", false, false, 0, false, ""},
+		{"failed_after_mailbox_drain", true, false, http.StatusConflict, false, contract.ResultUploadSkipTransport},
+		{"uploaded", true, false, 0, true, ""},
+		{"absent_result_uploaded", true, true, 0, true, contract.ResultUploadSkipAbsent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRetentionHarness(t, time.Hour)
@@ -110,7 +243,7 @@ func TestHandoffPublicationOCI(t *testing.T) {
 			claim.Lease.AttemptID, claim.Lease.FencingToken, claim.Lease.LeaseTTL = "attempt-1", "fence-1", time.Minute
 			claim.SubmittedByRunLedger = tc.captured
 			lifecycle := uploadingLifecycle(t, h.manager, &resultUploadRecorder{status: tc.status}, successfulRetentionRun)
-			runtime := &publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime()}
+			runtime := &publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime(), absent: tc.absent}
 			lifecycle.dependencies.runtimes = workloadRuntimeSet{contract.JobKindOCI: runtime}
 			if tc.captured {
 				appender := newRecordingAppender("")
@@ -137,8 +270,13 @@ func TestHandoffPublicationOCI(t *testing.T) {
 			if err != nil || found != tc.captured {
 				t.Fatalf("capture/upload availability = %+v found=%t err=%v", upload, found, err)
 			}
-			if tc.captured && (upload.Uploaded != tc.published || (!tc.published && upload.Reason != contract.ResultUploadSkipTransport)) {
+			if tc.captured && (upload.Uploaded != (tc.published && tc.reason == "") || upload.Reason != tc.reason || !upload.MailboxDrained) {
 				t.Fatalf("upload fact = %+v", upload)
+			}
+			h.manager.ociHandoffs = &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+				ociVolume(t, "run_oci_publication", 4096, 2, h.now)}}
+			if published, _ := h.manager.evictionCandidates(h.account()); (len(published) == 1) != tc.published {
+				t.Fatalf("evict-first candidates = %v, want published=%t", published, tc.published)
 			}
 			reopened := newHandoffManager(h.root, h.manager.stateRoot, "node-1", time.Hour, nil)
 			reopened.now = h.manager.now
@@ -216,7 +354,9 @@ func TestHandoffPublicationCrashAfterUpload(t *testing.T) {
 		published    bool
 	}{
 		{"process", "current", true}, {"process", "older", false}, {"process", "failed", false}, {"process", "missing", false},
+		{"process", "undrained", false}, {"process", "absent", true}, {"process", "legacy", false},
 		{"oci", "current", true}, {"oci", "older", false}, {"oci", "failed", false}, {"oci", "missing", false},
+		{"oci", "undrained", false}, {"oci", "absent", true}, {"oci", "legacy", false},
 	} {
 		t.Run(tc.kind+"/"+tc.upload, func(t *testing.T) {
 			kind := tc.kind
@@ -259,15 +399,43 @@ func TestHandoffPublicationCrashAfterUpload(t *testing.T) {
 			}
 			switch tc.upload {
 			case "older":
-				if err := h.manager.recordUpload("run_crash", "node-1", "attempt-older", attemptResult{document: []byte(`{}`)}); err != nil {
+				if err := h.manager.recordUpload("run_crash", "node-1", "attempt-older", attemptResult{document: []byte(`{}`)}, true); err != nil {
 					t.Fatal(err)
 				}
 			case "failed":
-				if err := h.manager.recordUpload("run_crash", "node-1", claim.Lease.AttemptID, attemptResult{skip: contract.ResultUploadSkipTransport}); err != nil {
+				if err := h.manager.recordUpload("run_crash", "node-1", claim.Lease.AttemptID, attemptResult{skip: contract.ResultUploadSkipTransport}, true); err != nil {
 					t.Fatal(err)
 				}
 			case "missing":
 				if err := os.Remove(filepath.Join(h.manager.uploadRecordRoot(), recordComponent("run_crash"))); err != nil {
+					t.Fatal(err)
+				}
+			case "undrained":
+				// The document reached L1 and the mailbox did not drain: the
+				// events still pending in the handoff are the only copy.
+				if err := h.manager.recordUpload("run_crash", "node-1", claim.Lease.AttemptID, attemptResult{document: []byte(`{}`)}, false); err != nil {
+					t.Fatal(err)
+				}
+			case "absent":
+				if err := h.manager.recordUpload("run_crash", "node-1", claim.Lease.AttemptID, attemptResult{skip: contract.ResultUploadSkipAbsent}, true); err != nil {
+					t.Fatal(err)
+				}
+			case "legacy":
+				// An older agent's upload record says nothing about the drain.
+				upload := h.manager.newUploadRecord("run_crash", "node-1", claim.Lease.AttemptID, attemptResult{document: []byte(`{}`)}, true)
+				payload, err := json.Marshal(upload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var legacy map[string]any
+				if err := json.Unmarshal(payload, &legacy); err != nil {
+					t.Fatal(err)
+				}
+				delete(legacy, "mailbox_drained")
+				if payload, err = json.Marshal(legacy); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(h.manager.uploadRecordRoot(), recordComponent("run_crash")), payload, 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -291,13 +459,25 @@ func TestHandoffPublicationCrashAfterUpload(t *testing.T) {
 }
 
 // Old agents stored the mailbox verdict in published. That is not proof that
-// the retained document has another copy, even after restarting the node.
+// the retained document has another copy, even after restarting the node. An
+// old OCI record also carried the document upload in uploaded, and a document
+// that reached L1 from an attempt whose mailbox did not drain is not
+// published either.
 func TestHandoffPublicationLegacyMailboxVerdict(t *testing.T) {
-	for _, kind := range []string{"process", "oci"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		kind     string
+		drained  bool
+		uploaded any // nil: an older process record has no uploaded member
+	}{
+		{"process_drained", "process", true, nil},
+		{"oci_drained_not_uploaded", "oci", true, nil},
+		{"oci_uploaded_not_drained", "oci", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			h := newRetentionHarness(t, time.Hour)
 			path := h.manager.recordPath("run_legacy")
-			if kind == "process" {
+			if tc.kind == "process" {
 				h.retain("run_legacy", true, true, map[string]int{"result.json": 32})
 			} else {
 				h.retainOCI("run_legacy", "attempt-1", true)
@@ -311,18 +491,22 @@ func TestHandoffPublicationLegacyMailboxVerdict(t *testing.T) {
 			if err := json.Unmarshal(payload, &record); err != nil {
 				t.Fatal(err)
 			}
+			record["published"] = tc.drained
 			delete(record, "uploaded")
+			if tc.uploaded != nil {
+				record["uploaded"] = tc.uploaded
+			}
 			payload, _ = json.Marshal(record)
 			if err := os.WriteFile(path, payload, 0600); err != nil {
 				t.Fatal(err)
 			}
-			if kind == "oci" {
+			if tc.kind == "oci" {
 				helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{ociVolume(t, "run_legacy", 4096, 2, h.now)}}
 				h.manager.ociHandoffs = helper
 			}
 			published, unpublished := h.manager.evictionCandidates(h.account())
 			if len(published) != 0 || len(unpublished) != 1 {
-				t.Fatalf("legacy mailbox verdict granted publication: published=%v unpublished=%v", published, unpublished)
+				t.Fatalf("legacy record granted publication: published=%v unpublished=%v", published, unpublished)
 			}
 		})
 	}
@@ -334,6 +518,8 @@ type publicationOCIRuntime struct {
 	captureRuntime
 	*fakeRunMailboxRuntime
 	reaped, resultRead atomic.Bool
+	// absent makes the volume hold no result.json at all.
+	absent bool
 }
 
 func (r *publicationOCIRuntime) ReadRunMailbox(ctx context.Context, ref workloadrunner.RunMailboxReference, name string, limit int) ([]byte, bool, error) {
@@ -342,6 +528,9 @@ func (r *publicationOCIRuntime) ReadRunMailbox(ctx context.Context, ref workload
 	}
 	if ref.Scope == workloadrunner.RunMailboxScopeHandoffFiles {
 		r.resultRead.Store(true)
+		if r.absent {
+			return nil, false, fs.ErrNotExist
+		}
 		return []byte(`{"ok":true}`), false, nil
 	}
 	return r.fakeRunMailboxRuntime.ReadRunMailbox(ctx, ref, name, limit)

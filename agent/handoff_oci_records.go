@@ -63,9 +63,13 @@ type ociHandoffRecord struct {
 	// an admission and no RetainedAt is a run still writing.
 	AdmittedAt time.Time `json:"admitted_at"`
 	RetainedAt time.Time `json:"retained_at,omitempty"`
-	// Published was the mailbox drain verdict in older agents. Only Uploaded
-	// proves the result document reached L1; a legacy Published alone cannot
-	// grant early eviction. Both are cleared by the next admission.
+	// Published and Uploaded together are the publication verdict
+	// (uploadRecord.publishes), and evidenceReachedLedger reads their
+	// conjunction. This agent writes both as that one verdict. Older agents
+	// wrote Published as the mailbox drain verdict and Uploaded as the
+	// document upload, so their conjunction is the same rule for a legacy
+	// record too: a document that reached L1 from an attempt whose mailbox
+	// did not drain is not published. Both are cleared by the next admission.
 	Published bool `json:"published,omitempty"`
 	Succeeded bool `json:"succeeded,omitempty"`
 	Uploaded  bool `json:"uploaded,omitempty"`
@@ -81,7 +85,7 @@ func (record ociHandoffRecord) live() bool { return record.RetainedAt.IsZero() }
 
 // evidenceReachedLedger is the `published` fact the eviction order reads.
 func (record ociHandoffRecord) evidenceReachedLedger() bool {
-	return record.Uploaded
+	return record.Published && record.Uploaded
 }
 
 // usesOCIHandoffLifecycle is the set of jobs whose handoff volume this agent
@@ -193,12 +197,12 @@ func (m *handoffManager) finishOCIHandoff(spec contract.JobSpec, nodeID, attempt
 	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), record)
 }
 
-// noteOCIHandoffUpload binds the result upload's outcome to the attempt that
-// produced it. An upload recorded for an attempt the record no longer names is
-// dropped rather than applied: that is precisely the stale authority a rerun
-// used to inherit.
-func (m *handoffManager) noteOCIHandoffUpload(ownerKey, attemptID string, uploaded bool) error {
-	if m == nil || strings.TrimSpace(m.stateRoot) == "" || !uploaded {
+// noteOCIHandoffUpload binds the publication verdict reached at upload to the
+// attempt that produced it. A verdict recorded for an attempt the record no
+// longer names is dropped rather than applied: that is precisely the stale
+// authority a rerun used to inherit.
+func (m *handoffManager) noteOCIHandoffUpload(ownerKey, attemptID string, published bool) error {
+	if m == nil || strings.TrimSpace(m.stateRoot) == "" || !published {
 		return nil
 	}
 	record, found, err := m.readOCIRecord(ownerKey)
@@ -208,7 +212,7 @@ func (m *handoffManager) noteOCIHandoffUpload(ownerKey, attemptID string, upload
 	if record.AttemptID != strings.TrimSpace(attemptID) {
 		return nil
 	}
-	record.Uploaded = true
+	record.Published, record.Uploaded = true, true
 	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), record)
 }
 
@@ -331,17 +335,21 @@ func (m *handoffManager) reconcileOCIAdmissions() {
 		// The upload record is the one place an interrupted attempt's
 		// publication can still be read, and it is joined by attempt, not by
 		// owner: an upload another attempt made says nothing about this one's
-		// contents.
+		// contents. It carries the drain verdict as well as the upload, so
+		// this is the classification the attempt's own finish would have
+		// written.
+		published := false
 		if upload, found, err := m.readUploadRecord(record.OwnerKey); err == nil && found &&
-			upload.AttemptID == record.AttemptID && upload.Uploaded {
-			record.Uploaded = true
+			upload.AttemptID == record.AttemptID {
+			published = upload.publishes()
 		}
+		record.Published, record.Uploaded = published, published
 		if err := writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(record.OwnerKey), record); err != nil {
 			m.log("agent: reconcile the OCI handoff admission for run %s: %v", record.OwnerKey, err)
 			continue
 		}
 		m.log("agent: the OCI handoff volume for run %s was admitted by attempt %s and never finished; it is now retained from this startup%s",
 			record.OwnerKey, record.AttemptID,
-			map[bool]string{true: ", with its result upload recorded"}[record.Uploaded])
+			map[bool]string{true: ", with its publication recorded"}[record.evidenceReachedLedger()])
 	}
 }

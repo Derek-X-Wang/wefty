@@ -392,6 +392,9 @@ type runMailbox struct {
 
 	fenced     atomic.Bool
 	incomplete atomic.Bool
+	// finalized latches once finalize has returned, which is when incomplete
+	// becomes the drain's final answer. Before that, no answer is complete.
+	finalized atomic.Bool
 
 	// Once finalization detaches, its cleanup worker alone closes the roots.
 	detached     atomic.Bool
@@ -903,6 +906,7 @@ func (m *runMailbox) finalize(ctx context.Context) {
 	if m.incomplete.Load() {
 		m.log("agent: run %s mailbox has unpublished evidence; retaining the handoff directory", m.runID)
 	}
+	m.finalized.Store(true)
 }
 
 // finishExpired cancels synchronously, then joins appends, both workers and
@@ -971,6 +975,13 @@ func (m *runMailbox) readsThroughRuntime() bool {
 // files are the only remaining copy.
 func (m *runMailbox) publicationIncomplete() bool {
 	return m != nil && m.incomplete.Load()
+}
+
+// drained reports a drain observed to be complete: finalization ran and left
+// nothing this attempt wrote unpublished. A mailbox that was never finalized
+// has not been observed to drain, so it does not count.
+func (m *runMailbox) drained() bool {
+	return m != nil && m.finalized.Load() && !m.incomplete.Load()
 }
 
 // pending reports whether evidence may still be unpublished. An exhausted scan

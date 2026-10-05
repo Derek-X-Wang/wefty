@@ -145,9 +145,9 @@ type attemptLifecycle struct {
 	// the same reason retention is latched: several exits reach it and only
 	// the first one's answer is the run's.
 	resultUploaded atomic.Bool
-	// resultPublished is observed document upload success, separate from the
-	// latch saying an upload was attempted. A missing read path, skip receipt
-	// or transport failure never sets it.
+	// resultPublished is the publication verdict the upload reached
+	// (uploadRecord.publishes), separate from the latch saying an upload was
+	// attempted, so a second exit reads the first one's answer.
 	resultPublished atomic.Bool
 	// capturedResult holds a result read before the runtime was reaped. An OCI
 	// attempt's handoff volume is only readable while its attempt is live, so
@@ -728,9 +728,10 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
 	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
-	// Publication is observed L1 document upload success, not a mailbox drain
-	// verdict. Upload while the attempt still holds its handoff lease and
-	// before terminal retention can make the handoff an eviction candidate.
+	// Publication needs both halves: the result reached L1 and the run
+	// mailbox drained. Either one alone leaves an only copy on this node. The
+	// upload runs while the attempt still holds its handoff lease and before
+	// terminal retention can make the handoff an eviction candidate.
 	published := lifecycle.uploadResult(ctx, claim)
 	if err := lifecycle.retainResults(claim, succeeded, published); err != nil {
 		return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
@@ -1720,6 +1721,10 @@ func (lifecycle *attemptLifecycle) captureRemoteResult(ctx context.Context, mail
 // reads it here, through the ownership receipt it still holds. An OCI attempt
 // read it before its runtime was reaped, because that was the last moment it
 // could.
+//
+// It returns the handoff's publication verdict (uploadRecord.publishes): the
+// result reached L1 and the run mailbox drained. An attempt with no read path
+// to its result uploads nothing and is never published.
 func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Claim) bool {
 	if lifecycle.dependencies.client == nil {
 		return false
@@ -1738,15 +1743,20 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 	if err != nil {
 		lifecycle.log("agent: upload result for attempt %s: %v", claim.Lease.AttemptID, err)
 	}
-	published := err == nil && len(recorded.document) > 0 && recorded.skip == ""
+	// The drain has finished by now on every path that reaches here: the
+	// workload path finalizes its mailbox before it returns, and both callers
+	// run after it. So the record written here carries the whole verdict, and
+	// startup recovery reads the same one if the agent dies before retention.
+	outcome := lifecycle.dependencies.handoffs.newUploadRecord(
+		handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID,
+		claim.Lease.AttemptID, recorded, lifecycle.mailboxDrained())
+	published := outcome.publishes()
 	lifecycle.resultPublished.Store(published)
 	// The outcome is recorded for every runtime, not only the ones whose
 	// handoff directory this agent owns. An upload that never landed leaves no
 	// ledger row at all, so this record is the only place the reason exists.
 	if lifecycle.dependencies.handoffs != nil {
-		if noteErr := lifecycle.dependencies.handoffs.recordUpload(
-			handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID,
-			claim.Lease.AttemptID, recorded); noteErr != nil {
+		if noteErr := lifecycle.dependencies.handoffs.writeUploadRecord(outcome); noteErr != nil {
 			lifecycle.log("agent: record result upload for attempt %s: %v", claim.Lease.AttemptID, noteErr)
 		}
 		// And, for an OCI run, onto the record eviction reads. It is bound to
@@ -1763,6 +1773,15 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 		}
 	}
 	return published
+}
+
+// mailboxDrained is the drain half of publication. An attempt that never had a
+// run mailbox has nothing to drain. One that had a mailbox counts only once its
+// finalization ran and left nothing unpublished: those pending events are the
+// only copy of what the run reported.
+func (lifecycle *attemptLifecycle) mailboxDrained() bool {
+	mailbox := lifecycle.mailbox.Load()
+	return mailbox == nil || mailbox.drained()
 }
 
 // attemptResult returns what this attempt has to upload, reading it now for the

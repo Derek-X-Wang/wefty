@@ -711,7 +711,7 @@ func (m *handoffManager) measureNode(ctx context.Context, root *os.Root, now tim
 		status.PerRun = append(status.PerRun, RetainedRunFigures{
 			RunID: record.RunID, Entries: tally.entries,
 			LogicalBytes: tally.logical, ChargedBytes: tally.charged,
-			Published: record.Uploaded, Truncated: tally.truncated != 0,
+			Published: record.evidenceReachedLedger(), Truncated: tally.truncated != 0,
 		})
 		if ctx != nil && ctx.Err() != nil {
 			break
@@ -995,12 +995,14 @@ func (m *handoffManager) adoptedWindow(record retentionRecord, deadline time.Tim
 	updated.RetainUntil = deadline
 	updated.Adopted = true
 	// A crash may land after upload and before terminal retention. Restore
-	// only a durable success for this admission's attempt, never an older
-	// upload for the same owner key. Legacy admissions have no attempt ID
-	// and remain conservatively unpublished.
+	// publication only from this admission's own attempt's upload record,
+	// never an older upload for the same owner key, and by the same rule its
+	// finish would have applied: that record carries the drain verdict too.
+	// Legacy admissions have no attempt ID and remain conservatively
+	// unpublished.
 	if record.AttemptID != "" {
 		if upload, found, err := m.readUploadRecord(record.handoffOwnerKey()); err == nil && found &&
-			upload.AttemptID == record.AttemptID && upload.Uploaded {
+			upload.AttemptID == record.AttemptID && upload.publishes() {
 			updated.Published, updated.Uploaded = true, true
 		}
 	}
@@ -1338,8 +1340,9 @@ type handoffVolumeAttribution struct {
 // place this agent names such a run.
 //
 // Publication is joined here, on the agent's side, rather than carried on the
-// wire. The helper has no way to know it: publication is the mailbox drain
-// verdict and the result upload, both of which happen in this process.
+// wire. The helper has no way to know it: a volume is published only when its
+// attempt's result reached L1 (uploadRecord.publishes) and its run mailbox
+// drained completely, and both of those happen in this process.
 //
 // Three sources, in decreasing authority, and the order matters more than the
 // count.
@@ -1356,6 +1359,8 @@ type handoffVolumeAttribution struct {
 // retained before it wrote OCI handoff records at all. It is keyed by owner
 // and not by attempt, so it is used only when no handoff record names the
 // volume -- exactly the case where no rerun has happened since the upgrade.
+// It is read by the same rule, so an older agent's record, which carries no
+// drain verdict, never makes its volume published.
 //
 // The **retention record** contributes attribution and nothing else. A process
 // run's owner key derives a name the OCI root will never hold; it is kept
@@ -1389,7 +1394,7 @@ func (m *handoffManager) derivedHandoffVolumes() map[string]handoffVolumeAttribu
 		}
 		upload, found, err := m.readUploadRecord(runID)
 		volumes[derived] = handoffVolumeAttribution{
-			ownerKey: runID, published: err == nil && found && upload.Uploaded,
+			ownerKey: runID, published: err == nil && found && upload.publishes(),
 		}
 	}
 	for _, record := range m.loadOCIRecords() {
