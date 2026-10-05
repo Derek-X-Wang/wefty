@@ -244,9 +244,9 @@ func TestTerminationNamesNoInitiatorItCannotConfirm(t *testing.T) {
 		if delivered || result.ExitCode == nil || *result.ExitCode != 0 || result.TerminationInitiator != "" {
 			t.Fatalf("self-exit = (%#v, delivered=%t), want the payload's own exit 0", result, delivered)
 		}
-		if processGroupAlive(processGroupID) {
-			t.Fatal("the stop did not clear what the payload left in its group")
-		}
+		// The killed child stays a zombie until its new parent reaps it.
+		waitForCondition(t, func() bool { return !processGroupAlive(processGroupID) },
+			"the stop clears what the payload left in its group")
 	}
 
 	t.Run("agent stop after the self-exit was reaped", func(t *testing.T) {
