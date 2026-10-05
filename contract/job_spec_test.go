@@ -139,7 +139,7 @@ func validProcessJobSpecForValidation() JobSpec {
 }
 
 func TestServiceRestartPolicies(t *testing.T) {
-	for _, restart := range []string{"", "always", "on-failure"} {
+	for _, restart := range []string{"", "always", "on-failure", "never"} {
 		t.Run("ordinary/"+restart, func(t *testing.T) {
 			spec := JobSpec{SchemaVersion: 1, DispatchKey: "policy", Kind: "process", Class: "service", Restart: restart, Execution: ExecutionSpec{Executable: ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: "/tmp"}}
 			if err := ValidateJobSpec(&spec); err != nil {
@@ -167,6 +167,7 @@ func TestComputerRestartMustBeExplicitlyAlways(t *testing.T) {
 		{restart: RestartAlways, valid: true},
 		{restart: "", valid: false},
 		{restart: RestartOnFailure, valid: false},
+		{restart: "never", valid: false},
 	} {
 		t.Run("restart="+test.restart, func(t *testing.T) {
 			var spec JobSpec

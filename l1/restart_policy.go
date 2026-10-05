@@ -133,9 +133,9 @@ type serviceCompletionPolicy struct {
 	updateLastFailure    bool
 }
 
-// restartRequested comes from the durable directive for this exact attempt,
-// read by completion inside its committing transaction.
-func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest, lastFailureJSON []byte, now time.Time, restartRequested bool) serviceCompletionPolicy {
+// started comes from the durable attempt start marker. restartRequested comes
+// from the directive for this exact attempt, read in the completion transaction.
+func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest, resultJSON, lastFailureJSON []byte, now time.Time, started, restartRequested bool) serviceCompletionPolicy {
 	result, quiescenceEvidence := completion.Result, completion.RuntimeQuiescenceEvidence
 	policy := serviceCompletionPolicy{
 		jobState:             contract.JobFailed,
@@ -182,9 +182,9 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 		// sent, never a policy stop and never a payload failure.
 		infrastructure = true
 	case result.ExitCode != nil:
-		if *result.ExitCode == 0 && job.Spec.Restart == contract.RestartOnFailure && !restartRequested {
+		if *result.ExitCode == 0 && (job.Spec.Restart == contract.RestartOnFailure || job.Spec.Restart == contract.RestartNever) && !restartRequested {
 			policy.jobState = contract.JobStopped
-			policy.policyStop = lastFailureJSON
+			policy.policyStop = resultJSON
 			return policy
 		}
 		restartable = true
@@ -203,6 +203,14 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 	}
 
 	if infrastructure {
+		// Pre-start infrastructure failures retain their retry rules. After
+		// durable start acknowledgement, never leaves an interruption failed
+		// without a payload policy stop or restart accounting.
+		if job.Spec.Restart == contract.RestartNever && started && !restartRequested {
+			policy.lastFailure = lastFailureJSON
+			policy.updateLastFailure = true
+			return policy
+		}
 		policy.jobState = contract.JobQueued
 		policy.lifetimeRestartCount++
 		nextRestart := now.Add(prestartRetryDelay(policy.lifetimeRestartCount, s.restartJitter))
@@ -211,6 +219,13 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 		return policy
 	}
 	if !restartable {
+		policy.lastFailure = lastFailureJSON
+		policy.updateLastFailure = true
+		return policy
+	}
+
+	if job.Spec.Restart == contract.RestartNever && !restartRequested {
+		policy.policyStop = resultJSON
 		policy.lastFailure = lastFailureJSON
 		policy.updateLastFailure = true
 		return policy

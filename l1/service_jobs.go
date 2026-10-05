@@ -14,7 +14,9 @@ import (
 // into Job so the HTTP representation remains flat while one-shot jobs omit
 // every service field entirely.
 type ServiceJob struct {
-	// PolicyStop is an observed payload exit, never an intent mutation.
+	// PolicyStop is an observed payload termination or restartable spawn failure,
+	// never an intent mutation. Infrastructure interruption/lease loss has no
+	// payload policy stop.
 	PolicyStop           *ProcessResult               `json:"policy_stop,omitempty"`
 	DesiredState         contract.ServiceDesiredState `json:"desired_state"`
 	BoundNodeID          string                       `json:"bound_node_id,omitempty"`

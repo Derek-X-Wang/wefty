@@ -1010,6 +1010,30 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
 		}
 	}
+	var processStartError error
+	if claim.Job.Spec.Kind == contract.JobKindProcess && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Restart == contract.RestartNever {
+		// The runner calls Started only after spawning and establishing
+		// guardian ownership. Renewal must never substitute for this fact.
+		var cancelStart context.CancelCauseFunc
+		ctx, cancelStart = context.WithCancelCause(ctx)
+		defer cancelStart(nil)
+		localStarted := request.Started
+		request.Started = func() {
+			if lifecycle.dependencies.client == nil {
+				processStartError = errors.New("process start acknowledgement requires an L1 client")
+			} else {
+				_, processStartError = lifecycle.dependencies.client.StartAttempt(ctx, claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken})
+			}
+			if processStartError != nil {
+				processStartError = fmt.Errorf("acknowledge process start: %w", processStartError)
+				cancelStart(processStartError)
+				return
+			}
+			if localStarted != nil {
+				localStarted()
+			}
+		}
+	}
 	if computerService {
 		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
 		if claim.ComputerStorage.SubmitEnabled {
@@ -1530,6 +1554,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	} else {
 		runtimeResult, err := runtimeAdapter.Run(ctx, request, sink)
 		result, runErr = runtimeResult.Outcome, err
+	}
+	if processStartError != nil {
+		runErr = errors.Join(runErr, processStartError)
 	}
 	return finish(result, runErr)
 }

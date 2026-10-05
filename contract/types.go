@@ -340,6 +340,7 @@ const (
 	JobClassService  = "service"
 	RestartAlways    = "always"
 	RestartOnFailure = "on-failure"
+	RestartNever     = "never"
 )
 
 type ExecutionSpec struct {

@@ -139,18 +139,18 @@
           },
           "policy_stop": {
             "$ref": "#/components/schemas/ProcessResult",
-            "description": "Ordinary service only. The clean payload exit (exit_code 0 that no agent or guardian termination request produced) observed under restart on-failure. It suppresses automatic claims without changing desired_state. An explicit start or restart clears it, and so does the image-reconciliation failure latch, which records its own last_failure. An operator stop keeps it, so a later start still clears it."
+            "description": "Ordinary service only. A clean payload exit under on-failure or never, or a payload failure (nonzero exit, spontaneous signal, restartable readiness failure) under never. Agent/guardian-requested termination, runtime loss and lease loss are infrastructure, never a policy stop. Clean exit observes stopped; never payload failure observes failed; both release capacity without restart accounting. It suppresses automatic claims without changing desired_state. An explicit start or restart clears it, and so does the image-reconciliation failure latch, which records its own last_failure. An operator stop keeps it, so a later start still clears it."
           },
           "restart_suppressed_reason": {
             "type": "string",
-            "description": "Present when durable desired state, a policy stop, or a failed latch suppresses automatic restart."
+            "description": "Present when durable desired state, a policy stop, or a failed state suppresses automatic restart. An automatically-failed never service names its current attempt cause (lease loss or infrastructure completion) and may resume by explicit start or restart; terminal latches retain precedence."
           },
           "restart_streak": { "type": "integer", "minimum": 0 },
           "lifetime_restart_count": { "type": "integer", "minimum": 0 },
           "lease_loss_count": {
             "type": "integer",
             "minimum": 0,
-            "description": "Service jobs only. Attempts whose lease expired. A lease loss proves execution authority ended, not that the process failed, so it is counted apart from restarts and drives its own bounded retry backoff."
+            "description": "Service jobs only. Attempts whose lease expired. A lease loss proves execution authority ended, not that the process failed, so it is counted apart from restarts and drives its own bounded retry backoff when requeue is permitted. Under never, loss after durable OCI Started or process start acknowledgement leaves failed without a restart timer, policy_stop or last_failure; legacy process renewal promotion is not start evidence. Pre-start loss retains existing rules; explicit restart for the exact attempt permits requeue."
           },
           "next_restart_at": { "type": "string", "format": "date-time" },
           "published_port": {
@@ -163,7 +163,7 @@
             "type": "boolean",
             "description": "Portful service jobs only. True only while the current attempt has active authoritative publication; omitted for portless services."
           },
-          "last_failure": {},
+          "last_failure": { "description": "Service failure evidence: a bare SpawnFailure for a spawn/readiness failure, otherwise the ProcessResult. A suppressed post-start never infrastructure completion records its fact here without a policy stop or restart accounting. Lease loss fabricates no result and preserves earlier failure evidence; its current cause is named in restart_suppressed_reason. A readiness policy_stop always carries the full ProcessResult including spawn_error." },
           "healthy_since_at": { "type": "string", "format": "date-time" },
           "removal": {
             "type": "object",

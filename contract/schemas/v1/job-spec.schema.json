@@ -74,8 +74,8 @@
       "maximum": 65535
     },
     "restart": {
-      "description": "Service restart mode; omission defaults to always. Computers must explicitly declare always.",
-      "enum": ["always", "on-failure"],
+      "description": "Service restart mode: always, on-failure, or never. Omission defaults to always. Computers must explicitly declare always.",
+      "enum": ["always", "on-failure", "never"],
       "default": "always"
     },
     "max_restart_streak": {
