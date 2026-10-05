@@ -232,8 +232,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			}
 			remaining := activity.Remaining(runner.clock.Now(), idleTimeout)
 			if remaining <= 0 {
-				outcome := runner.terminateAndWait(command.Process.Pid, wait)
-				return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrIdleTimeout
+				return runner.terminate(command.Process.Pid, wait), ErrIdleTimeout
 			}
 			resetTimer(idleTimer, remaining)
 
@@ -243,8 +242,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 				resetTimer(idleTimer, remaining)
 				continue
 			}
-			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrIdleTimeout
+			return runner.terminate(command.Process.Pid, wait), ErrIdleTimeout
 
 		case <-completionSignal:
 			completionSignal = nil
@@ -255,20 +253,16 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			defer stopTimer(completionTimer)
 
 		case <-completionTimerChannel:
-			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrCompletionTimeout
+			return runner.terminate(command.Process.Pid, wait), ErrCompletionTimeout
 
 		case <-maxRuntimeChannel:
-			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrMaxRuntime
+			return runner.terminate(command.Process.Pid, wait), ErrMaxRuntime
 
 		case <-failure.Changed():
-			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), fmt.Errorf("output sink: %w", failure.Err())
+			return runner.terminate(command.Process.Pid, wait), fmt.Errorf("output sink: %w", failure.Err())
 
 		case <-ctx.Done():
-			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ctx.Err()
+			return runner.terminate(command.Process.Pid, wait), ctx.Err()
 		}
 	}
 }
@@ -300,15 +294,49 @@ func (runner *Runner) timeouts(limits *contract.JobLimits) (time.Duration, time.
 	return idleTimeout, completionTimeout, maxRuntime, nil
 }
 
-func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResult) waitResult {
-	_ = terminateProcessGroup(processGroupID)
+// terminate ends the payload's process group for the agent and reports the
+// payload's result. The result names the agent as initiator only when TERM
+// reached a payload that was still running; otherwise the exit is the
+// payload's own.
+func (runner *Runner) terminate(processGroupID int, wait <-chan waitResult) contract.ProcessResult {
+	outcome, delivered := runner.terminateAndWait(processGroupID, wait)
+	return resultFromWait(outcome.err, outcome.state, terminationCause(delivered, contract.TerminationCauseAgent))
+}
+
+// requestTermination sends TERM to the payload's process group, which also
+// clears what an exited payload left behind. It returns the payload's outcome
+// when Wait had already reaped it, and reports whether TERM reached a payload
+// that was still running: not yet reaped, and the signal call succeeded rather
+// than finding the group gone. A stop that cannot be confirmed did not cause
+// the exit, so ambiguity resolves toward the payload's own exit.
+func requestTermination(processGroupID int, wait <-chan waitResult) (*waitResult, bool) {
+	var completed *waitResult
+	select {
+	case outcome := <-wait:
+		completed = &outcome
+	default:
+	}
+	delivered := deliverTermination(processGroupID)
+	return completed, completed == nil && delivered
+}
+
+// terminationCause names who ended the payload: the requester when its stop
+// was delivered, and nobody when the payload's exit was its own.
+func terminationCause(delivered bool, requester contract.TerminationCause) contract.TerminationCause {
+	if delivered {
+		return requester
+	}
+	return contract.TerminationCauseSpontaneous
+}
+
+func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResult) (waitResult, bool) {
+	completed, delivered := requestTermination(processGroupID, wait)
 	graceTimer := runner.clock.NewTimer(runner.terminationGraceTime)
 	defer stopTimer(graceTimer)
 
-	var completed *waitResult
 	for {
 		if completed != nil && !processGroupAlive(processGroupID) {
-			return *completed
+			return *completed, delivered
 		}
 
 		select {
@@ -317,7 +345,7 @@ func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResul
 		case <-graceTimer.C():
 			_ = killProcessGroup(processGroupID)
 			if completed != nil {
-				return *completed
+				return *completed, delivered
 			}
 			// Deliberately a REAL timer, not the injected clock. This bounds
 			// an OS-level reap, not domain timing: the injected clock only
@@ -328,9 +356,9 @@ func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResul
 			defer reapTimer.Stop()
 			select {
 			case outcome := <-wait:
-				return outcome
+				return outcome, delivered
 			case <-reapTimer.C:
-				return waitResult{err: ErrProcessReapTimeout}
+				return waitResult{err: ErrProcessReapTimeout}, delivered
 			}
 		}
 	}

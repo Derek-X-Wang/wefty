@@ -137,9 +137,13 @@
             "format": "date-time",
             "description": "One-shot jobs only. When L1 removed the job's sensitive environment, inline executable bytes and run_params_json label from its stored spec, in the same transaction that made it succeeded or failed. Absent while the job can still run."
           },
+          "policy_stop": {
+            "$ref": "#/components/schemas/ProcessResult",
+            "description": "Ordinary service only. The clean payload exit (exit_code 0 that no agent or guardian termination request produced) observed under restart on-failure. It suppresses automatic claims without changing desired_state. An explicit start or restart clears it, and so does the image-reconciliation failure latch, which records its own last_failure. An operator stop keeps it, so a later start still clears it."
+          },
           "restart_suppressed_reason": {
             "type": "string",
-            "description": "Present when durable desired state or a failed latch suppresses automatic restart."
+            "description": "Present when durable desired state, a policy stop, or a failed latch suppresses automatic restart."
           },
           "restart_streak": { "type": "integer", "minimum": 0 },
           "lifetime_restart_count": { "type": "integer", "minimum": 0 },

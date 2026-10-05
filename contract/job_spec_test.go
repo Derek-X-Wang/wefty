@@ -1,6 +1,7 @@
 package contract
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -134,5 +135,58 @@ func validProcessJobSpecForValidation() JobSpec {
 			WorkingDirectory: "/tmp",
 			HandoffDirectory: "/tmp/out",
 		},
+	}
+}
+
+func TestServiceRestartPolicies(t *testing.T) {
+	for _, restart := range []string{"", "always", "on-failure"} {
+		t.Run("ordinary/"+restart, func(t *testing.T) {
+			spec := JobSpec{SchemaVersion: 1, DispatchKey: "policy", Kind: "process", Class: "service", Restart: restart, Execution: ExecutionSpec{Executable: ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: "/tmp"}}
+			if err := ValidateJobSpec(&spec); err != nil {
+				t.Fatal(err)
+			}
+			if restart == "" && spec.Restart != RestartAlways {
+				t.Fatalf("omitted restart = %q", spec.Restart)
+			}
+		})
+	}
+}
+
+// A Computer is always-only and must say so: an omitted restart is not
+// normalized to always for it, and on-failure is refused, so a Computer can
+// never end in a policy stop.
+func TestComputerRestartMustBeExplicitlyAlways(t *testing.T) {
+	raw, err := contractFiles.ReadFile("testdata/schemas/job-spec/valid-oci-computer.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		restart string
+		valid   bool
+	}{
+		{restart: RestartAlways, valid: true},
+		{restart: "", valid: false},
+		{restart: RestartOnFailure, valid: false},
+	} {
+		t.Run("restart="+test.restart, func(t *testing.T) {
+			var spec JobSpec
+			if err := json.Unmarshal(raw, &spec); err != nil {
+				t.Fatal(err)
+			}
+			spec.Restart = test.restart
+			err := ValidateJobSpec(&spec)
+			if test.valid {
+				if err != nil {
+					t.Fatalf("explicit always Computer rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "Computer restart must be explicitly") {
+				t.Fatalf("Computer restart %q = %v, want the always-only refusal", test.restart, err)
+			}
+			if spec.Restart != test.restart {
+				t.Fatalf("refused Computer restart was rewritten to %q", spec.Restart)
+			}
+		})
 	}
 }

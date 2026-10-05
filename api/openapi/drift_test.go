@@ -341,6 +341,9 @@ var driftEnumExceptions = map[string]driftEnumException{
 		subset: []string{"current", "staging", "retired"},
 		reason: "absent names a missing generation row in a refusal's error details; it is never a stored phase",
 	},
+	"contract.TerminationCause@" + requestBody(agentDoc, "post", "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete") + "/properties/termination_initiator": {
+		subset: []string{"agent", "guardian"}, reason: "a spontaneous exit names no initiator, so L1 refuses spontaneous here",
+	},
 	"contract.ErrorCode@" + component(commonDoc, "Error") + "/properties/code": {
 		reason: "deliberately open: the one error envelope serves L1 and L3 and gains codes with new refusals, " +
 			"so a client acts on the codes it knows and on retryable for the rest",

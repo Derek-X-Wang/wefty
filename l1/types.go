@@ -542,6 +542,12 @@ type CompletionRequest struct {
 	Result                    ProcessResult             `json:"result"`
 	RuntimeQuiescenceEvidence RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
 	ProtocolOutputHash        string                    `json:"protocol_output_digest,omitempty"`
+	// TerminationInitiator is the agent's report that it, or its guardian,
+	// asked the payload to end and the payload answered with the exit code in
+	// Result. It accompanies only an exit_code result: a signal result names
+	// its initiator in termination_cause. Service policy never reads such an
+	// exit as the payload deciding to stop.
+	TerminationInitiator contract.TerminationCause `json:"termination_initiator,omitempty"`
 }
 
 // RuntimeQuiescenceEvidence names the positive runtime authority that proved

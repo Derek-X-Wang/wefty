@@ -15,6 +15,7 @@ var errUnsupportedPlatform = errors.New("process runner requires darwin or linux
 func configureProcessGroup(*exec.Cmd) error { return errUnsupportedPlatform }
 func terminateProcessGroup(int) error       { return errUnsupportedPlatform }
 func killProcessGroup(int) error            { return errUnsupportedPlatform }
+func deliverTermination(int) bool           { return false }
 func processGroupAlive(int) bool            { return false }
 
 func resultFromWait(waitErr error, state *os.ProcessState, _ contract.TerminationCause) contract.ProcessResult {

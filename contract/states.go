@@ -42,8 +42,8 @@ var JobTransitions = map[JobState][]JobState{
 // one-shot terminal state resumable.
 var ServiceJobTransitions = map[JobState][]JobState{
 	JobQueued:                     {JobClaimed, JobStopped, JobFailed, JobRemovalPending},
-	JobClaimed:                    {JobRunning, JobStopping, JobQueued, JobFailed, JobRemovalPending},
-	JobRunning:                    {JobStopping, JobQueued, JobFailed, JobRemovalPending},
+	JobClaimed:                    {JobRunning, JobStopping, JobStopped, JobQueued, JobFailed, JobRemovalPending},
+	JobRunning:                    {JobStopping, JobStopped, JobQueued, JobFailed, JobRemovalPending},
 	JobStopping:                   {JobStopped, JobFailed, JobRemovalPending},
 	JobStopped:                    {JobQueued, JobFailed, JobRemovalPending},
 	JobFailed:                     {JobQueued, JobRemovalPending},

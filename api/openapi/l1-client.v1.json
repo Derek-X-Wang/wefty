@@ -474,7 +474,7 @@
       "put": {
         "operationId": "setServiceDesiredState",
         "summary": "Start or stop a service by setting durable desired state",
-        "description": "The mutation is idempotent and asynchronous. Running does not disturb a healthy attempt; a latched failed service rejects start and requires restart.",
+        "description": "The mutation is idempotent and asynchronous. Running clears a policy stop and reacquires capacity before queuing a fresh attempt. It does not disturb a healthy attempt; a latched failed service rejects start and requires restart.",
         "parameters": [
           { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
         ],
@@ -514,7 +514,7 @@
       "post": {
         "operationId": "restartService",
         "summary": "Explicitly restart a service under the same job identity",
-        "description": "Durably idempotent. Clears the failed latch, restart streak, last failure, and pending backoff, and directs any active attempt to stop before a fresh attempt is claimed.",
+        "description": "Durably idempotent. Clears the policy stop, failed latch, restart streak, last failure, and pending backoff, and directs any active attempt to stop before a fresh attempt is claimed. This explicit restart overrides on-failure suppression even when the payload handles TERM by exiting zero; terminal spawn/output and image/removal latches retain precedence.",
         "parameters": [
           { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
         ],

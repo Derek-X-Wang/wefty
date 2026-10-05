@@ -196,7 +196,7 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 			if err := transitionServiceJob(ctx, tx, jobID, desired, contract.JobQueued, now); err != nil {
 				return Job{}, err
 			}
-			if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET next_restart_at=NULL WHERE job_id=?", jobID); err != nil {
+			if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET policy_stop_json=NULL, next_restart_at=NULL WHERE job_id=?", jobID); err != nil {
 				return Job{}, internalError(err, "clear service start backoff")
 			}
 		case contract.JobStopping:
@@ -225,7 +225,24 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 			if _, err := tx.ExecContext(ctx, "UPDATE jobs SET updated_ns=? WHERE job_id=?", now.UnixNano(), jobID); err != nil {
 				return Job{}, internalError(err, "timestamp latched service stop")
 			}
-		case contract.JobStopping, contract.JobStopped:
+		case contract.JobStopped:
+			if job.DesiredState == contract.ServiceDesiredStopped {
+				// A repeat stop of a stopped service is a validated no-op.
+				break
+			}
+			if job.PolicyStop == nil {
+				return Job{}, protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", jobID)
+			}
+			// The one stopped service whose desired state is still running is a
+			// policy stop, which never rewrote intent. An operator stop records
+			// that intent now, keeping the observed policy stop.
+			if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET desired_state=? WHERE job_id=?", desired, jobID); err != nil {
+				return Job{}, internalError(err, "stop policy-stopped service")
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE jobs SET updated_ns=? WHERE job_id=?", now.UnixNano(), jobID); err != nil {
+				return Job{}, internalError(err, "timestamp policy-stopped service stop")
+			}
+		case contract.JobStopping:
 			if job.DesiredState != contract.ServiceDesiredStopped {
 				return Job{}, protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", jobID)
 			}
@@ -311,7 +328,7 @@ func (s *Store) RestartService(ctx context.Context, jobID string, request Servic
 		return Job{}, false, protocolError(contract.ErrorConflict, "service job %q cannot be restarted from %q", jobID, job.State)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-		SET desired_state=?, restart_streak=0, next_restart_at=NULL, last_failure=NULL,
+		SET desired_state=?, restart_streak=0, next_restart_at=NULL, last_failure=NULL, policy_stop_json=NULL,
 			healthy_since_ns=NULL, published_attempt_id=NULL WHERE job_id=?`,
 		contract.ServiceDesiredRunning, jobID); err != nil {
 		return Job{}, false, internalError(err, "reset service restart policy")
@@ -400,6 +417,8 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 	}
 	if service.DesiredState == contract.ServiceDesiredStopped {
 		service.RestartSuppressed = "desired state is stopped"
+	} else if job.State == contract.JobStopped && service.PolicyStop != nil {
+		service.RestartSuppressed = "policy stop: on-failure payload exited cleanly; use start or restart"
 	} else if job.State == contract.JobFailed {
 		if job.Spec.MaxRestartStreak != nil && service.RestartStreak >= *job.Spec.MaxRestartStreak {
 			service.RestartSuppressed = fmt.Sprintf("max restart streak reached: %d/%d; use restart", service.RestartStreak, *job.Spec.MaxRestartStreak)

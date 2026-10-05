@@ -28,14 +28,10 @@ func main() {
 	}
 }
 
-// commandExitCodeForArgs preserves the historical exit 1 contract for all
-// pre-existing commands. Typed exits are explicit contracts only for the
-// surfaces that published one: the Computer lifecycle, access and Storage
-// surfaces introduced in M3.5, and the two commands whose whole purpose is an
-// exit code -- `wefty status` and `wefty wait`. A command that advertises an
-// exit code it cannot deliver is worse than one that advertises none, so this
-// list and the documented codes have to be kept in step; the walkthrough test
-// checks that they are.
+// commandExitCodeForArgs keeps exit 1 for commands without a published typed
+// exit contract. Service creation, Computer lifecycle/access/Storage, and the
+// explicitly listed operator surfaces publish typed exits. Keep this dispatch
+// and the documented codes in step; real-binary tests verify the process result.
 func commandExitCodeForArgs(err error, args []string) int {
 	if !isTypedExitCLIArgs(args) {
 		return exitFailure
@@ -49,6 +45,12 @@ func commandExitCodeForArgs(err error, args []string) int {
 var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
 
 func isTypedExitCLIArgs(args []string) bool {
+	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
+	// the service creation exit contract.
+	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
+		len(commandArgs) >= 2 && commandArgs[0] == "services" && commandArgs[1] == "create" {
+		return true
+	}
 	for _, arg := range args {
 		if !strings.HasPrefix(arg, "-") {
 			if slices.Contains(typedExitCommands, arg) {

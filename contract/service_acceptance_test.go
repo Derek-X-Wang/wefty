@@ -15,6 +15,8 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 		"testdata/schemas/job-spec/valid-oci-reserved-environment-names.json",
 		"testdata/schemas/job-spec/valid-oci-service.json",
 		"testdata/schemas/job-spec/valid-service.json",
+		"testdata/schemas/job-spec/valid-service-missing-restart.json",
+		"testdata/schemas/job-spec/valid-service-on-failure.json",
 		"testdata/schemas/job-spec/valid-unknown-class.json",
 	} {
 		if err := schema.Validate(unmarshalJSONFile(t, path)); err != nil {
@@ -52,7 +54,8 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 		"testdata/schemas/job-spec/invalid-one-shot-missing-handoff.json",
 		"testdata/schemas/job-spec/invalid-process-environment-name.json",
 		"testdata/schemas/job-spec/invalid-process-with-oci.json",
-		"testdata/schemas/job-spec/invalid-service-missing-restart.json",
+		"testdata/schemas/job-spec/invalid-computer-missing-restart.json",
+		"testdata/schemas/job-spec/invalid-computer-on-failure.json",
 	} {
 		if err := schema.Validate(unmarshalJSONFile(t, path)); err == nil {
 			t.Fatalf("%s accepted", path)

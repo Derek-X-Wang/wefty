@@ -659,10 +659,12 @@ Every job also declares the independent, required `class` lifecycle axis.
 agent that cannot execute one reports `unsupported_class`. The known values are
 `one-shot` and `service`. L3 always constructs `one-shot` jobs explicitly.
 
-A service declares `restart: always`, may declare a positive
+A service declares `restart: always` or `restart: on-failure` (omission is
+normalized to `always` before hashing), may declare a positive
 `max_restart_streak`, and may carry a `published_port` in the inclusive range
 1–65535. A missing or null port means the service is portless. A Computer is a
-digest-pinned OCI service Job with `display.protocol=rfb-websocket-v1`, positive
+digest-pinned OCI service Job that must explicitly declare `restart: always`,
+with `display.protocol=rfb-websocket-v1`, positive
 `disk_bytes`, and positive explicit OCI `memory_bytes`; it forbids the
 `published_port` member because later Computer publication uses named display
 endpoints. OCI `disk_bytes`, `memory_bytes`, and `cpu_millicores` use JSON
@@ -677,7 +679,14 @@ Process spawn failures carry a stable `{code, message}` object. The message is
 diagnostic only. L1 owns the restartability allowlist and treats every unknown
 or unlisted spawn failure code as terminal. Signal results also carry a closed
 `termination_cause` (`spontaneous`, `agent`, or `guardian`) naming the
-initiator; policy never parses a signal or error string to infer intent.
+initiator; policy never parses a signal or error string to infer intent. A
+payload that handles TERM can answer the agent's or guardian's request with an
+exit code instead, so the completion request carries that initiator beside an
+`exit_code` result as `termination_initiator` (`agent` or `guardian`; absent
+for a spontaneous exit). The agent sets it only when the stop was confirmed
+delivered to a payload that was still running, so a self-exit that raced the
+stop stays the payload's own. It is a completion fact, not part of
+`ProcessResult`, and L1 refuses it beside any other result arm.
 
 `ProcessResult` has exactly one primary arm: `spawn_error`, `runtime_failure`,
 `output_error`, `exit_code`, or `signal`. `runtime_failure {code,message}` is
@@ -712,3 +721,21 @@ L1-only installations. Its process exit codes are 0 for any HTTP 200 current
 state (including an already-terminal target), 2 for usage/invalid requests,
 3 for authentication or principal refusals, 4 for `not_found`, 5 for
 `cancel_service`/`cancel_not_queued` or another conflict, and 1 for other errors.
+
+### Service policy stops and CLI
+
+A clean payload exit under `on-failure` records `policy_stop` (a `ProcessResult`
+with `exit_code: 0`) on the service Job. It observes `stopped` while retaining
+operator desired state, binding, and terminal attempt; publication and ordinary
+service capacity are released. Claims check the policy stop inside their
+transaction. The completion replay preserves the original fact and does not
+reapply it after an explicit start/restart. Explicit restart targeting the
+current attempt overrides a zero exit from its TERM handler; a later attempt
+cannot inherit that request. Failure classification and accounting are unchanged.
+
+`wefty services create --restart=always|on-failure` submits this contract.
+Service status/list JSON exposes `policy_stop` and `restart_suppressed_reason`;
+the table includes the cause in POLICY STOP. `services create` dispatches typed
+process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch
+key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
+remain explicitly always-only, including the `--computer` compatibility alias.

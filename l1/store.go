@@ -501,7 +501,8 @@ CREATE TABLE IF NOT EXISTS service_jobs (
   last_failure BLOB,
   healthy_since_ns INTEGER,
   published_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL,
-  display_endpoint TEXT
+  display_endpoint TEXT,
+  policy_stop_json BLOB
 );
 CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node_id, desired_state);
 CREATE TABLE IF NOT EXISTS computers (
@@ -1183,6 +1184,11 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
+		return err
+	}
+	// A database from before restart: on-failure gains the nullable policy
+	// stop column; every existing service reads it as absent.
+	if err := s.ensureColumn(ctx, "service_jobs", "policy_stop_json", "BLOB"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "jobs", "completion_replay_attempt_id", "TEXT"); err != nil {
@@ -2907,6 +2913,7 @@ WHERE job_id=(
 	        AND candidate_service.job_id IS NOT NULL
 	        AND candidate_service.desired_state=@desired_running
 	        AND (candidate_service.bound_node_id IS NULL OR candidate_service.bound_node_id=@node_id)
+	        AND candidate_service.policy_stop_json IS NULL
 	        AND (candidate_service.next_restart_at IS NULL OR candidate_service.next_restart_at<=@now_ns)
 	        AND (
 	          candidate_service.bound_node_id=@node_id
@@ -4014,6 +4021,9 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err := validateProcessResult(request.Result); err != nil {
 		return CompletionOutcome{}, err
 	}
+	if err := validateTerminationInitiator(request); err != nil {
+		return CompletionOutcome{}, err
+	}
 	if request.RuntimeQuiescenceEvidence != "" && !validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence) {
 		return CompletionOutcome{}, protocolError(contract.ErrorInvalidRequest, "runtime_quiescence_evidence is not recognized")
 	}
@@ -4151,7 +4161,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	finalJobState, finalAttemptState := completionStates(request.Result)
 	var servicePolicy *serviceCompletionPolicy
 	if jobBeforeCompletion.ServiceJob != nil {
-		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, request.RuntimeQuiescenceEvidence, lastFailureJSON, now)
+		directive, err := readAttemptDirective(ctx, tx, jobID, attemptID)
+		if err != nil {
+			return CompletionOutcome{}, err
+		}
+		policy := s.classifyServiceCompletion(jobBeforeCompletion, request, lastFailureJSON, now, directive == AttemptDirectiveRestart)
 		servicePolicy = &policy
 		finalJobState = policy.jobState
 		finalAttemptState = policy.attemptState
@@ -4214,11 +4228,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	}
 	if servicePolicy != nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-			SET restart_streak=?, lifetime_restart_count=?, next_restart_at=?,
+			SET restart_streak=?, lifetime_restart_count=?, next_restart_at=?, policy_stop_json=?,
 				last_failure=CASE WHEN ? THEN ? ELSE last_failure END,
 				healthy_since_ns=NULL, published_attempt_id=NULL
 			WHERE job_id=?`, servicePolicy.restartStreak, servicePolicy.lifetimeRestartCount,
-			servicePolicy.nextRestartNS, servicePolicy.updateLastFailure, servicePolicy.lastFailure, jobID); err != nil {
+			servicePolicy.nextRestartNS, servicePolicy.policyStop, servicePolicy.updateLastFailure, servicePolicy.lastFailure, jobID); err != nil {
 			return CompletionOutcome{}, internalError(err, "apply service completion policy")
 		}
 	}
@@ -4565,6 +4579,23 @@ func validateProcessResult(result ProcessResult) error {
 	return nil
 }
 
+// validateTerminationInitiator keeps the completion's initiator coherent with
+// its result. It names who asked for an exit-code termination; a signal names
+// its own initiator in termination_cause, and a spontaneous exit names none.
+func validateTerminationInitiator(request CompletionRequest) error {
+	switch request.TerminationInitiator {
+	case "":
+		return nil
+	case contract.TerminationCauseAgent, contract.TerminationCauseGuardian:
+	default:
+		return protocolError(contract.ErrorInvalidRequest, "termination_initiator must be agent or guardian")
+	}
+	if request.Result.ExitCode == nil {
+		return protocolError(contract.ErrorInvalidRequest, "termination_initiator accompanies only an exit_code result; a signal names its initiator in termination_cause")
+	}
+	return nil
+}
+
 func validTerminationCause(cause contract.TerminationCause) bool {
 	switch cause {
 	case contract.TerminationCauseSpontaneous, contract.TerminationCauseAgent, contract.TerminationCauseGuardian:
@@ -4643,6 +4674,7 @@ CASE
 		)
 	THEN 1 ELSE 0
 END,
+service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append(append([]any{
@@ -4703,6 +4735,7 @@ CASE
 		)
 	THEN 1 ELSE 0
 END,
+service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append(append([]any{
@@ -4740,7 +4773,11 @@ func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, creat
 	}
 	job.CreatedAt = time.Unix(0, createdNS).UTC()
 	job.UpdatedAt = time.Unix(0, updatedNS).UTC()
-	job.ServiceJob = serviceColumns.projection()
+	service, err := serviceColumns.projection()
+	if err != nil {
+		return err
+	}
+	job.ServiceJob = service
 	spawnColumns.apply(job)
 	return nil
 }

@@ -1254,6 +1254,12 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 			})
 		})
 	}()
+	// termination records whether this adapter asked the helper to end the
+	// payload; the caller's trace, when it passed one, is the same record.
+	termination := trace
+	if termination == nil {
+		termination = &terminationTrace{}
+	}
 	waitForWatch := func() error {
 		if request.LifetimeBoundary != workloadrunner.AgentBootLifetime {
 			return <-watchDone
@@ -1262,7 +1268,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		case watchErr := <-watchDone:
 			return watchErr
 		case <-ctx.Done():
-			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, trace)
+			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, termination)
 		}
 	}
 	if request.HostBridgeDial != nil {
@@ -1295,6 +1301,12 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		return runtimeFailure(err), err
 	}
 	result = workloadrunner.Result{Outcome: processResult(*completion)}
+	if result.Outcome.ExitCode != nil && termination.requestedTermination() {
+		// The helper reports an initiator only for a signal death, but a
+		// container that handles TERM answers this adapter's request with an
+		// exit code of its own, zero included.
+		result.Outcome.TerminationInitiator = contract.TerminationCauseAgent
+	}
 	// A runtime failure the helper proved ended only this attempt -- one
 	// Computer's lost shim, with containerd still answering for its task --
 	// fails this attempt and nothing else. Recovering from it invalidated the
@@ -1356,6 +1368,15 @@ type terminationTrace struct {
 	termAlreadyTerminated bool
 	decision              terminationDecision
 	killCallEntered       bool
+}
+
+// requestedTermination reports whether TERM reached a payload that was still
+// running: the adapter sent it (it does not when Watch had already completed),
+// and the helper answered success, neither that the task had already ended on
+// its own nor with a refusal or error. A stop that cannot be confirmed did not
+// cause the exit, so ambiguity resolves toward the payload's own exit.
+func (trace *terminationTrace) requestedTermination() bool {
+	return trace.termObserved && trace.termRawError == terminationErrorNone && !trace.termAlreadyTerminated
 }
 
 type terminationErrorClass uint8

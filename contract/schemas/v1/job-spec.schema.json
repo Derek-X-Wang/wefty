@@ -73,8 +73,9 @@
       "maximum": 65535
     },
     "restart": {
-      "description": "Declared service restart mode. v1 supports only always.",
-      "const": "always"
+      "description": "Service restart mode; omission defaults to always. Computers must explicitly declare always.",
+      "enum": ["always", "on-failure"],
+      "default": "always"
     },
     "max_restart_streak": {
       "description": "Optional maximum consecutive restartable terminations; omission means unlimited.",
@@ -137,13 +138,6 @@
           "execution": { "required": ["handoff_directory"] }
         }
       }
-    },
-    {
-      "if": {
-        "properties": { "class": { "const": "service" } },
-        "required": ["class"]
-      },
-      "then": { "required": ["restart"] }
     },
     {
       "if": {
@@ -211,8 +205,10 @@
         "required": ["execution"]
       },
       "then": {
+        "required": ["restart"],
         "properties": {
           "class": { "const": "service" },
+          "restart": { "const": "always" },
           "execution": {
             "properties": {
               "oci": {

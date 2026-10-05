@@ -14,6 +14,8 @@ import (
 // into Job so the HTTP representation remains flat while one-shot jobs omit
 // every service field entirely.
 type ServiceJob struct {
+	// PolicyStop is an observed payload exit, never an intent mutation.
+	PolicyStop           *ProcessResult               `json:"policy_stop,omitempty"`
 	DesiredState         contract.ServiceDesiredState `json:"desired_state"`
 	BoundNodeID          string                       `json:"bound_node_id,omitempty"`
 	NodeState            contract.NodeState           `json:"node_state,omitempty"`
@@ -31,6 +33,7 @@ type ServiceJob struct {
 }
 
 type serviceJobColumns struct {
+	policyStopJSON       []byte
 	desiredState         sql.NullString
 	boundNodeID          sql.NullString
 	restartStreak        sql.NullInt64
@@ -48,19 +51,25 @@ func (columns *serviceJobColumns) scanDestinations() []any {
 	return []any{
 		&columns.desiredState, &columns.boundNodeID, &columns.restartStreak,
 		&columns.lifetimeRestartCount, &columns.leaseLossCount, &columns.nextRestartNS, &columns.publishedPort,
-		&columns.lastFailure, &columns.healthySinceNS, &columns.publishedAttemptID, &columns.ready,
+		&columns.lastFailure, &columns.healthySinceNS, &columns.publishedAttemptID, &columns.ready, &columns.policyStopJSON,
 	}
 }
 
-func (columns serviceJobColumns) projection() *ServiceJob {
+func (columns serviceJobColumns) projection() (*ServiceJob, error) {
 	if !columns.desiredState.Valid {
-		return nil
+		return nil, nil
 	}
 	service := &ServiceJob{
 		DesiredState:         contract.ServiceDesiredState(columns.desiredState.String),
 		RestartStreak:        int(columns.restartStreak.Int64),
 		LifetimeRestartCount: int(columns.lifetimeRestartCount.Int64),
 		LeaseLossCount:       int(columns.leaseLossCount.Int64),
+	}
+	if columns.policyStopJSON != nil {
+		service.PolicyStop = &ProcessResult{}
+		if err := json.Unmarshal(columns.policyStopJSON, service.PolicyStop); err != nil {
+			return nil, err
+		}
 	}
 	if columns.boundNodeID.Valid {
 		service.BoundNodeID = columns.boundNodeID.String
@@ -87,7 +96,7 @@ func (columns serviceJobColumns) projection() *ServiceJob {
 	if columns.publishedAttemptID.Valid {
 		service.PublishedAttemptID = columns.publishedAttemptID.String
 	}
-	return service
+	return service, nil
 }
 
 // HoldsSlot reports whether this binding currently occupies service capacity.
@@ -210,7 +219,7 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL, updated_ns=? WHERE job_id=?`, s.clock.Now().UnixNano(), jobID); err != nil {
 		return Job{}, internalError(err, "clear service attempt after image reconciliation failure")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET next_restart_at=NULL, last_failure=?,
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET policy_stop_json=NULL, next_restart_at=NULL, last_failure=?,
 		healthy_since_ns=NULL, published_attempt_id=NULL WHERE job_id=?`, payload, jobID); err != nil {
 		return Job{}, internalError(err, "record service image reconciliation failure")
 	}
@@ -241,9 +250,12 @@ func validateImagePinNodeSession(ctx context.Context, q queryer, identityNodeID,
 	return nil
 }
 
-func validServiceStatePair(desired contract.ServiceDesiredState, state contract.JobState) bool {
+func validServiceStatePair(desired contract.ServiceDesiredState, state contract.JobState, policyStopped bool) bool {
 	switch desired {
 	case contract.ServiceDesiredRunning:
+		if state == contract.JobStopped {
+			return policyStopped
+		}
 		switch state {
 		case contract.JobQueued, contract.JobClaimed, contract.JobRunning, contract.JobFailed:
 			return true
@@ -270,9 +282,10 @@ func transitionServiceJob(
 	now time.Time,
 ) error {
 	var current contract.JobState
-	err := tx.QueryRowContext(ctx, `SELECT jobs.state
+	var policyStop []byte
+	err := tx.QueryRowContext(ctx, `SELECT jobs.state, service_jobs.policy_stop_json
 		FROM jobs JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-		WHERE jobs.job_id=?`, jobID).Scan(&current)
+		WHERE jobs.job_id=?`, jobID).Scan(&current, &policyStop)
 	if errors.Is(err, sql.ErrNoRows) {
 		return protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)
 	}
@@ -282,7 +295,7 @@ func transitionServiceJob(
 	if !contract.CanTransition(contract.ServiceJobTransitions, current, next) {
 		return protocolError(contract.ErrorConflict, "service job cannot transition from %q to %q", current, next)
 	}
-	if !validServiceStatePair(desired, next) {
+	if !validServiceStatePair(desired, next, len(policyStop) > 0) {
 		return protocolError(contract.ErrorConflict, "service desired state %q cannot pair with observed state %q", desired, next)
 	}
 	clearPublication := next == contract.JobQueued || next == contract.JobStopping ||

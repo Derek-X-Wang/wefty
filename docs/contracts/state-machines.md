@@ -83,10 +83,10 @@ resumable.
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
 | `queued` | No live attempt. Initial, restart-ready, or waiting until `next_restart_at`. | `claimed`, `stopped`, `failed`, `removal_pending` |
-| `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `queued`, `failed`, `removal_pending` |
-| `running` | The current attempt acknowledged execution. | `stopping`, `queued`, `failed`, `removal_pending` |
+| `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
+| `running` | The current attempt acknowledged execution. | `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
 | `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed`, `removal_pending` |
-| `stopped` | Desired stopped and no live attempt remains. | `queued` through explicit operator start or restart only; `failed` through the image-reconciliation latch; `removal_pending` |
+| `stopped` | No live attempt remains: operator stop, or an observed policy stop with desired state preserved. | `queued` through explicit operator start or restart only; `failed` through the image-reconciliation latch; `removal_pending` |
 | `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only; `removal_pending` |
 | `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified`, `stalled_cleanup_unverified` |
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
@@ -95,7 +95,7 @@ resumable.
 | `stalled_cleanup_unverified` | The bound agent declared, after the removal retried past the ten-minute bound against the same refusal, that cleanup cannot complete. The service slot is released and nothing claims any part of cleanup succeeded -- neither runtime deletion nor, for a Computer, deletion of the Backup copies the directive names. The deletion directive remains for a returning node and the unverified outcome is permanent. Terminal agent outcome. | none |
 
 Legal desired/observed pairings are: desired `running` with `queued`,
-`claimed`, `running`, or `failed`; and desired `stopped` with `stopping`,
+`claimed`, `running`, or `failed`, plus `stopped` only when `policy_stop` is recorded; and desired `stopped` with `stopping`,
 `stopped`, or `failed`. Desired `removed` is projected from the durable
 `service_removals` row with `removal_pending`, `agent_cleaned`,
 `removed_verified`, `forgotten_cleanup_unverified`, or
@@ -104,6 +104,31 @@ Legal desired/observed pairings are: desired `running` with `queued`,
 state until final deletion. `restart-pending` is never persisted. It is computed
 when a service is `queued`, desired `running`, and its `next_restart_at` is in
 the future.
+
+An ordinary service may declare `restart: on-failure`; omission means `always`.
+Computers must explicitly declare `always`. A clean payload `exit_code: 0`
+under `on-failure` records its `ProcessResult` as `policy_stop`, observes
+`stopped`, clears publication and restart timing, and releases service capacity.
+A clean exit is one the payload chose: an exit the agent or its guardian asked
+for (the completion carries `termination_initiator`) is an interruption and
+never a policy stop, whatever code a TERM handler returns. The durable binding
+and terminal attempt remain. Desired state is never changed
+by this reaction (ADR-0004). The policy stop suppresses claims until an explicit
+start or restart clears it and reacquires capacity; the image-reconciliation
+latch also clears it when it records its own failure. An operator stop keeps it.
+It survives database reopen.
+It leaves `restart_streak`, `lifetime_restart_count`, and prior `last_failure`
+unchanged. Nonzero exits, spontaneous signals, infrastructure/lease loss,
+backoff, and streak limits retain their existing treatment. Additive incomplete
+log evidence does not turn a clean exit into a failure.
+
+An explicit restart targeting the completing attempt wins over clean policy
+suppression, including a TERM handler that exits zero. Its durable request
+cannot affect a later attempt. Terminal spawn/output, image-reconciliation,
+and removal latches still take precedence; restart never converts those facts
+into a clean policy stop. Operator stop is accepted on a policy-stopped service
+and records stopped intent without starting an attempt; a repeat stop of a
+service already desired `stopped` is a validated no-op.
 
 Removal is accepted from every pre-removal state and enters `removal_pending`
 in the same transaction that fences the live attempt `lost`; a service that
@@ -249,7 +274,9 @@ Agent shutdown is an infrastructure interruption, not operator stop intent. A
 fenced shutdown completion therefore leaves desired state `running`, moves the
 service from `running` to `queued`, and leaves the restart streak unchanged.
 It must not use `stopping` or `stopped`, whose meaning is reserved for a
-durable operator request to stop the service.
+durable operator request to stop the service. This holds whether the payload
+dies of the agent's signal or handles TERM and exits with a code of its own:
+the agent reports the request as `termination_initiator` beside an exit code.
 
 ### Computer authority and immutable Job projections
 
@@ -893,6 +920,39 @@ identity, and never prints or persists its contents itself. The sideband
 remains the authority: a copied file from another person, device, ended
 session, or Computer fails closed, and neither a CLI flag nor URL selects the
 control backend directly.
+
+Service completion policy classifies who ended the payload before what it
+returned. Its initiator rows are explicit:
+
+| Completion fact | Service treatment | Restart streak |
+| --- | --- | ---: |
+| `exit_code` with `termination_initiator` `agent` or `guardian` (shutdown, attempt directive, lost authority, agent supervision; any code, zero included) | Infrastructure interruption: requeue `queued` with pre-start backoff and count a lifetime restart. Never a policy stop, never `last_failure`. | unchanged |
+| `signal` with `termination_cause` `agent` or `guardian` | Infrastructure interruption, as above. | unchanged |
+| `exit_code: 0` with no initiator under `on-failure`, no restart directive for the attempt | Policy stop: observed `stopped`, desired state kept, capacity released. | unchanged |
+| `exit_code: 0` with no initiator under `on-failure`, restart directive for the attempt (the payload exited before the agent acted on it, or an agent that predates `termination_initiator`) | Restartable: the explicit restart wins over the policy stop. | +1 |
+| `exit_code` with no initiator otherwise, or `signal` with `termination_cause` `spontaneous` | Restartable payload failure with backoff and the streak limit. | +1 |
+
+A stop the operator asked for (desired `stopped` or `stopping`) is classified
+before every row above, and the Computer resource-exhaustion, `spawn_error`, and
+`output_error` latches keep their precedence. `termination_initiator` is valid
+only beside an `exit_code` result; L1 refuses it with any other arm.
+
+The agent names an initiator, in `termination_initiator` or a signal's
+`termination_cause`, only when its stop was confirmed delivered to a payload
+that was still running. For a process payload, Wait had not already reaped the
+payload and the TERM signal call succeeded rather than finding the group gone;
+the guardian follows the same rule. For OCI, the helper's Signal answered
+success, not that the task had already terminated and not a refusal or error.
+When delivery cannot be confirmed (the payload's own exit raced the stop), the
+initiator is left unset and the payload's exit is classified as its own:
+ambiguity resolves toward the program's own exit.
+
+L1 and agents must be upgraded together. An agent that predates
+`termination_initiator` reports a TERM handler's exit after any stop it asked
+for, including its own shutdown, as an unmarked `exit_code: 0`. Under
+`on-failure` that records a policy stop, and the service stays stopped until an
+operator starts or restarts it; only an explicit restart directive for the
+attempt is still recognized without the field.
 
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:

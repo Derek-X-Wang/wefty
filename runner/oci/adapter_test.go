@@ -1236,6 +1236,127 @@ func TestAdapterServiceCancellationUsesTermBeforeKill(t *testing.T) {
 	}
 }
 
+// A container that handles TERM answers the agent's request with an exit code
+// of its own. The adapter keeps that it asked, so service policy never reads
+// the code as the container deciding to stop; an exit nobody asked for names
+// no initiator.
+func TestAdapterKeepsTheInitiatorOfARequestedExit(t *testing.T) {
+	zero := 0
+	for _, requested := range []bool{true, false} {
+		t.Run(fmt.Sprintf("requested=%t", requested), func(t *testing.T) {
+			engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: &zero}}
+			if requested {
+				engine.watchSignals = make(chan ocihelper.Signal, 2)
+				engine.termExitCode = &zero
+			}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			request := adapterTestRequest()
+			request.Authority.WorkloadClass = contract.JobClassService
+			request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+			request.TerminationGrace = time.Second
+			started := make(chan struct{})
+			request.Started = func() { close(started) }
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			type runOutcome struct {
+				result workloadrunner.Result
+				err    error
+			}
+			done := make(chan runOutcome, 1)
+			go func() {
+				result, err := adapter.Run(ctx, request, nil)
+				done <- runOutcome{result: result, err: err}
+			}()
+			<-started
+			if requested {
+				cancel()
+			}
+			finished := <-done
+			want := contract.TerminationCause("")
+			if requested {
+				want = contract.TerminationCauseAgent
+			}
+			outcome := finished.result.Outcome
+			if finished.err != nil || outcome.ExitCode == nil || *outcome.ExitCode != 0 || outcome.Signal != "" || outcome.TerminationInitiator != want {
+				t.Fatalf("exit = (%+v, %v), want exit 0 initiated by %q", outcome, finished.err, want)
+			}
+		})
+	}
+}
+
+// The adapter names itself initiator only when the helper confirmed that TERM
+// reached a container that was still running. A container that exited on its
+// own as TERM arrived, or whose TERM was never confirmed, keeps its own exit.
+func TestAdapterNamesNoInitiatorItCannotConfirm(t *testing.T) {
+	zero := 0
+	for _, test := range []struct {
+		name      string
+		configure func(*adapterTestEngine)
+	}{
+		{name: "self-exit won the race", configure: func(engine *adapterTestEngine) { engine.termRacesSelfExit = true }},
+		{name: "TERM never confirmed", configure: func(engine *adapterTestEngine) { engine.termUnconfirmed = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), termExitCode: &zero, killAlreadyTerminated: true}
+			test.configure(engine)
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			request := adapterTestRequest()
+			request.Authority.WorkloadClass = contract.JobClassService
+			request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+			request.TerminationGrace = time.Second
+			started := make(chan struct{})
+			request.Started = func() { close(started) }
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			trace := &terminationTrace{}
+			type runOutcome struct {
+				result workloadrunner.Result
+				err    error
+			}
+			done := make(chan runOutcome, 1)
+			go func() {
+				result, err := adapter.runObserved(ctx, request, nil, trace)
+				done <- runOutcome{result: result, err: err}
+			}()
+			<-started
+			cancel()
+			finished := <-done
+			outcome := finished.result.Outcome
+			if !trace.termObserved {
+				t.Fatalf("the adapter never asked for TERM: %+v", *trace)
+			}
+			if finished.err != nil || outcome.ExitCode == nil || *outcome.ExitCode != 0 || outcome.TerminationInitiator != "" {
+				t.Fatalf("exit = (%+v, %v), trace %+v; want the container's own exit 0", outcome, finished.err, *trace)
+			}
+		})
+	}
+}
+
+// requestedTermination is the one delivery rule: TERM was sent, and the
+// helper answered success rather than a refusal, an error, or that the task had
+// already ended.
+func TestRequestedTerminationRequiresConfirmedDelivery(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		trace terminationTrace
+		want  bool
+	}{
+		{"delivered", terminationTrace{termObserved: true}, true},
+		{"watch completed first", terminationTrace{}, false},
+		{"already terminated", terminationTrace{termObserved: true, termAlreadyTerminated: true}, false},
+		{"connection_limit refusal", terminationTrace{termObserved: true, termRawError: terminationErrorRPC, termRPCCode: terminationRPCOther}, false},
+		{"engine failure", terminationTrace{termObserved: true, termRawError: terminationErrorRPC, termRPCCode: terminationRPCEngineFailure}, false},
+		{"runtime loss", terminationTrace{termObserved: true, termRawError: terminationErrorRuntimeLoss}, false},
+		{"deadline", terminationTrace{termObserved: true, termRawError: terminationErrorDeadline}, false},
+	} {
+		if got := test.trace.requestedTermination(); got != test.want {
+			t.Errorf("%s: requestedTermination = %t, want %t", test.name, got, test.want)
+		}
+	}
+}
+
 func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing.T) {
 	engine := &adapterTestEngine{
 		watchSignals: make(chan ocihelper.Signal, 2),
@@ -2219,6 +2340,9 @@ type adapterTestEngine struct {
 	missingUntilEnsure            bool
 	reconcileCalls                int
 	watchSignals                  chan ocihelper.Signal
+	termExitCode                  *int
+	termRacesSelfExit             bool
+	termUnconfirmed               bool
 	ignoreTERM                    bool
 	ignoreKILL                    bool
 	exitOnKillRace                bool
@@ -2376,8 +2500,21 @@ func (engine *adapterTestEngine) Signal(ctx context.Context, request ocihelper.S
 	exitOnKillRace := request.Signal == ocihelper.SignalKILL && engine.exitOnKillRace
 	killAlreadyTerminated := request.Signal == ocihelper.SignalKILL && engine.killAlreadyTerminated
 	block := engine.blockSignal
+	termRacesSelfExit := request.Signal == ocihelper.SignalTERM && engine.termRacesSelfExit
+	termUnconfirmed := request.Signal == ocihelper.SignalTERM && engine.termUnconfirmed
 	engine.mu.Unlock()
 	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if watchSignals != nil && (termRacesSelfExit || termUnconfirmed) {
+		// The container exits on its own as TERM arrives: Watch completes with
+		// termExitCode while Signal either answers that the task had already
+		// terminated or never answers, so the adapter's delivery deadline expires.
+		watchSignals <- request.Signal
+		if termRacesSelfExit {
+			return ocihelper.ErrTaskAlreadyTerminated
+		}
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -2414,6 +2551,10 @@ func (engine *adapterTestEngine) Watch(ctx context.Context, _ ocihelper.WatchReq
 			}
 		}
 		engine.watch = ocihelper.WatchResponse{Signal: signal, TerminationCause: "agent"}
+		if signal == ocihelper.SignalTERM && engine.termExitCode != nil {
+			// A container that handles TERM exits with a code of its own.
+			engine.watch = ocihelper.WatchResponse{ExitCode: engine.termExitCode}
+		}
 	}
 	if engine.watchErrorOnCancel {
 		<-ctx.Done()

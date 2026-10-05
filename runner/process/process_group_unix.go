@@ -20,6 +20,12 @@ func terminateProcessGroup(processGroupID int) error {
 	return ignoreMissingProcessGroup(syscall.Kill(-processGroupID, syscall.SIGTERM))
 }
 
+// deliverTermination sends TERM to the process group and reports whether the
+// kernel accepted it for a member; ESRCH means the group was already gone.
+func deliverTermination(processGroupID int) bool {
+	return syscall.Kill(-processGroupID, syscall.SIGTERM) == nil
+}
+
 func killProcessGroup(processGroupID int) error {
 	return ignoreMissingProcessGroup(syscall.Kill(-processGroupID, syscall.SIGKILL))
 }
@@ -42,7 +48,15 @@ func resultFromWait(waitErr error, state *os.ProcessState, cause contract.Termin
 			return contract.ProcessResult{Signal: waitStatus.Signal().String(), TerminationCause: cause}
 		}
 		exitCode := state.ExitCode()
-		return contract.ProcessResult{ExitCode: &exitCode}
+		result := contract.ProcessResult{ExitCode: &exitCode}
+		// A payload that handles TERM can answer a termination it was asked for
+		// with any exit code, zero included. Who asked is kept, so policy never
+		// reads that answer as the payload deciding to stop. Callers pass a
+		// non-spontaneous cause only when the stop was confirmed delivered.
+		if cause != contract.TerminationCauseSpontaneous {
+			result.TerminationInitiator = cause
+		}
+		return result
 	}
 
 	return spawnFailure(contract.SpawnFailureProcessWait, waitErr)

@@ -85,7 +85,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		},
 		"service_jobs": {
 			"job_id", "desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count", "lease_loss_count",
-			"next_restart_at", "published_port", "last_failure", "healthy_since_ns", "published_attempt_id", "display_endpoint",
+			"next_restart_at", "published_port", "last_failure", "healthy_since_ns", "published_attempt_id", "display_endpoint", "policy_stop_json",
 		},
 		"computers": {
 			"computer_id", "name", "placement_node_id", "bound_node_id", "grants_json", "storage_id",
