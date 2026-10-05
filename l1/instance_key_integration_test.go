@@ -307,7 +307,7 @@ func TestInstanceKeyTerminalReleaseAndPolicyStop(t *testing.T) {
 	})
 }
 
-func TestInstanceKeyAttemptCredentialRefusalAndDispatchPrecedence(t *testing.T) {
+func TestChildInstanceKeyNamespaceAndDispatchPrecedence(t *testing.T) {
 	h, client, agent, node := credentialHarness(t)
 	parent := h.submit(client, "key-parent", []string{"linux"})
 	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
@@ -319,11 +319,28 @@ func TestInstanceKeyAttemptCredentialRefusalAndDispatchPrecedence(t *testing.T) 
 	holder := decodeJob(t, holderBody)
 	request := instanceKeyRequest(t, validJobSpec("key-child", nil), "private-key")
 	status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", claim.AttemptToken, request)
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorCode("instance_key_not_supported"))
-	if bytes.Contains(body, []byte(parent.JobID)) || bytes.Contains(body, []byte(holder.JobID)) {
-		t.Fatalf("refusal exposed a holder: %s", body)
+	if status != http.StatusCreated {
+		t.Fatalf("keyed child=%d %s", status, body)
 	}
-	// A different-body replay takes dispatch-key precedence over the unsupported key.
+	child := decodeJob(t, body)
+	if child.ParentJobID != parent.JobID || child.OriginatingSubmitter != holder.OriginatingSubmitter {
+		t.Fatalf("child origin=%+v", child)
+	}
+	status, body = h.credentialRequest(agent, http.MethodPost, "/v1/jobs", claim.AttemptToken, request)
+	if status != http.StatusOK || decodeJob(t, body).JobID != child.JobID {
+		t.Fatalf("keyed child replay=%d %s", status, body)
+	}
+	request["dispatch_key"] = "key-child-conflict"
+	status, body = h.credentialRequest(agent, http.MethodPost, "/v1/jobs", claim.AttemptToken, request)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorInstanceKeyConflict)
+	var refusal contract.ErrorResponse
+	if err := json.Unmarshal(body, &refusal); err != nil {
+		t.Fatal(err)
+	}
+	if refusal.Error.Details["job_id"] != child.JobID || bytes.Contains(body, []byte(holder.JobID)) {
+		t.Fatalf("conflict scope=%s", body)
+	}
+	// A different-body replay still takes dispatch-key precedence.
 	status, body = h.credentialRequest(agent, http.MethodPost, "/v1/jobs", claim.AttemptToken, validJobSpec("unkeyed-child", nil))
 	if status != http.StatusCreated {
 		t.Fatalf("unkeyed child=%d %s", status, body)

@@ -34,9 +34,12 @@ func (s *Store) initializeInstanceKeys(ctx context.Context) error {
 	return nil
 }
 
-// Tag namespace encodings so future parent-job namespaces cannot collide with
-// a Fabric identity that happens to look like a job ID. Only roots use keys now.
+// Parent namespaces follow the authenticated job, so all of its attempts share
+// a reservation. Tags keep them disjoint from arbitrary Fabric identities.
 func instanceNamespace(origin JobOrigin) string {
+	if origin.Parent != nil {
+		return "job:" + origin.Parent.JobID
+	}
 	return "fabric:" + strings.TrimSpace(origin.OriginatingSubmitter)
 }
 
