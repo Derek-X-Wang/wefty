@@ -95,10 +95,10 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 
 	rows, err := tx.QueryContext(ctx, `SELECT attempts.attempt_id
 		FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
-		WHERE attempts.state IN (?, ?, ?) AND attempts.lease_expires_ns<=?
+		WHERE attempts.state IN (?, ?, ?) AND (attempts.lease_expires_ns<=? OR (jobs.outcome='canceled' AND jobs.cancel_settle_by_ns<=?))
 			AND jobs.current_attempt_id=attempts.attempt_id
 			AND jobs.state IN (?, ?, ?, ?)`,
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(),
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(), now.UnixNano(),
 		contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput, contract.JobStopping)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "select expired attempts")

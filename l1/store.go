@@ -1197,10 +1197,16 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.ensureColumn(ctx, "service_jobs", "policy_stop_json", "BLOB"); err != nil {
 		return err
 	}
+	for _, column := range []string{"originating_submitter", "parent_job_id"} {
+		if err := s.ensureColumn(ctx, "service_tombstones", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
 	if err := s.ensureColumn(ctx, "jobs", "completion_replay_attempt_id", "TEXT"); err != nil {
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
+		{"cancel_settle_by_ns", "INTEGER"},
 		{"outcome", "TEXT NOT NULL DEFAULT '' CHECK(outcome IN ('', 'canceled'))"},
 		{"parent_job_id", "TEXT"},
 		{"parent_attempt_id", "TEXT"},
@@ -2206,12 +2212,12 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	hash := sha256.Sum256(specJSON)
 	requestHash := hex.EncodeToString(hash[:])
 
-	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, false, internalError(err, "begin job creation")
 	}
 	defer tx.Rollback()
+	now := canonicalTime(s.clock.Now())
 
 	// Authorization ran before this transaction opened. Re-prove the credential
 	// against the snapshot the write will commit on, so an attempt that lost
@@ -2219,6 +2225,13 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	if origin.Parent != nil {
 		if err := revalidateAttemptCredential(ctx, tx, *origin.Parent, now.UnixNano()); err != nil {
 			return Job{}, false, err
+		}
+		canceled, _, cancelErr := cancellationDeadline(ctx, tx, origin.Parent.JobID)
+		if cancelErr != nil {
+			return Job{}, false, cancelErr
+		}
+		if canceled {
+			return Job{}, false, protocolError(contract.ErrorUnauthorized, "cancellation revoked child creation authority")
 		}
 	}
 
@@ -2896,7 +2909,7 @@ WHERE job_id=(
 	  LEFT JOIN service_jobs candidate_service ON candidate_service.job_id=j.job_id
 	  LEFT JOIN computer_job_projections candidate_projection ON candidate_projection.job_id=j.job_id
 	  LEFT JOIN computers candidate_computer ON candidate_computer.computer_id=candidate_projection.computer_id
-		  WHERE j.state=@job_queued
+		  WHERE j.state=@job_queued AND j.outcome=''
 		    AND (candidate_projection.job_id IS NULL OR (
 		      candidate_projection.current=1
 		      AND candidate_computer.current_job_id=j.job_id
@@ -3204,13 +3217,17 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		return AttemptLease{}, err
 	}
 	now := canonicalTime(s.clock.Now())
+	canceled, settleBy, err := cancellationDeadline(ctx, tx, jobID)
+	if err != nil {
+		return AttemptLease{}, err
+	}
 	if attempt.state == contract.AttemptLost && !now.Before(attempt.leaseExpires) {
 		return AttemptLease{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
 	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
 		return AttemptLease{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
-	if !now.Before(attempt.leaseExpires) {
+	if !now.Before(attempt.leaseExpires) || (canceled && !now.Before(settleBy)) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return AttemptLease{}, err
 		}
@@ -3224,20 +3241,25 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		return AttemptLease{}, err
 	}
 	expires := canonicalTime(now.Add(s.leaseDuration))
+	if canceled {
+		if settleBy.Before(expires) {
+			expires = settleBy
+		}
+	}
 	nextState := attempt.state
-	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI {
+	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		nextState = contract.AttemptRunning
 	}
 	_, err = tx.ExecContext(ctx, "UPDATE attempts SET state=?, lease_expires_ns=?, updated_ns=? WHERE attempt_id=?", nextState, expires.UnixNano(), now.UnixNano(), attemptID)
 	if err != nil {
 		return AttemptLease{}, internalError(err, "renew attempt lease")
 	}
-	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI {
+	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
 			return AttemptLease{}, internalError(err, "acknowledge renewed job execution")
 		}
 	}
-	if attempt.spec.Kind != contract.JobKindOCI {
+	if attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
 			return AttemptLease{}, err
 		}
@@ -3647,9 +3669,16 @@ func validComputerDisplayEndpoint(value string) bool {
 }
 
 func readAttemptDirective(ctx context.Context, tx *sql.Tx, jobID, attemptID string) (AttemptDirective, error) {
+	canceled, _, err := cancellationDeadline(ctx, tx, jobID)
+	if err != nil {
+		return "", err
+	}
+	if canceled {
+		return AttemptDirectiveCancel, nil
+	}
 	var desiredState string
 	var restartRequested bool
-	err := tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 SELECT service_jobs.desired_state, EXISTS (
   SELECT 1
   FROM service_restart_requests
@@ -3703,6 +3732,10 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "service removal has revoked log authority")
 	}
 	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+		return AppendLogsResponse{}, err
+	}
+	canceled, _, err := cancellationDeadline(ctx, tx, jobID)
+	if err != nil {
 		return AppendLogsResponse{}, err
 	}
 	hasAuthority := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt) == nil
@@ -3835,7 +3868,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 			return AppendLogsResponse{}, err
 		}
 	}
-	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
+	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
 		}
@@ -4099,7 +4132,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		return CompletionOutcome{}, err
 	}
 	now := canonicalTime(s.clock.Now())
-	if !now.Before(attempt.leaseExpires) && attempt.state != contract.AttemptLost {
+	canceled, settleBy, err := cancellationDeadline(ctx, tx, jobID)
+	if err != nil {
+		return CompletionOutcome{}, err
+	}
+	if (!now.Before(attempt.leaseExpires) || (canceled && !now.Before(settleBy))) && attempt.state != contract.AttemptLost {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return CompletionOutcome{}, err
 		}
@@ -4190,6 +4227,9 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		}
 	}
 	finalJobState, finalAttemptState := completionStates(request.Result)
+	if canceled {
+		finalJobState = contract.JobFailed
+	}
 	var servicePolicy *serviceCompletionPolicy
 	if jobBeforeCompletion.ServiceJob != nil {
 		directive, err := readAttemptDirective(ctx, tx, jobID, attemptID)
@@ -4533,8 +4573,12 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 			return internalError(err, "read job after lease expiry")
 		}
 
+		canceled, _, err := cancellationDeadline(ctx, tx, attempt.jobID)
+		if err != nil {
+			return err
+		}
 		nextState := contract.JobFailed
-		if desiredState.Valid && contract.ServiceDesiredState(desiredState.String) == contract.ServiceDesiredRunning &&
+		if !canceled && desiredState.Valid && contract.ServiceDesiredState(desiredState.String) == contract.ServiceDesiredRunning &&
 			(jobState == contract.JobClaimed || jobState == contract.JobRunning) {
 			directive, err := readAttemptDirective(ctx, tx, attempt.jobID, attempt.attemptID)
 			if err != nil {

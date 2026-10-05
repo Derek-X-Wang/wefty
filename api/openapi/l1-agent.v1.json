@@ -328,7 +328,7 @@
       "post": {
         "operationId": "renewAttemptLease",
         "summary": "Renew one attempt lease",
-        "description": "Distinct from node heartbeat. Process renewal retains legacy claimed-to-running promotion, but does not record payload start acknowledgement for never lease-loss policy. OCI renewal never promotes execution. A success returns a duration TTL and any attempt-scoped service directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
+        "description": "Distinct from node heartbeat. Process renewal retains legacy claimed-to-running promotion, but does not record payload start acknowledgement for never lease-loss policy. OCI renewal never promotes execution. A success returns a duration TTL and any attempt-scoped service or process one-shot cancel directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
         "requestBody": {
           "required": true,
           "content": {
@@ -346,7 +346,7 @@
         },
         "responses": {
           "200": {
-            "description": "Lease renewed with a duration TTL and any stop or restart directive for this payload.",
+            "description": "Lease renewed with a duration TTL and any stop, restart or one-shot cancel directive for this payload. Cancellation caps the lease at the durable fixed settlement deadline, never acknowledges a new process start, and uses TERM, grace, then KILL.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" }

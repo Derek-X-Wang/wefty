@@ -136,10 +136,10 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 			createdAt: time.Unix(0, createdNS).UTC(), removalRequestedAt: now, removedAt: now,
 			outcome: ServiceRemovalVerified, removalGeneration: InitialServiceRemovalGeneration,
 		}
-		if err := deleteServiceRows(ctx, tx, jobID); err != nil {
+		if err := insertServiceTombstone(ctx, tx, tombstone); err != nil {
 			return Job{}, err
 		}
-		if err := insertServiceTombstone(ctx, tx, tombstone); err != nil {
+		if err := deleteServiceRows(ctx, tx, jobID); err != nil {
 			return Job{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -953,9 +953,6 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		// the permanent unverified outcome.
 		tombstone.cleanupAcknowledgedAt = removal.acknowledgedAt
 	}
-	if err := deleteServiceRows(ctx, tx, jobID); err != nil {
-		return Job{}, false, err
-	}
 	if insertTombstone {
 		if err := insertServiceTombstone(ctx, tx, tombstone); err != nil {
 			return Job{}, false, err
@@ -964,6 +961,9 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		cleanup_acknowledgement_key=?, cleanup_acknowledgement_hash=? WHERE job_id=?`,
 		removal.acknowledgedAt.UnixNano(), removal.acknowledgementKey, removal.acknowledgementHash, jobID); err != nil {
 		return Job{}, false, internalError(err, "record forgotten-service cleanup acknowledgement")
+	}
+	if err := deleteServiceRows(ctx, tx, jobID); err != nil {
+		return Job{}, false, err
 	}
 	return tombstone.job(), true, nil
 }
@@ -1170,6 +1170,13 @@ func insertServiceTombstone(ctx context.Context, tx *sql.Tx, tombstone serviceTo
 		tombstone.acknowledgementKey, tombstone.acknowledgementHash,
 		tombstone.stallEvidence, tombstone.stallKey, tombstone.stallHash, stalled); err != nil {
 		return internalError(err, "insert service tombstone")
+	}
+	// Preserve cancellation authority before the ordinary job is deleted. Old
+	// tombstones without this provenance remain accessible only to an admin.
+	if _, err := tx.ExecContext(ctx, `UPDATE service_tombstones SET
+ originating_submitter=COALESCE((SELECT originating_submitter FROM jobs WHERE job_id=?), ''),
+ parent_job_id=COALESCE((SELECT parent_job_id FROM jobs WHERE job_id=?), '') WHERE job_id=?`, tombstone.jobID, tombstone.jobID, tombstone.jobID); err != nil {
+		return internalError(err, "retain tombstone cancellation authority")
 	}
 	return nil
 }

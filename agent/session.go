@@ -106,6 +106,8 @@ type agentSession struct {
 }
 
 type residentAttempt struct {
+	attemptID     string
+	fencingToken  string
 	class         string
 	kind          string
 	cancel        context.CancelCauseFunc
@@ -319,6 +321,16 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 	return session.publishCapabilityHeartbeat(ctx, &generation)
 }
 
+func (session *agentSession) processCancelDirectives(directives []l1.OneShotCancelDirective) {
+	session.claimMu.Lock()
+	for _, directive := range directives {
+		if resident := session.resident[directive.JobID]; resident != nil && resident.class == contract.JobClassOneShot && resident.kind == contract.JobKindProcess && resident.attemptID == directive.AttemptID && resident.fencingToken == directive.FencingToken {
+			resident.cancel(errAttemptDirectiveCancel)
+		}
+	}
+	session.claimMu.Unlock()
+}
+
 // processStandingDirectives reconciles every standing node-scoped directive
 // carried by one boot-sequence response. Registration and OCI recovery run the
 // identical set, and its joined error is what keeps `kind:oci` withdrawn until
@@ -354,6 +366,7 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 // through its own operation outcome. Nothing about the helper's namespace
 // sweep and verification changes either.
 func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
+	session.processCancelDirectives(response.OneShotCancelDirectives)
 	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 	return errors.Join(session.resumePendingRemovals(ctx),
 		session.processRemovalDirectives(ctx, response.RemovalDirectives, retention),
@@ -1075,6 +1088,7 @@ func (session *agentSession) executeResident(
 ) (destination errorDestination, executeErr error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
 	resident := &residentAttempt{
+		attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
 		class: claim.Job.Spec.Class, kind: claim.Job.Spec.Kind, cancel: cancelAttempt,
 		done: make(chan struct{}), runtimeReaped: make(chan runtimeReapOutcome, 1),
 	}
@@ -1319,6 +1333,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 			}
 			session.observeGrantedCapacity(response.Node)
+			session.processCancelDirectives(response.OneShotCancelDirectives)
 			// The same exclusion the boot sequence makes: a stalled removal's
 			// retained resources belong to its own durable backoff, and the
 			// ordinary directive lists must not reconcile them a second time.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -19,9 +20,23 @@ type JobCancelCaller struct {
 	Parent    *AttemptCredentialScope
 }
 
-// CancelJob arbitrates authority and the queued-to-terminal transition in the
-// same immediate transaction used by claim. Whichever commits first wins:
-// claim cannot select a failed job, and cancel refuses a claimed job.
+// CancelSettlementTimeout bounds pending cancellation independently of renewals.
+// It allows the normal five-second TERM grace and final evidence delivery.
+const CancelSettlementTimeout = 30 * time.Second
+
+// cancellationDeadline reads intent in the transaction that arbitrates work.
+// A reserved outcome is independent of the attempt's actual process result.
+func cancellationDeadline(ctx context.Context, q queryer, jobID string) (bool, time.Time, error) {
+	var outcome string
+	var deadline sql.NullInt64
+	if err := q.QueryRowContext(ctx, `SELECT outcome, cancel_settle_by_ns FROM jobs WHERE job_id=?`, jobID).Scan(&outcome, &deadline); err != nil {
+		return false, time.Time{}, internalError(err, "read cancellation intent")
+	}
+	return outcome == "canceled", time.Unix(0, deadline.Int64).UTC(), nil
+}
+
+// CancelJob reserves the outcome in the same immediate transaction as claim,
+// start, child creation and completion. The first committed terminal intent wins.
 func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCaller) (Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -36,7 +51,16 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 	}
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, protocolError(contract.ErrorNotFound, "job was not found")
+		tombstone, tombstoneErr := readServiceTombstoneByID(ctx, tx, jobID)
+		if errors.Is(tombstoneErr, sql.ErrNoRows) {
+			return Job{}, protocolError(contract.ErrorNotFound, "job was not found")
+		}
+		if tombstoneErr != nil {
+			return Job{}, internalError(tombstoneErr, "read cancellation tombstone")
+		}
+		job = tombstone.job()
+		job.Spec.Class = contract.JobClassService
+		err = tx.QueryRowContext(ctx, `SELECT originating_submitter, parent_job_id FROM service_tombstones WHERE job_id=?`, jobID).Scan(&job.OriginatingSubmitter, &job.ParentJobID)
 	}
 	if err != nil {
 		return Job{}, internalError(err, "read cancellation target")
@@ -94,9 +118,21 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 		if err != nil {
 			return Job{}, internalError(err, "read canceled job")
 		}
+	case contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput:
+		if job.Spec.Class != contract.JobClassOneShot || job.Spec.Kind != contract.JobKindProcess {
+			return Job{}, protocolErrorWithDetails(contract.ErrorCancelNotQueued, map[string]any{"state": job.State}, "active OCI one-shot cancellation is not supported yet")
+		}
+		if job.Outcome != "canceled" {
+			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET outcome='canceled', cancel_settle_by_ns=?, updated_ns=? WHERE job_id=?`, now.Add(CancelSettlementTimeout).UnixNano(), now.UnixNano(), jobID); err != nil {
+				return Job{}, internalError(err, "reserve canceled outcome")
+			}
+			job, err = getJobByID(ctx, tx, jobID, now)
+			if err != nil {
+				return Job{}, internalError(err, "read cancellation intent")
+			}
+		}
 	default:
-		return Job{}, protocolErrorWithDetails(contract.ErrorCancelNotQueued, map[string]any{"state": job.State},
-			"cancellation currently supports queued one-shots only; claimed, running and awaiting-input jobs are unchanged")
+		return Job{}, protocolErrorWithDetails(contract.ErrorCancelNotQueued, map[string]any{"state": job.State}, "job does not support cancellation in this state")
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, internalError(err, "commit job cancellation")
@@ -135,4 +171,34 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJobResource(w, r, job)
+}
+
+// ListNodeCancelDirectives keeps stop delivery available after logical settlement:
+// a canceled job is never proof that an unreachable program has stopped. Exact
+// attempt, fence and boot binding prevent stopping any successor execution.
+func (s *Store) ListNodeCancelDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]OneShotCancelDirective, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT jobs.job_id, attempts.attempt_id, attempts.fencing_token
+ FROM jobs JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+ JOIN nodes ON nodes.node_id=attempts.node_id
+ WHERE jobs.outcome='canceled' AND attempts.node_id=? AND nodes.identity_node_id=?
+ AND attempts.boot_session_id=? AND nodes.boot_session_id=attempts.boot_session_id
+ AND nodes.authority_generation=attempts.authority_generation
+ AND attempts.result_json IS NULL AND attempts.late_result_json IS NULL
+ ORDER BY jobs.job_id`, nodeID, identityNodeID, bootSessionID)
+	if err != nil {
+		return nil, internalError(err, "list one-shot cancel directives")
+	}
+	defer rows.Close()
+	directives := make([]OneShotCancelDirective, 0)
+	for rows.Next() {
+		var directive OneShotCancelDirective
+		if err := rows.Scan(&directive.JobID, &directive.AttemptID, &directive.FencingToken); err != nil {
+			return nil, internalError(err, "read one-shot cancel directive")
+		}
+		directives = append(directives, directive)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate one-shot cancel directives")
+	}
+	return directives, nil
 }
