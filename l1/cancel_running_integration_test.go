@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,51 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 )
+
+func TestCancelProcessStartAcknowledgementRefused(t *testing.T) {
+	for _, promoted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("already-running=%t", promoted), func(t *testing.T) {
+			h, client, agent, node := credentialHarness(t)
+			job := h.submit(client, "cancel-before-started", []string{"linux"})
+			claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+			wantState := contract.JobClaimed
+			if promoted {
+				if _, err := h.store.RenewLease(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+				wantState = contract.JobRunning
+			}
+			status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/cancel", nil)
+			if status != http.StatusOK {
+				t.Fatalf("cancel=%d %s", status, body)
+			}
+			pending, err := h.store.GetJob(t.Context(), job.JobID)
+			if err != nil || pending.State != wantState || pending.Outcome != "canceled" {
+				t.Fatalf("pending cancellation=%+v %v", pending, err)
+			}
+			for i := 0; i < 2; i++ {
+				status, _, body = h.do(agent, http.MethodPost, fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/started", job.JobID, claim.Lease.AttemptID), StartedRequest{FencingToken: claim.Lease.FencingToken})
+				assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+				var refusal contract.ErrorResponse
+				if err := json.Unmarshal(body, &refusal); err != nil || refusal.Error.Retryable {
+					t.Fatalf("refusal must be non-retryable=%s %v", body, err)
+				}
+			}
+			var started sql.NullInt64
+			var state contract.AttemptState
+			if err := h.store.db.QueryRow(`SELECT started_ns, state FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&started, &state); err != nil {
+				t.Fatal(err)
+			}
+			if started.Valid || string(state) != string(wantState) {
+				t.Fatalf("refused start mutated attempt: started=%+v state=%s", started, state)
+			}
+			after, err := h.store.GetJob(t.Context(), job.JobID)
+			if err != nil || !reflect.DeepEqual(pending, after) {
+				t.Fatalf("refused start mutated pending cancellation=%+v %v", after, err)
+			}
+		})
+	}
+}
 
 func TestCancelActiveProcessContract(t *testing.T) {
 	for _, state := range []contract.JobState{contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput} {
@@ -267,7 +313,7 @@ func TestCancelRemovedServiceAndComputerRefusals(t *testing.T) {
 // is held. Launch the competing operation before releasing it, so both commit
 // orders are deterministic instead of depending on scheduler luck.
 func TestCancelDeterministicTransactionRaces(t *testing.T) {
-	for _, operation := range []string{"claim", "renew", "logs", "child", "completion", "expiry"} {
+	for _, operation := range []string{"claim", "started", "renew", "logs", "child", "completion", "expiry"} {
 		for _, cancelFirst := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s/cancel-first=%t", operation, cancelFirst), func(t *testing.T) {
 				h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{"node-1": DefaultNodePolicy()}, true, time.Hour)
@@ -312,6 +358,8 @@ func TestCancelDeterministicTransactionRaces(t *testing.T) {
 						claim, rivalErr = h.store.ClaimJob(t.Context(), "node-1", node.NodeID, node.BootSessionID, contract.JobClassOneShot)
 					case "renew", "expiry":
 						renewed, rivalErr = h.store.RenewLease(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken)
+					case "started":
+						_, rivalErr = h.store.StartAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken})
 					case "logs":
 						_, rivalErr = h.store.AppendLogs(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("acknowledgement"))}})
 					case "child":
@@ -336,7 +384,11 @@ func TestCancelDeterministicTransactionRaces(t *testing.T) {
 				if cancelErr != nil {
 					t.Fatal(cancelErr)
 				}
-				if operation == "child" && cancelFirst {
+				if operation == "started" && cancelFirst {
+					if errorCode(rivalErr) != contract.ErrorConflict {
+						t.Fatalf("start committed after cancel=%v", rivalErr)
+					}
+				} else if operation == "child" && cancelFirst {
 					if errorCode(rivalErr) != contract.ErrorUnauthorized {
 						t.Fatalf("child committed after cancel=%+v %v", child, rivalErr)
 					}
@@ -369,13 +421,22 @@ func TestCancelDeterministicTransactionRaces(t *testing.T) {
 					if cancelFirst && claim != nil {
 						t.Fatalf("claim after cancel=%+v", claim)
 					}
-				case "renew", "logs":
+				case "started", "renew", "logs":
 					want := contract.JobClaimed
 					if !cancelFirst {
 						want = contract.JobRunning
 					}
 					if got.State != want {
 						t.Fatalf("start arbitration=%+v", got)
+					}
+					if operation == "started" {
+						var started sql.NullInt64
+						if err := h.store.db.QueryRow(`SELECT started_ns FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&started); err != nil {
+							t.Fatal(err)
+						}
+						if started.Valid == cancelFirst {
+							t.Fatalf("start marker arbitration=%+v cancel-first=%t", started, cancelFirst)
+						}
 					}
 					if operation == "renew" && cancelFirst && string(renewed.Directive) != "cancel" {
 						t.Fatalf("cancel delivery=%+v", renewed)

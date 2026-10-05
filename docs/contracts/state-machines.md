@@ -1126,9 +1126,11 @@ reconciliation at the deadline settles a silent node as `failed`/`canceled`
 with an attempt `lost`, never a manufactured result or termination confirmation.
 One-shot secret scrubbing uses the same terminal trigger as ordinary completion.
 
-Claim, process start acknowledgement (renewal or logs), renewal, child creation,
-completion and expiry consult cancellation in their committing transactions.
-Pending cancellation forbids acknowledgement of a new start and child creation.
+Claim, process `/started` acknowledgement, legacy start promotion by renewal or
+logs, renewal, child creation, completion and expiry consult cancellation in
+their committing transactions. Pending cancellation refuses `/started` with
+HTTP 409 `conflict`, `retryable=false`, without recording `started_ns` or
+promoting the attempt, and forbids child creation.
 Existing children are independent and never canceled automatically. Evidence,
 logs and result uploads retain their existing provenance and late-window rules.
 
