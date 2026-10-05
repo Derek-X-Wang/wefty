@@ -355,11 +355,12 @@ type AttemptLease struct {
 	Directive    AttemptDirective `json:"directive,omitempty"`
 }
 
-// AttemptDirective carries service intent to the currently fenced payload.
+// AttemptDirective carries lifecycle intent to the currently fenced payload.
 // The empty value means no lifecycle change is requested.
 type AttemptDirective string
 
 const (
+	AttemptDirectiveCancel  AttemptDirective = "cancel"
 	AttemptDirectiveStop    AttemptDirective = "stop"
 	AttemptDirectiveRestart AttemptDirective = "restart"
 )
@@ -445,9 +446,18 @@ type Node struct {
 	LastHeartbeatAt     time.Time          `json:"last_heartbeat_at"`
 }
 
+// OneShotCancelDirective is standing stop delivery for exactly one attempt.
+// Delivery does not attest that its process was terminated.
+type OneShotCancelDirective struct {
+	JobID        string `json:"job_id"`
+	AttemptID    string `json:"attempt_id"`
+	FencingToken string `json:"fencing_token"`
+}
+
 // HeartbeatResponse is the boot-session-scoped node channel. Directives stay
 // off the operator-visible Node projection because they carry cleanup fences.
 type HeartbeatResponse struct {
+	OneShotCancelDirectives []OneShotCancelDirective `json:"one_shot_cancel_directives"`
 	Node
 	RemovalDirectives       []RemovalDirective                  `json:"removal_directives"`
 	StorageResetDirectives  []ComputerStorageResetDirective     `json:"storage_reset_directives"`

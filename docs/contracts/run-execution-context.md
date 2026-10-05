@@ -219,7 +219,7 @@ to the workload. Withholding it removes only the workload's copy.
 
 The credential authorizes exactly
 four things: submitting a child job, reading its own job, listing and
-reading that job's children, and canceling a queued one-shot child. No other
+reading that job's children, and canceling a queued one-shot or active process one-shot child. No other
 route accepts it, so no operator-level action is reachable with it; the service collection read `GET /v1/jobs` is
 refused with `principal_forbidden` like every other job route.
 
@@ -236,8 +236,12 @@ unrelated jobs, grandchildren and unknown IDs receive `not_found`, even when
 their originating submitter is the same. The workflow bridge's `/l1` allowlist
 includes this exact method/path. A queued child becomes `failed` with job-level
 `outcome=canceled`; no attempt or signal is invented. Services receive
-`cancel_service`; claimed, running and awaiting-input children receive
-`cancel_not_queued` until #651/#652. Neither refusal mutates the target.
+`cancel_service`. Claimed, running and awaiting-input process children reserve
+the canceled outcome and receive bounded TERM/grace/KILL termination (#651).
+Active OCI children receive `cancel_not_queued` until #652. Neither refusal
+mutates the target. Pending cancellation revokes authority to create children
+in the creation transaction; existing children and provenance-scoped reads
+remain independent.
 
 Parent job, parent attempt, and originating submitter are derived from the
 credential and can never be supplied by the caller: they live on the job
