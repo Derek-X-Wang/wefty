@@ -890,11 +890,30 @@ the run's `WEFTY_HANDOFF_DIR`, its retained files, its retention record and its
 uploaded result all name the adopted directory. The dispatched path is
 unchanged on the wire, so an older node keeps reading it. A dispatched path
 under neither the node's root nor the ledger's default is refused before
-execution rather than run into. A job carrying no run identity at all — possible
-only for a spec submitted straight to L1, since every dispatch names its run —
-keeps the directory it was dispatched with, and has no retained results, no
-retention record and no result row on the node either way. Before execution, the
-node agent rejects symlinks and non-directories, creates the directory when it
+execution rather than run into. An ordinary L1 client may submit a process one-shot without a run identity
+or `execution.handoff_directory`. The node resolves execution ownership from
+the immutable spec plus the server-assigned Job ID and assigns
+`<node-handoff-root>/<job_id>`. It injects that absolute directory as
+`WEFTY_HANDOFF_DIR`, overriding either submitted environment map. Execution,
+locking, result upload, retention and cleanup all use that same resolved owner
+and directory. The node never writes the fallback identity into submitted
+labels or changes the canonical request hash; identical dispatch-key replay
+still returns the original job. The label-only resolver remains the sole input
+to run-identity entitlement: a child of a job-owned parent cannot name its
+parent's Job ID in `run_id` or `handoff_owner_run_id`.
+
+A process submission with an explicit absolute path and no run identity keeps
+its unowned behavior: the node creates a private directory for the workload,
+but records no managed retention and uploads no result. L3 run and rerun
+identities, including shared handoff ownership, keep their existing rules.
+Omitting a path with entitled run labels assigns the same run-owned leaf under
+the node root. A process result from managed output is readable at
+`GET /v1/jobs/{job_id}/result` with no L3 or run mailbox. Publication still
+requires accepted L1 upload (document or `absent`) plus a drained mailbox;
+an attempt without a mailbox has nothing to drain. Failed uploads stay
+unpublished. L1 result retention is independent of node directory expiry.
+
+Before execution, the node agent rejects symlinks and non-directories, creates the directory when it
 is absent, forces mode `0700`, and writes an ownership marker at mode `0600`.
 The marker and the agent's retention records are replaced by renaming a synced
 staging file over the name and then syncing the directory, so after power loss

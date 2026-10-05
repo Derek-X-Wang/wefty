@@ -196,10 +196,17 @@ func handoffPathLeaseKey(directory string) string {
 // never manages, held for the length of an attempt, and the sweep and the
 // budget both read that as "an attempt holds this".
 func (m *handoffManager) lock(ctx context.Context, spec contract.JobSpec) (*handoffLease, error) {
-	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	return m.lockExecution(ctx, legacyExecutionHandoff(spec))
+}
+
+func (m *handoffManager) lockExecution(ctx context.Context, execution executionHandoff) (*handoffLease, error) {
+	if execution.err != nil {
+		return nil, execution.err
+	}
+	path := filepath.Clean(execution.directory)
 	if path == "." || !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%w: %q is not an absolute path",
-			errUnmanagedHandoffDirectory, spec.Execution.HandoffDirectory)
+			errUnmanagedHandoffDirectory, execution.directory)
 	}
 	return m.lockPath(ctx, handoffPathLeaseKey(path))
 }
@@ -266,15 +273,8 @@ var errUnmanagedHandoffDirectory = errors.New("handoff directory is not one this
 // "stop sweeping this run" is too consequential a decision to key off wording.
 var errHandoffNameNotADirectory = errors.New("handoff name is not a directory")
 
-// ownsHandoff reports that this job carries the run identity everything the
-// agent does with a handoff directory is keyed by: the retention record, the
-// per-run bound, the sweep, and the result upload all name a run.
-//
-// A one-shot process job submitted straight to L1 may carry none — the job spec
-// requires a handoff directory, not a run — and such a job has no retained
-// results and no result row on this node by construction. Its directory is
-// still created for the workload, explicitly and with a log line, rather than
-// being an unannounced nil somewhere inside preparation.
+// ownsHandoff is the legacy label-only query. Execution uses the resolved
+// executionHandoff so a server-owned job identity never becomes a run label.
 func (m *handoffManager) ownsHandoff(spec contract.JobSpec) bool {
 	return handoffOwnerRunID(spec) != ""
 }
@@ -336,7 +336,15 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 }
 
 func (m *handoffManager) prepareAttempt(lease *handoffLease, spec contract.JobSpec, nodeID, attemptID string) (*handoffOwnership, error) {
-	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	return m.prepareExecution(lease, legacyExecutionHandoff(spec), nodeID, attemptID)
+}
+
+func (m *handoffManager) prepareExecution(lease *handoffLease, execution executionHandoff, nodeID, attemptID string) (*handoffOwnership, error) {
+	if execution.err != nil {
+		return nil, execution.err
+	}
+	spec := execution.spec
+	path := filepath.Clean(execution.directory)
 	m.mu.Lock()
 	owned := lease != nil && lease.manager == m && lease.path == handoffPathLeaseKey(path) && lease.pathLock.owner == lease && lease.ownership == nil
 	m.mu.Unlock()
@@ -346,20 +354,13 @@ func (m *handoffManager) prepareAttempt(lease *handoffLease, spec contract.JobSp
 	// Preparation either returns a receipt or says why it could not. It never
 	// returns neither: an attempt that proceeds with no ownership is one whose
 	// results nothing retains, reads or uploads.
-	managed, err := m.resolveHandoffDirectory(spec)
-	if err != nil {
-		return nil, err
+	runID := execution.ownerKey
+	if !validRunMailboxSegment(runID) {
+		return nil, fmt.Errorf("%w: handoff owner %q is not one safe path component", errUnmanagedHandoffDirectory, runID)
 	}
-	if managed != path {
-		// The lock this attempt holds is on the dispatched path, so preparing a
-		// different directory here would retain and read one nothing else in
-		// the attempt is holding. The claim adopts the path before the lock is
-		// taken; reaching this means it did not, and a refusal is louder than
-		// a silent divergence.
-		return nil, fmt.Errorf("%w: this attempt holds %q while this node manages %q",
-			errUnmanagedHandoffDirectory, path, managed)
+	if !m.manages(path, runID) {
+		return nil, fmt.Errorf("%w: %q is not the managed directory for %q", errUnmanagedHandoffDirectory, path, runID)
 	}
-	runID := handoffOwnerRunID(spec)
 	root, err := m.openHandoffRoot()
 	if err != nil {
 		return nil, err
@@ -439,7 +440,7 @@ func (m *handoffManager) prepareAttempt(lease *handoffLease, spec contract.JobSp
 	// or expire this run's results, and saying so before the workload starts
 	// is better than discovering it at finish with the files already written.
 	if err := m.writeRecord(retentionRecord{
-		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: handoffOwnerRunID(spec),
+		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: execution.ownerKey,
 		AdmittedAt: m.now().UTC(), AttemptID: attemptID,
 	}); err != nil {
 		return nil, fmt.Errorf("record the admission of handoff directory %q: %w", path, err)
@@ -463,21 +464,25 @@ func (m *handoffManager) prepareAttempt(lease *handoffLease, spec contract.JobSp
 // workload could have rewritten, and the caller runs this while it still holds
 // the path lock so a successor attempt cannot already be writing here.
 func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, nodeID string, succeeded, published bool) error {
-	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	return m.finishExecution(owner, legacyExecutionHandoff(spec), nodeID, succeeded, published)
+}
+
+func (m *handoffManager) finishExecution(owner *handoffOwnership, execution executionHandoff, nodeID string, succeeded, published bool) error {
+	path := filepath.Clean(execution.directory)
 	if owner == nil {
 		return nil
 	}
 	if !m.holdsReceipt(owner, path) {
 		return nil
 	}
-	runID := handoffOwnerRunID(spec)
+	runID := execution.ownerKey
 	if owner.runID != runID || owner.nodeID != nodeID || !m.manages(path, runID) {
 		return fmt.Errorf("handoff directory %q is prepared for run %q on node %q, not %q on %q",
 			path, owner.runID, owner.nodeID, runID, nodeID)
 	}
 	now := m.now().UTC()
 	record := retentionRecord{
-		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: handoffOwnerRunID(spec),
+		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: execution.ownerKey,
 		AdmittedAt: m.admissionOf(runID, nodeID, path, now),
 		RetainedAt: now, RetainUntil: now.Add(m.retention),
 		Published: published, Uploaded: published, Succeeded: succeeded, AttemptID: owner.attemptID,
@@ -614,11 +619,15 @@ func (m *handoffManager) admissionOf(runID, nodeID, path string, now time.Time) 
 // finish is: the handle belongs to an acquisition this attempt still holds, and
 // a successor attempt's directory is not this one's to read.
 func (m *handoffManager) readResult(owner *handoffOwnership, spec contract.JobSpec, nodeID string) attemptResult {
+	return m.readExecutionResult(owner, legacyExecutionHandoff(spec), nodeID)
+}
+
+func (m *handoffManager) readExecutionResult(owner *handoffOwnership, execution executionHandoff, nodeID string) attemptResult {
 	if owner == nil {
 		return attemptResult{skip: contract.ResultUploadSkipAbsent}
 	}
-	path := filepath.Clean(spec.Execution.HandoffDirectory)
-	if !m.holdsReceipt(owner, path) || owner.runID != handoffOwnerRunID(spec) || owner.nodeID != nodeID {
+	path := filepath.Clean(execution.directory)
+	if !m.holdsReceipt(owner, path) || owner.runID != execution.ownerKey || owner.nodeID != nodeID {
 		return attemptResult{skip: contract.ResultUploadSkipAbsent}
 	}
 	return readHandoffResult(owner.run)

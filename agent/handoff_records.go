@@ -108,12 +108,16 @@ const (
 // and finish updates it into the second, so the record is one run's whole
 // life on this node rather than only its afterlife.
 type retentionRecord struct {
+	// RunID is the legacy field name for the resolved execution owner. Direct
+	// managed process output stores the server-assigned job ID here; this does
+	// not create a run identity or a run-entitlement label.
 	RunID     string `json:"run_id"`
 	NodeID    string `json:"node_id"`
 	Directory string `json:"directory"`
 	// HandoffOwnerKey is the stable identity a runtime derives this run's
 	// handoff volume name from -- `handoff_owner_run_id` when a rerun is
-	// pointed at a source run's results, and the run ID otherwise.
+	// pointed at a source run's results, the run ID for other run-owned output,
+	// or the server-assigned job ID for direct managed process output.
 	//
 	// It is recorded rather than re-derived because the two are only the same
 	// by construction today: preparation happens to key the directory on the

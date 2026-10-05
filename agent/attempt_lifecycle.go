@@ -155,6 +155,7 @@ type attemptLifecycle struct {
 	// wait here for the upload that follows completion.
 	capturedResult   atomic.Pointer[attemptResult]
 	handoffOwnership *handoffOwnership
+	executionHandoff *executionHandoff
 }
 
 // attemptDeadmanAdmission holds successful L1 renewal evidence until the OCI
@@ -1178,7 +1179,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	var handoffLease *handoffLease
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
-		lease, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
+		lease, err := lifecycle.dependencies.handoffs.lockExecution(ctx, *lifecycle.executionHandoff)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
@@ -1281,8 +1282,8 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// Which of the two this is decides whether the run has results at all,
 		// so it is decided here, in the open, rather than inside a preparation
 		// that would otherwise have to answer "prepared, owned by nobody".
-		if handoffs.ownsHandoff(claim.Job.Spec) {
-			owner, err := handoffs.prepareAttempt(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID, claim.Lease.AttemptID)
+		if lifecycle.executionHandoff.ownerKey != "" {
+			owner, err := handoffs.prepareExecution(handoffLease, *lifecycle.executionHandoff, lifecycle.dependencies.nodeID, claim.Lease.AttemptID)
 			if err != nil {
 				return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 			}
@@ -1587,22 +1588,31 @@ func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
 // unexplained refusal from here.
 func (lifecycle *attemptLifecycle) adoptHandoffDirectory(claim l1.Claim) l1.Claim {
 	handoffs := lifecycle.dependencies.handoffs
-	if handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) || !handoffs.ownsHandoff(claim.Job.Spec) {
+	if handoffs == nil || !usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return claim
 	}
-	dispatched := claim.Job.Spec.Execution.HandoffDirectory
-	managed, err := handoffs.resolveHandoffDirectory(claim.Job.Spec)
-	if err != nil || managed == dispatched {
+	execution := handoffs.resolveExecutionHandoff(claim.Job.Spec, claim.Job.JobID)
+	lifecycle.executionHandoff = &execution
+	if execution.err != nil || execution.ownerKey == "" {
 		return claim
 	}
 	spec := claim.Job.Spec
-	spec.Execution.HandoffDirectory = managed
+	spec.Execution.HandoffDirectory = execution.directory
 	spec.Execution.Env = cloneEnvironment(spec.Execution.Env)
-	spec.Execution.Env[contract.EnvHandoffDir] = managed
+	spec.Execution.SensitiveEnv = cloneEnvironment(spec.Execution.SensitiveEnv)
+	delete(spec.Execution.SensitiveEnv, contract.EnvHandoffDir)
+	spec.Execution.Env[contract.EnvHandoffDir] = execution.directory
 	claim.Job.Spec = spec
-	lifecycle.log("agent: handoff directory %q dispatched for attempt %s is managed here as %q",
-		dispatched, claim.Lease.AttemptID, managed)
 	return claim
+}
+
+// executionOwnerKey names process uploads with the same resolved identity as
+// execution and retention. OCI keeps its existing owner resolution.
+func (lifecycle *attemptLifecycle) executionOwnerKey(spec contract.JobSpec) string {
+	if usesAgentHandoffLifecycle(spec) && lifecycle.executionHandoff != nil {
+		return lifecycle.executionHandoff.ownerKey
+	}
+	return handoffOwnerRunID(spec)
 }
 
 func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
@@ -1693,8 +1703,8 @@ func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, publ
 	if !lifecycle.resultsRetained.CompareAndSwap(false, true) {
 		return nil
 	}
-	if err := lifecycle.dependencies.handoffs.finish(
-		lifecycle.handoffOwnership, claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
+	if err := lifecycle.dependencies.handoffs.finishExecution(
+		lifecycle.handoffOwnership, *lifecycle.executionHandoff, lifecycle.dependencies.nodeID, succeeded, published); err != nil {
 		return err
 	}
 	return lifecycle.dependencies.handoffs.collect()
@@ -1750,7 +1760,7 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 	// run after it. So the record written here carries the whole verdict, and
 	// startup recovery reads the same one if the agent dies before retention.
 	outcome := lifecycle.dependencies.handoffs.newUploadRecord(
-		handoffOwnerRunID(claim.Job.Spec), lifecycle.dependencies.nodeID,
+		lifecycle.executionOwnerKey(claim.Job.Spec), lifecycle.dependencies.nodeID,
 		claim.Lease.AttemptID, recorded, lifecycle.mailboxDrained())
 	published := outcome.publishes()
 	lifecycle.resultPublished.Store(published)
@@ -1796,8 +1806,8 @@ func (lifecycle *attemptLifecycle) attemptResult(claim l1.Claim) (attemptResult,
 		!usesAgentHandoffLifecycle(claim.Job.Spec) {
 		return attemptResult{}, false
 	}
-	return lifecycle.dependencies.handoffs.readResult(
-		lifecycle.handoffOwnership, claim.Job.Spec, lifecycle.dependencies.nodeID), true
+	return lifecycle.dependencies.handoffs.readExecutionResult(
+		lifecycle.handoffOwnership, *lifecycle.executionHandoff, lifecycle.dependencies.nodeID), true
 }
 
 func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
