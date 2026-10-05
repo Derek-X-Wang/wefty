@@ -307,7 +307,7 @@ func TestNothingIsGivenUpWhileTheNodeFitsItsBudget(t *testing.T) {
 // and the helper derives the directory back.
 func TestAnOCIVolumeIsGivenUpThroughTheHelperWithTheOwnerKeyTheNodeDerived(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
-	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
@@ -466,7 +466,7 @@ func TestAHandoffVolumeNoRunOfThisNodeCanNameIsChargedAndNeverGivenUp(t *testing
 // what knows an attempt registered ownership and superseded the prior receipt.
 func TestALiveHandoffVolumeIsNeverACandidate(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
-	if err := harness.manager.recordUpload("run_live", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_live", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	live := ociVolume(t, "run_live", 8<<20, 4, harness.now)
@@ -497,7 +497,7 @@ func TestALiveHandoffVolumeIsNeverACandidate(t *testing.T) {
 func TestAVolumeWithNoHelperOwnedTerminalTimeIsGivenUpLast(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	for _, runID := range []string{"run_dated", "run_undated"} {
-		if err := harness.manager.recordUpload(runID, "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+		if err := harness.manager.recordUpload(runID, "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -553,7 +553,7 @@ func TestTheNodeRemeasuresAfterEveryDeletionRatherThanSubtracting(t *testing.T) 
 func TestTheBudgetIsNeverEnforcedOnAnAttemptsFinalization(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	harness.retain("run_big", true, true, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
-	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
@@ -635,7 +635,7 @@ func TestAQuarantinedRecordIsChargedAndNeverGivenUp(t *testing.T) {
 // give up, and the budget says that out loud instead of looping.
 func TestANodeWithNoRuntimeEvictionSaysSoRatherThanFailingQuietly(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
-	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
@@ -660,7 +660,7 @@ func TestANodeWithNoRuntimeEvictionSaysSoRatherThanFailingQuietly(t *testing.T) 
 // asking again for something that just refused.
 func TestAHelperThatRefusesAnEvictionStopsThePassRatherThanSpinning(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
-	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	helper := &fakeHelperHandoffRoot{
@@ -761,7 +761,7 @@ func TestTheEvictionOrderIsOneOrderOverBothRoots(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	harness.retain("run_process", true, true, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
 	harness.now = harness.now.Add(time.Hour)
-	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
@@ -899,7 +899,7 @@ func TestARerunDoesNotInheritTheEarlierAttemptsPublication(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	harness.retainOCI("run_republished", "attempt-1", true)
 	if err := harness.manager.recordUpload("run_republished", "node-1", "attempt-1",
-		attemptResult{document: []byte("{}")}); err != nil {
+		attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	// attempt-1's result reached the ledger, on the record eviction reads.
@@ -964,7 +964,7 @@ func TestAnAdmissionThatNeverFinishedIsResolvedAtStartup(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	lease := harness.admitOCI("run_crashed", "attempt-1")
 	if err := harness.manager.recordUpload("run_crashed", "node-1", "attempt-1",
-		attemptResult{document: []byte("{}")}); err != nil {
+		attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	lease.release() // the process went away; the lease did not outlive it
@@ -988,7 +988,7 @@ func TestAnAdmissionThatNeverFinishedIsResolvedAtStartup(t *testing.T) {
 	otherLease := other.admitOCI("run_crashed", "attempt-2")
 	otherLease.release()
 	if err := other.manager.recordUpload("run_crashed", "node-1", "attempt-1",
-		attemptResult{document: []byte("{}")}); err != nil {
+		attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := other.manager.adoptResidue(); err != nil {
