@@ -185,9 +185,10 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 	switch desired {
 	case contract.ServiceDesiredRunning:
 		switch job.State {
-		case contract.JobFailed:
-			return Job{}, protocolError(contract.ErrorConflict, "service job %q is latched failed; use restart", jobID)
-		case contract.JobStopped:
+		case contract.JobFailed, contract.JobStopped:
+			if job.State == contract.JobFailed && job.PolicyStop == nil {
+				return Job{}, protocolError(contract.ErrorConflict, "service job %q is latched failed; use restart", jobID)
+			}
 			if !job.HoldsSlot(job.State) {
 				if err := ensureBoundServiceCapacity(ctx, tx, job); err != nil {
 					return Job{}, err
@@ -417,8 +418,12 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 	}
 	if service.DesiredState == contract.ServiceDesiredStopped {
 		service.RestartSuppressed = "desired state is stopped"
-	} else if job.State == contract.JobStopped && service.PolicyStop != nil {
-		service.RestartSuppressed = "policy stop: on-failure payload exited cleanly; use start or restart"
+	} else if service.PolicyStop != nil {
+		if job.Spec.Restart == contract.RestartOnFailure {
+			service.RestartSuppressed = "policy stop: on-failure payload exited cleanly; use start or restart"
+		} else {
+			service.RestartSuppressed = "policy stop: never payload ended; use start or restart"
+		}
 	} else if job.State == contract.JobFailed {
 		if job.Spec.MaxRestartStreak != nil && service.RestartStreak >= *job.Spec.MaxRestartStreak {
 			service.RestartSuppressed = fmt.Sprintf("max restart streak reached: %d/%d; use restart", service.RestartStreak, *job.Spec.MaxRestartStreak)

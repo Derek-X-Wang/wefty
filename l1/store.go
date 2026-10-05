@@ -3386,7 +3386,9 @@ func imageObservationIdentityFromRequest(request ImageObservationRequest) imageO
 	}
 }
 
-// StartAttempt is the sole claimed-to-running acknowledgement for OCI.
+// StartAttempt durably acknowledges payload start. OCI requires an image
+// observation; process renewal/logging may already have promoted running, but
+// neither is evidence that the process runner acknowledged start.
 func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attemptID string, request StartedRequest) (Job, error) {
 	if request.FencingToken == "" {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "fencing_token is required")
@@ -3403,8 +3405,8 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
 	}
-	if attempt.spec.Kind != contract.JobKindOCI {
-		return Job{}, protocolError(contract.ErrorConflict, "Started is only valid for OCI attempts")
+	if attempt.spec.Kind != contract.JobKindOCI && attempt.spec.Kind != contract.JobKindProcess {
+		return Job{}, protocolError(contract.ErrorConflict, "Started is only valid for OCI or process attempts")
 	}
 	now := canonicalTime(s.clock.Now())
 	if !now.Before(attempt.leaseExpires) {
@@ -3419,24 +3421,27 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	if attempt.startedNS.Valid {
 		return getJobByID(ctx, tx, jobID, now)
 	}
-	if attempt.state != contract.AttemptClaimed {
+	if attempt.state != contract.AttemptClaimed && !(attempt.spec.Kind == contract.JobKindProcess && attempt.state == contract.AttemptRunning) {
 		return Job{}, protocolError(contract.ErrorConflict, "attempt cannot accept Started")
 	}
-	if len(attempt.imageObservationJSON) == 0 {
-		return Job{}, protocolError(contract.ErrorConflict, "OCI attempt has no fenced image observation")
-	}
-	var image OCIImageEvidence
-	if err := json.Unmarshal(attempt.imageObservationJSON, &image); err != nil {
-		return Job{}, internalError(err, "decode image observation for Started")
-	}
 	startedAt := now
-	if !startedAt.After(image.ResolvedAt) {
-		startedAt = image.ResolvedAt.Add(time.Nanosecond)
-	}
-	image.StartedAt = &startedAt
-	imageJSON, err := json.Marshal(image)
-	if err != nil {
-		return Job{}, internalError(err, "encode Started image evidence")
+	imageJSON := attempt.imageObservationJSON
+	if attempt.spec.Kind == contract.JobKindOCI {
+		if len(attempt.imageObservationJSON) == 0 {
+			return Job{}, protocolError(contract.ErrorConflict, "OCI attempt has no fenced image observation")
+		}
+		var image OCIImageEvidence
+		if err := json.Unmarshal(attempt.imageObservationJSON, &image); err != nil {
+			return Job{}, internalError(err, "decode image observation for Started")
+		}
+		if !startedAt.After(image.ResolvedAt) {
+			startedAt = image.ResolvedAt.Add(time.Nanosecond)
+		}
+		image.StartedAt = &startedAt
+		imageJSON, err = json.Marshal(image)
+		if err != nil {
+			return Job{}, internalError(err, "encode Started image evidence")
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, started_ns=?, image_observation_json=?, updated_ns=? WHERE attempt_id=?`,
 		contract.AttemptRunning, startedAt.UnixNano(), imageJSON, now.UnixNano(), attemptID); err != nil {
@@ -4505,7 +4510,15 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 		nextState := contract.JobFailed
 		if desiredState.Valid && contract.ServiceDesiredState(desiredState.String) == contract.ServiceDesiredRunning &&
 			(jobState == contract.JobClaimed || jobState == contract.JobRunning) {
-			nextState = contract.JobQueued
+			directive, err := readAttemptDirective(ctx, tx, attempt.jobID, attempt.attemptID)
+			if err != nil {
+				return err
+			}
+			// Running alone is not start evidence for process attempts: renewal
+			// and logs retain their legacy promotion without setting started_ns.
+			if attempt.spec.Restart != contract.RestartNever || !attempt.startedNS.Valid || directive == AttemptDirectiveRestart {
+				nextState = contract.JobQueued
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
 			WHERE job_id=? AND current_attempt_id=?`, nextState, now.UnixNano(), attempt.jobID, attempt.attemptID); err != nil {

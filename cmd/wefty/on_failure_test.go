@@ -53,7 +53,7 @@ func TestServiceCreateTypedExitsFromRealBinary(t *testing.T) {
 		args []string
 		want int
 	}{
-		{"invalid policy", []string{"--l1=" + refusal, "services", "create", "--script", script, "--restart=never"}, exitUsage},
+		{"invalid policy", []string{"--l1=" + refusal, "services", "create", "--script", script, "--restart=invalid"}, exitUsage},
 		{"server refusal", []string{"--l1", refusal, "services", "create", "--script", script}, exitConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

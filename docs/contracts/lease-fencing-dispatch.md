@@ -274,8 +274,10 @@ a join around the per-attempt wait; service stop transitions belong to the
 service job state machine in `state-machines.md`. This route
 is session liveness, not operator intent: it leaves `claims_enabled` and every
 `intent_*` field untouched. A fenced service shutdown completion is an
-infrastructure interruption, so desired `running` projects back to `queued`
-with an unchanged restart streak rather than fabricating operator stop intent.
+infrastructure interruption. Under `always` or `on-failure`, desired `running`
+projects back to `queued` with an unchanged restart streak. Under `never`, a
+post-start interruption remains `failed`, unless an explicit restart targets
+that attempt. Neither reaction fabricates operator stop intent or a policy stop.
 
 Lease renewal continues after the subprocess exits while redacted output is
 flushed, durable logs are acknowledged, and the idempotent completion request
@@ -284,7 +286,12 @@ attempt authority. A redaction, spool, or uploader finalization failure is
 reported as `output_error`, never as a successful exit code.
 
 For `kind=process`, first renewal retains the legacy claimed-to-running
-acknowledgement. For `kind=oci`, renewal changes only the lease and directive;
+promotion. This promotion, including promotion by log append, is not proof of
+payload start for `restart: never`. The agent acknowledges its runner's start
+through the fenced `/started` endpoint after successful spawn and guardian
+ownership. That acknowledgement durably sets the attempt's start marker even
+when renewal already advanced its state. A refused acknowledgement cancels
+the payload; it cannot remain running under unacknowledged authority. For `kind=oci`, renewal changes only the lease and directive;
 it never acknowledges execution or starts the portless-service stability
 clock. Successful completion likewise never supplies a missing OCI `Started`.
 
@@ -419,9 +426,11 @@ Current authority, lease, and claimed state gate only the first write. A
 changed job-scoped identity is also `idempotency_conflict`, and a pinned job
 digest must match the observation.
 
-`POST .../attempts/{attempt_id}/started` is fenced and idempotent. It requires
-an accepted or copied image observation, records `started_at` from the L1 clock, and is
-the sole `claimed → running` transition for OCI jobs and attempts. A stale
+`POST .../attempts/{attempt_id}/started` is fenced and idempotent for process
+and OCI. For OCI it requires an accepted or copied image observation, records
+`started_at` from the L1 clock, and is the sole `claimed → running` transition.
+For process it durably records the runner start acknowledgement; a claimed or
+legacy-promoted running attempt may accept it, without an image observation. A stale
 fence, replaced session, expired lease, terminal attempt, or missing image
 observation cannot start authority.
 
@@ -477,7 +486,7 @@ visible with claims disabled.
 | --- | ---: | --- | --- | --- |
 | Attempt ID is not the job's current attempt | 409 | `attempt_mismatch` | false | No mutation. |
 | Fence is not current | 409 | `stale_fence` | false | No mutation. The stale worker must stop writing. |
-| Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` exactly once. A one-shot job fails; a desired-running service job requeues without incrementing its restart streak or lifetime restart count, increments `lease_loss_count`, and receives lease-loss backoff. |
+| Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` exactly once. A one-shot job fails; a desired-running service job requeues with lease-loss backoff unless `never` suppresses a post-start loss without an explicit restart. Only `lease_loss_count` increments; restart streak and lifetime restart count remain unchanged. |
 | Same idempotency identity and same body is replayed | original success | none | n/a | Return the original result; do not duplicate logs or completion. A completion replay is also marked `Idempotent-Replay: true`. |
 | Same idempotency identity has a different body | 409 | `idempotency_conflict` | false | No mutation. |
 
@@ -492,13 +501,14 @@ one carried by the request that wrote it, and reusing that key with a different
 body is still `idempotency_conflict`.
 
 Expiry never creates another attempt. A desired-running service job becomes
-eligible for its bound node again, while the ordinary atomic claim transaction
+eligible for its bound node again when policy permits requeue; `never` suppresses
+post-start loss unless an explicit restart targets the attempt. The ordinary atomic claim transaction
 is the only operation that can mint the fresh attempt ID and incremented fence.
 The expired attempt remains `lost`, `current_attempt_id` remains available for
 completion replay until a later claim wins. Both `restart_streak` and
 `lifetime_restart_count` are frozen because lease loss is infrastructure
 suppression; the distinct durable `lease_loss_count` drives the bounded
-pre-start backoff so a lease-flapping node cannot hot-requeue invisibly. One-shot jobs still fail
+pre-start backoff when requeue is permitted, so a lease-flapping node cannot hot-requeue invisibly. One-shot jobs still fail
 terminally. A partitioned node may still be running non-idempotent work, so
 later authority-changing writes receive `lease_expired` or `stale_fence` and
 cannot alter state. Evidence writes follow the provenance-only rules above.
@@ -659,7 +669,7 @@ Every job also declares the independent, required `class` lifecycle axis.
 agent that cannot execute one reports `unsupported_class`. The known values are
 `one-shot` and `service`. L3 always constructs `one-shot` jobs explicitly.
 
-A service declares `restart: always` or `restart: on-failure` (omission is
+A service declares `restart: always`, `restart: on-failure`, or `restart: never` (omission is
 normalized to `always` before hashing), may declare a positive
 `max_restart_streak`, and may carry a `published_port` in the inclusive range
 1–65535. A missing or null port means the service is portless. A Computer is a
@@ -724,16 +734,41 @@ state (including an already-terminal target), 2 for usage/invalid requests,
 
 ### Service policy stops and CLI
 
-A clean payload exit under `on-failure` records `policy_stop` (a `ProcessResult`
-with `exit_code: 0`) on the service Job. It observes `stopped` while retaining
+A clean payload exit under `on-failure` or `never` records `policy_stop` (a
+`ProcessResult` with `exit_code: 0`). It observes `stopped` while retaining
 operator desired state, binding, and terminal attempt; publication and ordinary
-service capacity are released. Claims check the policy stop inside their
-transaction. The completion replay preserves the original fact and does not
-reapply it after an explicit start/restart. Explicit restart targeting the
-current attempt overrides a zero exit from its TERM handler; a later attempt
-cannot inherit that request. Failure classification and accounting are unchanged.
+service capacity are released. Under `never`, a nonzero payload exit,
+spontaneous signal, or restartable readiness failure observes `failed` and
+records its result as both `policy_stop` and `last_failure`. Policy stops under
+`never` do not increment restart streak or lifetime restart count. Terminal
+spawn/output, image-reconciliation, and removal latches retain their precedence;
+they are not policy stops. Claims check suppression inside their transaction.
+Completion replay preserves the original fact and does not reapply it after
+explicit start/restart. Start may resume a policy-stopped failed service; a
+stronger failed latch still requires restart. Both actions reacquire capacity
+before clearing suppression, and removal refuses both.
 
-`wefty services create --restart=always|on-failure` submits this contract.
+An agent/guardian-requested termination (signal or exit code) is infrastructure,
+never a payload policy stop or `last_failure`. Under `never`, post-start
+infrastructure interruption or OCI runtime loss remains `failed` without
+consuming restart accounting. Pre-start infrastructure completion retains its
+existing per-kind retry rules. An explicit restart targeting the exact attempt
+overrides `never` suppression for payload termination and infrastructure
+interruption; it cannot affect a later attempt. Terminal latches still win.
+
+Lease expiry under `never` leaves a post-start attempt `lost` and its service
+`failed`, without fabricating a payload result, policy stop, or `last_failure`.
+Started means durable OCI `Started` or the process runner start acknowledgement;
+a process renewal or log append that promotes running cannot substitute.
+Pre-start expiry retains today's service requeue rule for both kinds. A durable
+explicit restart for the expiring attempt permits requeue; operator stop and
+stronger latches retain precedence. Expiry increments only `lease_loss_count`,
+once, including suppressed loss; it never increments `restart_streak` or
+`lifetime_restart_count`. A suppressed loss has no restart timer or publication.
+Node return alone cannot requeue it; explicit restart can. Desired state remains
+unchanged in every automatic reaction (ADR-0004).
+
+`wefty services create --restart=always|on-failure|never` submits this contract.
 Service status/list JSON exposes `policy_stop` and `restart_suppressed_reason`;
 the table includes the cause in POLICY STOP. `services create` dispatches typed
 process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch

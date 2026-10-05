@@ -94,7 +94,7 @@ func executeServiceCreate(
 	var publishedPort optionalPortFlag
 	var imageFlags imageFlagSet
 	flags.StringVar(&scriptPath, "script", "", "service script file")
-	flags.StringVar(&restart, "restart", contract.RestartAlways, "service restart policy: always or on-failure")
+	flags.StringVar(&restart, "restart", contract.RestartAlways, "service restart policy: always, on-failure or never")
 	flags.BoolVar(&computer, "computer", false, "create a durable Computer authority")
 	flags.StringVar(&computerName, "name", "", "durable Computer name (requires --computer)")
 	flags.Int64Var(&computerBackupCap, "backup-cap", 0, "maximum retained Computer Backups (requires --computer)")
@@ -111,8 +111,8 @@ func executeServiceCreate(
 	if flags.NArg() != 0 {
 		return usageError("services create does not accept positional arguments")
 	}
-	if restart != contract.RestartAlways && restart != contract.RestartOnFailure {
-		return usageError("--restart must be always or on-failure")
+	if restart != contract.RestartAlways && restart != contract.RestartOnFailure && restart != contract.RestartNever {
+		return usageError("--restart must be always, on-failure or never")
 	}
 	if computer {
 		if restart != contract.RestartAlways {

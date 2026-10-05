@@ -182,7 +182,7 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 		// sent, never a policy stop and never a payload failure.
 		infrastructure = true
 	case result.ExitCode != nil:
-		if *result.ExitCode == 0 && job.Spec.Restart == contract.RestartOnFailure && !restartRequested {
+		if *result.ExitCode == 0 && (job.Spec.Restart == contract.RestartOnFailure || job.Spec.Restart == contract.RestartNever) && !restartRequested {
 			policy.jobState = contract.JobStopped
 			policy.policyStop = lastFailureJSON
 			return policy
@@ -203,6 +203,12 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 	}
 
 	if infrastructure {
+		// Pre-start infrastructure failures retain their retry rules. Once a
+		// payload existed, never leaves an interruption failed without turning
+		// it into a payload policy stop or consuming restart accounting.
+		if job.Spec.Restart == contract.RestartNever && result.SpawnError == nil && !restartRequested {
+			return policy
+		}
 		policy.jobState = contract.JobQueued
 		policy.lifetimeRestartCount++
 		nextRestart := now.Add(prestartRetryDelay(policy.lifetimeRestartCount, s.restartJitter))
@@ -211,6 +217,13 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 		return policy
 	}
 	if !restartable {
+		policy.lastFailure = lastFailureJSON
+		policy.updateLastFailure = true
+		return policy
+	}
+
+	if job.Spec.Restart == contract.RestartNever && !restartRequested {
+		policy.policyStop = lastFailureJSON
 		policy.lastFailure = lastFailureJSON
 		policy.updateLastFailure = true
 		return policy

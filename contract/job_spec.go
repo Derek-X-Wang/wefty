@@ -76,8 +76,8 @@ func ValidateJobSpec(spec *JobSpec) error {
 		if spec.Restart == "" {
 			spec.Restart = RestartAlways
 		}
-		if spec.Restart != RestartAlways && spec.Restart != RestartOnFailure {
-			return invalidJobSpecf("service restart must be %q or %q", RestartAlways, RestartOnFailure)
+		if spec.Restart != RestartAlways && spec.Restart != RestartOnFailure && spec.Restart != RestartNever {
+			return invalidJobSpecf("service restart must be %q, %q or %q", RestartAlways, RestartOnFailure, RestartNever)
 		}
 		if spec.PublishedPort != nil && (*spec.PublishedPort < 1 || *spec.PublishedPort > 65535) {
 			return invalidJobSpecf("published_port must be between 1 and 65535")

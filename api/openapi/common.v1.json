@@ -139,7 +139,7 @@
           },
           "policy_stop": {
             "$ref": "#/components/schemas/ProcessResult",
-            "description": "Ordinary service only. The clean payload exit (exit_code 0 that no agent or guardian termination request produced) observed under restart on-failure. It suppresses automatic claims without changing desired_state. An explicit start or restart clears it, and so does the image-reconciliation failure latch, which records its own last_failure. An operator stop keeps it, so a later start still clears it."
+            "description": "Ordinary service only. A clean payload exit under on-failure or never, or a payload failure (nonzero exit, spontaneous signal, restartable readiness failure) under never. Agent/guardian-requested termination, runtime loss and lease loss are infrastructure, never a policy stop. Clean exit observes stopped; never payload failure observes failed; both release capacity without restart accounting. It suppresses automatic claims without changing desired_state. An explicit start or restart clears it, and so does the image-reconciliation failure latch, which records its own last_failure. An operator stop keeps it, so a later start still clears it."
           },
           "restart_suppressed_reason": {
             "type": "string",
@@ -150,7 +150,7 @@
           "lease_loss_count": {
             "type": "integer",
             "minimum": 0,
-            "description": "Service jobs only. Attempts whose lease expired. A lease loss proves execution authority ended, not that the process failed, so it is counted apart from restarts and drives its own bounded retry backoff."
+            "description": "Service jobs only. Attempts whose lease expired. A lease loss proves execution authority ended, not that the process failed, so it is counted apart from restarts and drives its own bounded retry backoff when requeue is permitted. Under never, loss after durable OCI Started or process start acknowledgement leaves failed without a restart timer, policy_stop or last_failure; legacy process renewal promotion is not start evidence. Pre-start loss retains existing rules; explicit restart for the exact attempt permits requeue."
           },
           "next_restart_at": { "type": "string", "format": "date-time" },
           "published_port": {
