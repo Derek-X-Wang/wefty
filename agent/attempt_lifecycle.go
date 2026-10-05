@@ -357,6 +357,7 @@ func (finalization *attemptFinalization) stop() {
 }
 
 var (
+	errAttemptDirectiveCancel  = errors.New("attempt directive: cancel")
 	errAttemptDirectiveStop    = errors.New("attempt directive: stop")
 	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
 )
@@ -573,9 +574,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 				return destination, err
 			}
 		}
+		if errors.Is(cause, errAttemptDirectiveCancel) {
+			return errorDestinationUnclassified, nil
+		}
 		return errorDestinationUnclassified, ctx.Err()
 	case failure := <-renewalErrors:
-		if errors.Is(failure.err, errAttemptDirectiveStop) || errors.Is(failure.err, errAttemptDirectiveRestart) {
+		if errors.Is(failure.err, errAttemptDirectiveCancel) || errors.Is(failure.err, errAttemptDirectiveStop) || errors.Is(failure.err, errAttemptDirectiveRestart) {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, failure.err)
 			cancelExecution()
 			cancelAttempt(failure.err)
@@ -596,6 +600,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			if completionFailure.err != nil {
 				reconcileCompletion = true
 				return completionFailure.destination, fmt.Errorf("agent: directive completion: %w", completionFailure.err)
+			}
+			if errors.Is(failure.err, errAttemptDirectiveCancel) {
+				return lifecycle.finishCompletedAttempt(context.WithoutCancel(ctx), claim, result, outcome.err)
 			}
 			return errorDestinationUnclassified, nil
 		}
@@ -661,7 +668,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	request := completionRequest(claim, outcome.result, outcome.reapEvidence)
 	completionDone := make(chan destinationError, 1)
 	completionContext := attemptContext
-	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) ||
+	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveCancel) || errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) ||
 		(errors.Is(cause, errOCIIntentDisabled) && claim.Job.Spec.Class != contract.JobClassService) {
 		completionContext = context.WithoutCancel(attemptContext)
 	}
@@ -676,7 +683,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		<-renewalDone
 		if completionFailure.err != nil {
 			reconcileCompletion = true
-			if renewalFailure.err == errAttemptDirectiveStop || renewalFailure.err == errAttemptDirectiveRestart {
+			if renewalFailure.err == errAttemptDirectiveCancel || renewalFailure.err == errAttemptDirectiveStop || renewalFailure.err == errAttemptDirectiveRestart {
 				var abandoned *completionDeliveryAbandoned
 				if lifecycle.dependencies.outbox != nil && errors.As(completionFailure.err, &abandoned) && abandoned.cause == renewalFailure.err {
 					// The result and quiescence evidence were persisted before
@@ -1858,6 +1865,11 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		lease = updated
 		authority = localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(updated.LeaseTTL)}
 		watch.Renewed(authority)
+		if updated.Directive == l1.AttemptDirectiveCancel {
+			deadmanAdmission.terminate()
+			returnWithDirective(failures, errAttemptDirectiveCancel)
+			return
+		}
 		if updated.Directive == l1.AttemptDirectiveStop {
 			deadmanAdmission.terminate()
 			returnWithDirective(failures, errAttemptDirectiveStop)

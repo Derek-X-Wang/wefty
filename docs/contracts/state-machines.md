@@ -1075,25 +1075,36 @@ does not add a job state. L3 projects this job-level outcome as "the L1 job was
 canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
 Cancellation of an L3 Run remains reserved and returns `501`.
 
-### Queued one-shot cancellation (#650)
+### One-shot cancellation (#650, #651)
 
-`POST /v1/jobs/{job_id}/cancel` atomically changes `queued → failed` and
-records job-level `outcome=canceled`. It creates no attempt, result, signal or
-termination cause. A requeued OCI job retains every earlier attempt's evidence;
-that evidence is no longer the job's terminal reason. The terminal transition
-scrubs one-shot secrets by the same trigger as completion and lease loss.
-Claim and cancel serialize in immediate transactions: if cancel commits first,
-claim cannot select the job; if claim wins, cancel is refused without mutation.
-Already-terminal one-shots and retries return the current job unchanged. The
-first committed terminal outcome wins. Cancel does not cascade to children.
+`POST /v1/jobs/{job_id}/cancel` atomically changes a queued one-shot to
+`failed`, with `outcome=canceled`, without inventing an attempt, process result
+or termination cause. A requeued OCI job retains all earlier evidence.
 
-Until #651 and #652 implement active cancellation, `claimed`, `running` and
-reserved `awaiting-input` targets receive HTTP 409 `cancel_not_queued`,
-`retryable=false`, with their state in `error.details.state`, and no mutation.
-Services in every state receive HTTP 409 `cancel_service`, `retryable=false`,
-with `desired_state_path` and `remove_path` in `error.details`; use desired state
-or remove with `class=service`. Cancel requires no body and determines the
-target class itself; the read-route `class` selector is ignored.
+For `claimed`, `running` and reserved `awaiting-input` **process** one-shots,
+cancel reserves `outcome=canceled` inside the immediate transaction and fixes
+a settlement deadline 30 seconds after acceptance. The job remains in its
+current state pending settlement. Retries preserve the original deadline and
+updated timestamp. A completion committed before cancel retains its real
+outcome; a later completion records the actual process result but makes the
+job `failed`/`canceled`, even for a TERM-handler exit zero. Lease loss or
+reconciliation at the deadline settles a silent node as `failed`/`canceled`
+with an attempt `lost`, never a manufactured result or termination confirmation.
+One-shot secret scrubbing uses the same terminal trigger as ordinary completion.
+
+Claim, process start acknowledgement (renewal or logs), renewal, child creation,
+completion and expiry consult cancellation in their committing transactions.
+Pending cancellation forbids acknowledgement of a new start and child creation.
+Existing children are independent and never canceled automatically. Evidence,
+logs and result uploads retain their existing provenance and late-window rules.
+
+Active OCI one-shots remain refused with HTTP 409 `cancel_not_queued`,
+`retryable=false`, and `error.details.state` (#652). Services, including removed
+service tombstones with retained caller authority, receive HTTP 409
+`cancel_service`, with `desired_state_path` and `remove_path`; Computers also
+name `computer_id` and their Computer routes. Older tombstones lacking
+submitter provenance require a current person admin. No request body or class
+selector is required.
 
 ## Instance-key reservation lifetime
 
