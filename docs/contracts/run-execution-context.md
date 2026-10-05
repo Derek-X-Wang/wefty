@@ -1510,7 +1510,8 @@ the authenticated parent Job's namespace, shared across its successive attempts
 and independent of other parents and the inherited root submitter. L1 revalidates
 credential authority inside the creation transaction before replay, conflict or
 creation. Instance-key conflicts disclose a holder only within the credential's
-child-read scope (matching parent Job and originating submitter). Dispatch replay
+replay scope (matching both parent Job and originating submitter), which is
+narrower than the child-read route's parent-Job check. Dispatch replay
 and tombstones resolve before instance-key handling and retain their existing
 scope checks. Keyed children follow the same one-shot release and service removal
 rules as roots. See [the key contract](lease-fencing-dispatch.md#instance-keys).

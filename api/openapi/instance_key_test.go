@@ -48,7 +48,7 @@ func TestChildInstanceKeyContractPublished(t *testing.T) {
 	}
 	route := object(t, object(t, object(t, client["paths"], "paths")["/v1/jobs"], "jobs")["post"], "post")
 	description, _ := route["description"].(string)
-	for _, promise := range []string{"authenticated parent job namespace", "Successive attempts", "creation transaction", "child-read scope", "Dispatch replay keeps its existing"} {
+	for _, promise := range []string{"authenticated parent job namespace", "Successive attempts", "creation transaction", "replay scope", "Dispatch replay keeps its existing"} {
 		if !strings.Contains(description, promise) {
 			t.Fatalf("child submission contract missing %q", promise)
 		}

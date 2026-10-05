@@ -1098,7 +1098,8 @@ target class itself; the read-route `class` selector is ignored.
 ## Instance-key reservation lifetime
 
 An optional Instance key reserves one live job across both classes in the
-submitter's authenticated Fabric namespace. A one-shot keeps it in queued,
+submitter's namespace: the authenticated Fabric identity for a root submission,
+or the authenticated parent Job for a child. A one-shot keeps it in queued,
 claimed, running and awaiting-input, including cancellation pending settlement;
 its terminal succeeded/failed transition (including canceled outcome) releases
 it atomically. A service keeps it in every state, including a policy stop,
