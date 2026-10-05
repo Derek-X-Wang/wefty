@@ -229,8 +229,14 @@ func TestHandoffPublicationOCI(t *testing.T) {
 		published bool
 		reason    contract.ResultUploadSkipReason
 	}{
-		// No mailbox is no read path: nothing was read, nothing uploaded.
-		{"missing_mailbox", false, false, 0, false, ""},
+		// Result capture and publication do not depend on a run mailbox.
+		{"without_mailbox", false, false, 0, true, ""},
+		{"without_mailbox_failed_upload", false, false, http.StatusConflict, false, contract.ResultUploadSkipTransport},
+		{"without_mailbox_absent", false, true, 0, true, contract.ResultUploadSkipAbsent},
+		{"without_mailbox_not_json", false, false, 0, false, contract.ResultUploadSkipNotJSON},
+		{"without_mailbox_not_file", false, false, 0, false, contract.ResultUploadSkipNotFile},
+		{"without_mailbox_oversize", false, false, 0, false, contract.ResultUploadSkipOversize},
+		{"without_mailbox_unreadable", false, false, 0, false, contract.ResultUploadSkipUnreadable},
 		{"failed_after_mailbox_drain", true, false, http.StatusConflict, false, contract.ResultUploadSkipTransport},
 		{"uploaded", true, false, 0, true, ""},
 		{"absent_result_uploaded", true, true, 0, true, contract.ResultUploadSkipAbsent},
@@ -242,8 +248,25 @@ func TestHandoffPublicationOCI(t *testing.T) {
 			claim.Job.Spec.Execution.Env[contract.EnvRunID] = "run_oci_publication"
 			claim.Lease.AttemptID, claim.Lease.FencingToken, claim.Lease.LeaseTTL = "attempt-1", "fence-1", time.Minute
 			claim.SubmittedByRunLedger = tc.captured
+			if !tc.captured {
+				claim.Job.Spec.Execution.Env = nil
+				claim.Job.Spec.Execution.SensitiveEnv = nil
+				claim.Job.Spec.Labels["handoff_owner_run_id"] = "run_oci_publication"
+				delete(claim.Job.Spec.Labels, "run_id")
+			}
 			lifecycle := uploadingLifecycle(t, h.manager, &resultUploadRecorder{status: tc.status}, successfulRetentionRun)
 			runtime := &publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime(), absent: tc.absent}
+			switch tc.name {
+			case "without_mailbox_not_json":
+				runtime.document = []byte("invalid JSON")
+			case "without_mailbox_not_file":
+				runtime.readErr = workloadrunner.ErrRunMailboxEntryUnusable
+			case "without_mailbox_oversize":
+				runtime.document = sizedJSONDocument(maxHandoffFileReadBytes)
+				runtime.truncated = true
+			case "without_mailbox_unreadable":
+				runtime.readErr = errors.New("attempt authority unavailable")
+			}
 			lifecycle.dependencies.runtimes = workloadRuntimeSet{contract.JobKindOCI: runtime}
 			if tc.captured {
 				appender := newRecordingAppender("")
@@ -259,18 +282,18 @@ func TestHandoffPublicationOCI(t *testing.T) {
 			if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			if runtime.resultRead.Load() != tc.captured || !runtime.reaped.Load() {
-				t.Fatal("OCI result capture/reap order did not match mailbox availability")
+			if !runtime.resultRead.Load() || !runtime.reaped.Load() {
+				t.Fatal("OCI result was not captured before reap")
 			}
 			record, found, err := h.manager.readOCIRecord("run_oci_publication")
 			if err != nil || !found || record.evidenceReachedLedger() != tc.published {
 				t.Fatalf("OCI publication = %+v, found=%t err=%v", record, found, err)
 			}
 			upload, found, err := h.manager.readUploadRecord("run_oci_publication")
-			if err != nil || found != tc.captured {
+			if err != nil || !found {
 				t.Fatalf("capture/upload availability = %+v found=%t err=%v", upload, found, err)
 			}
-			if tc.captured && (upload.Uploaded != (tc.published && tc.reason == "") || upload.Reason != tc.reason || !upload.MailboxDrained) {
+			if upload.Uploaded != (tc.published && tc.reason == "") || upload.Reason != tc.reason || !upload.MailboxDrained {
 				t.Fatalf("upload fact = %+v", upload)
 			}
 			h.manager.ociHandoffs = &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
@@ -519,7 +542,10 @@ type publicationOCIRuntime struct {
 	*fakeRunMailboxRuntime
 	reaped, resultRead atomic.Bool
 	// absent makes the volume hold no result.json at all.
-	absent bool
+	absent    bool
+	document  []byte
+	truncated bool
+	readErr   error
 }
 
 func (r *publicationOCIRuntime) ReadRunMailbox(ctx context.Context, ref workloadrunner.RunMailboxReference, name string, limit int) ([]byte, bool, error) {
@@ -531,10 +557,32 @@ func (r *publicationOCIRuntime) ReadRunMailbox(ctx context.Context, ref workload
 		if r.absent {
 			return nil, false, fs.ErrNotExist
 		}
+		if r.readErr != nil {
+			return nil, false, r.readErr
+		}
+		if r.document != nil {
+			return r.document, r.truncated, nil
+		}
 		return []byte(`{"ok":true}`), false, nil
 	}
 	return r.fakeRunMailboxRuntime.ReadRunMailbox(ctx, ref, name, limit)
 }
+func (r *publicationOCIRuntime) ReadHandoffFile(ctx context.Context, ref workloadrunner.HandoffFileReference, name string, limit int) ([]byte, bool, error) {
+	if ref.Authority != r.request.Authority || ref.OwnerKey != handoffOwnerRunIDFromRequest(r.request) {
+		return nil, false, errors.New("handoff reader did not carry admitted attempt and owner")
+	}
+	return r.ReadRunMailbox(ctx, workloadrunner.RunMailboxReference{Authority: ref.Authority, OwnerKey: ref.OwnerKey, Scope: workloadrunner.RunMailboxScopeHandoffFiles}, name, limit)
+}
+
+func handoffOwnerRunIDFromRequest(request workloadrunner.Request) string {
+	for _, volume := range request.ManagedVolumes {
+		if volume.Kind == workloadrunner.ManagedVolumeHandoff {
+			return volume.OwnerKey
+		}
+	}
+	return ""
+}
+
 func (r *publicationOCIRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
 	r.reaped.Store(true)
 	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
