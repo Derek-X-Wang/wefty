@@ -84,10 +84,10 @@ resumable.
 | --- | --- | --- |
 | `queued` | No live attempt. Initial, restart-ready, or waiting until `next_restart_at`. | `claimed`, `stopped`, `failed`, `removal_pending` |
 | `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
-| `running` | OCI acknowledged Started, or process renewal/logging promoted the attempt. Process runner start acknowledgement is stored separately. | `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
+| `running` | OCI acknowledged Started, or process start acknowledgement, renewal, or logging promoted the attempt. Only the process start acknowledgement stores the durable start marker. | `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
 | `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed`, `removal_pending` |
 | `stopped` | No live attempt remains: operator stop, or an observed policy stop with desired state preserved. | `queued` through explicit operator start or restart only; `failed` through the image-reconciliation latch; `removal_pending` |
-| `failed` | Payload failure under never, lost post-start authority, a terminal latch, or unconfirmed quiescence. | `queued` through explicit restart; explicit start also resumes a policy stop; `removal_pending` |
+| `failed` | Payload failure under never, lost post-start authority, a terminal latch, or unconfirmed quiescence. | `queued` through explicit restart; explicit start also resumes a policy stop or automatically-failed never service; `removal_pending` |
 | `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified`, `stalled_cleanup_unverified` |
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
 | `removed_verified` | Cleanup was proven. An ordinary service deleted its remaining attempt/service rows and committed the verified tombstone; a Computer-projecting Job is finalized in place and keeps its Job and removal rows. Terminal. | none |
@@ -116,12 +116,16 @@ restart accounting. Incomplete logs do not change the payload result.
 
 An agent/guardian-requested exit or signal is an infrastructure interruption,
 never a payload policy stop, even when a TERM handler exits zero. `never` leaves
-post-start interruption or OCI runtime loss `failed` with no restart accounting
-or payload `last_failure`. Pre-start infrastructure completion retains its
+post-start interruption or OCI runtime loss `failed` with no restart accounting.
+The completion fact is exposed as `last_failure`; it remains infrastructure
+rather than a payload policy stop. Pre-start infrastructure completion retains its
 existing per-kind rules. The binding and terminal attempt remain; desired
 state is never changed by this reaction (ADR-0004). Policy suppression survives
 reopen and prevents claims until explicit start/restart clears it and reacquires
-capacity. Start also accepts `failed` with a policy stop. Image reconciliation
+capacity. Start accepts any automatically-failed `never` service, including
+post-start lease loss and agent/guardian interruption, while preserving restart
+and lease-loss counters. Suppression names the current attempt's cause rather
+than a generic failed latch. Image reconciliation
 clears suppression and records its own stronger failure; terminal spawn/output
 and removal latches keep precedence. An operator stop retains the policy stop.
 
@@ -951,7 +955,8 @@ returned. Its initiator rows are explicit:
 | `exit_code` with no initiator otherwise, or `signal` with `termination_cause` `spontaneous` | Restartable payload failure with backoff and the streak limit. | +1 |
 | Clean payload exit under `never`, no explicit restart | Policy stop, observed stopped, desired state retained. | unchanged |
 | Nonzero payload exit, spontaneous signal, or restartable readiness failure under `never`, no explicit restart | Failed plus policy stop and last failure, no requeue. | unchanged |
-| Agent/guardian signal or requested exit code, or OCI runtime loss under `never`, no explicit restart | Failed infrastructure interruption; no policy stop or payload last failure. | unchanged |
+| Agent/guardian signal or requested exit code, published-listener failure, or OCI runtime loss under `never`, durable start marker present, no explicit restart | Failed infrastructure interruption; completion fact in last failure, no policy stop or retry timer. Explicit start or restart may resume. | unchanged |
+| Infrastructure completion under `never`, no durable start marker | Existing per-kind infrastructure retry, even if process renewal/logging promoted running. | unchanged |
 | Payload termination or infrastructure interruption under `never`, explicit restart for this attempt | Existing payload or infrastructure retry classification; restart wins, terminal latches still win. | +1 payload; unchanged infrastructure |
 
 A stop the operator asked for (desired `stopped` or `stopping`) is classified
@@ -975,6 +980,13 @@ for, including its own shutdown, as an unmarked `exit_code: 0`. Under
 `on-failure` that records a policy stop, and the service stays stopped until an
 operator starts or restarts it; only an explicit restart directive for the
 attempt is still recognized without the field.
+
+The same coordinated L1/agent upgrade is required for `never` process start
+protection (#649). It relies on the acknowledging agent's fenced `/started`
+request. A pre-#649 agent never records that marker, so a process whose payload
+actually started still follows pre-start retry rules after lease loss or
+infrastructure completion. There is no capability gate; upgrade L1 and agents
+together before relying on post-start suppression.
 
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:

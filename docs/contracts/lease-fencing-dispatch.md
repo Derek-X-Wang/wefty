@@ -739,19 +739,25 @@ A clean payload exit under `on-failure` or `never` records `policy_stop` (a
 operator desired state, binding, and terminal attempt; publication and ordinary
 service capacity are released. Under `never`, a nonzero payload exit,
 spontaneous signal, or restartable readiness failure observes `failed` and
-records its result as both `policy_stop` and `last_failure`. Policy stops under
+records the full `ProcessResult` as `policy_stop` and the failure as
+`last_failure` (a bare `SpawnFailure` for a readiness failure). Policy stops under
 `never` do not increment restart streak or lifetime restart count. Terminal
 spawn/output, image-reconciliation, and removal latches retain their precedence;
 they are not policy stops. Claims check suppression inside their transaction.
 Completion replay preserves the original fact and does not reapply it after
-explicit start/restart. Start may resume a policy-stopped failed service; a
-stronger failed latch still requires restart. Both actions reacquire capacity
+explicit start/restart. Start may resume any automatically-failed `never`
+service, including post-start lease loss or agent/guardian interruption. Terminal
+spawn/output and image-reconciliation latches still require restart. Both
+actions reacquire capacity
 before clearing suppression, and removal refuses both.
 
 An agent/guardian-requested termination (signal or exit code) is infrastructure,
-never a payload policy stop or `last_failure`. Under `never`, post-start
-infrastructure interruption or OCI runtime loss remains `failed` without
-consuming restart accounting. Pre-start infrastructure completion retains its
+never a payload policy stop. Under `never`, post-start infrastructure
+interruption, published-listener failure, or OCI runtime loss remains `failed`
+without consuming restart accounting; `last_failure` exposes that completion
+fact. The durable start marker decides pre-start versus post-start, regardless
+of which result arm carries the failure. Pre-start infrastructure completion
+retains its
 existing per-kind retry rules. An explicit restart targeting the exact attempt
 overrides `never` suppression for payload termination and infrastructure
 interruption; it cannot affect a later attempt. Terminal latches still win.
@@ -765,12 +771,13 @@ explicit restart for the expiring attempt permits requeue; operator stop and
 stronger latches retain precedence. Expiry increments only `lease_loss_count`,
 once, including suppressed loss; it never increments `restart_streak` or
 `lifetime_restart_count`. A suppressed loss has no restart timer or publication.
-Node return alone cannot requeue it; explicit restart can. Desired state remains
-unchanged in every automatic reaction (ADR-0004).
+Node return alone cannot requeue it; explicit start or restart can. Desired
+state remains unchanged in every automatic reaction (ADR-0004).
 
 `wefty services create --restart=always|on-failure|never` submits this contract.
-Service status/list JSON exposes `policy_stop` and `restart_suppressed_reason`;
-the table includes the cause in POLICY STOP. `services create` dispatches typed
+Service status/list JSON exposes `policy_stop`, `last_failure` where there is
+completion evidence, and `restart_suppressed_reason` naming the current cause
+(for example, attempt lease loss); the table includes the cause in POLICY STOP. `services create` dispatches typed
 process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch
 key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
 remain explicitly always-only, including the `--computer` compatibility alias.

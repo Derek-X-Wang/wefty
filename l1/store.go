@@ -4170,7 +4170,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err != nil {
 			return CompletionOutcome{}, err
 		}
-		policy := s.classifyServiceCompletion(jobBeforeCompletion, request, lastFailureJSON, now, directive == AttemptDirectiveRestart)
+		policy := s.classifyServiceCompletion(jobBeforeCompletion, request, resultJSON, lastFailureJSON, now, attempt.startedNS.Valid, directive == AttemptDirectiveRestart)
 		servicePolicy = &policy
 		finalJobState = policy.jobState
 		finalAttemptState = policy.attemptState

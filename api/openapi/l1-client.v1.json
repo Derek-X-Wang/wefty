@@ -474,7 +474,7 @@
       "put": {
         "operationId": "setServiceDesiredState",
         "summary": "Start or stop a service by setting durable desired state",
-        "description": "The mutation is idempotent and asynchronous. Running clears a policy stop and reacquires capacity before queuing a fresh attempt. It does not disturb a healthy attempt; a failed service with a never policy stop may also start, while a stronger latched failure rejects start and requires restart.",
+        "description": "The mutation is idempotent and asynchronous. Running clears a policy stop and reacquires capacity before queuing a fresh attempt. It does not disturb a healthy attempt; any automatically-failed never service may also start, including post-start lease loss or agent/guardian interruption. Start preserves restart and lease-loss counters. Terminal spawn/output, image-reconciliation and removal latches keep precedence; stronger failed latches require restart.",
         "parameters": [
           { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
         ],

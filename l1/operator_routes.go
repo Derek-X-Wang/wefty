@@ -186,7 +186,11 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 	case contract.ServiceDesiredRunning:
 		switch job.State {
 		case contract.JobFailed, contract.JobStopped:
-			if job.State == contract.JobFailed && job.PolicyStop == nil {
+			_, resumable, err := neverAutomaticFailureCause(ctx, tx, job)
+			if err != nil {
+				return Job{}, err
+			}
+			if job.State == contract.JobFailed && job.PolicyStop == nil && !resumable {
 				return Job{}, protocolError(contract.ErrorConflict, "service job %q is latched failed; use restart", jobID)
 			}
 			if !job.HoldsSlot(job.State) {
@@ -390,6 +394,49 @@ func ensureBoundServiceCapacity(ctx context.Context, tx *sql.Tx, job Job) error 
 	return nil
 }
 
+// neverAutomaticFailureCause uses the current attempt, not historical last_failure,
+// so an older failure cannot mask a lease loss or bypass a newer terminal latch.
+// Image reconciliation clears the current attempt and therefore keeps precedence.
+func neverAutomaticFailureCause(ctx context.Context, q queryer, job Job) (string, bool, error) {
+	if job.ServiceJob == nil || job.Spec.Restart != contract.RestartNever || job.State != contract.JobFailed || job.Removal != nil || job.CurrentAttemptID == "" {
+		return "", false, nil
+	}
+	var state contract.AttemptState
+	var raw []byte
+	if err := q.QueryRowContext(ctx, "SELECT state, result_json FROM attempts WHERE attempt_id=? AND job_id=?", job.CurrentAttemptID, job.JobID).Scan(&state, &raw); err != nil {
+		return "", false, internalError(err, "read never service failure cause")
+	}
+	if state == contract.AttemptLost {
+		return "attempt lease lost", true, nil
+	}
+	var result ProcessResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", false, internalError(err, "decode never service failure cause")
+	}
+	switch {
+	case result.SpawnError != nil:
+		if classifySpawnFailure(result.SpawnError.Code) == failureInfrastructure &&
+			(result.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable || job.Spec.Kind == contract.JobKindOCI) {
+			return string(result.SpawnError.Code) + ": " + result.SpawnError.Message, true, nil
+		}
+	case result.OutputError != "":
+		// Durable-output failures remain terminal latches.
+	case result.RuntimeFailure != nil:
+		if job.Spec.Kind == contract.JobKindOCI && classifyRuntimeFailure(result.RuntimeFailure.Code) == failureInfrastructure {
+			return string(result.RuntimeFailure.Code) + ": " + result.RuntimeFailure.Message, true, nil
+		}
+	case result.Signal != "":
+		if result.TerminationCause == contract.TerminationCauseAgent || result.TerminationCause == contract.TerminationCauseGuardian {
+			return string(result.TerminationCause) + " interruption", true, nil
+		}
+	case result.ExitCode != nil && job.PolicyStop == nil:
+		// Requested exits persist the exit result; the completion initiator is
+		// not part of ProcessResult. A payload's own exit records a policy stop.
+		return "agent or guardian interruption", true, nil
+	}
+	return "", false, nil
+}
+
 func (s *Store) projectJob(ctx context.Context, job Job) (Job, error) {
 	if job.ServiceJob != nil || job.Removal != nil {
 		return s.projectServiceJob(ctx, job)
@@ -425,7 +472,13 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 			service.RestartSuppressed = "policy stop: never payload ended; use start or restart"
 		}
 	} else if job.State == contract.JobFailed {
-		if job.Spec.MaxRestartStreak != nil && service.RestartStreak >= *job.Spec.MaxRestartStreak {
+		cause, resumable, err := neverAutomaticFailureCause(ctx, s.db, job)
+		if err != nil {
+			return Job{}, err
+		}
+		if resumable {
+			service.RestartSuppressed = "never: " + cause + "; use start or restart"
+		} else if job.Spec.MaxRestartStreak != nil && service.RestartStreak >= *job.Spec.MaxRestartStreak {
 			service.RestartSuppressed = fmt.Sprintf("max restart streak reached: %d/%d; use restart", service.RestartStreak, *job.Spec.MaxRestartStreak)
 		} else {
 			service.RestartSuppressed = "failure is latched; use restart"

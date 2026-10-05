@@ -228,7 +228,7 @@ func TestOnFailureCompletionPrecedence(t *testing.T) {
 			// Use completion through the store for restart precedence; this classifier
 			// row tests that terminal arms still precede a clean exit.
 			completion := CompletionRequest{Result: tc.result, RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt, TerminationInitiator: tc.initiator}
-			p := s.classifyServiceCompletion(job, completion, raw, time.Unix(100, 0), false)
+			p := s.classifyServiceCompletion(job, completion, raw, raw, time.Unix(100, 0), true, false)
 			if p.jobState != tc.want || p.restartStreak != tc.streak || p.lifetimeRestartCount != tc.lifetime {
 				t.Fatalf("policy = %+v", p)
 			}

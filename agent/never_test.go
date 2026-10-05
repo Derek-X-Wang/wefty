@@ -170,10 +170,11 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 			if stopped.State != want || stopped.DesiredState != contract.ServiceDesiredRunning || stopped.PolicyStop.ExitCode == nil || *stopped.PolicyStop.ExitCode != code || stopped.HoldsSlot(stopped.State) {
 				t.Fatalf("payload verdict = %+v", stopped)
 			}
-			time.Sleep(50 * time.Millisecond)
-			retained := call(http.MethodGet, "/v1/jobs/"+job.JobID+"?class=service", nil, http.StatusOK)
-			if retained.State != want || retained.CurrentAttemptID != stopped.CurrentAttemptID {
-				t.Fatalf("automatic requeue = %+v", retained)
+			// L1 queues automatic retries immediately with a durable timer. A
+			// terminal state with no timer and no restart accounting proves
+			// suppression without waiting through a backoff window.
+			if stopped.NextRestartAt != nil || stopped.RestartStreak != 0 || stopped.LifetimeRestartCount != 0 || stopped.LeaseLossCount != 0 {
+				t.Fatalf("automatic retry scheduled = %+v", stopped.ServiceJob)
 			}
 			if code == 0 {
 				call(http.MethodPut, "/v1/jobs/"+job.JobID+"/desired-state?class=service", l1.ServiceDesiredStateRequest{DesiredState: contract.ServiceDesiredRunning}, http.StatusAccepted)
