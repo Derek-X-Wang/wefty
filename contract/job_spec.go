@@ -30,6 +30,20 @@ func ValidateJobSpec(spec *JobSpec) error {
 		utf8.RuneCountInString(spec.Class) > 128 || utf8.RuneCountInString(spec.RuntimeHandler) > 128 {
 		return invalidJobSpecf("job identifier fields exceed contract limits")
 	}
+	if spec.instanceKeySet && spec.InstanceKey == nil {
+		return invalidJobSpecf("instance_key cannot be null; omit it for an unkeyed job")
+	}
+	if spec.InstanceKey != nil {
+		if err := ValidateInstanceKey(*spec.InstanceKey); err != nil {
+			return err
+		}
+		if spec.Class != JobClassOneShot && spec.Class != JobClassService {
+			return invalidJobSpecf("instance_key requires class one-shot or service")
+		}
+		if IsComputerExecution(spec.Execution) {
+			return invalidJobSpecf("instance_key is forbidden for Computers")
+		}
+	}
 	spec.Kind = strings.ToLower(strings.TrimSpace(spec.Kind))
 	spec.RuntimeHandler = strings.ToLower(strings.TrimSpace(spec.RuntimeHandler))
 	if strings.IndexFunc(spec.Kind, unicode.IsSpace) >= 0 || strings.IndexFunc(spec.RuntimeHandler, unicode.IsSpace) >= 0 {
@@ -364,4 +378,19 @@ func validRoutingTag(tag string) bool {
 		return false
 	}
 	return true
+}
+
+// ValidateInstanceKey uses identity normalization: keys are case-sensitive and
+// never trimmed or folded. Restricting them to visible ASCII makes byte and
+// character bounds identical across the Go and JSON Schema contracts.
+func ValidateInstanceKey(key string) error {
+	if len(key) < 1 || len(key) > 255 {
+		return invalidJobSpecf("instance_key must contain between 1 and 255 visible ASCII characters")
+	}
+	for i := range len(key) {
+		if key[i] < 0x21 || key[i] > 0x7e {
+			return invalidJobSpecf("instance_key must contain only visible ASCII characters (no whitespace)")
+		}
+	}
+	return nil
 }
