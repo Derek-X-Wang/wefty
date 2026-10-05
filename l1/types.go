@@ -79,7 +79,9 @@ type Job struct {
 	ComputerID string            `json:"computer_id,omitempty"`
 	NodeID     string            `json:"node_id,omitempty"`
 	State      contract.JobState `json:"state"`
-	Status     string            `json:"status,omitempty"`
+	// Outcome is a job-level decision, never an invented process result.
+	Outcome contract.JobOutcome `json:"outcome,omitempty"`
+	Status  string              `json:"status,omitempty"`
 	// Spec is absent once removal has finalized because tombstones deliberately
 	// retain no executable or environment bytes.
 	Spec             contract.JobSpec `json:"spec,omitzero"`

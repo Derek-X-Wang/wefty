@@ -440,7 +440,7 @@ var runBridgeRoutes = []bridgeRoute{
 }
 
 // controlPlaneHandler restricts the attempt-credential surface to the exact
-// three routes L1 publishes for it. L1 refuses everything else anyway, since
+// routes L1 publishes for it. L1 refuses everything else anyway, since
 // the agent's Fabric identity reaches no client route without a credential;
 // this is the transport-side half of the same statement.
 func (b *workflowBridge) controlPlaneHandler(next http.Handler) http.Handler {
@@ -463,6 +463,7 @@ var attemptCredentialBridgeRoutes = []bridgeRoute{
 	{Method: http.MethodPost, Path: "/v1/jobs"},
 	{Method: http.MethodGet, Path: "/v1/jobs/{job_id}"},
 	{Method: http.MethodGet, Path: "/v1/jobs/{job_id}/children"},
+	{Method: http.MethodPost, Path: "/v1/jobs/{job_id}/cancel"},
 }
 
 func bridgeRouteAllowed(routes []bridgeRoute, method, path string) bool {

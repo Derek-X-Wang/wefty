@@ -205,8 +205,8 @@ it.
 
 ## Attempt-credential authentication and scope
 
-`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, and `GET /v1/jobs/{job_id}/children`
-accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
+`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/children`, and
+`POST /v1/jobs/{job_id}/cancel` (for the parent's own children) accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
 `WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
 attempt and stores only its SHA-256 digest.
 
@@ -218,9 +218,9 @@ every claim and authenticates it identically whether or not the agent handed it
 to the workload. Withholding it removes only the workload's copy.
 
 The credential authorizes exactly
-three things: submitting a child job, reading its own job, and listing and
-reading that job's children. No other route accepts it, so no operator-level
-action is reachable with it; the service collection read `GET /v1/jobs` is
+four things: submitting a child job, reading its own job, listing and
+reading that job's children, and canceling a queued one-shot child. No other
+route accepts it, so no operator-level action is reachable with it; the service collection read `GET /v1/jobs` is
 refused with `principal_forbidden` like every other job route.
 
 Reads follow the ordinary class-selector rule rather than a credential-specific
@@ -229,6 +229,15 @@ absent when it is a one-shot, exactly as for a client principal. A job that is
 neither the credential's own nor one of its children receives `forbidden`, and
 so does a job ID that does not exist, so the route cannot be used to discover
 which jobs are present.
+
+The credential also authorizes `POST /v1/jobs/{job_id}/cancel` for its immediate
+children only, revalidated inside the cancellation transaction. Its own job,
+unrelated jobs, grandchildren and unknown IDs receive `not_found`, even when
+their originating submitter is the same. The workflow bridge's `/l1` allowlist
+includes this exact method/path. A queued child becomes `failed` with job-level
+`outcome=canceled`; no attempt or signal is invented. Services receive
+`cancel_service`; claimed, running and awaiting-input children receive
+`cancel_not_queued` until #651/#652. Neither refusal mutates the target.
 
 Parent job, parent attempt, and originating submitter are derived from the
 credential and can never be supplied by the caller: they live on the job
