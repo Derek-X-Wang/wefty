@@ -137,7 +137,7 @@ func TestCancelRefusalsAndTerminalReplay(t *testing.T) {
 	if err := json.Unmarshal(body, &refusal); err != nil {
 		t.Fatal(err)
 	}
-	if refusal.Error.Retryable || refusal.Error.Details["desired_state_path"] != "/v1/jobs/"+service.JobID+"/desired-state" || refusal.Error.Details["remove_path"] != "/v1/jobs/"+service.JobID+"/remove" {
+	if refusal.Error.Retryable || refusal.Error.Details["desired_state_path"] != "/v1/jobs/"+service.JobID+"/desired-state?class=service" || refusal.Error.Details["remove_path"] != "/v1/jobs/"+service.JobID+"/remove?class=service" {
 		t.Fatalf("refusal=%s", body)
 	}
 	after, err := h.store.GetJob(t.Context(), service.JobID)

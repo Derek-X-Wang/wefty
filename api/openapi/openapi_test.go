@@ -852,7 +852,7 @@ func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
 }
 
 // The attempt credential is published as a per-operation alternative on the
-// three routes it reaches. Document-level security stays Fabric identity alone
+// four routes it reaches. Document-level security stays Fabric identity alone
 // for both L1 protocols, so no route becomes credential-authorizable by
 // omission.
 func TestL1PublishesAttemptCredentialSurface(t *testing.T) {

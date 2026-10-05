@@ -205,8 +205,8 @@ it.
 
 ## Attempt-credential authentication and scope
 
-`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, and `GET /v1/jobs/{job_id}/children`
-accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
+`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/children`, and
+`POST /v1/jobs/{job_id}/cancel` (for the parent's own children) accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
 `WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
 attempt and stores only its SHA-256 digest.
 

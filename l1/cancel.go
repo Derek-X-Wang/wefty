@@ -58,10 +58,24 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 		return Job{}, protocolError(contract.ErrorNotFound, "job was not found")
 	}
 	if job.Spec.Class == contract.JobClassService {
-		return Job{}, protocolErrorWithDetails(contract.ErrorCancelService, map[string]any{
-			"desired_state_path": "/v1/jobs/" + jobID + "/desired-state",
-			"remove_path":        "/v1/jobs/" + jobID + "/remove",
-		}, "services cannot be canceled; use desired state or remove")
+		// Point at the routes that actually govern this service: a Computer's
+		// job answers only through its Computer resource, and the job routes
+		// need the explicit service class selector.
+		details := map[string]any{
+			"desired_state_path": "/v1/jobs/" + jobID + "/desired-state?class=service",
+			"remove_path":        "/v1/jobs/" + jobID + "/remove?class=service",
+		}
+		if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+			return Job{}, mapErr
+		} else if mapped {
+			details = map[string]any{
+				"computer_id":        computerID,
+				"desired_state_path": "/v1/computers/" + computerID + "/desired-state",
+				"remove_path":        "/v1/computers/" + computerID + "/remove",
+			}
+		}
+		return Job{}, protocolErrorWithDetails(contract.ErrorCancelService, details,
+			"services cannot be canceled; use desired state or remove")
 	}
 	switch job.State {
 	case contract.JobSucceeded, contract.JobFailed:
