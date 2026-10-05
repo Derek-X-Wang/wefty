@@ -674,13 +674,25 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		completionContext = context.WithoutCancel(attemptContext)
 	}
 	go func() { completionDone <- lifecycle.completeWithRetry(completionContext, claim, request) }()
+	// A heartbeat may cancel the resident directly after execution has already
+	// finished, without a renewal error. Join the abandoned delivery and retry
+	// the identical completion now, inside the original settlement window.
+	retryCanceledDelivery := func(failure destinationError) destinationError {
+		var abandoned *completionDeliveryAbandoned
+		if errors.As(failure.err, &abandoned) && errors.Is(abandoned.cause, errAttemptDirectiveCancel) {
+			deliveryContext, cancel := context.WithTimeout(context.WithoutCancel(attemptContext), lifecycle.dependencies.client.operationTimeout)
+			defer cancel()
+			return lifecycle.completeWithRetry(deliveryContext, claim, request)
+		}
+		return failure
+	}
 	var completionFailure destinationError
 	select {
 	case completionFailure = <-completionDone:
 		cancelAttempt(nil)
 	case renewalFailure := <-renewalErrors:
 		cancelAttempt(renewalFailure.err)
-		completionFailure = <-completionDone
+		completionFailure = retryCanceledDelivery(<-completionDone)
 		<-renewalDone
 		if completionFailure.err != nil {
 			reconcileCompletion = true
@@ -706,14 +718,24 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		reconcileCompletion = true
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while completing: %w", err)
 	case <-ctx.Done():
-		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, ctx.Err())
-		cancelAttempt(ctx.Err())
-		<-completionDone
+		cause := context.Cause(ctx)
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
+		cancelAttempt(cause)
+		completionFailure = <-completionDone
 		<-renewalDone
+		if errors.Is(cause, errAttemptDirectiveCancel) {
+			completionFailure = retryCanceledDelivery(completionFailure)
+			if completionFailure.err == nil {
+				return lifecycle.finishCompletedAttempt(context.WithoutCancel(ctx), claim, outcome.result, outcome.err)
+			}
+			reconcileCompletion = true
+			return completionFailure.destination, fmt.Errorf("agent: cancel while completing: %w", completionFailure.err)
+		}
 		reconcileCompletion = true
 		return errorDestinationUnclassified, ctx.Err()
 	}
 	<-renewalDone
+	completionFailure = retryCanceledDelivery(completionFailure)
 	if errors.Is(completionFailure.err, errOCIIntentDisabled) {
 		return errorDestinationUnclassified, nil
 	}
@@ -858,7 +880,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 }
 
 func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
-	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
+	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.RuntimeFailure == nil && result.OutputError == "" {
 		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
 	}
 	return result
@@ -976,6 +998,14 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		request.OCIImageResolved = observeImage
 		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
+			// The helper already proved payload start. Cancellation must not
+			// abandon a response for a Started transaction that committed: L1
+			// still arbitrates cancel-before-start versus durable-start replay.
+			if claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.client != nil {
+				boundedContext, cancelStart := context.WithTimeout(context.WithoutCancel(startContext), lifecycle.dependencies.client.operationTimeout)
+				defer cancelStart()
+				startContext = boundedContext
+			}
 			if err := observeImage(startContext, observation); err != nil {
 				return err
 			}

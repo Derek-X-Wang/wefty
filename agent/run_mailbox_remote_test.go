@@ -548,3 +548,20 @@ func sizedJSONDocument(size int) []byte {
 	}
 	return append(document, `"}`...)
 }
+
+func TestRemoteRunMailboxUsesResolvedExecutionOwner(t *testing.T) {
+	claim := remoteMailboxClaim("")
+	claim.Job.Spec.Labels = nil
+	claim.Job.JobID = "job-direct-mailbox"
+	runtime := newFakeRunMailboxRuntime()
+	authority := workloadrunner.AttemptAuthority{NodeID: "node-1", BootSessionID: "boot-1", JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken, WorkloadClass: contract.JobClassOneShot}
+	mailbox, err := prepareRemoteRunMailbox(claim, t.TempDir(), runtime, authority, newRecordingAppender(""), time.Hour, newManualClock(mailboxTestClockOrigin), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mailbox.close()
+	fs := mailbox.fs.(*helperMailboxFS)
+	if fs.reference.OwnerKey != claim.Job.JobID {
+		t.Fatalf("remote reader owner=%q want=%q", fs.reference.OwnerKey, claim.Job.JobID)
+	}
+}

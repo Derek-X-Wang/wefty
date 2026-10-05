@@ -297,7 +297,11 @@ func TestCancelOrderedCompletionExpiryAndChildRaces(t *testing.T) {
 					t.Fatalf("cascade=%+v %v", got, err)
 				}
 			}
-			if _, err := create(); errorCode(err) != contract.ErrorUnauthorized {
+			if replay, err := create(); first == "child" {
+				if err != nil || replay.JobID != child.JobID {
+					t.Fatalf("child replay=%+v %v", replay, err)
+				}
+			} else if errorCode(err) != contract.ErrorUnauthorized {
 				t.Fatalf("stale creation authority=%v", err)
 			}
 			if first == "cancel" {
@@ -358,170 +362,172 @@ func TestCancelRemovedServiceAndComputerRefusals(t *testing.T) {
 // is held. Launch the competing operation before releasing it, so both commit
 // orders are deterministic instead of depending on scheduler luck.
 func TestCancelDeterministicTransactionRaces(t *testing.T) {
-	for _, operation := range []string{"claim", "started", "renew", "logs", "child", "completion", "expiry"} {
-		for _, cancelFirst := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s/cancel-first=%t", operation, cancelFirst), func(t *testing.T) {
-				h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{"node-1": DefaultNodePolicy()}, true, time.Hour)
-				client := h.client(fabric.Identity{NodeID: "race-submitter", Tags: []string{DefaultClientPrincipalTag}})
-				agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
-				node := h.register(agent, "node-1")
-				job := h.submit(client, "transaction-race", nil)
-				var claim *Claim
-				var scope AttemptCredentialScope
-				var err error
-				if operation != "claim" {
-					won := claimClass(t, h, agent, node, contract.JobClassOneShot)
-					claim = &won
-					scope, err = h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, "node-1")
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-				if operation == "expiry" {
-					h.clock.Advance(30 * time.Second)
-				}
-				now := h.clock.Now()
-				entered, release := make(chan struct{}), make(chan struct{})
-				var reads atomic.Int32
-				h.store.clock = ClockFunc(func() time.Time {
-					if reads.Add(1) == 1 {
-						close(entered)
-						<-release
-					}
-					return now
-				})
-				var canceled Job
-				var cancelErr, rivalErr error
-				var renewed AttemptLease
-				var child Job
-				cancel := func() {
-					canceled, cancelErr = h.store.CancelJob(t.Context(), job.JobID, JobCancelCaller{Submitter: "race-submitter"})
-				}
-				rival := func() {
-					switch operation {
-					case "claim":
-						claim, rivalErr = h.store.ClaimJob(t.Context(), "node-1", node.NodeID, node.BootSessionID, contract.JobClassOneShot)
-					case "renew", "expiry":
-						renewed, rivalErr = h.store.RenewLease(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken)
-					case "started":
-						_, rivalErr = h.store.StartAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken})
-					case "logs":
-						_, rivalErr = h.store.AppendLogs(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("acknowledgement"))}})
-					case "child":
-						child, _, rivalErr = h.store.CreateJobAs(t.Context(), validJobSpec("race-child", nil), JobOrigin{Parent: &scope})
-					case "completion":
-						zero := 0
-						_, rivalErr = h.store.CompleteAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "race-complete", Result: ProcessResult{ExitCode: &zero}})
-					}
-				}
-				first, second := cancel, rival
-				if !cancelFirst {
-					first, second = rival, cancel
-				}
-				firstDone, secondDone := make(chan struct{}), make(chan struct{})
-				go func() { defer close(firstDone); first() }()
-				<-entered
-				go func() { defer close(secondDone); second() }()
-				close(release)
-				<-firstDone
-				<-secondDone
-				h.store.clock = h.clock
-				if cancelErr != nil {
-					t.Fatal(cancelErr)
-				}
-				if operation == "started" && cancelFirst {
-					if errorCode(rivalErr) != contract.ErrorConflict {
-						t.Fatalf("start committed after cancel=%v", rivalErr)
-					}
-				} else if operation == "child" && cancelFirst {
-					if errorCode(rivalErr) != contract.ErrorUnauthorized {
-						t.Fatalf("child committed after cancel=%+v %v", child, rivalErr)
-					}
-				} else if operation == "expiry" {
-					if errorCode(rivalErr) != contract.ErrorLeaseExpired {
-						t.Fatalf("expiry error=%v", rivalErr)
-					}
-				} else if rivalErr != nil {
-					t.Fatal(rivalErr)
-				}
-				got, err := h.store.GetJob(t.Context(), job.JobID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if (operation == "completion" || operation == "expiry") && !cancelFirst {
-					want := contract.JobSucceeded
-					if operation == "expiry" {
-						want = contract.JobFailed
-					}
-					if got.State != want || got.Outcome != "" || canceled.Outcome != "" {
-						t.Fatalf("earlier completion lost=%+v", got)
-					}
-					return
-				}
-				if got.Outcome != "canceled" {
-					t.Fatalf("reservation lost=%+v", got)
-				}
-				switch operation {
-				case "claim":
-					if cancelFirst && claim != nil {
-						t.Fatalf("claim after cancel=%+v", claim)
-					}
-				case "started", "renew", "logs":
-					want := contract.JobClaimed
-					if !cancelFirst {
-						want = contract.JobRunning
-					}
-					if got.State != want {
-						t.Fatalf("start arbitration=%+v", got)
-					}
-					if operation == "started" {
-						var started sql.NullInt64
-						if err := h.store.db.QueryRow(`SELECT started_ns FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&started); err != nil {
+	for _, kind := range []string{contract.JobKindProcess, contract.JobKindOCI} {
+		t.Run(kind, func(t *testing.T) {
+			for _, operation := range []string{"claim", "started", "renew", "logs", "child", "completion", "expiry"} {
+				for _, cancelFirst := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%s/cancel-first=%t", operation, cancelFirst), func(t *testing.T) {
+						h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{"node-1": DefaultNodePolicy()}, true, time.Hour)
+						client := h.client(fabric.Identity{NodeID: "race-submitter", Tags: []string{DefaultClientPrincipalTag}})
+						agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+						node := h.registerWithCapabilities(agent, "node-1", map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true})
+						spec := validJobSpec("transaction-race", nil)
+						if kind == contract.JobKindOCI {
+							spec.Kind = kind
+							spec.Execution = contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"}}}
+							spec.RuntimeHandler = "io.containerd.runc.v2"
+						}
+						status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+						if status != http.StatusCreated {
+							t.Fatalf("submit=%d %s", status, body)
+						}
+						job := decodeJob(t, body)
+						var claim *Claim
+						var scope AttemptCredentialScope
+						var err error
+						if operation != "claim" {
+							won := claimClass(t, h, agent, node, contract.JobClassOneShot)
+							claim = &won
+							scope, err = h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, "node-1")
+							if err != nil {
+								t.Fatal(err)
+							}
+						}
+						if kind == contract.JobKindOCI && (operation == "started" || operation == "completion") {
+							if _, err := h.store.ObserveAttemptImage(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, testImageObservation(claim.Lease.FencingToken)); err != nil {
+								t.Fatal(err)
+							}
+							if operation == "completion" {
+								if _, err := h.store.StartAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+									t.Fatal(err)
+								}
+							}
+						}
+						if operation == "expiry" {
+							h.clock.Advance(30 * time.Second)
+						}
+						now := h.clock.Now()
+						entered, release := make(chan struct{}), make(chan struct{})
+						var reads atomic.Int32
+						h.store.clock = ClockFunc(func() time.Time {
+							if reads.Add(1) == 1 {
+								close(entered)
+								<-release
+							}
+							return now
+						})
+						var canceled Job
+						var cancelErr, rivalErr error
+						var renewed AttemptLease
+						var child Job
+						cancel := func() {
+							canceled, cancelErr = h.store.CancelJob(t.Context(), job.JobID, JobCancelCaller{Submitter: "race-submitter"})
+						}
+						rival := func() {
+							switch operation {
+							case "claim":
+								claim, rivalErr = h.store.ClaimJob(t.Context(), "node-1", node.NodeID, node.BootSessionID, contract.JobClassOneShot)
+							case "renew", "expiry":
+								renewed, rivalErr = h.store.RenewLease(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken)
+							case "started":
+								_, rivalErr = h.store.StartAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken})
+							case "logs":
+								_, rivalErr = h.store.AppendLogs(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("acknowledgement"))}})
+							case "child":
+								child, _, rivalErr = h.store.CreateJobAs(t.Context(), validJobSpec("race-child", nil), JobOrigin{Parent: &scope})
+							case "completion":
+								zero := 0
+								_, rivalErr = h.store.CompleteAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "race-complete", Result: ProcessResult{ExitCode: &zero}})
+							}
+						}
+						first, second := cancel, rival
+						if !cancelFirst {
+							first, second = rival, cancel
+						}
+						firstDone, secondDone := make(chan struct{}), make(chan struct{})
+						go func() { defer close(firstDone); first() }()
+						<-entered
+						go func() { defer close(secondDone); second() }()
+						close(release)
+						<-firstDone
+						<-secondDone
+						h.store.clock = h.clock
+						if cancelErr != nil {
+							t.Fatal(cancelErr)
+						}
+						if operation == "started" && cancelFirst {
+							if errorCode(rivalErr) != contract.ErrorConflict {
+								t.Fatalf("start committed after cancel=%v", rivalErr)
+							}
+						} else if operation == "child" && cancelFirst {
+							if errorCode(rivalErr) != contract.ErrorUnauthorized {
+								t.Fatalf("child committed after cancel=%+v %v", child, rivalErr)
+							}
+						} else if operation == "expiry" {
+							if errorCode(rivalErr) != contract.ErrorLeaseExpired {
+								t.Fatalf("expiry error=%v", rivalErr)
+							}
+						} else if rivalErr != nil {
+							t.Fatal(rivalErr)
+						}
+						got, err := h.store.GetJob(t.Context(), job.JobID)
+						if err != nil {
 							t.Fatal(err)
 						}
-						if started.Valid == cancelFirst {
-							t.Fatalf("start marker arbitration=%+v cancel-first=%t", started, cancelFirst)
+						if (operation == "completion" || operation == "expiry") && !cancelFirst {
+							want := contract.JobSucceeded
+							if operation == "expiry" {
+								want = contract.JobFailed
+							}
+							if got.State != want || got.Outcome != "" || canceled.Outcome != "" {
+								t.Fatalf("earlier completion lost=%+v", got)
+							}
+							return
 						}
-					}
-					if operation == "renew" && cancelFirst && string(renewed.Directive) != "cancel" {
-						t.Fatalf("cancel delivery=%+v", renewed)
-					}
-				case "child":
-					if !cancelFirst {
-						got, err := h.store.GetJob(t.Context(), child.JobID)
-						if err != nil || got.State != contract.JobQueued || got.Outcome != "" {
-							t.Fatalf("child cascaded=%+v %v", got, err)
+						if got.Outcome != "canceled" {
+							t.Fatalf("reservation lost=%+v", got)
 						}
-					}
-				case "completion":
-					if got.State != contract.JobFailed {
-						t.Fatalf("completion overwrote intent=%+v", got)
-					}
+						switch operation {
+						case "claim":
+							if cancelFirst && claim != nil {
+								t.Fatalf("claim after cancel=%+v", claim)
+							}
+						case "started", "renew", "logs":
+							want := contract.JobClaimed
+							if !cancelFirst && (kind == contract.JobKindProcess || operation == "started") {
+								want = contract.JobRunning
+							}
+							if got.State != want {
+								t.Fatalf("start arbitration=%+v", got)
+							}
+							if operation == "started" {
+								var started sql.NullInt64
+								if err := h.store.db.QueryRow(`SELECT started_ns FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&started); err != nil {
+									t.Fatal(err)
+								}
+								if started.Valid == cancelFirst {
+									t.Fatalf("start marker arbitration=%+v cancel-first=%t", started, cancelFirst)
+								}
+							}
+							if operation == "renew" && cancelFirst && string(renewed.Directive) != "cancel" {
+								t.Fatalf("cancel delivery=%+v", renewed)
+							}
+						case "child":
+							if !cancelFirst {
+								got, err := h.store.GetJob(t.Context(), child.JobID)
+								if err != nil || got.State != contract.JobQueued || got.Outcome != "" {
+									t.Fatalf("child cascaded=%+v %v", got, err)
+								}
+							}
+						case "completion":
+							if got.State != contract.JobFailed {
+								t.Fatalf("completion overwrote intent=%+v", got)
+							}
+						}
+					})
 				}
-			})
-		}
-	}
-}
+			}
 
-func TestCancelActiveOCIStillRefused(t *testing.T) {
-	h := newIntegrationHarness(t, map[string][]string{"node-1": {}})
-	registerOCIFixtureNode(t, h)
-	client := h.client(fabric.Identity{NodeID: runLedgerOrigin.OriginatingSubmitter, Tags: []string{DefaultClientPrincipalTag}})
-	spec := contract.JobSpec{SchemaVersion: 1, DispatchKey: "active-oci-cancel", Kind: "oci", Class: "one-shot", RuntimeHandler: "io.containerd.runc.v2", Labels: map[string]string{contract.LabelRunID: "run-active-oci-cancel"}, Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"}}}}
-	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
-	if status != http.StatusCreated {
-		t.Fatalf("submit=%d %s", status, body)
-	}
-	job := decodeJob(t, body)
-	claimOCIFixture(t, h, contract.JobClassOneShot)
-	before, err := h.store.GetJob(t.Context(), job.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	status, _, body = h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/cancel", nil)
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorCancelNotQueued)
-	after, err := h.store.GetJob(t.Context(), job.JobID)
-	if err != nil || !reflect.DeepEqual(before, after) {
-		t.Fatalf("OCI cancel mutated=%+v %v", after, err)
+		})
 	}
 }

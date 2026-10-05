@@ -1194,25 +1194,28 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
-	if err := request.OCIStarted(ctx, imageObservation(*runResponse.Image)); err != nil {
+	startErr := request.OCIStarted(ctx, imageObservation(*runResponse.Image))
+	if startErr != nil && request.Authority.WorkloadClass != contract.JobClassOneShot {
 		_ = reapAfterFailedStart(session, authority)
-		// A fencing/authority refusal is a terminal fact about this attempt, not
-		// infrastructure loss eligible for the OCI pre-start retry budget.
-		return spawnResult(contract.SpawnFailureProcessRequest, err), err
+		return spawnResult(contract.SpawnFailureProcessRequest, startErr), startErr
 	}
-	if request.OCIHelperAdmitted != nil {
+	// A canceled one-shot may already have entered the helper before L1
+	// refuses Started. Stop that exact attempt below, but leave its handoff
+	// readable until the caller captures the result and performs normal reap.
+	if startErr == nil && request.OCIHelperAdmitted != nil {
 		admitted := helperSession(session)
 		if err := request.OCIHelperAdmitted(workloadrunner.RuntimeGeneration{InstanceID: admitted.HelperInstanceID, Generation: admitted.SessionGeneration}); err != nil {
 			_ = reapAfterFailedStart(session, authority)
 			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 		}
 	}
-	if request.Started != nil {
+	if startErr == nil && request.Started != nil {
 		request.Started()
 	}
 
 	watchParent := ctx
-	if request.LifetimeBoundary == workloadrunner.AgentBootLifetime {
+	gracefulTermination := request.LifetimeBoundary == workloadrunner.AgentBootLifetime || request.Authority.WorkloadClass == contract.JobClassOneShot
+	if gracefulTermination {
 		watchParent = context.WithoutCancel(ctx)
 	}
 	watchContext, cancelWatch := context.WithCancel(watchParent)
@@ -1261,7 +1264,10 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		termination = &terminationTrace{}
 	}
 	waitForWatch := func() error {
-		if request.LifetimeBoundary != workloadrunner.AgentBootLifetime {
+		if startErr != nil {
+			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, termination)
+		}
+		if !gracefulTermination {
 			return <-watchDone
 		}
 		select {
@@ -1289,6 +1295,13 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		}
 	} else {
 		err = waitForWatch()
+	}
+	if startErr != nil {
+		// L1 has no durable Started edge, so retain pre-start evidence even
+		// though the helper needed termination. Never turn this refusal into
+		// a runtime-unavailable requeue or delete before result capture.
+		err = errors.Join(startErr, err)
+		return spawnResult(contract.SpawnFailureProcessRequest, err), err
 	}
 	if err != nil {
 		if requiresOCIRuntimeRecovery(err) && (request.LifetimeBoundary == workloadrunner.AgentBootLifetime || ctx.Err() == nil) {

@@ -324,7 +324,7 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 func (session *agentSession) processCancelDirectives(directives []l1.OneShotCancelDirective) {
 	session.claimMu.Lock()
 	for _, directive := range directives {
-		if resident := session.resident[directive.JobID]; resident != nil && resident.class == contract.JobClassOneShot && resident.kind == contract.JobKindProcess && resident.attemptID == directive.AttemptID && resident.fencingToken == directive.FencingToken {
+		if resident := session.resident[directive.JobID]; resident != nil && resident.class == contract.JobClassOneShot && resident.attemptID == directive.AttemptID && resident.fencingToken == directive.FencingToken {
 			resident.cancel(errAttemptDirectiveCancel)
 		}
 	}
