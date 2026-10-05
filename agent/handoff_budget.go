@@ -394,7 +394,7 @@ func (m *handoffManager) evictionCandidates(status RetainedResultsStatus) (publi
 			continue
 		}
 		candidates = append(candidates, handoffEvictionCandidate{
-			runID: record.RunID, record: record, published: record.Published,
+			runID: record.RunID, record: record, published: record.evidenceReachedLedger(),
 			at: record.RetainedAt, atKnown: true, charged: bytes,
 			admittedAt: record.AdmittedAt, retainedAt: record.RetainedAt,
 		})
@@ -557,7 +557,7 @@ func (m *handoffManager) candidateMoved(candidate handoffEvictionCandidate) (boo
 	if !ok {
 		return true, "no longer has a record this node can act on"
 	}
-	if record.Published != candidate.published {
+	if record.evidenceReachedLedger() != candidate.published {
 		return true, "no longer carries the same answer to whether its evidence reached the ledger"
 	}
 	if !record.AdmittedAt.Equal(candidate.admittedAt) || !record.RetainedAt.Equal(candidate.retainedAt) {

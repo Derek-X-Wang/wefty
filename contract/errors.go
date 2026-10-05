@@ -57,6 +57,8 @@ const (
 	ErrorUnsupportedClass            ErrorCode = "unsupported_class"
 	ErrorUnsupportedRuntimeHandler   ErrorCode = "unsupported_runtime_handler"
 	ErrorNoResolvedImageSnapshot     ErrorCode = "no_resolved_image_snapshot"
+	ErrorCancelService               ErrorCode = "cancel_service"
+	ErrorCancelNotQueued             ErrorCode = "cancel_not_queued"
 	ErrorNotImplemented              ErrorCode = "not_implemented"
 	// ErrorRunLedgerUnavailable names the one dependency L1 cannot substitute
 	// for: the run ledger that holds Computer submission tokens. L1 must reach

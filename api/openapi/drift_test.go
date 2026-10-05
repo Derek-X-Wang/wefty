@@ -191,6 +191,7 @@ var driftRows = []driftRow{
 	{responseBody(clientDoc, "post", "/v1/host-boot-session-proof", "200"), typeOf[l1.HostBootSessionProof]()},
 	{responseBody(clientDoc, "get", "/v1/jobs", "200"), typeOf[l1.JobList]()},
 	{responseBody(clientDoc, "get", "/v1/jobs/{job_id}/children", "200"), typeOf[l1.JobList]()},
+	{responseBody(clientDoc, "post", "/v1/jobs/{job_id}/cancel", "200"), typeOf[l1.Job]()},
 	{requestBody(clientDoc, "put", "/v1/jobs/{job_id}/desired-state"), typeOf[l1.ServiceDesiredStateRequest]()},
 	{requestBody(clientDoc, "post", "/v1/jobs/{job_id}/restart"), typeOf[l1.ServiceRestartRequest]()},
 	{requestBody(clientDoc, "post", "/v1/jobs/{job_id}/forget"), typeOf[l1.ForceForgetRequest]()},

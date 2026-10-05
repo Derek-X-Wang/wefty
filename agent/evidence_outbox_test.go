@@ -3431,7 +3431,7 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 						t.Fatalf("successful handoff not retained across replay: %v", err)
 					}
 					record := requireRetentionRecord(t, handoffs, "directive-run")
-					if !record.Succeeded || !record.Published || record.NodeID != "stable-node" || record.Directory != handoffPath || record.RetainedAt.IsZero() || !record.RetainUntil.Equal(record.RetainedAt.Add(time.Hour)) {
+					if !record.Succeeded || !record.evidenceReachedLedger() || record.NodeID != "stable-node" || record.Directory != handoffPath || record.RetainedAt.IsZero() || !record.RetainUntil.Equal(record.RetainedAt.Add(time.Hour)) {
 						t.Fatalf("completion replay retained the wrong terminal record: %#v", record)
 					}
 
@@ -3455,8 +3455,11 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					state = "sealed_incomplete"
 				}
 				waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, state, 2*time.Second)
+				// This workload wrote "result", not result.json, and has no run
+				// mailbox. L1 accepted `absent`, so nothing on the node is an
+				// only copy: it is published, and replay must not change that.
 				retained := requireRetentionRecord(t, handoffs, "directive-run")
-				if !retained.Succeeded || !retained.Published || retained.NodeID != "stable-node" || retained.Directory != handoffPath || retained.RetainedAt.IsZero() || !retained.RetainUntil.Equal(retained.RetainedAt.Add(time.Hour)) {
+				if !retained.Succeeded || !retained.evidenceReachedLedger() || retained.NodeID != "stable-node" || retained.Directory != handoffPath || retained.RetainedAt.IsZero() || !retained.RetainUntil.Equal(retained.RetainedAt.Add(time.Hour)) {
 					t.Fatalf("replay changed retained terminal values: %#v", retained)
 				}
 				if test.rejectReplay {

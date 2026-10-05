@@ -94,10 +94,11 @@ type handoffManager struct {
 // handoffOwnership is an opaque preparation receipt for one lock acquisition.
 // The handle remains open until that acquisition is released.
 type handoffOwnership struct {
-	lease  *handoffLease
-	runID  string
-	nodeID string
-	run    *os.Root
+	lease     *handoffLease
+	runID     string
+	nodeID    string
+	attemptID string
+	run       *os.Root
 	// prepared is the identity of the directory this receipt was issued for,
 	// taken while it was certainly still linked. finish compares the run name
 	// against this rather than re-stating the handle, because a workload that
@@ -331,6 +332,10 @@ func (m *handoffManager) resolveHandoffDirectory(spec contract.JobSpec) (string,
 }
 
 func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nodeID string) (*handoffOwnership, error) {
+	return m.prepareAttempt(lease, spec, nodeID, "")
+}
+
+func (m *handoffManager) prepareAttempt(lease *handoffLease, spec contract.JobSpec, nodeID, attemptID string) (*handoffOwnership, error) {
 	path := filepath.Clean(spec.Execution.HandoffDirectory)
 	m.mu.Lock()
 	owned := lease != nil && lease.manager == m && lease.path == handoffPathLeaseKey(path) && lease.pathLock.owner == lease && lease.ownership == nil
@@ -435,11 +440,11 @@ func (m *handoffManager) prepare(lease *handoffLease, spec contract.JobSpec, nod
 	// is better than discovering it at finish with the files already written.
 	if err := m.writeRecord(retentionRecord{
 		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: handoffOwnerRunID(spec),
-		AdmittedAt: m.now().UTC(),
+		AdmittedAt: m.now().UTC(), AttemptID: attemptID,
 	}); err != nil {
 		return nil, fmt.Errorf("record the admission of handoff directory %q: %w", path, err)
 	}
-	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, run: run, prepared: prepared}
+	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, attemptID: attemptID, run: run, prepared: prepared}
 	m.mu.Lock()
 	lease.ownership = owner
 	m.mu.Unlock()
@@ -475,7 +480,7 @@ func (m *handoffManager) finish(owner *handoffOwnership, spec contract.JobSpec, 
 		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: handoffOwnerRunID(spec),
 		AdmittedAt: m.admissionOf(runID, nodeID, path, now),
 		RetainedAt: now, RetainUntil: now.Add(m.retention),
-		Published: published, Succeeded: succeeded,
+		Published: published, Uploaded: published, Succeeded: succeeded, AttemptID: owner.attemptID,
 	}
 	// The record is written before the bound runs, so a run whose trimming
 	// fails is still an accounted directory that expires on schedule rather
@@ -988,7 +993,8 @@ func sameRetainedRun(left, right retentionRecord) bool {
 		left.AdmittedAt.Equal(right.AdmittedAt) &&
 		left.RetainedAt.Equal(right.RetainedAt) &&
 		left.RetainUntil.Equal(right.RetainUntil) &&
-		left.Published == right.Published && left.Succeeded == right.Succeeded
+		left.Published == right.Published && left.Uploaded == right.Uploaded &&
+		left.AttemptID == right.AttemptID && left.Succeeded == right.Succeeded
 }
 
 // handoffSweepRace is a test seam. It runs at the two points in one record's

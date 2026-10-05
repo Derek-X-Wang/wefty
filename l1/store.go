@@ -1195,6 +1195,7 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
+		{"outcome", "TEXT NOT NULL DEFAULT '' CHECK(outcome IN ('', 'canceled'))"},
 		{"parent_job_id", "TEXT"},
 		{"parent_attempt_id", "TEXT"},
 		{"originating_submitter", "TEXT NOT NULL DEFAULT ''"},
@@ -4652,7 +4653,7 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason, secrets_scrubbed_ns,
+state, jobs.outcome, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason, secrets_scrubbed_ns,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.lease_loss_count, service_jobs.next_restart_at, service_jobs.published_port,
 service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
@@ -4677,7 +4678,7 @@ service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append(append([]any{
-		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
+		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &job.Outcome, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
 		&secretsScrubbedNS,
 	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
 	if err != nil {
@@ -4713,7 +4714,7 @@ func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Jo
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason, secrets_scrubbed_ns,
+state, jobs.outcome, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason, secrets_scrubbed_ns,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.lease_loss_count, service_jobs.next_restart_at, service_jobs.published_port,
 service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
@@ -4738,7 +4739,7 @@ service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append(append([]any{
-		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
+		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &job.Outcome, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
 		&secretsScrubbedNS,
 	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
 	if err != nil {

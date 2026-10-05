@@ -571,7 +571,8 @@ func TestAttemptCredentialReplayStaysInsideItsOwnParent(t *testing.T) {
 	}
 }
 
-// The credential reaches exactly three routes. Everything else on the job
+// The credential reaches exactly four routes (create, read, children, and
+// cancel for its own children). Everything else on the job
 // collection is refused without consulting the store.
 func TestAttemptCredentialReachesNoOperatorRoute(t *testing.T) {
 	h, client, agent, node := credentialHarness(t)

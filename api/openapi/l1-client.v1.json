@@ -437,7 +437,7 @@
       "get": {
         "operationId": "getJobResult",
         "summary": "Read the result document the job's latest attempt uploaded",
-        "description": "Authorized exactly as the job's logs are, including the class selector. The row is replaced by a retry and removed with the job, so it answers for the job's latest attempt only.",
+        "description": "Authorized exactly as the job's logs are, including the class selector. The row is replaced by a retry and removed with the job, so it answers for the job's latest attempt only. L1 result retention is independent of node handoff retention: node expiry or budget eviction does not delete this copy. A node counts its handoff as published only after L1 accepted the producing attempt's result, as its document or as absent when it wrote none, and that attempt's run mailbox drained completely.",
         "parameters": [
           { "name": "class", "in": "query", "required": false, "schema": { "const": "service" }, "description": "Required, as class=service, when the job is a service; must be absent when it is a one-shot. An unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found." }
         ],
@@ -1752,11 +1752,17 @@
       ],
       "post": {
         "operationId": "cancelJob",
-        "summary": "Reserved job cancellation",
-        "description": "Always returns 501 in v0.1 and does not mutate job state.",
-        "x-wefty-implementation": "reserved",
+        "summary": "Cancel a queued one-shot job",
+        "description": "Atomically ends a queued one-shot as failed with job-level outcome canceled; no attempt or process result is invented. Requeued OCI jobs retain earlier attempt evidence. The originating client submitter, a current untagged person admin, or the live attempt credential of the immediate parent may cancel; authority is revalidated in the transaction. A bearer selects only parent scope and must arrive from the holding node. Out-of-scope and unknown targets return 404 not_found. Already-terminal one-shots and retries return the current job unchanged. Services return 409 cancel_service with desired_state_path and remove_path in error.details: the job routes with class=service, or for a Computer's job its /v1/computers/{computer_id} routes together with computer_id. Until active cancellation is implemented, claimed, running and awaiting-input jobs return 409 cancel_not_queued with details.state and no mutation. Both refusals are non-retryable. Children are never canceled automatically. No request body or class selector is required; cancel determines the target class itself and ignores the read-route class selector.",
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "attemptCredential": [] }],
         "responses": {
-          "501": { "$ref": "./common.v1.json#/components/responses/NotImplemented" }
+          "200": { "description": "Current job, including any cancellation outcome and retained attempt evidence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
       }
     }

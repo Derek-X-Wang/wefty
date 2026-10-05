@@ -141,8 +141,17 @@ type retentionRecord struct {
 	// without the other is not trusted at all.
 	RetainedAt  time.Time `json:"retained_at,omitempty"`
 	RetainUntil time.Time `json:"retain_until,omitempty"`
-	Published   bool      `json:"published,omitempty"`
-	Succeeded   bool      `json:"succeeded,omitempty"`
+	// Published and Uploaded together are the publication verdict
+	// (uploadRecord.publishes); evidenceReachedLedger reads their
+	// conjunction. This agent writes both as that one verdict. Older agents
+	// wrote Published as the mailbox drain verdict alone, true with no
+	// mailbox at all, and no Uploaded, so a legacy record reads as
+	// unpublished. Both are reset on each admission.
+	Published bool `json:"published,omitempty"`
+	Uploaded  bool `json:"uploaded,omitempty"`
+	// AttemptID binds crash-recovered upload evidence to this admission.
+	AttemptID string `json:"attempt_id,omitempty"`
+	Succeeded bool   `json:"succeeded,omitempty"`
 	// Adopted marks a window the agent derived rather than one an attempt
 	// wrote: either an admission that never finished, or a directory carrying
 	// this node's ownership marker and no record at all. It changes nothing
@@ -205,31 +214,67 @@ type uploadRecord struct {
 	AttemptID string                          `json:"attempt_id"`
 	Uploaded  bool                            `json:"uploaded"`
 	Reason    contract.ResultUploadSkipReason `json:"reason,omitempty"`
-	At        time.Time                       `json:"at"`
+	// MailboxDrained is the other half of publication: every event the
+	// attempt wrote to its run mailbox reached L3, or the attempt never had
+	// a mailbox to drain. It is written with the upload outcome, after the
+	// drain finished, so startup recovery classifies an attempt interrupted
+	// before terminal retention exactly as that retention would have. A
+	// record from an older agent has no such field and reads as not drained.
+	MailboxDrained bool      `json:"mailbox_drained"`
+	At             time.Time `json:"at"`
+}
+
+// publishes is the node's publication rule for one attempt's handoff: L1
+// holds its result and L3 holds its events, so nothing on the node is the
+// only copy of either.
+//
+// L1 holds the result when the document was uploaded, or when L1 accepted
+// `absent`: a run that wrote no result.json has no document to lose, and
+// absent is only ever recorded from a read made under the attempt's own
+// handoff receipt. Every other skip reason names a file that is still on the
+// node and nowhere else, so it never publishes.
+func (record uploadRecord) publishes() bool {
+	resultReachedL1 := record.Uploaded || record.Reason == contract.ResultUploadSkipAbsent
+	return resultReachedL1 && record.MailboxDrained
 }
 
 func (m *handoffManager) uploadRecordRoot() string {
 	return filepath.Join(m.stateRoot, uploadRecordDirectoryName)
 }
 
-// recordUpload writes what became of this attempt's result. It is best effort
-// by design: it never fails an attempt, because a node that cannot write its
-// own diagnosis has not changed what the run did.
-func (m *handoffManager) recordUpload(runID, nodeID, attemptID string, result attemptResult) error {
-	if m == nil || strings.TrimSpace(m.stateRoot) == "" || strings.TrimSpace(runID) == "" {
-		return nil
-	}
+// newUploadRecord is what became of one attempt's result, together with
+// whether its run mailbox drained. Building the record is separate from
+// writing it, so the live verdict and startup recovery read the same record
+// through the same rule.
+func (m *handoffManager) newUploadRecord(runID, nodeID, attemptID string, result attemptResult, mailboxDrained bool) uploadRecord {
 	record := uploadRecord{
 		RunID: runID, NodeID: nodeID, AttemptID: attemptID,
 		Uploaded: len(result.document) > 0 && result.skip == "",
-		Reason:   result.skip, At: m.now().UTC(),
+		Reason:   result.skip, MailboxDrained: mailboxDrained,
 	}
-	return writeStateDocument(m.stateRoot, uploadRecordDirectoryName, recordComponent(runID), record)
+	if m != nil {
+		record.At = m.now().UTC()
+	}
+	return record
 }
 
-// readUploadRecord reads one run's upload outcome back. Nothing in the agent
-// acts on it; it exists so an operator on the node, and the tests, can see the
-// reason a result never reached the ledger.
+// recordUpload writes what became of this attempt's result. It is best effort
+// by design: it never fails an attempt, because a node that cannot write its
+// own diagnosis has not changed what the run did.
+func (m *handoffManager) recordUpload(runID, nodeID, attemptID string, result attemptResult, mailboxDrained bool) error {
+	return m.writeUploadRecord(m.newUploadRecord(runID, nodeID, attemptID, result, mailboxDrained))
+}
+
+func (m *handoffManager) writeUploadRecord(record uploadRecord) error {
+	if m == nil || strings.TrimSpace(m.stateRoot) == "" || strings.TrimSpace(record.RunID) == "" {
+		return nil
+	}
+	return writeStateDocument(m.stateRoot, uploadRecordDirectoryName, recordComponent(record.RunID), record)
+}
+
+// readUploadRecord reads one run's upload outcome back. Startup recovery joins
+// it to the admitted attempt; an operator can also see why a result never
+// reached L1.
 func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, error) {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
 		return uploadRecord{}, false, nil
@@ -299,6 +344,13 @@ func (record retentionRecord) handoffOwnerKey() string {
 		return key
 	}
 	return record.RunID
+}
+
+// evidenceReachedLedger is the `published` fact the eviction order and the
+// retained-results projection read. Requiring both members is what keeps a
+// legacy record, whose Published was the mailbox drain alone, unpublished.
+func (record retentionRecord) evidenceReachedLedger() bool {
+	return record.Published && record.Uploaded
 }
 
 func (m *handoffManager) recordRoot() string {

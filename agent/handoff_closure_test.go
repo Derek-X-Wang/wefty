@@ -72,7 +72,9 @@ func TestFinishingAnAttemptCollectsWithoutAnyoneAskingIt(t *testing.T) {
 		t.Fatalf("execute did not expire old results: %v", err)
 	}
 	record := requireRetentionRecord(t, harness.manager, "run_fresh")
-	if !record.Succeeded || !record.Published {
+	// The run wrote no result.json and had no mailbox; L1 accepted `absent`,
+	// so there is nothing on the node to lose and the handoff is published.
+	if !record.Succeeded || !record.evidenceReachedLedger() {
 		t.Fatalf("fallback won before completion: %#v", record)
 	}
 	if !record.RetainedAt.Equal(harness.now) || !record.RetainUntil.Equal(harness.now.Add(time.Hour)) {

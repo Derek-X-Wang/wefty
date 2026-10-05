@@ -15,7 +15,7 @@ invalid. State changes and their required side effects commit atomically.
 | `stopped` | Service-only state, unreachable in the one-shot transition table. | none |
 | `awaiting-input` | Reserved warm-session state; observable but not enterable through a v0.1 API implementation. | `running`, `failed` |
 | `succeeded` | Completion was accepted with a successful process result and required protocol outputs. Terminal. | none |
-| `failed` | Execution, lease, or workflow protocol failed. Terminal; v0.1 never automatically requeues. | none |
+| `failed` | Execution, lease, workflow protocol failed, or queued cancellation committed. Terminal; v0.1 never automatically requeues. | none |
 
 For `kind=oci`, `claimed → queued` is allowed only when fenced completion
 records pre-`Started` `runtime_unavailable`. The old attempt becomes terminal
@@ -1070,5 +1070,27 @@ An exit-zero parent remains `running` while any child run is non-terminal; once
 all children settle, a failed child fails the parent and otherwise the parent's
 own envelope/gate checks determine its terminal state. This reconciliation is
 applied deepest-child-first so one pass can settle an already-terminal chain.
-Cancellation is reserved and returns `501`, so there is no cancellable or
-cancelled state in the v1 state table.
+L1 queued one-shot cancellation records `state=failed`, `outcome=canceled`; it
+does not add a job state. L3 projects this job-level outcome as "the L1 job was
+canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
+Cancellation of an L3 Run remains reserved and returns `501`.
+
+### Queued one-shot cancellation (#650)
+
+`POST /v1/jobs/{job_id}/cancel` atomically changes `queued → failed` and
+records job-level `outcome=canceled`. It creates no attempt, result, signal or
+termination cause. A requeued OCI job retains every earlier attempt's evidence;
+that evidence is no longer the job's terminal reason. The terminal transition
+scrubs one-shot secrets by the same trigger as completion and lease loss.
+Claim and cancel serialize in immediate transactions: if cancel commits first,
+claim cannot select the job; if claim wins, cancel is refused without mutation.
+Already-terminal one-shots and retries return the current job unchanged. The
+first committed terminal outcome wins. Cancel does not cascade to children.
+
+Until #651 and #652 implement active cancellation, `claimed`, `running` and
+reserved `awaiting-input` targets receive HTTP 409 `cancel_not_queued`,
+`retryable=false`, with their state in `error.details.state`, and no mutation.
+Services in every state receive HTTP 409 `cancel_service`, `retryable=false`,
+with `desired_state_path` and `remove_path` in `error.details`; use desired state
+or remove with `class=service`. Cancel requires no body and determines the
+target class itself; the read-route `class` selector is ignored.

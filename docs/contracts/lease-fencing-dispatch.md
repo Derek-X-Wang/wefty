@@ -698,9 +698,29 @@ For OCI, L1 validates that arm against durable `started_at` before accepting
 authoritative or late evidence: pre-start accepts only a sole `spawn_error`
 without OOM, while post-start rejects `spawn_error`.
 
-The awaiting-input prompt verbs and cancellation verbs are reserved. They
-return the shared error shape with HTTP `501`, code `not_implemented`, and
-`retryable=false`; they do not mutate state.
+The awaiting-input prompt verbs remain reserved and return HTTP `501`,
+`not_implemented`, `retryable=false` without mutation. Job cancellation is
+implemented only for queued one-shots: `POST /v1/jobs/{job_id}/cancel` returns
+HTTP 200 with the current job; a successful queued cancel records
+`state=failed`, `outcome=canceled` in the claim-serializing transaction.
+Authority is checked in that transaction: the originating client submitter,
+a current person admin, or the live immediate parent's attempt credential.
+A bearer cannot fall back to the inherited submitter's scope. Unknown and
+out-of-scope targets receive HTTP 404 `not_found`; an expired, superseded,
+wrong-node or replaced-session credential is refused under the existing
+credential authority rules. Services receive 409 `cancel_service` pointing at
+desired state and remove. Until #651/#652, claimed, running and awaiting-input
+jobs receive 409 `cancel_not_queued` and no mutation. Both refusals are
+non-retryable. Retries and already-terminal one-shots return the current state.
+Neither attempts nor process results are invented; retained earlier evidence,
+including identical completion replay for a requeued OCI attempt, cannot
+change the cancellation outcome. One-shot terminal secret scrubbing applies.
+
+`wefty cancel JOB_ID` calls this L1 route and supports `--json`, including on
+L1-only installations. Its process exit codes are 0 for any HTTP 200 current
+state (including an already-terminal target), 2 for usage/invalid requests,
+3 for authentication or principal refusals, 4 for `not_found`, 5 for
+`cancel_service`/`cancel_not_queued` or another conflict, and 1 for other errors.
 
 ### Service policy stops and CLI
 

@@ -97,6 +97,7 @@
             "$ref": "#/components/schemas/JobRecordSpec",
             "description": "Absent after removal finalizes; tombstones retain no executable or environment bytes. Once secrets_scrubbed_at is set it is the permanent record of a terminal one-shot, not a resubmittable request: execution.executable keeps its sha256, interpreter and mode but no inline_base64 (JobRecordSpec), and the run_params_json label is gone. Without secrets_scrubbed_at the spec is a full JobSpec. Client responses never carry sensitive_env."
           },
+          "outcome": { "type": "string", "enum": ["canceled"], "description": "Job-level cancellation decision, independent of any attempt process result. Present on a canceled one-shot, whose state is failed. A never-claimed canceled job has no attempts or signal; a requeued job retains its earlier attempt evidence." },
           "current_attempt_id": { "type": "string" },
           "parent_job_id": { "type": "string", "description": "Job whose live attempt submitted this job through its attempt credential. Derived from the credential, never supplied by the caller; absent on a root job." },
           "parent_attempt_id": { "type": "string", "description": "Exact parent attempt that submitted this job. Absent on a root job." },
