@@ -47,7 +47,7 @@ const ociHandoffRecordDirectoryName = "run-oci-handoffs"
 type ociHandoffRecord struct {
 	// OwnerKey is the identity the runtime derives the volume's name from --
 	// `handoff_owner_run_id` when a rerun is pointed at a source run's
-	// results, the run ID otherwise. It is the record's key, because it is the
+	// results, the run ID otherwise, or the server Job ID for a direct job. It is the record's key, because it is the
 	// volume's identity; two runs sharing results share this record, and the
 	// later one replaces it.
 	OwnerKey string `json:"owner_key"`
@@ -89,12 +89,10 @@ func (record ociHandoffRecord) evidenceReachedLedger() bool {
 }
 
 // usesOCIHandoffLifecycle is the set of jobs whose handoff volume this agent
-// admits: an OCI one-shot with a handoff owner. Services get service data, not
-// a handoff volume (runtimeManagedVolumes), and a job naming no owner has no
-// volume at all.
+// admits: every OCI one-shot. Services get service data, not a handoff volume
+// (runtimeManagedVolumes). A direct one-shot is owned by its server Job ID.
 func usesOCIHandoffLifecycle(spec contract.JobSpec) bool {
-	return spec.Kind == contract.JobKindOCI && spec.Class == contract.JobClassOneShot &&
-		strings.TrimSpace(handoffOwnerRunID(spec)) != ""
+	return spec.Kind == contract.JobKindOCI && spec.Class == contract.JobClassOneShot
 }
 
 // ociHandoffLeaseKey is the path-lock registry key for one handoff volume.
@@ -136,17 +134,17 @@ func (m *handoffManager) ociRecordPath(ownerKey string) string {
 // It replaces whatever stood at this owner key. That is the publication reset:
 // a rerun's contents are its own, and inheriting the previous attempt's
 // "published" would let the node give a run's only copy up first.
-func (m *handoffManager) admitOCIHandoff(lease *handoffLease, spec contract.JobSpec, nodeID, attemptID string) error {
+func (m *handoffManager) admitOCIHandoff(lease *handoffLease, execution executionHandoff, nodeID, attemptID string) error {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
 		return nil
 	}
-	ownerKey := handoffOwnerRunID(spec)
+	ownerKey := execution.ownerKey
 	if !m.holdsOCIHandoffLease(lease, ownerKey) {
 		return errors.New("admitting an OCI handoff volume requires that volume's lease")
 	}
 	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), ociHandoffRecord{
 		OwnerKey: ownerKey, NodeID: strings.TrimSpace(nodeID),
-		RunID: strings.TrimSpace(spec.Labels["run_id"]), AttemptID: strings.TrimSpace(attemptID),
+		RunID: strings.TrimSpace(execution.spec.Labels["run_id"]), AttemptID: strings.TrimSpace(attemptID),
 		AdmittedAt: m.now().UTC(),
 	})
 }
@@ -167,11 +165,11 @@ func (m *handoffManager) holdsOCIHandoffLease(lease *handoffLease, ownerKey stri
 // The record keeps its admission rather than being replaced, so a reader can
 // see one run's whole life on this node, and the attempt it names stays the
 // attempt publication is joined to.
-func (m *handoffManager) finishOCIHandoff(spec contract.JobSpec, nodeID, attemptID string, succeeded, published bool) error {
+func (m *handoffManager) finishOCIHandoff(execution executionHandoff, nodeID, attemptID string, succeeded, published bool) error {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
 		return nil
 	}
-	ownerKey := handoffOwnerRunID(spec)
+	ownerKey := execution.ownerKey
 	record, found, err := m.readOCIRecord(ownerKey)
 	if err != nil {
 		return err
@@ -182,7 +180,7 @@ func (m *handoffManager) finishOCIHandoff(spec contract.JobSpec, nodeID, attempt
 		// without them the volume is one the budget can never place -- and the
 		// admission time is this moment, which is the conservative reading.
 		record = ociHandoffRecord{OwnerKey: ownerKey, NodeID: strings.TrimSpace(nodeID),
-			RunID: strings.TrimSpace(spec.Labels["run_id"]), AttemptID: strings.TrimSpace(attemptID), AdmittedAt: m.now().UTC()}
+			RunID: strings.TrimSpace(execution.spec.Labels["run_id"]), AttemptID: strings.TrimSpace(attemptID), AdmittedAt: m.now().UTC()}
 	}
 	if record.AttemptID != strings.TrimSpace(attemptID) {
 		// A later attempt has already admitted this volume. Its record is the

@@ -492,10 +492,13 @@ The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat
 `execution.handoff_directory`: after `kind=oci` selects the adapter, the
 agent puts exactly one `handoff` requirement on the runtime request, keyed by
-the job's `handoff_owner_run_id`, else its `run_id`. A job naming no key the
-helper accepts ends its attempt with `handoff_preparation_failed` before the
-runtime is asked (`run-execution-context.md`, "Node-local handoff lifecycle");
-L1 refuses one at submission. The adapter passes that key opaquely
+the resolved execution owner: non-blank `handoff_owner_run_id`, else `run_id`,
+else the server-assigned Job ID. The same owner keys admission, locking,
+result capture before reap, upload, retention and eviction. Direct ordinary
+L1 submissions require no L3 or run mailbox, and do not gain run-identity
+entitlement. Malformed explicit owners still end with
+`handoff_preparation_failed` before the runtime is asked; L1 refuses them
+at submission after replay and entitlement checks. The adapter passes that key opaquely
 to the helper and unconditionally makes `/wefty/handoff` the reserved guest
 value. Attempt reap preserves this helper-owned volume on every outcome and refreshes
 its retention window when another attempt or rerun reuses it. The agent no

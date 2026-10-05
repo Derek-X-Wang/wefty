@@ -5,9 +5,11 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -25,7 +27,7 @@ func TestOCIHandoffResultWithoutL3ThroughL1(t *testing.T) {
 	network := plain.NewNetwork()
 	_, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"oci-result"}})
 	defer stopServer()
-	submitter, err := NewClient(network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}}), "wefty://control-plane")
+	submitter, err := NewClient(network.NewFabric(fabric.Identity{NodeID: "ordinary-app", Tags: []string{l1.DefaultClientPrincipalTag}}), "wefty://control-plane")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +35,6 @@ func TestOCIHandoffResultWithoutL3ThroughL1(t *testing.T) {
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	spec := contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: "handoff-no-l3", Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		RoutingTags: []string{"oci-result"}, RuntimeHandler: "io.containerd.runc.v2",
-		Labels:    map[string]string{contract.LabelHandoffOwnerRunID: "entitled-owner"},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/result:v1", Digest: &digest}, Argv: []string{"/payload"}}},
 	}
 	var job l1.Job
@@ -95,6 +96,9 @@ func TestOCIHandoffResultWithoutL3ThroughL1(t *testing.T) {
 	if err := submitter.request(t.Context(), http.MethodGet, "/v1/jobs/"+job.JobID, nil, &finished); err != nil {
 		t.Fatal(err)
 	}
+	if !reflect.DeepEqual(finished.Spec.Labels, spec.Labels) {
+		t.Fatalf("submitted labels changed: %+v", finished.Spec.Labels)
+	}
 	if finished.State != contract.JobSucceeded || !runtime.reaped.Load() || !runtime.resultRead.Load() {
 		t.Fatalf("job=%+v; reaped=%t read=%t", finished, runtime.reaped.Load(), runtime.resultRead.Load())
 	}
@@ -118,4 +122,82 @@ func (r *l1ResultOCIRuntime) Run(ctx context.Context, request workloadrunner.Req
 		return workloadrunner.Result{}, err
 	}
 	return r.captureRuntime.Run(ctx, request, sink)
+}
+
+// One owner must govern admission, locking, reading, publication and eviction.
+// The runtime double rejects a reader whose owner differs from its volume.
+func TestDirectOCIHandoffOwnerPublicationAndEviction(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		published bool
+	}{
+		{"uploaded", 0, true}, {"upload_failed", http.StatusConflict, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRetentionHarness(t, time.Hour)
+			claim := ociHandoffClaim("unused", "attempt-direct")
+			claim.Job.JobID = "job_direct"
+			claim.Job.Spec.Labels = nil
+			claim.Job.Spec.Execution.Env = nil
+			claim.Job.Spec.Execution.SensitiveEnv = nil
+			claim.SubmittedByRunLedger = false
+			before, _ := json.Marshal(claim.Job.Spec)
+			lifecycle := uploadingLifecycle(t, h.manager, &resultUploadRecorder{status: tc.status}, successfulRetentionRun)
+			runtime := &publicationOCIRuntime{fakeRunMailboxRuntime: newFakeRunMailboxRuntime()}
+			lifecycle.dependencies.runtimes = workloadRuntimeSet{contract.JobKindOCI: runtime}
+			if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			after, _ := json.Marshal(claim.Job.Spec)
+			if string(before) != string(after) {
+				t.Fatal("submitted spec changed")
+			}
+			if got := handoffOwnerRunIDFromRequest(runtime.request); got != claim.Job.JobID {
+				t.Fatalf("volume owner=%q", got)
+			}
+			if runtime.request.RunMailbox != nil || !runtime.resultRead.Load() || !runtime.reaped.Load() {
+				t.Fatal("result not read before reap without mailbox")
+			}
+			record, found, err := h.manager.readOCIRecord(claim.Job.JobID)
+			if err != nil || !found || record.OwnerKey != claim.Job.JobID || record.AttemptID != claim.Lease.AttemptID || record.live() || record.evidenceReachedLedger() != tc.published {
+				t.Fatalf("admission/retention=%+v found=%t err=%v", record, found, err)
+			}
+			upload := requireUploadRecord(t, h.manager, claim.Job.JobID)
+			if upload.publishes() != tc.published || !upload.MailboxDrained || upload.AttemptID != claim.Lease.AttemptID {
+				t.Fatalf("upload=%+v", upload)
+			}
+			// Reopening the agent's state must not infer publication from Job success
+			// or from the absence of a run mailbox.
+			reopened := newHandoffManager(h.root, h.manager.stateRoot, "node-1", time.Hour, nil)
+			reopened.now = h.manager.now
+			if err := reopened.adoptResidue(); err != nil {
+				t.Fatal(err)
+			}
+			recovered, found, err := reopened.readOCIRecord(claim.Job.JobID)
+			if err != nil || !found || recovered.evidenceReachedLedger() != tc.published {
+				t.Fatalf("recovered publication=%+v found=%t err=%v", recovered, found, err)
+			}
+			// Hold the producing owner's lease again: eviction must use that same key.
+			helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{ociVolume(t, claim.Job.JobID, 4096, 2, h.now)}}
+			h.manager.ociHandoffs, h.manager.ociEvictor = helper, helper
+			published, unpublished := h.manager.evictionCandidates(h.account())
+			if (len(published) == 1) != tc.published || (len(unpublished) == 1) == tc.published {
+				t.Fatalf("published=%v unpublished=%v", published, unpublished)
+			}
+			lease, err := h.manager.lockOCIHandoff(t.Context(), claim.Job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.budget(1)
+			if len(helper.evicted) != 0 {
+				t.Fatal("locked owner evicted")
+			}
+			lease.release()
+			h.budget(1)
+			if len(helper.evicted) != 1 || helper.evicted[0] != claim.Job.JobID {
+				t.Fatalf("evicted=%v", helper.evicted)
+			}
+		})
+	}
 }

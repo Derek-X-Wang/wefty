@@ -111,9 +111,8 @@ func TestOnlyTheRunLedgerMayNameARunOnARootSubmission(t *testing.T) {
 		})
 	}
 
-	// Naming no run is unchanged: a process one-shot is accepted, a blank
-	// label names nothing, and an OCI one-shot is still refused by #578's rule
-	// for what it lacks rather than for what it claims.
+	// Naming no run claims no run entitlement. Process and OCI one-shots
+	// are accepted with job-owned output, and blank labels name nothing.
 	if status, _, body := h.do(operator, http.MethodPost, "/v1/jobs", validJobSpec("operator-process", nil)); status != http.StatusCreated {
 		t.Fatalf("unlabelled process one-shot status = %d body=%s, want 201", status, body)
 	}
@@ -122,13 +121,10 @@ func TestOnlyTheRunLedgerMayNameARunOnARootSubmission(t *testing.T) {
 		t.Fatalf("blank run identity status = %d body=%s, want 201", status, body)
 	}
 	status, _, body := h.do(operator, http.MethodPost, "/v1/jobs", runIdentityOCIOneShot("operator-ownerless-oci", nil))
-	var response contract.ErrorResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		t.Fatalf("decode refusal %s: %v", body, err)
+	if status != http.StatusCreated {
+		t.Fatalf("unlabelled OCI one-shot status=%d body=%s, want 201", status, body)
 	}
-	if status != http.StatusConflict || response.Error.Code != contract.ErrorRunIdentityRequired {
-		t.Fatalf("unlabelled OCI one-shot status = %d body=%s, want 409 %s", status, body, contract.ErrorRunIdentityRequired)
-	}
+
 }
 
 // TestAChildMayNameOnlyItsParentsRun is the attempt-credential half of #583.
@@ -405,29 +401,40 @@ func TestACustodyImportMayNameNoRun(t *testing.T) {
 }
 
 // Execution ownership must never widen label-based run entitlement.
-func TestManagedProcessOwnerDoesNotEntitleChildRunIdentity(t *testing.T) {
-	h := runLedgerHarness(t, "run-ledger")
-	app := h.client(fabric.Identity{NodeID: "app", Tags: []string{DefaultClientPrincipalTag}})
-	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
-	node := h.register(agent, "node-1")
-	spec := labelledProcessOneShot("managed-parent", []string{"linux"}, map[string]string{"app": "test"})
-	spec.Execution.HandoffDirectory = ""
-	if status, _, body := h.do(app, http.MethodPost, "/v1/jobs", spec); status != http.StatusCreated {
-		t.Fatalf("parent status=%d body=%s", status, body)
-	}
-	parent := claimOneShot(t, h, agent, node)
-	if parent.Job.Spec.Execution.HandoffDirectory != "" || parent.Job.Spec.Labels[contract.LabelRunID] != "" || parent.Job.Spec.Labels[contract.LabelHandoffOwnerRunID] != "" {
-		t.Fatalf("fallback modified submitted spec: %+v", parent.Job.Spec)
-	}
-	for _, label := range []string{contract.LabelRunID, contract.LabelHandoffOwnerRunID} {
-		child := labelledProcessOneShot("forged-job-owner-"+label, nil, map[string]string{label: parent.Job.JobID})
-		child.Execution.HandoffDirectory = ""
-		status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", parent.AttemptToken, child)
-		requireNotEntitled(t, h, status, body, child.DispatchKey)
-	}
-	child := labelledProcessOneShot("managed-child", nil, nil)
-	child.Execution.HandoffDirectory = ""
-	if status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", parent.AttemptToken, child); status != http.StatusCreated {
-		t.Fatalf("child status=%d body=%s", status, body)
+func TestManagedOneShotOwnerDoesNotEntitleChildRunIdentity(t *testing.T) {
+	for _, kind := range []string{contract.JobKindProcess, contract.JobKindOCI} {
+		t.Run(kind, func(t *testing.T) {
+			h := runLedgerHarness(t, "run-ledger")
+			app := h.client(fabric.Identity{NodeID: "app", Tags: []string{DefaultClientPrincipalTag}})
+			agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+			node := h.registerWithCapabilities(agent, "node-1", map[string]bool{"kind:process": true, "kind:oci": true})
+			spec := labelledProcessOneShot("managed-parent", []string{"linux"}, map[string]string{"app": "test"})
+			spec.Execution.HandoffDirectory = ""
+			if kind == contract.JobKindOCI {
+				spec = runIdentityOCIOneShot("managed-parent", nil)
+				spec.RoutingTags = []string{"linux"}
+			}
+			if status, _, body := h.do(app, http.MethodPost, "/v1/jobs", spec); status != http.StatusCreated {
+				t.Fatalf("parent status=%d body=%s", status, body)
+			}
+			parent := claimOneShot(t, h, agent, node)
+			if parent.Job.Spec.Execution.HandoffDirectory != "" || parent.Job.Spec.Labels[contract.LabelRunID] != "" || parent.Job.Spec.Labels[contract.LabelHandoffOwnerRunID] != "" {
+				t.Fatalf("fallback modified submitted spec: %+v", parent.Job.Spec)
+			}
+			for _, label := range []string{contract.LabelRunID, contract.LabelHandoffOwnerRunID} {
+				child := labelledProcessOneShot("forged-job-owner-"+label, nil, map[string]string{label: parent.Job.JobID})
+				child.Execution.HandoffDirectory = ""
+				status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", parent.AttemptToken, child)
+				requireNotEntitled(t, h, status, body, child.DispatchKey)
+			}
+			child := labelledProcessOneShot("managed-child", nil, nil)
+			child.Execution.HandoffDirectory = ""
+			if kind == contract.JobKindOCI {
+				child = runIdentityOCIOneShot("managed-child", nil)
+			}
+			if status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", parent.AttemptToken, child); status != http.StatusCreated {
+				t.Fatalf("child status=%d body=%s", status, body)
+			}
+		})
 	}
 }

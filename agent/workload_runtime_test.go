@@ -152,16 +152,10 @@ func TestOCIImageFailuresSurviveFullLifecycleFinalization(t *testing.T) {
 	}
 }
 
-// TestAnOCIOneShotWithNoHandoffOwnerEndsItsAttemptBeforeTheRuntime is the
-// node's half of wefty #578, for a job L1 stored before it refused them. The
-// helper cannot name a handoff volume without an owner key and refuses the
-// Run, and that refusal reached L1 as runtime_unavailable -- which L1 requeues.
-// The node now refuses first, with handoff_preparation_failed, which L1 treats
-// as terminal, and never asks the runtime at all.
-func TestAnOCIOneShotWithNoHandoffOwnerEndsItsAttemptBeforeTheRuntime(t *testing.T) {
+// Malformed explicit OCI owners still end before runtime admission.
+func TestMalformedOCIHandoffOwnerEndsItsAttemptBeforeTheRuntime(t *testing.T) {
 	for _, labels := range []map[string]string{
-		nil,
-		{contract.LabelRunID: "   "},
+		{contract.LabelRunID: "run\x00bad"},
 		{contract.LabelRunID: strings.Repeat("r", contract.MaxHandoffOwnerKeyBytes+1)},
 	} {
 		runtime := &captureRuntime{}
@@ -672,11 +666,11 @@ func TestRuntimeManagedVolumesCompileClassPolicyBeforeOCIAdapter(t *testing.T) {
 	oneshoot := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{
 		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		Labels: map[string]string{"run_id": "run-1"},
-	}}})
+	}}}, "run-1")
 	if len(oneshoot) != 1 || oneshoot[0].Kind != workloadrunner.ManagedVolumeHandoff || oneshoot[0].OwnerKey != "run-1" {
 		t.Fatalf("one-shot managed volumes = %+v", oneshoot)
 	}
-	service := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}}})
+	service := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}}}, "")
 	if len(service) != 1 || service[0].Kind != workloadrunner.ManagedVolumeServiceData || service[0].OwnerKey != "" {
 		t.Fatalf("service managed volumes = %+v", service)
 	}
@@ -688,13 +682,13 @@ func TestRuntimeManagedVolumesCompileClassPolicyBeforeOCIAdapter(t *testing.T) {
 			OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}},
 		}}},
 		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 3, IntentRevision: 4, DiskBytes: 8 << 30},
-	})
+	}, "")
 	if len(computer) != 1 || computer[0].Kind != workloadrunner.ManagedVolumeComputerDisk || computer[0].ComputerStorage == nil ||
 		computer[0].ComputerStorage.ComputerID != "computer-1" || computer[0].ComputerStorage.StorageID != "storage-1" ||
 		computer[0].ComputerStorage.StorageGeneration != 3 || computer[0].ComputerStorage.DiskBytes != 8<<30 {
 		t.Fatalf("Computer managed volume = %+v", computer)
 	}
-	if volumes := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassService}}}); len(volumes) != 0 {
+	if volumes := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassService}}}, ""); len(volumes) != 0 {
 		t.Fatalf("process managed volumes = %+v", volumes)
 	}
 }

@@ -223,7 +223,7 @@ func (h *retentionHarness) retainOCI(ownerKey, attemptID string, published bool)
 	spec := ociHandoffClaim(ownerKey, attemptID).Job.Spec
 	lease := h.admitOCI(ownerKey, attemptID)
 	lease.release()
-	if err := h.manager.finishOCIHandoff(spec, "node-1", attemptID, true, published); err != nil {
+	if err := h.manager.finishOCIHandoff(legacyExecutionHandoff(spec), "node-1", attemptID, true, published); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -237,7 +237,7 @@ func (h *retentionHarness) admitOCI(ownerKey, attemptID string) *handoffLease {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	if err := h.manager.admitOCIHandoff(lease, spec, "node-1", attemptID); err != nil {
+	if err := h.manager.admitOCIHandoff(lease, legacyExecutionHandoff(spec), "node-1", attemptID); err != nil {
 		lease.release()
 		h.t.Fatal(err)
 	}
@@ -1273,7 +1273,7 @@ func TestAnAdmissionThatLandsAfterTheCandidateIsChosenIsSeenUnderTheLease(t *tes
 			t.Error(err)
 			return
 		}
-		if err := harness.manager.admitOCIHandoff(lease, spec, "node-1", "attempt-2"); err != nil {
+		if err := harness.manager.admitOCIHandoff(lease, legacyExecutionHandoff(spec), "node-1", "attempt-2"); err != nil {
 			t.Error(err)
 		}
 		lease.release()
@@ -1924,7 +1924,7 @@ func TestAnOCIVolumeHeldByARerunThatPublishedStopsTheWalk(t *testing.T) {
 		// volume's lease.
 		lease := harness.admitOCI("run_a_oci", "attempt-2")
 		spec := ociHandoffClaim("run_a_oci", "attempt-2").Job.Spec
-		if err := harness.manager.finishOCIHandoff(spec, "node-1", "attempt-2", true, true); err != nil {
+		if err := harness.manager.finishOCIHandoff(legacyExecutionHandoff(spec), "node-1", "attempt-2", true, true); err != nil {
 			t.Error(err)
 		}
 		held = lease

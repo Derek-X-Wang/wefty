@@ -628,6 +628,17 @@ It forbids `execution.oci`. `kind=oci` requires
 `execution.oci` and forbids every flat process field. An unknown kind remains
 valid open-kind data but cannot reuse the OCI arm.
 
+An ordinary client may submit an OCI one-shot with no run identity. Execution
+uses the server-assigned Job ID as handoff owner through the same resolver as
+managed process output, without rewriting the immutable spec or request hash.
+Dispatch-key replay and removal tombstones resolve before explicit owner
+validation and run-identity entitlement. Malformed explicit OCI owners retain
+`409 run_identity_required`; naming a run still requires existing entitlement.
+The result is read through the exact-attempt, admitted-owner helper reader
+before reap and uploaded to `GET /v1/jobs/{job_id}/result`, with no L3. Upload
+failure leaves the node handoff unpublished.
+
+
 The OCI arm carries image reference and optional digest, an optional full-vector
 argv replacement, optional container working directory, operator mounts,
 optional cgroup-v2 hard limits, and an optional Computer trait. Only an initial

@@ -8,7 +8,7 @@ import (
 )
 
 // executionHandoff is resolved once from the immutable submission and L1's
-// server-owned identity. All process execution, locking, upload and retention
+// server-owned identity. All one-shot execution, locking, upload and retention
 // use this answer; run entitlement continues to read labels alone. spec is the
 // submitted spec, never a spec with synthetic owner labels or a rewritten path.
 type executionHandoff struct {
@@ -20,6 +20,10 @@ type executionHandoff struct {
 
 func (m *handoffManager) resolveExecutionHandoff(spec contract.JobSpec, jobID string) executionHandoff {
 	h := executionHandoff{spec: spec, ownerKey: contract.ExecutionHandoffOwnerKey(spec, jobID), directory: spec.Execution.HandoffDirectory}
+	if spec.Kind == contract.JobKindOCI {
+		// OCI volumes have no host path; the helper hashes the opaque owner key.
+		return h
+	}
 	if h.ownerKey == "" && h.directory != "" {
 		return h
 	}

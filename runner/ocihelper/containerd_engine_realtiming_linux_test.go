@@ -754,6 +754,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		}
 	}
 	exerciseOrdinaryL3OCIOneshot(t, ctx, barrier, adapter, echoReference, echoImage.TopLevelDigest, reference, digest, newRefloatRegistry(t, echoArchivePath))
+	t.Run("direct-L1-job-owned-result", func(t *testing.T) {
+		exerciseDirectL1OCIOneShot(t, ctx, barrier, adapter, echoReference, echoImage.TopLevelDigest, reference, digest)
+	})
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -2351,6 +2354,157 @@ func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapt
 		t.Fatalf("echo post-Started loss cleanup receipt=%+v err=%v", receipt, err)
 	}
 	return true
+}
+
+// This row is driven by an ordinary app over L1 HTTP with the real agent and
+// engine. No L3 listener, run identity, token or mailbox is created.
+func exerciseDirectL1OCIOneShot(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, adapter *ocirunner.Adapter, image, digest, probeImage, probeDigest string) {
+	t.Helper()
+	network := plain.NewNetwork()
+	control := network.NewFabric(fabric.Identity{NodeID: "direct-control"})
+	app := network.NewFabric(fabric.Identity{NodeID: "direct-app", Tags: []string{l1.DefaultClientPrincipalTag}})
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "direct-l1.sqlite"), l1.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := l1.NewServer(control, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"native-node": l1.DefaultNodePolicy("linux")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := control.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(runContext, listener) }()
+	defer func() {
+		cancel()
+		if err := <-served; err != nil {
+			t.Error(err)
+		}
+	}()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	directRuntime := &directResultRuntime{Adapter: adapter}
+	node, err := agent.New(agent.Config{
+		Fabric: network.NewFabric(fabric.Identity{NodeID: "native-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "native-node", BootSessionID: "native-boot", Version: "realtiming-direct", OS: "linux", Architecture: runtime.GOARCH,
+		CapabilityProbe: realOCIProbe{run: func(c context.Context) error {
+			return adapter.Probe(c, "native-node", "native-boot", probeImage, probeDigest, l1.DefaultLeaseDuration)
+		}},
+		OCIBootBarrier: barrier, OCIIntent: func(context.Context) (agent.OCIIntentObservation, error) {
+			return agent.OCIIntentObservation{Enabled: true, Revision: 1}, nil
+		},
+		WorkloadRuntimes:  map[string]agent.WorkloadRuntime{contract.JobKindOCI: directRuntime},
+		AttemptDeadman:    nativeAgentAttemptDeadman{barrier: barrier, nodeID: "native-node", bootSessionID: "native-boot"},
+		HeartbeatInterval: time.Second, ClaimInterval: 25 * time.Millisecond, RenewalInterval: time.Second,
+		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	done := make(chan error, 1)
+	go func() { done <- node.Run(runContext) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	caller := &http.Client{Transport: &http.Transport{DialContext: func(c context.Context, networkName, _ string) (net.Conn, error) {
+		return app.Dial(c, networkName, "wefty://control-plane")
+	}}}
+	defer caller.CloseIdleConnections()
+	spec := contract.JobSpec{SchemaVersion: 1, DispatchKey: "native-direct-oci", Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
+		RuntimeHandler: "io.containerd.runc.v2", Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: image, Digest: &digest},
+			Argv: []string{"/bin/sh", "-c", `test -z "$WEFTY_RUN_ID" && test -z "$WEFTY_RUN_DIR" && test -z "$WEFTY_RUN_TOKEN" && printf '{"direct":true}' > "$WEFTY_HANDOFF_DIR/result.json"`}}}}
+	started := time.Now()
+	var job l1.Job
+	doNativeJSON(t, caller, http.MethodPost, "/v1/jobs", spec, nil, http.StatusCreated, &job)
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var current l1.Job
+		doNativeJSON(t, caller, http.MethodGet, "/v1/jobs/"+job.JobID, nil, nil, http.StatusOK, &current)
+		if current.State == contract.JobSucceeded {
+			break
+		}
+		if current.State == contract.JobFailed || time.Now().After(deadline) {
+			t.Fatalf("direct OCI job did not succeed: %+v", current)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	var result l1.JobResult
+	// Completion is committed before best-effort result upload. Wait for its
+	// public row rather than assuming terminal Job state proves upload readiness.
+	for {
+		status, body := tryNativeJSON(t, caller, http.MethodGet, "/v1/jobs/"+job.JobID+"/result")
+		if status == http.StatusOK {
+			if err := json.Unmarshal(body, &result); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("direct result unavailable: status=%d body=%s", status, body)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if result.JobID != job.JobID || result.AttemptID == "" || string(result.Document) != `{"direct":true}` || result.SkipReason != "" || !directRuntime.captured.Load() || !directRuntime.reaped.Load() {
+		t.Fatalf("direct result=%+v captured-before-reap=%t reaped=%t", result, directRuntime.captured.Load(), directRuntime.reaped.Load())
+	}
+	var replay l1.Job
+	doNativeJSON(t, caller, http.MethodPost, "/v1/jobs", spec, nil, http.StatusOK, &replay)
+	if replay.JobID != job.JobID || len(replay.Spec.Labels) != 0 {
+		t.Fatalf("direct replay=%+v", replay)
+	}
+	if directory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); directory != "" {
+		evidence := fmt.Sprintf("job_id=%s\nattempt_id=%s\nowner_key=%s\nresult_captured_before_reap=true\nno_l3=true\nsubmit_to_result_elapsed=%s\n", job.JobID, result.AttemptID, job.JobID, time.Since(started))
+		if err := os.WriteFile(filepath.Join(directory, "direct-l1-oci.txt"), []byte(evidence), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Observe the real read/reap seam without replacing engine execution. The
+// admitted volume and bounded reader must both use the server Job ID.
+type directResultRuntime struct {
+	*ocirunner.Adapter
+	captured, reaped atomic.Bool
+}
+
+func (r *directResultRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if len(request.ManagedVolumes) != 1 || request.ManagedVolumes[0].OwnerKey != request.Authority.JobID || request.RunMailbox != nil {
+		return workloadrunner.Result{}, fmt.Errorf("direct OCI request has wrong owner or a run mailbox: %+v", request)
+	}
+	return r.Adapter.Run(ctx, request, sink)
+}
+
+func (r *directResultRuntime) ReadHandoffFile(ctx context.Context, ref workloadrunner.HandoffFileReference, name string, limit int) ([]byte, bool, error) {
+	if r.reaped.Load() || ref.OwnerKey != ref.Authority.JobID {
+		return nil, false, errors.New("direct result read after reap or with wrong owner")
+	}
+	payload, truncated, err := r.Adapter.ReadHandoffFile(ctx, ref, name, limit)
+	if err == nil && name == "result.json" && string(payload) == `{"direct":true}` && !truncated {
+		r.captured.Store(true)
+	}
+	return payload, truncated, err
+}
+
+func (r *directResultRuntime) ReapAndVerify(ctx context.Context, request workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	captured := r.captured.Load()
+	r.reaped.Store(true)
+	receipt, err := r.Adapter.ReapAndVerify(ctx, request)
+	if err == nil && !captured {
+		err = errors.New("direct OCI result was not captured before reap")
+	}
+	return receipt, err
 }
 
 func exerciseOrdinaryL3OCIOneshot(
