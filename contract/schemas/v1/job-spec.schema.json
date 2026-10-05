@@ -54,7 +54,7 @@
           "$ref": "#/$defs/environment"
         },
         "working_directory": { "type": "string", "minLength": 1 },
-        "handoff_directory": { "type": "string", "minLength": 1 },
+        "handoff_directory": { "type": "string", "minLength": 1, "description": "Optional for process one-shots. Omission assigns a managed directory under the node handoff root, owned by the server-assigned job ID unless run labels name an owner. Explicit absolute paths without run labels remain unowned, without managed retention or result upload." },
         "oci": { "$ref": "#/$defs/ociExecution" }
       }
     },
@@ -124,20 +124,6 @@
       "else": {
         "properties": {
           "execution": { "not": { "required": ["oci"] } }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "kind": { "const": "process" },
-          "class": { "const": "one-shot" }
-        },
-        "required": ["kind", "class"]
-      },
-      "then": {
-        "properties": {
-          "execution": { "required": ["handoff_directory"] }
         }
       }
     },

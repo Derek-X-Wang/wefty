@@ -713,7 +713,7 @@ func TestJobSpecClassValidationIsConditional(t *testing.T) {
 		want   int
 	}{
 		{name: "missing class", mutate: func(spec *contract.JobSpec) { spec.Class = "" }, want: http.StatusBadRequest},
-		{name: "one-shot missing handoff", mutate: func(spec *contract.JobSpec) { spec.Execution.HandoffDirectory = "" }, want: http.StatusBadRequest},
+		{name: "one-shot managed handoff", mutate: func(spec *contract.JobSpec) { spec.Execution.HandoffDirectory = "" }, want: http.StatusCreated},
 		{name: "service missing restart defaults to always", mutate: func(spec *contract.JobSpec) {
 			spec.Class = contract.JobClassService
 			spec.Execution.HandoffDirectory = ""

@@ -403,3 +403,31 @@ func TestACustodyImportMayNameNoRun(t *testing.T) {
 		t.Fatalf("a refused Custody import reserved %d Computers", stored)
 	}
 }
+
+// Execution ownership must never widen label-based run entitlement.
+func TestManagedProcessOwnerDoesNotEntitleChildRunIdentity(t *testing.T) {
+	h := runLedgerHarness(t, "run-ledger")
+	app := h.client(fabric.Identity{NodeID: "app", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "node-1")
+	spec := labelledProcessOneShot("managed-parent", []string{"linux"}, map[string]string{"app": "test"})
+	spec.Execution.HandoffDirectory = ""
+	if status, _, body := h.do(app, http.MethodPost, "/v1/jobs", spec); status != http.StatusCreated {
+		t.Fatalf("parent status=%d body=%s", status, body)
+	}
+	parent := claimOneShot(t, h, agent, node)
+	if parent.Job.Spec.Execution.HandoffDirectory != "" || parent.Job.Spec.Labels[contract.LabelRunID] != "" || parent.Job.Spec.Labels[contract.LabelHandoffOwnerRunID] != "" {
+		t.Fatalf("fallback modified submitted spec: %+v", parent.Job.Spec)
+	}
+	for _, label := range []string{contract.LabelRunID, contract.LabelHandoffOwnerRunID} {
+		child := labelledProcessOneShot("forged-job-owner-"+label, nil, map[string]string{label: parent.Job.JobID})
+		child.Execution.HandoffDirectory = ""
+		status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", parent.AttemptToken, child)
+		requireNotEntitled(t, h, status, body, child.DispatchKey)
+	}
+	child := labelledProcessOneShot("managed-child", nil, nil)
+	child.Execution.HandoffDirectory = ""
+	if status, body := h.credentialRequest(agent, http.MethodPost, "/v1/jobs", parent.AttemptToken, child); status != http.StatusCreated {
+		t.Fatalf("child status=%d body=%s", status, body)
+	}
+}

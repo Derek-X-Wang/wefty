@@ -990,3 +990,15 @@ pre-Run failure), `ReapAndVerify` invokes the helper's exact-authority
 idempotent pre-Run pin release. A successful helper `Run` response disarms that
 path; a helper `Run` error leaves it armed. Ordinary verified attempt deletion
 then owns both runtime cleanup and attempt-pin release after successful entry.
+
+### Direct process one-shot output
+
+A process one-shot with no explicit handoff path resolves its execution owner
+from its immutable spec and the server-assigned Job ID. Entitled run labels
+keep precedence; otherwise the Job owns `<node-handoff-root>/<job_id>`.
+The resolved owner and directory drive its path lease, private preparation,
+`WEFTY_HANDOFF_DIR`, receipt-authorized result read, upload record, retention
+record, accounting and expiry. Explicit paths without run labels remain
+unowned. No synthetic label is introduced, so execution ownership never grants
+run-identity entitlement. Publication retains the accepted-upload and drained-
+mailbox rule, including accepted `absent` when no result was written.

@@ -190,8 +190,8 @@ func validateProcessExecution(spec *JobSpec) error {
 	if spec.Execution.WorkingDirectory == "" || len(spec.Execution.Argv) == 0 {
 		return invalidJobSpecf("process execution argv and working_directory are required")
 	}
-	if spec.Class == JobClassOneShot && spec.Execution.HandoffDirectory == "" {
-		return invalidJobSpecf("one-shot process execution handoff_directory is required")
+	if spec.Class == JobClassOneShot && spec.Execution.handoffDirSet && spec.Execution.HandoffDirectory == "" {
+		return invalidJobSpecf("process execution handoff_directory must be non-empty when present; omit it for managed output")
 	}
 	if (spec.Execution.Executable.Path == "") == (spec.Execution.Executable.InlineBase64 == "") {
 		return invalidJobSpecf("executable must contain exactly one of path or inline_base64")

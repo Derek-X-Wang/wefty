@@ -191,3 +191,11 @@ func TestComputerRestartMustBeExplicitlyAlways(t *testing.T) {
 		})
 	}
 }
+
+func TestProcessOneShotMayOmitHandoffDirectory(t *testing.T) {
+	spec := validProcessJobSpecForValidation()
+	spec.Execution.HandoffDirectory = ""
+	if err := ValidateJobSpec(&spec); err != nil {
+		t.Fatal(err)
+	}
+}

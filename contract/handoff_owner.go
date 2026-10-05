@@ -21,8 +21,9 @@ const (
 
 // HandoffOwnerKey is the stable identity a job's retained handoff is keyed by:
 // the run whose handoff it reuses, or else its own run. It is read from the
-// job's labels alone, so L1 at submission and the node agent at execution
-// derive the same answer from the same immutable spec.
+// job's labels alone, so L1 can check run-identity entitlement independently
+// of execution ownership. ExecutionHandoffOwnerKey adds server-owned identity
+// without changing what run labels entitle a submitter to name.
 func HandoffOwnerKey(spec JobSpec) string {
 	if owner := strings.TrimSpace(spec.Labels[LabelHandoffOwnerRunID]); owner != "" {
 		return owner
@@ -30,12 +31,26 @@ func HandoffOwnerKey(spec JobSpec) string {
 	return strings.TrimSpace(spec.Labels[LabelRunID])
 }
 
+// ExecutionHandoffOwnerKey resolves execution ownership from the immutable
+// submission and the server-assigned job ID. It must not be used for run
+// entitlement: HandoffOwnerKey remains the label-only resolver for that check.
+// A process one-shot without an explicit directory owns its managed output by
+// job ID when it names no run. Explicit paths without a run remain unowned.
+func ExecutionHandoffOwnerKey(spec JobSpec, jobID string) string {
+	if owner := HandoffOwnerKey(spec); owner != "" {
+		return owner
+	}
+	if spec.Kind == JobKindProcess && spec.Class == JobClassOneShot && spec.Execution.HandoffDirectory == "" {
+		return jobID
+	}
+	return ""
+}
+
 // RequiresHandoffOwner reports whether a job cannot execute without a handoff
 // owner key. Only an OCI one-shot needs one: its handoff is a helper-owned
 // volume named from the key, and the helper refuses to create one without it.
-// A process one-shot keeps the directory it was dispatched with and simply
-// retains nothing when it names no run; a service's data is keyed by its own
-// job ID, and a Computer is a service.
+// A process one-shot can use job-owned output without a run identity. A
+// service's data is keyed by its own job ID, and a Computer is a service.
 func RequiresHandoffOwner(spec JobSpec) bool {
 	return spec.Kind == JobKindOCI && spec.Class == JobClassOneShot
 }

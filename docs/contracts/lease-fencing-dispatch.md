@@ -620,8 +620,11 @@ effects for an ended run.
 
 JSON Schema and `contract.ValidateJobSpec` accept every non-empty job `kind` and
 apply the same asymmetric arm rules. `kind=process` retains the flat
-`execution.executable`, `argv`, host `working_directory`, and one-shot
-`handoff_directory`; it forbids `execution.oci`. `kind=oci` requires
+`execution.executable`, `argv`, host `working_directory`, and optional
+`handoff_directory`; process one-shots that omit the path get node-managed
+output owned by the server-assigned Job ID unless entitled run labels name an
+owner. Explicit absolute paths without run labels retain unowned behavior.
+It forbids `execution.oci`. `kind=oci` requires
 `execution.oci` and forbids every flat process field. An unknown kind remains
 valid open-kind data but cannot reuse the OCI arm.
 
@@ -682,8 +685,8 @@ Schema integer semantics: decimal and exponent spellings are accepted only
 when mathematically integral and within signed 64-bit range. It adds no kind,
 class, desired state, attempt state, capacity slot,
 or numeric capability. Services do not participate in the run handoff
-lifecycle, so `handoff_directory` is required only for `one-shot`; the agent
-never prepares or finishes a handoff path for a service.
+lifecycle. Process one-shots may omit `handoff_directory` for managed output;
+the agent never prepares or finishes a handoff path for a service.
 
 Process spawn failures carry a stable `{code, message}` object. The message is
 diagnostic only. L1 owns the restartability allowlist and treats every unknown
