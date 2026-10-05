@@ -60,6 +60,51 @@ func TestCancelProcessStartAcknowledgementRefused(t *testing.T) {
 	}
 }
 
+func TestCancelProcessStartedReplayAccepted(t *testing.T) {
+	h, client, agent, node := credentialHarness(t)
+	job := h.submit(client, "started-before-cancel", []string{"linux"})
+	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/started", job.JobID, claim.Lease.AttemptID)
+	request := StartedRequest{FencingToken: claim.Lease.FencingToken}
+	status, _, body := h.do(agent, http.MethodPost, path, request)
+	if status != http.StatusOK || decodeJob(t, body).State != contract.JobRunning {
+		t.Fatalf("started=%d %s", status, body)
+	}
+	var startedBefore sql.NullInt64
+	if err := h.store.db.QueryRow(`SELECT started_ns FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&startedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if !startedBefore.Valid {
+		t.Fatal("accepted start did not record started_ns")
+	}
+	h.clock.Advance(time.Second)
+	status, _, body = h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/cancel", nil)
+	if status != http.StatusOK {
+		t.Fatalf("cancel=%d %s", status, body)
+	}
+	pending := decodeJob(t, body)
+	stored, err := h.store.GetJob(t.Context(), job.JobID)
+	if err != nil || pending.State != contract.JobRunning || pending.Outcome != "canceled" || stored.Outcome != "canceled" {
+		t.Fatalf("stored cancellation=%+v %v body=%s", stored, err, body)
+	}
+	h.clock.Advance(time.Second)
+	status, _, body = h.do(agent, http.MethodPost, path, request)
+	if status != http.StatusOK || !reflect.DeepEqual(stored, decodeJob(t, body)) {
+		t.Fatalf("started replay=%d %s; want stored canceled job=%+v", status, body, stored)
+	}
+	var startedAfter sql.NullInt64
+	if err := h.store.db.QueryRow(`SELECT started_ns FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&startedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if startedAfter != startedBefore {
+		t.Fatalf("replay changed started_ns: before=%+v after=%+v", startedBefore, startedAfter)
+	}
+	after, err := h.store.GetJob(t.Context(), job.JobID)
+	if err != nil || !reflect.DeepEqual(stored, after) {
+		t.Fatalf("replay mutated stored cancellation=%+v %v", after, err)
+	}
+}
+
 func TestCancelActiveProcessContract(t *testing.T) {
 	for _, state := range []contract.JobState{contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput} {
 		t.Run(string(state), func(t *testing.T) {

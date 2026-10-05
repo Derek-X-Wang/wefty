@@ -3466,15 +3466,15 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 		}
 		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
+	if attempt.startedNS.Valid {
+		return getJobByID(ctx, tx, jobID, now)
+	}
 	canceled, _, err := cancellationDeadline(ctx, tx, jobID)
 	if err != nil {
 		return Job{}, err
 	}
 	if canceled {
 		return Job{}, protocolError(contract.ErrorConflict, "pending cancellation forbids Started acknowledgement")
-	}
-	if attempt.startedNS.Valid {
-		return getJobByID(ctx, tx, jobID, now)
 	}
 	if attempt.state != contract.AttemptClaimed && !(attempt.spec.Kind == contract.JobKindProcess && attempt.state == contract.AttemptRunning) {
 		return Job{}, protocolError(contract.ErrorConflict, "attempt cannot accept Started")

@@ -788,14 +788,17 @@ remain explicitly always-only, including the `--computer` compatibility alias.
 
 Renewal returns `directive=cancel` for a pending canceled process one-shot.
 It preserves evidence authority but never acknowledges a claimed program as
-started. The process `/started` acknowledgement also reads cancellation inside
-its committing transaction and refuses pending cancellation with HTTP 409
-`conflict`, `retryable=false`, without recording `started_ns` or promoting the
-attempt. Claim, legacy start promotion by renewal or logs, child creation,
-completion and expiry check the same intent transactionally. The returned
-lease is capped at the fixed 30-second cancellation settlement deadline.
+started. The returned lease is capped at the fixed 30-second cancellation
+settlement deadline.
 Neither renewals nor repeated cancel requests move that deadline, including
-across a database reopen. Expiry and reconciliation consult
+across a database reopen. The process `/started` acknowledgement also reads
+cancellation inside its committing transaction. If `started_ns` is already
+recorded, an identical replay returns HTTP 200 with the current stored job,
+including its `outcome=canceled`. Otherwise, pending cancellation refuses a
+new acknowledgement with HTTP 409 `conflict`, `retryable=false`, leaving
+`started_ns` unset and without promoting the attempt. Claim, legacy start
+promotion by renewal or logs, child creation, completion and expiry check
+the same intent transactionally. Expiry and reconciliation consult
 intent inside their immediate transactions, so no success or requeue can
 replace an earlier accepted cancellation.
 
