@@ -146,23 +146,6 @@ func TestCancelRefusalsAndTerminalReplay(t *testing.T) {
 	}
 	job := h.submit(client, "cancel-live", []string{"linux"})
 	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
-	for _, running := range []bool{false, true} {
-		if running {
-			if _, err := h.store.RenewLease(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken); err != nil {
-				t.Fatal(err)
-			}
-		}
-		before, err = h.store.GetJob(t.Context(), job.JobID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		status, _, body = h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/cancel", nil)
-		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorCode("cancel_not_queued"))
-		after, err = h.store.GetJob(t.Context(), job.JobID)
-		if err != nil || !reflect.DeepEqual(before, after) {
-			t.Fatalf("live cancel mutated=%#v err=%v", after, err)
-		}
-	}
 	zero := 0
 	if _, err := h.store.CompleteAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "finish", Result: ProcessResult{ExitCode: &zero}}); err != nil {
 		t.Fatal(err)
@@ -243,19 +226,20 @@ func TestCancelClaimRace(t *testing.T) {
 		if claimErr != nil {
 			t.Fatal(claimErr)
 		}
-		if status == http.StatusOK {
+		if status != http.StatusOK {
+			t.Fatalf("cancel=%d %s", status, body)
+		}
+		if claim == nil {
 			assertCanceledJob(t, status, body)
-			if claim != nil {
-				t.Fatalf("claim won after successful cancel: %#v", claim)
-			}
 		} else {
-			assertAPIError(t, status, body, http.StatusConflict, contract.ErrorCode("cancel_not_queued"))
-			if claim == nil || claim.Job.JobID != job.JobID {
-				t.Fatalf("cancel refused without winning claim=%#v", claim)
+			pending := decodeJob(t, body)
+			if pending.Outcome != "canceled" || pending.State != contract.JobClaimed {
+				t.Fatalf("claimed cancellation=%s", body)
 			}
 			zero := 0
-			if _, err := h.store.CompleteAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "race-finish", Result: ProcessResult{ExitCode: &zero}}); err != nil {
-				t.Fatal(err)
+			done, err := h.store.CompleteAttempt(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "race-finish", Result: ProcessResult{ExitCode: &zero}})
+			if err != nil || done.State != contract.JobFailed || done.Outcome != "canceled" {
+				t.Fatalf("claim race=%+v %v", done, err)
 			}
 		}
 	}

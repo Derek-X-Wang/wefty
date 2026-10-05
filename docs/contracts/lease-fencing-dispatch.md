@@ -703,7 +703,7 @@ without OOM, while post-start rejects `spawn_error`.
 
 The awaiting-input prompt verbs remain reserved and return HTTP `501`,
 `not_implemented`, `retryable=false` without mutation. Job cancellation is
-implemented only for queued one-shots: `POST /v1/jobs/{job_id}/cancel` returns
+implemented for queued one-shots and active process one-shots: `POST /v1/jobs/{job_id}/cancel` returns
 HTTP 200 with the current job; a successful queued cancel records
 `state=failed`, `outcome=canceled` in the claim-serializing transaction.
 Authority is checked in that transaction: the originating client submitter,
@@ -712,8 +712,10 @@ A bearer cannot fall back to the inherited submitter's scope. Unknown and
 out-of-scope targets receive HTTP 404 `not_found`; an expired, superseded,
 wrong-node or replaced-session credential is refused under the existing
 credential authority rules. Services receive 409 `cancel_service` pointing at
-desired state and remove. Until #651/#652, claimed, running and awaiting-input
-jobs receive 409 `cancel_not_queued` and no mutation. Both refusals are
+desired state and remove, including removed tombstones with retained caller
+authority. Active OCI one-shots receive 409 `cancel_not_queued` and no mutation
+until #652. Active process cancellation reserves the outcome and delivers
+termination as described below. Both refusals are
 non-retryable. Retries and already-terminal one-shots return the current state.
 Neither attempts nor process results are invented; retained earlier evidence,
 including identical completion replay for a requeued OCI attempt, cannot
@@ -742,6 +744,29 @@ the table includes the cause in POLICY STOP. `services create` dispatches typed
 process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch
 key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
 remain explicitly always-only, including the `--computer` compatibility alias.
+
+### Process one-shot cancellation delivery
+
+Renewal returns `directive=cancel` for a pending canceled process one-shot.
+It preserves evidence authority but never acknowledges a claimed program as
+started; the returned lease is capped at the fixed 30-second cancellation
+settlement deadline. Neither renewals nor repeated cancel requests move that
+deadline, including across a database reopen. Expiry and reconciliation consult
+intent inside their immediate transactions, so no success or requeue can
+replace an earlier accepted cancellation.
+
+Heartbeat carries `one_shot_cancel_directives`, each with `job_id`,
+`attempt_id` and `fencing_token`. These standing directives are scoped to the
+node's current boot session and authority generation. They remain deliverable
+after logical settlement until process completion evidence has been recorded;
+a terminal canceled job alone never proves the runtime stopped. The agent
+matches all three identifiers to a resident process one-shot, requests TERM,
+waits the existing five-second grace, then forces KILL. Normal output flush,
+completion evidence, result upload and handoff retention still run. Confirmed
+delivery follows the existing agent termination-initiator rule; failed signal
+delivery must not invent confirmed termination. A TERM handler's zero exit
+remains a real attempt fact, with `termination_initiator=agent`, independent of
+the job's reserved canceled outcome.
 
 ## Instance keys
 

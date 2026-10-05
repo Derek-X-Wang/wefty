@@ -159,6 +159,7 @@ var driftRows = []driftRow{
 	{component(commonDoc, "ComputerReimagePreflightDirective"), typeOf[l1.ComputerReimagePreflightDirective]()},
 	{component(commonDoc, "Node"), typeOf[l1.Node]()},
 	{component(commonDoc, "HeartbeatResponse"), typeOf[l1.HeartbeatResponse]()},
+	{component(commonDoc, "OneShotCancelDirective"), typeOf[l1.OneShotCancelDirective]()},
 	{component(commonDoc, "JobSpec"), typeOf[contract.JobSpec]()},
 	{component(commonDoc, "JobRecordSpec"), typeOf[contract.JobSpec]()},
 	{component(commonDoc, "RunRecord"), typeOf[contract.RunRecord]()},
@@ -1015,7 +1016,7 @@ func TestNodeProjectionsValidateAgainstPublishedSchemas(t *testing.T) {
 		IntentUpdatedAt: &observed, IntentActor: "operator", LastHeartbeatAt: observed,
 	}
 	heartbeat := l1.HeartbeatResponse{
-		Node: node, RemovalDirectives: []l1.RemovalDirective{}, StorageResetDirectives: []l1.ComputerStorageResetDirective{},
+		Node: node, OneShotCancelDirectives: []l1.OneShotCancelDirective{}, RemovalDirectives: []l1.RemovalDirective{}, StorageResetDirectives: []l1.ComputerStorageResetDirective{},
 		StorageGrowDirectives: []l1.ComputerStorageGrowDirective{}, ReimageDirectives: []l1.ComputerReimagePreflightDirective{},
 		BackupDirectives: []l1.ComputerBackupDirective{}, BackupPruneDirectives: []l1.ComputerBackupPruneDirective{},
 		StorageCopyDirectives: []l1.ComputerStorageCopyDirective{}, CustodyExportDirectives: []l1.ComputerCustodyExportDirective{},

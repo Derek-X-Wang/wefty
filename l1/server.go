@@ -2367,7 +2367,12 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		computerPolicy = nil
 	}
-	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
+	cancels, err := s.store.ListNodeCancelDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, OneShotCancelDirectives: cancels, RemovalDirectives: directives,
 		StorageResetDirectives: storageResets, StorageGrowDirectives: storageGrows, ReimageDirectives: reimages, BackupDirectives: backups,
 		BackupPruneDirectives: backupPrunes, StorageCopyDirectives: storageCopies,
 		CustodyExportDirectives: custodyExports, ComputerPolicy: computerPolicy})
