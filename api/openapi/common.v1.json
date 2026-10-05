@@ -50,7 +50,7 @@
       },
       "JobSpec": {
         "$ref": "../../contract/schemas/v1/job-spec.schema.json",
-        "description": "Open-kind workload contract. kind=process uses the flat process execution fields; kind=oci uses execution.oci while env and sensitive_env remain shared. execution.oci.computer is an optional trait valid only on digest-pinned, Pinned OCI service Jobs; it adds no kind, class, state, or scheduling axis."
+        "description": "Open-kind workload contract. kind=process uses the flat process execution fields; kind=oci uses execution.oci while env and sensitive_env remain shared. execution.oci.computer is an optional trait valid only on digest-pinned, Pinned OCI service Jobs; it adds no kind, class, state, or scheduling axis. Optional instance_key reserves at most one live job in the authenticated Fabric submitter namespace. Keys are 1-255 visible ASCII characters, case-sensitive, with identity normalization (no trimming or folding); omission is unkeyed, empty and null are invalid. One-shots release on terminal state; services retain through stopped, failed and removal until ordinary-row deletion. Computers cannot carry instance_key."
       },
       "JobRecordSpec": {
         "$id": "job-record-spec.schema.json",

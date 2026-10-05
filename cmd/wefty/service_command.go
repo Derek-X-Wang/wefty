@@ -84,7 +84,7 @@ func executeServiceCreate(
 ) error {
 	flags := flag.NewFlagSet("services create", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var scriptPath, idempotencyKey, restart string
+	var scriptPath, idempotencyKey, restart, instanceKey string
 	var computer bool
 	var computerName string
 	var computerBackupCap int64
@@ -105,6 +105,7 @@ func executeServiceCreate(
 	flags.Var(&tags, "tag", "routing tag (repeatable)")
 	flags.Var(&publishedPort, "published-port", "Fabric port to publish")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable service creation idempotency key")
+	flags.StringVar(&instanceKey, "instance-key", "", "reserve this instance key in the authenticated app namespace")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -113,6 +114,20 @@ func executeServiceCreate(
 	}
 	if restart != contract.RestartAlways && restart != contract.RestartOnFailure && restart != contract.RestartNever {
 		return usageError("--restart must be always, on-failure or never")
+	}
+	var key *string
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "instance-key" {
+			key = &instanceKey
+		}
+	})
+	if key != nil {
+		if err := contract.ValidateInstanceKey(*key); err != nil {
+			return usageError(err.Error())
+		}
+		if computer {
+			return usageError("Computers cannot reserve instance keys")
+		}
 	}
 	if computer {
 		if restart != contract.RestartAlways {
@@ -168,6 +183,7 @@ func executeServiceCreate(
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		Class:         contract.JobClassService,
+		InstanceKey:   key,
 		PublishedPort: port,
 		Restart:       restart,
 		RoutingTags:   append([]string(nil), resolvedTags...),

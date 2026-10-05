@@ -298,6 +298,7 @@ func ValidComputerRFBVersionBanner(banner []byte) bool {
 type JobSpec struct {
 	SchemaVersion    int               `json:"schema_version"`
 	DispatchKey      string            `json:"dispatch_key"`
+	InstanceKey      *string           `json:"instance_key,omitempty"`
 	Kind             string            `json:"kind"`
 	Class            string            `json:"class"`
 	PublishedPort    *int              `json:"published_port,omitempty"`
@@ -309,11 +310,12 @@ type JobSpec struct {
 	Limits           *JobLimits        `json:"limits,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty"`
 	publishedPortSet bool
+	instanceKeySet   bool
 }
 
-// UnmarshalJSON records whether published_port appeared on the wire. Plain
-// services retain their historical null-or-absent contract, while the
-// Computer trait forbids the member itself, including an explicit null.
+// UnmarshalJSON records wire presence for published_port and instance_key.
+// Plain services retain their historical null-or-absent port contract;
+// Computers forbid that member, and instance keys reject explicit null.
 func (s *JobSpec) UnmarshalJSON(data []byte) error {
 	type wire JobSpec
 	var decoded wire
@@ -326,6 +328,7 @@ func (s *JobSpec) UnmarshalJSON(data []byte) error {
 	}
 	*s = JobSpec(decoded)
 	_, s.publishedPortSet = members["published_port"]
+	_, s.instanceKeySet = members["instance_key"]
 	return nil
 }
 

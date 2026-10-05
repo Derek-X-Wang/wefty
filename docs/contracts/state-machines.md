@@ -1128,3 +1128,15 @@ Services in every state receive HTTP 409 `cancel_service`, `retryable=false`,
 with `desired_state_path` and `remove_path` in `error.details`; use desired state
 or remove with `class=service`. Cancel requires no body and determines the
 target class itself; the read-route `class` selector is ignored.
+
+## Instance-key reservation lifetime
+
+An optional Instance key reserves one live job across both classes in the
+submitter's authenticated Fabric namespace. A one-shot keeps it in queued,
+claimed, running and awaiting-input, including cancellation pending settlement;
+its terminal succeeded/failed transition (including canceled outcome) releases
+it atomically. A service keeps it in every state, including a policy stop,
+stopped/failed, removal pending, agent cleaned, forgotten and stalled, until
+removal finalization deletes the ordinary job. Releasing a Slot does not release
+an Instance key. Computers are excluded. See [instance-key concurrency and
+validation](lease-fencing-dispatch.md#instance-keys).

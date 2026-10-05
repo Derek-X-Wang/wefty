@@ -1186,8 +1186,9 @@ successful upload does not hide a failed drain, whose pending events are still
 in the handoff, and a successful drain does not hide a failed upload. Every
 other skip reason (`not_json`, `oversize`, `unreadable`, `not_file`) names a
 file that is still on the node and nowhere else, so it never publishes;
-neither does a refused or unreachable L1 (`transport`), nor an OCI attempt
-with no run mailbox, which has no read path to its volume and uploads nothing.
+neither does a refused or unreachable L1 (`transport`) or an attempt whose
+runtime exposes no result reader. An OCI handoff result reader does not require
+a run mailbox.
 Publication never changes the workload's verdict.
 
 Publication is what L1 accepted, not what L1 serves later. L1 authorizes the
@@ -1316,10 +1317,11 @@ An upload from an attempt a later one has already superseded is refused
 (`superseded_attempt`). A completion that has a read path to its attempt's
 result writes the row — the document, or the named reason there is none,
 `absent` included — so a retry that produced no result displaces its
-predecessor's document. Some completions write nothing: an OCI attempt with no
-run mailbox has no read path to its helper-owned volume, and a node that
-completes an attempt and crashes before its upload never sends it. The
-predecessor's row then stays in place, but the row is served only while it
+predecessor's document. An OCI one-shot with an admitted handoff owner has a
+bounded result reader independent of L3 configuration, a run token, and a run
+mailbox. Some completions write nothing: an attempt with no runtime result
+reader, or a node that completes an attempt and crashes before its upload,
+never sends it. The predecessor's row then stays in place, but the row is served only while it
 belongs to the latest attempt, so a reader gets an ordinary not-found rather
 than that earlier document. Either way a reader is never shown an earlier
 attempt's result as this run's answer. The row is removed with the job,
@@ -1334,7 +1336,11 @@ the provenance around it — which attempt produced it, its digest, when it
 arrived. `kind=oci` uploads the same way: the agent reads `result.json` out of
 the helper-owned volume through the confined helper read path
 (`Scope=handoff_files`) before the attempt is reaped, because that read is
-authorized against the live attempt and there is no read path afterwards.
+authorized against the exact live attempt and its admitted handoff owner, and
+there is no read path afterwards. The handoff-file scope omits the mailbox run
+ID; mailbox event publication still requires the exact declared run ID. A
+wrong owner, stale fence or boot, and a reaped attempt are refused before the
+helper engine reads anything.
 
 The upload is bounded separately and much more tightly than the node's own
 retention, because it is a document in a database rather than files on a disk:
@@ -1358,8 +1364,8 @@ are exactly the cases the ledger cannot describe, because nothing of theirs got
 there. The reader sees an ordinary not-found, and the reason lives on the node
 that ran the job: the agent writes an upload record beside the run's retained
 files, for every runtime including `kind=oci`, whose handoff volume is the
-helper's. A missing OCI mailbox leaves no result capture or upload outcome;
-a failed upload records `transport`; a successful document upload records
+helper's. A missing OCI mailbox requires no drain and does not prevent result capture
+or upload; a failed upload records `transport`; a successful document upload records
 `uploaded=true`, and an accepted `absent` records that reason. The record also
 carries `mailbox_drained`. The handoff is published only when the result
 reached L1 — `uploaded=true`, or `absent` accepted — **and** `mailbox_drained`
@@ -1495,3 +1501,12 @@ cannot hold live runs' dispatch behind ended ones.
 `l1_job_id` without a `job` only when the failed ledger run and diagnostic match
 the same authoritative missing-job response. Reading execution never creates a
 regression record and does not hide other L1 failures.
+
+## Instance keys and child submission
+
+L1 root submissions may use an Instance key in the authenticated Fabric
+submitter namespace. New keyed submissions using an Attempt credential are
+explicitly refused with non-retryable `instance_key_not_supported` (HTTP 409)
+until parent-scoped namespaces ship in #654. Unkeyed child submission and
+credential scope are unchanged; dispatch replay and tombstones resolve before
+instance-key handling. See [the key contract](lease-fencing-dispatch.md#instance-keys).

@@ -794,12 +794,13 @@ func (scope RunMailboxScope) valid() bool {
 
 // RunMailboxReference names exactly one attempt's mailbox. Every field is
 // checked: the authority must match a live attempt of this session, and the
-// owner key must be the one that attempt's Run declared, so a live attempt
-// cannot read a different run's handoff volume.
+// owner key must be the one that attempt's Run declared. A handoff-file read
+// may omit RunID and needs no mailbox seed. Event operations require the exact
+// declared mailbox run ID. A live attempt cannot read a different run's volume.
 type RunMailboxReference struct {
 	Authority AttemptAuthority `json:"authority"`
 	OwnerKey  string           `json:"owner_key"`
-	RunID     string           `json:"run_id"`
+	RunID     string           `json:"run_id,omitempty"`
 	// Scope selects the directory within the volume. Empty is the event
 	// directory, which is what every pre-scope caller meant.
 	Scope RunMailboxScope `json:"scope,omitempty"`
@@ -897,7 +898,7 @@ func (reference RunMailboxReference) validate() error {
 	if !reference.Scope.valid() {
 		return fmt.Errorf("run mailbox scope %q is not a known scope", string(reference.Scope))
 	}
-	if !ValidRunMailboxName(reference.RunID) {
+	if !(reference.Scope == RunMailboxScopeHandoffFiles && reference.RunID == "") && !ValidRunMailboxName(reference.RunID) {
 		return errors.New("run mailbox run ID is not a bounded mailbox name")
 	}
 	if _, err := DeterministicHandoffVolumeDirectory(reference.OwnerKey); err != nil {

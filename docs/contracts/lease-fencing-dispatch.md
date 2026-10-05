@@ -781,3 +781,38 @@ completion evidence, and `restart_suppressed_reason` naming the current cause
 process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch
 key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
 remain explicitly always-only, including the `--computer` compatibility alias.
+
+## Instance keys
+
+A root JobSpec may carry `instance_key` independently of `dispatch_key`.
+Normalization is identity: keys are compared exactly, case-sensitive, without
+trimming or folding. A present value must be a string of 1–255 visible ASCII
+characters (`!` through `~`); whitespace, non-ASCII, empty and null are invalid.
+Omission means no reservation. Keys apply only to `one-shot` and `service`;
+Computers reject the member. The namespace is the authenticated Fabric identity
+of the submitting app. Apps sharing that identity share the namespace.
+`services create --instance-key KEY` exposes it; `wefty submit` continues through
+L3 and has no instance-key flag.
+
+L1 persists namespace, key and immutable lifecycle discriminator on the ordinary
+job row. A single partial unique index covers both classes, inside the creation
+transaction. The internal namespace encoding tags Fabric identity (`fabric:`)
+so future parent-job namespaces cannot alias an identity. The index excludes
+terminal one-shots (`succeeded` or `failed`, including `outcome=canceled`), so
+release commits atomically with the terminal transition. Live states, including
+cancellation pending settlement, keep the reservation. This is logical Job
+uniqueness, not a guarantee that a lost attempt's process no longer exists.
+
+Services retain the reservation in every state: stopped, failed, policy-stopped,
+removal pending, agent cleaned, forgotten and stalled. Only removal finalization
+that deletes the ordinary job releases it. A tombstone retains dispatch replay
+identity but does not reserve an instance key or keep executable bytes.
+
+Dispatch replay, dispatch mismatch and removal tombstones resolve first. A
+new request with a different dispatch key that loses a reservation, including
+concurrent creation, receives HTTP 409 `instance_key_conflict`, non-retryable,
+with `details.instance_key` and `details.job_id` only when the caller may read
+the holder. Client principals can read ordinary jobs; bearer credentials cannot
+expose jobs outside their own job/children scope. A new keyed attempt-credential
+submission receives HTTP 409 `instance_key_not_supported`, non-retryable, until
+#654 introduces parent-scoped namespaces. No child namespace is implemented here.

@@ -8,6 +8,7 @@
   "properties": {
     "schema_version": { "const": 1 },
     "dispatch_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S" },
+    "instance_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[!-~]+$", "description": "Optional case-sensitive instance key. Identity normalization: no trimming or folding. Omission is unkeyed; empty, null, whitespace and non-ASCII are invalid. One-shots release on terminal; services hold until removal finalization. Computers excluded." },
     "kind": {
       "description": "Open workload kind. Unknown values are valid data and are rejected only by agents that cannot execute them.",
       "type": "string",
@@ -84,6 +85,7 @@
     }
   },
   "allOf": [
+    { "if": { "required": ["instance_key"] }, "then": { "properties": { "class": { "enum": ["one-shot", "service"] } } } },
     {
       "if": {
         "properties": { "kind": { "pattern": "^\\s*[Pp][Rr][Oo][Cc][Ee][Ss][Ss]\\s*$" } },
@@ -227,7 +229,7 @@
             }
           }
         },
-        "not": { "required": ["published_port"] }
+        "not": { "anyOf": [{ "required": ["published_port"] }, { "required": ["instance_key"] }] }
       }
     }
   ],

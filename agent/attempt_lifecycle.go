@@ -1061,6 +1061,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
 	var mailbox *runMailbox
+	var handoffReader handoffFileReader
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
 		// No renewal may cross the terminal/reap boundary. Closing before
 		// ReapAndVerify also discards a pre-admission renewal when Started
@@ -1094,11 +1095,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// volume is retained rather than expiring as a clean success.
 		if mailbox.readsThroughRuntime() {
 			mailbox.finalize(finalizationContext)
-			// The result document lives in the same helper-owned volume and is
-			// readable under the same live-attempt authority, so it is read
-			// here for the same reason and in the same window. The upload
-			// itself happens after completion; only the read has to be here.
-			lifecycle.captureRemoteResult(finalizationContext, mailbox)
+		}
+		// Capture every OCI handoff result while its exact attempt is still live,
+		// including attempts with no L3 mailbox. Upload follows completion.
+		if handoffReader != nil {
+			lifecycle.captureRemoteResult(finalizationContext, handoffReader)
 		}
 		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
 			Authority: authority, ManagedResources: managedResources,
@@ -1365,6 +1366,16 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			}()
 			lifecycle.storeMailbox(mailbox)
 			request.RunMailbox = runMailboxSeed(claim.Job.Spec)
+		}
+	}
+	if usesOCIHandoffLifecycle(claim.Job.Spec) {
+		if runtime, served := runtimeAdapter.(workloadrunner.HandoffFileRuntime); served {
+			handoffReader = &helperHandoffReader{runtime: runtime, reference: workloadrunner.HandoffFileReference{
+				Authority: authority, OwnerKey: handoffOwnerRunID(claim.Job.Spec),
+			}}
+		} else if reader, served := mailbox.handoffFiles(); served {
+			// Existing mailbox runtimes can still serve their original read path.
+			handoffReader = reader
 		}
 	}
 	var err error
@@ -1719,11 +1730,7 @@ func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, publ
 // captureRemoteResult reads an OCI attempt's result.json through the helper
 // while the attempt is still live. A failure here is not an error for the
 // attempt: it becomes a named skip reason, and the document stays on the node.
-func (lifecycle *attemptLifecycle) captureRemoteResult(ctx context.Context, mailbox *runMailbox) {
-	reader, ok := mailbox.handoffFiles()
-	if !ok {
-		return
-	}
+func (lifecycle *attemptLifecycle) captureRemoteResult(ctx context.Context, reader handoffFileReader) {
 	result := readRemoteHandoffResult(ctx, reader)
 	lifecycle.capturedResult.Store(&result)
 }

@@ -29,6 +29,8 @@ const (
 	// the job.
 	ErrorSupersededAttempt           ErrorCode = "superseded_attempt"
 	ErrorDispatchKeyConflict         ErrorCode = "dispatch_key_conflict"
+	ErrorInstanceKeyConflict         ErrorCode = "instance_key_conflict"
+	ErrorInstanceKeyNotSupported     ErrorCode = "instance_key_not_supported"
 	ErrorSpawnDepthExceeded          ErrorCode = "spawn_depth_exceeded"
 	ErrorIdempotencyConflict         ErrorCode = "idempotency_conflict"
 	ErrorStaleIntentRevision         ErrorCode = "stale_intent_revision"

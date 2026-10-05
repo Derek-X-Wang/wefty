@@ -405,6 +405,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   parent_job_id TEXT,
   parent_attempt_id TEXT,
   originating_submitter TEXT NOT NULL DEFAULT '',
+  instance_namespace TEXT NOT NULL DEFAULT '',
+  instance_key TEXT,
+  instance_class TEXT NOT NULL DEFAULT '' CHECK(instance_class IN ('', 'one-shot', 'service')),
   submitted_by_run_ledger INTEGER NOT NULL DEFAULT 0 CHECK(submitted_by_run_ledger IN (0, 1)),
   spawn_depth INTEGER NOT NULL DEFAULT 0 CHECK(spawn_depth >= 0),
   created_ns INTEGER NOT NULL,
@@ -1181,6 +1184,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	if err := s.markLogEventDocumentsCompactOnNewDatabase(ctx); err != nil {
+		return err
+	}
+	if err := s.initializeInstanceKeys(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
@@ -2238,6 +2244,18 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read removed dispatch key")
 	}
+	if spec.InstanceKey != nil {
+		if origin.Parent != nil {
+			return Job{}, false, protocolError(contract.ErrorInstanceKeyNotSupported,
+				"keyed attempt-credential submissions are not supported until parent-scoped instance keys are available")
+		}
+		if originatingSubmitter == "" {
+			return Job{}, false, protocolError(contract.ErrorInvalidRequest, "instance_key requires an authenticated Fabric submitter")
+		}
+		if err := instanceKeyConflict(ctx, tx, spec, origin); err != nil {
+			return Job{}, false, err
+		}
+	}
 	// A run identity label is a claim to speak for that run: the node keys a
 	// one-shot's retained handoff by it and attributes the attempt's results
 	// to it. Only a submitter entitled to the run may make the claim (wefty
@@ -2272,14 +2290,16 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state,
-                 parent_job_id, parent_attempt_id, originating_submitter, submitted_by_run_ledger, spawn_depth, created_ns, updated_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON, job.State,
-		parentJobID, parentAttemptID, originatingSubmitter, submittedByRunLedger, spawnDepth, now.UnixNano(), now.UnixNano())
+                 parent_job_id, parent_attempt_id, originating_submitter, submitted_by_run_ledger, spawn_depth, created_ns, updated_ns,
+                 instance_namespace, instance_key, instance_class)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON, job.State,
+		parentJobID, parentAttemptID, originatingSubmitter, submittedByRunLedger, spawnDepth, now.UnixNano(), now.UnixNano(),
+		instanceNamespace(origin), spec.InstanceKey, instanceClass(spec))
 	if err != nil {
 		// A concurrent identical submit can win the unique dispatch key. Read
 		// it after rolling this transaction back and preserve replay semantics.
 		_ = tx.Rollback()
-		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, origin, err)
+		return s.readConcurrentSubmit(ctx, spec, requestHash, origin, err)
 	}
 	for _, capability := range requiredCapabilities {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)", job.JobID, capability); err != nil {
@@ -2378,11 +2398,17 @@ func replayWithinScope(origin JobOrigin, replayed Job) bool {
 		replayed.OriginatingSubmitter == origin.Parent.OriginatingSubmitter
 }
 
-func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {
+func (s *Store) readConcurrentSubmit(ctx context.Context, spec contract.JobSpec, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {
+	dispatchKey := spec.DispatchKey
 	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey, canonicalTime(s.clock.Now()))
 	if err != nil {
 		tombstone, tombstoneErr := readServiceTombstoneByDispatchHash(ctx, s.db, hashDispatchKey(dispatchKey))
 		if tombstoneErr != nil {
+			if errors.Is(err, sql.ErrNoRows) && errors.Is(tombstoneErr, sql.ErrNoRows) {
+				if conflict := instanceKeyConflict(ctx, s.db, spec, origin); conflict != nil {
+					return Job{}, false, conflict
+				}
+			}
 			return Job{}, false, internalError(insertErr, "store job")
 		}
 		if !replayWithinScope(origin, tombstone.job()) || tombstone.requestHash != requestHash {
