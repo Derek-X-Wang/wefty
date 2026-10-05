@@ -128,7 +128,8 @@ const (
 type serverAttempt struct {
 	authority AttemptAuthority
 	// handoffOwnerKey and runMailboxRunID are exactly what this attempt's Run
-	// declared. A mailbox request must name both, so a live attempt can only
+	// declared. Event operations must name both; a handoff-file read needs
+	// only the owner key. A live attempt can only
 	// ever read the one mailbox it was started with -- never another run's
 	// handoff volume, and never a second run inside its own.
 	handoffOwnerKey  string
@@ -1244,11 +1245,36 @@ func (session *serverSession) authorizeRunMailbox(reference RunMailboxReference)
 	return nil
 }
 
+// authorizeHandoffRead needs no run mailbox. Ownership is still what this
+// exact live attempt's Run admitted, never an owner selected by the reader.
+func (session *serverSession) authorizeHandoffRead(reference RunMailboxReference) *RPCError {
+	if err := reference.validate(); err != nil {
+		return &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+	}
+	attempt, rpcErr := session.authorizeAttempt(reference.Authority)
+	if rpcErr != nil {
+		return rpcErr
+	}
+	session.mu.Lock()
+	ownerKey, runID := attempt.handoffOwnerKey, attempt.runMailboxRunID
+	session.mu.Unlock()
+	if ownerKey == "" || reference.OwnerKey != ownerKey || (reference.RunID != "" && reference.RunID != runID) {
+		return &RPCError{Code: CodeUnauthorizedAttempt, Message: "handoff is not the one this attempt was started with"}
+	}
+	return nil
+}
+
 // runMailboxEngine authorizes the request and then resolves the engine that can
 // serve it. Authorization always runs first, so an engine that cannot serve a
 // mailbox never becomes a way to learn whether an attempt exists.
-func (session *serverSession) runMailboxEngine(server *Server, reference RunMailboxReference) (RunMailboxEngine, *RPCError) {
-	if rpcErr := session.authorizeRunMailbox(reference); rpcErr != nil {
+func (session *serverSession) runMailboxEngine(server *Server, reference RunMailboxReference, handoffRead bool) (RunMailboxEngine, *RPCError) {
+	var rpcErr *RPCError
+	if handoffRead && reference.Scope == RunMailboxScopeHandoffFiles {
+		rpcErr = session.authorizeHandoffRead(reference)
+	} else {
+		rpcErr = session.authorizeRunMailbox(reference)
+	}
+	if rpcErr != nil {
 		return nil, rpcErr
 	}
 	engine, ok := server.engine.(RunMailboxEngine)
@@ -1957,7 +1983,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
-		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference)
+		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference, false)
 		if rpcErr != nil {
 			_ = writeRPCError(wire, rpcErr)
 			return
@@ -1974,7 +2000,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			_ = writeFailure(wire, CodeInvalidRequest, "run mailbox entry name is not a bounded mailbox name")
 			return
 		}
-		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference)
+		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference, true)
 		if rpcErr != nil {
 			_ = writeRPCError(wire, rpcErr)
 			return
@@ -1991,7 +2017,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			_ = writeFailure(wire, CodeInvalidRequest, "run mailbox entry name is not a bounded mailbox name")
 			return
 		}
-		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference)
+		engine, rpcErr := session.runMailboxEngine(server, body.RunMailboxReference, false)
 		if rpcErr != nil {
 			_ = writeRPCError(wire, rpcErr)
 			return

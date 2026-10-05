@@ -115,6 +115,21 @@ func (fs *helperMailboxFS) readHandoffFile(ctx context.Context, name string, lim
 
 var _ handoffFileReader = (*helperMailboxFS)(nil)
 
+// helperHandoffReader is independent of mailbox publication: a handoff-only
+// OCI attempt holds precisely its own live authority and admitted owner key.
+type helperHandoffReader struct {
+	runtime   workloadrunner.HandoffFileRuntime
+	reference workloadrunner.HandoffFileReference
+}
+
+func (reader *helperHandoffReader) readHandoffFile(ctx context.Context, name string, limit int64) ([]byte, bool, error) {
+	callContext, cancel := context.WithTimeout(ctx, runMailboxRemoteCallTimeout)
+	defer cancel()
+	return reader.runtime.ReadHandoffFile(callContext, reader.reference, name, int(min(limit, int64(maxHandoffFileReadBytes))))
+}
+
+var _ handoffFileReader = (*helperHandoffReader)(nil)
+
 // close has nothing to release: the helper session is the adapter's and
 // outlives every attempt that borrows it.
 func (fs *helperMailboxFS) close() error { return nil }

@@ -39,7 +39,7 @@ func openRunMailboxScope(managedRoot string, reference RunMailboxReference) (*os
 	if err != nil {
 		return nil, err
 	}
-	if !ValidRunMailboxName(reference.RunID) {
+	if !(reference.Scope == RunMailboxScopeHandoffFiles && reference.RunID == "") && !ValidRunMailboxName(reference.RunID) {
 		return nil, errors.New("run mailbox run ID is not a bounded mailbox name")
 	}
 	switch reference.Scope {

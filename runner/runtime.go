@@ -139,6 +139,20 @@ type RunMailboxReference struct {
 	Scope RunMailboxScope
 }
 
+// HandoffFileReference binds a result read to the live attempt and the handoff
+// owner its admission declared. It carries no L3 mailbox identity or credential.
+type HandoffFileReference struct {
+	Authority AttemptAuthority
+	OwnerKey  string
+}
+
+// HandoffFileRuntime reads one bounded regular file from that attempt's handoff
+// root before reap. Unusable and absent entries use the same classifications as
+// RunMailboxRuntime; transport and authority failures remain errors.
+type HandoffFileRuntime interface {
+	ReadHandoffFile(ctx context.Context, reference HandoffFileReference, name string, limit int) (payload []byte, truncated bool, err error)
+}
+
 // ErrRunMailboxEntryUnusable is a runtime's positive classification of one
 // mailbox entry that can never become an event: it is not a readable regular
 // file, or it changed identity while being opened. A caller may delete such an

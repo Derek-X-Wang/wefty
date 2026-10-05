@@ -398,3 +398,76 @@ func TestWithheldAttemptCredentialIsAcceptedByTheHelper(t *testing.T) {
 		})
 	}
 }
+
+// A handoff-only attempt can read its own result without acquiring a mailbox.
+func TestHandoffReadWithoutRunMailbox(t *testing.T) {
+	engine := &runMailboxFakeEngine{fakeEngine: newFakeEngine(), payload: []byte(`{"ok":true}`)}
+	session, authority := startRunMailboxSession(t, engine, func(a AttemptAuthority) RunRequest {
+		request := testRunMailboxRunRequest(a)
+		request.Workload.RunMailbox = nil
+		request.InitialDeadman = time.Minute
+		return request
+	})
+	ref := RunMailboxReference{Authority: authority, OwnerKey: mailboxTestOwnerKey, Scope: RunMailboxScopeHandoffFiles}
+	response, err := session.ReadRunMailbox(t.Context(), ReadRunMailboxRequest{RunMailboxReference: ref, Name: "result.json"})
+	if err != nil || string(response.Payload) != `{"ok":true}` {
+		t.Fatalf("handoff-only read = %+v, %v", response, err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*RunMailboxReference)
+		code   ErrorCode
+	}{
+		{"owner", func(r *RunMailboxReference) { r.OwnerKey = "another-owner" }, CodeUnauthorizedAttempt},
+		{"fence", func(r *RunMailboxReference) { r.Authority.FencingToken = "stale" }, CodeAttemptOutsideSession},
+		{"attempt", func(r *RunMailboxReference) { r.Authority.AttemptID = "another-attempt" }, CodeAttemptOutsideSession},
+		{"boot", func(r *RunMailboxReference) { r.Authority.BootSessionID = "old-boot" }, CodeAttemptOutsideSession},
+		{"node", func(r *RunMailboxReference) { r.Authority.NodeID = "another-node" }, CodeAttemptOutsideSession},
+		{"job", func(r *RunMailboxReference) { r.Authority.JobID = "another-job" }, CodeAttemptOutsideSession},
+		{"removal", func(r *RunMailboxReference) { r.Authority.RemovalGeneration = "old-removal" }, CodeAttemptOutsideSession},
+		{"class", func(r *RunMailboxReference) { r.Authority.Class = contract.JobClassService }, CodeAttemptOutsideSession},
+		{"run", func(r *RunMailboxReference) { r.RunID = "undeclared-run" }, CodeUnauthorizedAttempt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := ref
+			tc.change(&other)
+			before := len(engine.served())
+			_, err := session.ReadRunMailbox(t.Context(), ReadRunMailboxRequest{RunMailboxReference: other, Name: "result.json"})
+			requireRunMailboxCode(t, err, tc.code)
+			if len(engine.served()) != before {
+				t.Fatal("refused read reached engine")
+			}
+		})
+	}
+	// A result reader does not grant mailbox listing or retirement authority.
+	eventRef := ref
+	eventRef.Scope = RunMailboxScopeEvents
+	eventRef.RunID = mailboxTestRunID
+	_, err = session.ReadRunMailbox(t.Context(), ReadRunMailboxRequest{RunMailboxReference: eventRef, Name: "0001-event"})
+	requireRunMailboxCode(t, err, CodeUnauthorizedAttempt)
+	eventRef.Scope = RunMailboxScopeHandoffFiles
+	_, err = session.ListRunMailbox(t.Context(), ListRunMailboxRequest{RunMailboxReference: eventRef})
+	requireRunMailboxCode(t, err, CodeUnauthorizedAttempt)
+	_, err = session.RemoveRunMailboxEntry(t.Context(), RemoveRunMailboxEntryRequest{RunMailboxReference: eventRef, Name: "result.json"})
+	requireRunMailboxCode(t, err, CodeUnauthorizedAttempt)
+	if _, err = session.Delete(t.Context(), DeleteRequest{Authority: authority}); err != nil {
+		t.Fatal(err)
+	}
+	before := len(engine.served())
+	_, err = session.ReadRunMailbox(t.Context(), ReadRunMailboxRequest{RunMailboxReference: ref, Name: "result.json"})
+	requireRunMailboxCode(t, err, CodeUnauthorizedAttempt)
+	if len(engine.served()) != before {
+		t.Fatal("post-reap read reached engine")
+	}
+}
+
+func TestHandoffReadRequiresAdmittedVolume(t *testing.T) {
+	engine := &runMailboxFakeEngine{fakeEngine: newFakeEngine()}
+	session, authority := startRunMailboxSession(t, engine, func(a AttemptAuthority) RunRequest { return testRunRequest(a, time.Minute) })
+	ref := RunMailboxReference{Authority: authority, OwnerKey: mailboxTestOwnerKey, Scope: RunMailboxScopeHandoffFiles}
+	_, err := session.ReadRunMailbox(t.Context(), ReadRunMailboxRequest{RunMailboxReference: ref, Name: "result.json"})
+	requireRunMailboxCode(t, err, CodeUnauthorizedAttempt)
+	if len(engine.served()) != 0 {
+		t.Fatal("attempt without a handoff volume reached engine")
+	}
+}
