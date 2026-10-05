@@ -333,9 +333,10 @@ const (
 	JobKindProcess = "process"
 	JobKindOCI     = "oci"
 
-	JobClassOneShot = "one-shot"
-	JobClassService = "service"
-	RestartAlways   = "always"
+	JobClassOneShot  = "one-shot"
+	JobClassService  = "service"
+	RestartAlways    = "always"
+	RestartOnFailure = "on-failure"
 )
 
 type ExecutionSpec struct {

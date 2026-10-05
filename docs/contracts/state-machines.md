@@ -83,10 +83,10 @@ resumable.
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
 | `queued` | No live attempt. Initial, restart-ready, or waiting until `next_restart_at`. | `claimed`, `stopped`, `failed`, `removal_pending` |
-| `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `queued`, `failed`, `removal_pending` |
-| `running` | The current attempt acknowledged execution. | `stopping`, `queued`, `failed`, `removal_pending` |
+| `claimed` | A fresh attempt and fence exist; execution has not been acknowledged. | `running`, `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
+| `running` | The current attempt acknowledged execution. | `stopping`, `stopped` on a clean policy stop, `queued`, `failed`, `removal_pending` |
 | `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed`, `removal_pending` |
-| `stopped` | Desired stopped and no live attempt remains. | `queued` through explicit operator start or restart only; `failed` through the image-reconciliation latch; `removal_pending` |
+| `stopped` | No live attempt remains: operator stop, or an observed policy stop with desired state preserved. | `queued` through explicit operator start or restart only; `failed` through the image-reconciliation latch; `removal_pending` |
 | `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only; `removal_pending` |
 | `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified`, `stalled_cleanup_unverified` |
 | `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
@@ -95,7 +95,7 @@ resumable.
 | `stalled_cleanup_unverified` | The bound agent declared, after the removal retried past the ten-minute bound against the same refusal, that cleanup cannot complete. The service slot is released and nothing claims any part of cleanup succeeded -- neither runtime deletion nor, for a Computer, deletion of the Backup copies the directive names. The deletion directive remains for a returning node and the unverified outcome is permanent. Terminal agent outcome. | none |
 
 Legal desired/observed pairings are: desired `running` with `queued`,
-`claimed`, `running`, or `failed`; and desired `stopped` with `stopping`,
+`claimed`, `running`, or `failed`, plus `stopped` only when `policy_stop` is recorded; and desired `stopped` with `stopping`,
 `stopped`, or `failed`. Desired `removed` is projected from the durable
 `service_removals` row with `removal_pending`, `agent_cleaned`,
 `removed_verified`, `forgotten_cleanup_unverified`, or
@@ -104,6 +104,25 @@ Legal desired/observed pairings are: desired `running` with `queued`,
 state until final deletion. `restart-pending` is never persisted. It is computed
 when a service is `queued`, desired `running`, and its `next_restart_at` is in
 the future.
+
+An ordinary service may declare `restart: on-failure`; omission means `always`.
+Computers must explicitly declare `always`. A clean payload `exit_code: 0`
+under `on-failure` records its `ProcessResult` as `policy_stop`, observes
+`stopped`, clears publication and restart timing, and releases service capacity.
+The durable binding and terminal attempt remain. Desired state is never changed
+by this reaction (ADR-0004). The policy stop suppresses claims until an explicit
+start or restart clears it and reacquires capacity. It survives database reopen.
+It leaves `restart_streak`, `lifetime_restart_count`, and prior `last_failure`
+unchanged. Nonzero exits, spontaneous signals, infrastructure/lease loss,
+backoff, and streak limits retain their existing treatment. Additive incomplete
+log evidence does not turn a clean exit into a failure.
+
+An explicit restart targeting the completing attempt wins over clean policy
+suppression, including a TERM handler that exits zero. Its durable request
+cannot affect a later attempt. Terminal spawn/output, image-reconciliation,
+and removal latches still take precedence; restart never converts those facts
+into a clean policy stop. Operator stop is accepted on a policy-stopped service
+and records stopped intent without starting an attempt.
 
 Removal is accepted from every pre-removal state and enters `removal_pending`
 in the same transaction that fences the live attempt `lost`; a service that

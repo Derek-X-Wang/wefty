@@ -93,3 +93,14 @@ func assertStates[S ~string](t *testing.T, table map[S][]S, states []S) {
 		}
 	}
 }
+
+func TestServicePolicyStopTransitions(t *testing.T) {
+	for _, from := range []JobState{JobClaimed, JobRunning} {
+		if !CanTransition(ServiceJobTransitions, from, JobStopped) {
+			t.Fatalf("missing policy-stop edge %s -> stopped", from)
+		}
+		if CanTransition(JobTransitions, from, JobStopped) {
+			t.Fatalf("service policy leaked to one-shot %s", from)
+		}
+	}
+}

@@ -659,10 +659,12 @@ Every job also declares the independent, required `class` lifecycle axis.
 agent that cannot execute one reports `unsupported_class`. The known values are
 `one-shot` and `service`. L3 always constructs `one-shot` jobs explicitly.
 
-A service declares `restart: always`, may declare a positive
+A service declares `restart: always` or `restart: on-failure` (omission is
+normalized to `always` before hashing), may declare a positive
 `max_restart_streak`, and may carry a `published_port` in the inclusive range
 1–65535. A missing or null port means the service is portless. A Computer is a
-digest-pinned OCI service Job with `display.protocol=rfb-websocket-v1`, positive
+digest-pinned OCI service Job that must explicitly declare `restart: always`,
+with `display.protocol=rfb-websocket-v1`, positive
 `disk_bytes`, and positive explicit OCI `memory_bytes`; it forbids the
 `published_port` member because later Computer publication uses named display
 endpoints. OCI `disk_bytes`, `memory_bytes`, and `cpu_millicores` use JSON
@@ -692,3 +694,21 @@ without OOM, while post-start rejects `spawn_error`.
 The awaiting-input prompt verbs and cancellation verbs are reserved. They
 return the shared error shape with HTTP `501`, code `not_implemented`, and
 `retryable=false`; they do not mutate state.
+
+### Service policy stops and CLI
+
+A clean payload exit under `on-failure` records `policy_stop` (a `ProcessResult`
+with `exit_code: 0`) on the service Job. It observes `stopped` while retaining
+operator desired state, binding, and terminal attempt; publication and ordinary
+service capacity are released. Claims check the policy stop inside their
+transaction. The completion replay preserves the original fact and does not
+reapply it after an explicit start/restart. Explicit restart targeting the
+current attempt overrides a zero exit from its TERM handler; a later attempt
+cannot inherit that request. Failure classification and accounting are unchanged.
+
+`wefty services create --restart=always|on-failure` submits this contract.
+Service status/list JSON exposes `policy_stop` and `restart_suppressed_reason`;
+the table includes the cause in POLICY STOP. `services create` dispatches typed
+process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch
+key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
+remain explicitly always-only, including the `--computer` compatibility alias.

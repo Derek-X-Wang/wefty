@@ -84,7 +84,7 @@ func executeServiceCreate(
 ) error {
 	flags := flag.NewFlagSet("services create", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var scriptPath, idempotencyKey string
+	var scriptPath, idempotencyKey, restart string
 	var computer bool
 	var computerName string
 	var computerBackupCap int64
@@ -94,6 +94,7 @@ func executeServiceCreate(
 	var publishedPort optionalPortFlag
 	var imageFlags imageFlagSet
 	flags.StringVar(&scriptPath, "script", "", "service script file")
+	flags.StringVar(&restart, "restart", contract.RestartAlways, "service restart policy: always or on-failure")
 	flags.BoolVar(&computer, "computer", false, "create a durable Computer authority")
 	flags.StringVar(&computerName, "name", "", "durable Computer name (requires --computer)")
 	flags.Int64Var(&computerBackupCap, "backup-cap", 0, "maximum retained Computer Backups (requires --computer)")
@@ -110,9 +111,23 @@ func executeServiceCreate(
 	if flags.NArg() != 0 {
 		return usageError("services create does not accept positional arguments")
 	}
+	if restart != contract.RestartAlways && restart != contract.RestartOnFailure {
+		return usageError("--restart must be always or on-failure")
+	}
 	if computer {
+		if restart != contract.RestartAlways {
+			return usageError("Computers require --restart=always")
+		}
 		computerArgs := make([]string, 0, len(args)-1)
-		for _, arg := range args {
+		for index := 0; index < len(args); index++ {
+			arg := args[index]
+			if arg == "--restart" || arg == "-restart" {
+				index++
+				continue
+			}
+			if strings.HasPrefix(arg, "--restart=") || strings.HasPrefix(arg, "-restart=") {
+				continue
+			}
 			if arg != "--computer" {
 				computerArgs = append(computerArgs, arg)
 			}
@@ -154,7 +169,7 @@ func executeServiceCreate(
 		SchemaVersion: contract.SchemaVersionV1,
 		Class:         contract.JobClassService,
 		PublishedPort: port,
-		Restart:       contract.RestartAlways,
+		Restart:       restart,
 		RoutingTags:   append([]string(nil), resolvedTags...),
 	}
 	if scriptPath != "" {

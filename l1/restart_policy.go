@@ -123,6 +123,7 @@ func serviceRestartDelay(restartStreak int, leaseDuration time.Duration, jitter 
 }
 
 type serviceCompletionPolicy struct {
+	policyStop           []byte
 	jobState             contract.JobState
 	attemptState         contract.AttemptState
 	restartStreak        int
@@ -132,7 +133,9 @@ type serviceCompletionPolicy struct {
 	updateLastFailure    bool
 }
 
-func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiescenceEvidence RuntimeQuiescenceEvidence, lastFailureJSON []byte, now time.Time) serviceCompletionPolicy {
+// restartRequested comes from the durable directive for this exact attempt,
+// read by completion inside its committing transaction.
+func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiescenceEvidence RuntimeQuiescenceEvidence, lastFailureJSON []byte, now time.Time, restartRequested ...bool) serviceCompletionPolicy {
 	policy := serviceCompletionPolicy{
 		jobState:             contract.JobFailed,
 		attemptState:         completionStatesAttempt(result),
@@ -171,6 +174,12 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiesce
 		// Genuine output failures are terminal. Expected service spool eviction
 		// never reaches this mapper.
 	case result.ExitCode != nil:
+		if *result.ExitCode == 0 && job.Spec.Restart == contract.RestartOnFailure &&
+			!(len(restartRequested) > 0 && restartRequested[0]) {
+			policy.jobState = contract.JobStopped
+			policy.policyStop = lastFailureJSON
+			return policy
+		}
 		restartable = true
 	case result.Signal != "":
 		if result.TerminationCause == contract.TerminationCauseSpontaneous {

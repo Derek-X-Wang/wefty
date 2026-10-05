@@ -490,6 +490,7 @@ CREATE TABLE IF NOT EXISTS attempt_credentials (
 );
 CREATE INDEX IF NOT EXISTS attempt_credentials_attempt ON attempt_credentials(attempt_id);
 CREATE TABLE IF NOT EXISTS service_jobs (
+  policy_stop_json BLOB,
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped')),
   bound_node_id TEXT REFERENCES nodes(node_id),
@@ -1180,6 +1181,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	if err := s.markLogEventDocumentsCompactOnNewDatabase(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_jobs", "policy_stop_json", "BLOB"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
@@ -2906,6 +2910,7 @@ WHERE job_id=(
 	        AND candidate_service.job_id IS NOT NULL
 	        AND candidate_service.desired_state=@desired_running
 	        AND (candidate_service.bound_node_id IS NULL OR candidate_service.bound_node_id=@node_id)
+	        AND candidate_service.policy_stop_json IS NULL
 	        AND (candidate_service.next_restart_at IS NULL OR candidate_service.next_restart_at<=@now_ns)
 	        AND (
 	          candidate_service.bound_node_id=@node_id
@@ -4150,7 +4155,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	finalJobState, finalAttemptState := completionStates(request.Result)
 	var servicePolicy *serviceCompletionPolicy
 	if jobBeforeCompletion.ServiceJob != nil {
-		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, request.RuntimeQuiescenceEvidence, lastFailureJSON, now)
+		directive, err := readAttemptDirective(ctx, tx, jobID, attemptID)
+		if err != nil {
+			return CompletionOutcome{}, err
+		}
+		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, request.RuntimeQuiescenceEvidence, lastFailureJSON, now, directive == AttemptDirectiveRestart)
 		servicePolicy = &policy
 		finalJobState = policy.jobState
 		finalAttemptState = policy.attemptState
@@ -4213,11 +4222,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	}
 	if servicePolicy != nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-			SET restart_streak=?, lifetime_restart_count=?, next_restart_at=?,
+			SET restart_streak=?, lifetime_restart_count=?, next_restart_at=?, policy_stop_json=?,
 				last_failure=CASE WHEN ? THEN ? ELSE last_failure END,
 				healthy_since_ns=NULL, published_attempt_id=NULL
 			WHERE job_id=?`, servicePolicy.restartStreak, servicePolicy.lifetimeRestartCount,
-			servicePolicy.nextRestartNS, servicePolicy.updateLastFailure, servicePolicy.lastFailure, jobID); err != nil {
+			servicePolicy.nextRestartNS, servicePolicy.policyStop, servicePolicy.updateLastFailure, servicePolicy.lastFailure, jobID); err != nil {
 			return CompletionOutcome{}, internalError(err, "apply service completion policy")
 		}
 	}
@@ -4642,6 +4651,7 @@ CASE
 		)
 	THEN 1 ELSE 0
 END,
+service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append(append([]any{
@@ -4702,6 +4712,7 @@ CASE
 		)
 	THEN 1 ELSE 0
 END,
+service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append(append([]any{
@@ -4739,7 +4750,11 @@ func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, creat
 	}
 	job.CreatedAt = time.Unix(0, createdNS).UTC()
 	job.UpdatedAt = time.Unix(0, updatedNS).UTC()
-	job.ServiceJob = serviceColumns.projection()
+	service, err := serviceColumns.projection()
+	if err != nil {
+		return err
+	}
+	job.ServiceJob = service
 	spawnColumns.apply(job)
 	return nil
 }
