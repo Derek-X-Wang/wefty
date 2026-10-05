@@ -1495,3 +1495,12 @@ cannot hold live runs' dispatch behind ended ones.
 `l1_job_id` without a `job` only when the failed ledger run and diagnostic match
 the same authoritative missing-job response. Reading execution never creates a
 regression record and does not hide other L1 failures.
+
+## Instance keys and child submission
+
+L1 root submissions may use an Instance key in the authenticated Fabric
+submitter namespace. New keyed submissions using an Attempt credential are
+explicitly refused with non-retryable `instance_key_not_supported` (HTTP 409)
+until parent-scoped namespaces ship in #654. Unkeyed child submission and
+credential scope are unchanged; dispatch replay and tombstones resolve before
+instance-key handling. See [the key contract](lease-fencing-dispatch.md#instance-keys).
