@@ -83,6 +83,13 @@ _Avoid_: runtime status, capability toggle, autostart preference
 The L1 schedulable unit, routed to nodes by subset tag matching.
 _Avoid_: task, work item
 
+**Instance key**:
+An optional app-chosen name that reserves at most one live Job in the app's
+authenticated Fabric identity namespace. One-shots release it when terminal;
+services retain it through stopped, failed and removal until cleanup finalizes.
+Apps sharing a Fabric identity share a namespace. Computers do not use keys.
+_Avoid_: dispatch key (request replay), Computer name, schedule, Slot
+
 **Attempt**:
 One node's leased, fenced execution of a job. A job may outlive a lost
 attempt; an attempt never outlives its lease.

@@ -1105,3 +1105,15 @@ service tombstones with retained caller authority, receive HTTP 409
 name `computer_id` and their Computer routes. Older tombstones lacking
 submitter provenance require a current person admin. No request body or class
 selector is required.
+
+## Instance-key reservation lifetime
+
+An optional Instance key reserves one live job across both classes in the
+submitter's authenticated Fabric namespace. A one-shot keeps it in queued,
+claimed, running and awaiting-input, including cancellation pending settlement;
+its terminal succeeded/failed transition (including canceled outcome) releases
+it atomically. A service keeps it in every state, including a policy stop,
+stopped/failed, removal pending, agent cleaned, forgotten and stalled, until
+removal finalization deletes the ordinary job. Releasing a Slot does not release
+an Instance key. Computers are excluded. See [instance-key concurrency and
+validation](lease-fencing-dispatch.md#instance-keys).
