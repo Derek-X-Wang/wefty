@@ -328,7 +328,7 @@
       "post": {
         "operationId": "renewAttemptLease",
         "summary": "Renew one attempt lease",
-        "description": "Distinct from node heartbeat. Process renewal retains legacy claimed-to-running promotion, but does not record payload start acknowledgement for never lease-loss policy. OCI renewal never promotes execution. A success returns a duration TTL and any attempt-scoped service or process one-shot cancel directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
+        "description": "Distinct from node heartbeat. Process renewal retains legacy claimed-to-running promotion, but does not record payload start acknowledgement for never lease-loss policy. OCI renewal never promotes execution. A success returns a duration TTL and any attempt-scoped service or one-shot cancel directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
         "requestBody": {
           "required": true,
           "content": {
@@ -413,6 +413,7 @@
       "put": {
         "operationId": "observeAttemptImage",
         "summary": "Record one fenced, write-once OCI image observation",
+        "description": "The last L1 checkpoint before helper Run. After immutable ownership and fence checks, an identical observation recorded before cancellation replays with HTTP 200 and the current stored job, including outcome=canceled. Otherwise a pending one-shot cancellation refuses a new observation inside the transaction with HTTP 409 conflict, retryable=false, without recording image identity or promoting the attempt. The agent does not call helper Run after a pre-Run refusal; it settles the never-started attempt with pre-start evidence and absent result evidence. Cancellation after an accepted pre-Run observation can still race helper admission; a refused Started acknowledgement then stops the one-shot with TERM, grace and KILL, followed by result capture and caller ReapAndVerify.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
@@ -450,7 +451,7 @@
       "post": {
         "operationId": "startAttempt",
         "summary": "Acknowledge payload start idempotently",
-        "description": "For OCI, requires fenced image observation and is the sole claimed-to-running transition. For process, records the runner start acknowledgement after spawn and guardian ownership, even when renewal or logging already promoted running. Under restart never, only this durable acknowledgement establishes post-start infrastructure-completion and lease-loss suppression; renewal or logging alone never does. L1 and agents must upgrade together: a pre-acknowledgement agent leaves process attempts under pre-start retry rules, with no capability gate. Cancellation is checked inside the committing transaction: if started_ns is already recorded, an identical replay returns HTTP 200 with the current stored job, including outcome=canceled. Otherwise, pending process one-shot cancellation refuses a new acknowledgement with HTTP 409 conflict, retryable=false, leaving started_ns unset and without promoting the attempt. Stale authority, expired leases and terminal attempts are refused.",
+        "description": "For OCI, requires fenced image observation and is the sole claimed-to-running transition. For process, records the runner start acknowledgement after spawn and guardian ownership, even when renewal or logging already promoted running. Under restart never, only this durable acknowledgement establishes post-start infrastructure-completion and lease-loss suppression; renewal or logging alone never does. L1 and agents must upgrade together: a pre-acknowledgement agent leaves process attempts under pre-start retry rules, with no capability gate. Cancellation is checked inside the committing transaction: if started_ns is already recorded, an identical replay returns HTTP 200 with the current stored job, including outcome=canceled. Otherwise, pending one-shot cancellation refuses a new acknowledgement with HTTP 409 conflict, retryable=false, leaving started_ns unset and without promoting the attempt. Stale authority, expired leases and terminal attempts are refused.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false, "required": ["fencing_token"],
           "properties": { "fencing_token": { "type": "string", "minLength": 1 } }

@@ -422,9 +422,14 @@ top-level media type; platform manifest, platform, runtime handler, and
 snapshotter remain attempt-local. Immutable attempt ownership and fence are
 authenticated before replay: an identical stored attempt hash succeeds even
 after authority advances, while changed replay is `idempotency_conflict`.
-Current authority, lease, and claimed state gate only the first write. A
-changed job-scoped identity is also `idempotency_conflict`, and a pinned job
-digest must match the observation.
+Current authority, lease, claimed state, and absence of pending cancellation
+gate only the first write. A committed one-shot cancellation refuses a new
+observation with HTTP 409 `conflict`, `retryable=false`, without recording
+image identity or promoting the attempt. An identical observation recorded
+before cancellation still replays with HTTP 200 and the current stored job,
+including `outcome=canceled`. The agent must not invoke helper `Run` after
+a pre-Run observation refusal. A changed job-scoped identity is also
+`idempotency_conflict`, and a pinned job digest must match the observation.
 
 `POST .../attempts/{attempt_id}/started` is fenced and idempotent for process
 and OCI. For OCI it requires an accepted or copied image observation, records
@@ -724,7 +729,7 @@ without OOM, while post-start rejects `spawn_error`.
 
 The awaiting-input prompt verbs remain reserved and return HTTP `501`,
 `not_implemented`, `retryable=false` without mutation. Job cancellation is
-implemented for queued one-shots and active process one-shots: `POST /v1/jobs/{job_id}/cancel` returns
+implemented for queued one-shots and active process and OCI one-shots: `POST /v1/jobs/{job_id}/cancel` returns
 HTTP 200 with the current job; a successful queued cancel records
 `state=failed`, `outcome=canceled` in the claim-serializing transaction.
 Authority is checked in that transaction: the originating client submitter,
@@ -734,9 +739,8 @@ out-of-scope targets receive HTTP 404 `not_found`; an expired, superseded,
 wrong-node or replaced-session credential is refused under the existing
 credential authority rules. Services receive 409 `cancel_service` pointing at
 desired state and remove, including removed tombstones with retained caller
-authority. Active OCI one-shots receive 409 `cancel_not_queued` and no mutation
-until #652. Active process cancellation reserves the outcome and delivers
-termination as described below. Both refusals are
+authority. Active process and OCI cancellation reserves the outcome and delivers
+termination as described below. The service refusal is
 non-retryable. Retries and already-terminal one-shots return the current state.
 Neither attempts nor process results are invented; retained earlier evidence,
 including identical completion replay for a requeued OCI attempt, cannot
@@ -798,14 +802,14 @@ process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatc
 key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
 remain explicitly always-only, including the `--computer` compatibility alias.
 
-### Process one-shot cancellation delivery
+### Process and OCI one-shot cancellation delivery
 
-Renewal returns `directive=cancel` for a pending canceled process one-shot.
+Renewal returns `directive=cancel` for a pending canceled process or OCI one-shot.
 It preserves evidence authority but never acknowledges a claimed program as
 started. The returned lease is capped at the fixed 30-second cancellation
 settlement deadline.
 Neither renewals nor repeated cancel requests move that deadline, including
-across a database reopen. The process `/started` acknowledgement also reads
+across a database reopen. The process and OCI `/started` acknowledgement also reads
 cancellation inside its committing transaction. If `started_ns` is already
 recorded, an identical replay returns HTTP 200 with the current stored job,
 including its `outcome=canceled`. Otherwise, pending cancellation refuses a
@@ -814,14 +818,17 @@ new acknowledgement with HTTP 409 `conflict`, `retryable=false`, leaving
 promotion by renewal or logs, child creation, completion and expiry check
 the same intent transactionally. Expiry and reconciliation consult
 intent inside their immediate transactions, so no success or requeue can
-replace an earlier accepted cancellation.
+replace an earlier accepted cancellation, including OCI pre-start
+`runtime_unavailable` completion and identical completion replay. New child
+creation is refused; an identical dispatch replay still returns the stored
+child after credential revalidation.
 
 Heartbeat carries `one_shot_cancel_directives`, each with `job_id`,
 `attempt_id` and `fencing_token`. These standing directives are scoped to the
 node's current boot session and authority generation. They remain deliverable
-after logical settlement until process completion evidence has been recorded;
+after logical settlement until attempt completion evidence has been recorded;
 a terminal canceled job alone never proves the runtime stopped. The agent
-matches all three identifiers to a resident process one-shot, requests TERM,
+matches all three identifiers to a resident process or OCI one-shot, requests TERM,
 waits the existing five-second grace, then forces KILL. Normal output flush,
 completion evidence, result upload and handoff retention still run. Confirmed
 delivery follows the existing agent termination-initiator rule; failed signal

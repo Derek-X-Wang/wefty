@@ -192,7 +192,7 @@ func prepareRemoteRunMailbox(claim l1.Claim, stateRoot string, runtime workloadr
 	mailbox.fs = &helperMailboxFS{
 		runtime: runtime,
 		reference: workloadrunner.RunMailboxReference{
-			Authority: authority, OwnerKey: handoffOwnerRunID(spec), RunID: runID,
+			Authority: authority, OwnerKey: contract.ExecutionHandoffOwnerKey(spec, claim.Job.JobID), RunID: runID,
 		},
 		parent:  mailbox.publicationContext,
 		timeout: runMailboxRemoteCallTimeout,

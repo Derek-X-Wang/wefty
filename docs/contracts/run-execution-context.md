@@ -219,7 +219,7 @@ to the workload. Withholding it removes only the workload's copy.
 
 The credential authorizes exactly
 four things: submitting a child job, reading its own job, listing and
-reading that job's children, and canceling a queued one-shot or active process one-shot child. No other
+reading that job's children, and canceling a queued one-shot or active process or OCI one-shot child. No other
 route accepts it, so no operator-level action is reachable with it; the service collection read `GET /v1/jobs` is
 refused with `principal_forbidden` like every other job route.
 
@@ -236,12 +236,13 @@ unrelated jobs, grandchildren and unknown IDs receive `not_found`, even when
 their originating submitter is the same. The workflow bridge's `/l1` allowlist
 includes this exact method/path. A queued child becomes `failed` with job-level
 `outcome=canceled`; no attempt or signal is invented. Services receive
-`cancel_service`. Claimed, running and awaiting-input process children reserve
-the canceled outcome and receive bounded TERM/grace/KILL termination (#651).
-Active OCI children receive `cancel_not_queued` until #652. Neither refusal
-mutates the target. Pending cancellation revokes authority to create children
-in the creation transaction; existing children and provenance-scoped reads
-remain independent.
+`cancel_service`. Claimed, running and awaiting-input process and OCI children reserve
+the canceled outcome and receive bounded TERM/grace/KILL termination (#651,
+#652), including OCI image preparation and helper startup. The service refusal
+does not mutate the target. Pending cancellation revokes authority to create
+new children in the creation transaction; identical dispatch replay still
+returns the stored child after credential revalidation. Existing children and
+provenance-scoped reads remain independent.
 
 Parent job, parent attempt, and originating submitter are derived from the
 credential and can never be supplied by the caller: they live on the job
@@ -974,11 +975,12 @@ or class:
 A label that is blank after trimming names no run and claims nothing. A
 submission naming a run it is not entitled to is refused with HTTP 403
 `run_identity_not_entitled`, `retryable: false`, and nothing is stored; the
-remedy is to submit the work as an L3 run, not to change a label. The check
-follows dispatch-key resolution exactly as the missing-identity refusal does,
-so an identical replay of a labelled job stored before L1 checked still returns
-the stored job, and it runs before that refusal, so an OCI one-shot naming a run
-it may not is refused for the claim, not for what it lacks.
+remedy for an ordinary client is to omit the run labels and submit a direct
+job, or submit an L3 run whose dispatch names the run. The check follows
+dispatch-key resolution exactly as the malformed-owner refusal does, so an
+identical replay of a labelled job stored before L1 checked still returns the
+stored job. Entitlement is checked before owner validation, so an OCI one-shot
+naming a run it may not is refused for the unauthorized claim.
 
 A Computer never belongs to a run, so no submitter — the run ledger included —
 may name one in a Computer specification. `POST /v1/computers`, a projection

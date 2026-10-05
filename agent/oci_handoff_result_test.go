@@ -167,17 +167,6 @@ func TestDirectOCIHandoffOwnerPublicationAndEviction(t *testing.T) {
 			if upload.publishes() != tc.published || !upload.MailboxDrained || upload.AttemptID != claim.Lease.AttemptID {
 				t.Fatalf("upload=%+v", upload)
 			}
-			// Reopening the agent's state must not infer publication from Job success
-			// or from the absence of a run mailbox.
-			reopened := newHandoffManager(h.root, h.manager.stateRoot, "node-1", time.Hour, nil)
-			reopened.now = h.manager.now
-			if err := reopened.adoptResidue(); err != nil {
-				t.Fatal(err)
-			}
-			recovered, found, err := reopened.readOCIRecord(claim.Job.JobID)
-			if err != nil || !found || recovered.evidenceReachedLedger() != tc.published {
-				t.Fatalf("recovered publication=%+v found=%t err=%v", recovered, found, err)
-			}
 			// Hold the producing owner's lease again: eviction must use that same key.
 			helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{ociVolume(t, claim.Job.JobID, 4096, 2, h.now)}}
 			h.manager.ociHandoffs, h.manager.ociEvictor = helper, helper

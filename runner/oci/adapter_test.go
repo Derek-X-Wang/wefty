@@ -221,8 +221,12 @@ func TestAdapterRequiresAuthoritativeStartedBeforeLocalPromotion(t *testing.T) {
 	engine.mu.Lock()
 	deletes := engine.deletes
 	engine.mu.Unlock()
-	if deletes == 0 {
-		t.Fatal("failed Started acknowledgement did not reap the real task")
+	if deletes != 0 {
+		t.Fatal("failed Started deleted before the caller could capture its handoff")
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("failed Started normal reap=%+v err=%v", receipt, err)
 	}
 }
 
@@ -1595,7 +1599,7 @@ func TestAdapterServiceSignalDeadlinePrefersRuntimeLossOverWatchCancellation(t *
 }
 
 func TestAdapterOneShotCancellationDoesNotReportRuntimeLoss(t *testing.T) {
-	engine := &adapterTestEngine{watchErrorOnCancel: true}
+	engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2)}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
 	request := adapterTestRequest()
@@ -1611,8 +1615,8 @@ func TestAdapterOneShotCancellationDoesNotReportRuntimeLoss(t *testing.T) {
 	}()
 	<-started
 	cancel()
-	if err := <-done; err == nil {
-		t.Fatal("cancelled one-shot Watch unexpectedly succeeded")
+	if err := <-done; err != nil {
+		t.Fatalf("canceled one-shot did not confirm termination: %v", err)
 	}
 	if recoveries != 0 {
 		t.Fatalf("cancelled one-shot recovery calls = %d, want 0", recoveries)
@@ -1640,7 +1644,7 @@ func TestAdapterAdmitsDeadmanOnlyAfterStartedEvidenceAccepted(t *testing.T) {
 		{name: "L1 Started evidence is refused", startedErr: errors.New("stale L1 attempt authority")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			engine := &adapterTestEngine{omitRunImage: test.omitRunImage}
+			engine := &adapterTestEngine{omitRunImage: test.omitRunImage, watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
 			adapter, closeAdapter := startAdapterTestServer(t, engine)
 			defer closeAdapter()
 			request := adapterTestRequest()
@@ -1661,6 +1665,18 @@ func TestAdapterAdmitsDeadmanOnlyAfterStartedEvidenceAccepted(t *testing.T) {
 			engine.mu.Lock()
 			deletes := engine.runtimeDeletes
 			engine.mu.Unlock()
+			if test.startedErr != nil {
+				if deletes != 0 {
+					t.Fatalf("failed Started reaped before result capture: %d", deletes)
+				}
+				receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+				if err != nil || !receipt.RuntimeQuiesced {
+					t.Fatalf("failed Started normal reap=%+v err=%v", receipt, err)
+				}
+				engine.mu.Lock()
+				deletes = engine.runtimeDeletes
+				engine.mu.Unlock()
+			}
 			if deletes != 1 {
 				t.Fatalf("failed Started path helper reaps=%d, want 1", deletes)
 			}

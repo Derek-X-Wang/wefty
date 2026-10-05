@@ -15,7 +15,7 @@ invalid. State changes and their required side effects commit atomically.
 | `stopped` | Service-only state, unreachable in the one-shot transition table. | none |
 | `awaiting-input` | Reserved warm-session state; observable but not enterable through a v0.1 API implementation. | `running`, `failed` |
 | `succeeded` | Completion was accepted with a successful process result and required protocol outputs. Terminal. | none |
-| `failed` | Execution, lease, workflow protocol failed, or queued cancellation committed. Terminal; v0.1 never automatically requeues. | none |
+| `failed` | Execution, lease, workflow protocol failed, or one-shot cancellation settled. Terminal; v0.1 never automatically requeues. | none |
 
 For `kind=oci`, `claimed → queued` is allowed only when fenced completion
 records pre-`Started` `runtime_unavailable`. The old attempt becomes terminal
@@ -1109,13 +1109,13 @@ does not add a job state. L3 projects this job-level outcome as "the L1 job was
 canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
 Cancellation of an L3 Run remains reserved and returns `501`.
 
-### One-shot cancellation (#650, #651)
+### One-shot cancellation (#650, #651, #652)
 
 `POST /v1/jobs/{job_id}/cancel` atomically changes a queued one-shot to
 `failed`, with `outcome=canceled`, without inventing an attempt, process result
 or termination cause. A requeued OCI job retains all earlier evidence.
 
-For `claimed`, `running` and reserved `awaiting-input` **process** one-shots,
+For `claimed`, `running` and reserved `awaiting-input` **process and OCI** one-shots,
 cancel reserves `outcome=canceled` inside the immediate transaction and fixes
 a settlement deadline 30 seconds after acceptance. The job remains in its
 current state pending settlement. Retries preserve the original deadline and
@@ -1126,17 +1126,23 @@ reconciliation at the deadline settles a silent node as `failed`/`canceled`
 with an attempt `lost`, never a manufactured result or termination confirmation.
 One-shot secret scrubbing uses the same terminal trigger as ordinary completion.
 
-Claim, process `/started` acknowledgement, legacy start promotion by renewal or
+Claim, process and OCI `/started` acknowledgement, legacy start promotion by renewal or
 logs, renewal, child creation, completion and expiry consult cancellation in
 their committing transactions. Pending cancellation refuses a new `/started`
 acknowledgement (an identical replay of one recorded earlier returns the stored
 job) with HTTP 409 `conflict`, `retryable=false`, without recording `started_ns` or
-promoting the attempt, and forbids child creation.
+promoting the attempt, and forbids new child creation. Identical child dispatch
+replays still return the stored child after credential revalidation.
 Existing children are independent and never canceled automatically. Evidence,
 logs and result uploads retain their existing provenance and late-window rules.
 
-Active OCI one-shots remain refused with HTTP 409 `cancel_not_queued`,
-`retryable=false`, and `error.details.state` (#652). Services, including removed
+OCI cancellation covers image preparation, helper admission and durable
+`Started`. An accepted cancel prevents the OCI pre-start `runtime_unavailable`
+completion from requeuing, including identical completion replay. A helper
+attempt admitted before a refused `Started` is terminated through the existing
+TERM/grace/KILL path; its handoff remains readable for capture before normal
+reap. Result upload, publication classification and handoff retention use the
+same rules as ordinary completion. Services, including removed
 service tombstones with retained caller authority, receive HTTP 409
 `cancel_service`, with `desired_state_path` and `remove_path`; Computers also
 name `computer_id` and their Computer routes. Older tombstones lacking

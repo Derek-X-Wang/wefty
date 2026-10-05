@@ -2228,13 +2228,6 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 		if err := revalidateAttemptCredential(ctx, tx, *origin.Parent, now.UnixNano()); err != nil {
 			return Job{}, false, err
 		}
-		canceled, _, cancelErr := cancellationDeadline(ctx, tx, origin.Parent.JobID)
-		if cancelErr != nil {
-			return Job{}, false, cancelErr
-		}
-		if canceled {
-			return Job{}, false, protocolError(contract.ErrorUnauthorized, "cancellation revoked child creation authority")
-		}
 	}
 
 	job, storedHash, err := getJobByDispatchKey(ctx, tx, spec.DispatchKey, now)
@@ -2258,6 +2251,15 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read removed dispatch key")
+	}
+	if origin.Parent != nil {
+		canceled, _, cancelErr := cancellationDeadline(ctx, tx, origin.Parent.JobID)
+		if cancelErr != nil {
+			return Job{}, false, cancelErr
+		}
+		if canceled {
+			return Job{}, false, protocolError(contract.ErrorUnauthorized, "cancellation revoked child creation authority")
+		}
 	}
 	if spec.InstanceKey != nil {
 		if origin.Parent == nil && originatingSubmitter == "" {
@@ -2365,7 +2367,7 @@ func authorizeRunIdentity(ctx context.Context, q queryer, spec contract.JobSpec,
 	if parent == nil {
 		return protocolErrorWithDetails(contract.ErrorRunIdentityNotEntitled,
 			map[string]any{"labels": labels},
-			"only the run ledger may name a run in %s: submit the work as an L3 run, whose dispatch names it",
+			"only the run ledger may name a run in %s: omit the run labels for a direct job, or submit an L3 run whose dispatch names it",
 			strings.Join(labels, " or "))
 	}
 	parentJob, err := getJobByID(ctx, q, parent.JobID, now)
@@ -3313,6 +3315,13 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 		}
 		return getJobByID(ctx, tx, jobID, canonicalTime(s.clock.Now()))
 	}
+	canceled, _, err := cancellationDeadline(ctx, tx, jobID)
+	if err != nil {
+		return Job{}, err
+	}
+	if canceled {
+		return Job{}, protocolError(contract.ErrorConflict, "pending cancellation forbids image observation")
+	}
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
 	}
@@ -3882,7 +3891,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 			return AppendLogsResponse{}, err
 		}
 	}
-	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
+	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		attempt.state = contract.AttemptRunning
 	}
 	if _, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, appendEvictionBudget()); err != nil {
@@ -4242,7 +4251,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		finalJobState = policy.jobState
 		finalAttemptState = policy.attemptState
 	}
-	prestartRequeue := attempt.spec.Kind == contract.JobKindOCI && jobBeforeCompletion.ServiceJob == nil &&
+	prestartRequeue := !canceled && attempt.spec.Kind == contract.JobKindOCI && jobBeforeCompletion.ServiceJob == nil &&
 		attempt.state == contract.AttemptClaimed && request.Result.SpawnError != nil &&
 		request.Result.SpawnError.Code == contract.SpawnFailureRuntimeUnavailable
 	if prestartRequeue {

@@ -119,8 +119,8 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 			return Job{}, internalError(err, "read canceled job")
 		}
 	case contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput:
-		if job.Spec.Class != contract.JobClassOneShot || job.Spec.Kind != contract.JobKindProcess {
-			return Job{}, protocolErrorWithDetails(contract.ErrorCancelNotQueued, map[string]any{"state": job.State}, "active OCI one-shot cancellation is not supported yet")
+		if job.Spec.Class != contract.JobClassOneShot {
+			return Job{}, protocolErrorWithDetails(contract.ErrorCancelNotQueued, map[string]any{"state": job.State}, "only one-shots support active cancellation")
 		}
 		if job.Outcome != "canceled" {
 			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET outcome='canceled', cancel_settle_by_ns=?, updated_ns=? WHERE job_id=?`, now.Add(CancelSettlementTimeout).UnixNano(), now.UnixNano(), jobID); err != nil {

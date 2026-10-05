@@ -753,8 +753,8 @@ func TestComputerSubmissionPolicyRemintDrainsFourWaitingHostBridgePumpsWithoutFo
 	cancelRun()
 	select {
 	case err := <-runDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled host-bridge run = %v, want context cancellation", err)
+		if err != nil {
+			t.Fatalf("one-shot host-bridge termination = %v, want confirmed completion", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("adapter did not finish after canceling the waiting host-bridge pumps")
@@ -881,8 +881,8 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 	cancelRun()
 	select {
 	case err := <-runDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled marker-backed host-bridge run = %v, want context cancellation", err)
+		if err != nil {
+			t.Fatalf("one-shot marker-backed host-bridge termination = %v, want confirmed completion", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("adapter did not finish after marker-backed request cancellation")
@@ -893,10 +893,11 @@ type workflowBridgeMarkerEngine struct {
 	ocihelper.UnavailableEngine
 	bridgeEntered    chan struct{}
 	guestConnections chan net.Conn
+	signals          chan ocihelper.Signal
 }
 
 func newWorkflowBridgeMarkerEngine() *workflowBridgeMarkerEngine {
-	return &workflowBridgeMarkerEngine{bridgeEntered: make(chan struct{}, 4), guestConnections: make(chan net.Conn, 1)}
+	return &workflowBridgeMarkerEngine{bridgeEntered: make(chan struct{}, 4), guestConnections: make(chan net.Conn, 1), signals: make(chan ocihelper.Signal, 2)}
 }
 
 func (*workflowBridgeMarkerEngine) EnsureImage(_ context.Context, _ ocihelper.EnsureImageRequest, _ io.Reader, emit func(ocihelper.EnsureImageEvent) error) error {
@@ -914,13 +915,26 @@ func (*workflowBridgeMarkerEngine) Run(_ context.Context, request ocihelper.RunR
 	return response, nil
 }
 
-func (*workflowBridgeMarkerEngine) Watch(ctx context.Context, request ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+func (engine *workflowBridgeMarkerEngine) Watch(ctx context.Context, request ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
 	if !strings.HasPrefix(request.Authority.JobID, "probe-") {
-		<-ctx.Done()
-		return ctx.Err()
+		select {
+		case signal := <-engine.signals:
+			return emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &ocihelper.WatchResponse{Signal: signal, TerminationCause: "agent"}})
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	exitCode := 0
 	return emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &ocihelper.WatchResponse{ExitCode: &exitCode}})
+}
+
+func (engine *workflowBridgeMarkerEngine) Signal(ctx context.Context, request ocihelper.SignalRequest) error {
+	select {
+	case engine.signals <- request.Signal:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (*workflowBridgeMarkerEngine) Delete(context.Context, ocihelper.DeleteRequest) (ocihelper.DeleteResponse, error) {
