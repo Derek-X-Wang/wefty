@@ -175,3 +175,72 @@ func TestProcessManagedHandoffPublicationAndCleanup(t *testing.T) {
 		})
 	}
 }
+
+// An explicit path remains caller-owned even when its leaf matches the Job ID.
+func TestProcessExplicitHandoffWithoutRunLabelsStaysUnowned(t *testing.T) {
+	for _, suppliedEnv := range []bool{false, true} {
+		name := "environment_omitted"
+		if suppliedEnv {
+			name = "environment_supplied"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newRetentionHarness(t, time.Hour)
+			path := filepath.Join(h.root, "job_x")
+			claim := retentionClaim(t, "", path)
+			claim.Job.JobID = "job_x"
+			claim.Job.Spec.Labels = nil
+			if suppliedEnv {
+				claim.Job.Spec.Execution.Env = map[string]string{contract.EnvHandoffDir: path}
+			}
+			before, _ := json.Marshal(claim.Job.Spec)
+			recorder := &resultUploadRecorder{}
+			called := false
+			document := []byte(`{"caller_owned":true}`)
+			run := completionDirectiveRunFunc(func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+				called = true
+				if request.Execution.HandoffDirectory != path {
+					t.Fatalf("handoff directory=%q want=%q", request.Execution.HandoffDirectory, path)
+				}
+				value, present := request.Execution.Env[contract.EnvHandoffDir]
+				if present != suppliedEnv || (suppliedEnv && value != path) {
+					t.Fatalf("WEFTY_HANDOFF_DIR=(%q, %v), want submitted environment unchanged", value, present)
+				}
+				info, err := os.Stat(path)
+				if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+					t.Fatalf("explicit directory=(%v, %v), want a private directory before execution", info, err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "result.json"), document, 0o600); err != nil {
+					return contract.ProcessResult{}, err
+				}
+				return successfulRetentionRun(ctx, request, sink)
+			})
+			lifecycle := uploadingLifecycle(t, h.manager, recorder, run)
+			if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				t.Fatal("explicit handoff never reached the workload")
+			}
+			after, _ := json.Marshal(claim.Job.Spec)
+			if string(before) != string(after) {
+				t.Fatal("submitted spec changed")
+			}
+			if records := h.manager.loadRecords(); len(records) != 0 {
+				t.Fatalf("explicit handoff produced managed retention records: %+v", records)
+			}
+			if requests, _ := recorder.observed(); len(requests) != 0 {
+				t.Fatalf("explicit handoff uploaded %d results", len(requests))
+			}
+			if record, found, err := h.manager.readUploadRecord(claim.Job.JobID); err != nil || found {
+				t.Fatalf("explicit handoff upload record=(%+v, %v, %v), want none", record, found, err)
+			}
+			h.now = h.now.Add(time.Hour)
+			if err := h.manager.collect(); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.ReadFile(filepath.Join(path, "result.json")); err != nil || string(got) != string(document) {
+				t.Fatalf("caller-owned result changed after collection: %q, %v", got, err)
+			}
+		})
+	}
+}

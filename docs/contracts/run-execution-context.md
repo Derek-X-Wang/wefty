@@ -905,6 +905,7 @@ labels or changes the canonical request hash; identical dispatch-key replay
 still returns the original job. The label-only resolver remains the sole input
 to run-identity entitlement: a child of a job-owned parent cannot name its
 parent's Job ID in `run_id` or `handoff_owner_run_id`.
+Managed handoff directories require the updated agent: L1 and agents upgrade together; a pre-#646 agent permanently fails a pathless process one-shot with `handoff_preparation_failed`.
 
 A process submission with an explicit absolute path and no run identity keeps
 its unowned behavior: the node creates a private directory for the workload,
