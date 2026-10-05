@@ -63,11 +63,9 @@ type ociHandoffRecord struct {
 	// an admission and no RetainedAt is a run still writing.
 	AdmittedAt time.Time `json:"admitted_at"`
 	RetainedAt time.Time `json:"retained_at,omitempty"`
-	// Published is the mailbox drain verdict and Uploaded is what became of
-	// the result document. Either one is evidence that reached a ledger, so
-	// eviction treats the volume as published when either is true. Both are
-	// cleared by the next admission, which is the safe direction: a run that
-	// looks unpublished is kept longer, never given up sooner.
+	// Published was the mailbox drain verdict in older agents. Only Uploaded
+	// proves the result document reached L1; a legacy Published alone cannot
+	// grant early eviction. Both are cleared by the next admission.
 	Published bool `json:"published,omitempty"`
 	Succeeded bool `json:"succeeded,omitempty"`
 	Uploaded  bool `json:"uploaded,omitempty"`
@@ -83,7 +81,7 @@ func (record ociHandoffRecord) live() bool { return record.RetainedAt.IsZero() }
 
 // evidenceReachedLedger is the `published` fact the eviction order reads.
 func (record ociHandoffRecord) evidenceReachedLedger() bool {
-	return record.Published || record.Uploaded
+	return record.Uploaded
 }
 
 // usesOCIHandoffLifecycle is the set of jobs whose handoff volume this agent
@@ -191,7 +189,7 @@ func (m *handoffManager) finishOCIHandoff(spec contract.JobSpec, nodeID, attempt
 		return nil
 	}
 	record.RetainedAt = m.now().UTC()
-	record.Succeeded, record.Published = succeeded, published
+	record.Succeeded, record.Published, record.Uploaded = succeeded, published, published
 	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), record)
 }
 

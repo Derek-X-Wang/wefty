@@ -141,8 +141,14 @@ type retentionRecord struct {
 	// without the other is not trusted at all.
 	RetainedAt  time.Time `json:"retained_at,omitempty"`
 	RetainUntil time.Time `json:"retain_until,omitempty"`
-	Published   bool      `json:"published,omitempty"`
-	Succeeded   bool      `json:"succeeded,omitempty"`
+	// Published was the mailbox drain verdict in older agents. Uploaded is
+	// the authoritative publication fact; a legacy Published alone cannot
+	// establish that L1 has a copy. Both are reset on each admission.
+	Published bool `json:"published,omitempty"`
+	Uploaded  bool `json:"uploaded,omitempty"`
+	// AttemptID binds crash-recovered upload evidence to this admission.
+	AttemptID string `json:"attempt_id,omitempty"`
+	Succeeded bool   `json:"succeeded,omitempty"`
 	// Adopted marks a window the agent derived rather than one an attempt
 	// wrote: either an admission that never finished, or a directory carrying
 	// this node's ownership marker and no record at all. It changes nothing
@@ -227,9 +233,9 @@ func (m *handoffManager) recordUpload(runID, nodeID, attemptID string, result at
 	return writeStateDocument(m.stateRoot, uploadRecordDirectoryName, recordComponent(runID), record)
 }
 
-// readUploadRecord reads one run's upload outcome back. Nothing in the agent
-// acts on it; it exists so an operator on the node, and the tests, can see the
-// reason a result never reached the ledger.
+// readUploadRecord reads one run's upload outcome back. Startup recovery joins
+// it to the admitted attempt; an operator can also see why a result never
+// reached L1.
 func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, error) {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
 		return uploadRecord{}, false, nil

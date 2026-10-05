@@ -72,8 +72,8 @@ func TestFinishingAnAttemptCollectsWithoutAnyoneAskingIt(t *testing.T) {
 		t.Fatalf("execute did not expire old results: %v", err)
 	}
 	record := requireRetentionRecord(t, harness.manager, "run_fresh")
-	if !record.Succeeded || !record.Published {
-		t.Fatalf("fallback won before completion: %#v", record)
+	if !record.Succeeded || record.Published {
+		t.Fatalf("success without a result must stay unpublished: %#v", record)
 	}
 	if !record.RetainedAt.Equal(harness.now) || !record.RetainUntil.Equal(harness.now.Add(time.Hour)) {
 		t.Fatalf("wrong retention window: %#v", record)

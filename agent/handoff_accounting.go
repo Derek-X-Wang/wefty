@@ -711,7 +711,7 @@ func (m *handoffManager) measureNode(ctx context.Context, root *os.Root, now tim
 		status.PerRun = append(status.PerRun, RetainedRunFigures{
 			RunID: record.RunID, Entries: tally.entries,
 			LogicalBytes: tally.logical, ChargedBytes: tally.charged,
-			Published: record.Published, Truncated: tally.truncated != 0,
+			Published: record.Uploaded, Truncated: tally.truncated != 0,
 		})
 		if ctx != nil && ctx.Err() != nil {
 			break
@@ -994,6 +994,16 @@ func (m *handoffManager) adoptedWindow(record retentionRecord, deadline time.Tim
 	updated.RetainedAt = deadline.Add(-m.retention)
 	updated.RetainUntil = deadline
 	updated.Adopted = true
+	// A crash may land after upload and before terminal retention. Restore
+	// only a durable success for this admission's attempt, never an older
+	// upload for the same owner key. Legacy admissions have no attempt ID
+	// and remain conservatively unpublished.
+	if record.AttemptID != "" {
+		if upload, found, err := m.readUploadRecord(record.handoffOwnerKey()); err == nil && found &&
+			upload.AttemptID == record.AttemptID && upload.Uploaded {
+			updated.Published, updated.Uploaded = true, true
+		}
+	}
 	return updated
 }
 

@@ -503,6 +503,19 @@ longer asks the runtime to delete it after a successful completion: the volume
 holds the run's results, and the helper's boot sweep expires it on the
 contract's retention window (`run-execution-context.md`, "Results and their
 retention").
+
+For process and OCI one-shots, the node marks retained handoffs published
+only after observing that the attempt's result document reached L1. Neither
+a missing run mailbox nor a successful mailbox drain proves this. A failed
+upload or an uploaded skip reason leaves the handoff unpublished, without
+changing the workload's verdict. Completion uploads before recording terminal
+retention while still holding the handoff lease. Each admission clears the
+previous publication and records the producing attempt; restart recovery
+joins successful upload evidence only to that same attempt. Legacy mailbox-only
+publication never grants early-eviction priority. Unpublished results remain
+subject to the existing bounded retention and last-resort budget eviction.
+L1's stored result has its own job retention, independent of node cleanup.
+
 The payload sees only the reserved container path, never the helper source
 path. The named `usesAgentHandoffLifecycle` predicate positively selects only
 `kind=process`, `class=one-shot`; no negative kind gate can accidentally add a

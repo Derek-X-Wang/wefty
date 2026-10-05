@@ -145,6 +145,10 @@ type attemptLifecycle struct {
 	// the same reason retention is latched: several exits reach it and only
 	// the first one's answer is the run's.
 	resultUploaded atomic.Bool
+	// resultPublished is observed document upload success, separate from the
+	// latch saying an upload was attempted. A missing read path, skip receipt
+	// or transport failure never sets it.
+	resultPublished atomic.Bool
 	// capturedResult holds a result read before the runtime was reaped. An OCI
 	// attempt's handoff volume is only readable while its attempt is live, so
 	// the read happens at the same moment the mailbox drains and the bytes
@@ -724,15 +728,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
 	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
-	// Publication completeness no longer decides whether the files survive --
-	// both outcomes are retained -- but it still decides what the node gives up
-	// first when it runs out of room, so it is recorded rather than folded into
-	// the verdict.
-	published := !lifecycle.mailbox.Load().publicationIncomplete()
+	// Publication is observed L1 document upload success, not a mailbox drain
+	// verdict. Upload while the attempt still holds its handoff lease and
+	// before terminal retention can make the handoff an eviction candidate.
+	published := lifecycle.uploadResult(ctx, claim)
 	if err := lifecycle.retainResults(claim, succeeded, published); err != nil {
 		return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
 	}
-	lifecycle.uploadResult(ctx, claim)
 	if succeeded {
 		volumes := runtimeManagedVolumesForSuccessfulCompletion(claim.Job.Spec)
 		if len(volumes) > 0 {
@@ -1283,7 +1285,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// so it is decided here, in the open, rather than inside a preparation
 		// that would otherwise have to answer "prepared, owned by nobody".
 		if handoffs.ownsHandoff(claim.Job.Spec) {
-			owner, err := handoffs.prepare(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID)
+			owner, err := handoffs.prepareAttempt(handoffLease, claim.Job.Spec, lifecycle.dependencies.nodeID, claim.Lease.AttemptID)
 			if err != nil {
 				return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 			}
@@ -1656,13 +1658,10 @@ func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
 // a cancelled context. It is latched behind the completion path, so it does
 // nothing at all when a real verdict was already recorded.
 func (lifecycle *attemptLifecycle) retainResultsFallback(claim l1.Claim) {
-	if err := lifecycle.retainResults(claim, false, false); err != nil {
+	published := lifecycle.uploadResult(context.Background(), claim)
+	if err := lifecycle.retainResults(claim, false, published); err != nil {
 		lifecycle.log("agent: retain results for attempt %s: %v", claim.Lease.AttemptID, err)
 	}
-	// The upload is latched separately, so a completion that already uploaded
-	// is untouched and an exit that never reached one still accounts for its
-	// result rather than leaving it unexplained.
-	lifecycle.uploadResult(context.Background(), claim)
 }
 
 func (lifecycle *attemptLifecycle) retainResults(claim l1.Claim, succeeded, published bool) error {
@@ -1721,16 +1720,16 @@ func (lifecycle *attemptLifecycle) captureRemoteResult(ctx context.Context, mail
 // reads it here, through the ownership receipt it still holds. An OCI attempt
 // read it before its runtime was reaped, because that was the last moment it
 // could.
-func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Claim) {
+func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Claim) bool {
 	if lifecycle.dependencies.client == nil {
-		return
+		return false
 	}
 	if !lifecycle.resultUploaded.CompareAndSwap(false, true) {
-		return
+		return lifecycle.resultPublished.Load()
 	}
 	result, found := lifecycle.attemptResult(claim)
 	if !found || result.empty() {
-		return
+		return false
 	}
 	uploadContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 	defer cancel()
@@ -1739,6 +1738,8 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 	if err != nil {
 		lifecycle.log("agent: upload result for attempt %s: %v", claim.Lease.AttemptID, err)
 	}
+	published := err == nil && len(recorded.document) > 0 && recorded.skip == ""
+	lifecycle.resultPublished.Store(published)
 	// The outcome is recorded for every runtime, not only the ones whose
 	// handoff directory this agent owns. An upload that never landed leaves no
 	// ledger row at all, so this record is the only place the reason exists.
@@ -1755,12 +1756,13 @@ func (lifecycle *attemptLifecycle) uploadResult(ctx context.Context, claim l1.Cl
 		if usesOCIHandoffLifecycle(claim.Job.Spec) {
 			if noteErr := lifecycle.dependencies.handoffs.noteOCIHandoffUpload(
 				handoffOwnerRunID(claim.Job.Spec), claim.Lease.AttemptID,
-				len(recorded.document) > 0 && recorded.skip == ""); noteErr != nil {
+				published); noteErr != nil {
 				lifecycle.log("agent: record the result upload on run %s's OCI handoff record: %v",
 					handoffOwnerRunID(claim.Job.Spec), noteErr)
 			}
 		}
 	}
+	return published
 }
 
 // attemptResult returns what this attempt has to upload, reading it now for the

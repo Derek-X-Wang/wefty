@@ -1162,11 +1162,18 @@ person through the agent log and the node doctor's retained-results line.
 **What the node gives up when it is over budget.** On the collector's timer, and only
 there, the node evicts until it fits. The pass at agent startup measures and
 reports and gives nothing up: the budget's first irreversible decision does not
-belong inside the call bringing the node up, before it has claimed any work. Published results go first: a run whose
-evidence reached a ledger has a copy somewhere else, and the `published` fact
-the record carries — the mailbox drain verdict, and the result upload, which is
-the only place an OCI run is named at all — is what says so. Within each of
-those two classes the oldest terminal time goes first, except that a handoff
+belong inside the call bringing the node up, before it has claimed any work.
+Published results go first: a handoff is published only after the node
+observes a successful upload of that attempt's `result.json` document to L1.
+A missing mailbox is not publication, and even a successful mailbox drain
+cannot hide a failed result-document upload. An uploaded skip reason is not
+an uploaded document. The node records upload success separately from the
+workload's success and the mailbox drain; older mailbox-only publication
+records are treated conservatively as unpublished. The agent's private
+records keep the legacy `published` member for compatibility; the eviction
+classification and retained-results projection read `uploaded` instead.
+Process admissions now carry `attempt_id`, as OCI admissions already do.
+Within each of those two classes the oldest terminal time goes first, except that a handoff
 volume with no helper-owned terminal receipt is given up **last** rather than
 first: that timestamp is one the workload could have written, and ordering
 evictions by it would let one workload push an honest run's results off a full
@@ -1250,7 +1257,10 @@ document, written before the runtime request and naming the attempt it admitted
 owner. A rerun of a published owner replaces it, so the rerun's own contents,
 which no ledger has seen, are not given up first on the strength of what an
 earlier attempt uploaded. The upload outcome is joined to the attempt that
-produced it for the same reason.
+produced it for both process directories and OCI volumes. Startup recovery
+may restore publication from a durable successful upload record only when
+its attempt ID matches the handoff admission. An old upload for the same
+owner key grants no publication to a later attempt.
 
 These are the agent's own bounds. Cache-pressure rules elsewhere — the OCI image
 cache, a node running out of disk — govern their own resources and neither
@@ -1309,8 +1319,13 @@ are exactly the cases the ledger cannot describe, because nothing of theirs got
 there. The reader sees an ordinary not-found, and the reason lives on the node
 that ran the job: the agent writes an upload record beside the run's retained
 files, for every runtime including `kind=oci`, whose handoff volume is the
-helper's and has no retention record of its own. `wefty inspect` says so rather
-than guessing — it reports `uploaded`, which is observed from the ledger, the
+helper's. A missing OCI mailbox leaves no result capture or upload outcome;
+a failed document upload records `transport`; a successful document upload
+records `uploaded=true`. Only the last fact makes the handoff published.
+The upload stays best effort and never changes the workload's verdict.
+L1's result retention follows the job's own lifecycle independently of node
+handoff expiry or budget eviction; neither node operation deletes L1's copy.
+`wefty inspect` says so rather than guessing — it reports `uploaded`, which is observed from the ledger, the
 named reason when the ledger holds one, and where to look when it does not.
 
 Handoff files are node-local. If a cold rerun finds files in an existing
