@@ -465,6 +465,11 @@ func TestRunMailboxOperationsHonourTheirContext(t *testing.T) {
 // the event directory, not less: it is where a run writes result.json, and it
 // is the directory the container mounts read-write.
 func TestHandoffFileScopeIsConfinedTheSameWayTheEventScopeIs(t *testing.T) {
+	t.Run("mailbox", func(t *testing.T) { testHandoffFileScopeConfinement(t, mailboxTestRunID) })
+	t.Run("without_mailbox", func(t *testing.T) { testHandoffFileScopeConfinement(t, "") })
+}
+
+func testHandoffFileScopeConfinement(t *testing.T, runID string) {
 	secret := filepath.Join(stableTempDir(t), "node-secret")
 	if err := os.WriteFile(secret, []byte("a credential the helper must never serve"), 0o600); err != nil {
 		t.Fatal(err)
@@ -472,6 +477,7 @@ func TestHandoffFileScopeIsConfinedTheSameWayTheEventScopeIs(t *testing.T) {
 	handoffReference := func() RunMailboxReference {
 		reference := confinementReference()
 		reference.Scope = RunMailboxScopeHandoffFiles
+		reference.RunID = runID
 		return reference
 	}
 	volumeRoot := func(t *testing.T, runtimeRoot string) string {
@@ -485,6 +491,11 @@ func TestHandoffFileScopeIsConfinedTheSameWayTheEventScopeIs(t *testing.T) {
 
 	t.Run("the volume root is what the scope opens", func(t *testing.T) {
 		runtimeRoot, _ := newConfinementRoot(t)
+		if runID == "" {
+			if err := os.RemoveAll(filepath.Join(volumeRoot(t, runtimeRoot), RunMailboxDirectoryName)); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := os.WriteFile(filepath.Join(volumeRoot(t, runtimeRoot), "result.json"), []byte(`{"ok":1}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -497,6 +508,9 @@ func TestHandoffFileScopeIsConfinedTheSameWayTheEventScopeIs(t *testing.T) {
 		if string(response.Payload) != `{"ok":1}` || response.Truncated || response.Unusable {
 			t.Fatalf("handoff read = %#v", response)
 		}
+		if runID == "" {
+			return
+		} // No mailbox directories were needed.
 		// The same name in the event scope is a different file, and absent:
 		// the scope chooses the directory, so neither scope can reach into the
 		// other's.

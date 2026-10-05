@@ -214,3 +214,28 @@ func TestWorkloadInputPairsTheAttemptCredentialWithItsEndpoint(t *testing.T) {
 		}
 	})
 }
+
+func TestAdapterHandoffReadWithoutRunMailbox(t *testing.T) {
+	engine := &mailboxAdapterEngine{adapterTestEngine: &adapterTestEngine{}, entries: map[string][]byte{"result.json": []byte(`{"ok":true}`)}}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := mailboxAdapterAuthority()
+	if _, err := session.Run(t.Context(), ocihelper.RunRequest{Authority: HelperAuthority(authority), InitialDeadman: time.Minute,
+		Workload: ocihelper.WorkloadInput{ImageDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Argv: []string{"/bin/probe"}, ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: mailboxAdapterOwnerKey}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref := workloadrunner.RunMailboxReference{Authority: authority, OwnerKey: mailboxAdapterOwnerKey, Scope: workloadrunner.RunMailboxScopeHandoffFiles}
+	payload, truncated, err := adapter.ReadRunMailbox(t.Context(), ref, "result.json", 0)
+	if err != nil || truncated || string(payload) != `{"ok":true}` {
+		t.Fatalf("read = %q truncated=%t err=%v", payload, truncated, err)
+	}
+	payload, truncated, err = adapter.ReadHandoffFile(t.Context(), workloadrunner.HandoffFileReference{Authority: authority, OwnerKey: mailboxAdapterOwnerKey}, "result.json", 0)
+	if err != nil || truncated || string(payload) != `{"ok":true}` {
+		t.Fatalf("independent reader = %q truncated=%t err=%v", payload, truncated, err)
+	}
+}

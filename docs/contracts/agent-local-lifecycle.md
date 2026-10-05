@@ -514,9 +514,12 @@ only when it observed both halves of publication (`run-execution-context.md`,
 L1, as its uploaded document or as an accepted `absent` when it wrote none,
 and its run mailbox drained completely, which an attempt with no mailbox does
 trivially. A successful upload does not hide a failed drain, and a drain does
-not hide a failed upload. Any other skip reason, a refused upload, and an OCI
-attempt with no run mailbox (no read path, so no upload) leave the handoff
-unpublished, without changing the workload's verdict. Completion drains the
+not hide a failed upload. Any other skip reason or a refused upload leaves
+the handoff unpublished, without changing the workload's verdict. An OCI
+one-shot reads its admitted handoff root with exact live-attempt authority
+before runtime reap, independently of a run mailbox, run token or L3
+configuration. Event operations retain their declared-mailbox authorization.
+Completion drains the
 mailbox, then uploads while still holding the handoff lease and before
 recording terminal retention, and writes the drain verdict on the upload
 record beside the upload outcome. Each admission clears the previous

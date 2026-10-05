@@ -2508,6 +2508,17 @@ func (adapter *Adapter) ListRunMailbox(ctx context.Context, reference workloadru
 	return response.Names, response.Exhausted, nil
 }
 
+// ReadHandoffFile uses the helper's handoff scope with no run-mailbox identity.
+// The helper checks the exact live attempt and its admitted owner before read.
+func (adapter *Adapter) ReadHandoffFile(ctx context.Context, reference workloadrunner.HandoffFileReference, name string, limit int) ([]byte, bool, error) {
+	return adapter.ReadRunMailbox(ctx, workloadrunner.RunMailboxReference{
+		Authority: reference.Authority, OwnerKey: reference.OwnerKey,
+		Scope: workloadrunner.RunMailboxScopeHandoffFiles,
+	}, name, limit)
+}
+
+var _ workloadrunner.HandoffFileRuntime = (*Adapter)(nil)
+
 func (adapter *Adapter) ReadRunMailbox(ctx context.Context, reference workloadrunner.RunMailboxReference, name string, limit int) ([]byte, bool, error) {
 	session, request, err := adapter.runMailboxRequest(reference)
 	if err != nil {
