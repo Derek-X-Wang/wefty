@@ -770,22 +770,28 @@ the job's reserved canceled outcome.
 
 ## Instance keys
 
-A root JobSpec may carry `instance_key` independently of `dispatch_key`.
+A JobSpec may carry `instance_key` independently of `dispatch_key`.
 Normalization is identity: keys are compared exactly, case-sensitive, without
 trimming or folding. A present value must be a string of 1–255 visible ASCII
 characters (`!` through `~`); whitespace, non-ASCII, empty and null are invalid.
 Omission means no reservation. Keys apply only to `one-shot` and `service`;
-Computers reject the member. The namespace is the authenticated Fabric identity
-of the submitting app. Apps sharing that identity share the namespace.
+Computers reject the member. Root submissions use the authenticated Fabric
+identity of the submitting app; apps sharing that identity share the namespace.
+Child submissions use the authenticated parent Job's namespace, derived from
+its Attempt credential. Successive attempts of that parent share a namespace;
+different parents are independent even when they inherit the same root submitter.
+The caller cannot select a namespace or derive it from an attempt ID.
 `services create --instance-key KEY` exposes it; `wefty submit` continues through
 L3 and has no instance-key flag.
 
 L1 persists namespace, key and immutable lifecycle discriminator on the ordinary
 job row. A single partial unique index covers both classes, inside the creation
 transaction. The internal namespace encoding tags Fabric identity (`fabric:`)
-so future parent-job namespaces cannot alias an identity. The index excludes
-terminal one-shots (`succeeded` or `failed`, including `outcome=canceled`), so
-release commits atomically with the terminal transition. Live states, including
+and parent Job identity (`job:`) so they cannot alias. The existing Fabric
+encoding, index columns and live predicate are unchanged when adding child
+namespaces; existing reservations survive database reopen without an index
+rebuild. The index excludes terminal one-shots (`succeeded` or `failed`, including
+`outcome=canceled`), so release commits atomically with the terminal transition. Live states, including
 cancellation pending settlement, keep the reservation. This is logical Job
 uniqueness, not a guarantee that a lost attempt's process no longer exists.
 
@@ -798,7 +804,14 @@ Dispatch replay, dispatch mismatch and removal tombstones resolve first. A
 new request with a different dispatch key that loses a reservation, including
 concurrent creation, receives HTTP 409 `instance_key_conflict`, non-retryable,
 with `details.instance_key` and `details.job_id` only when the caller may read
-the holder. Client principals can read ordinary jobs; bearer credentials cannot
-expose jobs outside their own job/children scope. A new keyed attempt-credential
-submission receives HTTP 409 `instance_key_not_supported`, non-retryable, until
-#654 introduces parent-scoped namespaces. No child namespace is implemented here.
+the holder. Client principals can read ordinary jobs. Attempt-credential
+conflicts use the same child-read scope check as dispatch replay: the holder's
+parent Job and originating submitter must match the authenticated credential.
+An inconsistent reservation outside that scope still conflicts but omits
+`details.job_id`, including after a concurrent insertion loses. Before creation,
+replay or conflict resolution, L1 revalidates the credential's live authority
+inside the creation transaction, using time read after acquiring the writer
+transaction so a lease that expires while waiting is refused. Expired or
+superseded credentials cannot reserve a key or learn its holder. Dispatch replay retains its existing parent
+and originating-submitter scope checks; a removal tombstone with no provable
+parentage remains a dispatch conflict for an Attempt credential.

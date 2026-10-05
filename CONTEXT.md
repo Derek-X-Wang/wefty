@@ -85,8 +85,9 @@ _Avoid_: task, work item
 
 **Instance key**:
 An optional app-chosen name that reserves at most one live Job in the app's
-authenticated Fabric identity namespace. One-shots release it when terminal;
-services retain it through stopped, failed and removal until cleanup finalizes.
+authenticated Fabric identity namespace, or in the authenticated parent Job's
+namespace for children. Successive parent attempts share that namespace.
+One-shots release it when terminal; services retain it through stopped, failed and removal until cleanup finalizes.
 Apps sharing a Fabric identity share a namespace. Computers do not use keys.
 _Avoid_: dispatch key (request replay), Computer name, schedule, Slot
 
