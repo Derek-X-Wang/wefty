@@ -94,7 +94,7 @@ func TestTheAccountingPassReportsTheOCIHelpersHandoffRootToo(t *testing.T) {
 // agent names such a run.
 func TestAnOCIRunIsPlacedFromItsUploadRecord(t *testing.T) {
 	harness := newRetentionHarness(t, time.Hour)
-	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}); err != nil {
+	if err := harness.manager.recordUpload("run_oci", "node-1", "attempt-1", attemptResult{document: []byte("{}")}, true); err != nil {
 		t.Fatal(err)
 	}
 	name, err := ocihelper.DeterministicHandoffVolumeDirectory("run_oci")

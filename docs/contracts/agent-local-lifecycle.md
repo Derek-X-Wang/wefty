@@ -508,6 +508,25 @@ path. The named `usesAgentHandoffLifecycle` predicate positively selects only
 `kind=process`, `class=one-shot`; no negative kind gate can accidentally add a
 future runtime to the host-directory manager.
 
+For process and OCI one-shots, the node marks a retained handoff published
+only when it observed both halves of publication (`run-execution-context.md`,
+"What the node gives up when it is over budget"): the attempt's result reached
+L1, as its uploaded document or as an accepted `absent` when it wrote none,
+and its run mailbox drained completely, which an attempt with no mailbox does
+trivially. A successful upload does not hide a failed drain, and a drain does
+not hide a failed upload. Any other skip reason, a refused upload, and an OCI
+attempt with no run mailbox (no read path, so no upload) leave the handoff
+unpublished, without changing the workload's verdict. Completion drains the
+mailbox, then uploads while still holding the handoff lease and before
+recording terminal retention, and writes the drain verdict on the upload
+record beside the upload outcome. Each admission clears the previous
+publication and records the producing attempt; restart recovery applies the
+same rule to that same attempt's upload record only. A legacy record that
+cannot show both halves never grants early-eviction priority. Unpublished
+results remain subject to the existing bounded retention and last-resort
+budget eviction. L1's stored result has its own job retention, independent of
+node cleanup.
+
 Immediately before helper `Run`, the adapter atomically captures the session,
 verified sweep epoch, and helper instance/session generation, replacing any
 Preflight-era observation. If helper or engine loss invalidates that session,
