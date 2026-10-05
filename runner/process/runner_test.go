@@ -152,6 +152,62 @@ func TestServiceRunSelfExecsGuardianAndPreservesRawEvents(t *testing.T) {
 	}
 }
 
+// A payload that handles TERM answers a termination it was asked for with an
+// exit code of its own, zero included. The result keeps who asked, so service
+// policy never reads that code as the payload deciding to stop; a payload that
+// exits by itself names no initiator.
+func TestRunKeepsTheInitiatorOfARequestedExit(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		guarded bool
+		want    contract.TerminationCause
+	}{
+		{name: "agent", want: contract.TerminationCauseAgent},
+		{name: "guardian", guarded: true, want: contract.TerminationCauseGuardian},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
+			script := "trap 'exit 0' TERM\n: > \"$1\"\nwhile [ ! -e \"$2\" ]; do sleep 0.05; done\nexit 0\n"
+			run := func(ctx context.Context) (contract.ProcessResult, error) {
+				return New(Config{GuardianExecutable: guardianAgentPath}).Run(ctx, Request{
+					AttemptID: "attempt-requested-exit-" + test.name, Guarded: test.guarded, IdlePolicy: IgnoreIdle,
+					Execution: contract.ExecutionSpec{
+						Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", script, "sh", ready, release},
+						WorkingDirectory: directory,
+					},
+				}, nil)
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			go func() {
+				// Cancel only once the TERM handler is installed.
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, err := os.Stat(ready); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				cancel()
+			}()
+			result, err := run(ctx)
+			if !errors.Is(err, context.Canceled) || result.ExitCode == nil || *result.ExitCode != 0 || result.Signal != "" || result.TerminationInitiator != test.want {
+				t.Fatalf("requested exit = (%#v, %v), want exit 0 initiated by %s", result, err, test.want)
+			}
+
+			if err := os.WriteFile(release, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			result, err = run(t.Context())
+			if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.TerminationInitiator != "" {
+				t.Fatalf("self exit = (%#v, %v), want exit 0 with no initiator", result, err)
+			}
+		})
+	}
+}
+
 func TestRunDistinguishesProcessResults(t *testing.T) {
 	t.Run("service readiness without guardian", func(t *testing.T) {
 		result, err := New(Config{}).Run(context.Background(), Request{

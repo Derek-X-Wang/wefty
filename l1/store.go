@@ -490,7 +490,6 @@ CREATE TABLE IF NOT EXISTS attempt_credentials (
 );
 CREATE INDEX IF NOT EXISTS attempt_credentials_attempt ON attempt_credentials(attempt_id);
 CREATE TABLE IF NOT EXISTS service_jobs (
-  policy_stop_json BLOB,
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped')),
   bound_node_id TEXT REFERENCES nodes(node_id),
@@ -502,7 +501,8 @@ CREATE TABLE IF NOT EXISTS service_jobs (
   last_failure BLOB,
   healthy_since_ns INTEGER,
   published_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL,
-  display_endpoint TEXT
+  display_endpoint TEXT,
+  policy_stop_json BLOB
 );
 CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node_id, desired_state);
 CREATE TABLE IF NOT EXISTS computers (
@@ -1183,10 +1183,12 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.markLogEventDocumentsCompactOnNewDatabase(ctx); err != nil {
 		return err
 	}
-	if err := s.ensureColumn(ctx, "service_jobs", "policy_stop_json", "BLOB"); err != nil {
+	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
 		return err
 	}
-	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
+	// A database from before restart: on-failure gains the nullable policy
+	// stop column; every existing service reads it as absent.
+	if err := s.ensureColumn(ctx, "service_jobs", "policy_stop_json", "BLOB"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "jobs", "completion_replay_attempt_id", "TEXT"); err != nil {
@@ -4018,6 +4020,9 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err := validateProcessResult(request.Result); err != nil {
 		return CompletionOutcome{}, err
 	}
+	if err := validateTerminationInitiator(request); err != nil {
+		return CompletionOutcome{}, err
+	}
 	if request.RuntimeQuiescenceEvidence != "" && !validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence) {
 		return CompletionOutcome{}, protocolError(contract.ErrorInvalidRequest, "runtime_quiescence_evidence is not recognized")
 	}
@@ -4159,7 +4164,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err != nil {
 			return CompletionOutcome{}, err
 		}
-		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, request.RuntimeQuiescenceEvidence, lastFailureJSON, now, directive == AttemptDirectiveRestart)
+		policy := s.classifyServiceCompletion(jobBeforeCompletion, request, lastFailureJSON, now, directive == AttemptDirectiveRestart)
 		servicePolicy = &policy
 		finalJobState = policy.jobState
 		finalAttemptState = policy.attemptState
@@ -4569,6 +4574,23 @@ func validateProcessResult(result ProcessResult) error {
 	}
 	if set != 1 {
 		return protocolError(contract.ErrorInvalidRequest, "result must contain exactly one of spawn_error, runtime_failure, output_error, exit_code, or signal")
+	}
+	return nil
+}
+
+// validateTerminationInitiator keeps the completion's initiator coherent with
+// its result. It names who asked for an exit-code termination; a signal names
+// its own initiator in termination_cause, and a spontaneous exit names none.
+func validateTerminationInitiator(request CompletionRequest) error {
+	switch request.TerminationInitiator {
+	case "":
+		return nil
+	case contract.TerminationCauseAgent, contract.TerminationCauseGuardian:
+	default:
+		return protocolError(contract.ErrorInvalidRequest, "termination_initiator must be agent or guardian")
+	}
+	if request.Result.ExitCode == nil {
+		return protocolError(contract.ErrorInvalidRequest, "termination_initiator accompanies only an exit_code result; a signal names its initiator in termination_cause")
 	}
 	return nil
 }

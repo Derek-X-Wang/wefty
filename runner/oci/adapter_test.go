@@ -1236,6 +1236,55 @@ func TestAdapterServiceCancellationUsesTermBeforeKill(t *testing.T) {
 	}
 }
 
+// A container that handles TERM answers the agent's request with an exit code
+// of its own. The adapter keeps that it asked, so service policy never reads
+// the code as the container deciding to stop; an exit nobody asked for names
+// no initiator.
+func TestAdapterKeepsTheInitiatorOfARequestedExit(t *testing.T) {
+	zero := 0
+	for _, requested := range []bool{true, false} {
+		t.Run(fmt.Sprintf("requested=%t", requested), func(t *testing.T) {
+			engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: &zero}}
+			if requested {
+				engine.watchSignals = make(chan ocihelper.Signal, 2)
+				engine.termExitCode = &zero
+			}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			request := adapterTestRequest()
+			request.Authority.WorkloadClass = contract.JobClassService
+			request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+			request.TerminationGrace = time.Second
+			started := make(chan struct{})
+			request.Started = func() { close(started) }
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			type runOutcome struct {
+				result workloadrunner.Result
+				err    error
+			}
+			done := make(chan runOutcome, 1)
+			go func() {
+				result, err := adapter.Run(ctx, request, nil)
+				done <- runOutcome{result: result, err: err}
+			}()
+			<-started
+			if requested {
+				cancel()
+			}
+			finished := <-done
+			want := contract.TerminationCause("")
+			if requested {
+				want = contract.TerminationCauseAgent
+			}
+			outcome := finished.result.Outcome
+			if finished.err != nil || outcome.ExitCode == nil || *outcome.ExitCode != 0 || outcome.Signal != "" || outcome.TerminationInitiator != want {
+				t.Fatalf("exit = (%+v, %v), want exit 0 initiated by %q", outcome, finished.err, want)
+			}
+		})
+	}
+}
+
 func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing.T) {
 	engine := &adapterTestEngine{
 		watchSignals: make(chan ocihelper.Signal, 2),
@@ -2219,6 +2268,7 @@ type adapterTestEngine struct {
 	missingUntilEnsure            bool
 	reconcileCalls                int
 	watchSignals                  chan ocihelper.Signal
+	termExitCode                  *int
 	ignoreTERM                    bool
 	ignoreKILL                    bool
 	exitOnKillRace                bool
@@ -2414,6 +2464,10 @@ func (engine *adapterTestEngine) Watch(ctx context.Context, _ ocihelper.WatchReq
 			}
 		}
 		engine.watch = ocihelper.WatchResponse{Signal: signal, TerminationCause: "agent"}
+		if signal == ocihelper.SignalTERM && engine.termExitCode != nil {
+			// A container that handles TERM exits with a code of its own.
+			engine.watch = ocihelper.WatchResponse{ExitCode: engine.termExitCode}
+		}
 	}
 	if engine.watchErrorOnCancel {
 		<-ctx.Done()

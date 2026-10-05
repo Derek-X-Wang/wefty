@@ -226,6 +226,16 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 				return Job{}, internalError(err, "timestamp latched service stop")
 			}
 		case contract.JobStopped:
+			if job.DesiredState == contract.ServiceDesiredStopped {
+				// A repeat stop of a stopped service is a validated no-op.
+				break
+			}
+			if job.PolicyStop == nil {
+				return Job{}, protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", jobID)
+			}
+			// The one stopped service whose desired state is still running is a
+			// policy stop, which never rewrote intent. An operator stop records
+			// that intent now, keeping the observed policy stop.
 			if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET desired_state=? WHERE job_id=?", desired, jobID); err != nil {
 				return Job{}, internalError(err, "stop policy-stopped service")
 			}

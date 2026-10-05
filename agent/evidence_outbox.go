@@ -177,7 +177,15 @@ func (outbox *evidenceOutbox) markCreatedHere(attemptID string) {
 }
 
 func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
-	if err := outbox.spool.storeCompletion(ctx, attemptID, result, finishedAt, evidence...); err != nil {
+	var quiescenceEvidence l1.RuntimeQuiescenceEvidence
+	if len(evidence) > 0 {
+		quiescenceEvidence = evidence[0]
+	}
+	return outbox.storeDurableCompletion(ctx, attemptID, durableCompletion{Result: result, RuntimeQuiescenceEvidence: quiescenceEvidence}, finishedAt)
+}
+
+func (outbox *evidenceOutbox) storeDurableCompletion(ctx context.Context, attemptID string, completion durableCompletion, finishedAt time.Time) error {
+	if err := outbox.spool.storeDurableCompletion(ctx, attemptID, completion, finishedAt); err != nil {
 		return err
 	}
 	if outbox.completionStored != nil {
@@ -637,7 +645,7 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 }
 
 func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
-	result, evidence, _, present, err := outbox.spool.completionWithEvidence(ctx, attempt.attemptID)
+	completion, _, present, err := outbox.spool.durableCompletion(ctx, attempt.attemptID)
 	if err != nil || !present {
 		return err
 	}
@@ -675,7 +683,8 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 	}
 	request := l1.CompletionRequest{
 		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,
-		Result: result, RuntimeQuiescenceEvidence: evidence,
+		Result: completion.Result, RuntimeQuiescenceEvidence: completion.RuntimeQuiescenceEvidence,
+		TerminationInitiator: completion.TerminationInitiator,
 	}
 	_, err = client.Complete(ctx, attempt.jobID, attempt.attemptID, request)
 	if releaseIntent != nil {

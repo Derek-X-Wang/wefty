@@ -42,7 +42,14 @@ func resultFromWait(waitErr error, state *os.ProcessState, cause contract.Termin
 			return contract.ProcessResult{Signal: waitStatus.Signal().String(), TerminationCause: cause}
 		}
 		exitCode := state.ExitCode()
-		return contract.ProcessResult{ExitCode: &exitCode}
+		result := contract.ProcessResult{ExitCode: &exitCode}
+		// A payload that handles TERM can answer a termination it was asked for
+		// with any exit code, zero included. Who asked is kept, so policy never
+		// reads that answer as the payload deciding to stop.
+		if cause != contract.TerminationCauseSpontaneous {
+			result.TerminationInitiator = cause
+		}
+		return result
 	}
 
 	return spawnFailure(contract.SpawnFailureProcessWait, waitErr)

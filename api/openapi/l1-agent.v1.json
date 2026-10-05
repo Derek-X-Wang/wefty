@@ -613,7 +613,12 @@
                     "type": "string",
                     "enum": ["attempt", "no_runtime_resources", "oci_sweep", "prior_boot_guardian", "prior_boot_oci_sweep"]
                   },
-                  "protocol_output_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+                  "protocol_output_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                  "termination_initiator": {
+                    "type": "string",
+                    "enum": ["agent", "guardian"],
+                    "description": "The agent's report that it, or its guardian, asked the payload to end and the payload answered with the exit code in result: shutdown, an attempt directive, lost authority, or the agent's own supervision. Valid only with an exit_code result; a signal result names its initiator in termination_cause, and a spontaneous exit omits this. Service policy treats such a completion as an infrastructure interruption that requeues without consuming the restart streak, never as a payload failure or an on-failure policy stop."
+                  }
                 }
               }
             }

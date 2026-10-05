@@ -1170,6 +1170,18 @@ ORDER BY a.created_ns, a.attempt_id`)
 type durableCompletion struct {
 	Result                    l1.ProcessResult             `json:"result"`
 	RuntimeQuiescenceEvidence l1.RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
+	// TerminationInitiator is replayed with the result so a completion
+	// recovered after a restart is byte-identical to the one first sent.
+	TerminationInitiator contract.TerminationCause `json:"termination_initiator,omitempty"`
+}
+
+// durableCompletionOf is the part of a completion request the spool keeps;
+// the fence and idempotency key are rebuilt from the attempt row.
+func durableCompletionOf(request l1.CompletionRequest) durableCompletion {
+	return durableCompletion{
+		Result: request.Result, RuntimeQuiescenceEvidence: request.RuntimeQuiescenceEvidence,
+		TerminationInitiator: request.TerminationInitiator,
+	}
 }
 
 // terminalCompletionAudit is the bounded, diagnostic-free terminal shape kept
@@ -1345,7 +1357,11 @@ func (spool *logSpool) storeCompletion(ctx context.Context, attemptID string, re
 	if len(evidence) > 0 {
 		quiescenceEvidence = evidence[0]
 	}
-	resultJSON, err := json.Marshal(durableCompletion{Result: result, RuntimeQuiescenceEvidence: quiescenceEvidence})
+	return spool.storeDurableCompletion(ctx, attemptID, durableCompletion{Result: result, RuntimeQuiescenceEvidence: quiescenceEvidence}, finishedAt)
+}
+
+func (spool *logSpool) storeDurableCompletion(ctx context.Context, attemptID string, completion durableCompletion, finishedAt time.Time) error {
+	resultJSON, err := json.Marshal(completion)
 	if err != nil {
 		return fmt.Errorf("agent: encode durable completion: %w", err)
 	}
@@ -1372,28 +1388,33 @@ func (spool *logSpool) completion(ctx context.Context, attemptID string) (l1.Pro
 }
 
 func (spool *logSpool) completionWithEvidence(ctx context.Context, attemptID string) (l1.ProcessResult, l1.RuntimeQuiescenceEvidence, time.Time, bool, error) {
+	completion, finishedAt, present, err := spool.durableCompletion(ctx, attemptID)
+	return completion.Result, completion.RuntimeQuiescenceEvidence, finishedAt, present, err
+}
+
+func (spool *logSpool) durableCompletion(ctx context.Context, attemptID string) (durableCompletion, time.Time, bool, error) {
 	var resultJSON []byte
 	var finishedNS int64
 	err := spool.db.QueryRowContext(ctx, `SELECT result_json, finished_ns FROM spool_attempts
 WHERE attempt_id=? AND result_json IS NOT NULL AND incomplete_json IS NULL`, attemptID).Scan(&resultJSON, &finishedNS)
 	if errors.Is(err, sql.ErrNoRows) {
-		return l1.ProcessResult{}, "", time.Time{}, false, nil
+		return durableCompletion{}, time.Time{}, false, nil
 	}
 	if err != nil {
-		return l1.ProcessResult{}, "", time.Time{}, false, fmt.Errorf("agent: read durable completion: %w", err)
+		return durableCompletion{}, time.Time{}, false, fmt.Errorf("agent: read durable completion: %w", err)
 	}
 	var completion durableCompletion
 	if err := json.Unmarshal(resultJSON, &completion); err != nil {
-		return l1.ProcessResult{}, "", time.Time{}, false, fmt.Errorf("agent: decode durable completion: %w", err)
+		return durableCompletion{}, time.Time{}, false, fmt.Errorf("agent: decode durable completion: %w", err)
 	}
 	if completion.Result == (l1.ProcessResult{}) {
 		// Pre-quiescence-evidence spools stored ProcessResult directly. Preserve
 		// their replayability without treating an absent evidence kind as proof.
 		if err := json.Unmarshal(resultJSON, &completion.Result); err != nil {
-			return l1.ProcessResult{}, "", time.Time{}, false, fmt.Errorf("agent: decode legacy durable completion: %w", err)
+			return durableCompletion{}, time.Time{}, false, fmt.Errorf("agent: decode legacy durable completion: %w", err)
 		}
 	}
-	return completion.Result, completion.RuntimeQuiescenceEvidence, time.Unix(0, finishedNS).UTC(), true, nil
+	return completion, time.Unix(0, finishedNS).UTC(), true, nil
 }
 
 func (spool *logSpool) completionDelivered(ctx context.Context, attemptID string, intentRevision uint64) error {

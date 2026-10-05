@@ -109,9 +109,14 @@ An ordinary service may declare `restart: on-failure`; omission means `always`.
 Computers must explicitly declare `always`. A clean payload `exit_code: 0`
 under `on-failure` records its `ProcessResult` as `policy_stop`, observes
 `stopped`, clears publication and restart timing, and releases service capacity.
-The durable binding and terminal attempt remain. Desired state is never changed
+A clean exit is one the payload chose: an exit the agent or its guardian asked
+for (the completion carries `termination_initiator`) is an interruption and
+never a policy stop, whatever code a TERM handler returns. The durable binding
+and terminal attempt remain. Desired state is never changed
 by this reaction (ADR-0004). The policy stop suppresses claims until an explicit
-start or restart clears it and reacquires capacity. It survives database reopen.
+start or restart clears it and reacquires capacity; the image-reconciliation
+latch also clears it when it records its own failure. An operator stop keeps it.
+It survives database reopen.
 It leaves `restart_streak`, `lifetime_restart_count`, and prior `last_failure`
 unchanged. Nonzero exits, spontaneous signals, infrastructure/lease loss,
 backoff, and streak limits retain their existing treatment. Additive incomplete
@@ -122,7 +127,8 @@ suppression, including a TERM handler that exits zero. Its durable request
 cannot affect a later attempt. Terminal spawn/output, image-reconciliation,
 and removal latches still take precedence; restart never converts those facts
 into a clean policy stop. Operator stop is accepted on a policy-stopped service
-and records stopped intent without starting an attempt.
+and records stopped intent without starting an attempt; a repeat stop of a
+service already desired `stopped` is a validated no-op.
 
 Removal is accepted from every pre-removal state and enters `removal_pending`
 in the same transaction that fences the live attempt `lost`; a service that
@@ -268,7 +274,9 @@ Agent shutdown is an infrastructure interruption, not operator stop intent. A
 fenced shutdown completion therefore leaves desired state `running`, moves the
 service from `running` to `queued`, and leaves the restart streak unchanged.
 It must not use `stopping` or `stopped`, whose meaning is reserved for a
-durable operator request to stop the service.
+durable operator request to stop the service. This holds whether the payload
+dies of the agent's signal or handles TERM and exits with a code of its own:
+the agent reports the request as `termination_initiator` beside an exit code.
 
 ### Computer authority and immutable Job projections
 
@@ -912,6 +920,22 @@ identity, and never prints or persists its contents itself. The sideband
 remains the authority: a copied file from another person, device, ended
 session, or Computer fails closed, and neither a CLI flag nor URL selects the
 control backend directly.
+
+Service completion policy classifies who ended the payload before what it
+returned. Its initiator rows are explicit:
+
+| Completion fact | Service treatment | Restart streak |
+| --- | --- | ---: |
+| `exit_code` with `termination_initiator` `agent` or `guardian` (shutdown, attempt directive, lost authority, agent supervision; any code, zero included) | Infrastructure interruption: requeue `queued` with pre-start backoff and count a lifetime restart. Never a policy stop, never `last_failure`. | unchanged |
+| `signal` with `termination_cause` `agent` or `guardian` | Infrastructure interruption, as above. | unchanged |
+| `exit_code: 0` with no initiator under `on-failure`, no restart directive for the attempt | Policy stop: observed `stopped`, desired state kept, capacity released. | unchanged |
+| `exit_code: 0` with no initiator under `on-failure`, restart directive for the attempt (the payload exited before the agent acted on it, or an agent that predates `termination_initiator`) | Restartable: the explicit restart wins over the policy stop. | +1 |
+| `exit_code` with no initiator otherwise, or `signal` with `termination_cause` `spontaneous` | Restartable payload failure with backoff and the streak limit. | +1 |
+
+A stop the operator asked for (desired `stopped` or `stopping`) is classified
+before every row above, and the Computer resource-exhaustion, `spawn_error`, and
+`output_error` latches keep their precedence. `termination_initiator` is valid
+only beside an `exit_code` result; L1 refuses it with any other arm.
 
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:

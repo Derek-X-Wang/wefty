@@ -844,9 +844,13 @@ const (
 // the bounded log-finalization deadline. Deadline expiry after a payload result
 // preserves that result and sets LogEvidenceIncomplete; a pre-Started
 // SpawnError remains a sole spawn arm. A signal outcome always names its
-// structured initiator in TerminationCause. OOM, DiskExhausted, and
-// LogEvidenceIncomplete are additive evidence alongside one valid primary
-// terminal arm.
+// structured initiator in TerminationCause. TerminationInitiator is set only
+// beside ExitCode, and only to agent or guardian: the payload answered a
+// termination it was asked for with an exit code of its own, so that code is
+// not the payload deciding to stop. The agent reports it to L1 beside the
+// result on the completion request; L1's ProcessResult names an initiator only
+// for a signal. OOM, DiskExhausted, and LogEvidenceIncomplete are additive
+// evidence alongside one valid primary terminal arm.
 type ProcessResult struct {
 	SpawnError            *SpawnFailure    `json:"spawn_error,omitempty"`
 	RuntimeFailure        *RuntimeFailure  `json:"runtime_failure,omitempty"`
@@ -854,6 +858,7 @@ type ProcessResult struct {
 	ExitCode              *int             `json:"exit_code,omitempty"`
 	Signal                string           `json:"signal,omitempty"`
 	TerminationCause      TerminationCause `json:"termination_cause,omitempty"`
+	TerminationInitiator  TerminationCause `json:"termination_initiator,omitempty"`
 	OOM                   bool             `json:"oom,omitempty"`
 	DiskExhausted         bool             `json:"disk_exhausted,omitempty"`
 	LogEvidenceIncomplete bool             `json:"log_evidence_incomplete,omitempty"`
@@ -921,7 +926,7 @@ const (
 	SpawnFailureComputerStoragePreparationInterrupted SpawnFailureCode = "computer_storage_preparation_interrupted"
 )
 
-// TerminationCause identifies who initiated a signal termination. A service
+// TerminationCause identifies who initiated a termination. A service
 // policy may combine this with durable desired/node state, but must never infer
 // intent by parsing Signal or an error message.
 type TerminationCause string

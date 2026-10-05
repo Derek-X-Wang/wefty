@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1159,6 +1160,107 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("abandoned lifecycle completion was not reconciled")
+	}
+	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+}
+
+type requestedExitRunner struct{}
+
+func (requestedExitRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	exitCode := 0
+	return contract.ProcessResult{ExitCode: &exitCode, TerminationInitiator: contract.TerminationCauseGuardian}, nil
+}
+
+// The initiator of a requested exit is part of the completion L1 classifies,
+// so the spool keeps it: the completion recovered after an abandoned delivery
+// is byte-identical to the one first sent, initiator included.
+func TestRecoveredCompletionKeepsTheTerminationInitiator(t *testing.T) {
+	bodies := make(chan []byte, 2)
+	var mu sync.Mutex
+	completionCalls := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		bodies <- body
+		mu.Lock()
+		completionCalls++
+		call := completionCalls
+		mu.Unlock()
+		if call == 1 {
+			<-request.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorLeaseExpired, Message: "attempt lease has expired",
+		}})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "job-requested-exit", Spec: contract.JobSpec{
+			Class: contract.JobClassOneShot, Kind: contract.JobKindProcess,
+			Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "ignored-by-fake-runner"},
+				Argv: []string{"ignored-by-fake-runner"}, WorkingDirectory: t.TempDir()},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-requested-exit", FencingToken: "fence-requested-exit", LeaseTTL: time.Minute},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, runtimes: testRuntimeSet(requestedExitRunner{}), outbox: outbox,
+		clock: systemClock{}, renewalInterval: 10 * time.Second, completionRetry: time.Millisecond,
+		observer: newLifecycleObserver(systemClock{}),
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	executeDone := make(chan error, 1)
+	go func() {
+		_, executeErr := lifecycle.execute(ctx, claim, time.Now())
+		executeDone <- executeErr
+	}()
+	receive := func(what string) []byte {
+		t.Helper()
+		select {
+		case body := <-bodies:
+			return body
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s completion was not sent", what)
+			return nil
+		}
+	}
+	live := receive("live")
+	cancel()
+	select {
+	case <-executeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle did not abandon canceled live completion")
+	}
+	recovered := receive("recovered")
+	var completion l1.CompletionRequest
+	if err := json.Unmarshal(live, &completion); err != nil {
+		t.Fatal(err)
+	}
+	if completion.TerminationInitiator != contract.TerminationCauseGuardian || completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 || completion.Result.TerminationCause != "" {
+		t.Fatalf("live completion = %s", live)
+	}
+	if !bytes.Equal(live, recovered) {
+		t.Fatalf("recovered completion differs from the live one:\nlive      %s\nrecovered %s", live, recovered)
 	}
 	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
 }

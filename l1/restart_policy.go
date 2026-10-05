@@ -135,7 +135,8 @@ type serviceCompletionPolicy struct {
 
 // restartRequested comes from the durable directive for this exact attempt,
 // read by completion inside its committing transaction.
-func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiescenceEvidence RuntimeQuiescenceEvidence, lastFailureJSON []byte, now time.Time, restartRequested ...bool) serviceCompletionPolicy {
+func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest, lastFailureJSON []byte, now time.Time, restartRequested bool) serviceCompletionPolicy {
+	result, quiescenceEvidence := completion.Result, completion.RuntimeQuiescenceEvidence
 	policy := serviceCompletionPolicy{
 		jobState:             contract.JobFailed,
 		attemptState:         completionStatesAttempt(result),
@@ -173,9 +174,15 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiesce
 	case result.OutputError != "":
 		// Genuine output failures are terminal. Expected service spool eviction
 		// never reaches this mapper.
+	case result.ExitCode != nil && completion.TerminationInitiator != "":
+		// The agent or its guardian asked the payload to end (shutdown, a
+		// directive, lost authority, its own supervision), and a payload that
+		// handles TERM answers with an exit code of its own. That code is the
+		// payload obeying, not deciding: an interruption like a signal the agent
+		// sent, never a policy stop and never a payload failure.
+		infrastructure = true
 	case result.ExitCode != nil:
-		if *result.ExitCode == 0 && job.Spec.Restart == contract.RestartOnFailure &&
-			!(len(restartRequested) > 0 && restartRequested[0]) {
+		if *result.ExitCode == 0 && job.Spec.Restart == contract.RestartOnFailure && !restartRequested {
 			policy.jobState = contract.JobStopped
 			policy.policyStop = lastFailureJSON
 			return policy

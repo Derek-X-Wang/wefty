@@ -516,8 +516,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if lifecycle.dependencies.outbox == nil || outcome.durabilityErr != nil {
 			return outcome.durabilityErr
 		}
-		outcome.durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
-			context.WithoutCancel(attemptContext), attemptID, toL1Result(outcome.result), lifecycle.dependencies.clock.Now(), toL1QuiescenceEvidence(outcome.reapEvidence),
+		outcome.durabilityErr = lifecycle.dependencies.outbox.storeDurableCompletion(
+			context.WithoutCancel(attemptContext), attemptID,
+			durableCompletionOf(completionRequest(claim, outcome.result, outcome.reapEvidence)), lifecycle.dependencies.clock.Now(),
 		)
 		return outcome.durabilityErr
 	}
@@ -552,10 +553,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// reap before it purges spool metadata or invokes managedroot.Remove.
 			return errorDestinationUnclassified, nil
 		}
-		request := l1.CompletionRequest{
-			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
-			Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence),
-		}
+		request := completionRequest(claim, result, outcome.reapEvidence)
 		finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 		defer cancelFinalization()
 		failure := lifecycle.completeWithRetry(finalizationContext, claim, request)
@@ -584,7 +582,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			if err := persistCompletion(&outcome); err != nil {
 				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
 			}
-			request := l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence)}
+			request := completionRequest(claim, result, outcome.reapEvidence)
 			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 			defer cancelFinalization()
 			completionFailure := lifecycle.completeWithRetry(finalizationContext, claim, request)
@@ -656,10 +654,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
 	}
-	request := l1.CompletionRequest{
-		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
-		Result: toL1Result(outcome.result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence),
-	}
+	request := completionRequest(claim, outcome.result, outcome.reapEvidence)
 	completionDone := make(chan destinationError, 1)
 	completionContext := attemptContext
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) ||
@@ -1903,6 +1898,23 @@ func renewalRequestTimeout(remaining, operationTimeout time.Duration) time.Durat
 		return 0
 	}
 	return timeout
+}
+
+// completionRequest is the single place an attempt's outcome becomes its L1
+// completion, so the request sent now and the one replayed from the spool
+// after a restart are byte-identical. An exit code the payload gave in answer
+// to a termination the agent or its guardian asked for travels beside the
+// result: L1's ProcessResult names an initiator only for a signal, and without
+// this fact a TERM handler's exit zero reads as the payload stopping itself.
+func completionRequest(claim l1.Claim, result contract.ProcessResult, evidence workloadrunner.ReapEvidence) l1.CompletionRequest {
+	request := l1.CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(evidence),
+	}
+	if result.ExitCode != nil {
+		request.TerminationInitiator = result.TerminationInitiator
+	}
+	return request
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {

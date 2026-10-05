@@ -138,7 +138,7 @@
           },
           "policy_stop": {
             "$ref": "#/components/schemas/ProcessResult",
-            "description": "Ordinary service only. Persisted clean payload exit under on-failure; suppresses automatic claims without changing desired_state. Cleared by explicit start or restart."
+            "description": "Ordinary service only. The clean payload exit (exit_code 0 that no agent or guardian termination request produced) observed under restart on-failure. It suppresses automatic claims without changing desired_state. An explicit start or restart clears it, and so does the image-reconciliation failure latch, which records its own last_failure. An operator stop keeps it, so a later start still clears it."
           },
           "restart_suppressed_reason": {
             "type": "string",
