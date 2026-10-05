@@ -937,6 +937,23 @@ before every row above, and the Computer resource-exhaustion, `spawn_error`, and
 `output_error` latches keep their precedence. `termination_initiator` is valid
 only beside an `exit_code` result; L1 refuses it with any other arm.
 
+The agent names an initiator, in `termination_initiator` or a signal's
+`termination_cause`, only when its stop was confirmed delivered to a payload
+that was still running. For a process payload, Wait had not already reaped the
+payload and the TERM signal call succeeded rather than finding the group gone;
+the guardian follows the same rule. For OCI, the helper's Signal answered
+success, not that the task had already terminated and not a refusal or error.
+When delivery cannot be confirmed (the payload's own exit raced the stop), the
+initiator is left unset and the payload's exit is classified as its own:
+ambiguity resolves toward the program's own exit.
+
+L1 and agents must be upgraded together. An agent that predates
+`termination_initiator` reports a TERM handler's exit after any stop it asked
+for, including its own shutdown, as an unmarked `exit_code: 0`. Under
+`on-failure` that records a policy stop, and the service stays stopped until an
+operator starts or restarts it; only an explicit restart directive for the
+attempt is still recognized without the field.
+
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:
 

@@ -208,6 +208,79 @@ func TestRunKeepsTheInitiatorOfARequestedExit(t *testing.T) {
 	}
 }
 
+// A stop names an initiator only when it reached a payload that was still
+// running. A payload Wait had already reaped exited on its own, even while a
+// child keeps its group alive and the stop still lands on the group; a group
+// already gone takes no stop at all. Either way the exit stays the payload's.
+func TestTerminationNamesNoInitiatorItCannotConfirm(t *testing.T) {
+	start := func(t *testing.T, script string) *exec.Cmd {
+		t.Helper()
+		command := exec.Command("/bin/sh", "-c", script)
+		if err := configureProcessGroup(command); err != nil {
+			t.Fatal(err)
+		}
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return command
+	}
+	// reaped returns a group whose leader already exited zero by itself and was
+	// reaped, with that outcome waiting in the channel: the self-exit won the
+	// race against the stop. A background child keeps the group alive.
+	reaped := func(t *testing.T) (int, chan waitResult) {
+		t.Helper()
+		command := start(t, "sleep 30 & exit 0")
+		err := command.Wait()
+		wait := make(chan waitResult, 1)
+		wait <- waitResult{err: err, state: command.ProcessState}
+		if !processGroupAlive(command.Process.Pid) {
+			t.Fatal("the child did not keep the reaped leader's group alive")
+		}
+		return command.Process.Pid, wait
+	}
+	assertOwnExit := func(t *testing.T, processGroupID int, outcome waitResult, delivered bool, requester contract.TerminationCause) {
+		t.Helper()
+		result := resultFromWait(outcome.err, outcome.state, terminationCause(delivered, requester))
+		if delivered || result.ExitCode == nil || *result.ExitCode != 0 || result.TerminationInitiator != "" {
+			t.Fatalf("self-exit = (%#v, delivered=%t), want the payload's own exit 0", result, delivered)
+		}
+		if processGroupAlive(processGroupID) {
+			t.Fatal("the stop did not clear what the payload left in its group")
+		}
+	}
+
+	t.Run("agent stop after the self-exit was reaped", func(t *testing.T) {
+		processGroupID, wait := reaped(t)
+		outcome, delivered := New(Config{TerminationGraceTime: 100 * time.Millisecond}).terminateAndWait(processGroupID, wait)
+		assertOwnExit(t, processGroupID, outcome, delivered, contract.TerminationCauseAgent)
+	})
+	t.Run("guardian stop after the self-exit was reaped", func(t *testing.T) {
+		processGroupID, wait := reaped(t)
+		outcome, delivered := guardianTerminateAndWait(processGroupID, 100*time.Millisecond, wait)
+		assertOwnExit(t, processGroupID, outcome, delivered, contract.TerminationCauseGuardian)
+	})
+	t.Run("stop finds the group gone", func(t *testing.T) {
+		command := start(t, "exit 0")
+		if err := command.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		// Wait has reaped the payload but its outcome has not reached the
+		// channel yet, so only the failed signal can show the stop missed.
+		completed, delivered := requestTermination(command.Process.Pid, make(chan waitResult))
+		if completed != nil || delivered {
+			t.Fatalf("stop to a vanished group = (%v, %t), want undelivered", completed, delivered)
+		}
+	})
+	t.Run("stop reaches a running payload", func(t *testing.T) {
+		command := start(t, "sleep 30")
+		completed, delivered := requestTermination(command.Process.Pid, make(chan waitResult))
+		_ = command.Wait()
+		if completed != nil || !delivered {
+			t.Fatalf("stop to a running payload = (%v, %t), want delivered", completed, delivered)
+		}
+	})
+}
+
 func TestRunDistinguishesProcessResults(t *testing.T) {
 	t.Run("service readiness without guardian", func(t *testing.T) {
 		result, err := New(Config{}).Run(context.Background(), Request{
@@ -512,7 +585,10 @@ func assertTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {
 	})
 	wait := make(chan waitResult)
 	done := make(chan waitResult, 1)
-	go func() { done <- runner.terminateAndWait(1<<30, wait) }()
+	go func() {
+		outcome, _ := runner.terminateAndWait(1<<30, wait)
+		done <- outcome
+	}()
 	clock.WaitForTimerCount(t, 1)
 	select {
 	case outcome := <-done:

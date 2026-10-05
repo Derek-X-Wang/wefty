@@ -683,8 +683,10 @@ initiator; policy never parses a signal or error string to infer intent. A
 payload that handles TERM can answer the agent's or guardian's request with an
 exit code instead, so the completion request carries that initiator beside an
 `exit_code` result as `termination_initiator` (`agent` or `guardian`; absent
-for a spontaneous exit). It is a completion fact, not part of `ProcessResult`,
-and L1 refuses it beside any other result arm.
+for a spontaneous exit). The agent sets it only when the stop was confirmed
+delivered to a payload that was still running, so a self-exit that raced the
+stop stays the payload's own. It is a completion fact, not part of
+`ProcessResult`, and L1 refuses it beside any other result arm.
 
 `ProcessResult` has exactly one primary arm: `spawn_error`, `runtime_failure`,
 `output_error`, `exit_code`, or `signal`. `runtime_failure {code,message}` is

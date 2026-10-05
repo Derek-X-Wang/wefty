@@ -617,7 +617,7 @@
                   "termination_initiator": {
                     "type": "string",
                     "enum": ["agent", "guardian"],
-                    "description": "The agent's report that it, or its guardian, asked the payload to end and the payload answered with the exit code in result: shutdown, an attempt directive, lost authority, or the agent's own supervision. Valid only with an exit_code result; a signal result names its initiator in termination_cause, and a spontaneous exit omits this. Service policy treats such a completion as an infrastructure interruption that requeues without consuming the restart streak, never as a payload failure or an on-failure policy stop."
+                    "description": "The agent's report that it, or its guardian, asked the payload to end and the payload answered with the exit code in result: shutdown, an attempt directive, lost authority, or the agent's own supervision. Set only when the stop was confirmed delivered to a payload that was still running; when the payload's own exit raced the stop, it is omitted and the exit counts as the payload's own. Valid only with an exit_code result; a signal result names its initiator in termination_cause, and a spontaneous exit omits this. Service policy treats such a completion as an infrastructure interruption that requeues without consuming the restart streak, never as a payload failure or an on-failure policy stop."
                   }
                 }
               }

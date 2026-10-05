@@ -308,7 +308,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 	if err := encoder.Encode(guardianStatusMessage{
 		Type: guardianMessageStarted, PID: command.Process.Pid, ProcessGroupID: processGroupID,
 	}); err != nil {
-		_ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+		_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
 		return nil
 	}
 	control := make(chan guardianDecodeResult, 1)
@@ -356,12 +356,13 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			return writeSpontaneousExit(outcome)
 		case next := <-control:
 			disconnected := next.err != nil || next.message.Type != guardianMessageStop
-			outcome := guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+			outcome, delivered := guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+			cause := terminationCause(delivered, contract.TerminationCauseGuardian)
 			if disconnected {
-				_ = writeExit(outcome, contract.TerminationCauseGuardian)
+				_ = writeExit(outcome, cause)
 				return nil
 			}
-			return writeExit(outcome, contract.TerminationCauseGuardian)
+			return writeExit(outcome, cause)
 		case probeReady := <-probes:
 			if !startupSatisfied {
 				if !probeReady {
@@ -381,7 +382,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 					deadlineChannel = nil
 				}
 				if err := writeReadiness(true); err != nil {
-					_ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+					_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
 					return nil
 				}
 				continue
@@ -391,7 +392,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			}
 			ready = probeReady
 			if err := writeReadiness(ready); err != nil {
-				_ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+				_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
 				return nil
 			}
 		case <-deadlineChannel:
@@ -403,7 +404,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 				return writeSpontaneousExit(outcome)
 			default:
 			}
-			_ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+			_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
 			result := spawnFailure(
 				contract.SpawnFailureStartupReadinessTimeout,
 				errors.New("runtime-local service endpoint did not accept connections before the startup deadline"),
@@ -443,14 +444,15 @@ func guardianServiceProbes(ctx context.Context, address string, interval, timeou
 	return results
 }
 
-func guardianTerminateAndWait(processGroupID int, grace time.Duration, wait <-chan waitResult) waitResult {
-	_ = terminateProcessGroup(processGroupID)
+// guardianTerminateAndWait reports, beside the payload's outcome, whether
+// the guardian's TERM reached a payload that was still running.
+func guardianTerminateAndWait(processGroupID int, grace time.Duration, wait <-chan waitResult) (waitResult, bool) {
+	completed, delivered := requestTermination(processGroupID, wait)
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
-	var completed *waitResult
 	for {
 		if completed != nil && !processGroupAlive(processGroupID) {
-			return *completed
+			return *completed, delivered
 		}
 		select {
 		case outcome := <-wait:
@@ -458,9 +460,9 @@ func guardianTerminateAndWait(processGroupID int, grace time.Duration, wait <-ch
 		case <-timer.C:
 			_ = killProcessGroup(processGroupID)
 			if completed != nil {
-				return *completed
+				return *completed, delivered
 			}
-			return <-wait
+			return <-wait, delivered
 		}
 	}
 }

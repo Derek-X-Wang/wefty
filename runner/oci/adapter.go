@@ -1370,11 +1370,13 @@ type terminationTrace struct {
 	killCallEntered       bool
 }
 
-// requestedTermination reports whether the adapter reached TERM delivery,
-// which it skips when Watch had already completed, and the helper did not
-// answer that the task had already ended on its own.
+// requestedTermination reports whether TERM reached a payload that was still
+// running: the adapter sent it (it does not when Watch had already completed),
+// and the helper answered success, neither that the task had already ended on
+// its own nor with a refusal or error. A stop that cannot be confirmed did not
+// cause the exit, so ambiguity resolves toward the payload's own exit.
 func (trace *terminationTrace) requestedTermination() bool {
-	return trace.termObserved && !trace.termAlreadyTerminated
+	return trace.termObserved && trace.termRawError == terminationErrorNone && !trace.termAlreadyTerminated
 }
 
 type terminationErrorClass uint8
