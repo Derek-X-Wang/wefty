@@ -497,7 +497,7 @@ Commands:
   pushing a new reg/app:latest still replays the old run. Pin images by digest
   (reg/app@sha256:...) or use --again; pin Workflow versions or use --again too.
   logs RUN_ID [--follow]     Read or follow run logs
-  cancel JOB_ID              Cancel a queued or active one-shot job
+  cancel JOB_ID|RUN_ID       Cancel a run or one-shot job
   wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout
   results RUN_ID [--out FILE]
                              Read the result document the run uploaded

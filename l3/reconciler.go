@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const DefaultReconcileInterval = time.Second
@@ -76,9 +74,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	for _, intent := range intents {
 		runToken, err := r.store.beginDispatch(ctx, intent.RunID)
 		if errors.Is(err, errDispatchAbandoned) {
-			// The run ended after this pass listed it. Its job, if an earlier
-			// attempt created one, is linked by lookup recovery, never by a
-			// new submit.
+			// The run ended or was canceled after this pass listed it. A job
+			// created by an earlier attempt is linked by lookup recovery,
+			// never by a new submit.
 			continue
 		}
 		if err != nil {
@@ -123,47 +121,29 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 			passErrors = append(passErrors, err)
 			continue
 		}
-		if r.images != nil && (job.State == contract.JobSucceeded || job.State == contract.JobFailed) {
-			evidence, err := r.images.GetJobImageEvidence(ctx, run.JobID)
-			if err != nil {
-				passErrors = append(passErrors, err)
-				continue
-			}
-			ingestionFailed := false
-			for _, observation := range evidence {
-				recorded, err := r.store.recordRunImageResolution(ctx, run.RunID, observation)
-				if err != nil {
-					passErrors = append(passErrors, err)
-					ingestionFailed = true
-					break
-				}
-				if recorded {
-					break
-				}
-			}
-			if ingestionFailed {
-				continue
-			}
-		}
-		// A terminal job has no current attempt, so jobNodeID reads the
-		// attempt that settled it; that answer replaces a provisional one.
-		nodeID, settled := jobNodeID(job)
-		if err := r.store.recordRunNode(ctx, run.RunID, nodeID, settled); err != nil {
-			passErrors = append(passErrors, err)
-			continue
-		}
-		jobFailure := ""
-		if job.State == contract.JobFailed {
-			jobFailure = JobFailureReason(job)
-		}
-		if err := r.store.projectJobOutcome(ctx, run, job.State, jobFailure); err != nil {
+		if err := r.projectObservedJob(ctx, run, job); err != nil {
 			passErrors = append(passErrors, err)
 		}
 	}
 	passErrors = append(passErrors, r.settlePendingNodeAttributions(ctx)...)
 	// Recovery runs last and within its budget: it serves ended runs, and must
 	// not delay dispatch, projection or node attribution of live ones.
-	passErrors = append(passErrors, r.recoverUnrecordedDispatches(ctx)...)
+	remote, cancel := context.WithTimeout(ctx, r.budget)
+	defer cancel()
+	cancellations, err := r.store.pendingRunCancellations(ctx, "")
+	if err != nil {
+		passErrors = append(passErrors, err)
+	} else {
+		for _, run := range cancellations {
+			if remote.Err() != nil {
+				break
+			}
+			if err := r.deliverRunCancellation(ctx, remote, run); err != nil {
+				passErrors = append(passErrors, err)
+			}
+		}
+	}
+	passErrors = append(passErrors, r.recoverUnrecordedDispatchesRemote(ctx, remote)...)
 	return errors.Join(passErrors...)
 }
 
@@ -183,6 +163,13 @@ func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 	}
 	remote, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
+	return r.recoverUnrecordedDispatchesRemote(ctx, remote)
+}
+
+func (r *Reconciler) recoverUnrecordedDispatchesRemote(ctx, remote context.Context) []error {
+	if r.lookup == nil || remote.Err() != nil {
+		return nil
+	}
 	pending, err := r.store.unrecordedDispatches(remote, unrecordedDispatchBatch)
 	if err != nil {
 		return []error{err}

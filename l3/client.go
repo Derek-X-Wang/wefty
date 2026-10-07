@@ -25,6 +25,12 @@ type JobClient interface {
 	GetJob(context.Context, string) (l1.Job, error)
 }
 
+// JobCancelClient is the public L1 one-shot cancellation seam. It is optional
+// so clients that only submit or read jobs retain their existing contract.
+type JobCancelClient interface {
+	CancelJob(context.Context, string) (l1.Job, error)
+}
+
 // JobDispatchLookupClient is the lookup-only recovery seam for a dispatch L1
 // accepted before L3 recorded its job ID. It stays separate from JobClient so
 // existing clients and test fakes do not acquire another required method.
@@ -106,6 +112,14 @@ func (c *L1Client) CloseIdleConnections() { c.client.CloseIdleConnections() }
 func (c *L1Client) SubmitJob(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
 	var job l1.Job
 	if err := c.do(ctx, http.MethodPost, "/v1/jobs", spec, &job, http.StatusCreated, http.StatusOK); err != nil {
+		return l1.Job{}, err
+	}
+	return job, nil
+}
+
+func (c *L1Client) CancelJob(ctx context.Context, jobID string) (l1.Job, error) {
+	var job l1.Job
+	if err := c.do(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(jobID)+"/cancel", nil, &job, http.StatusOK); err != nil {
 		return l1.Job{}, err
 	}
 	return job, nil
