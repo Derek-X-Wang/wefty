@@ -340,7 +340,7 @@ type ServiceRestartRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
 }
 
-// JobList is one stable creation/job-ID ordered page of service jobs.
+// JobList is one stable creation/job-ID ordered page of readable jobs.
 type JobList struct {
 	Jobs       []Job  `json:"jobs"`
 	NextCursor string `json:"next_cursor,omitempty"`

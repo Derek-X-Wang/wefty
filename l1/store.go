@@ -1175,6 +1175,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
+	if err := s.initializeJobListing(ctx); err != nil {
+		return err
+	}
 	if err := s.seedLogContinuity(ctx); err != nil {
 		return err
 	}
