@@ -80,7 +80,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"capability_revision", "capability_observed_ns", "missing_capabilities_json", "capability_reason_code",
 		},
 		"attempts": {
-			"authority_generation", "result_json", "late_result_json", "late_result_observed_ns",
+			"authority_generation", "result_json", "termination_initiator", "late_result_json", "late_result_observed_ns",
 			"late_result_authority_lost_ns", "late_result_is_late",
 		},
 		"service_jobs": {

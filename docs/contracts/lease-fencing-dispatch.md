@@ -290,8 +290,14 @@ promotion. This promotion, including promotion by log append, is not proof of
 payload start for `restart: never`. The agent acknowledges its runner's start
 through the fenced `/started` endpoint after successful spawn and guardian
 ownership. That acknowledgement durably sets the attempt's start marker even
-when renewal already advanced its state. A refused acknowledgement cancels
-the payload; it cannot remain running under unacknowledged authority. For `kind=oci`, renewal changes only the lease and directive;
+when renewal already advanced its state. An answer without an L1 verdict (a
+transport failure, timeout, or 5xx other than 501) is not a refusal: L1 may
+already have committed the start, so the agent retries the identical request
+at its completion retry interval for at most one lease window, and a retry
+after a lost answer replays the committed start. A refusal (any 4xx, such as
+a stale fence, an expired lease, or a pending cancellation), or no verdict
+within that window, cancels the payload; it cannot remain running under
+unacknowledged authority. For `kind=oci`, renewal changes only the lease and directive;
 it never acknowledges execution or starts the portless-service stability
 clock. Successful completion likewise never supplies a missing OCI `Started`.
 
@@ -772,7 +778,9 @@ actions reacquire capacity
 before clearing suppression, and removal refuses both.
 
 An agent/guardian-requested termination (signal or exit code) is infrastructure,
-never a payload policy stop. Under `never`, post-start infrastructure
+never a payload policy stop. L1 stores a completion's `termination_initiator`
+with its attempt, so an exit code names its initiator exactly as a signal's
+`termination_cause` does. Under `never`, post-start infrastructure
 interruption, published-listener failure, or OCI runtime loss remains `failed`
 without consuming restart accounting; `last_failure` exposes that completion
 fact. The durable start marker decides pre-start versus post-start, regardless
@@ -797,7 +805,15 @@ state remains unchanged in every automatic reaction (ADR-0004).
 `wefty services create --restart=always|on-failure|never` submits this contract.
 Service status/list JSON exposes `policy_stop`, `last_failure` where there is
 completion evidence, and `restart_suppressed_reason` naming the current cause
-(for example, attempt lease loss); the table includes the cause in POLICY STOP. `services create` dispatches typed
+(for example, attempt lease loss, or `agent interruption` and `guardian
+interruption` for a payload asked to end, whether it answered with an exit code
+or a signal). A payload's
+own end that an explicit restart claimed is never an interruption: under
+`max_restart_streak` it can reach `max restart streak reached: N/N; use
+restart`, which refuses start, whether it ended with an exit code or a signal.
+An attempt completed before L1 stored the initiator is told apart from that
+race by the streak limit and otherwise reads `agent or guardian interruption`.
+The table includes the cause in POLICY STOP. `services create` dispatches typed
 process exits: usage 2, unauthorized 3, not found 4, conflict (including dispatch
 key conflict) 5, other failure (including transport/unavailable) 1, success 0. Computers
 remain explicitly always-only, including the `--computer` compatibility alias.

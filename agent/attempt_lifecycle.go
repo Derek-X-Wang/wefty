@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -888,6 +889,61 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	}
 }
 
+// acknowledgeProcessStart records the runner's start through the fenced,
+// idempotent /started call. An answer that carries no L1 verdict is not a
+// refusal: L1 may already have committed the start, and an identical retry
+// replays it. So a transport failure, a timeout or a 5xx is retried at the
+// completion interval for at most one lease window, the budget renewal spends
+// on its own transient failures. A definitive refusal, a canceled attempt, or
+// no verdict within the window returns the error, and the caller cancels the
+// payload.
+func (lifecycle *attemptLifecycle) acknowledgeProcessStart(ctx context.Context, claim l1.Claim) error {
+	clock := lifecycle.dependencies.clock
+	deadline := clock.Now().Add(claim.Lease.LeaseTTL)
+	retryDelay := lifecycle.dependencies.completionRetry
+	if retryDelay <= 0 {
+		retryDelay = DefaultLogRetryInterval
+	}
+	for retried := false; ; retried = true {
+		// The first request is sent even without a window; only retries need one.
+		requestContext, cancelRequest := ctx, context.CancelFunc(func() {})
+		if remaining := deadline.Sub(clock.Now()); remaining > 0 {
+			requestContext, cancelRequest = context.WithTimeout(ctx, remaining)
+		}
+		_, err := lifecycle.dependencies.client.StartAttempt(requestContext, claim.Job.JobID, claim.Lease.AttemptID,
+			l1.StartedRequest{FencingToken: claim.Lease.FencingToken})
+		cancelRequest()
+		if err == nil || ctx.Err() != nil || !startAcknowledgementUndecided(err) {
+			return err
+		}
+		remaining := deadline.Sub(clock.Now())
+		if remaining <= 0 {
+			return err
+		}
+		if !retried {
+			lifecycle.log("attempt %s start acknowledgement has no L1 verdict; retrying: %v", claim.Lease.AttemptID, err)
+		}
+		timer := clock.NewTimer(min(retryDelay, remaining))
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return err
+		case <-timer.C():
+		}
+	}
+}
+
+// startAcknowledgementUndecided reports that a /started failure carries no L1
+// verdict. A transport failure, a timeout or an unparseable answer has none,
+// and neither does a 5xx other than 501; every 4xx is L1 refusing the start.
+func startAcknowledgementUndecided(err error) bool {
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		return true
+	}
+	return protocolErr.StatusCode >= http.StatusInternalServerError && protocolErr.StatusCode != http.StatusNotImplemented
+}
+
 func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
 	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.RuntimeFailure == nil && result.OutputError == "" {
 		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
@@ -1064,7 +1120,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			if lifecycle.dependencies.client == nil {
 				processStartError = errors.New("process start acknowledgement requires an L1 client")
 			} else {
-				_, processStartError = lifecycle.dependencies.client.StartAttempt(ctx, claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken})
+				processStartError = lifecycle.acknowledgeProcessStart(ctx, claim)
 			}
 			if processStartError != nil {
 				processStartError = fmt.Errorf("acknowledge process start: %w", processStartError)

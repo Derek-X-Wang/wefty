@@ -467,6 +467,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   completion_key TEXT,
   completion_hash TEXT,
   result_json BLOB,
+  termination_initiator TEXT CHECK(termination_initiator IN ('', 'agent', 'guardian')),
   image_observation_json BLOB,
   image_observation_hash TEXT,
   started_ns INTEGER,
@@ -1227,6 +1228,12 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return fmt.Errorf("l1: ensure child job order index: %w", err)
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "lease_loss_count", "INTEGER NOT NULL DEFAULT 0 CHECK(lease_loss_count >= 0)"); err != nil {
+		return err
+	}
+	// A completion records who asked its exit-code payload to end, '' for no
+	// one. An attempt completed before L1 kept that fact reads NULL: unknown,
+	// not a payload's own exit.
+	if err := s.ensureColumn(ctx, "attempts", "termination_initiator", "TEXT CHECK(termination_initiator IN ('', 'agent', 'guardian'))"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_takeover_audit", "stored_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -4285,8 +4292,10 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 			return CompletionOutcome{}, internalError(err, "acknowledge job execution")
 		}
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, result_json=?, updated_ns=? WHERE attempt_id=?`,
-		finalAttemptState, request.IdempotencyKey, completionHash, resultJSON, now.UnixNano(), attemptID)
+	// The initiator is kept with the result: it is the only durable fact that
+	// tells a payload's own exit from one it gave because it was asked to end.
+	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, result_json=?, termination_initiator=?, updated_ns=? WHERE attempt_id=?`,
+		finalAttemptState, request.IdempotencyKey, completionHash, resultJSON, string(request.TerminationInitiator), now.UnixNano(), attemptID)
 	if err != nil {
 		return CompletionOutcome{}, internalError(err, "complete attempt")
 	}

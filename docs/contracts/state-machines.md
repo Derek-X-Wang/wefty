@@ -125,9 +125,18 @@ reopen and prevents claims until explicit start/restart clears it and reacquires
 capacity. Start accepts any automatically-failed `never` service, including
 post-start lease loss and agent/guardian interruption, while preserving restart
 and lease-loss counters. Suppression names the current attempt's cause rather
-than a generic failed latch. Image reconciliation
-clears suppression and records its own stronger failure; terminal spawn/output
-and removal latches keep precedence. An operator stop retains the policy stop.
+than a generic failed latch, from durable facts: the attempt stores the
+completion's termination initiator, so an exit code names `agent` or
+`guardian` interruption exactly as a signal's termination cause does. Image
+reconciliation clears suppression and records its own stronger failure;
+terminal spawn/output and removal latches keep precedence. An operator stop
+retains the policy stop.
+
+Explicit restart can claim a payload's own end, an exit code or a spontaneous
+signal alike. Under `max_restart_streak` that end can latch the streak; it is
+never an interruption, so its cause and gate are the same for both arms:
+`max restart streak reached`, restart only. An attempt completed before L1
+stored the initiator is told apart from that race by the streak limit.
 
 Explicit restart targeting the completing attempt overrides either policy's
 suppression, including TERM handling and infrastructure interruption. Its durable
@@ -962,7 +971,10 @@ returned. Its initiator rows are explicit:
 A stop the operator asked for (desired `stopped` or `stopping`) is classified
 before every row above, and the Computer resource-exhaustion, `spawn_error`, and
 `output_error` latches keep their precedence. `termination_initiator` is valid
-only beside an `exit_code` result; L1 refuses it with any other arm.
+only beside an `exit_code` result; L1 refuses it with any other arm. L1 stores
+it with the completed attempt, empty when the completion named none, so the
+suppression cause of a failed `never` service is read from it rather than
+guessed from the result arm.
 
 The agent names an initiator, in `termination_initiator` or a signal's
 `termination_cause`, only when its stop was confirmed delivered to a payload
