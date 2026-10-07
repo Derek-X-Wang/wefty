@@ -668,19 +668,29 @@ func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r
 }
 
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.Reconcile(r.Context()); err != nil {
-		writeError(w, err)
-		return
-	}
-	nodes, err := s.store.ListNodes(r.Context())
+	filters, err := parseNodeListFilters(r)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	for i := range nodes {
-		nodes[i] = s.projectNodeForCaller(r, nodes[i])
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
 	}
-	writeJSON(w, http.StatusOK, NodeList{Nodes: nodes})
+	if _, err := s.store.Reconcile(r.Context()); err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.listNodesPage(r.Context(), filters, r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for i := range page.Nodes {
+		page.Nodes[i] = s.projectNodeForCaller(r, page.Nodes[i])
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) getNode(w http.ResponseWriter, r *http.Request) {

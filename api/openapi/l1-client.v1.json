@@ -1592,7 +1592,14 @@
       "get": {
         "operationId": "listNodes",
         "summary": "List operator-visible nodes",
-        "description": "Returns every registered node after applying liveness thresholds. Results are ordered by stable node ID.",
+        "description": "Returns a page of registered nodes after applying liveness thresholds, ordered by stable node ID. Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
+        "parameters": [
+          { "name": "cursor", "in": "query", "description": "Opaque continuation cursor from the same filter query. Limit may change between pages.", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+          { "name": "state", "in": "query", "description": "Exact observed node state after liveness reconciliation.", "schema": { "type": "string", "enum": ["alive", "stale", "draining", "dead"] } },
+          { "name": "claims_enabled", "in": "query", "description": "Exact durable claims intent; accepts only true or false.", "schema": { "type": "boolean" } },
+          { "name": "capability", "in": "query", "description": "Exact advertised capability key whose JSON value is true. Missing and false entries do not match.", "schema": { "type": "string", "minLength": 1 } }
+        ],
         "responses": {
           "200": {
             "description": "Current fleet state.",
@@ -1601,8 +1608,9 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["nodes"],
+                  "required": ["nodes", "next_cursor"],
                   "properties": {
+                    "next_cursor": { "type": "string", "description": "Opaque continuation cursor, or an empty string on the last page." },
                     "nodes": {
                       "type": "array",
                       "items": { "$ref": "./common.v1.json#/components/schemas/Node" }
@@ -1612,6 +1620,7 @@
               }
             }
           },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

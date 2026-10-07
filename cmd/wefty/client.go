@@ -128,10 +128,23 @@ func (c *apiClients) close() {
 	}
 }
 
+// listNodes preserves the complete-fleet read used by readiness and routing
+// probes. The operator list command separately exposes one page by default.
 func (c *apiClients) listNodes(ctx context.Context) (l1.NodeList, error) {
-	var result l1.NodeList
-	err := c.l1.do(ctx, http.MethodGet, "/v1/nodes", nil, nil, &result, http.StatusOK)
-	return result, err
+	result := l1.NodeList{Nodes: []l1.Node{}}
+	cursor := ""
+	for {
+		query := url.Values{"limit": []string{strconv.Itoa(l1.DefaultJobPageLimit)}, "cursor": []string{cursor}}
+		var page l1.NodeList
+		if err := c.l1.do(ctx, http.MethodGet, "/v1/nodes?"+query.Encode(), nil, nil, &page, http.StatusOK); err != nil {
+			return l1.NodeList{}, err
+		}
+		result.Nodes = append(result.Nodes, page.Nodes...)
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 func (c *apiClients) bootstrapAdmin(ctx context.Context, nonce string) (l1.AdminPolicy, error) {
