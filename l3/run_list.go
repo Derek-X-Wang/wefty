@@ -3,6 +3,7 @@ package l3
 import (
 	"context"
 	"database/sql"
+	"math"
 	"strings"
 	"time"
 
@@ -88,17 +89,8 @@ func (s *Store) ListRuns(ctx context.Context, filter RunListFilter) (RunListPage
 	if err != nil {
 		return RunListPage{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
-SELECT r.run_id, r.parent_run_id, r.status, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
-       t.actor, t.source, t.source_run_id, t.computer_id, t.computer_attempt_id,
-       t.computer_storage_generation, t.submit_intent_revision
-FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
-WHERE (? = '' OR r.status = ?)
- AND (? = '' OR t.actor = ?)
- AND (? = '' OR r.created_ns < ? OR (r.created_ns = ? AND r.run_id < ?))
-ORDER BY r.created_ns DESC, r.run_id DESC
-LIMIT ?`, status, status, filter.Submitter, filter.Submitter,
-		filter.Cursor, cursor.CreatedNS, cursor.CreatedNS, cursor.RunID, limit+1)
+	query, args := runListQuery(status, filter.Submitter, cursor, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return RunListPage{}, internalError(err, "list Runs")
 	}
@@ -159,6 +151,46 @@ LIMIT ?`, status, status, filter.Submitter, filter.Submitter,
 		page.Runs[index].CurrentStep = DeriveRunSteps(envelopes).Current
 	}
 	return page, nil
+}
+
+// runListQuery keeps every page an index range walk, including the head.
+func runListQuery(status, submitter string, cursor runListCursor, limit int) (string, []any) {
+	if cursor.RunID == "" {
+		// Generated Run IDs are ASCII, so this tuple is above every Run,
+		// including one at the largest representable creation timestamp.
+		cursor.CreatedNS, cursor.RunID = math.MaxInt64, "\uffff"
+	}
+	query := `
+SELECT r.run_id, r.parent_run_id, r.status, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
+       t.actor, t.source, t.source_run_id, t.computer_id, t.computer_attempt_id,
+       t.computer_storage_generation, t.submit_intent_revision
+`
+	var args []any
+	order := "r.created_ns DESC, r.run_id DESC"
+	if submitter == "" {
+		query += "FROM runs r CROSS JOIN run_triggers t ON t.run_id=r.run_id WHERE "
+		if status != "" {
+			query += "r.status=? AND "
+			args = append(args, status)
+		}
+		query += "(r.created_ns, r.run_id) < (?, ?)"
+	} else {
+		// Trigger and Run creation times are written together. Drive the
+		// actor-filtered walk from provenance so it seeks within that actor,
+		// even with a status filter. CROSS JOIN preserves the driving table
+		// rather than letting SQLite choose a scan and sort after ANALYZE.
+		query += "FROM run_triggers t CROSS JOIN runs r ON r.run_id=t.run_id WHERE t.actor=? AND (t.created_ns, t.run_id) < (?, ?)"
+		args = append(args, submitter)
+		order = "t.created_ns DESC, t.run_id DESC"
+	}
+	args = append(args, cursor.CreatedNS, cursor.RunID)
+	if submitter != "" && status != "" {
+		query += " AND r.status=?"
+		args = append(args, status)
+	}
+	query += " ORDER BY " + order + " LIMIT ?"
+	args = append(args, limit+1)
+	return query, args
 }
 
 // terminalRunState is the ledger's own definition: a state with nowhere left to

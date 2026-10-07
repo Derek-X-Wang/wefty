@@ -36,15 +36,14 @@ func TestGeneralRunPagingWalkBeyond500WithInserts(t *testing.T) {
 	expected := map[string]bool{}
 	// Groups share creation timestamps, including across page boundaries.
 	for i := 0; i < 617; i++ {
+		h.l3Store.clock = ClockFunc(func() time.Time { return time.Date(2026, 1, 1, 0, 0, i/100, 0, time.UTC) })
 		record, _, err := h.l3Store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: fmt.Sprintf("paging-%d", i), Actor: h.callerUser, Request: inlineRunRequest("#!/bin/sh\nexit 0\n")})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.l3Store.db.Exec(`UPDATE runs SET created_ns=? WHERE run_id=?`, time.Date(2026, 1, 1, 0, 0, i/100, 0, time.UTC).UnixNano(), record.RunID); err != nil {
-			t.Fatal(err)
-		}
 		expected[record.RunID] = true
 	}
+	h.l3Store.clock = systemClock{}
 	seen := map[string]bool{}
 	cursor := ""
 	var previous RunSummary
@@ -70,15 +69,26 @@ func TestGeneralRunPagingWalkBeyond500WithInserts(t *testing.T) {
 			t.Fatal("cursor walk did not terminate")
 		}
 		// Inserts committed between requests must not shift the walk into duplicates
-		// or hide old rows. The inserted runs are newer than the walk's position.
+		// or hide old rows. Insert at the cursor timestamp on both sides of
+		// its Run ID, as well as at a newer timestamp. Only the smaller ID
+		// belongs to the rest of this walk.
+		olderID := previous.RunID[:len(previous.RunID)-1]
+		newerID := previous.RunID + "0"
 		done := make(chan error, 1)
 		go func() {
 			_, _, err := h.l3Store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: fmt.Sprintf("insert-%d", pageNumber), Actor: h.callerUser, Request: inlineRunRequest("#!/bin/sh\nexit 0\n")})
+			if err == nil {
+				err = insertPagingTestRun(h.l3Store, olderID, h.callerUser, contract.RunPending, previous.CreatedAt.UnixNano())
+			}
+			if err == nil {
+				err = insertPagingTestRun(h.l3Store, newerID, h.callerUser, contract.RunPending, previous.CreatedAt.UnixNano())
+			}
 			done <- err
 		}()
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
+		expected[olderID] = true
 		cursor = page.NextCursor
 	}
 	if len(seen) != len(expected) {
