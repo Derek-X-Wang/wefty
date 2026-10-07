@@ -290,14 +290,18 @@ promotion. This promotion, including promotion by log append, is not proof of
 payload start for `restart: never`. The agent acknowledges its runner's start
 through the fenced `/started` endpoint after successful spawn and guardian
 ownership. That acknowledgement durably sets the attempt's start marker even
-when renewal already advanced its state. An answer without an L1 verdict (a
-transport failure, timeout, or 5xx other than 501) is not a refusal: L1 may
-already have committed the start, so the agent retries the identical request
-at its completion retry interval for at most one lease window, and a retry
-after a lost answer replays the committed start. A refusal (any 4xx, such as
-a stale fence, an expired lease, or a pending cancellation), or no verdict
-within that window, cancels the payload; it cannot remain running under
-unacknowledged authority. For `kind=oci`, renewal changes only the lease and directive;
+when renewal already advanced its state. The acknowledgement runs alongside
+the payload, whose supervision limits (maximum runtime among them) stay
+enforced while it is pending. An answer that never arrived (a transport failure
+or timeout) or a 5xx other than 501 is not a refusal: L1 may already have
+committed the start, so the agent retries the identical request at its
+completion retry interval within one lease window, every request and wait
+ending at that window, and a retry after a lost answer replays the committed
+start. Any other status L1 sent is its verdict even when the body is
+unreadable: a 2xx is the committed start, and any 4xx (such as a stale fence,
+an expired lease, or a pending cancellation) or 501 is a refusal. A refusal, or
+no verdict within the window, cancels the payload; it cannot remain running
+under refused or unanswered authority. For `kind=oci`, renewal changes only the lease and directive;
 it never acknowledges execution or starts the portless-service stability
 clock. Successful completion likewise never supplies a missing OCI `Started`.
 

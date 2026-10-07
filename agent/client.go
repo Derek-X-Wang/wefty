@@ -41,6 +41,19 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("l1 agent protocol: HTTP %d %s: %s", e.StatusCode, e.APIError.Code, e.APIError.Message)
 }
 
+// responseBodyError is an L1 answer whose HTTP status arrived but whose body
+// could not be read or decoded. It is deliberately not a ProtocolError: no
+// error code arrived, so code-based classification still reads it as
+// transient. A caller that acts on the status alone can still read it here.
+type responseBodyError struct {
+	statusCode int
+	err        error
+}
+
+func (e *responseBodyError) Error() string { return e.err.Error() }
+
+func (e *responseBodyError) Unwrap() error { return e.err }
+
 // Client calls the Fabric-authenticated L1 agent protocol.
 type Client struct {
 	baseURL          string
@@ -314,7 +327,7 @@ func (c *Client) requestAllowNoContent(ctx context.Context, method, path string,
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
 	if err := decoder.Decode(target); err != nil {
-		return false, fmt.Errorf("agent: decode L1 response: %w", err)
+		return false, &responseBodyError{statusCode: response.StatusCode, err: fmt.Errorf("agent: decode L1 response: %w", err)}
 	}
 	return false, nil
 }
@@ -330,7 +343,8 @@ func decodeProtocolError(response *http.Response) error {
 	var protocolResponse contract.ErrorResponse
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
 	if err := decoder.Decode(&protocolResponse); err != nil {
-		return fmt.Errorf("l1 agent protocol: HTTP %d with invalid error response: %w", response.StatusCode, err)
+		return &responseBodyError{statusCode: response.StatusCode,
+			err: fmt.Errorf("l1 agent protocol: HTTP %d with invalid error response: %w", response.StatusCode, err)}
 	}
 	return &ProtocolError{StatusCode: response.StatusCode, APIError: protocolResponse.Error}
 }

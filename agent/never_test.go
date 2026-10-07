@@ -22,6 +22,49 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
+// startVerdict waits for the start acknowledgement running alongside the
+// payload: true once the agent records the attempt running, false once a
+// refusal cancels the payload.
+func startVerdict(t *testing.T, ctx context.Context, observer *lifecycleObserver, attemptID string) bool {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		if observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts[attemptID].State == AttemptRunning {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline:
+			t.Error("start acknowledgement reached no verdict")
+			return false
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func neverProcessClaim(t *testing.T, leaseTTL time.Duration, limits *contract.JobLimits, executable string, argv ...string) l1.Claim {
+	return l1.Claim{Job: l1.Job{JobID: "job", Spec: contract.JobSpec{Kind: "process", Class: "service", Restart: "never", Limits: limits,
+		Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: executable}, Argv: argv, WorkingDirectory: t.TempDir()}}},
+		Lease: l1.AttemptLease{AttemptID: "attempt", FencingToken: "fence", LeaseTTL: leaseTTL}}
+}
+
+func neverProcessLifecycle(t *testing.T, client *Client, clock Clock, executor processrunner.Executor) (*attemptLifecycle, *lifecycleObserver) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource, err := initializeManagedResource(root, "node", "boot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := newLifecycleObserver(clock)
+	observer.beginAttempt("attempt", "job", contract.JobClassService)
+	return newAttemptLifecycle(attemptLifecycleDependencies{nodeID: "node", bootSessionID: "boot", managedResource: resource, client: client,
+		runtimes: testRuntimeSet(executor), clock: clock, completionRetry: time.Millisecond, finalizationTimeout: time.Second, observer: observer}), observer
+}
+
 func TestNeverProcessAcknowledgesRunnerStart(t *testing.T) {
 	for _, refuse := range []bool{false, true} {
 		t.Run(map[bool]string{false: "accepted", true: "refused"}[refuse], func(t *testing.T) {
@@ -45,14 +88,7 @@ func TestNeverProcessAcknowledgesRunnerStart(t *testing.T) {
 			}), time.Second)
 			defer closeServer()
 			defer client.Close()
-			root, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			resource, err := initializeManagedResource(root, "node", "boot")
-			if err != nil {
-				t.Fatal(err)
-			}
+			var observer *lifecycleObserver
 			executor := directiveContinuationRunner(func(ctx context.Context, req processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
 				if req.Started == nil {
 					t.Fatal("process runner has no start acknowledgement hook")
@@ -61,21 +97,21 @@ func TestNeverProcessAcknowledgesRunnerStart(t *testing.T) {
 					t.Fatal("acknowledged before runner start")
 				}
 				req.Started()
-				if !acknowledged.Load() {
-					t.Fatal("runner start did not reach L1")
+				if alive := startVerdict(t, ctx, observer, "attempt"); alive == refuse {
+					t.Errorf("payload alive = %t after the start answer", alive)
 				}
-				if refuse {
-					if ctx.Err() == nil {
-						t.Fatal("refused acknowledgement left payload running")
-					}
+				if !acknowledged.Load() {
+					t.Error("runner start did not reach L1")
+				}
+				if ctx.Err() != nil {
 					return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
 				}
 				zero := 0
 				return contract.ProcessResult{ExitCode: &zero}, nil
 			})
-			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{nodeID: "node", bootSessionID: "boot", managedResource: resource, client: client, runtimes: testRuntimeSet(executor), clock: systemClock{}, finalizationTimeout: time.Second})
-			claim := l1.Claim{Job: l1.Job{JobID: "job", Spec: contract.JobSpec{Kind: "process", Class: "service", Restart: "never", Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: t.TempDir()}}}, Lease: l1.AttemptLease{AttemptID: "attempt", FencingToken: "fence"}}
-			result, err := lifecycle.runWorkload(t.Context(), claim)
+			var lifecycle *attemptLifecycle
+			lifecycle, observer = neverProcessLifecycle(t, client, systemClock{}, executor)
+			result, err := lifecycle.runWorkload(t.Context(), neverProcessClaim(t, 0, nil, "/bin/true", "true"))
 			if refuse {
 				if err == nil || !strings.Contains(err.Error(), "acknowledge process start") || result.Signal == "" {
 					t.Fatalf("refused start = %+v %v", result, err)
@@ -87,14 +123,23 @@ func TestNeverProcessAcknowledgesRunnerStart(t *testing.T) {
 	}
 }
 
-// Only an answer without an L1 verdict is retried. A refusal cancels the
-// payload on its first answer, even with a lease window left to spend.
+// Only an answer that never arrived, or a 5xx other than 501, is retried.
+// Any other status L1 sent is its verdict, even when the body is unreadable:
+// a refusal cancels the payload on its first answer with a lease window left
+// to spend, and a 2xx is the committed start.
 func TestNeverProcessStartRetriesOnlyUndecidedAnswers(t *testing.T) {
 	refusal := func(status int, code contract.ErrorCode) func(http.ResponseWriter) {
 		return func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: string(code)}})
+		}
+	}
+	unreadable := func(status int, body string) func(http.ResponseWriter) {
+		return func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
 		}
 	}
 	accept := func(w http.ResponseWriter) {
@@ -107,9 +152,13 @@ func TestNeverProcessStartRetriesOnlyUndecidedAnswers(t *testing.T) {
 	}{
 		{"internal then accepted", []func(http.ResponseWriter){refusal(http.StatusInternalServerError, contract.ErrorInternal), accept}, true},
 		{"unavailable then accepted", []func(http.ResponseWriter){refusal(http.StatusServiceUnavailable, contract.ErrorRunLedgerUnavailable), accept}, true},
+		{"unreadable unavailable then accepted", []func(http.ResponseWriter){unreadable(http.StatusServiceUnavailable, "<html>busy"), accept}, true},
+		{"truncated acceptance", []func(http.ResponseWriter){unreadable(http.StatusOK, `{"job_id":"jo`)}, true},
 		{"stale fence", []func(http.ResponseWriter){refusal(http.StatusConflict, contract.ErrorStaleFence)}, false},
 		{"lease expired", []func(http.ResponseWriter){refusal(http.StatusConflict, contract.ErrorLeaseExpired)}, false},
 		{"pending cancellation", []func(http.ResponseWriter){refusal(http.StatusConflict, contract.ErrorConflict)}, false},
+		{"truncated conflict", []func(http.ResponseWriter){unreadable(http.StatusConflict, `{"error":{"code":"stale_fe`)}, false},
+		{"unreadable not implemented", []func(http.ResponseWriter){unreadable(http.StatusNotImplemented, "<html>")}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -117,24 +166,18 @@ func TestNeverProcessStartRetriesOnlyUndecidedAnswers(t *testing.T) {
 				call := int(calls.Add(1))
 				if call > len(tc.answers) {
 					t.Errorf("start acknowledgement call %d after a final answer", call)
+					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
 				tc.answers[call-1](w)
 			}), time.Second)
 			defer closeServer()
 			defer client.Close()
-			root, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			resource, err := initializeManagedResource(root, "node", "boot")
-			if err != nil {
-				t.Fatal(err)
-			}
+			var observer *lifecycleObserver
 			executor := directiveContinuationRunner(func(ctx context.Context, req processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
 				req.Started()
-				if (ctx.Err() == nil) != tc.alive {
-					t.Errorf("payload alive = %t after %d answers", ctx.Err() == nil, calls.Load())
+				if alive := startVerdict(t, ctx, observer, "attempt"); alive != tc.alive {
+					t.Errorf("payload alive = %t after %d answers", alive, calls.Load())
 				}
 				if ctx.Err() != nil {
 					return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
@@ -142,13 +185,87 @@ func TestNeverProcessStartRetriesOnlyUndecidedAnswers(t *testing.T) {
 				zero := 0
 				return contract.ProcessResult{ExitCode: &zero}, nil
 			})
-			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{nodeID: "node", bootSessionID: "boot", managedResource: resource, client: client, runtimes: testRuntimeSet(executor), clock: systemClock{}, completionRetry: time.Millisecond, finalizationTimeout: time.Second})
-			claim := l1.Claim{Job: l1.Job{JobID: "job", Spec: contract.JobSpec{Kind: "process", Class: "service", Restart: "never", Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: t.TempDir()}}}, Lease: l1.AttemptLease{AttemptID: "attempt", FencingToken: "fence", LeaseTTL: time.Minute}}
-			_, err = lifecycle.runWorkload(t.Context(), claim)
+			var lifecycle *attemptLifecycle
+			lifecycle, observer = neverProcessLifecycle(t, client, systemClock{}, executor)
+			_, err := lifecycle.runWorkload(t.Context(), neverProcessClaim(t, time.Minute, nil, "/bin/true", "true"))
 			if tc.alive != (err == nil) || int(calls.Load()) != len(tc.answers) {
 				t.Fatalf("start acknowledgement = %v after %d calls, want %d", err, calls.Load(), len(tc.answers))
 			}
 		})
+	}
+}
+
+// The retry ends with the lease window. A backoff that reaches the window's
+// end sends no further request, even one L1 would have accepted.
+func TestNeverProcessStartRetryEndsWithLeaseWindow(t *testing.T) {
+	for _, overshoot := range []time.Duration{0, time.Second} {
+		t.Run(fmt.Sprint(overshoot), func(t *testing.T) {
+			var calls atomic.Int32
+			answered := make(chan struct{}, 1)
+			client, closeServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if calls.Add(1) > 1 {
+					_ = json.NewEncoder(w).Encode(l1.Job{JobID: "job", State: contract.JobRunning})
+					return
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: "busy"}})
+				answered <- struct{}{}
+			}), time.Second)
+			defer closeServer()
+			defer client.Close()
+			start := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+			clock := newManualClock(start)
+			window := time.Second
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, clock: clock, completionRetry: window})
+			result := make(chan error, 1)
+			go func() {
+				result <- lifecycle.acknowledgeProcessStart(t.Context(), neverProcessClaim(t, window, nil, "/bin/true", "true"))
+			}()
+			select {
+			case <-answered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first start acknowledgement was not answered")
+			}
+			clock.waitForDeadline(t, start.Add(window))
+			clock.Advance(window + overshoot)
+			select {
+			case err := <-result:
+				if err == nil || calls.Load() != 1 {
+					t.Fatalf("acknowledgement after its window = %v after %d calls, want the undecided answer and no new request", err, calls.Load())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("acknowledgement outlived its lease window")
+			}
+		})
+	}
+}
+
+// While L1 has not answered the start acknowledgement, the real process
+// runner still enforces the payload's maximum runtime, and no acknowledgement
+// request outlives the attempt.
+func TestNeverProcessMaxRuntimeHoldsWhileStartUndecided(t *testing.T) {
+	var calls atomic.Int32
+	client, closeServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-r.Context().Done()
+	}), 500*time.Millisecond)
+	defer closeServer()
+	defer client.Close()
+	lifecycle, _ := neverProcessLifecycle(t, client, systemClock{}, processrunner.New(processrunner.Config{}))
+	started := time.Now()
+	result, err := lifecycle.runWorkload(t.Context(), neverProcessClaim(t, 20*time.Second, &contract.JobLimits{MaxRuntimeSeconds: 1}, "/bin/sleep", "sleep", "30"))
+	elapsed := time.Since(started)
+	if !errors.Is(err, processrunner.ErrMaxRuntime) || elapsed > 5*time.Second {
+		t.Fatalf("payload under an undecided start = %+v %v after %s, want the 1s maximum runtime enforced", result, err, elapsed)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("start acknowledgement never reached L1")
+	}
+	settled := calls.Load()
+	time.Sleep(100 * time.Millisecond)
+	if calls.Load() != settled {
+		t.Fatal("start acknowledgement kept retrying after its attempt ended")
 	}
 }
 
@@ -304,16 +421,16 @@ func TestNeverProcessStartSurvivesLostAcknowledgement(t *testing.T) {
 		}
 	}()
 
-	alive := make(chan bool, 1)
+	canceled := make(chan struct{})
 	release := make(chan struct{})
 	runner := directiveContinuationRunner(func(ctx context.Context, req processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
 		req.Started()
-		alive <- ctx.Err() == nil
 		select {
 		case <-release:
 			zero := 0
 			return contract.ProcessResult{ExitCode: &zero}, nil
 		case <-ctx.Done():
+			close(canceled)
 			return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
 		}
 	})
@@ -357,13 +474,13 @@ func TestNeverProcessStartSurvivesLostAcknowledgement(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("start acknowledgement never reached L1")
 	}
+	// The agent records the attempt running only once L1's start verdict
+	// arrives, here through the retry after the lost answer.
+	assertAttemptStatus(t, nodeAgent, AttemptRunning)
 	select {
-	case running := <-alive:
-		if !running {
-			t.Fatal("a lost start acknowledgement canceled the payload")
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("start acknowledgement never returned to the runner")
+	case <-canceled:
+		t.Fatal("a lost start acknowledgement canceled the payload")
+	default:
 	}
 	if calls := startCalls.Load(); calls < 2 {
 		t.Fatalf("start acknowledgement calls = %d, want a retry after the lost answer", calls)
