@@ -2685,3 +2685,25 @@ func TestAllowedActionSchemaSeparatesPreconditionsAndInputs(t *testing.T) {
 		}
 	}
 }
+
+func TestServiceOperatorFactsValidateAgainstPublishedSchema(t *testing.T) {
+	schema := compileProtocolSchema(t, "file:///api/openapi/common.v1.json#/components/schemas/Job")
+	for _, check := range []struct {
+		fields string
+		valid  bool
+	}{
+		{`"allowed_actions":[{"verb":"start","requires":{"desired_state":"running"}},{"verb":"restart","inputs":[{"name":"idempotency_key","type":"string","required":true}]}],"last_condition":{"code":"policy_stop","scope":"service_restart","since":"2026-10-07T12:00:00Z","details":{"restart":"never"}}`, true},
+		{`"allowed_actions":[],"last_condition":null`, true},
+		{`"allowed_actions":null,"last_condition":null`, false},
+		{`"allowed_actions":[{"verb":"forget","requires":null}],"last_condition":null`, false},
+	} {
+		payload := `{"job_id":"service","state":"stopped","created_at":"2026-10-07T12:00:00Z","updated_at":"2026-10-07T12:00:00Z",` + check.fields + `}`
+		instance, err := jsonschema.UnmarshalJSON(strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := schema.Validate(instance); (err == nil) != check.valid {
+			t.Errorf("valid=%t payload=%s err=%v", check.valid, payload, err)
+		}
+	}
+}

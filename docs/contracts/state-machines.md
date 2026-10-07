@@ -1292,3 +1292,62 @@ precedence when a capability transition and liveness transition occur together.
 A repeated observation does not advance `since`.
 Registration never overwrites durable operator intent. The last event may have
 cleared: its presence is historical evidence, not a current eligibility answer.
+
+## Service operator facts and actions
+
+Every service in `GET /v1/jobs` (including `?class=service`), service detail
+`GET /v1/jobs/{job_id}?class=service`, and child collections uses one per-caller
+projection. Removal tombstones retain these operator facts on exact-ID reads.
+`wefty services list` and ordinary-service `status` preserve the same fields in
+JSON and display `LAST CONDITION` and `ALLOWED ACTIONS` in their table.
+Computer-name/ID aliases retain the separate Computer projection and lifecycle
+authority; Computer action reporting is covered by #690. One-shots omit both fields.
+
+`allowed_actions` is always an array of the five verbs below, using the shared
+`contract.AllowedAction` shape unchanged. A refusal uses the write's APIError
+conversion, including details and retryability; unknown decision errors fail
+closed as scrubbed internal errors. Client-tag authority is checked from the
+actual request identity, including custom configured tags. An attempt credential
+has no service mutation authority even if its holding node has a client tag.
+Services have no desired-state revision field or service-scoped grant/revoke
+endpoint. Active Computer-owned Jobs refuse these verbs with `computer_resource_required`;
+the Computer endpoints remain their sole lifecycle and grant authority.
+
+| Verb | Endpoint | Exact `requires` | Caller `inputs` | Enforced rules |
+| --- | --- | --- | --- | --- |
+| `start` | `PUT /v1/jobs/{job_id}/desired-state?class=service` | `desired_state: running` | none | Stopped and policy-stopped services can start; a failed `never` infrastructure interruption can start. Terminal latches require an explicit restart. Bound services reacquire capacity. Stopping and removal refuse. Healthy running/claimed/queued starts are idempotent. |
+| `stop` | same desired-state endpoint | `desired_state: stopped` | none | Queued, claimed, running, stopped, failed, and stopping states accept. Stops preserve failure latches and observed policy stops. Removal refuses. |
+| `restart` | `POST /v1/jobs/{job_id}/restart?class=service` | none | required string `idempotency_key` | Fresh keys accept queued, claimed, running, stopped, or failed, clearing restart latches; stopped/failed bound services reacquire capacity. Stopping and removal refuse. A previously accepted identical key replays its original mutation without another restart; the advertised decision describes a fresh key. |
+| `remove` | `POST /v1/jobs/{job_id}/remove?class=service` | none | none | Any service state accepts, including repeated removal phases and tombstones. A new bound removal needs a registered managed-root instance; an unbound service finalizes immediately. |
+| `forget` | `POST /v1/jobs/{job_id}/forget?class=service` | `force: true` | none | Same removal preconditions. Waives proof while retaining the deletion directive. Verified, forgotten and stalled outcomes are idempotent and are never rewritten. |
+
+There is no advice or preferred action in the new fields. `requires` is omitted
+or an object, never null; restart's key is a typed input, never a manufactured
+exact value. The server rechecks the shared actor-aware decision in the mutation
+transaction. Read projections use read-only transactions, avoiding the store's
+default immediate writer lock. State and actions share a fresh read snapshot;
+collection membership and filters retain their existing paging semantics.
+
+`last_condition` is the **closest existing state-machine fact**, rather than a
+new event history. It is null when no policy stop, failure or removal condition
+is retained. It uses the shared `contract.Condition` shape:
+
+- `policy_stop`, scope `service_restart`: the recorded payload result and restart
+  policy. `since` is the current attempt's recorded completion time, when an
+  attempt is retained; otherwise the existing Job timestamp. Explicit operator
+  stop does not advance that completion time.
+- `failure_latched` or `never_automatic_restart_suppressed`, scope
+  `service_restart`: the failed Job snapshot, restart streak/limit and any
+  controller failure reason. `since` is the existing Job update time; an intent
+  mutation may update that snapshot, while reads never do.
+- The persisted removal state (for example `removal_pending`, `agent_cleaned`,
+  `removed_verified`, `forgotten_cleanup_unverified`, or
+  `stalled_cleanup_unverified`), scope `service_removal`: cleanup status, outcome,
+  generation and any retained stall facts. `since` uses the removal request,
+  acknowledgement, terminal removal or stall timestamp as available. Neither
+  pending nor waived nor stalled cleanup claims deletion was verified.
+
+Start/restart clearing policy/failure state clears its closest condition; healthy
+services do not invent a past event. Repeated reads preserve timestamps. This
+projection does not infer runtime presence from a service binding or recommend
+an operator decision.
