@@ -18,8 +18,8 @@ func insertPagingTestRun(s *Store, runID, actor string, status contract.RunState
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO runs(run_id, dispatch_key, idempotency_key, request_hash, status, params_json, tags_json, created_ns, updated_ns)
-VALUES(?, ?, ?, '', ?, '{}', '[]', ?, ?)`, runID, "run:"+runID, runID, status, createdNS, createdNS); err != nil {
+	if _, err := tx.Exec(`INSERT INTO runs(run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, created_ns, updated_ns)
+VALUES(?, ?, ?, ?, '', ?, '{}', '[]', ?, ?)`, runID, "run:"+runID, actor, runID, status, createdNS, createdNS); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO run_triggers(run_id, actor, source, params_json, created_ns)
