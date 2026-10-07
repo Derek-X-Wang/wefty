@@ -146,6 +146,8 @@ func (s *Store) initialize(ctx context.Context) error {
 	}
 	const schema = runTableSchema + `
 CREATE INDEX IF NOT EXISTS runs_projection ON runs(status, l1_job_id, created_ns);
+CREATE INDEX IF NOT EXISTS runs_created ON runs(created_ns, run_id);
+CREATE INDEX IF NOT EXISTS runs_status_created ON runs(status, created_ns, run_id);
 CREATE TABLE IF NOT EXISTS run_scripts (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
   content BLOB NOT NULL,
@@ -230,6 +232,7 @@ CREATE TABLE IF NOT EXISTS run_triggers (
   params_json BLOB NOT NULL,
   created_ns INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS run_triggers_actor_created ON run_triggers(actor, created_ns, run_id);
 CREATE TRIGGER IF NOT EXISTS run_triggers_no_update
 BEFORE UPDATE ON run_triggers BEGIN SELECT RAISE(ABORT, 'trigger provenance is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS run_triggers_no_delete

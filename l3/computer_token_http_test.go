@@ -511,10 +511,13 @@ func TestComputerRootRunListIsPaginatedAndCurrentGenerationScoped(t *testing.T) 
 	// An omitted origin is now the general listing rather than a malformed
 	// request, so a Computer pass asking for it is refused for what it is: a
 	// scope that names its own Runs and not every Run.
-	status, _, body = doComputerHTTP(t, client, http.MethodGet, "/v1/runs", grant.Token, "", nil)
-	if status != http.StatusForbidden {
-		t.Fatalf("general list under a Computer pass status=%d body=%s", status, body)
+	for _, query := range []string{"/v1/runs", "/v1/runs?submitter=me", "/v1/runs?cursor=" + url.QueryEscape(first.NextCursor)} {
+		status, _, body = doComputerHTTP(t, client, http.MethodGet, query, grant.Token, "", nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("general list under a Computer pass status=%d body=%s", status, body)
+		}
 	}
+
 }
 
 func TestComputerHTTPInflightLimitErrorKeepsTypedCountAndLimit(t *testing.T) {

@@ -6,11 +6,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"io"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -472,11 +469,7 @@ type computerRunListScope struct {
 }
 
 func encodeComputerRunCursor(cursor computerRunCursor) string {
-	payload, err := json.Marshal(cursor)
-	if err != nil {
-		panic("l3: encode Computer Run cursor: " + err.Error())
-	}
-	return base64.RawURLEncoding.EncodeToString(payload)
+	return encodeRunCursor(cursor)
 }
 
 func decodeComputerRunCursor(value string, scope computerRunListScope, includeDescendants bool) (computerRunCursor, error) {
@@ -484,20 +477,14 @@ func decodeComputerRunCursor(value string, scope computerRunListScope, includeDe
 		return computerRunCursor{ComputerID: scope.ComputerID, ComputerStorageGeneration: scope.ComputerStorageGeneration,
 			IncludeDescendants: includeDescendants}, nil
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil {
-		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
-	}
 	var cursor computerRunCursor
-	decoder := json.NewDecoder(strings.NewReader(string(payload)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&cursor); err != nil || cursor.ComputerID != scope.ComputerID ||
+	if err := decodeRunCursor(value, &cursor); err != nil {
+		return computerRunCursor{}, err
+	}
+	if cursor.ComputerID != scope.ComputerID ||
 		!sameOptionalInt64(cursor.ComputerStorageGeneration, scope.ComputerStorageGeneration) || cursor.IncludeDescendants != includeDescendants ||
 		cursor.CreatedNS < 0 || strings.TrimSpace(cursor.RunID) == "" {
 		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid for this Computer Run scope")
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
 	}
 	return cursor, nil
 }

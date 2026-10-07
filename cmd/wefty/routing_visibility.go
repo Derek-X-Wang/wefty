@@ -127,7 +127,8 @@ type runListingRow struct {
 }
 
 type runListingPage struct {
-	Runs []runListingRow `json:"runs"`
+	Runs       []runListingRow `json:"runs"`
+	NextCursor string          `json:"next_cursor,omitempty"`
 }
 
 func annotateRunListing(ctx context.Context, clients *apiClients, page l3.RunListPage) runListingPage {
@@ -138,7 +139,7 @@ func annotateRunListing(ctx context.Context, clients *apiClients, page l3.RunLis
 		}
 	}
 	reasons := queuedRunReasons(ctx, clients, queued)
-	annotated := runListingPage{Runs: make([]runListingRow, 0, len(page.Runs))}
+	annotated := runListingPage{Runs: make([]runListingRow, 0, len(page.Runs)), NextCursor: page.NextCursor}
 	for _, run := range page.Runs {
 		annotated.Runs = append(annotated.Runs, runListingRow{RunSummary: run, UnschedulableReason: reasons[run.RunID]})
 	}

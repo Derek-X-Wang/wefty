@@ -112,6 +112,28 @@ func errorCode(err error) contract.ErrorCode {
 	return contract.ErrorInternal
 }
 
+// apiErrorFromDecision is the one conversion for action refusals and HTTP
+// errors. Only nil means allowed. Unknown errors fail closed as scrubbed,
+// retryable internal errors, and typed errors retain their retryability policy.
+func apiErrorFromDecision(err error) *contract.APIError {
+	if err == nil {
+		return nil
+	}
+	code := errorCode(err)
+	result := &contract.APIError{Code: code, Message: err.Error(), Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted || code == contract.ErrorRunLedgerUnavailable}
+	var protocolErr *Error
+	if errors.As(err, &protocolErr) {
+		result.Details = protocolErr.Details
+		if protocolErr.notRetryable {
+			result.Retryable = false
+		}
+	}
+	if code == contract.ErrorInternal {
+		result.Message = "internal server error"
+	}
+	return result
+}
+
 // scrubbedCause renders the whole wrapped chain behind an error whose message
 // the response will not carry. A *Error prints only its own message, so the
 // operation label and the driver failure underneath it are two different

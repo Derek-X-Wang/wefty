@@ -432,27 +432,26 @@ func (c *apiClients) getServiceLogs(ctx context.Context, jobID, cursor string, l
 	return page, err
 }
 
-func (c *apiClients) drainNode(ctx context.Context, nodeID string) (l1.Node, error) {
-	nodes, err := c.listNodes(ctx)
-	if err != nil {
-		return l1.Node{}, err
-	}
+func (c *apiClients) getNode(ctx context.Context, nodeID string) (l1.Node, error) {
+	var node l1.Node
+	err := c.l1.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeID), nil, nil, &node, http.StatusOK)
+	return node, err
+}
+
+func (c *apiClients) drainNode(ctx context.Context, nodeID string, observedRevision *int64, reason string) (l1.Node, error) {
 	var revision int64
-	found := false
-	for _, node := range nodes.Nodes {
-		if node.NodeID == nodeID {
-			revision = node.IntentRevision
-			found = true
-			break
+	if observedRevision == nil {
+		current, err := c.getNode(ctx, nodeID)
+		if err != nil {
+			return l1.Node{}, err
 		}
-	}
-	if !found {
-		return l1.Node{}, fmt.Errorf("node %q was not found", nodeID)
+		revision = current.IntentRevision
+	} else {
+		revision = *observedRevision
 	}
 	var node l1.Node
-	path := "/v1/nodes/" + url.PathEscape(nodeID) + "/drain"
-	err = c.l1.do(ctx, http.MethodPost, path, l1.NodeIntentRequest{
-		ClaimsEnabled: false, IntentRevision: revision, Reason: "operator requested drain",
+	err := c.l1.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(nodeID)+"/drain", l1.NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: revision, Reason: reason,
 	}, nil, &node, http.StatusOK)
 	return node, err
 }
@@ -674,9 +673,19 @@ func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID st
 }
 
 func (c *apiClients) listRuns(ctx context.Context, status string, limit int) (l3.RunListPage, error) {
+	return c.listRunsPage(ctx, status, limit, "", false)
+}
+
+func (c *apiClients) listRunsPage(ctx context.Context, status string, limit int, cursor string, mine bool) (l3.RunListPage, error) {
 	query := url.Values{"limit": []string{strconv.Itoa(limit)}}
 	if status != "" {
 		query.Set("status", status)
+	}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	if mine {
+		query.Set("submitter", "me")
 	}
 	var page l3.RunListPage
 	err := c.l3.do(ctx, http.MethodGet, "/v1/runs?"+query.Encode(), nil, nil, &page, http.StatusOK)

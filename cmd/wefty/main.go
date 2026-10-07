@@ -51,6 +51,9 @@ func isTypedExitCLIArgs(args []string) bool {
 	}
 	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
 	// the service creation exit contract.
+	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil && len(commandArgs) > 0 && (commandArgs[0] == "drain" || commandArgs[0] == "nodes") {
+		return true
+	}
 	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
 		len(commandArgs) >= 2 && commandArgs[0] == "services" && commandArgs[1] == "create" {
 		return true
@@ -447,7 +450,8 @@ Commands:
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
     [--reference REFERENCE]  Name an archive whose export named no artifact
-  nodes list                 List node reachability, eligibility, and capacity
+  nodes list                 List node facts and legal operator actions
+  nodes inspect NODE_ID      Read one node and its resident attempts
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   jobs list                  List readable jobs with filters and cursor paging
     [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
@@ -479,8 +483,8 @@ Commands:
                              Clone one Backup into a new stopped Computer with no grants
   services custody <verb>    Export, import, or attest external storage custody
     export|import|attest
-  runs list [--status STATUS --limit LIMIT]
-                             List the most recent Runs, newest first
+  runs list [--status STATUS] [--mine] [--limit LIMIT] [--cursor CURSOR] [--all]
+                             List Runs, newest first; --all walks every remaining page
     --origin computer:ID     List Runs by immutable Computer origin instead
   submit [--again] [--idempotency-key KEY]
                              Submit a saved Workflow or an inline-script/image run
@@ -498,7 +502,7 @@ Commands:
                              Read the result document the run uploaded
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
-  drain NODE_ID              Disable new claims using the current intent revision
+  drain NODE_ID              Disable new claims [--revision REV] [--reason REASON]
   run <envelope|step|gate|result|params>
                              Report from inside a running job by writing run
                              mailbox events; needs no credential and no cluster

@@ -95,20 +95,47 @@ func writeAccepted(writer io.Writer, accepted acceptedOutput, warnings []string,
 
 func writeNodesTable(writer io.Writer, nodes []l1.Node) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "NODE ID\tREACHABILITY\tWITHDRAWN CAPABILITIES\tWITHDRAWAL REASON\tCLAIMS ENABLED (ELIGIBILITY)\tONE-SHOT SLOTS\tSERVICE SLOTS\tOVERCOMMITTED\tINTENT REVISION\tINTENT REASON\tINTENT ACTOR\tOS/ARCH\tAGENT VERSION\tTAGS\tLAST HEARTBEAT"); err != nil {
+	if _, err := fmt.Fprintln(table, "NODE ID\tREACHABILITY\tWITHDRAWN CAPABILITIES\tWITHDRAWAL REASON\tCLAIMS ENABLED (ELIGIBILITY)\tONE-SHOT SLOTS\tSERVICE SLOTS\tOVERCOMMITTED\tINTENT REVISION\tINTENT REASON\tINTENT ACTOR\tOS/ARCH\tAGENT VERSION\tTAGS\tLAST HEARTBEAT\tACTIVE ATTEMPTS\tLAST CONDITION\tALLOWED ACTIONS"); err != nil {
 		return err
 	}
 	for _, node := range nodes {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%t\t%d/%d\t%d/%d\t%t\t%d\t%s\t%s\t%s/%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%t\t%d/%d\t%d/%d\t%t\t%d\t%s\t%s\t%s/%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			node.NodeID, node.State, withdrawnCapabilities(node), withdrawalReason(node), node.ClaimsEnabled,
 			node.OneshotOccupancy, node.MaxOneshotSlots, node.ServiceOccupancy, node.MaxServiceSlots,
 			node.Overcommitted, node.IntentRevision, node.IntentReason, node.IntentActor,
 			node.OS, node.Architecture, node.AgentVersion,
-			strings.Join(node.AuthoritativeTags, ","), node.LastHeartbeatAt.Format("2006-01-02T15:04:05Z07:00")); err != nil {
+			strings.Join(node.AuthoritativeTags, ","), node.LastHeartbeatAt.Format("2006-01-02T15:04:05Z07:00"), nodeAttemptFacts(node), nodeConditionFact(node), nodeActionFacts(node)); err != nil {
 			return err
 		}
 	}
 	return table.Flush()
+}
+
+func nodeAttemptFacts(node l1.Node) string {
+	attempts := make([]string, 0, len(node.ActiveAttempts))
+	for _, attempt := range node.ActiveAttempts {
+		attempts = append(attempts, attempt.JobID+"/"+attempt.AttemptID+":"+string(attempt.State))
+	}
+	if len(attempts) == 0 {
+		return "none"
+	}
+	return strings.Join(attempts, ",")
+}
+
+func nodeConditionFact(node l1.Node) string {
+	if node.LastCondition == nil {
+		return "none"
+	}
+	data, _ := json.Marshal(node.LastCondition)
+	return string(data)
+}
+
+func nodeActionFacts(node l1.Node) string {
+	if len(node.AllowedActions) == 0 {
+		return "none"
+	}
+	data, _ := json.Marshal(node.AllowedActions)
+	return string(data)
 }
 
 // withdrawnCapabilities and withdrawalReason put a node's own account of what
