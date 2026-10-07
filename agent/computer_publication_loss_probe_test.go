@@ -30,7 +30,7 @@ func TestComputerPublicationFinalWithdrawal(t *testing.T) {
 }
 
 // Hold the final mutation until execution cancellation is observed. It must
-// retain one independent caller-owned deadline through real L1 publication.
+// retain one independent operation deadline through real L1 publication.
 func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	t.Helper()
 	trace := func(event string, detail any) {
@@ -66,6 +66,16 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	publicationClient := client
+	if mode == "transient_deadline" {
+		// Only withdrawal exercises the client's shortened operation timeout.
+		// Setup and the same-authority control keep their full delivery guard.
+		publicationClient, err = newClient(agentFabric, "wefty://control-plane", withdrawalBudget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer publicationClient.Close()
+	}
 	if _, err := client.Register(t.Context(), contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: bootID, RootInstanceID: "publication-root", OS: "linux", Architecture: "amd64", AgentVersion: "test",
 		Capabilities:       map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true},
@@ -130,6 +140,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	var falseEnteredOnce sync.Once
 	var operationCalls atomic.Int32
 	var operationDeadline time.Time
+	var operationParentDeadline, operationStarted, operationBounded time.Time
 	var falseDeadlines []time.Time
 	var falseCalls int
 	var trueCalls int
@@ -169,10 +180,10 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 					parent, cancelParent = context.WithTimeout(parent, withdrawalBudget)
 					earlierDeadline, _ = parent.Deadline()
 				}
-				if mode == "transient_deadline" {
-					parent, cancelParent = context.WithTimeout(parent, withdrawalBudget)
-				}
-				operationContext, cancelOperation := client.boundedContext(parent)
+				operationParentDeadline, _ = parent.Deadline()
+				operationStarted = time.Now()
+				operationContext, cancelOperation := publicationClient.boundedContext(parent)
+				operationBounded = time.Now()
 				operationDeadline, _ = operationContext.Deadline()
 				trace("operation_anchored", operationDeadline.Format(time.RFC3339Nano))
 				return operationContext, func() { cancelOperation(); cancelParent() }
@@ -215,7 +226,11 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 						}}
 					}
 				}
-				_, err := client.SetAttemptPublication(publishContext, claim.Job.JobID, claim.Lease.AttemptID, request)
+				requestClient := client
+				if !ready {
+					requestClient = publicationClient
+				}
+				_, err := requestClient.SetAttemptPublication(publishContext, claim.Job.JobID, claim.Lease.AttemptID, request)
 				trace(fmt.Sprintf("publication_%t_real_client_returned", ready), err)
 				if ready && err == nil {
 					published <- endpoint
@@ -293,6 +308,15 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	}
 	if !earlierDeadline.IsZero() && !operationDeadline.Equal(earlierDeadline) {
 		t.Fatalf("earlier caller deadline replaced: got %s want %s", operationDeadline, earlierDeadline)
+	}
+	if mode == "transient_deadline" {
+		if !operationParentDeadline.IsZero() {
+			t.Fatalf("client operation timeout inherited a caller deadline: %s", operationParentDeadline)
+		}
+		if operationDeadline.Before(operationStarted.Add(withdrawalBudget)) || operationDeadline.After(operationBounded.Add(withdrawalBudget)) {
+			t.Fatalf("client operation deadline=%s, want withdrawal budget %s anchored between %s and %s",
+				operationDeadline, withdrawalBudget, operationStarted, operationBounded)
+		}
 	}
 	var cause error
 	select {

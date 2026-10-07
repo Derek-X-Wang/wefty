@@ -147,8 +147,8 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 		t.Fatal(err)
 	}
 	reconciliation, err := store.Reconcile(t.Context())
-	// Observing queued above proves the server's periodic reconciler serialized
-	// first; a second pass must report no duplicate transition.
+	// Observing queued after the explicit reconciliation above proves expiry
+	// converged; a second pass must report no duplicate transition.
 	if err != nil || reconciliation.ExpiredAttempts != 0 {
 		cancelRun()
 		t.Fatalf("post-intent-stop idempotent reconciliation=%+v err=%v", reconciliation, err)
