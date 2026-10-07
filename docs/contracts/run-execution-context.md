@@ -184,7 +184,7 @@ only the exact method and path set on which L3 serves a run token
 | `POST` | `/v1/runs/{run_id}/gates` |
 
 Every other `/l3` method or path, including the Run listings, rerun, the
-reserved cancel, Workflow administration, `/v1/computer/self`, and every
+cancel, Workflow administration, `/v1/computer/self`, and every
 `/v1/computer-token/*` and `/v1/computers/*` route, is refused at the bridge
 with a typed `403 forbidden` and never reaches L3. A request on an allowlisted
 route that carries no `Authorization: Bearer` credential is refused with a

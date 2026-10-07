@@ -9,7 +9,7 @@ import "net/http"
 // be reachable by the workload (#595). L3 remains authoritative for scope.
 //
 // Routes a run token is refused on are deliberately absent: the general and
-// origin-scoped Run listings, rerun, the reserved cancel, Workflow
+// origin-scoped Run listings, rerun, cancel, Workflow
 // administration, and the Computer-pass and node-administration routes.
 type RunTokenRoute struct {
 	Method string

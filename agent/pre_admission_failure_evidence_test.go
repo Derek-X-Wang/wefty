@@ -362,7 +362,7 @@ func startPreAdmissionFailureHelper(t *testing.T, engine ocihelper.Engine, now f
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(serveContext, listener) }()
 	client := ocihelper.NewUnixClient(path, "checksum-test")
-	client.HeartbeatInterval = 20 * time.Millisecond
+	client.HeartbeatInterval = hostedHeartbeatInterval
 	client.Now = now
 	// Retain only open client sockets; teardown explicitly closes every socket
 	// it owns before joining the heartbeat pump and server accept loop.

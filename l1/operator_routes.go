@@ -99,6 +99,10 @@ func (s *Store) ListServiceJobs(ctx context.Context, cursorValue string, limit i
 }
 
 func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desired contract.ServiceDesiredState) (Job, error) {
+	return s.setServiceDesiredState(ctx, jobID, desired, nil)
+}
+
+func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desired contract.ServiceDesiredState, actor *serviceActionActor) (Job, error) {
 	if strings.TrimSpace(jobID) == "" {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "job_id is required")
 	}
@@ -118,47 +122,25 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 	if err != nil {
 		return Job{}, internalError(err, "read service desired-state target")
 	}
-	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
-		return Job{}, mapErr
-	} else if mapped {
-		return Job{}, protocolErrorWithDetails(contract.ErrorComputerResourceRequired,
-			map[string]any{"computer_id": computerID},
-			"Computer %q is the sole desired-state authority for Job %q", computerID, jobID)
+	verb := "start"
+	if desired == contract.ServiceDesiredStopped {
+		verb = "stop"
 	}
-	if job.Removal != nil {
-		return Job{}, protocolError(contract.ErrorConflict, "service job %q is being removed", jobID)
+	if err := serviceActionDecision(ctx, tx, job, verb, actor); err != nil {
+		return Job{}, err
 	}
 
 	switch desired {
 	case contract.ServiceDesiredRunning:
 		switch job.State {
 		case contract.JobFailed, contract.JobStopped:
-			_, resumable, err := neverAutomaticFailureCause(ctx, tx, job)
-			if err != nil {
-				return Job{}, err
-			}
-			if job.State == contract.JobFailed && job.PolicyStop == nil && !resumable {
-				return Job{}, protocolError(contract.ErrorConflict, "service job %q is latched failed; use restart", jobID)
-			}
-			if !job.HoldsSlot(job.State) {
-				if err := ensureBoundServiceCapacity(ctx, tx, job); err != nil {
-					return Job{}, err
-				}
-			}
 			if err := transitionServiceJob(ctx, tx, jobID, desired, contract.JobQueued, now); err != nil {
 				return Job{}, err
 			}
 			if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET policy_stop_json=NULL, next_restart_at=NULL WHERE job_id=?", jobID); err != nil {
 				return Job{}, internalError(err, "clear service start backoff")
 			}
-		case contract.JobStopping:
-			return Job{}, protocolError(contract.ErrorConflict, "service job %q is still stopping; wait for stopped before start", jobID)
-		case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
-			if job.DesiredState != contract.ServiceDesiredRunning {
-				return Job{}, protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", jobID)
-			}
-		default:
-			return Job{}, protocolError(contract.ErrorConflict, "service job %q cannot be started from %q", jobID, job.State)
+
 		}
 	case contract.ServiceDesiredStopped:
 		switch job.State {
@@ -182,9 +164,6 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 				// A repeat stop of a stopped service is a validated no-op.
 				break
 			}
-			if job.PolicyStop == nil {
-				return Job{}, protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", jobID)
-			}
 			// The one stopped service whose desired state is still running is a
 			// policy stop, which never rewrote intent. An operator stop records
 			// that intent now, keeping the observed policy stop.
@@ -194,13 +173,8 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 			if _, err := tx.ExecContext(ctx, "UPDATE jobs SET updated_ns=? WHERE job_id=?", now.UnixNano(), jobID); err != nil {
 				return Job{}, internalError(err, "timestamp policy-stopped service stop")
 			}
-		case contract.JobStopping:
-			if job.DesiredState != contract.ServiceDesiredStopped {
-				return Job{}, protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", jobID)
-			}
-		default:
-			return Job{}, protocolError(contract.ErrorConflict, "service job %q cannot be stopped from %q", jobID, job.State)
 		}
+
 		if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET next_restart_at=NULL WHERE job_id=?", jobID); err != nil {
 			return Job{}, internalError(err, "clear stopped service backoff")
 		}
@@ -217,6 +191,10 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 }
 
 func (s *Store) RestartService(ctx context.Context, jobID string, request ServiceRestartRequest) (Job, bool, error) {
+	return s.restartService(ctx, jobID, request, nil)
+}
+
+func (s *Store) restartService(ctx context.Context, jobID string, request ServiceRestartRequest, actor *serviceActionActor) (Job, bool, error) {
 	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(request.IdempotencyKey) == "" {
 		return Job{}, false, protocolError(contract.ErrorInvalidRequest, "job_id and idempotency_key are required")
 	}
@@ -239,12 +217,8 @@ func (s *Store) RestartService(ctx context.Context, jobID string, request Servic
 	if err != nil {
 		return Job{}, false, internalError(err, "read service restart target")
 	}
-	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
-		return Job{}, false, mapErr
-	} else if mapped {
-		return Job{}, false, protocolErrorWithDetails(contract.ErrorComputerResourceRequired,
-			map[string]any{"computer_id": computerID},
-			"Computer %q is the sole lifecycle authority for Job %q", computerID, jobID)
+	if err := serviceActionAuthority(ctx, tx, job, "restart", actor); err != nil {
+		return Job{}, false, err
 	}
 	var storedHash string
 	err = tx.QueryRowContext(ctx, `SELECT request_hash FROM service_restart_requests
@@ -258,14 +232,10 @@ func (s *Store) RestartService(ctx context.Context, jobID string, request Servic
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read service restart replay")
 	}
-	if job.Removal != nil {
-		return Job{}, false, protocolError(contract.ErrorConflict, "service job %q is being removed", jobID)
+	if err := serviceActionDecision(ctx, tx, job, "restart", actor); err != nil {
+		return Job{}, false, err
 	}
-	if !job.HoldsSlot(job.State) {
-		if err := ensureBoundServiceCapacity(ctx, tx, job); err != nil {
-			return Job{}, false, err
-		}
-	}
+
 	switch job.State {
 	case contract.JobStopped, contract.JobFailed:
 		if err := transitionServiceJob(ctx, tx, jobID, contract.ServiceDesiredRunning, contract.JobQueued, now); err != nil {
@@ -274,11 +244,8 @@ func (s *Store) RestartService(ctx context.Context, jobID string, request Servic
 	case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
 		// An active attempt sees the durable restart request on renewal. A
 		// healthy attempt remains observed running until the agent reaps it.
-	case contract.JobStopping:
-		return Job{}, false, protocolError(contract.ErrorConflict, "service job %q is still stopping; wait for stopped before restart", jobID)
-	default:
-		return Job{}, false, protocolError(contract.ErrorConflict, "service job %q cannot be restarted from %q", jobID, job.State)
 	}
+
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
 		SET desired_state=?, restart_streak=0, next_restart_at=NULL, last_failure=NULL, policy_stop_json=NULL,
 			healthy_since_ns=NULL, published_attempt_id=NULL WHERE job_id=?`,
@@ -312,7 +279,7 @@ func (s *Store) RestartService(ctx context.Context, jobID string, request Servic
 	return job, false, nil
 }
 
-func ensureBoundServiceCapacity(ctx context.Context, tx *sql.Tx, job Job) error {
+func ensureBoundServiceCapacity(ctx context.Context, tx queryer, job Job) error {
 	if job.ServiceJob == nil || job.BoundNodeID == "" {
 		return nil
 	}

@@ -1175,13 +1175,6 @@ func TestProjectJobStateMatrix(t *testing.T) {
 	}
 }
 
-func TestReservedCancelRouteReturnsNotImplemented(t *testing.T) {
-	h := newIntegrationHarness(t)
-	run := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "cancel-reserved")
-	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
-	assertAPIError(t, status, body, http.StatusNotImplemented, contract.ErrorNotImplemented)
-}
-
 func TestL3StoreUsesWAL(t *testing.T) {
 	h := newIntegrationHarness(t)
 	var mode string

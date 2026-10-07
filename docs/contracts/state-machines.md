@@ -1104,7 +1104,7 @@ operator intent.
 | `running` | The workflow job is executing. | `awaiting-input`, `succeeded`, `failed` |
 | `awaiting-input` | Mirrors the reserved job state. Observable but not enterable in v0.1. | `running`, `failed` |
 | `succeeded` | The job succeeded and every required envelope validated. Terminal. | none |
-| `failed` | Dispatch, job execution, gate, or required-envelope protocol failed. Terminal. | none |
+| `failed` | Dispatch, job execution, gate, or required-envelope protocol failed, or cancellation settled. Terminal. | none |
 
 Terminal job mapping is deterministic: `succeeded` maps to run `succeeded`
 only after required envelope validation; job `failed` maps to run `failed`.
@@ -1119,7 +1119,63 @@ applied deepest-child-first so one pass can settle an already-terminal chain.
 L1 queued one-shot cancellation records `state=failed`, `outcome=canceled`; it
 does not add a job state. L3 projects this job-level outcome as "the L1 job was
 canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
-Cancellation of an L3 Run remains reserved and returns `501`.
+
+### Run cancellation (#691)
+
+`POST /v1/runs/{run_id}/cancel` requires the existing L3 caller principal and
+an actor matching either the Run's immutable submitting actor or the immutable
+submitting actor of its lineage's root Run. Authority follows parent links, not
+a rerun's source: a rerun starts a new lineage with its own submitting actor.
+Unrelated actors are refused. L3 has no person-admin arm yet: the existing L1
+admin-policy contract exposes its roster only to a current person admin, while
+L3 calls L1 as its own client identity; it cannot verify the caller's current
+admin membership through that identity. This also means a Computer-submitted
+root with actor `computer:<id>` remains unavailable to person cancellation
+until that arm exists. Run tokens and Computer tokens receive `403 forbidden`;
+an unknown Run
+receives `404 not_found`. The response is HTTP 200 with the current `RunRecord`,
+including for a terminal or already-canceled Run.
+
+Cancellation arbitrates with the first dispatch attempt inside the ledger
+transaction. If no attempt has begun and no L1 job is linked, L3 directly
+settles the Run as `failed`, with `failure_reason=the run was canceled before
+dispatch`, expires its run token, and clears staged token delivery. The outbox
+cannot dispatch it afterward. Once a dispatch has begun, a lost acknowledgement
+is not proof that no job exists: L3 durably records cancellation intent, blocks
+further submits, links the job by the public dispatch-key lookup, and delivers
+cancellation to `POST /v1/jobs/{job_id}/cancel` through the public L1 client
+contract, as the ledger's own originating-submitter identity. Intent survives
+ledger restart; transient delivery failures are retried with durable exponential
+backoff: 30 seconds, doubling to a 30-minute cap. Repeated HTTP calls honor the
+same backoff. Ambiguous-dispatch lookups use this schedule and share the existing
+per-pass dispatch-recovery budget (five seconds by default); ordinary recovery
+does not also look up a Run with cancellation intent. A late first dispatch
+acknowledgement wakes cancellation delivery immediately. A dispatch-key
+absence remains provisional until the existing one-hour dispatch settlement
+horizon has passed since the last attempt; only then, with no acknowledgement
+recorded meanwhile, can the Run settle locally as canceled before dispatch.
+An ambiguous dispatch is never replayed to create work after cancellation.
+
+A typed non-retryable L1 cancel refusal ends delivery and is retained with its
+reason in the ledger's cancellation record; reconciliation and repeated cancel
+calls do not send it again. A cancel `not_found` alone can hide an ownership
+refusal, so only an authoritative `GetJob` absence fails an active Run through
+the existing L1-regression settlement. Other refusals leave its real state intact.
+An existing terminal Run always returns HTTP 200 with that recorded outcome,
+including when L1 delivery is refused or temporarily unavailable.
+
+For a live job, the Run remains nonterminal until L1 settles, then projects
+`failed`/`outcome=canceled` as Run `failed`, with `failure_reason=the L1 job was
+canceled`. No new Run state is added. If the job finished before cancellation,
+L3 projects its actual outcome with the ordinary image-evidence, envelope, gate
+and child-lineage rules. The cancel response performs both legal projection
+steps if it first observes a succeeded job from `queued`. A terminal Run's
+status, reason and timestamps are never rewritten, and repeats preserve the
+first outcome. A terminal Run with a linked L1 job still records and delivers
+cancellation, so a ledger protocol failure cannot strand a live job. Children
+remain independent; cancel does not cascade. A rerun
+uses the stored immutable snapshot and creates a fresh Run without inheriting
+cancellation intent.
 
 ### One-shot cancellation (#650, #651, #652)
 
@@ -1294,6 +1350,65 @@ precedence when a capability transition and liveness transition occur together.
 A repeated observation does not advance `since`.
 Registration never overwrites durable operator intent. The last event may have
 cleared: its presence is historical evidence, not a current eligibility answer.
+
+## Service operator facts and actions
+
+Every service in `GET /v1/jobs` (including `?class=service`), service detail
+`GET /v1/jobs/{job_id}?class=service`, and child collections uses one per-caller
+projection. Removal tombstones retain these operator facts on exact-ID reads.
+`wefty services list` and ordinary-service `status` preserve the same fields in
+JSON and display `LAST CONDITION` and `ALLOWED ACTIONS` in their table.
+Computer-name/ID aliases retain the separate Computer projection and lifecycle
+authority; Computer action reporting is covered by #690. One-shots omit both fields.
+
+`allowed_actions` is always an array of the five verbs below, using the shared
+`contract.AllowedAction` shape unchanged. A refusal uses the write's APIError
+conversion, including details and retryability; unknown decision errors fail
+closed as scrubbed internal errors. Client-tag authority is checked from the
+actual request identity, including custom configured tags. An attempt credential
+has no service mutation authority even if its holding node has a client tag.
+Services have no desired-state revision field or service-scoped grant/revoke
+endpoint. Active Computer-owned Jobs refuse these verbs with `computer_resource_required`;
+the Computer endpoints remain their sole lifecycle and grant authority.
+
+| Verb | Endpoint | Exact `requires` | Caller `inputs` | Enforced rules |
+| --- | --- | --- | --- | --- |
+| `start` | `PUT /v1/jobs/{job_id}/desired-state?class=service` | `desired_state: running` | none | Stopped and policy-stopped services can start; a failed `never` infrastructure interruption can start. Terminal latches require an explicit restart. Bound services reacquire capacity. Stopping and removal refuse. Healthy running/claimed/queued starts are idempotent. |
+| `stop` | same desired-state endpoint | `desired_state: stopped` | none | Queued, claimed, running, stopped, failed, and stopping states accept. Stops preserve failure latches and observed policy stops. Removal refuses. |
+| `restart` | `POST /v1/jobs/{job_id}/restart?class=service` | none | required string `idempotency_key` | Fresh keys accept queued, claimed, running, stopped, or failed, clearing restart latches; stopped/failed bound services reacquire capacity. Stopping and removal refuse. A previously accepted identical key replays its original mutation without another restart; the advertised decision describes a fresh key. |
+| `remove` | `POST /v1/jobs/{job_id}/remove?class=service` | none | none | Any service state accepts, including repeated removal phases and tombstones. A new bound removal needs a registered managed-root instance; an unbound service finalizes immediately. |
+| `forget` | `POST /v1/jobs/{job_id}/forget?class=service` | `force: true` | none | Same removal preconditions. Waives proof while retaining the deletion directive. Verified, forgotten and stalled outcomes are idempotent and are never rewritten. |
+
+There is no advice or preferred action in the new fields. `requires` is omitted
+or an object, never null; restart's key is a typed input, never a manufactured
+exact value. The server rechecks the shared actor-aware decision in the mutation
+transaction. Read projections use read-only transactions, avoiding the store's
+default immediate writer lock. State and actions share a fresh read snapshot;
+collection membership and filters retain their existing paging semantics.
+
+`last_condition` is the **closest existing state-machine fact**, rather than a
+new event history. It is null when no policy stop, failure or removal condition
+is retained. It uses the shared `contract.Condition` shape:
+
+- `policy_stop`, scope `service_restart`: the recorded payload result and restart
+  policy. `since` is the current attempt's recorded completion time, when an
+  attempt is retained; otherwise the existing Job timestamp. Explicit operator
+  stop does not advance that completion time.
+- `failure_latched` or `never_automatic_restart_suppressed`, scope
+  `service_restart`: the failed Job snapshot, restart streak/limit and any
+  controller failure reason. `since` is the existing Job update time; an intent
+  mutation may update that snapshot, while reads never do.
+- The persisted removal state (for example `removal_pending`, `agent_cleaned`,
+  `removed_verified`, `forgotten_cleanup_unverified`, or
+  `stalled_cleanup_unverified`), scope `service_removal`: cleanup status, outcome,
+  generation and any retained stall facts. `since` uses the removal request,
+  acknowledgement, terminal removal or stall timestamp as available. Neither
+  pending nor waived nor stalled cleanup claims deletion was verified.
+
+Start/restart clearing policy/failure state clears its closest condition; healthy
+services do not invent a past event. Repeated reads preserve timestamps. This
+projection does not infer runtime presence from a service binding or recommend
+an operator decision.
 
 ### Computer operator facts (#690)
 

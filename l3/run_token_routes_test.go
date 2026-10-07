@@ -70,7 +70,7 @@ func TestRunTokenRoutesAreExactlyWhereARunTokenIsServed(t *testing.T) {
 		{http.MethodGet, "/v1/runs", http.StatusForbidden, contract.ErrorForbidden},
 		{http.MethodGet, "/v1/runs?origin=computer:computer-1", http.StatusForbidden, contract.ErrorForbidden},
 		{http.MethodPost, "/v1/runs/{run_id}/rerun", http.StatusForbidden, contract.ErrorForbidden},
-		{http.MethodPost, "/v1/runs/{run_id}/cancel", http.StatusNotImplemented, contract.ErrorNotImplemented},
+		{http.MethodPost, "/v1/runs/{run_id}/cancel", http.StatusForbidden, contract.ErrorForbidden},
 		{http.MethodGet, "/v1/computer/self", http.StatusForbidden, contract.ErrorForbidden},
 		{http.MethodPost, "/v1/workflows/workflow-1/versions", http.StatusForbidden, contract.ErrorForbidden},
 		{http.MethodGet, "/v1/workflows/workflow-1/versions/1", http.StatusForbidden, contract.ErrorForbidden},
