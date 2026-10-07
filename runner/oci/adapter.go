@@ -967,6 +967,20 @@ func (adapter *Adapter) RemovalResourceManifest(request workloadrunner.Request) 
 	return manifest, nil
 }
 
+// admissionBudget is how long after a Run request the agent may still admit
+// the attempt for deadman renewal. The helper arms the initial deadman when it
+// reserves the attempt, which is no earlier than the request, so measuring
+// from the request only shortens the budget. A renewal queued at its end still
+// needs up to one helper heartbeat timeout to arrive, so that is the margin; a
+// deadman shorter than twice the heartbeat timeout keeps half of itself.
+func admissionBudget(initialDeadman, heartbeatTimeout time.Duration) time.Duration {
+	margin := heartbeatTimeout
+	if margin <= 0 || margin > initialDeadman/2 {
+		margin = initialDeadman / 2
+	}
+	return initialDeadman - margin
+}
+
 func failedAdmission(admission workloadrunner.Admission, code contract.SpawnFailureCode, err error) (workloadrunner.Admission, workloadrunner.Result, error) {
 	return admission, workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}}, err
 }
@@ -1106,6 +1120,9 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
 	adapter.trackRun(request.Authority, entry)
+	if request.OCIAdmissionBudget != nil {
+		request.OCIAdmissionBudget(admissionBudget(request.InitialDeadman, session.Handshake().HeartbeatTimeout))
+	}
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
 		AllocateEndpoints:          request.AttemptEndpoints,

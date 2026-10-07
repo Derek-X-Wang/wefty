@@ -3765,3 +3765,47 @@ func TestAdapterWatchStartOutlastsSaturationBeyondAnyFixedBudget(t *testing.T) {
 		t.Fatalf("Watch attached after %s of simulated saturation, want at least %s", observed, saturation)
 	}
 }
+
+// The admission budget is the initial deadman less the margin a queued
+// renewal needs to reach the helper: one heartbeat timeout, or half the
+// deadman when that is shorter than two heartbeat timeouts.
+func TestAdmissionBudgetLeavesRenewalDeliveryMargin(t *testing.T) {
+	for _, test := range []struct{ deadman, heartbeat, want time.Duration }{
+		{30 * time.Second, 3 * time.Second, 27 * time.Second},
+		{2 * time.Second, time.Second, time.Second},
+		{time.Second, time.Minute, 500 * time.Millisecond},
+		{3 * time.Second, 0, 1500 * time.Millisecond},
+	} {
+		if got := admissionBudget(test.deadman, test.heartbeat); got != test.want {
+			t.Errorf("admissionBudget(%s, %s) = %s, want %s", test.deadman, test.heartbeat, got, test.want)
+		}
+	}
+}
+
+// The adapter reports the admission budget before it asks the helper to Run,
+// so the agent's window starts no later than the helper's initial deadman.
+func TestAdapterReportsAdmissionBudgetBeforeRun(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	var budgets []time.Duration
+	request.OCIAdmissionBudget = func(budget time.Duration) {
+		engine.mu.Lock()
+		ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
+		engine.mu.Unlock()
+		if ran {
+			t.Error("admission budget reported after helper Run")
+		}
+		budgets = append(budgets, budget)
+	}
+	// Only the order matters here; how the payload ends does not.
+	_, _ = adapter.Run(t.Context(), request, nil)
+	engine.mu.Lock()
+	ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
+	engine.mu.Unlock()
+	// The test helper's heartbeat timeout exceeds this one-second deadman.
+	if !ran || len(budgets) != 1 || budgets[0] != request.InitialDeadman/2 {
+		t.Fatalf("admission budgets = %v (helper Run reached: %t), want one of %s before Run", budgets, ran, request.InitialDeadman/2)
+	}
+}

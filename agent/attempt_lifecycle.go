@@ -272,6 +272,53 @@ func (admission *attemptDeadmanAdmission) log(format string, args ...any) {
 	}
 }
 
+// errOCIAdmissionWindowClosed reports that an OCI attempt can no longer be
+// admitted for deadman renewal: the helper may already have expired it.
+var errOCIAdmissionWindowClosed = errors.New("the OCI helper's admission window for this attempt has closed")
+
+// ociAdmissionWindow is how long an OCI attempt may wait, after the adapter
+// asks the helper to Run it, before it must be admitted for deadman renewal.
+// The adapter opens it just before Run with the helper's budget, measured on
+// this agent's clock. Until then it is not open and bounds nothing.
+type ociAdmissionWindow struct {
+	clock Clock
+	mu    sync.Mutex
+	end   time.Time
+}
+
+func (window *ociAdmissionWindow) open(budget time.Duration) {
+	clock := window.clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	window.mu.Lock()
+	window.end = clock.Now().Add(budget)
+	window.mu.Unlock()
+}
+
+// deadline is when the window closes, or zero while it is not open.
+func (window *ociAdmissionWindow) deadline() time.Time {
+	window.mu.Lock()
+	defer window.mu.Unlock()
+	return window.end
+}
+
+// check refuses once the open window has closed.
+func (window *ociAdmissionWindow) check() error {
+	end := window.deadline()
+	if end.IsZero() {
+		return nil
+	}
+	clock := window.clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	if !clock.Now().Before(end) {
+		return errOCIAdmissionWindowClosed
+	}
+	return nil
+}
+
 func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLifecycle {
 	if dependencies.watchdog == nil {
 		dependencies.watchdog = disabledAttemptWatchdog{}
@@ -911,19 +958,34 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 // wait ends at that window. A refusal, a canceled context, or no verdict within
 // the window returns the error, and the caller stops the payload.
 func (lifecycle *attemptLifecycle) acknowledgeStart(ctx context.Context, claim l1.Claim) error {
+	return lifecycle.acknowledgeStartBefore(ctx, claim, time.Time{})
+}
+
+// acknowledgeStartBefore is acknowledgeStart that also ends at notAfter, when
+// it is set and earlier than the lease window: no request or wait outlives it,
+// and no verdict before it is no verdict at all.
+func (lifecycle *attemptLifecycle) acknowledgeStartBefore(ctx context.Context, claim l1.Claim, notAfter time.Time) error {
 	client, clock := lifecycle.dependencies.client, lifecycle.dependencies.clock
 	request := l1.StartedRequest{FencingToken: claim.Lease.FencingToken}
-	if claim.Lease.LeaseTTL <= 0 {
-		// A claim without a lease window gets one answer and no retry.
+	// A claim without a lease window gets one answer and no retry.
+	retry := claim.Lease.LeaseTTL > 0
+	var deadline time.Time
+	err := fmt.Errorf("no L1 verdict within the %s lease window", claim.Lease.LeaseTTL)
+	if retry {
+		deadline = clock.Now().Add(claim.Lease.LeaseTTL)
+	}
+	if !notAfter.IsZero() && (deadline.IsZero() || notAfter.Before(deadline)) {
+		deadline = notAfter
+		err = errors.New("no L1 verdict within the attempt's admission window")
+	}
+	if deadline.IsZero() {
 		_, err := client.StartAttempt(ctx, claim.Job.JobID, claim.Lease.AttemptID, request)
 		return startAcknowledgementOutcome(err)
 	}
-	deadline := clock.Now().Add(claim.Lease.LeaseTTL)
 	retryDelay := lifecycle.dependencies.completionRetry
 	if retryDelay <= 0 {
 		retryDelay = DefaultLogRetryInterval
 	}
-	err := fmt.Errorf("no L1 verdict within the %s lease window", claim.Lease.LeaseTTL)
 	for retried := false; ; retried = true {
 		remaining := deadline.Sub(clock.Now())
 		if remaining <= 0 {
@@ -933,7 +995,7 @@ func (lifecycle *attemptLifecycle) acknowledgeStart(ctx context.Context, claim l
 		_, err = client.StartAttempt(requestContext, claim.Job.JobID, claim.Lease.AttemptID, request)
 		cancelRequest()
 		err = startAcknowledgementOutcome(err)
-		if err == nil || ctx.Err() != nil || !startAcknowledgementUndecided(err) {
+		if err == nil || ctx.Err() != nil || !startAcknowledgementUndecided(err) || !retry {
 			return err
 		}
 		remaining = deadline.Sub(clock.Now())
@@ -1061,9 +1123,17 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		request.OCIImageReady = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
 		}
+		admissionWindow := &ociAdmissionWindow{clock: lifecycle.dependencies.clock}
+		request.OCIAdmissionBudget = admissionWindow.open
 		if deadmanAdmission != nil {
 			admitDeadman := deadmanAdmission.admit
 			request.OCIHelperAdmitted = func(generation workloadrunner.RuntimeGeneration) error {
+				// Admission forwards L1 renewal evidence to the helper. After
+				// the window the helper may have expired this attempt, and a
+				// renewal for it would invalidate the whole helper session.
+				if err := admissionWindow.check(); err != nil {
+					return err
+				}
 				if err := admitDeadman(generation); err != nil {
 					return err
 				}
@@ -1118,7 +1188,8 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			// committed, nor the retry that recovers a lost one: L1 still
 			// arbitrates cancel-before-start versus durable-start replay. The
 			// observation is bounded by one operation, the acknowledgement by
-			// its lease window.
+			// its lease window and the helper's admission window, whichever
+			// ends first.
 			observationContext, acknowledgementContext := startContext, startContext
 			if claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.client != nil {
 				acknowledgementContext = context.WithoutCancel(startContext)
@@ -1131,9 +1202,19 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			}
 			// A lost answer to a committed Started is retried into L1's replay.
 			// Without that, the adapter would stop a payload L1 records as
-			// running and report a spawn_error L1 can never accept.
-			if err := lifecycle.acknowledgeStart(acknowledgementContext, claim); err != nil {
+			// running and report a spawn_error L1 can never accept. The retry
+			// never outlives the helper's admission window: once it closes,
+			// no verdict is the same as a refusal.
+			if err := lifecycle.acknowledgeStartBefore(acknowledgementContext, claim, admissionWindow.deadline()); err != nil {
+				if windowErr := admissionWindow.check(); windowErr != nil {
+					return fmt.Errorf("acknowledge OCI Started: %w: %w", windowErr, err)
+				}
 				return fmt.Errorf("acknowledge OCI Started: %w", err)
+			}
+			// An acceptance that arrives after the window is too late for the
+			// helper: this attempt is lost and is never admitted.
+			if err := admissionWindow.check(); err != nil {
+				return fmt.Errorf("acknowledge OCI Started: L1 accepted the start too late: %w", err)
 			}
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
 			return nil

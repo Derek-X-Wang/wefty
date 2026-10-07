@@ -320,8 +320,12 @@ The OCI `Started` acknowledgement, sent after the helper proves payload start
 and before the agent admits the attempt or reports it running, follows the
 same answer rule: an answer that never arrived or a 5xx other than 501 is
 retried within one lease window, so a lost answer to a committed start gets
-its replay and the attempt proceeds as started. A refusal, or no verdict within
-the window, stops the payload as a refused post-start mutation. A one-shot's
+its replay and the attempt proceeds as started. The retry also ends with the
+attempt's helper admission window (`agent-local-lifecycle.md`), which closes
+before the helper's initial deadman can expire the attempt. A refusal, no
+verdict within either window, or an acceptance after the admission window
+stops the payload as a refused post-start mutation; the late case is never
+admitted for deadman renewal. A one-shot's
 acknowledgement and its retries are not abandoned when the attempt is
 canceled; L1 arbitrates a pending cancel against an earlier durable start.
 

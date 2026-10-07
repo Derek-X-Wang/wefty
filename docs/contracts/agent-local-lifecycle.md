@@ -959,7 +959,15 @@ boundary described in [OCI helper protocol](oci-helper-protocol.md). The agent
 refreshes an attempt's helper deadman only after the matching L1 lease renewal
 succeeds and helper `Run` has admitted that exact attempt. Renewals during image
 delivery remain pending in the agent and the latest is queued only after every
-helper Started-evidence check and the fenced L1 `StartAttempt` succeed. The
+helper Started-evidence check and the fenced L1 `StartAttempt` succeed, and
+only inside the attempt's admission window. The helper arms `Run`'s initial
+deadman when it reserves the attempt and rejects a renewal for an attempt it
+has already expired by invalidating the whole session. So just before `Run` the
+adapter opens the window, on the agent's clock: the initial deadman less one
+helper heartbeat timeout, the most a queued renewal waits to reach the helper
+(half the deadman when it is shorter than two heartbeat timeouts). After the
+window closes the agent never admits the attempt and never forwards its
+pending renewal; the attempt stops as a refused start, and L1 settles it. The
 queued value retains its absolute monotonic L1 expiry; the heartbeat client
 derives its relative TTL only when the queued heartbeat is flushed, and drops
 an expiry already reached at that edge. It therefore never extends helper
@@ -980,10 +988,13 @@ agent replays the observation, performs fenced L1 `StartAttempt`, and only after
 both succeed marks its local observer running. `StartAttempt` is idempotent, so
 an answer that never arrived (a transport failure or timeout) or a 5xx other
 than 501 is retried at the completion retry interval within one lease window,
-as for a process start: a lost answer to a committed start gets L1's replay
-and the attempt proceeds as started. Any other status is L1's verdict even
-with an unreadable body; a 2xx is the committed start. A refusal, or no verdict
-within the window, is a refused post-start mutation. Lease renewal, log append, and
+as for a process start, and never past the attempt's admission window: a lost
+answer to a committed start gets L1's replay and the attempt proceeds as
+started. Any other status is L1's verdict even with an unreadable body; a 2xx
+is the committed start. A refusal, or no verdict within either window, is a
+refused post-start mutation, and so is an acceptance that arrives after the
+admission window closed: the helper may already have expired the attempt, so
+it is lost rather than admitted. Lease renewal, log append, and
 completion remain incapable of implicitly promoting the attempt. If the
 pre-Run observation is refused, no runtime resource is created; if either
 post-start mutation is refused for a service, the adapter kills and verifies

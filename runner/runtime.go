@@ -476,6 +476,16 @@ type Request struct {
 	// evidence, every Started validation succeeded, and the exact attempt is now
 	// eligible for deadman renewals in the named helper generation.
 	OCIHelperAdmitted func(RuntimeGeneration) error
+	// OCIAdmissionBudget is called immediately before the helper is asked to
+	// Run the attempt, with how long from that moment the attempt may still be
+	// admitted for deadman renewal. The helper arms InitialDeadman when it
+	// reserves the attempt, after this call, and a renewal needs up to the
+	// helper's heartbeat timeout to reach it; the budget leaves that margin.
+	// Past it the helper may already have expired the attempt, and a renewal
+	// for an expired attempt invalidates the whole helper session. The agent
+	// therefore ends the Started acknowledgement within the budget and never
+	// admits the attempt after it.
+	OCIAdmissionBudget func(time.Duration)
 	// OCIRuntimeUnavailable reports helper/session or engine loss to the agent.
 	// The agent performs recovery later under its finalization context. L1
 	// transport failures must not call this hook.
