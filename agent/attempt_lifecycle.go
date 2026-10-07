@@ -1153,7 +1153,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		// The hook only begins the acknowledgement: both process runners arm
 		// their supervision limits after it returns, and those limits must hold
 		// while L1 has not answered. A refusal cancels the payload through the
-		// runner's ordinary termination path.
+		// runner's ordinary termination path. Until L1 accepts, the attempt is
+		// not running: readiness is held, so nothing is reported serving or
+		// published and the front door forwards nothing.
 		request.Started = func() {
 			processStart.begin(func() error {
 				if lifecycle.dependencies.client == nil {
@@ -1170,6 +1172,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 					cancelStart(err)
 					return err
 				}
+				processStart.accept()
 				if localStarted != nil {
 					localStarted()
 				}
@@ -1689,6 +1692,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, startupSatisfied, false)
 			},
 			onForwarding: func(ready bool) {
+				// Teardown withdraws forwarding even when it never began; a
+				// start L1 has not accepted must not read as running then.
+				if processStart != nil && !processStart.accepted.Load() {
+					return
+				}
 				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, true, ready)
 			},
 		}
@@ -1703,8 +1711,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				return err
 			}
 		}
+		serviceRuntime := runtimeAdapter
+		if processStart != nil {
+			serviceRuntime = startGatedRuntime{WorkloadRuntime: runtimeAdapter, acknowledgement: processStart}
+		}
 		result, runErr = runPortfulService(
-			ctx, runtimeAdapter, request, sink, publishedListener, endpoint, config,
+			ctx, serviceRuntime, request, sink, publishedListener, endpoint, config,
 		)
 	} else {
 		runtimeResult, err := runtimeAdapter.Run(ctx, request, sink)
@@ -1727,6 +1739,74 @@ type pendingStartAcknowledgement struct {
 	finished bool
 	running  sync.WaitGroup
 	err      error
+
+	// The runner's readiness reports wait here until L1 accepts the start.
+	// Each report is absolute, so only the latest is held.
+	readinessMu sync.Mutex
+	// accepted is read without readinessMu: delivering held readiness reaches
+	// the publication controller, whose forwarding callback reads it.
+	accepted atomic.Bool
+	ended    bool
+	deliver  func(startupSatisfied, ready bool)
+	held     *readinessReport
+}
+
+type readinessReport struct{ startupSatisfied, ready bool }
+
+// gateReadiness returns the readiness callback the runner sees: it reaches
+// deliver only after L1 accepts the start, and never after the run ends.
+func (acknowledgement *pendingStartAcknowledgement) gateReadiness(deliver func(startupSatisfied, ready bool)) func(startupSatisfied, ready bool) {
+	if deliver == nil {
+		return nil
+	}
+	acknowledgement.readinessMu.Lock()
+	acknowledgement.deliver = deliver
+	acknowledgement.readinessMu.Unlock()
+	return func(startupSatisfied, ready bool) {
+		acknowledgement.readinessMu.Lock()
+		defer acknowledgement.readinessMu.Unlock()
+		switch {
+		case acknowledgement.ended:
+		case acknowledgement.accepted.Load():
+			deliver(startupSatisfied, ready)
+		default:
+			acknowledgement.held = &readinessReport{startupSatisfied: startupSatisfied, ready: ready}
+		}
+	}
+}
+
+// accept records L1's acceptance and applies the readiness held until now.
+func (acknowledgement *pendingStartAcknowledgement) accept() {
+	acknowledgement.readinessMu.Lock()
+	defer acknowledgement.readinessMu.Unlock()
+	acknowledgement.accepted.Store(true)
+	if held := acknowledgement.held; held != nil && !acknowledgement.ended && acknowledgement.deliver != nil {
+		acknowledgement.deliver(held.startupSatisfied, held.ready)
+	}
+	acknowledgement.held = nil
+}
+
+// endReadiness drops held readiness once the run has returned: a refused or
+// unanswered start never reaches serving or publication.
+func (acknowledgement *pendingStartAcknowledgement) endReadiness() {
+	acknowledgement.readinessMu.Lock()
+	acknowledgement.ended = true
+	acknowledgement.held = nil
+	acknowledgement.readinessMu.Unlock()
+}
+
+// startGatedRuntime gives the runner a readiness callback gated on L1
+// accepting the process start. It wraps only Run, so it is handed only to the
+// portful service supervisor, whose sole use of the runtime is Run.
+type startGatedRuntime struct {
+	WorkloadRuntime
+	acknowledgement *pendingStartAcknowledgement
+}
+
+func (runtime startGatedRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	request.ReadinessChanged = runtime.acknowledgement.gateReadiness(request.ReadinessChanged)
+	defer runtime.acknowledgement.endReadiness()
+	return runtime.WorkloadRuntime.Run(ctx, request, sink)
 }
 
 func (acknowledgement *pendingStartAcknowledgement) begin(acknowledge func() error) {

@@ -292,7 +292,10 @@ through the fenced `/started` endpoint after successful spawn and guardian
 ownership. That acknowledgement durably sets the attempt's start marker even
 when renewal already advanced its state. The acknowledgement runs alongside
 the payload, whose supervision limits (maximum runtime among them) stay
-enforced while it is pending. An answer that never arrived (a transport failure
+enforced while it is pending. Until L1 accepts it the attempt is not running:
+the agent holds the latest readiness report, so a service is never reported
+running or serving, never published, and its front door forwards nothing; the
+held report applies on acceptance. An answer that never arrived (a transport failure
 or timeout) or a 5xx other than 501 is not a refusal: L1 may already have
 committed the start, so the agent retries the identical request at its
 completion retry interval within one lease window, every request and wait

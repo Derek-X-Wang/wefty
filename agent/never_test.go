@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -266,6 +267,148 @@ func TestNeverProcessMaxRuntimeHoldsWhileStartUndecided(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if calls.Load() != settled {
 		t.Fatal("start acknowledgement kept retrying after its attempt ended")
+	}
+}
+
+// A portful never service whose backend is ready while L1 keeps answering the
+// start acknowledgement with 503. The held readiness reports nothing running
+// or serving, publishes nothing and forwards nothing. If L1 then accepts, the
+// held readiness applies: the service serves, is published and forwards. If L1
+// refuses, the payload stops and nothing was ever published.
+func TestNeverPortfulServiceWaitsForStartAcceptance(t *testing.T) {
+	for _, accept := range []bool{true, false} {
+		t.Run(map[bool]string{true: "accepted", false: "refused"}[accept], func(t *testing.T) {
+			var startCalls atomic.Int32
+			var published atomic.Bool
+			answer := make(chan struct{})
+			client, closeServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/started"):
+					startCalls.Add(1)
+					select {
+					case <-answer:
+						if accept {
+							_ = json.NewEncoder(w).Encode(l1.Job{JobID: "job", State: contract.JobRunning})
+							return
+						}
+						w.WriteHeader(http.StatusConflict)
+						_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorStaleFence, Message: "lost fence"}})
+					default:
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: "busy"}})
+					}
+				case strings.HasSuffix(r.URL.Path, "/publication"):
+					var request l1.PublicationRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					if request.Ready != nil && *request.Ready {
+						published.Store(true)
+					}
+					_ = json.NewEncoder(w).Encode(l1.Job{JobID: "job", State: contract.JobRunning})
+				default:
+					t.Errorf("unexpected L1 call %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}), time.Second)
+			defer closeServer()
+			defer client.Close()
+			backend, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer backend.Close()
+			go serveTestEcho(backend)
+			frontDoor, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			reported, release := make(chan struct{}), make(chan struct{})
+			executor := directiveContinuationRunner(func(ctx context.Context, req processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+				req.Started()
+				// The guardian finds the backend ready before L1 has answered.
+				req.ReadinessChanged(true, true)
+				close(reported)
+				select {
+				case <-release:
+					zero := 0
+					return contract.ProcessResult{ExitCode: &zero}, nil
+				case <-ctx.Done():
+					return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
+				}
+			})
+			lifecycle, observer := neverProcessLifecycle(t, client, systemClock{}, executor)
+			lifecycle.dependencies.reservePublishedPort = func(l1.Claim) (net.Listener, *contract.SpawnFailure) { return frontDoor, nil }
+			lifecycle.dependencies.prepareServiceEndpoint = func(context.Context) (serviceRuntimeEndpoint, error) {
+				dialer := &net.Dialer{}
+				return serviceRuntimeEndpoint{address: backend.Addr().String(), dial: func(ctx context.Context) (net.Conn, error) {
+					return dialer.DialContext(ctx, "tcp4", backend.Addr().String())
+				}}, nil
+			}
+			claim := neverProcessClaim(t, time.Minute, nil, "/bin/true", "true")
+			port := 8080
+			claim.Job.Spec.PublishedPort = &port
+			done := make(chan error, 1)
+			go func() {
+				_, err := lifecycle.runWorkload(t.Context(), claim)
+				done <- err
+			}()
+			select {
+			case <-reported:
+			case <-time.After(5 * time.Second):
+				t.Fatal("runner never reported readiness")
+			}
+			state := func() AttemptLifecycleState {
+				return observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts["attempt"].State
+			}
+			unpublished := func() {
+				t.Helper()
+				if got := state(); got == AttemptRunning || got == AttemptServing {
+					t.Fatalf("attempt state = %s before L1 accepted the start", got)
+				}
+				if published.Load() {
+					t.Fatal("published before L1 accepted the start")
+				}
+				if publishedEchoForwarded(frontDoor.Addr().String()) {
+					t.Fatal("front door forwarded before L1 accepted the start")
+				}
+			}
+			holdUntil, giveUp := time.Now().Add(300*time.Millisecond), time.Now().Add(5*time.Second)
+			for time.Now().Before(holdUntil) || startCalls.Load() < 2 {
+				if time.Now().After(giveUp) {
+					t.Fatalf("start acknowledgement calls = %d, want undecided retries", startCalls.Load())
+				}
+				unpublished()
+				time.Sleep(10 * time.Millisecond)
+			}
+			close(answer)
+			if !accept {
+				select {
+				case err := <-done:
+					if err == nil || !strings.Contains(err.Error(), "acknowledge process start") {
+						t.Fatalf("refused portful service = %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("refused start left the payload running")
+				}
+				unpublished()
+				return
+			}
+			waitForPublishedEcho(t, frontDoor.Addr().String(), true)
+			if got := state(); !published.Load() || got != AttemptServing {
+				t.Fatalf("after acceptance: published = %t, attempt state = %s", published.Load(), got)
+			}
+			close(release)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("accepted portful service = %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("portful service did not finish")
+			}
+		})
 	}
 }
 
