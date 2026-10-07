@@ -46,7 +46,7 @@ var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
 
 func isTypedExitCLIArgs(args []string) bool {
 	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
-		len(commandArgs) >= 1 && commandArgs[0] == "jobs" {
+		len(commandArgs) >= 1 && (commandArgs[0] == "jobs" || commandArgs[0] == "computers") {
 		return true
 	}
 	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
@@ -450,11 +450,12 @@ Commands:
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
     [--reference REFERENCE]  Name an archive whose export named no artifact
-  nodes list                 List node facts and legal operator actions
+  nodes list                 List node facts with filters, --cursor, --limit, --all
   nodes inspect NODE_ID      Read one node and its resident attempts
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   jobs list                  List readable jobs with filters and cursor paging
     [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
+  computers list             List Computers with --cursor, --limit, --all
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]

@@ -39,6 +39,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeAdmin(ctx, clients, jsonOutput, args[1:], stdout)
 	case "admins":
 		return executeAdmins(ctx, clients, jsonOutput, args[1:], stdout)
+	case "computers":
+		return executeComputers(ctx, clients, jsonOutput, args[1:], stdout)
 	case "nodes":
 		return executeNodes(ctx, clients, jsonOutput, args[1:], stdout)
 	case "jobs":
@@ -341,15 +343,8 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 }
 
 func executeNodes(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) == 1 && args[0] == "list" {
-		result, err := clients.listNodes(ctx)
-		if err != nil {
-			return err
-		}
-		if jsonOutput {
-			return writeJSON(stdout, result)
-		}
-		return writeNodesTable(stdout, result.Nodes)
+	if len(args) > 0 && args[0] == "list" {
+		return executeNodesList(ctx, clients, jsonOutput, args[1:], stdout)
 	}
 	if len(args) == 2 && args[0] == "inspect" {
 		node, err := clients.getNode(ctx, args[1])
@@ -364,7 +359,7 @@ func executeNodes(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	if len(args) > 0 && args[0] == "set-claims" {
 		return executeSetNodeClaims(ctx, clients, jsonOutput, args[1:], stdout)
 	}
-	return usageError("usage: wefty nodes list | wefty nodes inspect NODE_ID | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
+	return usageError("usage: wefty nodes list [--state STATE] [--claims-enabled BOOL] [--capability KEY] [--cursor CURSOR] [--limit N] [--all] | wefty nodes inspect NODE_ID | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
 }
 
 func executeSetNodeClaims(

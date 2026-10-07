@@ -503,7 +503,8 @@ type ServiceImageReconciliationFailureRequest struct {
 
 // NodeList is the L1 client representation of the operator-visible fleet.
 type NodeList struct {
-	Nodes []Node `json:"nodes"`
+	Nodes      []Node `json:"nodes"`
+	NextCursor string `json:"next_cursor"`
 }
 
 // ProcessResult matches the M0 completion contract. Pointer fields preserve
