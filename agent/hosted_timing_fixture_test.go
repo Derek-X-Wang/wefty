@@ -18,6 +18,14 @@ import (
 // hang guard, scaled for SQLite instrumentation under -race.
 const hostedFixtureTimeout = DefaultFinalizationTimeout * raceTimeoutScale
 
+// hostedHeartbeatInterval is the heartbeat interval of a fixture's OCI helper
+// client. The client gives each heartbeat round trip one interval and reads a
+// miss as helper-session loss, so it keeps production's third of the helper's
+// heartbeat timeout. At 20 ms a starved hosted runner missed one round trip
+// and dropped a healthy session (#701). Renewals do not wait for the interval:
+// the pump flushes each one as it is queued.
+const hostedHeartbeatInterval = hostedFixtureTimeout / 3
+
 func awaitFixtureCondition(parent context.Context, phase string, ready func() bool) error {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(parent, hostedFixtureTimeout)
