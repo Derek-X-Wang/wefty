@@ -1366,6 +1366,16 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.migrateBackupDigestConstraint(ctx); err != nil {
 		return err
 	}
+	// Create these after the Backup table migration, which can rebuild it.
+	// The leading ownership columns index all history reads; status and copy
+	// ID additionally bound operator decisions to retained/available records
+	// and avoid sorting copies. Removed copies need an unconditional index.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS backups_computer_status
+		ON backups(computer_id, status, backup_id);
+		CREATE INDEX IF NOT EXISTS backup_copies_backup_id
+		ON backup_copies(backup_id, copy_id);`); err != nil {
+		return fmt.Errorf("l1: ensure Backup ownership indexes: %w", err)
+	}
 	if err := s.migrateOwedRevocationSettlementConstraint(ctx); err != nil {
 		return err
 	}

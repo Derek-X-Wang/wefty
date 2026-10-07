@@ -694,12 +694,12 @@ func writeComputerProjection(writer io.Writer, computer computerOperatorProjecti
 
 func writeComputersTable(writer io.Writer, computers []computerOperatorProjection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tLAST GROW\tACTIVE CAPACITY FAILURE\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tOWED REVOCATIONS\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
+	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tLAST GROW\tACTIVE CAPACITY FAILURE\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tOWED REVOCATIONS\tMUTATION APPLIED\tIDEMPOTENT REPLAY\tLAST CONDITION\tALLOWED ACTIONS"); err != nil {
 		return err
 	}
 	for _, computer := range computers {
 		job := computer.CurrentJob
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			computer.ComputerID, computer.Name, computer.DesiredState, job.State,
 			computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 			computer.ReconfigurationPhase, computer.CurrentJobID, valueOrNA(job.CurrentAttemptID),
@@ -710,7 +710,7 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 			computer.ControllerTenure,
 			jsonOrNA(job.LastFailure), computerRemovalColumn(computer.RemovalOutcome, job.Removal),
 			computerOwedRevocationsColumn(computer.OwedRevocations), boolPointerOrNA(computer.MutationApplied),
-			boolPointerOrNA(computer.IdempotentReplay)); err != nil {
+			boolPointerOrNA(computer.IdempotentReplay), computerConditionColumn(computer.LastCondition), computerActionsColumn(computer.AllowedActions)); err != nil {
 			return err
 		}
 	}
@@ -777,4 +777,20 @@ func boolPointerOrNA(value *bool) string {
 		return "N/A"
 	}
 	return strconv.FormatBool(*value)
+}
+
+func computerConditionColumn(condition *contract.Condition) string {
+	if condition == nil {
+		return "none"
+	}
+	data, _ := json.Marshal(condition)
+	return string(data)
+}
+
+func computerActionsColumn(actions []contract.AllowedAction) string {
+	if len(actions) == 0 {
+		return "[]"
+	}
+	data, _ := json.Marshal(actions)
+	return string(data)
 }

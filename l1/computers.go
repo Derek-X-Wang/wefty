@@ -121,6 +121,10 @@ type Computer struct {
 	SubmitMaxInflight       int                          `json:"submit_max_inflight"`
 	SubmitPolicyRevision    int64                        `json:"submit_policy_revision"`
 	RemovalOutcome          string                       `json:"removal_outcome,omitempty"`
+	// Actions are projected per HTTP caller; trusted Store reads do not grant
+	// client authority. LastCondition uses existing recorded Computer evidence.
+	AllowedActions []contract.AllowedAction `json:"allowed_actions"`
+	LastCondition  *contract.Condition      `json:"last_condition"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
 	DisplayEndpoint  *string                             `json:"display_endpoint"`
@@ -568,7 +572,12 @@ func (s *Store) GetComputer(ctx context.Context, computerID string) (Computer, e
 	if strings.TrimSpace(computerID) == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
-	computer, err := readComputerAuthority(ctx, s.db, computerID, canonicalTime(s.clock.Now()))
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Computer{}, internalError(err, "begin Computer read")
+	}
+	defer tx.Rollback()
+	computer, err := readComputerAuthority(ctx, tx, computerID, canonicalTime(s.clock.Now()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
@@ -610,6 +619,10 @@ func decodeComputerCursor(value string) (computerCursor, error) {
 // immutable Job projections. computer_id and current_job_id therefore remain
 // visibly distinct on every row.
 func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int) (ComputerList, error) {
+	return s.listComputersForCaller(ctx, cursorValue, limit, nil)
+}
+
+func (s *Store) listComputersForCaller(ctx context.Context, cursorValue string, limit int, actor *computerActionActor) (ComputerList, error) {
 	if limit < 1 || limit > MaxJobPageLimit {
 		return ComputerList{}, protocolError(contract.ErrorInvalidRequest,
 			"limit must be between 1 and %d", MaxJobPageLimit)
@@ -618,14 +631,14 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 	if err != nil {
 		return ComputerList{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return ComputerList{}, internalError(err, "begin Computer list snapshot")
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT computer_id, created_ns FROM computers
-		WHERE created_ns>? OR (created_ns=? AND computer_id>?)
-		ORDER BY created_ns, computer_id LIMIT ?`, cursor.CreatedNS, cursor.CreatedNS, cursor.ComputerID, limit+1)
+		WHERE (created_ns, computer_id) > (?, ?)
+		ORDER BY created_ns, computer_id LIMIT ?`, cursor.CreatedNS, cursor.ComputerID, limit+1)
 	if err != nil {
 		return ComputerList{}, internalError(err, "list Computer IDs")
 	}
@@ -658,6 +671,12 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 		computer, err := readComputerAuthority(ctx, tx, item.computerID, s.clock.Now().UTC())
 		if err != nil {
 			return ComputerList{}, err
+		}
+		if actor != nil {
+			computer, err = projectComputerForCallerTx(ctx, tx, computer, *actor)
+			if err != nil {
+				return ComputerList{}, err
+			}
 		}
 		page.Computers = append(page.Computers, computer)
 	}
@@ -881,11 +900,11 @@ func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, req
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer Backup cap target")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, protocolError(contract.ErrorConflict, "Computer %q is not stable", computerID)
+	if err := computerBackupCapDecision(ctx, tx, computer, request); err != nil {
+		return Computer{}, err
 	}
 	if computer.BackupCap == request.BackupCap {
 		return computer, nil
@@ -1043,30 +1062,18 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer desired-state target")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
-	}
-	backupStopWins := computer.ReconfigurationPhase == ComputerReconfigurationBackingUp &&
-		request.DesiredState == contract.ServiceDesiredStopped
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable && !backupStopWins {
-		return Computer{}, protocolError(contract.ErrorConflict,
-			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
-	}
-	if request.DesiredState == contract.ServiceDesiredRunning {
-		if err := requireCurrentComputerStorage(ctx, tx, computer, "start"); err != nil {
-			return Computer{}, err
-		}
-	}
-	if request.DesiredState == contract.ServiceDesiredRunning && computer.CurrentJob.State == contract.JobFailed {
-		return Computer{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
-			"computer_id": computerID, "required_operation": "restart",
-		}, "Computer %q is latched failed; use POST /v1/computers/%s/restart", computerID, computerID)
+	backupStopWins, err := computerDesiredDecision(ctx, tx, computer, request)
+	if err != nil {
+		return Computer{}, err
 	}
 	if computer.DesiredState == request.DesiredState {
 		return computer, nil
+	}
+	if err := computerServiceDesiredDecision(ctx, tx, computer.CurrentJob, request.DesiredState); err != nil {
+		return Computer{}, err
 	}
 	// Read before the stop moves the Job or clears its current attempt.
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
@@ -1126,31 +1133,15 @@ func setComputerServiceDesiredState(
 	desired contract.ServiceDesiredState,
 	now time.Time,
 ) error {
-	if job.ServiceJob == nil {
-		return internalError(errors.New("Computer current Job is not a service"), "apply Computer desired state")
+	if err := computerServiceDesiredDecision(ctx, tx, job, desired); err != nil {
+		return err
 	}
 	switch desired {
 	case contract.ServiceDesiredRunning:
-		switch job.State {
-		case contract.JobFailed:
-			return protocolError(contract.ErrorConflict, "Computer Job %q is latched failed; restart is required", job.JobID)
-		case contract.JobStopped:
-			if !job.HoldsSlot(job.State) {
-				if err := ensureBoundServiceCapacity(ctx, tx, job); err != nil {
-					return err
-				}
-			}
+		if job.State == contract.JobStopped {
 			if err := transitionServiceJob(ctx, tx, job.JobID, desired, contract.JobQueued, now); err != nil {
 				return err
 			}
-		case contract.JobStopping:
-			return protocolError(contract.ErrorConflict, "Computer Job %q is still stopping", job.JobID)
-		case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
-			if job.DesiredState != contract.ServiceDesiredRunning {
-				return protocolError(contract.ErrorConflict, "Computer Job %q has inconsistent desired state", job.JobID)
-			}
-		default:
-			return protocolError(contract.ErrorConflict, "Computer Job %q cannot start from %q", job.JobID, job.State)
 		}
 	case contract.ServiceDesiredStopped:
 		switch job.State {
@@ -1173,12 +1164,7 @@ func setComputerServiceDesiredState(
 				published_attempt_id=NULL, healthy_since_ns=NULL WHERE job_id=?`, desired, job.JobID); err != nil {
 				return internalError(err, "stop latched Computer Job")
 			}
-		case contract.JobStopping, contract.JobStopped:
-			if job.DesiredState != contract.ServiceDesiredStopped {
-				return protocolError(contract.ErrorConflict, "Computer Job %q has inconsistent desired state", job.JobID)
-			}
-		default:
-			return protocolError(contract.ErrorConflict, "Computer Job %q cannot stop from %q", job.JobID, job.State)
+
 		}
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET next_restart_at=NULL WHERE job_id=?", job.JobID); err != nil {
@@ -1244,36 +1230,16 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, internalError(err, "read Computer restart replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
-	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
-	}
-	if err := requireCurrentComputerStorage(ctx, tx, computer, "restart"); err != nil {
+	activeResourceRestart, err := computerRestartDecision(ctx, tx, computer, request)
+	if err != nil {
 		return Computer{}, false, err
 	}
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
 	if err != nil {
 		return Computer{}, false, err
-	}
-	var latchedFailure contract.SpawnFailure
-	activeResourceRestart := (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning) &&
-		json.Unmarshal(computer.CurrentJob.LastFailure, &latchedFailure) == nil &&
-		(latchedFailure.Code == contract.SpawnFailureInsufficientDisk || latchedFailure.Code == contract.SpawnFailureInsufficientMemory)
-	if computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed && !activeResourceRestart {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q can restart only from stopped, failed, or an active insufficient-resource latch, not %q",
-			computerID, computer.CurrentJob.State)
-	}
-	if !activeResourceRestart && !computer.CurrentJob.HoldsSlot(computer.CurrentJob.State) {
-		if err := ensureBoundServiceCapacity(ctx, tx, computer.CurrentJob); err != nil {
-			return Computer{}, false, err
-		}
 	}
 	nextRevision := computer.IntentRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?, updated_ns=?
@@ -1355,23 +1321,14 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer removal target")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return computer, nil
 	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable &&
-		computer.ReconfigurationPhase != ComputerReconfigurationProjecting &&
-		computer.ReconfigurationPhase != ComputerReconfigurationResetting &&
-		computer.ReconfigurationPhase != ComputerReconfigurationBackingUp &&
-		computer.ReconfigurationPhase != ComputerReconfigurationRestoring &&
-		computer.ReconfigurationPhase != ComputerReconfigurationCloning &&
-		computer.ReconfigurationPhase != ComputerReconfigurationExporting &&
-		computer.ReconfigurationPhase != ComputerReconfigurationReimaging &&
-		computer.ReconfigurationPhase != ComputerReconfigurationGrowing {
-		return Computer{}, protocolError(contract.ErrorConflict,
-			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
+	if err := computerRemoveDecision(ctx, tx, computer, request); err != nil {
+		return Computer{}, err
 	}
 	// Read before the removal marks these attempts lost.
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
@@ -1459,12 +1416,9 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		contract.ServiceDesiredStopped, computer.CurrentJobID); err != nil {
 		return Computer{}, internalError(err, "withdraw Computer service projection")
 	}
-	boundNodeID := computer.CurrentJob.BoundNodeID
-	if computer.BoundNodeID != boundNodeID {
-		return Computer{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
-			"computer_id": computerID, "computer_bound_node_id": computer.BoundNodeID,
-			"job_bound_node_id": boundNodeID,
-		}, "Computer %q and current Job binding diverged", computerID)
+	boundNodeID, rootInstanceID, err := computerRemovalBindingDecision(ctx, tx, computer)
+	if err != nil {
+		return Computer{}, err
 	}
 	if boundNodeID == "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, fence_counter=fence_counter+1,
@@ -1472,17 +1426,6 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			return Computer{}, internalError(err, "finalize never-bound Computer Job removal")
 		}
 	} else {
-		var rootInstanceID string
-		if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return Computer{}, protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
-			}
-			return Computer{}, internalError(err, "read Computer removal managed-root authority")
-		}
-		if strings.TrimSpace(rootInstanceID) == "" {
-			return Computer{}, protocolError(contract.ErrorConflict,
-				"bound node %q has no registered managed-root instance", boundNodeID)
-		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, fence_counter=fence_counter+1,
 			updated_ns=? WHERE job_id=?`, contract.JobRemovalPending, now.UnixNano(), computer.CurrentJobID); err != nil {
 			return Computer{}, internalError(err, "foreclose Computer Job")
@@ -1671,7 +1614,7 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 		// the current digest is an explicit no-op and never creates a revision.
 		return computer, nil
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		// A retry while the same reimage is quiescing observes the preceding
 		// revision. The projection validator performs the exact replay check.
 		if computer.ReconfigurationPhase != ComputerReconfigurationReimaging ||
@@ -1679,10 +1622,8 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 			return Computer{}, err
 		}
 	}
-	if (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning ||
-		computer.CurrentJob.State == contract.JobStopping) && !request.TerminateSessions {
-		return Computer{}, protocolError(contract.ErrorConflict,
-			"running Computer reimage requires explicit take-over session termination")
+	if err := computerReimageSessionsDecision(computer, request.TerminateSessions); err != nil {
+		return Computer{}, err
 	}
 	nextSpec := computer.CurrentJob.Spec
 	nextOCI := *nextSpec.Execution.OCI
@@ -1765,26 +1706,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		}
 		return updated, nil
 	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, protocolError(contract.ErrorConflict,
-			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
-	}
-	// A projection's spec is the caller's, so it may not name a run (wefty
-	// #583). A reimage's is the stored Computer's own with only the image
-	// replaced, so it can introduce no claim the Computer did not already
-	// hold. Both follow the replay check above.
-	if operation == ComputerIntentProject {
-		if err := refuseComputerRunIdentity(request.Spec); err != nil {
-			return Computer{}, err
-		}
-	}
-	// Refused before any revision is reserved: a projection or reimage of a
-	// Computer with no published Storage commits a phase whose directive no
-	// helper can ever complete.
-	if err := requireCurrentComputerStorage(ctx, tx, computer, string(operation)); err != nil {
-		return Computer{}, err
-	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerProjectionDecision(ctx, tx, computer, request, operation); err != nil {
 		return Computer{}, err
 	}
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
@@ -1838,9 +1760,9 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		if boundNodeID == "" {
 			boundNodeID = computer.PlacementNodeID
 		}
-		var rootInstanceID string
-		if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
-			return Computer{}, protocolError(contract.ErrorConflict, "Computer reimage bound Node is unavailable")
+		rootInstanceID, err := computerReimageRootDecision(ctx, tx, computer)
+		if err != nil {
+			return Computer{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_reimage_operations(
 			computer_id, operation_revision, old_job_id, staging_job_id, storage_id, storage_generation,
@@ -1939,6 +1861,9 @@ func validatePendingComputerProjection(
 }
 
 func quiesceComputerProjectionTx(ctx context.Context, tx *sql.Tx, job Job, now time.Time) (bool, error) {
+	if err := computerProjectionQuiescenceDecision(job); err != nil {
+		return false, err
+	}
 	switch job.State {
 	case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
 		if err := setComputerServiceDesiredState(ctx, tx, job, contract.ServiceDesiredStopped, now); err != nil {
@@ -1979,8 +1904,8 @@ func (s *Store) finalizeComputerProjectionTx(ctx context.Context, tx *sql.Tx, co
 	if err != nil {
 		return internalError(err, "read quiesced Computer projection")
 	}
-	if currentJob.State != contract.JobStopped {
-		return protocolError(contract.ErrorConflict, "Computer %q has not quiesced its current Job", computer.ComputerID)
+	if err := computerProjectionPublicationDecision(computer.ComputerID, currentJob.State); err != nil {
+		return err
 	}
 	if phase == ComputerReconfigurationReimaging {
 		var preflightStatus string

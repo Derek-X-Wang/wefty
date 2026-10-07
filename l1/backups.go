@@ -243,46 +243,12 @@ func (s *Store) BeginComputerBackup(ctx context.Context, computerID string, requ
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer Backup replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRunning && !request.AllowPowerOff {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q is running; Backup creation requires explicit allow_power_off", computerID)
-	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
-	}
-	if computer.CurrentJob.State == contract.JobFailed {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q is latched failed; stop or restart it explicitly before Backup creation", computerID)
-	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
-	}
-	var retained int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status<>'pruned'`, computerID).Scan(&retained); err != nil {
-		return Computer{}, false, internalError(err, "count retained Computer Backups")
-	}
-	if computer.BackupCap == 0 || retained >= computer.BackupCap {
-		return Computer{}, false, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
-			"computer_id": computerID, "backup_cap": computer.BackupCap, "retained_backups": retained,
-		}, "Computer %q is at its Backup cap", computerID)
-	}
-	boundNodeID := computer.BoundNodeID
-	if boundNodeID == "" {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q has no bound source Node to back up", computerID)
-	}
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Computer{}, false, protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
-		}
-		return Computer{}, false, internalError(err, "read Computer Backup managed-root authority")
-	}
-	if rootInstanceID == "" {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "bound node %q has no registered managed-root instance", boundNodeID)
+	boundNodeID, rootInstanceID, err := computerBackupDecision(ctx, tx, computer, request)
+	if err != nil {
+		return Computer{}, false, err
 	}
 	nextRevision := computer.IntentRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET intent_revision=?, reconfiguration_phase=?,
@@ -735,24 +701,15 @@ func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string,
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return Backup{}, false, internalError(err, "read Computer Backup prune replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Backup{}, false, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase == ComputerReconfigurationRemoving {
-		return Backup{}, false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
-	}
-	backup, err := readBackup(ctx, tx, request.BackupID)
-	if errors.Is(err, sql.ErrNoRows) || backup.ComputerID != computerID {
-		return Backup{}, false, protocolError(contract.ErrorNotFound, "Backup %q was not found", request.BackupID)
-	}
+	backup, err := computerPruneDecision(ctx, tx, computer, request)
 	if err != nil {
-		return Backup{}, false, internalError(err, "read Computer Backup prune target")
+		return Backup{}, false, err
 	}
 	if backup.Status == "pruned" {
 		return backup, true, nil
-	}
-	if backup.Status != "available" || len(backup.Copies) != 1 || backup.Copies[0].Phase != "published" {
-		return Backup{}, false, protocolError(contract.ErrorConflict, "Backup %q is not available for pruning", request.BackupID)
 	}
 	cleanupFence := newID("backup-prune")
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_backup_prunes(computer_id, intent_revision,

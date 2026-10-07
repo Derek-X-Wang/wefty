@@ -185,38 +185,12 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer grow replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
-	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
-	}
-	// A grow mutates the current generation's image. With no published
-	// generation there is nothing to grow, and the helper would refuse the
-	// absent disk on every poll.
-	if err := requireCurrentComputerStorage(ctx, tx, computer, "resize"); err != nil {
+	boundNodeID, rootInstanceID, err := computerGrowDecision(ctx, tx, computer, request)
+	if err != nil {
 		return Computer{}, false, err
-	}
-	if request.DiskBytes <= computer.DesiredDiskBytes {
-		return Computer{}, false, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
-			"computer_id": computerID, "current_disk_bytes": computer.DesiredDiskBytes,
-			"requested_disk_bytes": request.DiskBytes,
-		}, "Computer resize is grow-only")
-	}
-	boundNodeID := computer.BoundNodeID
-	if boundNodeID == "" {
-		boundNodeID = computer.PlacementNodeID
-	}
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "bound node %q is unavailable", boundNodeID)
-	}
-	if rootInstanceID == "" {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "bound node has no managed-root instance")
 	}
 	nextRevision := computer.IntentRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET intent_revision=?, reconfiguration_phase=?,

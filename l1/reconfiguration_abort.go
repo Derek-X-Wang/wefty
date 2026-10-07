@@ -72,61 +72,12 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer reconfiguration abort replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != computer.IntentRevision {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q has no abortable reconfiguration authority", computerID)
-	}
-	switch computer.ReconfigurationPhase {
-	case ComputerReconfigurationBackingUp, ComputerReconfigurationResetting, ComputerReconfigurationReimaging,
-		ComputerReconfigurationGrowing, ComputerReconfigurationExporting, ComputerReconfigurationImporting:
-	default:
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q reconfiguration phase %q is not abortable", computerID, computer.ReconfigurationPhase)
-	}
-	boundNodeID := computer.BoundNodeID
-	if boundNodeID == "" {
-		boundNodeID = computer.CurrentJob.BoundNodeID
-	}
-	if boundNodeID == "" {
-		var query string
-		switch computer.ReconfigurationPhase {
-		case ComputerReconfigurationBackingUp:
-			query = `SELECT bound_node_id FROM computer_backup_operations WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationResetting:
-			query = `SELECT bound_node_id FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`
-		case ComputerReconfigurationReimaging:
-			query = `SELECT bound_node_id FROM computer_reimage_operations WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationGrowing:
-			query = `SELECT bound_node_id FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationExporting:
-			query = `SELECT bound_node_id FROM computer_custody_exports WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationImporting:
-			query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='import'`
-		}
-		if query != "" {
-			if err := tx.QueryRowContext(ctx, query, computerID, computer.IntentRevision).Scan(&boundNodeID); err != nil {
-				return Computer{}, false, internalError(err, "read aborted Computer operation binding")
-			}
-		}
-	}
-	if boundNodeID == "" {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q has no bound Node whose loss can authorize abort", computerID)
-	}
-	var nodeState contract.NodeState
-	if err := tx.QueryRowContext(ctx, `SELECT state FROM nodes WHERE node_id=?`, boundNodeID).Scan(&nodeState); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Computer{}, false, protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
-		}
-		return Computer{}, false, internalError(err, "read aborted Computer bound Node")
-	}
-	if nodeState != contract.NodeDead {
-		return Computer{}, false, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
-			"computer_id": computerID, "bound_node_id": boundNodeID, "node_state": nodeState,
-		}, "Computer reconfiguration abort requires a dead bound Node")
+	boundNodeID, err := computerAbortDecision(ctx, tx, computer, request)
+	if err != nil {
+		return Computer{}, false, err
 	}
 	abortedRevision := computer.IntentRevision
 	abortedPhase := computer.ReconfigurationPhase

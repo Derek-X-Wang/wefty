@@ -885,6 +885,7 @@
       "get": {
         "operationId": "listComputers",
         "summary": "List durable Computer authorities and their current Job observations",
+        "description": "Each page is a read-only snapshot including per-caller allowed_actions and the closest last_condition from recorded Computer evidence. Action preconditions use literal request fields. Path choices identify backup_id with in=path and consider only status=available Backup records, excluding pruned and pruning history. Person-only grant, submission and take-over verbs are omitted on this client-principal surface.",
         "parameters": [
           { "name": "cursor", "in": "query", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
@@ -946,6 +947,7 @@
       "get": {
         "operationId": "getComputer",
         "summary": "Read durable Computer intent and its current Job observation",
+        "description": "Returns the same per-caller Computer action and condition projection as the fleet listing in one read-only snapshot, including any selected historical operation.",
         "parameters": [
           { "name": "restore_operation_revision", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "description": "Also return that restore's own observed state as `restore_operation`, so a caller follows the restore it started rather than the Computer's latest operation. 404 when the Computer has no such restore." },
           { "name": "clone_operation_revision", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "description": "Also return that clone's own observed state as `clone_operation`, read in the same snapshot as the Computer, so a caller follows the clone that created this Computer rather than its latest operation or Job failure. 404 when the Computer has no such clone." }

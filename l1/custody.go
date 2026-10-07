@@ -193,28 +193,12 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return ComputerCustodyExport{}, false, internalError(replayErr, "read Custody export replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return ComputerCustodyExport{}, false, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return ComputerCustodyExport{}, false, protocolError(contract.ErrorConflict, "Computer %q cannot begin a Custody export", computerID)
-	}
-	backup, copy, err := readAvailableBackupCopy(ctx, tx, request.BackupID)
+	backup, copy, err := computerExportDecision(ctx, tx, computer, request)
 	if err != nil {
 		return ComputerCustodyExport{}, false, err
-	}
-	if backup.ComputerID != computerID || backup.SourceStorageID != computer.StorageID {
-		return ComputerCustodyExport{}, false, protocolError(contract.ErrorStorageReferenceConflict, "Backup %q does not belong to Computer %q Storage", backup.BackupID, computerID)
-	}
-	if copy.NodeID != computer.BoundNodeID || copy.RootInstanceID == "" {
-		return ComputerCustodyExport{}, false, protocolError(contract.ErrorConflict, "Custody export Backup is not on the Computer's bound Node")
-	}
-	var currentRoot string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRoot); err != nil {
-		return ComputerCustodyExport{}, false, internalError(err, "read Custody export managed-root identity")
-	}
-	if currentRoot == "" || currentRoot != copy.RootInstanceID {
-		return ComputerCustodyExport{}, false, protocolError(contract.ErrorConflict, "Custody export Backup belongs to a stale managed-root instance")
 	}
 	exportID := newID("custody-export")
 	revision := computer.IntentRevision + 1
