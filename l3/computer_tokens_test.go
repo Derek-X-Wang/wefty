@@ -160,10 +160,12 @@ func TestComputerRunProvenanceAndAtomicInflightLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := create("computer-root-1", "exit 0\n"); err == nil {
-		t.Fatal("cross-Computer idempotency replay unexpectedly succeeded")
-	} else if code, _ := errorDetails(err); code != contract.ErrorIdempotencyConflict {
-		t.Fatalf("cross-Computer idempotency replay error = %v", err)
+	foreignRun, replayed, err := create("computer-root-1", "exit 0\n")
+	if err != nil || replayed || foreignRun.RunID == first.RunID {
+		t.Fatalf("separate Computer key namespace = (%#v, %t, %v)", foreignRun, replayed, err)
+	}
+	if replay, replayed, err := create("computer-root-1", "exit 0\n"); err != nil || !replayed || replay.RunID != foreignRun.RunID {
+		t.Fatalf("foreign Computer own replay = (%#v, %t, %v)", replay, replayed, err)
 	}
 	scope = computerOneScope
 	trigger, err := store.GetTrigger(ctx, first.RunID)

@@ -23,16 +23,26 @@ than a selected subset. Any future request field must participate as well.
 `wefty rerun RUN_ID` derives `wefty-cli-rerun-v1-<sha256>` from the source run
 ID. The current rerun protocol accepts no overrides; all program fields and
 inputs come from the stored immutable snapshot. Any future overrides must join
-that canonical request. Submit and rerun occupy separate key namespaces.
+that canonical request. Derived submit and rerun keys have distinct operation
+prefixes; explicit keys share the actor's namespace across both operations.
 
 Matching requests replay the same run permanently, with no expiry or time
-window. This includes saved Workflow references to the latest version: updating
-the Workflow does not turn the same reference request into a deliberate repeat.
+window. **Mutable references are hashed by name, not their current contents.**
+For example, `submit --image reg/app:latest` after pushing a new `latest` still
+replays the old run. Pin images by digest (`reg/app@sha256:...`) or use `--again`
+to deliberately submit the current tag. The same rule applies to saved Workflow
+references to the latest version: pin `workflow://<id>/vN` or use `--again`
+after updating the Workflow.
+
 `--again` generates a fresh random key for each invocation and creates a new
 run. An explicit `--idempotency-key KEY` overrides both derivation and `--again`;
 reusing it with changed inputs retains L3's `idempotency_conflict` refusal.
-L3 also retains its authenticated-actor binding; a different actor cannot use
-another actor's key to obtain that run.
+L3 scopes all idempotency keys, including explicit keys, to the authenticated
+actor: uniqueness and replay lookup use `(actor, key)`. Two actors sending the
+same submit or rerun request create independent runs; neither can reserve the
+other's key or replay the other's run. Within one actor's namespace, reusing a
+key for a different request returns `idempotency_conflict`. Existing ledgers
+retain each key under the actor recorded in immutable trigger provenance.
 
 L3 already distinguishes these outcomes: creation is HTTP 201, and replay is
 HTTP 200 with `Idempotent-Replay: true`. Both return the existing `RunAccepted`

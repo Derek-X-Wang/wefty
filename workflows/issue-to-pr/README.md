@@ -17,12 +17,16 @@ RUN_ID=$(wefty --json submit \
   --params '{"issue":"479"}' \
   --tag=wefty:node:<your-mac> \
   --required-envelope \
-  --max-runtime=5400 \
-  --idempotency-key="issue-to-pr-479-$(date -u +%s)" | jq -er '.run_id')
+  --max-runtime=5400 | jq -er '.run_id')
 
 wefty wait "$RUN_ID" --timeout 90m   # 0 succeeded, 10 failed, 11 timed out
 wefty --json results "$RUN_ID"       # the verdict document
 ```
+
+The same submit request from the same actor permanently returns the same run.
+The CLI derives a retry-safe key; do not mint timestamped keys. Use `--again`
+for a deliberate repeat. An explicit key overrides `--again`, so keep it stable
+for retries and change it deliberately for a separate operation.
 
 The draft PR's URL is in `pr.json` in the run's handoff directory on the node,
 and in the verdict document's `pr_url`.
@@ -107,13 +111,20 @@ Issue-To-PR-Run: <run id>
 ```
 
 Pushing the marker, rather than only committing it, is what makes resuming work.
-A resumed run is a cold `wefty rerun`: it starts from an empty scratch directory
-and clones the branch, so the only phases it can know about are the ones the
-remote can tell it about. Submit with `continue_from` set to the branch the
+A resumed run starts from an empty scratch directory and clones the branch,
+so the only phases it can know about are the ones the remote can tell it about. Submit with `continue_from` set to the branch the
 earlier run pushed:
 
 ```sh
 wefty --json submit ... --params '{"issue":"479","continue_from":"issue-to-pr/479-abc123"}'
+```
+
+Submitting the same issue with the same `continue_from` and other inputs again
+replays the first resumed run; it does not start another attempt. To resume that
+branch again, use:
+
+```sh
+wefty --json submit ... --again --params '{"issue":"479","continue_from":"issue-to-pr/479-abc123"}'
 ```
 
 **Only `read-issue`, `plan` and `implement` can be skipped.** The gates, the push

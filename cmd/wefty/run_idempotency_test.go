@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -294,5 +295,46 @@ func TestSubmitCanonicalRequestKey(t *testing.T) {
 	}
 	if key := submit("--image", "example.test/program:v1", "--again", "--idempotency-key", " user-key "); key != "user-key" {
 		t.Fatalf("explicit key = %q", key)
+	}
+}
+
+// Exercise derived and explicit keys through independent Fabric identities.
+// On rerun, the node races ahead of the owner on the owner's source run.
+func TestRunActorScopedKeysFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	for _, explicit := range []bool{false, true} {
+		for _, verb := range []string{"submit", "rerun"} {
+			t.Run(fmt.Sprintf("%s/explicit=%t", verb, explicit), func(t *testing.T) {
+				store, ledger, control, _ := runRetryLedger(t)
+				invoke := func(person bool, replay bool, args ...string) string {
+					t.Helper()
+					global := []string{"--fabric=plain", "--plain-identity=other-node", "--plain-user-id=", "--plain-device-id=", "--l3=" + ledger, "--l1=" + control, "--json"}
+					if person {
+						global = append(global, "--plain-identity=person-device", "--plain-user-id=person-owner", "--plain-device-id=person-device")
+					}
+					code, output := runWefty(t, binary, 30*time.Second, append(global, args...)...)
+					return readRetryAcceptance(t, code, output, replay)
+				}
+				args := []string{"submit", "--image", "example.test/program@sha256:" + strings.Repeat("a", 64)}
+				count := 2
+				if verb == "rerun" {
+					source := invoke(true, false, args...)
+					args = []string{"rerun", source}
+					count = 3
+				}
+				if explicit {
+					args = append(args, "--idempotency-key", "same-"+verb+"-key")
+				}
+				nodeRun := invoke(false, false, args...)
+				ownerRun := invoke(true, false, args...)
+				if ownerRun == nodeRun {
+					t.Fatal("different actors shared a run")
+				}
+				if invoke(true, true, args...) != ownerRun || invoke(false, true, args...) != nodeRun {
+					t.Fatal("actor replay changed identity")
+				}
+				assertRetryRunCount(t, store, count)
+			})
+		}
 	}
 }

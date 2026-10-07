@@ -480,8 +480,11 @@ Commands:
                              Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID [--again] [--idempotency-key KEY]
                              Rerun a stored snapshot
-  Same submit/rerun request permanently replays its run. --again creates fresh
-  work; an explicit --idempotency-key wins. Output distinguishes created/replayed.
+  Same actor + submit/rerun request permanently replays its run. --again creates
+  fresh work; an explicit --idempotency-key wins, scoped per authenticated actor.
+  Output distinguishes created/replayed. Mutable references hash by name:
+  pushing a new reg/app:latest still replays the old run. Pin images by digest
+  (reg/app@sha256:...) or use --again; pin Workflow versions or use --again too.
   logs RUN_ID [--follow]     Read or follow run logs
   cancel JOB_ID              Cancel a queued or active one-shot job
   wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout

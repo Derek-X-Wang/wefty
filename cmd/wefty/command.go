@@ -415,9 +415,10 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var imageFlags imageFlagSet
-	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference")
+	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference (latest hashes by name: pin /vN or use --again after updating)")
 	flags.StringVar(&scriptPath, "script", "", "inline script file")
 	imageFlags.bind(flags)
+	flags.Lookup("image").Usage += "; mutable tags hash by name: pin by digest or use --again after moving a tag"
 	flags.StringVar(&params, "params", "", "params JSON object")
 	flags.StringVar(&paramsFile, "params-file", "", "file containing params JSON")
 	flags.Var(&tags, "tag", "routing tag (repeatable)")
@@ -430,7 +431,7 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	flags.BoolVar(&requiredEnvelope, "required-envelope", false, "require a valid envelope")
 	flags.BoolVar(&dispatchAuthority, "dispatch-authority", false,
 		"this run dispatches child work, so deliver the in-job credentials (default: report through the run mailbox and hold none)")
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key (overrides the derived key and --again)")
+	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
 	flags.BoolVar(&again, "again", false, "deliberately create a fresh run instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -513,7 +514,7 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	flags.SetOutput(stderr)
 	var idempotencyKey string
 	var again bool
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key (overrides the derived key and --again)")
+	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
 	flags.BoolVar(&again, "again", false, "deliberately create a fresh rerun instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
 		return err
