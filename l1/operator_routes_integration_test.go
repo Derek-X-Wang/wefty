@@ -45,11 +45,17 @@ func assertServiceOperatorRouteOwnershipListAndProjection(t *testing.T) {
 	oneshoot := h.submit(client, "operator-list-one-shot", nil)
 
 	status, _, body := h.do(client, http.MethodGet, "/v1/jobs", nil)
-	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	if status != http.StatusOK {
+		t.Fatalf("all jobs = %d %s", status, body)
+	}
 	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/", nil)
-	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	if status != http.StatusOK {
+		t.Fatalf("all jobs trailing slash = %d %s", status, body)
+	}
 	status, _, body = h.do(client, http.MethodGet, "/v1/jobs?class=one-shot", nil)
-	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	if status != http.StatusOK {
+		t.Fatalf("one-shot jobs = %d %s", status, body)
+	}
 	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/?class=service&limit=1", nil)
 	if status != http.StatusOK {
 		t.Fatalf("trailing-slash service list = %d body=%s", status, body)

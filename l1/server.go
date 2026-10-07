@@ -448,6 +448,8 @@ func (s *Server) routes() http.Handler {
 	// protocol later cannot become reachable with a credential by accident.
 	credential := http.NewServeMux()
 	credential.HandleFunc("POST /v1/jobs", s.createChildJob)
+	credential.HandleFunc("GET /v1/jobs", s.listJobs)
+	credential.HandleFunc("GET /v1/jobs/{$}", s.listJobs)
 	credential.HandleFunc("GET /v1/jobs/{job_id}", s.getAttemptScopedJob)
 	credential.HandleFunc("GET /v1/jobs/{job_id}/children", s.listAttemptScopedChildJobs)
 	credential.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.cancelJob)
@@ -785,7 +787,7 @@ func attemptCredentialFromRequest(r *http.Request) AttemptCredentialScope {
 // not publish. It is the reason no operator verb is reachable in-job.
 func (s *Server) attemptCredentialOutOfScope(w http.ResponseWriter, _ *http.Request) {
 	writeError(w, protocolError(contract.ErrorPrincipalForbidden,
-		"an attempt credential may only submit a child job, read its own job, list or read its children, and cancel its children"))
+		"an attempt credential may only submit a child job, list its own job and immediate children, read its own job, list or read its children, and cancel its children"))
 }
 
 // createChildJob is POST /v1/jobs presented with an attempt credential. Every
@@ -2057,7 +2059,8 @@ func (s *Server) revokeComputerAttemptAuthority(ctx context.Context, computerID,
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
-	if err := requireServiceClass(r); err != nil {
+	filters, err := parseJobListFilters(r)
+	if err != nil {
 		writeError(w, err)
 		return
 	}
@@ -2066,7 +2069,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	page, err := s.store.ListServiceJobs(r.Context(), r.URL.Query().Get("cursor"), limit)
+	page, err := s.store.listReadableJobs(r.Context(), filters, r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
 		return

@@ -45,6 +45,10 @@ func commandExitCodeForArgs(err error, args []string) int {
 var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
 
 func isTypedExitCLIArgs(args []string) bool {
+	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
+		len(commandArgs) >= 1 && commandArgs[0] == "jobs" {
+		return true
+	}
 	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
 	// the service creation exit contract.
 	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil && len(commandArgs) > 0 && (commandArgs[0] == "drain" || commandArgs[0] == "nodes") {
@@ -449,6 +453,8 @@ Commands:
   nodes list                 List node facts and legal operator actions
   nodes inspect NODE_ID      Read one node and its resident attempts
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
+  jobs list                  List readable jobs with filters and cursor paging
+    [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]

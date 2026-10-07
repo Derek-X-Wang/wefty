@@ -264,17 +264,24 @@
         }
       },
       "get": {
-        "operationId": "listServiceJobs",
-        "summary": "List service-class jobs",
-        "description": "Returns active service jobs in stable creation/job-ID order. Bare collection reads are invalid; class=service is mechanically required.",
+        "operationId": "listJobs",
+        "summary": "List all readable jobs, including one-shots",
+        "description": "Client principals may list every ordinary persisted Job. Attempt credentials may list only their own Job and its immediate children, authenticated against the live attempt and holding node on every page. Filters intersect with exact case-sensitive comparison before LIMIT; state is persisted Job state, not derived status. submitter=me uses the client Fabric node ID or an attempt credential's inherited originating submitter, without widening scope; an empty resolved identity returns invalid_request. Pages retain ascending creation-time/Job-ID order. The first page fixes an insertion watermark: jobs inserted later are excluded for the rest of the walk, even with equal or earlier timestamps; a fresh walk includes them. Mutable state and removals remain live reads. Cursors are opaque and bind filters and attempt scope; limit may change. Malformed or mismatched cursors and invalid or duplicate selectors return invalid_request. Kind is open; an unknown kind yields an empty page. class=service preserves active service selection, current Computer projections and service status projection; removed tombstones and retired Computer Job projections remain exact-ID resources outside every collection filter. Only current Computer projections appear, so the one-shot and service sets together equal the unfiltered set. Legacy service cursors remain valid for the unfiltered service query and establish their watermark when first resumed. Individual job-read class selectors are unchanged.",
+        "security": [
+          { "fabricIdentity": [] },
+          { "fabricIdentity": [], "attemptCredential": [] }
+        ],
         "parameters": [
-          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } },
-          { "name": "cursor", "in": "query", "description": "Opaque cursor returned by the previous page.", "schema": { "type": "string" } },
+          { "name": "class", "in": "query", "description": "Optional exact class filter; omission lists both one-shot and service jobs.", "schema": { "type": "string", "enum": ["one-shot", "service"] } },
+          { "name": "kind", "in": "query", "description": "Exact workload kind (open vocabulary).", "schema": { "type": "string", "minLength": 1 } },
+          { "name": "state", "in": "query", "description": "Exact persisted Job state, not a derived status.", "schema": { "type": "string", "enum": ["queued", "claimed", "running", "stopping", "stopped", "awaiting-input", "succeeded", "failed", "removal_pending", "agent_cleaned", "removed_verified", "forgotten_cleanup_unverified", "stalled_cleanup_unverified"] } },
+          { "name": "submitter", "in": "query", "description": "Only jobs with the caller's originating submitter identity, within its read scope. An empty resolved identity returns invalid_request.", "schema": { "type": "string", "const": "me" } },
+          { "name": "cursor", "in": "query", "description": "Opaque continuation bound to the initial insertion watermark, filters and attempt scope. Empty means first page.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
         ],
         "responses": {
           "200": {
-            "description": "One stable page of active service jobs.",
+            "description": "One stable page of redacted readable jobs.",
             "content": {
               "application/json": {
                 "schema": {

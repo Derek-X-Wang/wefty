@@ -1179,6 +1179,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.ensureColumn(ctx, "nodes", "last_condition_json", "BLOB"); err != nil {
 		return err
 	}
+	if err := s.initializeJobListing(ctx); err != nil {
+		return err
+	}
 	if err := s.seedLogContinuity(ctx); err != nil {
 		return err
 	}
