@@ -34,7 +34,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable machine-readable error code."
+            "description": "Stable machine-readable error code. CLI transport failures, deadlines, and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13."
           },
           "message": { "type": "string" },
           "retryable": {
@@ -44,7 +44,7 @@
           "details": {
             "type": "object",
             "additionalProperties": true,
-            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id)."
+            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id). Mux 404/405 errors carry reason=no_route to distinguish missing routes or methods from resource refusals."
           },
           "request_id": { "type": "string", "description": "Server-generated HTTP request correlation ID, echoed in X-Request-Id and the server log. L3 preserves a relayed L1 error ID and adds its own ID in details.l3_request_id and X-L3-Request-Id. Omitted for CLI-local and stored decision errors that have no HTTP request." }
         }

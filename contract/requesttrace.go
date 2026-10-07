@@ -11,7 +11,8 @@ const RequestIDHeader = "X-Request-Id"
 const L3RequestIDHeader = "X-L3-Request-Id"
 
 // ObserveHTTPRequests generates a fresh ID even if the caller supplies a correlation
-// header. It records no query, authorization value, or request body.
+// header. It logs only errors (status >= 400) and panics, never routine successes.
+// It records no query, authorization value, request body, or panic value.
 func ObserveHTTPRequests(layer string, logf func(string, ...any), next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := rand.Text()
@@ -21,7 +22,12 @@ func ObserveHTTPRequests(layer string, logf func(string, ...any), next http.Hand
 		}
 		response := &responseWriter{ResponseWriter: w}
 		defer func() {
+			panicValue := recover()
 			status := response.status
+			if panicValue != nil {
+				// A panic failed the request even if the handler already sent a 2xx.
+				status = http.StatusInternalServerError
+			}
 			if status == 0 {
 				status = http.StatusOK
 			}
@@ -29,8 +35,11 @@ func ObserveHTTPRequests(layer string, logf func(string, ...any), next http.Hand
 			if echoed := w.Header().Get(RequestIDHeader); echoed != id {
 				upstream = echoed
 			}
-			if logf != nil {
-				logf("event=%s_request request_id=%s upstream_request_id=%s method=%s path=%q status=%d", layer, id, upstream, r.Method, r.URL.Path, status)
+			if logf != nil && status >= http.StatusBadRequest {
+				logf("event=%s_request request_id=%s upstream_request_id=%q method=%s path=%q status=%d panic=%t", layer, id, upstream, r.Method, r.URL.Path, status, panicValue != nil)
+			}
+			if panicValue != nil {
+				panic(panicValue)
 			}
 		}()
 		next.ServeHTTP(response, r)
@@ -63,7 +72,11 @@ func (w *responseWriter) WriteHeader(status int) {
 		case http.StatusNotFound:
 			code = ErrorNotFound
 		}
-		envelope := ErrorResponse{Error: AttachRequestID(w, APIError{Code: code, Message: http.StatusText(status), Retryable: false})}
+		apiError := APIError{Code: code, Message: http.StatusText(status), Retryable: false}
+		if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+			apiError.Details = map[string]any{"reason": "no_route"}
+		}
+		envelope := ErrorResponse{Error: AttachRequestID(w, apiError)}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Del("Content-Length")
 		w.ResponseWriter.WriteHeader(status)

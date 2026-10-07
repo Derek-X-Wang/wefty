@@ -205,7 +205,8 @@ func waitExpired(stdout io.Writer, runID string, status contract.RunState, start
 // status is printed either way, because a script that wants the word as well as
 // the code should not have to run a second command for it. Stdout stays the
 // bare status; why a failed run failed travels in the error, which main prints
-// to stderr as one line.
+// to stderr as one line in plain mode. JSON mode emits only the RunRecord on
+// stdout; the failure_reason, when recorded by the ledger, is in that document.
 func reportTerminalRun(stdout io.Writer, record contract.RunRecord, reason string, jsonOutput bool) error {
 	if jsonOutput {
 		if err := writeJSON(stdout, record); err != nil {

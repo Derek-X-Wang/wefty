@@ -118,8 +118,32 @@ Each of those proves something different, and the difference matters:
 | Exit | Meaning |
 | --- | --- |
 | 0 | the run succeeded |
-| 10 | the run reached a terminal state that is not success; stderr names why in one line (exit code, signal, refused dispatch, or the ledger gate such as a missing required envelope) |
-| 11 | `--timeout` elapsed while the run was still going |
+| 10 | the run reached a terminal state that is not success; plain mode names why on stderr; `--json` writes the RunRecord on stdout, including any recorded `failure_reason`, with no extra error document |
+| 11 | `--timeout` elapsed; `--json` writes `timed_out=true`, the last observed `status`, and `waited_seconds` on stdout; you may wait again |
+
+All commands share these typed exits:
+
+| Exit | Meaning and operator action |
+| --- | --- |
+| 1 | Internal, unknown, or other local failure; read the error |
+| 2 | Usage, configuration, or `invalid_request`; fix the arguments |
+| 3 | Authentication or authorization refused; obtain the required authority |
+| 4 | Resource not found or take-over session ended; re-read the resource |
+| 5 | State, revision, idempotency, capacity, or controller conflict; re-read before deciding |
+| 6 | Custody import deferred; read its result document |
+| 7 | Custody import quarantined; read its result document |
+| 8 | Custody import failed; read its result document |
+| 9 | Custody import superseded; read its result document |
+| 12 | Cluster not ready; read the readiness reasons and stop submitting |
+| 13 | `unavailable`, `retryable=true`: connection/dial/deadline failure or a non-envelope HTTP 5xx; check reachability and retry with backoff within your authority |
+
+With `--json`, errors use the shared `error` envelope on stderr. Typed outcome
+exits 6–12 use their result document on stdout with no extra error envelope. A
+not-ready status is a readiness verdict, not an internal error. An API error
+with `details.reason="no_route"` means the route or method is unavailable (check
+client/server versions), rather than proving that a resource is absent.
+`--json` can appear before or after the command, but another flag's value (such
+as `--argv '--json'`) and arguments after `--` remain literal.
 
 - `--tag` routes by subset matching: the job runs on a node carrying ALL its
   tags. Use a node-reserved tag (`wefty:node:<id>`) to pin. When no alive node

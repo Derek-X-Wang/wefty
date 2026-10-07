@@ -104,9 +104,8 @@ var (
 )
 
 // UsageError is a caller mistake rather than a failure of the run. The CLI
-// turns it into its ordinary usage error, which exits 1: typed exit codes are
-// a contract only on the Computer, access and Storage surfaces, and this
-// surface does not claim one.
+// turns it into its ordinary usage error, which exits 2 on every command
+// surface and renders as invalid_request under --json.
 type UsageError string
 
 func (e UsageError) Error() string { return string(e) }

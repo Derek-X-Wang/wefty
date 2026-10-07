@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,16 +37,14 @@ func (l *requestLog) contains(s string) bool {
 
 func TestL3ErrorRequestIDBodyHeaderAndLog(t *testing.T) {
 	logs := &requestLog{}
-	previous := log.Writer()
-	log.SetOutput(logs)
-	defer log.SetOutput(previous)
+	logger := log.New(logs, "", 0)
 	store, err := OpenStore(filepath.Join(t.TempDir(), "ledger.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "ledger"})
-	server, err := NewServer(participant, store, ServerConfig{})
+	server, err := NewServer(participant, store, ServerConfig{Logf: logger.Printf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,10 +78,9 @@ func (c requestIDLogFailure) GetJobLogs(context.Context, string, string, int) (l
 
 func TestL3RelayedErrorKeepsBothRequestIDs(t *testing.T) {
 	logs := &requestLog{}
-	previous := log.Writer()
-	log.SetOutput(logs)
-	defer log.SetOutput(previous)
+	logger := log.New(logs, "", 0)
 	h := newIntegrationHarness(t)
+	h.l3Server.logf = logger.Printf
 	accepted := h.submit(inlineRunRequest("#!/bin/sh\necho test\n"), "correlation-test")
 	reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
 	if err != nil {
@@ -100,7 +98,7 @@ func TestL3RelayedErrorKeepsBothRequestIDs(t *testing.T) {
 			t.Fatal(err)
 		}
 		local := headers.Get("X-L3-Request-Id")
-		if status < 400 || local == "" || local == source.RequestID || headers.Get("X-Request-Id") != source.RequestID || envelope.Error.RequestID != source.RequestID || envelope.Error.Details["l3_request_id"] != local || !logs.contains("request_id="+local+" upstream_request_id="+source.RequestID) {
+		if status < 400 || local == "" || local == source.RequestID || headers.Get("X-Request-Id") != source.RequestID || envelope.Error.RequestID != source.RequestID || envelope.Error.Details["l3_request_id"] != local || !logs.contains("request_id="+local+" upstream_request_id="+strconv.Quote(source.RequestID)) {
 			t.Fatalf("status=%d headers=%v error=%+v", status, headers, envelope.Error)
 		}
 		if source.Details["l3_request_id"] != nil {

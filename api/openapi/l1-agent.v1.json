@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L1 agent protocol",
     "version": "0.1.0-prerelease",
-    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol. Each HTTP request receives a server-generated X-Request-Id response header and completion log; error.request_id matches the header."
+    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol. Each HTTP request receives a server-generated X-Request-Id response header. Only HTTP errors (status >= 400) and panics produce a completion log; routine successes are silent. Panics log status=500 and propagate. Mux 404/405 envelopes carry details.reason=no_route; error.request_id matches the header."
   },
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],

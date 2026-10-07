@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L3 run-ledger API",
     "version": "0.1.0-prerelease",
-    "description": "Caller run submission/polling, run-token-scoped workflow writes, and L3-authoritative Computer passes. Every request is Fabric-authenticated. Opaque bearer values are verified against the run-token and Computer-token ledgers; provenance never comes from transport headers. Each HTTP request receives a server-generated X-Request-Id response header and completion log; error.request_id matches the header. Relayed L1 errors preserve their request_id; X-L3-Request-Id and error.details.l3_request_id carry the local L3 ID, and the L3 log records both IDs."
+    "description": "Caller run submission/polling, run-token-scoped workflow writes, and L3-authoritative Computer passes. Every request is Fabric-authenticated. Opaque bearer values are verified against the run-token and Computer-token ledgers; provenance never comes from transport headers. Each HTTP request receives a server-generated X-Request-Id response header. Only HTTP errors (status >= 400) and panics produce a completion log; routine successes are silent. Panics log status=500 and propagate. Mux 404/405 envelopes carry details.reason=no_route; error.request_id matches the header. Relayed L1 errors preserve their request_id; X-L3-Request-Id and error.details.l3_request_id carry the local L3 ID, and the L3 log records both IDs."
   },
   "servers": [{ "url": "wefty://run-ledger" }],
   "paths": {

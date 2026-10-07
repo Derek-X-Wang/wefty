@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -62,6 +61,8 @@ const (
 	// cluster cannot take work, which is a different thing from the command
 	// failing and gets its own code so a script can tell them apart.
 	exitNotReady = 12
+	// exitUnavailable tells an operator that the transport or service may recover.
+	exitUnavailable = 13
 )
 
 func commandExitCode(err error) int {
@@ -94,6 +95,10 @@ func commandExitCode(err error) int {
 	if errors.As(err, &waitTimeout) {
 		return exitWaitTimeout
 	}
+	var unavailable *unavailableError
+	if errors.As(err, &unavailable) || errors.Is(err, context.DeadlineExceeded) {
+		return exitUnavailable
+	}
 	var apiError contract.APIError
 	var localErr *ocicontrol.ResponseError
 	var responseErr *apiResponseError
@@ -109,6 +114,8 @@ func commandExitCode(err error) int {
 		return exitFailure
 	}
 	switch apiError.Code {
+	case contract.ErrorUnavailable:
+		return exitUnavailable
 	case contract.ErrorInvalidRequest:
 		return exitUsage
 	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
@@ -128,6 +135,24 @@ func commandExitCode(err error) int {
 }
 
 func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
+	// These typed outcomes have already written their result document to stdout.
+	// A second error document would mislabel the verdict and corrupt JSON output.
+	if jsonOutput {
+		var custody *custodyImportOutcomeError
+		var outcome *runOutcomeError
+		var notReady *notReadyError
+		var timeout *waitTimeoutError
+		if errors.As(err, &custody) || errors.As(err, &outcome) || errors.As(err, &notReady) || errors.As(err, &timeout) {
+			return
+		}
+		var unavailable *unavailableError
+		if errors.As(err, &unavailable) || errors.Is(err, context.DeadlineExceeded) {
+			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
+				Code: contract.ErrorUnavailable, Message: err.Error(), Retryable: true,
+			}})
+			return
+		}
+	}
 	var usage usageError
 	if jsonOutput && errors.As(err, &usage) {
 		_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
@@ -359,32 +384,11 @@ func defaultNodeConfigPath() string {
 	return path
 }
 
-func removeBoolFlag(args []string, name string) ([]string, bool, error) {
-	filtered := make([]string, 0, len(args))
-	enabled := false
-	for _, arg := range args {
-		if arg == name {
-			enabled = true
-			continue
-		}
-		if value, ok := strings.CutPrefix(arg, name+"="); ok {
-			parsed, err := strconv.ParseBool(value)
-			if err != nil {
-				return nil, true, fmt.Errorf("invalid boolean value %q for %s", value, name)
-			}
-			enabled = parsed
-			continue
-		}
-		filtered = append(filtered, arg)
-	}
-	return filtered, enabled, nil
-}
-
 const rootUsage = `Usage: wefty [global flags] <command>
 
 --json[=true|false] is accepted before or after a command and its arguments.
 Every command uses typed exits: usage 2, unauthorized 3, not found 4,
-conflict 5, other failure (including unavailable) 1. JSON errors go to stderr.
+conflict 5, unavailable 13, other failure 1. JSON errors go to stderr.
 
 Commands:
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot

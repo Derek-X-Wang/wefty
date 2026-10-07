@@ -69,3 +69,22 @@ func errorBodyWithoutRequestID(t *testing.T, body []byte) []byte {
 	}
 	return normalized
 }
+
+func TestL1AgentClaimLogsOnlyErrors(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"kind:process"}})
+	logs := &recordedLog{}
+	h.server.logf = logs.record
+	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(agent, "node-1")
+	status, headers, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
+	if status != 204 || headers.Get(contract.RequestIDHeader) == "" {
+		t.Fatalf("status=%d body=%s", status, body)
+	}
+	if strings.Contains(logs.text(), "event=l1_request") {
+		t.Fatalf("routine agent traffic logged: %s", logs.text())
+	}
+	status, headers, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: "invalid"})
+	if status != 400 || !strings.Contains(logs.text(), "request_id="+headers.Get(contract.RequestIDHeader)) {
+		t.Fatalf("status=%d body=%s logs=%s", status, body, logs.text())
+	}
+}

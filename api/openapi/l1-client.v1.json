@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L1 client protocol",
     "version": "0.1.0-prerelease",
-    "description": "Fabric-authenticated job submission and polling surface for client principals, plus the separate stable-person administrator-policy routes. Agent-only mutation verbs are in l1-agent.v1.json. Each HTTP request receives a server-generated X-Request-Id response header and completion log; error.request_id matches the header."
+    "description": "Fabric-authenticated job submission and polling surface for client principals, plus the separate stable-person administrator-policy routes. Agent-only mutation verbs are in l1-agent.v1.json. Each HTTP request receives a server-generated X-Request-Id response header. Only HTTP errors (status >= 400) and panics produce a completion log; routine successes are silent. Panics log status=500 and propagate. Mux 404/405 envelopes carry details.reason=no_route; error.request_id matches the header."
   },
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
