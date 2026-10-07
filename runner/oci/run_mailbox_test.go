@@ -239,3 +239,50 @@ func TestAdapterHandoffReadWithoutRunMailbox(t *testing.T) {
 		t.Fatalf("independent reader = %q truncated=%t err=%v", payload, truncated, err)
 	}
 }
+
+// An image observation that reaches no L1 verdict (a 5xx or a transport
+// failure, not a refusal) skips helper Run, so the helper never admits the
+// attempt. The helper then refuses to read that attempt's handoff even though
+// the owner's volume still holds an earlier result: the agent records the
+// result unreadable, never the stale document. The same read succeeds once the
+// helper has admitted the attempt, so admission is what refused it.
+func TestAdapterHandoffReadRefusedWhenObservationSkippedRun(t *testing.T) {
+	engine := &mailboxAdapterEngine{adapterTestEngine: &adapterTestEngine{}, entries: map[string][]byte{"result.json": []byte(`{"ok":true}`)}}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: mailboxAdapterOwnerKey}}
+	request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error {
+		return errors.New("record OCI image observation: l1 agent protocol: HTTP 503 internal: busy")
+	}
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
+		t.Fatalf("undecided observation = (%+v, %v), want a runtime_unavailable spawn failure", result.Outcome, err)
+	}
+	engine.mu.Lock()
+	ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
+	engine.mu.Unlock()
+	if ran {
+		t.Fatal("helper Run was called after an undecided observation")
+	}
+	reference := workloadrunner.HandoffFileReference{Authority: request.Authority, OwnerKey: mailboxAdapterOwnerKey}
+	payload, _, err := adapter.ReadHandoffFile(t.Context(), reference, "result.json", 0)
+	var refusal *ocihelper.RPCError
+	if !errors.As(err, &refusal) || refusal.Code != ocihelper.CodeAttemptOutsideSession || payload != nil {
+		t.Fatalf("handoff read for an attempt the helper never admitted = (%q, %v), want an outside-session refusal", payload, err)
+	}
+
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Run(t.Context(), ocihelper.RunRequest{Authority: HelperAuthority(request.Authority), InitialDeadman: time.Minute,
+		Workload: ocihelper.WorkloadInput{ImageDigest: adapterTestDigest, Argv: []string{"/bin/true"},
+			ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: mailboxAdapterOwnerKey}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if payload, _, err := adapter.ReadHandoffFile(t.Context(), reference, "result.json", 0); err != nil || string(payload) != `{"ok":true}` {
+		t.Fatalf("handoff read for the admitted attempt = (%q, %v)", payload, err)
+	}
+}
