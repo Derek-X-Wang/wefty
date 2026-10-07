@@ -18,11 +18,13 @@ type AllowedAction struct {
 	RefusedBecause *APIError      `json:"refused_because,omitempty"`
 }
 
-// ActionInput names a caller-chosen field by its literal request JSON name.
+// ActionInput names a caller-chosen field or URL parameter by its literal name.
+// In is body by default; path identifies a URL parameter.
 // Type is its JSON type: string, boolean, integer, number, object or array.
 // Required indicates presence, never a required value. Endpoint schemas supply
 // further constraints (for example a Node reason must be nonempty after trim).
 type ActionInput struct {
+	In       string `json:"in,omitempty"`
 	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Required bool   `json:"required"`

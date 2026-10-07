@@ -541,7 +541,7 @@
           "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation", "desired_disk_bytes",
           "desired_state", "intent_revision", "applied_revision", "current_job_id",
           "current_spec_revision", "backup_cap", "reconfiguration_phase", "submit_enabled", "submit_intent_revision",
-          "submit_max_inflight", "submit_policy_revision", "display_endpoint", "controller_tenure", "current_job", "created_at", "updated_at"
+          "submit_max_inflight", "submit_policy_revision", "display_endpoint", "controller_tenure", "allowed_actions", "last_condition", "current_job", "created_at", "updated_at"
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
@@ -594,6 +594,8 @@
             "description": "Private take-over front-door endpoint. Null until the admission module is active; never a placeholder URL."
           },
           "controller_tenure": { "enum": ["free", "held"], "description": "Current Controller-tenure truth derived from immutable current-attempt audit evidence." },
+          "allowed_actions": { "type": "array", "readOnly": true, "items": { "$ref": "#/components/schemas/AllowedAction" }, "description": "Client Computer verbs evaluated for this authenticated caller. Person-only grants, submission and take-over are omitted; agent-only callers receive refused client verbs. Describes new operations with valid inputs, not replay keys or same-image reimage no-ops." },
+          "last_condition": { "anyOf": [{ "$ref": "#/components/schemas/Condition" }, { "type": "null" }], "readOnly": true, "description": "Latest recorded intent, grow or Backup completion, or removal stall from existing evidence. Recording time is preserved on reads; null when no evidence exists." },
           "current_job": { "$ref": "#/components/schemas/Job" },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
@@ -1634,7 +1636,8 @@
         "additionalProperties": false,
         "required": ["name", "type", "required"],
         "properties": {
-          "name": { "type": "string", "description": "Literal JSON field name in the request body." },
+          "name": { "type": "string", "description": "Literal request field or path parameter name." },
+          "in": { "type": "string", "enum": ["body", "path"], "default": "body", "description": "Where to send a caller-chosen value. Omitted means body; path means substitute the URL parameter." },
           "type": { "type": "string", "enum": ["string", "boolean", "integer", "number", "object", "array"], "description": "JSON type of the caller's value." },
           "required": { "type": "boolean", "description": "Whether the caller must supply the field, never a required value." }
         }
