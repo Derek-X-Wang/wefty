@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L1 agent protocol",
     "version": "0.1.0-prerelease",
-    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol."
+    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol. OCI helper control is a private node-local protocol: each heartbeat reply waits at most the authenticated helper HeartbeatTimeout minus min(100 ms, HeartbeatTimeout / 10), independently of send cadence. Heartbeats pipeline and successful attempt renewals flush immediately even while an earlier reply is outstanding; absolute L1 expiry still bounds their TTL. See docs/contracts/oci-helper-protocol.md."
   },
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],

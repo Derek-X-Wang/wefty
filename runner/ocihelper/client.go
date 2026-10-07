@@ -36,6 +36,7 @@ type Client struct {
 	HeartbeatInterval    time.Duration
 	Now                  func() time.Time
 	disableHeartbeatPump bool
+	heartbeatClock       Clock // test-only control of cadence and reply deadlines
 }
 
 func NewUnixClient(socketPath, expectedChecksum string) *Client {
@@ -440,8 +441,29 @@ func (session *Session) drainSuppress() bool {
 	}
 }
 
+// heartbeatReplyWait reserves a small part of the helper's advertised timeout
+// for transport teardown. It is independent of the heartbeat send interval.
+func heartbeatReplyWait(timeout time.Duration) time.Duration {
+	margin := min(100*time.Millisecond, timeout/10)
+	return timeout - margin
+}
+
+type heartbeatFlight struct {
+	renewals []DeadmanRenewal
+	deadline time.Time
+}
+
+type heartbeatReply struct {
+	response HeartbeatResponse
+	err      error
+}
+
 func (session *Session) heartbeatPump() {
 	defer close(session.pumpDone)
+	clock := session.client.heartbeatClock
+	if clock == nil {
+		clock = systemClock{}
+	}
 	interval := session.client.HeartbeatInterval
 	if interval <= 0 || interval >= session.response.HeartbeatTimeout {
 		interval = session.response.HeartbeatTimeout / 3
@@ -449,49 +471,147 @@ func (session *Session) heartbeatPump() {
 	if interval <= 0 {
 		interval = time.Millisecond
 	}
-	timer := time.NewTimer(interval)
+	wait := heartbeatReplyWait(session.response.HeartbeatTimeout)
+	timer := clock.NewTimerAt(clock.Now().Add(interval))
 	defer timer.Stop()
+	replyTimer := clock.NewTimerAt(clock.Now().Add(wait))
+	replyTimer.Stop()
+	defer replyTimer.Stop()
+
+	// One reader preserves FIFO response attribution. It reads only on demand,
+	// so suppression still leaves the control stream open and unread once all
+	// outstanding heartbeats have resolved. Writes never wait for this reader.
+	readerCtx, stopReader := context.WithCancel(session.pumpCtx)
+	readNext := make(chan struct{}, 1)
+	replies := make(chan heartbeatReply)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-readerCtx.Done():
+				return
+			case <-readNext:
+			}
+			var response HeartbeatResponse
+			err := decodeResponse(session.controlWire, &response)
+			select {
+			case replies <- heartbeatReply{response: response, err: err}:
+			case <-readerCtx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	defer func() { stopReader(); <-readerDone }()
+	fail := func(err error) {
+		session.markLost(runtimeLossError(err))
+		_ = session.control.Close()
+	}
+
+	var outstanding []heartbeatFlight
+	var acknowledge chan error
 	suppressed := false
 	for {
-		// A waiting blackhole command is taken before anything else, so the
-		// transition is picked up as soon as the pump is free to look for it.
-		// Both this and the recheck below acknowledge from the pump's own
-		// goroutine and between flushes, which is what makes the
-		// acknowledgement a fence.
-		if session.drainSuppress() {
-			suppressed = true
+		if len(outstanding) != 0 && !clock.Now().Before(outstanding[0].deadline) {
+			fail(fmt.Errorf("await OCI helper heartbeat: %w", context.DeadlineExceeded))
+			return
+		}
+		if acknowledge != nil && len(outstanding) == 0 {
+			if err := session.control.SetDeadline(time.Time{}); err != nil {
+				fail(err)
+				return
+			}
+			acknowledge <- session.suppressionAcknowledgement()
+			acknowledge = nil
+		}
+		// Retain the suppression fence: stop sending immediately, but only
+		// acknowledge after replies for every earlier flush have been consumed.
+		if acknowledge == nil {
+			select {
+			case acknowledge = <-session.suppress:
+				suppressed = true
+				continue
+			default:
+			}
+		}
+		var expiry <-chan time.Time
+		if len(outstanding) != 0 {
+			expiry = replyTimer.C()
+		}
+		suppress := session.suppress
+		if acknowledge != nil {
+			suppress = nil
 		}
 		select {
 		case <-session.pumpCtx.Done():
 			return
-		case acknowledge := <-session.suppress:
+		case acknowledge = <-suppress:
 			suppressed = true
-			acknowledge <- session.suppressionAcknowledgement()
-			timer.Reset(interval)
+			continue
+		case <-expiry:
+			// Re-read the oldest deadline in case this was a superseded wake.
+			continue
+		case reply := <-replies:
+			if !clock.Now().Before(outstanding[0].deadline) {
+				fail(fmt.Errorf("await OCI helper heartbeat: %w", context.DeadlineExceeded))
+				return
+			}
+			if reply.err != nil {
+				fail(reply.err)
+				return
+			}
+			if err := session.applyHeartbeatResponse(reply.response, outstanding[0].renewals); err != nil {
+				fail(err)
+				return
+			}
+			outstanding[0] = heartbeatFlight{}
+			outstanding = outstanding[1:]
+			if len(outstanding) == 0 {
+				replyTimer.Stop()
+			} else {
+				replyTimer.ResetAt(outstanding[0].deadline)
+				notify(readNext)
+			}
 			continue
 		case <-session.queued:
-		case <-timer.C:
-		}
-		// A command queued in the instant this select resolved on <-queued or
-		// <-timer.C -- racing those cases rather than losing to them -- would
-		// otherwise sit behind the flush about to start below. Recheck once
-		// more, still non-blocking, before committing to that flush.
-		if session.drainSuppress() {
-			suppressed = true
+		case <-timer.C():
 		}
 		if suppressed {
-			timer.Reset(interval)
+			timer.ResetAt(clock.Now().Add(interval))
 			continue
 		}
-		ctx, cancel := context.WithTimeout(session.pumpCtx, interval)
-		err := session.flushHeartbeat(ctx)
-		cancel()
-		if err != nil {
-			session.markLost(runtimeLossError(err))
-			_ = session.control.Close()
+		// Check suppression once more before committing to a write.
+		select {
+		case acknowledge = <-session.suppress:
+			suppressed = true
+			continue
+		default:
+		}
+		deadline := clock.Now().Add(wait)
+		writeDeadline := deadline
+		if len(outstanding) != 0 {
+			writeDeadline = outstanding[0].deadline
+		}
+		if err := session.control.SetWriteDeadline(time.Now().Add(writeDeadline.Sub(clock.Now()))); err != nil {
+			fail(err)
 			return
 		}
-		timer.Reset(interval)
+		renewals, err := session.sendHeartbeat()
+		if err != nil {
+			fail(err)
+			return
+		}
+		outstanding = append(outstanding, heartbeatFlight{renewals: renewals, deadline: deadline})
+		// Sending, not receiving a reply, sets the next cadence. A queued
+		// renewal wakes this loop immediately even with a reply outstanding.
+		timer.ResetAt(clock.Now().Add(interval))
+		if len(outstanding) == 1 {
+			replyTimer.ResetAt(deadline)
+			notify(readNext)
+		}
 	}
 }
 
@@ -501,6 +621,21 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 	if err := applyContextDeadline(ctx, session.control); err != nil {
 		return err
 	}
+	renewals, err := session.sendHeartbeat()
+	if err != nil {
+		return err
+	}
+	var response HeartbeatResponse
+	if err := decodeResponse(session.controlWire, &response); err != nil {
+		return err
+	}
+	if err := session.applyHeartbeatResponse(response, renewals); err != nil {
+		return err
+	}
+	return session.control.SetDeadline(time.Time{})
+}
+
+func (session *Session) sendHeartbeat() ([]DeadmanRenewal, error) {
 	session.queueMu.Lock()
 	renewals := make([]DeadmanRenewal, 0, len(session.pending))
 	snapshot := make(map[string]uint64, len(session.pending))
@@ -518,18 +653,27 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 	session.queueMu.Unlock()
 	body, err := marshalBody(HeartbeatRequest{Sequence: sequence, RenewedAttempts: renewals})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := session.controlWire.write(frame{
 		Version: session.client.protocolVersion(), Method: MethodHeartbeat,
 		SessionCapability: session.capability, Body: body,
 	}); err != nil {
-		return fmt.Errorf("send OCI helper heartbeat: %w", err)
+		return nil, fmt.Errorf("send OCI helper heartbeat: %w", err)
 	}
-	var response HeartbeatResponse
-	if err := decodeResponse(session.controlWire, &response); err != nil {
-		return err
+	// Remove only evidence captured by this send; a newer queued renewal must
+	// still flush immediately while this heartbeat's reply is outstanding.
+	session.queueMu.Lock()
+	for key, token := range snapshot {
+		if session.pending[key].token == token {
+			delete(session.pending, key)
+		}
 	}
+	session.queueMu.Unlock()
+	return renewals, nil
+}
+
+func (session *Session) applyHeartbeatResponse(response HeartbeatResponse, renewals []DeadmanRenewal) error {
 	sent := make(map[AttemptAuthority]bool, len(renewals))
 	for _, renewal := range renewals {
 		sent[renewal.Authority] = true
@@ -550,13 +694,8 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 		}
 	}
 
-	for key, token := range snapshot {
-		if session.pending[key].token == token {
-			delete(session.pending, key)
-		}
-	}
 	session.queueMu.Unlock()
-	return session.control.SetDeadline(time.Time{})
+	return nil
 }
 
 type pendingRenewal struct {
