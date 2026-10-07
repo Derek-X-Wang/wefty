@@ -137,6 +137,10 @@ const (
 	// evidence -- a bare close in its place read as EOF and reaped every OCI
 	// workload on the Node (#597).
 	CodeConnectionLimit ErrorCode = "connection_limit"
+	// CodeAttemptExpired refuses one renewal for an exact attempt this session
+	// admitted and then expired or deleted. It ends only that attempt: the
+	// renewal is never applied and the session continues (#680).
+	CodeAttemptExpired ErrorCode = "attempt_expired"
 )
 
 // ErrorDetail is a closed, stable token that narrows one ErrorCode without
@@ -492,6 +496,17 @@ type DeadmanRenewal struct {
 type HeartbeatRequest struct {
 	Sequence        uint64           `json:"sequence"`
 	RenewedAttempts []DeadmanRenewal `json:"renewed_attempts,omitempty"`
+}
+
+// AttemptRenewalRefusal is a non-restoring, attempt-scoped heartbeat result.
+// The full admitted tuple is echoed so a client cannot lose a neighbouring fence.
+type AttemptRenewalRefusal struct {
+	Authority AttemptAuthority `json:"authority"`
+	Code      ErrorCode        `json:"code"`
+}
+
+type HeartbeatResponse struct {
+	RefusedAttempts []AttemptRenewalRefusal `json:"refused_attempts,omitempty"`
 }
 
 type EnsureImageRequest struct {

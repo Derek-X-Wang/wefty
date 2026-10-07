@@ -566,7 +566,16 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		deadmanAdmission.terminate()
 		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err}
 	}()
-	persistCompletion := func(outcome *runOutcome) error {
+	persistCompletion := func(outcome *runOutcome, agentTerminated bool) error {
+		// The helper has refused expired authority. L1 may still hold a lease,
+		// but replaying a payload failure would convert this lost attempt into a
+		// completion. Retain other evidence and let its lease expire normally.
+		// Shutdown and directives still deliver an agent-terminated completion;
+		// persist it for replay even when Watch also reported attempt loss.
+		var attemptLost *ocihelper.AttemptLostError
+		if !agentTerminated && errors.As(outcome.err, &attemptLost) {
+			return nil
+		}
 		if lifecycle.dependencies.outbox == nil || outcome.durabilityErr != nil {
 			return outcome.durabilityErr
 		}
@@ -598,7 +607,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		<-renewalDone
 		result := agentTerminatedResult(outcome.result)
 		outcome.result = result
-		if err := persistCompletion(&outcome); err != nil {
+		if err := persistCompletion(&outcome, true); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
 		}
 		if errors.Is(cause, errServiceRemovalRequested) {
@@ -636,7 +645,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			<-renewalDone
 			result := agentTerminatedResult(outcome.result)
 			outcome.result = result
-			if err := persistCompletion(&outcome); err != nil {
+			if err := persistCompletion(&outcome, true); err != nil {
 				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
 			}
 			request := completionRequest(claim, result, outcome.reapEvidence)
@@ -665,7 +674,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		finalization.stop()
 		outcome := <-completed
 		<-renewalDone
-		if err := persistCompletion(&outcome); err != nil {
+		var attemptLost *ocihelper.AttemptLostError
+		if errors.As(failure.err, &attemptLost) {
+			// Queueing can observe the refusal before Watch does. Preserve that
+			// authority-loss fact even if Watch concurrently returned a result.
+			outcome.err = errors.Join(outcome.err, failure.err)
+		}
+		if err := persistCompletion(&outcome, false); err != nil {
 			return errorDestinationUnclassified, errors.Join(fmt.Errorf("agent: renew lease: %w", failure.err), fmt.Errorf("agent: persist durable completion: %w", err))
 		}
 		reconcileCompletion = true
@@ -676,7 +691,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		finalization.stop()
 		outcome := <-completed
 		<-renewalDone
-		if durabilityErr := persistCompletion(&outcome); durabilityErr != nil {
+		if durabilityErr := persistCompletion(&outcome, false); durabilityErr != nil {
 			return errorDestinationAttemptAuthority, errors.Join(fmt.Errorf("agent: authority watchdog: %w", err), fmt.Errorf("agent: persist durable completion: %w", durabilityErr))
 		}
 		reconcileCompletion = true
@@ -684,8 +699,16 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case outcome = <-completed:
 		cancelExecution()
 	}
-	if err := persistCompletion(&outcome); err != nil {
+	if err := persistCompletion(&outcome, false); err != nil {
 		return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+	}
+	var attemptLost *ocihelper.AttemptLostError
+	if errors.As(outcome.err, &attemptLost) {
+		reconcileCompletion = true
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, outcome.err)
+		cancelAttempt(outcome.err)
+		<-renewalDone
+		return errorDestinationAttemptAuthority, outcome.err
 	}
 	var routed *routedDestinationError
 	if errors.As(outcome.err, &routed) && routed.destination != errorDestinationUnclassified {
