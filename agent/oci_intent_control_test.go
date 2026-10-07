@@ -489,6 +489,7 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 }
 
 func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReopens(t *testing.T) {
+	started := time.Now()
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
@@ -574,7 +575,7 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 	}()
 	select {
 	case <-observationStarted:
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("resident completion did not acquire the intent fence")
 	}
 
@@ -594,21 +595,21 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 			err      error
 		}{response: response, err: stopErr}
 	}()
-	markerDeadline := time.Now().Add(time.Second)
+	markerDeadline := time.Now().Add(hostedFixtureTimeout)
 	for {
 		intent, readErr := intentSource.ReadIntent(t.Context())
 		if readErr == nil && !intent.Enabled && intent.Revision == 2 {
 			break
 		}
 		if time.Now().After(markerDeadline) {
-			t.Fatalf("disabled revision 2 was not written: intent=%+v error=%v", intent, readErr)
+			t.Fatalf("phase=disabled revision 2 elapsed=%s intent=%+v error=%v", time.Since(started), intent, readErr)
 		}
 		time.Sleep(time.Millisecond)
 	}
 	close(continueObservation)
 	select {
 	case <-beforeCompletionRecord:
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("resident completion did not reach the ledger checkpoint")
 	}
 	var firstStop struct {
@@ -617,7 +618,7 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 	}
 	select {
 	case firstStop = <-stopDone:
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("first stop did not report the failed completion fence")
 	}
 	var persistenceErr *OCIIntentSuppressionPersistenceError
@@ -645,20 +646,20 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 			err      error
 		}{response: response, err: stopErr}
 	}()
-	markerDeadline = time.Now().Add(time.Second)
+	markerDeadline = time.Now().Add(hostedFixtureTimeout)
 	for {
 		intent, readErr := intentSource.ReadIntent(t.Context())
 		if readErr == nil && !intent.Enabled && intent.Revision == 4 {
 			break
 		}
 		if time.Now().After(markerDeadline) {
-			t.Fatalf("disabled revision 4 was not written: intent=%+v error=%v", intent, readErr)
+			t.Fatalf("phase=disabled revision 4 elapsed=%s intent=%+v error=%v", time.Since(started), intent, readErr)
 		}
 		time.Sleep(time.Millisecond)
 	}
 	select {
 	case <-residentCanceled:
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("later stop did not select the live resident")
 	}
 	session.recordRuntimeReap(claim.Job.JobID, workloadrunner.ReapReceipt{
@@ -670,7 +671,7 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 		if !errors.As(err, &persistenceErr) {
 			t.Fatalf("resident completion error=%T %v, want typed suppression failure", err, err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("resident completion did not publish its delayed result")
 	}
 	select {
@@ -678,7 +679,7 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 		if secondStop.err != nil || !secondStop.response.RuntimeQuiesced {
 			t.Fatalf("later stop with live resident response=%+v error=%v, want quiesced", secondStop.response, secondStop.err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("later stop did not join the resident")
 	}
 }

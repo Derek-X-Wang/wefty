@@ -40,10 +40,18 @@ func TestMain(main *testing.M) {
 	// darwin and proves nothing a test asserts, since no test cuts power. The
 	// binaries built below are production builds and keep it (#599).
 	durable.DisableSQLiteFullFsyncForTests()
-	directory, err := os.MkdirTemp("", "wefty-agent-test-")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	// Failure-path children execute this same test binary. Reuse the parent's
+	// four helpers instead of starting another compiler/linker job during a
+	// timed cleanup proof. The parent owns their directory until children join.
+	directory := os.Getenv("WEFTY_AGENT_TEST_BINARIES")
+	inherited := directory != "" && (os.Getenv("WEFTY_PRE_ADMISSION_FAILURE_CHILD") == "1" || os.Getenv("WEFTY_RELEASE_CLEANUP_CHILD") == "1")
+	if !inherited {
+		var err error
+		directory, err = os.MkdirTemp("", "wefty-agent-test-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	agentHelperPath = filepath.Join(directory, "processhelper")
 	agentBinaryPath = filepath.Join(directory, "wefty-agent")
@@ -57,6 +65,14 @@ func TestMain(main *testing.M) {
 		{name: "control plane", output: controlPlanePath, pkg: "github.com/Derek-X-Wang/wefty/cmd/wefty-l1"},
 		{name: "echo service", output: echoServiceBinaryPath, pkg: "github.com/Derek-X-Wang/wefty/cmd/wefty-echo-service"},
 	} {
+		if inherited {
+			info, err := os.Stat(build.output)
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+				fmt.Fprintf(os.Stderr, "inherited %s helper unavailable: %v\n", build.name, err)
+				os.Exit(1)
+			}
+			continue
+		}
 		command := exec.Command("go", "build", "-o", build.output, build.pkg)
 		if output, buildErr := command.CombinedOutput(); buildErr != nil {
 			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", build.name, buildErr, output)
@@ -64,11 +80,18 @@ func TestMain(main *testing.M) {
 		}
 	}
 	code := main.Run()
-	if err := os.RemoveAll(directory); err != nil && code == 0 {
+	if err := removeOwnedAgentTestHelpers(directory, inherited); err != nil && code == 0 {
 		fmt.Fprintln(os.Stderr, err)
 		code = 1
 	}
 	os.Exit(code)
+}
+
+func removeOwnedAgentTestHelpers(directory string, inherited bool) error {
+	if inherited {
+		return nil
+	}
+	return os.RemoveAll(directory)
 }
 
 func TestAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {
@@ -625,11 +648,13 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 	for _, directive := range []l1.AttemptDirective{l1.AttemptDirectiveStop, l1.AttemptDirectiveRestart} {
 		t.Run(string(directive), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			started := time.Now()
+			clock := newManualClock(time.Now())
+			ctx, cancel := context.WithTimeout(t.Context(), hostedFixtureTimeout)
 			defer cancel()
 			network := plain.NewNetwork()
 			serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-			store, err := l1.OpenStore(filepath.Join(t.TempDir(), "directive.sqlite"), l1.StoreOptions{LeaseDuration: time.Second})
+			store, err := l1.OpenStore(filepath.Join(t.TempDir(), "directive.sqlite"), l1.StoreOptions{Clock: clock, LeaseDuration: time.Second})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -771,10 +796,10 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 			var runs atomic.Int32
 			nodeAgent, err := New(Config{
 				Fabric:              network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}}),
-				ControlPlaneAddress: "wefty://control-plane", NodeID: "stable-node", BootSessionID: "boot-directive", Version: "test",
+				ControlPlaneAddress: "wefty://control-plane", NodeID: "stable-node", BootSessionID: "boot-directive", Version: "test", Clock: clock,
 				Capabilities: map[string]bool{"kind:process": true}, MaxOneshotSlots: 1,
-				HeartbeatInterval: time.Second, ClaimInterval: time.Millisecond, RenewalInterval: time.Millisecond,
-				OperationTimeout: time.Second, LogRetryInterval: time.Millisecond, LogSpoolDirectory: t.TempDir(),
+				HeartbeatInterval: time.Second, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
+				OperationTimeout: hostedFixtureTimeout, LogRetryInterval: time.Millisecond, LogSpoolDirectory: t.TempDir(),
 				WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindProcess: testProcessRuntime(directiveContinuationRunner(func(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
 					if request.Started != nil {
 						request.Started()
@@ -801,15 +826,24 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 			select {
 			case <-completionEntered:
 			case <-ctx.Done():
-				t.Fatal("first completion did not enter")
+				t.Fatalf("phase=first completion elapsed=%s: %v", time.Since(started), ctx.Err())
 			}
 			second := createJob("directive-second")
+			if err := awaitFixtureCondition(ctx, "completion-phase renewal timer", func() bool {
+				return clock.hasDeadline(clock.Now().Add(100 * time.Millisecond))
+			}); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(100 * time.Millisecond)
 			select {
 			case <-secondCompleted:
 			case <-ctx.Done():
-				t.Fatal("agent did not complete subsequent eligible job")
+				t.Fatalf("phase=subsequent completion elapsed=%s: %v", time.Since(started), ctx.Err())
 			}
-			got, err := store.GetJob(t.Context(), second.JobID)
+			// A completion request can be refused transiently (including a
+			// started-acknowledgement race). Its handler returning is not the
+			// durable success fact. Keep asserting eventual success.
+			got, err := waitForFailureJobState(store, second.JobID, contract.JobSucceeded, hostedFixtureTimeout)
 			if err != nil || got.State != contract.JobSucceeded || runs.Load() != 2 || !stopResponse.Load() {
 				t.Fatalf("subsequent job=%+v err=%v runs=%d directive=%v", got, err, runs.Load(), stopResponse.Load())
 			}
@@ -822,7 +856,7 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			waitCompletionReceiptState(t, nodeAgent.outbox, firstState.CurrentAttemptID, "delivered", 2*time.Second)
+			waitCompletionReceiptState(t, nodeAgent.outbox, firstState.CurrentAttemptID, "delivered", hostedFixtureTimeout)
 			t.Logf("directive=%s first_completion=delivered second_job=%s state=%s runs=%d", directive, second.JobID, got.State, runs.Load())
 		})
 	}

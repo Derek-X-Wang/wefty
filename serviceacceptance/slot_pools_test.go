@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
@@ -27,7 +30,9 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 		}
 	}()
 	evidence.stage = "harness-start"
-	harness := newAcceptanceHarness(t)
+	// Real process/SQLite delivery uses the production lease, never a
+	// compressed renewal deadline while four payloads compete for the CPU.
+	harness := newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{leaseDuration: l1.DefaultLeaseDuration})
 	evidence.harness = harness
 	evidence.stage = "reserve-ports"
 	ports := reserveDistinctPorts(t, 3)
@@ -49,20 +54,23 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	evidence.stage = "initial-health-b"
 	healthB := waitForHealth(t, serviceClients[1], serviceURLs[1], harness.agent)
 	evidence.stage = "initial-running-a"
-	runningA := harness.waitForJobState(t, services[0].JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
+	runningA := harness.waitForJobState(t, services[0].JobID, contract.JobClassService, contract.JobRunning, poolObservationBudget)
 	evidence.stage = "initial-running-b"
-	harness.waitForJobState(t, services[1].JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
+	harness.waitForJobState(t, services[1].JobID, contract.JobClassService, contract.JobRunning, poolObservationBudget)
 	evidence.stage = "initial-c-queued"
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
 
 	oneshots := make([]l1.Job, 0, 5)
+	releases := make([]func(), 0, 5)
 	for index := range 5 {
 		evidence.stage = fmt.Sprintf("submit-oneshot-%d", index)
-		oneshots = append(oneshots, harness.submitSleepingOneShot(t, index))
+		job, release := harness.submitHeldOneShot(t, index)
+		oneshots = append(oneshots, job)
+		releases = append(releases, release)
 		evidence.jobs[3+index].JobID = oneshots[index].JobID
 	}
 	evidence.stage = "oneshot-saturation"
-	waitForOneShotSaturation(t, harness, oneshots, 5*time.Second)
+	waitForOneShotSaturation(t, harness, oneshots, poolObservationBudget)
 
 	evidence.stage = "kill-a-and-check-b"
 	if err := syscall.Kill(healthA.PID, syscall.SIGKILL); err != nil {
@@ -79,7 +87,7 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	}
 
 	evidence.stage = "a-restart"
-	restarted := waitForFreshRunningAttempt(t, harness, services[0].JobID, runningA.CurrentAttemptID, 8*time.Second)
+	restarted := waitForFreshRunningAttempt(t, harness, services[0].JobID, runningA.CurrentAttemptID, poolObservationBudget)
 	evidence.stage = "a-restart-health"
 	restartedHealth := waitForHealth(t, serviceClients[0], serviceURLs[0], harness.agent)
 	if restarted.CurrentAttemptID == runningA.CurrentAttemptID || restartedHealth.PID == healthA.PID {
@@ -88,9 +96,14 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	evidence.stage = "post-restart-c-queued"
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
 
+	// The first four remain occupied until all capacity/sibling assertions
+	// have completed, regardless of how slowly the observer is scheduled.
+	for _, release := range releases {
+		release()
+	}
 	for index, job := range oneshots {
 		evidence.stage = fmt.Sprintf("await-oneshot-%d-succeeded", index)
-		harness.waitForJobState(t, job.JobID, contract.JobClassOneShot, contract.JobSucceeded, 8*time.Second)
+		harness.waitForJobState(t, job.JobID, contract.JobClassOneShot, contract.JobSucceeded, poolObservationBudget)
 		evidence.stage = fmt.Sprintf("oneshot-%d-output", index)
 		output := harness.agent.outputString()
 		if !attributedOutputContains(output, job.JobID, fmt.Sprintf("oneshot-%d", index)) {
@@ -108,11 +121,22 @@ func attributedOutputContains(output, jobID, payload string) bool {
 	return false
 }
 
-func (h *acceptanceHarness) submitSleepingOneShot(t *testing.T, index int) l1.Job {
+// Use the production startup deadline plus reap time as real-process delivery
+// headroom. The condition being waited on, rather than elapsed time, wins.
+const poolObservationBudget = agent.DefaultFinalizationTimeout + 5*time.Second
+
+func (h *acceptanceHarness) submitHeldOneShot(t *testing.T, index int) (l1.Job, func()) {
 	t.Helper()
 	workingDirectory := t.TempDir()
 	handoffDirectory := t.TempDir()
-	command := fmt.Sprintf("sleep 1.5; printf 'oneshot-%d\\n'", index)
+	releasePath := filepath.Join(workingDirectory, "release")
+	release := func() {
+		if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(release)
+	command := fmt.Sprintf("while [ ! -f \"$1\" ]; do sleep 0.01; done; printf 'oneshot-%d\\n'", index)
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   fmt.Sprintf("slot-pool-oneshot-%d-%d", index, time.Now().UnixNano()),
@@ -121,18 +145,18 @@ func (h *acceptanceHarness) submitSleepingOneShot(t *testing.T, index int) l1.Jo
 		RoutingTags:   []string{"service-acceptance"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: "/bin/sh"},
-			Argv:             []string{"sh", "-c", command},
+			Argv:             []string{"sh", "-c", command, "held-oneshot", releasePath},
 			WorkingDirectory: workingDirectory,
 			HandoffDirectory: handoffDirectory,
 		},
-		Limits: &contract.JobLimits{MaxRuntimeSeconds: 10, IdleTimeoutSeconds: 10},
+		Limits: &contract.JobLimits{MaxRuntimeSeconds: int(4 * poolObservationBudget / time.Second), IdleTimeoutSeconds: int(4 * poolObservationBudget / time.Second)},
 	}
 	var job l1.Job
 	status, body := h.doJSON(t, http.MethodPost, "/v1/jobs", spec, &job)
 	if status != http.StatusCreated {
 		t.Fatalf("submit one-shot %d status = %d body=%s", index, status, body)
 	}
-	return job
+	return job, release
 }
 
 func waitForOneShotSaturation(t *testing.T, harness *acceptanceHarness, jobs []l1.Job, timeout time.Duration) {
