@@ -427,23 +427,39 @@ type HostBootSessionProof struct {
 	BootSessionID      string `json:"boot_session_id"`
 }
 
+// NodeActiveAttempt contains execution facts without an attempt credential or fence.
+type NodeActiveAttempt struct {
+	JobID          string                `json:"job_id"`
+	AttemptID      string                `json:"attempt_id"`
+	BootSessionID  string                `json:"boot_session_id"`
+	Kind           string                `json:"kind"`
+	Class          string                `json:"class"`
+	State          contract.AttemptState `json:"state"`
+	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
+}
+
 // Node is the node projection shared by the operator list and agent protocol.
+// Node carries observed facts. AllowedActions is filled only by the HTTP route
+// for its authenticated caller, never by a store read.
 type Node struct {
 	contract.NodeRegistration
-	State               contract.NodeState `json:"state"`
-	AuthoritativeTags   []string           `json:"authoritative_tags"`
-	MaxOneshotSlots     int                `json:"max_oneshot_slots"`
-	MaxServiceSlots     int                `json:"max_service_slots"`
-	OneshotOccupancy    int                `json:"oneshot_occupancy"`
-	ServiceOccupancy    int                `json:"service_occupancy"`
-	Overcommitted       bool               `json:"overcommitted"`
-	AuthorityGeneration int64              `json:"authority_generation"`
-	ClaimsEnabled       bool               `json:"claims_enabled"`
-	IntentRevision      int64              `json:"intent_revision"`
-	IntentReason        string             `json:"intent_reason"`
-	IntentUpdatedAt     *time.Time         `json:"intent_updated_at"`
-	IntentActor         string             `json:"intent_actor"`
-	LastHeartbeatAt     time.Time          `json:"last_heartbeat_at"`
+	State               contract.NodeState       `json:"state"`
+	AuthoritativeTags   []string                 `json:"authoritative_tags"`
+	MaxOneshotSlots     int                      `json:"max_oneshot_slots"`
+	MaxServiceSlots     int                      `json:"max_service_slots"`
+	OneshotOccupancy    int                      `json:"oneshot_occupancy"`
+	ServiceOccupancy    int                      `json:"service_occupancy"`
+	Overcommitted       bool                     `json:"overcommitted"`
+	AuthorityGeneration int64                    `json:"authority_generation"`
+	ClaimsEnabled       bool                     `json:"claims_enabled"`
+	IntentRevision      int64                    `json:"intent_revision"`
+	IntentReason        string                   `json:"intent_reason"`
+	IntentUpdatedAt     *time.Time               `json:"intent_updated_at"`
+	IntentActor         string                   `json:"intent_actor"`
+	LastHeartbeatAt     time.Time                `json:"last_heartbeat_at"`
+	ActiveAttempts      []NodeActiveAttempt      `json:"active_attempts"`
+	LastCondition       *contract.Condition      `json:"last_condition"`
+	AllowedActions      []contract.AllowedAction `json:"allowed_actions"`
 }
 
 // OneShotCancelDirective is standing stop delivery for exactly one attempt.

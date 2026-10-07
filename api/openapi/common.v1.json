@@ -43,7 +43,8 @@
           },
           "details": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": true,
+            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id)."
           },
           "request_id": { "type": "string" }
         }
@@ -1608,10 +1609,112 @@
           "chown": { "type": "boolean" }
         }
       },
+      "AllowedAction": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["verb"],
+        "properties": {
+          "verb": { "type": "string" },
+          "requires": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Exact request field/value preconditions only, keyed by literal request JSON names (for example intent_revision: 7). Copy these pairs into the body. Never caller-chosen input descriptors. Omitted or {} when empty, never null. A field occurs in either requires or inputs, never both."
+          },
+          "inputs": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ActionInput" },
+            "description": "Caller-chosen request fields. Omitted or [] when empty, never null. Endpoint schemas constrain chosen values."
+          },
+          "refused_because": { "$ref": "#/components/schemas/Error" }
+        },
+        "description": "Shared unchanged by Nodes, services and Computers. Evaluated for the authenticated actor and resource snapshot. refused_because is omitted only when the decision passes with valid chosen inputs and exact preconditions; any error refuses, using the same scrubbing and retryability as a write. Writes recheck the same actor-aware predicates atomically. Refusals are facts, never recommendations."
+      },
+      "ActionInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "type", "required"],
+        "properties": {
+          "name": { "type": "string", "description": "Literal JSON field name in the request body." },
+          "type": { "type": "string", "enum": ["string", "boolean", "integer", "number", "object", "array"], "description": "JSON type of the caller's value." },
+          "required": { "type": "boolean", "description": "Whether the caller must supply the field, never a required value." }
+        }
+      },
+      "Condition": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "scope",
+          "since",
+          "details"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "description": "Last recorded notable fact, retained through ordinary heartbeats and reads. Open code and scope vocabularies; since is the control-plane recording time, not a guarantee that the condition still holds."
+      },
+      "NodeActiveAttempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "attempt_id",
+          "boot_session_id",
+          "kind",
+          "class",
+          "state",
+          "lease_expires_at"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "class": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "claimed",
+              "running",
+              "awaiting-input",
+              "succeeded",
+              "failed",
+              "lost"
+            ]
+          },
+          "lease_expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "Nonterminal persisted attempt on this Node, including prior boots until reconciled. Read routes reconcile expiry first. Reports execution state and lease, never a credential, fence or proof that a payload is physically running."
+      },
       "Node": {
         "allOf": [{ "$ref": "#/components/schemas/NodeFields" }],
         "unevaluatedProperties": false,
-        "description": "The operator-visible Node projection: exactly NodeFields and nothing else."
+        "description": "The Node factual projection: exactly NodeFields and nothing else. Client and agent routes evaluate allowed_actions for their real authenticated caller; agent-only callers have no operator action authority."
       },
       "NodeFields": {
         "description": "NodeRegistrationFields plus L1's authoritative Node facts. Open on purpose so HeartbeatResponse can extend it; Node closes it.",
@@ -1623,7 +1726,8 @@
               "state", "authoritative_tags", "max_oneshot_slots", "max_service_slots",
               "oneshot_occupancy", "service_occupancy", "overcommitted",
               "authority_generation", "claims_enabled", "intent_revision", "intent_reason",
-              "intent_updated_at", "intent_actor", "last_heartbeat_at"
+              "intent_updated_at", "intent_actor", "last_heartbeat_at",
+              "active_attempts", "last_condition", "allowed_actions"
             ],
             "properties": {
               "state": { "enum": ["alive", "stale", "draining", "dead"] },
@@ -1683,7 +1787,23 @@
                 "readOnly": true
               },
               "intent_actor": { "type": "string", "readOnly": true },
-              "last_heartbeat_at": { "type": "string", "format": "date-time" }
+              "last_heartbeat_at": { "type": "string", "format": "date-time" },
+              "active_attempts": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/NodeActiveAttempt" },
+                "readOnly": true
+              },
+              "last_condition": {
+                "anyOf": [{ "$ref": "#/components/schemas/Condition" }, { "type": "null" }],
+                "readOnly": true,
+                "description": "Null for upgraded Nodes with no recorded condition; historical conditions are never invented. Capability reason clearing records node_capability_recovered in node_capability scope, with stored capability_revision and missing_capabilities. Repeated observations preserve since."
+              },
+              "allowed_actions": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/AllowedAction" },
+                "readOnly": true,
+                "description": "Computed at the route for the real authenticated caller through the write decision. drain requires exact intent_revision and claims_enabled=false, plus required string input reason. set-claims requires exact intent_revision, plus required string reason and boolean claims_enabled inputs; either boolean value is legal. Both are independent of liveness. Agent-only principals are refused with principal_forbidden, matching client write routes."
+              }
             }
           }
         ]
