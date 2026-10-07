@@ -127,7 +127,7 @@ func computerBackupDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 		return "", "", protocolError(contract.ErrorConflict, "Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
 	var retained int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status<>'pruned'`, computerID).Scan(&retained); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status IN ('available', 'pruning')`, computerID).Scan(&retained); err != nil {
 		return "", "", internalError(err, "count retained Computer Backups")
 	}
 	if computer.BackupCap == 0 || retained >= computer.BackupCap {
@@ -384,9 +384,13 @@ func computerProjectionDecision(ctx context.Context, tx *sql.Tx, computer Comput
 	if err := requireCurrentComputerStorage(ctx, tx, computer, string(operation)); err != nil {
 		return err
 	}
-	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
-		return err
-	}
+	return computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition)
+}
+
+// Reads must also check the predicates enforced later by projection writes.
+// Keep them out of the early write decision: dispatch-key conflicts precede
+// root lookup, quiescence and publication refusals in the write transaction.
+func computerProjectionReadinessDecision(ctx context.Context, tx *sql.Tx, computer Computer, operation ComputerIntentOperation) error {
 	if operation == ComputerIntentReimage {
 		if _, err := computerReimageRootDecision(ctx, tx, computer); err != nil {
 			return err
@@ -518,7 +522,7 @@ func computerProjectionQuiescenceDecision(job Job) error {
 func computerRestoreRetentionDecision(ctx context.Context, tx *sql.Tx, computer Computer) error {
 	computerID := computer.ComputerID
 	var retained int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status<>'pruned'`, computerID).Scan(&retained); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status IN ('available', 'pruning')`, computerID).Scan(&retained); err != nil {
 		return internalError(err, "count retained Backups before restore")
 	}
 	if computer.BackupCap == 0 || retained >= computer.BackupCap {

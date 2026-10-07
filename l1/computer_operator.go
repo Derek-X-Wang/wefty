@@ -88,6 +88,9 @@ func computerActionDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 		if err == nil {
 			err = computerProjectionDecision(ctx, tx, computer, ComputerProjectionRequest{ComputerMutationPrecondition: values.Precondition, Spec: values.Spec}, operation)
 		}
+		if err == nil {
+			err = computerProjectionReadinessDecision(ctx, tx, computer, operation)
+		}
 	default:
 		err = protocolError(contract.ErrorInvalidRequest, "unknown Computer action %q", verb)
 	}
@@ -182,7 +185,7 @@ func computerAllowedActions(ctx context.Context, tx *sql.Tx, computer Computer, 
 }
 
 func computerBackupChoiceDecision(ctx context.Context, tx *sql.Tx, computer Computer, values *computerActionValues, decision func() error) error {
-	rows, err := tx.QueryContext(ctx, `SELECT backup_id FROM backups WHERE computer_id=? ORDER BY backup_id`, computer.ComputerID)
+	rows, err := tx.QueryContext(ctx, `SELECT backup_id FROM backups WHERE computer_id=? AND status='available' ORDER BY backup_id`, computer.ComputerID)
 	if err != nil {
 		return internalError(err, "list Computer action Backup choices")
 	}
@@ -205,7 +208,7 @@ func computerBackupChoiceDecision(ctx context.Context, tx *sql.Tx, computer Comp
 	if len(ids) == 0 {
 		return decision()
 	}
-	var first error
+	var first, internal error
 	for _, id := range ids {
 		values.BackupID = id
 		err := decision()
@@ -213,11 +216,18 @@ func computerBackupChoiceDecision(ctx context.Context, tx *sql.Tx, computer Comp
 			return nil
 		}
 		if errorCode(err) == contract.ErrorInternal {
-			return err
+			// A corrupt choice cannot authorize this action, but another choice
+			// can. Preserve the internal refusal if no valid choice succeeds.
+			if internal == nil {
+				internal = err
+			}
 		}
 		if first == nil {
 			first = err
 		}
+	}
+	if internal != nil {
+		return internal
 	}
 	return first
 }

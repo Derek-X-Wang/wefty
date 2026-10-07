@@ -94,7 +94,7 @@ func computerActionHTTP(computer Computer, verb, backupID string) (string, strin
 }
 
 func TestComputerAllowedActionsMatchEveryVerbHTTP(t *testing.T) {
-	states := []string{"stopped", "queued", "claimed", "running", "stopping", "failed", "resource-latch", "projecting", "resetting", "backing_up", "restoring", "cloning", "exporting", "importing", "reimaging", "growing", "removing", "removed", "capacity-full", "retired-storage", "root-missing", "backup-cap-zero", "backup-pruned", "backup-corrupt", "dead-growing"}
+	states := []string{"stopped", "queued", "claimed", "running", "stopping", "failed", "resource-latch", "projecting", "resetting", "backing_up", "restoring", "cloning", "exporting", "importing", "reimaging", "growing", "removing", "removed", "capacity-full", "retired-storage", "root-missing", "backup-cap-zero", "backup-pruned", "backup-pruning", "backup-corrupt", "dead-growing"}
 	for _, state := range states {
 		for _, verb := range testedComputerVerbs {
 			t.Run(state+"/"+verb, func(t *testing.T) {
@@ -156,6 +156,9 @@ func TestComputerAllowedActionsMatchEveryVerbHTTP(t *testing.T) {
 				case "backup-pruned":
 					exec(`UPDATE backups SET status='pruned' WHERE backup_id=?`, backup.BackupID)
 					exec(`DELETE FROM backup_copies WHERE backup_id=?`, backup.BackupID)
+				case "backup-pruning":
+					exec(`UPDATE backups SET status='pruning' WHERE backup_id=?`, backup.BackupID)
+					exec(`UPDATE backup_copies SET phase='removal_pending' WHERE backup_id=?`, backup.BackupID)
 				case "backup-corrupt":
 					exec(`UPDATE backup_copies SET content_digest='invalid' WHERE backup_id=?`, backup.BackupID)
 				}
@@ -206,6 +209,16 @@ func TestComputerAllowedActionsMatchEveryVerbHTTP(t *testing.T) {
 						if input.Name == "backup_id" && input.In != "path" {
 							t.Fatalf("Backup choice missing path location: %#v", input)
 						}
+					}
+					// These records cannot supply a new operation. An explicit prune
+					// may still replay, and writes naming an unavailable record have
+					// their own conflict; neither is a choice advertised by reads.
+					if (state == "backup-pruned" || state == "backup-pruning") &&
+						(verb == "restore" || verb == "clone" || verb == "prune" || verb == "custody-export") {
+						if action.RefusedBecause == nil || action.RefusedBecause.Code != contract.ErrorNotFound {
+							t.Fatalf("no available Backup choice should be not_found: %#v", action)
+						}
+						continue
 					}
 					status, _, result := h.do(caller, method, path, body)
 					accepted := status >= 200 && status < 300

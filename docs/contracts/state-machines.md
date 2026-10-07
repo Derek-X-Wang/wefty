@@ -1453,10 +1453,16 @@ reserves nothing and reports no recommendations.
 `ActionInput` adds optional `in`: omitted (or `body`) means a JSON body field;
 `path` means a URL parameter. The four Backup verbs advertise a required string
 `backup_id` with `in: "path"`. Allowed means at least one valid Backup choice
-exists for that operation; the caller selects one from the Computer's Backup
-records satisfying the endpoint's copy, size, placement, and root-identity
-constraints. It never means any arbitrary Backup ID works. With no valid
-choice, the action carries the enforcing predicate's refusal. No field appears
+exists for that operation; the caller selects one from the Computer's
+`status=available` Backup records satisfying the endpoint's copy, size,
+placement, and root-identity constraints. Pruned and still-pruning records
+cannot supply a new action, even when an explicit prune request can replay.
+With no available record, the enforcing predicate reports `not_found` after
+caller and resource checks. A corrupt available record cannot authorize an
+action, but evaluation continues through the other available records; if none
+succeeds, an internal refusal takes precedence over other choice refusals.
+Allowed never means any arbitrary Backup ID works. With no valid choice, the
+action carries the enforcing predicate's refusal. No field appears
 in both `requires` and `inputs`, and neither collection is emitted as null.
 
 `last_condition` reuses `{code, scope, since, details}` and is the latest of
@@ -1466,7 +1472,17 @@ never the read time; the fact does not claim a historical failure still holds.
 Reads neither change state nor synthesize health, advice, or an event timestamp.
 Computer detail, including selected clone/restore operations, and each listing
 page use read-only transactions. Listing seeks through the existing
-`computers_created_id` index in `(created_ns, computer_id)` order.
+`computers_created_id` index in `(created_ns, computer_id)` order. Backup
+choice and retention-count queries seek by Computer and live status, and copy
+reads seek by Backup ID through an unconditional index that includes removed
+copies. These additive indexes are installed on database reopen, after any
+Backup table migration; pruned history does not add choice evaluations or
+rows visited by retention counts.
+
+Projection and reimage writes preserve refusal precedence: after replay,
+resource and request preconditions, dispatch-key conflicts are checked before
+bound-node root lookup, Job quiescence or failed-Job publication checks. Reads
+also evaluate those later predicates before advertising a new operation.
 
 `wefty computers list` emits these facts in both JSON and the table's
 `LAST CONDITION` and `ALLOWED ACTIONS` columns; the latter preserves the exact
