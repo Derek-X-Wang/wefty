@@ -1188,7 +1188,7 @@ func (session *serverSession) reapAttemptWithDeleteEvidence(attempt *serverAttem
 	case attemptStarting, attemptLive:
 		attempt.state = attemptReaping
 		attempt.guardianReaping = guardian
-		if guardian {
+		if guardian || deleted {
 			session.rememberExpiredLocked(attempt.authority)
 		}
 		session.internalReaps.Add(1)
@@ -1240,9 +1240,6 @@ func (session *serverSession) reapAttemptWithDeleteEvidence(attempt *serverAttem
 	attempt.state = attemptTombstoned
 	attempt.reapRecorded = true
 	attempt.reapErr = err
-	if deleted && err == nil {
-		session.rememberExpiredLocked(attempt.authority)
-	}
 	attempt.closeReaped.Do(func() { close(attempt.reaped) })
 	session.mu.Unlock()
 	session.internalReaps.Done()

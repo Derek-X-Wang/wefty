@@ -268,3 +268,90 @@ func TestLateRenewalBeforeGuardianSchedulingNeverRestoresAuthority(t *testing.T)
 		t.Fatalf("response=%+v rejection=%+v deadline=%s", response, rejection, attempt.deadline)
 	}
 }
+
+// Delete has already withdrawn the payload, but its absence verification is
+// still running. A captured renewal must not invalidate the neighbour here.
+func TestLateRenewalDuringDeleteReapKeepsNeighbour(t *testing.T) {
+	engine := &blockingReapEngine{fakeEngine: newFakeEngine(), entered: make(chan struct{}), release: make(chan struct{})}
+	budget := startBudgetServer(t, engine, ServerConfig{HeartbeatTimeout: time.Minute})
+	client := NewUnixClient(budget.path, "checksum-test")
+	client.disableHeartbeatPump = true
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(engine.release) }) }
+	defer release()
+	requireSweep(t, session)
+	authority := testAuthority()
+	neighbour := authority
+	neighbour.JobID, neighbour.AttemptID, neighbour.FencingToken, neighbour.Class = "neighbour", "neighbour", "neighbour", contract.JobClassService
+	for _, a := range []AttemptAuthority{authority, neighbour} {
+		if _, err := session.Run(t.Context(), testRunRequest(a, time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	budget.server.sessionMu.Lock()
+	active := budget.server.active
+	budget.server.sessionMu.Unlock()
+	active.mu.Lock()
+	deadline := active.attempts[authority.key()].deadline
+	active.mu.Unlock()
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleted, err := session.Delete(t.Context(), DeleteRequest{Authority: authority})
+		if err == nil && !deleted.Deleted {
+			err = fmt.Errorf("Delete did not report deletion")
+		}
+		deleteDone <- err
+	}()
+	select {
+	case <-engine.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Delete did not enter ReapAttempt")
+	}
+	active.mu.Lock()
+	reaping := active.attempts[authority.key()].state == attemptReaping && !active.attempts[authority.key()].guardianReaping
+	active.mu.Unlock()
+	if !reaping {
+		t.Fatal("Delete did not reach non-guardian reap")
+	}
+	body, err := marshalBody(HeartbeatRequest{Sequence: 1, RenewedAttempts: []DeadmanRenewal{{Authority: authority, TTL: 2 * time.Minute}, {Authority: neighbour, TTL: 2 * time.Minute}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.controlWire.write(frame{Version: ProtocolVersion, Method: MethodHeartbeat, SessionCapability: session.capability, Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	var response HeartbeatResponse
+	if err := decodeResponse(session.controlWire, &response); err != nil {
+		t.Fatalf("late renewal during Delete invalidated session: %v", err)
+	}
+	if len(response.RefusedAttempts) != 1 || response.RefusedAttempts[0].Authority != authority || response.RefusedAttempts[0].Code != CodeAttemptExpired {
+		t.Fatalf("refusals = %+v", response.RefusedAttempts)
+	}
+	active.mu.Lock()
+	unchanged := active.attempts[authority.key()].deadline == deadline && active.attempts[authority.key()].state == attemptReaping
+	renewed := active.attempts[neighbour.key()].deadline.After(deadline)
+	active.mu.Unlock()
+	budget.server.sessionMu.Lock()
+	sameSession := budget.server.active == active && budget.server.lastSessionInvalidation == nil
+	budget.server.sessionMu.Unlock()
+	if !unchanged || !renewed || !sameSession || engine.sessionReapCount() != 0 {
+		t.Fatalf("unchanged=%t renewed=%t same-session=%t session-reaps=%d", unchanged, renewed, sameSession, engine.sessionReapCount())
+	}
+	if err := session.Signal(t.Context(), SignalRequest{Authority: neighbour, Signal: SignalTERM}); err != nil {
+		t.Fatalf("neighbour lost during Delete: %v", err)
+	}
+	release()
+	select {
+	case err := <-deleteDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Delete did not finish")
+	}
+}

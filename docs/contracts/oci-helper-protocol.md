@@ -481,11 +481,13 @@ advances the heartbeat sequence and session deadline without replacing the
 session generation.
 
 Only an exact tuple admitted by this session and subsequently expired or
-successfully deleted qualifies. The tuple includes Node, Job, Attempt, fencing
-token, boot session, workload class, and removal generation; matching just an
-Attempt ID is insufficient. Expiry is authoritative at the deadline even if
-the guardian timer has not run yet. Guardian reap failure still invalidates the
-session through the existing cleanup-failure path.
+reported `Deleted=true` without error by the engine qualifies, including while
+Delete is still verifying absence through its attempt reap. The tuple includes
+Node, Job, Attempt, fencing token, boot session, workload class, and removal
+generation; matching just an Attempt ID is insufficient. Expiry is authoritative
+at the deadline even if the guardian timer has not run yet. Guardian reap failure still invalidates the
+session through the existing cleanup-failure path. Recognition during Delete
+reaping grants no authority and does not change cleanup-failure handling.
 
 The session keeps a FIFO record of at most 1024 expired/deleted tuples; repeated
 refusals do not refresh their position. Session invalidation clears the record,

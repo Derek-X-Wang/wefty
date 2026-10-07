@@ -1066,6 +1066,12 @@ notifies that attempt owner, stops its pending renewals, and the adapter ends
 its Watch. The lifecycle classifies the typed refusal as attempt authority
 loss and uses normal reap and lost-attempt evidence reconciliation, rather
 than publishing it as successful completion or recovering the helper session.
+The renewal loop preserves this loss even if Watch returns without the typed
+error, so neither live completion delivery nor durable completion replay turns
+a plain lost attempt into a payload result. Shutdown and cancel/stop/restart
+directives keep their existing agent-terminated completion semantics: that
+completion is persisted before delivery even when Watch also reports attempt
+loss, and remains replayable after a delivery failure. L1 still fences replay.
 Other attempts, OCI capability, and helper generation remain live. The exact
 identity, bounded recognition record, and session-fatal exceptions are defined
 in [OCI helper protocol](oci-helper-protocol.md#late-attempt-renewals).
