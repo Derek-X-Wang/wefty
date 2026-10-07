@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,12 +40,33 @@ func startOCIIntentFixtureAgent(t *testing.T, a *Agent, store *l1.Store, jobID s
 			if !first.CompareAndSwap(false, true) {
 				return lifecycle.execute(attemptContext, claim, started)
 			}
-			gate := &fixtureRenewalWatchdog{attemptWatchdog: lifecycle.dependencies.watchdog, second: make(chan struct{})}
+			gate := &fixtureRenewalWatchdog{attemptWatchdog: lifecycle.dependencies.watchdog, second: make(chan struct{}), receipts: make(chan struct{}, 2)}
 			lifecycle.dependencies.watchdog = gate
 			var arrived atomic.Bool
 			var setupCause error
 			lifecycle.dependencies.logSinkFactory = func(setupContext context.Context, claim l1.Claim) (attemptLogSink, error) {
 				arrived.Store(true)
+				// Drive the two real L1 renewals only after their timer is
+				// armed, and wait for each receipt before moving time again.
+				// Loaded runners cannot spend this fixture's authority TTL.
+				clock := a.session.clock.(*manualClock)
+				for range 2 {
+					deadline := clock.Now().Add(a.renewalInterval)
+					if err := awaitFixtureCondition(setupContext, "setup renewal timer", func() bool {
+						return clock.hasDeadline(deadline)
+					}); err != nil {
+						return nil, err
+					}
+					clock.Advance(a.renewalInterval)
+					receiptContext, cancelReceipt := context.WithTimeout(setupContext, hostedFixtureTimeout)
+					select {
+					case <-gate.receipts:
+					case <-receiptContext.Done():
+						cancelReceipt()
+						return nil, fmt.Errorf("phase=setup renewal receipt: %w", receiptContext.Err())
+					}
+					cancelReceipt()
+				}
 				select {
 				case <-gate.second:
 				case <-setupContext.Done():
@@ -85,6 +107,7 @@ type fixtureRenewalWatchdog struct {
 	attemptWatchdog
 	renewals atomic.Int32
 	second   chan struct{}
+	receipts chan struct{}
 }
 
 func (watchdog *fixtureRenewalWatchdog) Start(ctx context.Context, authority localAuthority, cancel context.CancelCauseFunc) attemptWatch {
@@ -98,7 +121,11 @@ type fixtureRenewalWatch struct {
 
 func (watch *fixtureRenewalWatch) Renewed(authority localAuthority) {
 	watch.attemptWatch.Renewed(authority)
-	if watch.owner.renewals.Add(1) == 2 {
+	count := watch.owner.renewals.Add(1)
+	if count <= 2 {
+		watch.owner.receipts <- struct{}{}
+	}
+	if count == 2 {
 		close(watch.owner.second)
 	}
 }

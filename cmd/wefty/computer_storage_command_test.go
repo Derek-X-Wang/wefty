@@ -510,14 +510,14 @@ func (fix303CapabilityProbe) Probe(context.Context) (agentpkg.CapabilityProbeRes
 }
 
 type fix303BootBarrier struct {
-	mu               sync.Mutex
-	unavailableUntil time.Time
+	mu          sync.Mutex
+	unavailable bool
 }
 
 func (barrier *fix303BootBarrier) Ready() bool {
 	barrier.mu.Lock()
 	defer barrier.mu.Unlock()
-	return time.Now().After(barrier.unavailableUntil)
+	return !barrier.unavailable
 }
 func (barrier *fix303BootBarrier) Ensure(context.Context) error {
 	if !barrier.Ready() {
@@ -536,9 +536,9 @@ func (*fix303BootBarrier) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) 
 		VerifiedAbsent: true}, true
 }
 
-func (barrier *fix303BootBarrier) failFor(duration time.Duration) {
+func (barrier *fix303BootBarrier) fail() {
 	barrier.mu.Lock()
-	barrier.unavailableUntil = time.Now().Add(duration)
+	barrier.unavailable = true
 	barrier.mu.Unlock()
 }
 
@@ -573,7 +573,7 @@ func (runtime fix303RuntimeLossRuntime) CopyComputerStorage(_ context.Context, r
 	case runtime.copyCalls <- request:
 	default:
 	}
-	runtime.barrier.failFor(2 * time.Second)
+	runtime.barrier.fail()
 	return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.RuntimeLossError{
 		Generation: workloadrunner.RuntimeGeneration{InstanceID: "helper-fix-303", Generation: 17},
 		Err:        errors.New("oci helper engine_failure operation_failed followed by EOF"),
@@ -605,7 +605,9 @@ func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing
 	agentContext, stopAgent := context.WithCancel(h.ctx)
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- nodeAgent.Run(agentContext) }()
-	readyDeadline := time.Now().Add(2 * time.Second)
+	// Give real SQLite/HTTP delivery the normal finalization margin.
+	const waitBudget = agentpkg.DefaultFinalizationTimeout
+	readyDeadline := time.Now().Add(waitBudget)
 	for nodeAgent.Status().State != agentpkg.LifecycleReady && time.Now().Before(readyDeadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -628,7 +630,7 @@ func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing
 	err = execute(h.ctx, h.clients, true, []string{"services", "custody", "import", manifest.ExportID,
 		"--name", "runtime-loss-import", "--disk-bytes", fmt.Sprint(2 << 30), "--node", h.node.NodeID,
 		"--path", t.TempDir(), "--manifest", manifestPath, "--manifest-digest", manifestDigest,
-		"--idempotency-key", "runtime-loss-import", "--wait", "750ms", "--poll-interval", "1ms"}, &stdout, &stderr)
+		"--idempotency-key", "runtime-loss-import", "--wait", waitBudget.String(), "--poll-interval", "1ms"}, &stdout, &stderr)
 	elapsed := time.Since(started)
 	stopAgent()
 	if agentErr := <-agentDone; agentErr != nil {
@@ -642,12 +644,12 @@ func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing
 		t.Logf("agent made no copy call; directives=%+v err=%v", directives, directiveErr)
 	}
 	if err == nil || !strings.Contains(err.Error(), "computer_storage_preparation_interrupted") ||
-		strings.Contains(err.Error(), "context deadline exceeded") || elapsed >= 500*time.Millisecond ||
+		strings.Contains(err.Error(), "context deadline exceeded") || elapsed >= waitBudget ||
 		!bytes.Contains(stdout.Bytes(), []byte(`"code": "computer_storage_preparation_interrupted"`)) {
 		t.Fatalf("runtime-loss import stdout=%s stderr=%s elapsed=%s err=%v", stdout.String(), stderr.String(), elapsed, err)
 	}
 	if barrierErr := barrier.Ensure(t.Context()); barrierErr == nil || !strings.Contains(barrierErr.Error(), "boot barrier has not completed") {
-		t.Fatalf("runtime loss did not leave the boot barrier unavailable beyond the 750ms wait: %v", barrierErr)
+		t.Fatalf("runtime loss did not leave the boot barrier unavailable until the fixture explicitly recovers: %v", barrierErr)
 	}
 }
 

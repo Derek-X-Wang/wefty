@@ -54,10 +54,13 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 		t.Fatal(err)
 	}
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: fabricNodeID, Tags: []string{l1.DefaultAgentPrincipalTag}})
-	operationTimeout := DefaultOperationTimeout
-	if mode == "transient_deadline" {
-		operationTimeout = 3 * DefaultPublicationRetryInterval
-	}
+	// Setup and the live-authority control are ordinary L1 operations, not
+	// subjects of the shortened withdrawal budget. Keep their delivery guard
+	// independent so an incidental SQLite delay cannot invalidate the probe.
+	const operationTimeout = hostedFixtureTimeout
+	// Three retry periods plus a stated one-second scheduler/HTTP margin.
+	// The precise caller-deadline rule is also covered by the unit fixture.
+	const withdrawalBudget = 3*DefaultPublicationRetryInterval + time.Second*raceTimeoutScale
 	client, err := newClient(agentFabric, "wefty://control-plane", operationTimeout)
 	if err != nil {
 		t.Fatal(err)
@@ -146,8 +149,8 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 		select {
 		case <-serviceDone:
 			trace("cleanup_joined", nil)
-		case <-time.After(5 * time.Second): // Existing Computer-service shutdown bound.
-			t.Error("probe service did not join within existing shutdown bound")
+		case <-time.After(hostedFixtureTimeout): // Real-service join hang guard.
+			t.Error("phase=service cleanup: probe did not join within delivery guard")
 		}
 	}()
 	go func() {
@@ -163,8 +166,11 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 				if mode == "earlier_caller_operation_deadline" {
 					// The real-L1 case budgets withdrawal after admission. Exact
 					// execution deadlines are covered at the production helper.
-					parent, cancelParent = context.WithTimeout(parent, 3*DefaultPublicationRetryInterval)
+					parent, cancelParent = context.WithTimeout(parent, withdrawalBudget)
 					earlierDeadline, _ = parent.Deadline()
+				}
+				if mode == "transient_deadline" {
+					parent, cancelParent = context.WithTimeout(parent, withdrawalBudget)
 				}
 				operationContext, cancelOperation := client.boundedContext(parent)
 				operationDeadline, _ = operationContext.Deadline()
@@ -225,7 +231,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	var endpoint string
 	select {
 	case endpoint = <-published:
-	case <-time.After(5 * time.Second): // Existing Computer-service publication bound.
+	case <-time.After(hostedFixtureTimeout): // Real publication delivery guard.
 		t.Fatal("probe did not publish")
 	}
 	if err := <-startedResult; err != nil {
@@ -250,12 +256,12 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	runtime.lose()
 	select {
 	case <-falseEntered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("final false operation was not attempted")
 	}
 	select {
 	case <-runtime.canceled:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("payload execution was not canceled before publication drain")
 	}
 	select {
@@ -266,8 +272,8 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	release()
 	select {
 	case <-serviceDone:
-	case <-time.After(5 * time.Second): // Do not extend the existing teardown observation.
-		t.Fatal("final publication drain exceeded the existing shutdown observation")
+	case <-time.After(hostedFixtureTimeout): // Keep an independent teardown observation guard.
+		t.Fatal("phase=final publication drain: exceeded delivery guard")
 	}
 	select {
 	case <-closed:
@@ -291,7 +297,7 @@ func assertComputerPublicationFinalWithdrawal(t *testing.T, mode string) {
 	var cause error
 	select {
 	case cause = <-falseCause:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("final false callback did not record its cancellation cause")
 	}
 	if cause != nil {

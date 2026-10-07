@@ -29,10 +29,11 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 }
 
 func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
+	clock := newManualClock(time.Now())
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"intent-node": {Tags: []string{"intent-stop"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-	}, 500*time.Millisecond)
+	}, time.Second)
 	defer stopServer()
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
@@ -60,7 +61,7 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 	}
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
-		NodeID: "intent-node", BootSessionID: "intent-boot", Version: "test",
+		NodeID: "intent-node", BootSessionID: "intent-boot", Version: "test", Clock: clock,
 		Capabilities: map[string]bool{
 			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
 		},
@@ -84,7 +85,7 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 		OCIBootBarrier:       readyOCIBootBarrier{},
 		WorkloadRuntimes:     map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
-		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		HeartbeatInterval: DefaultHeartbeatInterval, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 		Logf: t.Logf,
 	})
 	if err != nil {
@@ -96,7 +97,7 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 	var attemptID string
 	select {
 	case attemptID = <-runtime.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		current, _ := store.GetJob(t.Context(), job.JobID)
 		nodes, _ := store.ListNodes(t.Context())
 		t.Fatalf("intent-stop OCI service did not start: job=%+v nodes=%+v agent=%+v", current, nodes, nodeAgent.Status())
@@ -131,7 +132,16 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 		cancelRun()
 		t.Fatalf("disabled OCI intent capability snapshot=%+v", snapshot)
 	}
-	queued, err := waitForFailureJobState(store, job.JobID, contract.JobQueued, 3*time.Second)
+	if err := awaitFixtureCondition(t.Context(), "intent-stop suppressed receipt", func() bool {
+		return nodeAgent.outbox.spool.inspectCompletion(t.Context(), attemptID).State == "suppressed"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Second)
+	if _, err := store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := waitForFailureJobState(store, job.JobID, contract.JobQueued, hostedFixtureTimeout)
 	if err != nil {
 		cancelRun()
 		t.Fatal(err)
@@ -155,6 +165,9 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 		cancelRun()
 		t.Fatalf("intent-stop service=%+v starts=%d err=%v", queued, runtime.starts.Load(), err)
 	}
+	if queued.NextRestartAt != nil {
+		clock.Advance(queued.NextRestartAt.Sub(clock.Now()))
+	}
 	started, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now())
 	if err == nil {
 		err = nodeAgent.RecoverOCIRuntimeCapabilities(t.Context())
@@ -163,13 +176,19 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 		cancelRun()
 		t.Fatalf("explicit OCI start intent=%+v live=%t err=%v", started, nodeAgent.OCIRuntimeLive(), err)
 	}
+	if err := awaitFixtureCondition(t.Context(), "service claim timer after intent reopen", func() bool {
+		return len(runtime.started) != 0 || clock.hasDeadline(clock.Now().Add(5*time.Millisecond))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(5 * time.Millisecond)
 	select {
 	case nextAttemptID := <-runtime.started:
 		if nextAttemptID == attemptID || runtime.starts.Load() != 2 {
 			cancelRun()
 			t.Fatalf("explicit OCI start attempt=%q prior=%q starts=%d", nextAttemptID, attemptID, runtime.starts.Load())
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		cancelRun()
 		current, _ := store.GetJob(t.Context(), job.JobID)
 		nodes, _ := store.ListNodes(t.Context())
@@ -194,10 +213,11 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 		{name: "disabled intent suppresses phase-valid spawn failure", intentStop: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock(time.Now())
 			network := plain.NewNetwork()
-			store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+			store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 				"prestarted-loss-node": {Tags: []string{"prestarted-loss"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-			}, 750*time.Millisecond)
+			}, time.Second)
 			defer stopServer()
 			digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 			job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
@@ -226,7 +246,7 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 			}
 			nodeAgent, err := New(Config{
 				Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
-				NodeID: "prestarted-loss-node", BootSessionID: "prestarted-loss-boot", Version: "test",
+				NodeID: "prestarted-loss-node", BootSessionID: "prestarted-loss-boot", Version: "test", Clock: clock,
 				Capabilities: map[string]bool{"kind:process": true},
 				CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
 					intent, err := intentSource.ReadIntent(ctx)
@@ -260,7 +280,7 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 			defer cleanupRun()
 			select {
 			case <-runtime.entered:
-			case <-time.After(5 * time.Second):
+			case <-time.After(hostedFixtureTimeout):
 				cancelRun()
 				t.Fatal("pre-Started OCI runtime did not enter Run")
 			}
@@ -283,7 +303,7 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 				t.Fatal(err)
 			}
 			releaseRuntime()
-			deadline := time.Now().Add(3 * time.Second)
+			deadline := time.Now().Add(hostedFixtureTimeout)
 			if test.intentStop {
 				for {
 					receipt := nodeAgent.outbox.spool.inspectCompletion(t.Context(), runtime.attemptID)
@@ -298,7 +318,8 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 					}
 					time.Sleep(5 * time.Millisecond)
 				}
-				lostDeadline := time.Now().Add(3 * time.Second)
+				clock.Advance(2 * time.Second)
+				lostDeadline := time.Now().Add(hostedFixtureTimeout)
 				for {
 					if _, err := store.Reconcile(t.Context()); err != nil {
 						cancelRun()

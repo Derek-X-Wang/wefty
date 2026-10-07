@@ -16,6 +16,8 @@ import (
 )
 
 func TestGuardianStartedContractAndAgentDisconnectReapPayloadGroup(t *testing.T) {
+	began := time.Now()
+	const observationBudget = DefaultStartupReadinessDeadline + DefaultProcessReapTimeout
 	agentEndpoint, guardianEndpoint, err := newGuardianSocketPair()
 	if err != nil {
 		t.Fatal(err)
@@ -27,6 +29,17 @@ func TestGuardianStartedContractAndAgentDisconnectReapPayloadGroup(t *testing.T)
 	go func() {
 		done <- serveGuardian(guardianEndpoint, &stdout, os.Stderr)
 		_ = guardianEndpoint.Close()
+	}()
+	joined := false
+	defer func() {
+		_ = agentEndpoint.Close()
+		if !joined {
+			select {
+			case <-done:
+			case <-time.After(observationBudget):
+				t.Error("phase=guardian cleanup: did not join")
+			}
+		}
 	}()
 	encoder := json.NewEncoder(agentEndpoint)
 	decoder := json.NewDecoder(agentEndpoint)
@@ -40,23 +53,24 @@ func TestGuardianStartedContractAndAgentDisconnectReapPayloadGroup(t *testing.T)
 	if started.Type != guardianMessageStarted || started.PID != started.ProcessGroupID {
 		t.Fatalf("started status = %#v, want distinct payload process group", started)
 	}
-	outputDeadline := time.Now().Add(2 * time.Second)
-	for stdout.Len() == 0 && time.Now().Before(outputDeadline) {
+	outputDeadline := time.Now().Add(observationBudget)
+	for !strings.Contains(stdout.String(), "\n") && time.Now().Before(outputDeadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if stdout.Len() == 0 {
-		t.Fatal("payload did not start its descendant before disconnect")
+	if !strings.Contains(stdout.String(), "\n") {
+		t.Fatalf("phase=descendant PID delivery elapsed=%s: no complete PID line", time.Since(began))
 	}
 	if err := agentEndpoint.Close(); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case err := <-done:
+		joined = true
 		if err != nil {
 			t.Fatalf("serveGuardian() error = %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("guardian did not reap after agent endpoint closed")
+	case <-time.After(observationBudget):
+		t.Fatalf("phase=guardian reap elapsed=%s after agent endpoint closed", time.Since(began))
 	}
 
 	childPIDText, _, _ := strings.Cut(stdout.String(), "\n")
