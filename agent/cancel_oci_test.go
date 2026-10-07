@@ -83,20 +83,26 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 					t.Errorf("agent Run: %v", err)
 				}
 			}()
+			// The observation payload holds until release. A failure before the
+			// cancel commits must still release it, or the shutdown above waits
+			// on the held attempt until the package timeout.
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(runtime.release) }) }
+			defer release()
 			select {
 			case <-runtime.ready:
-			case <-time.After(5 * time.Second):
+			case <-time.After(5 * time.Second * raceTimeoutScale):
 				t.Fatal("OCI never reached cancellation edge")
 			}
 			var pending l1.Job
 			if err := submitter.post(t.Context(), "/v1/jobs/"+job.JobID+"/cancel", nil, &pending); err != nil {
 				t.Fatal(err)
 			}
-			close(runtime.release)
+			release()
 			if pending.Outcome != "canceled" {
 				t.Fatalf("pending=%+v", pending)
 			}
-			deadline := time.Now().Add(5 * time.Second)
+			deadline := time.Now().Add(5 * time.Second * raceTimeoutScale)
 			var result l1.JobResult
 			for {
 				err = submitter.request(t.Context(), http.MethodGet, "/v1/jobs/"+job.JobID+"/result", nil, &result)

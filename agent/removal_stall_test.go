@@ -936,8 +936,10 @@ func TestStallAcknowledgementSessionReplacementReachesEnqueueFence(t *testing.T)
 		}}
 	}
 	controller.recordStallDeclared = func(context.Context, localRemoval) error {
-		t.Fatal("a rejected stall acknowledgement was marked declared")
-		return nil
+		// enqueue runs this on its own goroutine, where t.Fatal is not allowed.
+		err := errors.New("a rejected stall acknowledgement was marked declared")
+		t.Error(err)
+		return err
 	}
 	failures := make(chan destinationError, 1)
 	controller.enqueue(t.Context(), l1.RemovalDirective{

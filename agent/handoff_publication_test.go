@@ -69,7 +69,9 @@ func TestHandoffPublicationProcess(t *testing.T) {
 				appender := newRecordingAppender(path)
 				lifecycle.dependencies.runLedger = appender
 				lifecycle.dependencies.runtimes = testRuntimeSet(completionDirectiveRunFunc(func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
-					writeMailboxEvent(t, request.Execution.Env[contract.EnvRunDir], "0001-step-work", "wefty-protocol: 1\nkind: step\nname: work\n--\n")
+					if err := stageMailboxEvent(request.Execution.Env[contract.EnvRunDir], "0001-step-work", "wefty-protocol: 1\nkind: step\nname: work\n--\n"); err != nil {
+						return failWorkload(t, err)
+					}
 					return run(ctx, request, sink)
 				}))
 				t.Cleanup(func() {
@@ -132,7 +134,9 @@ func TestHandoffPublicationNeedsACompleteMailboxDrain(t *testing.T) {
 		appender.failWith(errors.New("run ledger is unreachable"))
 		lifecycle.dependencies.runLedger = appender
 		lifecycle.dependencies.runtimes = testRuntimeSet(completionDirectiveRunFunc(func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
-			writeMailboxEvent(t, request.Execution.Env[contract.EnvRunDir], "0001-gate-test", event)
+			if err := stageMailboxEvent(request.Execution.Env[contract.EnvRunDir], "0001-gate-test", event); err != nil {
+				return failWorkload(t, err)
+			}
 			return run(ctx, request, sink)
 		}))
 		if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
