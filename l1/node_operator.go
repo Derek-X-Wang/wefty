@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
 const (
@@ -29,38 +31,56 @@ func validateNodeIntentRequest(verb, actor string, request NodeIntentRequest) er
 	return nil
 }
 
-// nodeIntentDecision is shared by the advertised actions and the transaction
-// that enforces them. Liveness, capacity, capabilities and resident attempts do
-// not forbid an operator intent write, including a disable on a dead Node.
-func nodeIntentDecision(node Node, verb, actor string, request NodeIntentRequest) error {
-	if err := validateNodeIntentRequest(verb, actor, request); err != nil {
+// nodeIntentActor keeps the authenticated identity and deployment's principal
+// policy together. Decisions must not infer authority from a display actor name.
+type nodeIntentActor struct {
+	Identity           fabric.Identity
+	ClientPrincipalTag string
+}
+
+func (s *Server) nodeIntentActor(r *http.Request) nodeIntentActor {
+	return nodeIntentActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag}
+}
+
+// nodeIntentDecision is shared by advertised actions and the enforcing write.
+// Liveness, capacity, capabilities and resident attempts do not forbid an
+// authorized operator intent write, including a disable on a dead Node.
+func nodeIntentDecision(node Node, verb string, actor nodeIntentActor, request NodeIntentRequest) error {
+	if err := taggedIdentityDecision(actor.Identity, actor.ClientPrincipalTag); err != nil {
+		return err
+	}
+	if err := validateNodeIntentRequest(verb, actor.Identity.NodeID, request); err != nil {
 		return err
 	}
 	if request.IntentRevision != node.IntentRevision {
 		return protocolErrorWithDetails(contract.ErrorStaleIntentRevision, map[string]any{
-			"node_id": node.NodeID, "current_revision": node.IntentRevision, "provided_revision": request.IntentRevision,
+			"node_id": node.NodeID, "expected_revision": node.IntentRevision, "observed_revision": request.IntentRevision,
 		}, "node %q intent revision has changed", node.NodeID)
 	}
 	return nil
 }
 
-func nodeAllowedActions(node Node) []contract.AllowedAction {
+func nodeAllowedActions(node Node, actor nodeIntentActor) []contract.AllowedAction {
 	actions := make([]contract.AllowedAction, 0, 2)
 	for _, verb := range []string{nodeVerbDrain, nodeVerbSetClaims} {
 		request := NodeIntentRequest{IntentRevision: node.IntentRevision, Reason: "required operator input"}
-		action := contract.AllowedAction{Verb: verb, Requires: map[string]any{"revision": node.IntentRevision, "reason": true}}
-		if verb == nodeVerbSetClaims {
-			action.Requires["claims_enabled"] = true
+		action := contract.AllowedAction{Verb: verb, Requires: map[string]any{"intent_revision": node.IntentRevision},
+			Inputs: []contract.ActionInput{{Name: "reason", Type: "string", Required: true}}}
+		if verb == nodeVerbDrain {
+			action.Requires["claims_enabled"] = false
+		} else {
+			action.Inputs = append(action.Inputs, contract.ActionInput{Name: "claims_enabled", Type: "boolean", Required: true})
 		}
-		if err := nodeIntentDecision(node, verb, "authenticated operator", request); err != nil {
-			var refusal *Error
-			if errors.As(err, &refusal) {
-				action.RefusedBecause = &contract.APIError{Code: refusal.Code, Message: refusal.Message, Details: refusal.Details}
-			}
-		}
+		action.RefusedBecause = apiErrorFromDecision(nodeIntentDecision(node, verb, actor, request))
 		actions = append(actions, action)
 	}
 	return actions
+}
+
+// Node actions are request-specific; store snapshots never advertise authority.
+func (s *Server) projectNodeForCaller(r *http.Request, node Node) Node {
+	node.AllowedActions = nodeAllowedActions(node, s.nodeIntentActor(r))
+	return node
 }
 
 func conditionJSON(code, scope string, now time.Time, details map[string]any) []byte {
@@ -80,9 +100,10 @@ func recordNodeCondition(ctx context.Context, tx *sql.Tx, nodeID, code, scope st
 	return err
 }
 
-// GetNode reads the same projection as the fleet listing in one snapshot.
+// GetNode reads the same factual snapshot as the fleet listing. The route
+// computes allowed actions for its authenticated caller.
 func (s *Store) GetNode(ctx context.Context, nodeID string) (Node, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return Node{}, internalError(err, "begin node read")
 	}

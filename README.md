@@ -179,7 +179,7 @@ The full pass criteria and evidence commands are in the
 - `wefty runs list` shows each run's AGE (since submission) and DURATION (since it started), and marks a queued run that no node can take.
 - `wefty results RUN_ID [--out FILE]` reads the result document the run uploaded when it finished, from the ledger rather than from the node that produced it.
 - `wefty rerun RUN_ID` creates a new run from the original stored snapshot.
-- `wefty drain NODE_ID` stops new claims on a node while current work finishes.
+- `wefty drain NODE_ID` stops new claims on a node while current work finishes. `wefty drain NODE_ID --revision=REV --reason="maintenance"` sends an observed intent revision without refreshing it; stale revisions exit 5.
 
 Run `wefty help` for the complete command list and global flags.
 

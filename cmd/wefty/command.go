@@ -382,7 +382,7 @@ func executeSetNodeClaims(
 	flags.Int64Var(&intentRevision, "intent-revision", 0, "intent revision observed in nodes list")
 	flags.StringVar(&reason, "reason", "", "operator reason recorded with the intent")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")

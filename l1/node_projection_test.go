@@ -1,8 +1,11 @@
 package l1
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,8 +36,13 @@ type nodeOperatorFacts struct {
 		Details map[string]any `json:"details"`
 	} `json:"last_condition"`
 	AllowedActions []struct {
-		Verb           string             `json:"verb"`
-		Requires       map[string]any     `json:"requires"`
+		Verb     string         `json:"verb"`
+		Requires map[string]any `json:"requires"`
+		Inputs   []struct {
+			Name     string `json:"name"`
+			Type     string `json:"type"`
+			Required bool   `json:"required"`
+		} `json:"inputs"`
 		RefusedBecause *contract.APIError `json:"refused_because"`
 	} `json:"allowed_actions"`
 }
@@ -66,6 +74,7 @@ func TestNodeAllowedActionsMatchOperatorHTTP(t *testing.T) {
 					}
 					var listedAllowed bool
 					var revision int64
+					var exactRequirements map[string]any
 					found := false
 					for _, action := range list.Nodes[0].AllowedActions {
 						if action.Verb != verb {
@@ -73,11 +82,18 @@ func TestNodeAllowedActionsMatchOperatorHTTP(t *testing.T) {
 						}
 						found = true
 						listedAllowed = action.RefusedBecause == nil
-						value, ok := action.Requires["revision"].(float64)
-						if !ok || action.Requires["reason"] != true {
+						value, ok := action.Requires["intent_revision"].(float64)
+						if !ok || len(action.Requires) != map[string]int{"drain": 2, "set-claims": 1}[verb] || len(action.Inputs) != map[string]int{"drain": 1, "set-claims": 2}[verb] || action.Inputs[0].Name != "reason" || action.Inputs[0].Type != "string" || !action.Inputs[0].Required {
 							t.Fatalf("missing preconditions: %#v", action)
 						}
 						revision = int64(value)
+						exactRequirements = action.Requires
+						if verb == "drain" && action.Requires["claims_enabled"] != false {
+							t.Fatalf("missing exact drain value: %#v", action)
+						}
+						if verb == "set-claims" && (action.Inputs[1].Name != "claims_enabled" || action.Inputs[1].Type != "boolean" || !action.Inputs[1].Required) {
+							t.Fatalf("missing boolean input: %#v", action)
+						}
 					}
 					if !found {
 						t.Fatalf("missing action %s", verb)
@@ -86,7 +102,16 @@ func TestNodeAllowedActionsMatchOperatorHTTP(t *testing.T) {
 					if verb == "set-claims" {
 						path = "/v1/nodes/node/claims"
 					}
-					status, _, body = h.do(operator, http.MethodPost, path, NodeIntentRequest{IntentRevision: revision, ClaimsEnabled: verb == "set-claims", Reason: "operator decision"})
+					status, _, body = h.do(operator, http.MethodPost, path, func() map[string]any {
+						body := map[string]any{"reason": "operator decision"}
+						for name, value := range exactRequirements {
+							body[name] = value
+						}
+						if verb == "set-claims" {
+							body["claims_enabled"] = !enabled
+						}
+						return body
+					}())
 					if (status == http.StatusOK) != listedAllowed {
 						t.Fatalf("listed allowed=%t but handler status=%d body=%s", listedAllowed, status, body)
 					}
@@ -97,7 +122,7 @@ func TestNodeAllowedActionsMatchOperatorHTTP(t *testing.T) {
 					if err := json.Unmarshal(body, &refusal); err != nil {
 						t.Fatal(err)
 					}
-					if refusal.Error.Details["current_revision"] != float64(revision+1) {
+					if refusal.Error.Details["expected_revision"] != float64(revision+1) {
 						t.Fatalf("missing current revision: %s", body)
 					}
 				})
@@ -228,7 +253,7 @@ func TestNodeStaleRevisionHTTP(t *testing.T) {
 			if err := json.Unmarshal(body, &response); err != nil {
 				t.Fatal(err)
 			}
-			if response.Error.Details["current_revision"] != float64(4) || response.Error.Details["provided_revision"] != float64(3) {
+			if response.Error.Details["expected_revision"] != float64(4) || response.Error.Details["observed_revision"] != float64(3) {
 				t.Fatalf("revision details=%s", body)
 			}
 			var revision int64
@@ -288,7 +313,7 @@ func TestNodeConditionPersistsAcrossRecoveryAndReopen(t *testing.T) {
 	if facts = decode(node); facts.LastCondition == nil || !facts.LastCondition.Since.Equal(since) {
 		t.Fatalf("replayed observation advanced since: %#v", facts)
 	}
-	// Capability recovery does not erase the last notable refusal.
+	// Capability recovery is a new notable fact, recorded once.
 	observation.Revision = 3
 	observation.ReasonCode = ""
 	observation.MissingCapabilities = []string{}
@@ -297,9 +322,10 @@ func TestNodeConditionPersistsAcrossRecoveryAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if facts = decode(node); facts.LastCondition == nil || facts.LastCondition.Code != string(contract.CapabilityReasonHelperHandshakeFailed) || !facts.LastCondition.Since.Equal(since) {
-		t.Fatalf("recovery erased last condition: %#v", facts)
+	if facts = decode(node); facts.LastCondition == nil || facts.LastCondition.Code != "node_capability_recovered" || facts.LastCondition.Scope != "node_capability" || !facts.LastCondition.Since.Equal(clock.Now()) || facts.LastCondition.Details["capability_revision"] != float64(3) {
+		t.Fatalf("missing recovery condition: %#v", facts)
 	}
+	since = facts.LastCondition.Since
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -340,5 +366,185 @@ func TestNodeConditionUpgradeDoesNotInventHistory(t *testing.T) {
 	}
 	if value, present := list.Nodes[0]["last_condition"]; !present || value != nil {
 		t.Fatalf("upgraded node fabricated history or omitted field: %s", body)
+	}
+}
+
+// Denied principals cannot read the client route, so exercise its projection
+// with an authenticated request context, then compare to the real write route.
+// Agent register/drain/heartbeat below also test publicly reachable projections.
+func TestNodeAllowedActionsMatchPrincipalHTTP(t *testing.T) {
+	for _, clientTag := range []string{DefaultClientPrincipalTag, "custom-client"} {
+		for _, identity := range []fabric.Identity{
+			{NodeID: "client", Kind: fabric.IdentityKindMachine, Tags: []string{clientTag}},
+			{NodeID: "agent", Kind: fabric.IdentityKindMachine, Tags: []string{DefaultAgentPrincipalTag}},
+			{NodeID: "person", FabricID: "fabric", UserID: "person", DeviceID: "device"},
+			{NodeID: "untagged", Kind: fabric.IdentityKindMachine},
+			{NodeID: "dual", Kind: fabric.IdentityKindMachine, Tags: []string{clientTag, DefaultAgentPrincipalTag}},
+		} {
+			t.Run(clientTag+"/"+identity.NodeID, func(t *testing.T) {
+				h := newIntegrationHarness(t, map[string][]string{"node": {"linux"}})
+				h.server.clientPrincipalTag = clientTag
+				agent := h.client(fabric.Identity{NodeID: "registration-agent", Tags: []string{DefaultAgentPrincipalTag}})
+				h.register(agent, "node")
+				caller := h.client(identity)
+				for _, verb := range []string{"drain", "set-claims"} {
+					r := httptest.NewRequest(http.MethodGet, "/v1/nodes/node", nil)
+					r.SetPathValue("node_id", "node")
+					r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity))
+					w := httptest.NewRecorder()
+					h.server.getNode(w, r)
+					if w.Code != http.StatusOK {
+						t.Fatalf("projection: %d %s", w.Code, w.Body.String())
+					}
+					var facts nodeOperatorFacts
+					if err := json.Unmarshal(w.Body.Bytes(), &facts); err != nil {
+						t.Fatal(err)
+					}
+					var actionFound bool
+					for _, action := range facts.AllowedActions {
+						if action.Verb != verb {
+							continue
+						}
+						actionFound = true
+						path := "drain"
+						if verb == "set-claims" {
+							path = "claims"
+						}
+						status, _, body := h.do(caller, http.MethodPost, "/v1/nodes/node/"+path, NodeIntentRequest{IntentRevision: facts.IntentRevision, ClaimsEnabled: false, Reason: "principal parity"})
+						if (status == http.StatusOK) != (action.RefusedBecause == nil) {
+							t.Fatalf("action=%#v write=%d %s", action, status, body)
+						}
+						if action.RefusedBecause != nil {
+							var response contract.ErrorResponse
+							if err := json.Unmarshal(body, &response); err != nil {
+								t.Fatal(err)
+							}
+							if response.Error.Code != action.RefusedBecause.Code || response.Error.Retryable != action.RefusedBecause.Retryable {
+								t.Fatalf("action refusal=%#v write=%s", action.RefusedBecause, body)
+							}
+						}
+					}
+					if !actionFound {
+						t.Fatalf("missing %s: %s", verb, w.Body.String())
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAgentNodeActionsRefuseOperatorProtocol(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node": {"linux"}})
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	registration := contract.NodeRegistration{NodeID: "node", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{}}
+	for _, check := range []struct {
+		path string
+		body any
+	}{
+		{"register", registration},
+		{"node/heartbeat", HeartbeatRequest{BootSessionID: "boot", Capabilities: registration.Capabilities, CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{}}},
+		{"node/drain", DrainRequest{BootSessionID: "boot"}},
+	} {
+		t.Run(check.path, func(t *testing.T) {
+			status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/"+check.path, check.body)
+			if status != http.StatusOK {
+				t.Fatalf("status=%d body=%s", status, body)
+			}
+			var facts nodeOperatorFacts
+			if err := json.Unmarshal(body, &facts); err != nil {
+				t.Fatal(err)
+			}
+			if len(facts.AllowedActions) != 2 {
+				t.Fatalf("missing actions: %s", body)
+			}
+			for _, action := range facts.AllowedActions {
+				if action.RefusedBecause == nil || action.RefusedBecause.Code != contract.ErrorPrincipalForbidden || action.RefusedBecause.Retryable {
+					t.Fatalf("agent offered operator action: %s", body)
+				}
+			}
+		})
+	}
+}
+
+func TestNodeReadsDoNotAcquireWriteLock(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "read-lock.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, err = store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, contract.NodeRegistration{NodeID: "node", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true}}, NodePolicy{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(t.Context(), &sql.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, path := range []string{"detail", "list"} {
+		t.Run(path, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			if path == "detail" {
+				_, err = store.GetNode(ctx, "node")
+			} else {
+				_, err = store.ListNodes(ctx)
+			}
+			if err != nil {
+				t.Fatalf("read waited for writer (%s): %v", time.Since(start), err)
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("read exceeded deadline: %s", time.Since(start))
+			}
+		})
+	}
+}
+
+func TestNodeRegistrationCapabilityConditions(t *testing.T) {
+	for _, newBoot := range []bool{false, true} {
+		t.Run(map[bool]string{false: "same boot", true: "new boot"}[newBoot], func(t *testing.T) {
+			h := newIntegrationHarness(t, map[string][]string{"node": {"linux"}})
+			agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+			node := h.register(agent, "node")
+			registration := node.NodeRegistration
+			registration.Capabilities["kind:oci"] = false
+			registration.MissingCapabilities = []string{"kind:oci"}
+			registration.CapabilityReasonCode = contract.CapabilityReasonHelperHandshakeFailed
+			registration.SupersedeCapabilityRevision = true
+			registration.CapabilityRevision = 99 // L1 stores previous revision + 1.
+			withdrawn, err := h.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, registration, NodePolicy{}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if withdrawn.LastCondition == nil || withdrawn.LastCondition.Details["capability_revision"] != float64(withdrawn.CapabilityRevision) {
+				t.Fatalf("withdrawal does not describe stored revision: %#v", withdrawn)
+			}
+			h.clock.Advance(time.Second)
+			registration.CapabilityReasonCode = ""
+			registration.SupersedeCapabilityRevision = false
+			registration.CapabilityRevision = withdrawn.CapabilityRevision + 1
+			registration.Capabilities["kind:oci"] = true
+			registration.MissingCapabilities = []string{}
+			if newBoot {
+				registration.BootSessionID = "new-boot"
+			}
+			recovered, err := h.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, registration, NodePolicy{}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered.LastCondition == nil || recovered.LastCondition.Code != "node_capability_recovered" || recovered.LastCondition.Scope != "node_capability" || !recovered.LastCondition.Since.Equal(h.clock.Now()) || recovered.LastCondition.Details["capability_revision"] != float64(recovered.CapabilityRevision) {
+				t.Fatalf("missing registration recovery: %#v", recovered)
+			}
+			since := recovered.LastCondition.Since
+			h.clock.Advance(time.Second)
+			recovered, err = h.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, registration, NodePolicy{}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !recovered.LastCondition.Since.Equal(since) {
+				t.Fatalf("repeated healthy registration advanced condition: %#v", recovered.LastCondition)
+			}
+		})
 	}
 }

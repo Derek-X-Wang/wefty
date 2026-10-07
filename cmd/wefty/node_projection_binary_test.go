@@ -97,7 +97,7 @@ func TestNodeOperatorFactsFromRealBinary(t *testing.T) {
 		if err := json.Unmarshal([]byte(firstJSONDocument(output)), &refusal); err != nil {
 			t.Fatal(err)
 		}
-		if refusal.Error.Code != contract.ErrorStaleIntentRevision || refusal.Error.Details["current_revision"] != float64(1) {
+		if refusal.Error.Code != contract.ErrorStaleIntentRevision || refusal.Error.Details["expected_revision"] != float64(1) {
 			t.Fatalf("stale refusal=%s", output)
 		}
 	})
@@ -115,6 +115,35 @@ func TestNodeOperatorFactsFromRealBinary(t *testing.T) {
 			if refusal.Error.Code != contract.ErrorInvalidRequest {
 				t.Fatalf("local error=%s", output)
 			}
+		}
+	})
+
+	t.Run("node command exit codes", func(t *testing.T) {
+		for _, check := range []struct {
+			name string
+			args []string
+			exit int
+			code contract.ErrorCode
+		}{
+			{"stale set claims", []string{"nodes", "set-claims", "node", "--claims-enabled=false", "--intent-revision=0", "--reason=stale"}, exitConflict, contract.ErrorStaleIntentRevision},
+			{"missing inspect", []string{"nodes", "inspect", "missing"}, exitNotFound, contract.ErrorNotFound},
+			{"bad flag", []string{"nodes", "set-claims", "node", "--unknown=true"}, exitUsage, contract.ErrorInvalidRequest},
+			{"bad boolean", []string{"nodes", "set-claims", "node", "--claims-enabled=bad"}, exitUsage, contract.ErrorInvalidRequest},
+			{"bad revision", []string{"nodes", "set-claims", "node", "--intent-revision=bad"}, exitUsage, contract.ErrorInvalidRequest},
+		} {
+			t.Run(check.name, func(t *testing.T) {
+				code, output := call(append([]string{"--json"}, check.args...)...)
+				if code != check.exit {
+					t.Fatalf("exit=%d want=%d output=%s", code, check.exit, output)
+				}
+				var response contract.ErrorResponse
+				if err := json.Unmarshal([]byte(firstJSONDocument(output)), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Error.Code != check.code {
+					t.Fatalf("error=%s", output)
+				}
+			})
 		}
 	})
 

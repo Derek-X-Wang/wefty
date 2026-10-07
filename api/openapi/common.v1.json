@@ -43,7 +43,8 @@
           },
           "details": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": true,
+            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id)."
           },
           "request_id": { "type": "string" }
         }
@@ -1610,24 +1611,32 @@
       "AllowedAction": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "verb",
-          "requires"
-        ],
+        "required": ["verb"],
         "properties": {
-          "verb": {
-            "type": "string"
-          },
+          "verb": { "type": "string" },
           "requires": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Open requirement keys. revision is the observed resource revision; other keys name required caller inputs or documented preconditions."
+            "description": "Exact request field/value preconditions only, keyed by literal request JSON names (for example intent_revision: 7). Copy these pairs into the body. Never caller-chosen input descriptors. Omitted or {} when empty, never null. A field occurs in either requires or inputs, never both."
           },
-          "refused_because": {
-            "$ref": "#/components/schemas/Error"
-          }
+          "inputs": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ActionInput" },
+            "description": "Caller-chosen request fields. Omitted or [] when empty, never null. Endpoint schemas constrain chosen values."
+          },
+          "refused_because": { "$ref": "#/components/schemas/Error" }
         },
-        "description": "A legal operator verb when its required inputs are supplied and refused_because is absent. Refusals are facts, not recommendations. A subsequent write rechecks the same predicates atomically."
+        "description": "Shared unchanged by Nodes, services and Computers. Evaluated for the authenticated actor and resource snapshot. refused_because is omitted only when the decision passes with valid chosen inputs and exact preconditions; any error refuses, using the same scrubbing and retryability as a write. Writes recheck the same actor-aware predicates atomically. Refusals are facts, never recommendations."
+      },
+      "ActionInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "type", "required"],
+        "properties": {
+          "name": { "type": "string", "description": "Literal JSON field name in the request body." },
+          "type": { "type": "string", "enum": ["string", "boolean", "integer", "number", "object", "array"], "description": "JSON type of the caller's value." },
+          "required": { "type": "boolean", "description": "Whether the caller must supply the field, never a required value." }
+        }
       },
       "Condition": {
         "type": "object",
@@ -1704,7 +1713,7 @@
       "Node": {
         "allOf": [{ "$ref": "#/components/schemas/NodeFields" }],
         "unevaluatedProperties": false,
-        "description": "The operator-visible Node projection: exactly NodeFields and nothing else."
+        "description": "The Node factual projection: exactly NodeFields and nothing else. Client and agent routes evaluate allowed_actions for their real authenticated caller; agent-only callers have no operator action authority."
       },
       "NodeFields": {
         "description": "NodeRegistrationFields plus L1's authoritative Node facts. Open on purpose so HeartbeatResponse can extend it; Node closes it.",
@@ -1786,13 +1795,13 @@
               "last_condition": {
                 "anyOf": [{ "$ref": "#/components/schemas/Condition" }, { "type": "null" }],
                 "readOnly": true,
-                "description": "Null for upgraded Nodes with no recorded condition; historical conditions are never invented."
+                "description": "Null for upgraded Nodes with no recorded condition; historical conditions are never invented. Capability reason clearing records node_capability_recovered in node_capability scope, with stored capability_revision and missing_capabilities. Repeated observations preserve since."
               },
               "allowed_actions": {
                 "type": "array",
                 "items": { "$ref": "#/components/schemas/AllowedAction" },
                 "readOnly": true,
-                "description": "Supported L1 node operator verbs: drain and set-claims. Both require the observed intent revision and a nonempty reason, independently of liveness. set-claims also requires a claims_enabled input."
+                "description": "Computed at the route for the real authenticated caller through the write decision. drain requires exact intent_revision and claims_enabled=false, plus required string input reason. set-claims requires exact intent_revision, plus required string reason and boolean claims_enabled inputs; either boolean value is legal. Both are independent of liveness. Agent-only principals are refused with principal_forbidden, matching client write routes."
               }
             }
           }

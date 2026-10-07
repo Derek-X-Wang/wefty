@@ -1199,8 +1199,8 @@ list` and `wefty nodes inspect NODE_ID` show these facts in table or JSON form:
 - `last_condition`: the last recorded notable event, or `null` for an upgraded
   Node with no recorded event. `{code, scope, since, details}` uses open string
   vocabularies and an object of factual details. `since` is the control-plane
-  recording time. Normal heartbeats and reads preserve it, including after a
-  capability recovers. A later notable event replaces it atomically with that
+  recording time. Normal heartbeats, repeated observations, and reads preserve
+  it. A capability reason clearing records a recovery condition. A later notable event replaces it atomically with that
   event's mutation. No pre-upgrade event or timestamp is fabricated.
 - `allowed_actions`: the shared `contract.AllowedAction` shape below. It
   reports rules for this snapshot, never advice or a recommended next action.
@@ -1210,7 +1210,8 @@ The shared wire shape for Nodes, services, and Computers is:
 ```json
 {
   "verb": "drain",
-  "requires": {"revision": 7, "reason": true},
+  "requires": {"intent_revision": 7, "claims_enabled": false},
+  "inputs": [{"name": "reason", "type": "string", "required": true}],
   "refused_because": {
     "code": "conflict",
     "message": "factual refusal",
@@ -1220,13 +1221,40 @@ The shared wire shape for Nodes, services, and Computers is:
 }
 ```
 
-`requires` is an open object. `revision` is the exact revision to send in the
-resource's revision field; `reason: true` requires a nonempty operator reason.
-`claims_enabled: true` on `set-claims` means a boolean input is required, **not**
-that its value must be true. `refused_because` uses the shared APIError shape
-and is omitted when the verb is legal with the required inputs. A later write
-always rechecks the same decision predicate inside its transaction; listing an
-allowed action does not reserve authority.
+`verb` names the resource action. `requires` contains **only exact values**
+the caller must send, keyed by the literal JSON request field (for example
+`intent_revision`, never the abstract `revision`). It is omitted or `{}` when
+there are no exact preconditions; it is never `null`. Copy these field/value
+pairs directly into the request body. For `drain`, `claims_enabled: false` is
+an exact value; for `set-claims`, that boolean is a caller choice.
+
+`inputs` lists caller-chosen request fields as `{name, type, required}`. `name`
+is the literal JSON request field, `type` is its JSON type (`string`, `boolean`,
+`integer`, `number`, `object`, or `array`), and `required` says whether the caller
+must supply it. A field appears in either `requires` or `inputs`, never both.
+`inputs` is omitted or `[]` when there are no caller-chosen fields; it is never
+`null`. Node `reason` is a required string and must be nonempty after trimming.
+`set-claims` additionally lists required boolean input `claims_enabled`: both
+`false` and `true` are valid choices. The endpoint schema supplies any further
+constraints on chosen values.
+
+`refused_because` is omitted only when the action passes the decision for this
+snapshot and the **authenticated caller**, assuming valid chosen inputs and
+exact preconditions. It uses the same APIError conversion, internal-error
+scrubbing, and retryability as a write refusal; any decision error refuses the
+action. The write rechecks the same actor-aware decision in its transaction.
+A listed action does not reserve authority or guarantee that a later write wins.
+Services and Computers reuse this shape unchanged, with their own request field
+names and person, administrator, and grant predicates in their decisions.
+
+Node client reads and writes compute actions at the route using the request's
+real Fabric identity and configured client principal policy, never in a store
+read. Agent registration, heartbeat, and drain responses retain the factual
+Node projection, but evaluate actions for that real caller too: an agent-only
+principal receives `principal_forbidden` for both operator verbs, matching the
+client write routes. Person and untagged principals lack Node client authority;
+a principal carrying the configured client tag may act even if it also carries
+an agent tag. This does not add person or administrator Node authority.
 
 The complete L1 Node operator verb set is currently:
 
@@ -1241,8 +1269,10 @@ attempts do not prevent these intent writes. There is no L1 Node `remove` or
 `forget` endpoint or CLI verb to advertise; service/Computer removal and local
 `wefty node` OCI/setup controls are separate resources and authority surfaces.
 
-A stale Node intent revision returns HTTP 409, code `stale_intent_revision`,
-`retryable=false`, and `details: {node_id, current_revision, provided_revision}`.
+The shared `stale_intent_revision` refusal is HTTP 409, `retryable=false`.
+`details.expected_revision` is the current stored intent revision and
+`details.observed_revision` is the revision the caller supplied. Details also
+identify the resource (`node_id` for Nodes, `computer_id` for Computers).
 It changes neither intent nor the last condition. `wefty drain NODE_ID
 --revision REV --reason REASON` sends the observed revision without refreshing
 it. Omitting `--revision` reads the current Node revision first; omitting
@@ -1254,6 +1284,11 @@ and initial claims intent), `node_alive`, `node_stale`, `node_dead`, and
 `node_draining` (`node_liveness`); `claims_enabled` and `claims_disabled`
 (`node_intent`, with actor, reason, and resulting revision); and the agent's
 capability withdrawal reason code (`node_capability`, with missing capabilities
-and capability revision). A repeated observation does not advance `since`.
+and the **stored** capability revision), or `node_capability_recovered` in the
+same scope when a previously nonempty reason clears, with the new stored
+capability revision and missing capabilities. Both heartbeat and registration
+record recovery, including a replacement boot. Capability conditions take
+precedence when a capability transition and liveness transition occur together.
+A repeated observation does not advance `since`.
 Registration never overwrites durable operator intent. The last event may have
 cleared: its presence is historical evidence, not a current eligibility answer.

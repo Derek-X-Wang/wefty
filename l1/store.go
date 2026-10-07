@@ -2535,7 +2535,7 @@ func (s *Store) ListJobAttempts(ctx context.Context, jobID string) ([]Attempt, e
 
 // ListNodes returns the operator-visible fleet in stable node ID order.
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, internalError(err, "begin node listing")
 	}
@@ -2724,10 +2724,17 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 		details = nil
 		notable = true
 	}
-	if replaceCapabilities && registration.CapabilityReasonCode != "" && (storedReason != registration.CapabilityReasonCode || storedBoot != registration.BootSessionID || !bytes.Equal(storedMissingJSON, incoming.missingJSON)) {
-		code, scope = string(registration.CapabilityReasonCode), "node_capability"
-		details = map[string]any{"missing_capabilities": registration.MissingCapabilities, "capability_revision": registration.CapabilityRevision}
-		notable = true
+	if replaceCapabilities {
+		capabilityCode := string(incoming.observation.ReasonCode)
+		changed := incoming.observation.ReasonCode != storedReason || !bytes.Equal(storedMissingJSON, incoming.missingJSON) || storedBoot != registration.BootSessionID
+		if capabilityCode == "" && storedReason != "" {
+			capabilityCode = "node_capability_recovered"
+		}
+		if capabilityCode != "" && changed {
+			code, scope = capabilityCode, "node_capability"
+			details = map[string]any{"missing_capabilities": incoming.observation.MissingCapabilities, "capability_revision": incoming.observation.Revision}
+			notable = true
+		}
 	}
 	if notable {
 		if err := recordNodeCondition(ctx, tx, registration.NodeID, code, scope, now, details); err != nil {
@@ -2840,11 +2847,17 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 			return Node{}, internalError(err, "record heartbeat liveness condition")
 		}
 	}
-	if replaceCapabilities && incoming.observation.ReasonCode != "" && (incoming.observation.ReasonCode != storedReason || !bytes.Equal(storedMissingJSON, incoming.missingJSON)) {
-		if err := recordNodeCondition(ctx, tx, nodeID, string(incoming.observation.ReasonCode), "node_capability", now, map[string]any{
-			"missing_capabilities": incoming.observation.MissingCapabilities, "capability_revision": incoming.observation.Revision,
-		}); err != nil {
-			return Node{}, internalError(err, "record heartbeat capability condition")
+	if replaceCapabilities && (incoming.observation.ReasonCode != storedReason || !bytes.Equal(storedMissingJSON, incoming.missingJSON)) {
+		code := string(incoming.observation.ReasonCode)
+		if code == "" && storedReason != "" {
+			code = "node_capability_recovered"
+		}
+		if code != "" {
+			if err := recordNodeCondition(ctx, tx, nodeID, code, "node_capability", now, map[string]any{
+				"missing_capabilities": incoming.observation.MissingCapabilities, "capability_revision": incoming.observation.Revision,
+			}); err != nil {
+				return Node{}, internalError(err, "record heartbeat capability condition")
+			}
 		}
 	}
 	node, err := getNode(ctx, tx, nodeID)
@@ -5026,7 +5039,6 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	if err := attempts.Err(); err != nil {
 		return Node{}, err
 	}
-	node.AllowedActions = nodeAllowedActions(node)
 	node.Overcommitted = node.OneshotOccupancy > node.MaxOneshotSlots || node.ServiceOccupancy > node.MaxServiceSlots
 	return node, nil
 }

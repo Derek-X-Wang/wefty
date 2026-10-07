@@ -675,6 +675,9 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	for i := range nodes {
+		nodes[i] = s.projectNodeForCaller(r, nodes[i])
+	}
 	writeJSON(w, http.StatusOK, NodeList{Nodes: nodes})
 }
 
@@ -688,7 +691,7 @@ func (s *Server) getNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, node)
+	writeJSON(w, http.StatusOK, s.projectNodeForCaller(r, node))
 }
 
 func (s *Server) operatorDrainNode(w http.ResponseWriter, r *http.Request) {
@@ -710,13 +713,12 @@ func (s *Server) setNodeClaims(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeNodeIntent(w http.ResponseWriter, r *http.Request, verb string, request NodeIntentRequest) {
-	identity := identityFromRequest(r)
-	node, err := s.store.setNodeIntentByOperator(r.Context(), r.PathValue("node_id"), verb, identity.NodeID, request)
+	node, err := s.store.setNodeIntentByOperator(r.Context(), r.PathValue("node_id"), verb, s.nodeIntentActor(r), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, node)
+	writeJSON(w, http.StatusOK, s.projectNodeForCaller(r, node))
 }
 
 // authorizeJobProtocol splits the job collection by what the caller presents.
@@ -869,6 +871,13 @@ func (s *Server) listChildJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
+func taggedIdentityDecision(identity fabric.Identity, tag string) error {
+	if tag == "" || !slices.Contains(NormalizeTags(identity.Tags), tag) {
+		return protocolError(contract.ErrorPrincipalForbidden, "fabric identity is not authorized for this protocol")
+	}
+	return nil
+}
+
 func (s *Server) authorize(principal principal, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
@@ -902,8 +911,8 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			if principal == agentPrincipal {
 				tag = s.agentPrincipalTag
 			}
-			if !slices.Contains(NormalizeTags(identity.Tags), tag) {
-				writeError(w, protocolError(contract.ErrorPrincipalForbidden, "fabric identity is not authorized for this protocol"))
+			if err := taggedIdentityDecision(identity, tag); err != nil {
+				writeError(w, err)
 				return
 			}
 		}
@@ -2258,7 +2267,7 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, node)
+	writeJSON(w, http.StatusOK, s.projectNodeForCaller(r, node))
 }
 
 func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
@@ -2382,7 +2391,7 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, OneShotCancelDirectives: cancels, RemovalDirectives: directives,
+	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: s.projectNodeForCaller(r, node), OneShotCancelDirectives: cancels, RemovalDirectives: directives,
 		StorageResetDirectives: storageResets, StorageGrowDirectives: storageGrows, ReimageDirectives: reimages, BackupDirectives: backups,
 		BackupPruneDirectives: backupPrunes, StorageCopyDirectives: storageCopies,
 		CustodyExportDirectives: custodyExports, ComputerPolicy: computerPolicy})
@@ -2607,7 +2616,7 @@ func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, node)
+	writeJSON(w, http.StatusOK, s.projectNodeForCaller(r, node))
 }
 
 func (s *Server) claimJob(w http.ResponseWriter, r *http.Request) {
@@ -2934,24 +2943,11 @@ func writeError(w http.ResponseWriter, err error) {
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
 	}
-	message := err.Error()
-	var details map[string]any
-	retryable := code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted ||
-		code == contract.ErrorRunLedgerUnavailable
-	var protocolErr *Error
-	if errors.As(err, &protocolErr) {
-		details = protocolErr.Details
-		if protocolErr.notRetryable {
-			retryable = false
-		}
-	}
+	apiError := apiErrorFromDecision(err)
 	if code == contract.ErrorInternal {
-		message = "internal server error"
 		if sink, ok := w.(scrubbedErrorSink); ok {
 			sink.recordScrubbedInternalError(err)
 		}
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{
-		Code: code, Message: message, Retryable: retryable, Details: details,
-	}})
+	writeJSON(w, status, contract.ErrorResponse{Error: *apiError})
 }

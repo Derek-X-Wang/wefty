@@ -80,3 +80,38 @@ func TestWriteErrorPublishesTruthfulRetryability(t *testing.T) {
 		})
 	}
 }
+
+func TestActionRefusalFailsClosedAndMatchesWriteError(t *testing.T) {
+	for _, err := range []error{
+		errors.New("private database path"),
+		internalError(errors.New("private cause"), "read action authority"),
+		protocolErrorWithDetails(contract.ErrorCapacityExhausted, map[string]any{"capacity": 1}, "full"),
+		runLedgerUnavailable(nil, "ledger unavailable"),
+		computerRevocationOwed(nil),
+		protocolError(contract.ErrorPrincipalForbidden, "wrong principal"),
+	} {
+		t.Run(err.Error(), func(t *testing.T) {
+			refusal := apiErrorFromDecision(err)
+			if refusal == nil {
+				t.Fatal("decision error advertised as allowed")
+			}
+			recorder := httptest.NewRecorder()
+			writeError(recorder, err)
+			var response contract.ErrorResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			expected, _ := json.Marshal(response.Error)
+			actual, _ := json.Marshal(refusal)
+			if string(actual) != string(expected) {
+				t.Fatalf("action=%s write=%s", actual, expected)
+			}
+			if errorCode(err) == contract.ErrorInternal && (refusal.Message != "internal server error" || !refusal.Retryable) {
+				t.Fatalf("unsafe internal refusal: %#v", refusal)
+			}
+		})
+	}
+	if apiErrorFromDecision(nil) != nil {
+		t.Fatal("successful decision refused")
+	}
+}

@@ -439,6 +439,8 @@ type NodeActiveAttempt struct {
 }
 
 // Node is the node projection shared by the operator list and agent protocol.
+// Node carries observed facts. AllowedActions is filled only by the HTTP route
+// for its authenticated caller, never by a store read.
 type Node struct {
 	contract.NodeRegistration
 	State               contract.NodeState       `json:"state"`

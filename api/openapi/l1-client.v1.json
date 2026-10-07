@@ -1664,7 +1664,7 @@
       "post": {
         "operationId": "operatorDrainNode",
         "summary": "Stop new claims on a node",
-        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes. A stale revision is refused as stale_intent_revision with node_id, current_revision and provided_revision in error.details.",
+        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes. A stale revision is refused as stale_intent_revision with revision details as defined in the shared Error schema.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1711,7 +1711,7 @@
       "post": {
         "operationId": "setNodeClaims",
         "summary": "Set durable node claim intent",
-        "description": "Stale intent revisions return stale_intent_revision with node_id, current_revision and provided_revision in error.details. Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts.",
+        "description": "Stale intent revisions return stale_intent_revision with revision details as defined in the shared Error schema. Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts.",
         "requestBody": {
           "required": true,
           "content": {

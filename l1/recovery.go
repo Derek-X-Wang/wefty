@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
 // Reconcile applies lease and node-liveness transitions using one snapshot of
@@ -339,14 +340,21 @@ func (s *Store) nodeSessionError(ctx context.Context, q nodeQueryer, nodeID, ide
 // CAS is deliberately independent of node liveness so work can be forbidden
 // while a node is dead, without fencing attempts already in progress.
 func (s *Store) SetNodeClaimsByOperator(ctx context.Context, nodeID, actor string, request NodeIntentRequest) (Node, error) {
-	return s.setNodeIntentByOperator(ctx, nodeID, nodeVerbSetClaims, actor, request)
+	// This store-only seam is for trusted local operator callers. HTTP routes
+	// pass the real identity and configured principal tag instead.
+	return s.setNodeIntentByOperator(ctx, nodeID, nodeVerbSetClaims, nodeIntentActor{
+		Identity: fabric.Identity{NodeID: actor, Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag,
+	}, request)
 }
 
-func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb, actor string, request NodeIntentRequest) (Node, error) {
+func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb string, actor nodeIntentActor, request NodeIntentRequest) (Node, error) {
 	if nodeID == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node_id is required")
 	}
-	if err := validateNodeIntentRequest(verb, actor, request); err != nil {
+	if err := validateNodeIntentRequest(verb, actor.Identity.NodeID, request); err != nil {
+		return Node{}, err
+	}
+	if err := taggedIdentityDecision(actor.Identity, actor.ClientPrincipalTag); err != nil {
 		return Node{}, err
 	}
 	now := canonicalTime(s.clock.Now())
@@ -369,10 +377,10 @@ func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb, actor
 	if request.ClaimsEnabled {
 		code = "claims_enabled"
 	}
-	condition := conditionJSON(code, "node_intent", now, map[string]any{"reason": strings.TrimSpace(request.Reason), "actor": strings.TrimSpace(actor), "revision": current.IntentRevision + 1})
+	condition := conditionJSON(code, "node_intent", now, map[string]any{"reason": strings.TrimSpace(request.Reason), "actor": strings.TrimSpace(actor.Identity.NodeID), "revision": current.IntentRevision + 1})
 	result, err := tx.ExecContext(ctx, `UPDATE nodes
 		SET claims_enabled=?, intent_revision=intent_revision+1, intent_reason=?, intent_updated_at=?, intent_actor=?, last_condition_json=?
-		WHERE node_id=? AND intent_revision=?`, request.ClaimsEnabled, strings.TrimSpace(request.Reason), now.UnixNano(), strings.TrimSpace(actor), condition, nodeID, request.IntentRevision)
+		WHERE node_id=? AND intent_revision=?`, request.ClaimsEnabled, strings.TrimSpace(request.Reason), now.UnixNano(), strings.TrimSpace(actor.Identity.NodeID), condition, nodeID, request.IntentRevision)
 	if err != nil {
 		return Node{}, internalError(err, "write operator node intent")
 	}
