@@ -479,8 +479,8 @@ Commands:
                              Clone one Backup into a new stopped Computer with no grants
   services custody <verb>    Export, import, or attest external storage custody
     export|import|attest
-  runs list [--status STATUS --limit LIMIT]
-                             List the most recent Runs, newest first
+  runs list [--status STATUS] [--mine] [--limit LIMIT] [--cursor CURSOR] [--all]
+                             List Runs, newest first; --all walks every remaining page
     --origin computer:ID     List Runs by immutable Computer origin instead
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot

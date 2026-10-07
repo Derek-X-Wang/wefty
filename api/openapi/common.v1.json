@@ -1375,9 +1375,10 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["runs"],
-        "description": "The general Run listing, newest first. It carries no cursor: this listing is the head of the list, and limit is the whole of the request.",
+        "description": "The general Run listing, ordered by creation time then Run ID descending. next_cursor is present only when another page exists; resume with the same status and submitting actor scope. Inserts newer than the cursor do not shift subsequent pages. Status is evaluated at each request, not snapshotted.",
         "properties": {
-          "runs": { "type": "array", "items": { "$ref": "#/components/schemas/RunSummary" } }
+          "runs": { "type": "array", "items": { "$ref": "#/components/schemas/RunSummary" } },
+          "next_cursor": { "type": "string", "minLength": 1 }
         }
       },
       "RunResult": {
