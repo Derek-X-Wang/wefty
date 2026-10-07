@@ -403,7 +403,9 @@ func neverAutomaticFailureCause(ctx context.Context, q queryer, job Job) (string
 	}
 	var state contract.AttemptState
 	var raw []byte
-	if err := q.QueryRowContext(ctx, "SELECT state, result_json FROM attempts WHERE attempt_id=? AND job_id=?", job.CurrentAttemptID, job.JobID).Scan(&state, &raw); err != nil {
+	var initiator sql.NullString
+	if err := q.QueryRowContext(ctx, "SELECT state, result_json, termination_initiator FROM attempts WHERE attempt_id=? AND job_id=?",
+		job.CurrentAttemptID, job.JobID).Scan(&state, &raw, &initiator); err != nil {
 		return "", false, internalError(err, "read never service failure cause")
 	}
 	if state == contract.AttemptLost {
@@ -430,8 +432,22 @@ func neverAutomaticFailureCause(ctx context.Context, q queryer, job Job) (string
 			return string(result.TerminationCause) + " interruption", true, nil
 		}
 	case result.ExitCode != nil && job.PolicyStop == nil:
-		// Requested exits persist the exit result; the completion initiator is
-		// not part of ProcessResult. A payload's own exit records a policy stop.
+		// An exit code is an interruption only when the completion named who
+		// asked for it, exactly as a signal names its termination_cause. A
+		// payload's own exit records a policy stop, unless an explicit restart
+		// claimed it; that exit then fails the service only at the restart
+		// streak limit, which restart alone clears, as for a spontaneous signal.
+		if initiator.Valid {
+			if initiator.String == "" {
+				return "", false, nil
+			}
+			return initiator.String + " interruption", true, nil
+		}
+		// Completed before L1 kept the initiator. Only the streak limit tells
+		// that restart race apart from an interruption.
+		if job.Spec.MaxRestartStreak != nil && job.RestartStreak >= *job.Spec.MaxRestartStreak {
+			return "", false, nil
+		}
 		return "agent or guardian interruption", true, nil
 	}
 	return "", false, nil

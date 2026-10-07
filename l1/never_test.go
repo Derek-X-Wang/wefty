@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,15 +15,22 @@ import (
 
 func neverFixture(t *testing.T, kind string, ports ...int) (*integrationHarness, *http.Client, *http.Client, Node, Job, Claim) {
 	t.Helper()
+	return neverFixtureWith(t, kind, func(spec *contract.JobSpec) {
+		if len(ports) > 0 {
+			spec.PublishedPort = &ports[0]
+		}
+	})
+}
+
+func neverFixtureWith(t *testing.T, kind string, configure func(*contract.JobSpec)) (*integrationHarness, *http.Client, *http.Client, Node, Job, Claim) {
+	t.Helper()
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{Jitter: func(d time.Duration) time.Duration { return d }}, map[string]NodePolicy{"service-node": DefaultNodePolicy("service")})
 	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
 	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
 	node := h.registerWithCapabilities(agent, "service-node", map[string]bool{"kind:" + kind: true})
 	spec := capabilityJobSpec("never", kind, contract.JobClassService, "", nil)
 	spec.Restart = "never"
-	if len(ports) > 0 {
-		spec.PublishedPort = &ports[0]
-	}
+	configure(&spec)
 	spec.RoutingTags = []string{"service"}
 	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
 	if status != http.StatusCreated {
@@ -510,7 +518,7 @@ func TestNeverUnacknowledgedInterruptionRetries(t *testing.T) {
 func TestNeverStartAfterAutomaticFailure(t *testing.T) {
 	zero := 0
 	for _, kind := range []string{"process", "oci"} {
-		for _, cause := range []string{"lease loss", "agent", "guardian", "requested exit", "runtime"} {
+		for _, cause := range []string{"lease loss", "agent", "guardian", "requested exit", "guardian exit", "runtime"} {
 			if kind == "process" && cause == "runtime" {
 				continue
 			}
@@ -531,6 +539,9 @@ func TestNeverStartAfterAutomaticFailure(t *testing.T) {
 					if cause == "requested exit" {
 						completion = CompletionRequest{Result: ProcessResult{ExitCode: &zero}, TerminationInitiator: contract.TerminationCauseAgent}
 					}
+					if cause == "guardian exit" {
+						completion = CompletionRequest{Result: ProcessResult{ExitCode: &zero}, TerminationInitiator: contract.TerminationCauseGuardian}
+					}
 					if cause == "runtime" {
 						completion = CompletionRequest{Result: ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "runtime lost"}}}
 					}
@@ -539,6 +550,14 @@ func TestNeverStartAfterAutomaticFailure(t *testing.T) {
 				got, err := h.store.projectServiceJob(t.Context(), getRestartService(t, h, job.JobID))
 				if err != nil || got.State != contract.JobFailed || got.PolicyStop != nil || !strings.Contains(got.RestartSuppressed, "use start or restart") || (cause == "lease loss" && !strings.Contains(got.RestartSuppressed, "lease lost")) {
 					t.Errorf("automatic failure cause = %+v %v", got.ServiceJob, err)
+				}
+				// An exit code names its initiator exactly as a signal names its
+				// termination_cause.
+				if want := map[string]string{
+					"agent": "agent interruption", "guardian": "guardian interruption",
+					"requested exit": "agent interruption", "guardian exit": "guardian interruption",
+				}[cause]; want != "" && got.RestartSuppressed != "never: "+want+"; use start or restart" {
+					t.Errorf("%s cause = %q, want %q", cause, got.RestartSuppressed, want)
 				}
 				if cause != "lease loss" {
 					var last ProcessResult
@@ -562,5 +581,125 @@ func TestNeverStartAfterAutomaticFailure(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// An explicit restart races the payload's own end under max_restart_streak 1.
+// The restart claims that end, so the payload exhausts the streak, and an exit
+// code is no more an interruption than a spontaneous signal: both name the
+// streak latch, refuse start and accept restart.
+func TestNeverMaxStreakRaceNamesOneCause(t *testing.T) {
+	three := 3
+	for _, kind := range []string{"process", "oci"} {
+		outcomes := map[string]struct {
+			reason      string
+			start, redo int
+		}{}
+		for _, tc := range []struct {
+			name   string
+			result ProcessResult
+		}{
+			{"exit code", ProcessResult{ExitCode: &three}},
+			{"signal", ProcessResult{Signal: "killed", TerminationCause: contract.TerminationCauseSpontaneous}},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				h, client, agent, _, job, claim := neverFixtureWith(t, kind, func(spec *contract.JobSpec) {
+					limit := 1
+					spec.MaxRestartStreak = &limit
+				})
+				neverStarted(t, h, agent, job, claim)
+				if _, _, err := h.store.RestartService(t.Context(), job.JobID, ServiceRestartRequest{IdempotencyKey: "race"}); err != nil {
+					t.Fatal(err)
+				}
+				got := neverComplete(t, h, agent, job, claim, CompletionRequest{Result: tc.result})
+				if got.State != contract.JobFailed || got.PolicyStop != nil || got.RestartStreak != 1 || got.NextRestartAt != nil {
+					t.Fatalf("raced completion = %+v service=%+v", got, got.ServiceJob)
+				}
+				projected, err := h.store.projectServiceJob(t.Context(), got)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if projected.RestartSuppressed != "max restart streak reached: 1/1; use restart" {
+					t.Errorf("suppression = %q", projected.RestartSuppressed)
+				}
+				start, _, body := h.do(client, http.MethodPut, serviceMutationPath(job.JobID, "desired-state"), ServiceDesiredStateRequest{DesiredState: contract.ServiceDesiredRunning})
+				if start != http.StatusConflict || !strings.Contains(string(body), "use restart") {
+					t.Errorf("start = %d %s", start, body)
+				}
+				redo, _, body := h.do(client, http.MethodPost, serviceMutationPath(job.JobID, "restart"), ServiceRestartRequest{IdempotencyKey: "after-race"})
+				if redo != http.StatusAccepted {
+					t.Errorf("restart = %d %s", redo, body)
+				}
+				outcomes[tc.name] = struct {
+					reason      string
+					start, redo int
+				}{projected.RestartSuppressed, start, redo}
+			})
+		}
+		if outcomes["exit code"] != outcomes["signal"] {
+			t.Fatalf("%s race outcomes differ: exit code %+v, signal %+v", kind, outcomes["exit code"], outcomes["signal"])
+		}
+	}
+}
+
+// An attempt completed before L1 kept the termination initiator reads it as
+// unknown after the upgrade adds the column. An interruption keeps its start
+// gate, and the restart race is still told apart by the streak limit.
+func TestNeverLegacyCompletionWithoutInitiator(t *testing.T) {
+	zero, three := 0, 3
+	for _, tc := range []struct {
+		name       string
+		restart    bool
+		completion CompletionRequest
+		reason     string
+		startable  bool
+	}{
+		{"interruption", false, CompletionRequest{Result: ProcessResult{ExitCode: &zero}, TerminationInitiator: contract.TerminationCauseAgent},
+			"never: agent or guardian interruption; use start or restart", true},
+		{"restart race", true, CompletionRequest{Result: ProcessResult{ExitCode: &three}},
+			"max restart streak reached: 1/1; use restart", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, agent, _, job, claim := neverFixtureWith(t, "process", func(spec *contract.JobSpec) {
+				limit := 1
+				spec.MaxRestartStreak = &limit
+			})
+			neverStarted(t, h, agent, job, claim)
+			if tc.restart {
+				if _, _, err := h.store.RestartService(t.Context(), job.JobID, ServiceRestartRequest{IdempotencyKey: "race"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			neverComplete(t, h, agent, job, claim, tc.completion)
+			if _, err := h.store.db.Exec(`ALTER TABLE attempts DROP COLUMN termination_initiator`); err != nil {
+				t.Fatal(err)
+			}
+			var seq int
+			var name, path string
+			if err := h.store.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); err != nil {
+				t.Fatal(err)
+			}
+			upgraded, err := OpenStore(path, StoreOptions{Clock: h.clock})
+			if err != nil {
+				t.Fatalf("open legacy database: %v", err)
+			}
+			defer upgraded.Close()
+			var initiator sql.NullString
+			if err := upgraded.db.QueryRow(`SELECT termination_initiator FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&initiator); err != nil || initiator.Valid {
+				t.Fatalf("legacy initiator = %+v %v", initiator, err)
+			}
+			legacy, err := upgraded.GetJob(t.Context(), job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projected, err := upgraded.projectServiceJob(t.Context(), legacy)
+			if err != nil || projected.RestartSuppressed != tc.reason {
+				t.Fatalf("legacy suppression = %q %v, want %q", projected.RestartSuppressed, err, tc.reason)
+			}
+			_, err = upgraded.SetServiceDesiredState(t.Context(), job.JobID, contract.ServiceDesiredRunning)
+			if tc.startable != (err == nil) {
+				t.Fatalf("legacy start = %v, want startable %t", err, tc.startable)
+			}
+		})
 	}
 }

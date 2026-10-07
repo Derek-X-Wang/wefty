@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -888,6 +889,92 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	}
 }
 
+// acknowledgeProcessStart records the runner's start through the fenced,
+// idempotent /started call. An answer that never arrived is not a refusal: L1
+// may already have committed the start, and an identical retry replays it. So
+// a transport failure, a timeout or a 5xx other than 501 is retried at the
+// completion interval within one lease window, the budget renewal spends on
+// its own transient failures. Every request and every wait ends at that
+// window. A refusal, a canceled attempt, or no verdict within the window
+// returns the error, and the caller cancels the payload.
+func (lifecycle *attemptLifecycle) acknowledgeProcessStart(ctx context.Context, claim l1.Claim) error {
+	client, clock := lifecycle.dependencies.client, lifecycle.dependencies.clock
+	request := l1.StartedRequest{FencingToken: claim.Lease.FencingToken}
+	if claim.Lease.LeaseTTL <= 0 {
+		// A claim without a lease window gets one answer and no retry.
+		_, err := client.StartAttempt(ctx, claim.Job.JobID, claim.Lease.AttemptID, request)
+		return startAcknowledgementOutcome(err)
+	}
+	deadline := clock.Now().Add(claim.Lease.LeaseTTL)
+	retryDelay := lifecycle.dependencies.completionRetry
+	if retryDelay <= 0 {
+		retryDelay = DefaultLogRetryInterval
+	}
+	err := fmt.Errorf("no L1 verdict within the %s lease window", claim.Lease.LeaseTTL)
+	for retried := false; ; retried = true {
+		remaining := deadline.Sub(clock.Now())
+		if remaining <= 0 {
+			return err
+		}
+		requestContext, cancelRequest := context.WithTimeout(ctx, remaining)
+		_, err = client.StartAttempt(requestContext, claim.Job.JobID, claim.Lease.AttemptID, request)
+		cancelRequest()
+		err = startAcknowledgementOutcome(err)
+		if err == nil || ctx.Err() != nil || !startAcknowledgementUndecided(err) {
+			return err
+		}
+		remaining = deadline.Sub(clock.Now())
+		if remaining <= 0 {
+			return err
+		}
+		if !retried {
+			lifecycle.log("attempt %s start acknowledgement has no L1 verdict; retrying: %v", claim.Lease.AttemptID, err)
+		}
+		timer := clock.NewTimer(min(retryDelay, remaining))
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return err
+		case <-timer.C():
+		}
+	}
+}
+
+// receivedL1Status returns the HTTP status of an L1 answer that arrived,
+// whether or not its body could be read.
+func receivedL1Status(err error) (int, bool) {
+	var protocolErr *ProtocolError
+	if errors.As(err, &protocolErr) {
+		return protocolErr.StatusCode, true
+	}
+	var bodyErr *responseBodyError
+	if errors.As(err, &bodyErr) {
+		return bodyErr.statusCode, true
+	}
+	return 0, false
+}
+
+// startAcknowledgementOutcome reads an acknowledgement by the status L1 sent.
+// A 2xx is the committed start even when its body was lost on the way.
+func startAcknowledgementOutcome(err error) error {
+	if status, received := receivedL1Status(err); received && status >= 200 && status < 300 {
+		return nil
+	}
+	return err
+}
+
+// startAcknowledgementUndecided reports that a /started failure carries no L1
+// verdict: no answer arrived (a transport failure or a timeout), or the answer
+// was a 5xx other than 501. Any other status that arrived, readable or not, is
+// L1's verdict.
+func startAcknowledgementUndecided(err error) bool {
+	status, received := receivedL1Status(err)
+	if !received {
+		return true
+	}
+	return status >= http.StatusInternalServerError && status != http.StatusNotImplemented
+}
+
 func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
 	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.RuntimeFailure == nil && result.OutputError == "" {
 		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
@@ -1052,28 +1139,45 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
 		}
 	}
-	var processStartError error
+	var processStart *pendingStartAcknowledgement
 	if claim.Job.Spec.Kind == contract.JobKindProcess && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Restart == contract.RestartNever {
 		// The runner calls Started only after spawning and establishing
 		// guardian ownership. Renewal must never substitute for this fact.
 		var cancelStart context.CancelCauseFunc
 		ctx, cancelStart = context.WithCancelCause(ctx)
 		defer cancelStart(nil)
+		acknowledgementContext, stopAcknowledgement := context.WithCancel(ctx)
+		defer stopAcknowledgement()
+		processStart = &pendingStartAcknowledgement{stop: stopAcknowledgement}
 		localStarted := request.Started
+		// The hook only begins the acknowledgement: both process runners arm
+		// their supervision limits after it returns, and those limits must hold
+		// while L1 has not answered. A refusal cancels the payload through the
+		// runner's ordinary termination path. Until L1 accepts, the attempt is
+		// not running: readiness is held, so nothing is reported serving or
+		// published and the front door forwards nothing.
 		request.Started = func() {
-			if lifecycle.dependencies.client == nil {
-				processStartError = errors.New("process start acknowledgement requires an L1 client")
-			} else {
-				_, processStartError = lifecycle.dependencies.client.StartAttempt(ctx, claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken})
-			}
-			if processStartError != nil {
-				processStartError = fmt.Errorf("acknowledge process start: %w", processStartError)
-				cancelStart(processStartError)
-				return
-			}
-			if localStarted != nil {
-				localStarted()
-			}
+			processStart.begin(func() error {
+				if lifecycle.dependencies.client == nil {
+					err := errors.New("acknowledge process start: an L1 client is required")
+					cancelStart(err)
+					return err
+				}
+				if err := lifecycle.acknowledgeProcessStart(acknowledgementContext, claim); err != nil {
+					if acknowledgementContext.Err() != nil {
+						// The payload ended, or the attempt was canceled, first.
+						return nil
+					}
+					err = fmt.Errorf("acknowledge process start: %w", err)
+					cancelStart(err)
+					return err
+				}
+				processStart.accept()
+				if localStarted != nil {
+					localStarted()
+				}
+				return nil
+			})
 		}
 	}
 	if computerService {
@@ -1588,6 +1692,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, startupSatisfied, false)
 			},
 			onForwarding: func(ready bool) {
+				// Teardown withdraws forwarding even when it never began; a
+				// start L1 has not accepted must not read as running then.
+				if processStart != nil && !processStart.accepted.Load() {
+					return
+				}
 				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, true, ready)
 			},
 		}
@@ -1602,17 +1711,126 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				return err
 			}
 		}
+		serviceRuntime := runtimeAdapter
+		if processStart != nil {
+			serviceRuntime = startGatedRuntime{WorkloadRuntime: runtimeAdapter, acknowledgement: processStart}
+		}
 		result, runErr = runPortfulService(
-			ctx, runtimeAdapter, request, sink, publishedListener, endpoint, config,
+			ctx, serviceRuntime, request, sink, publishedListener, endpoint, config,
 		)
 	} else {
 		runtimeResult, err := runtimeAdapter.Run(ctx, request, sink)
 		result, runErr = runtimeResult.Outcome, err
 	}
-	if processStartError != nil {
-		runErr = errors.Join(runErr, processStartError)
+	if processStart != nil {
+		if err := processStart.finish(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
 	}
 	return finish(result, runErr)
+}
+
+// pendingStartAcknowledgement is a process start acknowledgement running
+// alongside its payload. Once the payload's run returns, an acknowledgement
+// still in flight is stopped and joined, so none outlives its attempt.
+type pendingStartAcknowledgement struct {
+	stop     context.CancelFunc
+	mu       sync.Mutex
+	finished bool
+	running  sync.WaitGroup
+	err      error
+
+	// The runner's readiness reports wait here until L1 accepts the start.
+	// Each report is absolute, so only the latest is held.
+	readinessMu sync.Mutex
+	// accepted is read without readinessMu: delivering held readiness reaches
+	// the publication controller, whose forwarding callback reads it.
+	accepted atomic.Bool
+	ended    bool
+	deliver  func(startupSatisfied, ready bool)
+	held     *readinessReport
+}
+
+type readinessReport struct{ startupSatisfied, ready bool }
+
+// gateReadiness returns the readiness callback the runner sees: it reaches
+// deliver only after L1 accepts the start, and never after the run ends.
+func (acknowledgement *pendingStartAcknowledgement) gateReadiness(deliver func(startupSatisfied, ready bool)) func(startupSatisfied, ready bool) {
+	if deliver == nil {
+		return nil
+	}
+	acknowledgement.readinessMu.Lock()
+	acknowledgement.deliver = deliver
+	acknowledgement.readinessMu.Unlock()
+	return func(startupSatisfied, ready bool) {
+		acknowledgement.readinessMu.Lock()
+		defer acknowledgement.readinessMu.Unlock()
+		switch {
+		case acknowledgement.ended:
+		case acknowledgement.accepted.Load():
+			deliver(startupSatisfied, ready)
+		default:
+			acknowledgement.held = &readinessReport{startupSatisfied: startupSatisfied, ready: ready}
+		}
+	}
+}
+
+// accept records L1's acceptance and applies the readiness held until now.
+func (acknowledgement *pendingStartAcknowledgement) accept() {
+	acknowledgement.readinessMu.Lock()
+	defer acknowledgement.readinessMu.Unlock()
+	acknowledgement.accepted.Store(true)
+	if held := acknowledgement.held; held != nil && !acknowledgement.ended && acknowledgement.deliver != nil {
+		acknowledgement.deliver(held.startupSatisfied, held.ready)
+	}
+	acknowledgement.held = nil
+}
+
+// endReadiness drops held readiness once the run has returned: a refused or
+// unanswered start never reaches serving or publication.
+func (acknowledgement *pendingStartAcknowledgement) endReadiness() {
+	acknowledgement.readinessMu.Lock()
+	acknowledgement.ended = true
+	acknowledgement.held = nil
+	acknowledgement.readinessMu.Unlock()
+}
+
+// startGatedRuntime gives the runner a readiness callback gated on L1
+// accepting the process start. It wraps only Run, so it is handed only to the
+// portful service supervisor, whose sole use of the runtime is Run.
+type startGatedRuntime struct {
+	WorkloadRuntime
+	acknowledgement *pendingStartAcknowledgement
+}
+
+func (runtime startGatedRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	request.ReadinessChanged = runtime.acknowledgement.gateReadiness(request.ReadinessChanged)
+	defer runtime.acknowledgement.endReadiness()
+	return runtime.WorkloadRuntime.Run(ctx, request, sink)
+}
+
+func (acknowledgement *pendingStartAcknowledgement) begin(acknowledge func() error) {
+	acknowledgement.mu.Lock()
+	defer acknowledgement.mu.Unlock()
+	if acknowledgement.finished {
+		return
+	}
+	acknowledgement.running.Add(1)
+	go func() {
+		defer acknowledgement.running.Done()
+		acknowledgement.err = acknowledge()
+	}()
+}
+
+// finish stops and joins the acknowledgement. Its error is the refusal or
+// exhausted window that canceled the payload, if one did.
+func (acknowledgement *pendingStartAcknowledgement) finish() error {
+	acknowledgement.mu.Lock()
+	acknowledgement.finished = true
+	acknowledgement.mu.Unlock()
+	acknowledgement.stop()
+	acknowledgement.running.Wait()
+	return acknowledgement.err
 }
 
 func classifyLogFinalizationError(err error) (bool, logFinalizationStage, error) {

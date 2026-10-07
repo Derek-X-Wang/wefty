@@ -143,7 +143,7 @@
           },
           "restart_suppressed_reason": {
             "type": "string",
-            "description": "Present when durable desired state, a policy stop, or a failed state suppresses automatic restart. An automatically-failed never service names its current attempt cause (lease loss or infrastructure completion) and may resume by explicit start or restart; terminal latches retain precedence."
+            "description": "Present when durable desired state, a policy stop, or a failed state suppresses automatic restart. An automatically-failed never service names its current attempt cause (lease loss, agent or guardian interruption from the stored termination initiator or signal cause, or infrastructure completion) and may resume by explicit start or restart; terminal latches retain precedence. A payload's own exit code or spontaneous signal claimed by an explicit restart is never an interruption: at max_restart_streak both name the streak limit and accept restart only."
           },
           "restart_streak": { "type": "integer", "minimum": 0 },
           "lifetime_restart_count": { "type": "integer", "minimum": 0 },
