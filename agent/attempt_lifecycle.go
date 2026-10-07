@@ -1692,12 +1692,14 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, startupSatisfied, false)
 			},
 			onForwarding: func(ready bool) {
-				// Teardown withdraws forwarding even when it never began; a
-				// start L1 has not accepted must not read as running then.
+				// Teardown withdraws forwarding even when it never began, so
+				// only enabling it says startup was satisfied: a service that
+				// never became ready, or whose start L1 has not accepted, must
+				// not read as running then.
 				if processStart != nil && !processStart.accepted.Load() {
 					return
 				}
-				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, true, ready)
+				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, ready, ready)
 			},
 		}
 		if lifecycle.dependencies.client != nil {

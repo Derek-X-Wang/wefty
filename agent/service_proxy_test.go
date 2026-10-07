@@ -346,6 +346,225 @@ func TestPortlessOCIServiceReceivesOnlyReservedContainerDirectory(t *testing.T) 
 	}
 }
 
+// portfulTeardownCases are the portful services the teardown status tests
+// stop. A process `never` start is also gated on L1 accepting it;
+// TestNeverPortfulServiceWaitsForStartAcceptance covers that.
+var portfulTeardownCases = []struct{ kind, restart string }{
+	{contract.JobKindProcess, contract.RestartAlways},
+	{contract.JobKindProcess, contract.RestartOnFailure},
+	{contract.JobKindOCI, contract.RestartAlways},
+	{contract.JobKindOCI, contract.RestartOnFailure},
+	{contract.JobKindOCI, contract.RestartNever},
+}
+
+// Teardown withdraws forwarding that never began. A portful service that never
+// became ready never satisfied its startup, so that withdrawal must not report
+// it running under any restart policy (#675).
+func TestPortfulServiceThatNeverBecameReadyIsNotReportedRunningAtTeardown(t *testing.T) {
+	for _, test := range portfulTeardownCases {
+		t.Run(test.kind+"/"+test.restart, func(t *testing.T) {
+			service := startPortfulTeardownService(t, test.kind, test.restart, false)
+			if got := service.status().State; got == AttemptRunning || got == AttemptServing {
+				t.Fatalf("attempt state = %s before the service became ready", got)
+			}
+			service.stop(t)
+			service.assertTornDown(t, false)
+		})
+	}
+}
+
+// A stop marks the attempt reaping before teardown withdraws forwarding. A
+// service that was serving must stay reaping then, never reading as running
+// or serving again (#675).
+func TestPortfulServiceThatWasServingStaysReapingAtTeardown(t *testing.T) {
+	for _, test := range portfulTeardownCases {
+		t.Run(test.kind+"/"+test.restart, func(t *testing.T) {
+			service := startPortfulTeardownService(t, test.kind, test.restart, true)
+			deadline := time.Now().Add(5 * time.Second)
+			for service.status().State != AttemptServing {
+				if time.Now().After(deadline) {
+					t.Fatalf("attempt state = %s, want serving once the service is ready", service.status().State)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			service.stop(t)
+			service.assertTornDown(t, true)
+		})
+	}
+}
+
+// Outside teardown, a withdrawn served service still reads running and a
+// recovered one serving; once teardown begins, neither update moves it.
+func TestServiceReadinessLeavesOnlyTeardownStatesAlone(t *testing.T) {
+	observer := newLifecycleObserver(systemClock{})
+	observer.beginAttempt("attempt", "job", contract.JobClassService)
+	observer.configurePortfulAttempt("attempt")
+	expect := func(startupSatisfied, ready bool, want AttemptLifecycleState) {
+		t.Helper()
+		observer.setServiceReadiness("attempt", startupSatisfied, ready)
+		got := observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts["attempt"]
+		if got.State != want || *got.Ready != ready {
+			t.Fatalf("after readiness (%t, %t): state = %s, ready = %t; want %s, %t", startupSatisfied, ready, got.State, *got.Ready, want, ready)
+		}
+	}
+	expect(true, true, AttemptServing)
+	expect(false, false, AttemptRunning)
+	expect(true, true, AttemptServing)
+	for _, teardown := range []AttemptLifecycleState{AttemptReaping, AttemptFinalizing} {
+		observer.setAttempt("attempt", teardown, nil)
+		expect(false, false, teardown)
+		expect(true, true, teardown)
+	}
+}
+
+type portfulTeardownService struct {
+	observer *lifecycleObserver
+	cancel   context.CancelFunc
+	done     chan error
+}
+
+// startPortfulTeardownService runs a portful service whose payload becomes
+// ready only when ready is set, and returns once the payload has started.
+func startPortfulTeardownService(t *testing.T, kind, restart string, ready bool) portfulTeardownService {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource, err := initializeManagedResource(root, "node", "boot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	spec := contract.JobSpec{Kind: kind, Class: contract.JobClassService, Restart: restart}
+	var runtimes workloadRuntimeSet
+	if kind == contract.JobKindOCI {
+		digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		spec.Execution = contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/teardown:v1", Digest: &digest},
+			Argv:  []string{"/payload"},
+		}}
+		runtime := portfulOCIRuntime{entered: entered}
+		if ready {
+			backend, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = backend.Close() })
+			go serveTestEcho(backend)
+			runtime.backend = backend.Addr().String()
+		}
+		runtimes = workloadRuntimeSet{contract.JobKindOCI: runtime}
+	} else {
+		spec.Execution = contract.ExecutionSpec{
+			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: t.TempDir(),
+		}
+		runtimes = testRuntimeSet(directiveContinuationRunner(func(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+			if ready {
+				request.ReadinessChanged(true, true)
+			}
+			close(entered)
+			<-ctx.Done()
+			return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
+		}))
+	}
+	port := 8080
+	spec.PublishedPort = &port
+	frontDoor, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := newLifecycleObserver(systemClock{})
+	observer.beginAttempt("attempt", "job", contract.JobClassService)
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		nodeID: "node", bootSessionID: "boot", managedResource: resource, runtimes: runtimes,
+		clock: systemClock{}, observer: observer,
+		reservePublishedPort:   func(l1.Claim) (net.Listener, *contract.SpawnFailure) { return frontDoor, nil },
+		prepareServiceEndpoint: prepareProcessServiceEndpoint,
+	})
+	claim := l1.Claim{
+		Job:   l1.Job{JobID: "job", Spec: spec},
+		Lease: l1.AttemptLease{AttemptID: "attempt", FencingToken: "fence", LeaseTTL: time.Minute},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	service := portfulTeardownService{observer: observer, cancel: cancel, done: make(chan error, 1)}
+	go func() {
+		_, err := lifecycle.runWorkload(ctx, claim)
+		service.done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service payload never started")
+	}
+	return service
+}
+
+func (service portfulTeardownService) status() AttemptStatus {
+	return service.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts["attempt"]
+}
+
+// stop does what the attempt's stop path does: it marks the attempt reaping,
+// then cancels its execution and waits for teardown to finish.
+func (service portfulTeardownService) stop(t *testing.T) {
+	t.Helper()
+	service.observer.setAttempt("attempt", AttemptReaping, nil)
+	service.cancel()
+	select {
+	case <-service.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service did not stop")
+	}
+}
+
+func (service portfulTeardownService) assertTornDown(t *testing.T, startupSatisfied bool) {
+	t.Helper()
+	got := service.status()
+	if got.State != AttemptReaping || got.StartupSatisfied == nil || *got.StartupSatisfied != startupSatisfied || got.Ready == nil || *got.Ready {
+		shown := func(value *bool) string {
+			if value == nil {
+				return "unset"
+			}
+			return fmt.Sprint(*value)
+		}
+		t.Fatalf("after teardown: state = %s, startup satisfied = %s, ready = %s; want reaping, %t, false",
+			got.State, shown(got.StartupSatisfied), shown(got.Ready), startupSatisfied)
+	}
+}
+
+// portfulOCIRuntime starts a service payload. Given a backend, it publishes
+// that as the service endpoint, so readiness probes connect; without one,
+// none ever does.
+type portfulOCIRuntime struct {
+	backend string
+	entered chan struct{}
+}
+
+func (portfulOCIRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime portfulOCIRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if runtime.backend != "" {
+		dialer := &net.Dialer{}
+		if err := request.AttemptEndpointReady(workloadrunner.AttemptEndpointService, workloadrunner.AttemptEndpoint{
+			Port: 8080,
+			Dial: func(ctx context.Context) (net.Conn, error) { return dialer.DialContext(ctx, "tcp4", runtime.backend) },
+		}); err != nil {
+			return workloadrunner.Result{}, err
+		}
+	}
+	request.Started()
+	close(runtime.entered)
+	<-ctx.Done()
+	return workloadrunner.Result{}, ctx.Err()
+}
+
+func (portfulOCIRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
 func assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
