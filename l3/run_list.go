@@ -9,22 +9,11 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-// The general Run listing answers "what is happening on this fabric right now".
-//
-// The existing listing is scoped to one Computer's origin, because that is a
-// membership question with a cursor and a generation. This one is the operator's
-// view: the most recent runs, newest first, optionally narrowed to a status. It
-// deliberately has no cursor. A person or an agent asking what is running wants
-// the head of the list, and a page size is the whole of that request; a cursor
-// would be a second, unused way to walk the same table.
-
+// General listings retain newest-first ordering and use the origin listing's
+// keyset paging semantics: a cursor resumes strictly after the last row.
 const (
-	// DefaultRunListLimit is what `wefty runs list` asks for when nothing is
-	// said. It is a screenful of recent work, not a page of a pager.
 	DefaultRunListLimit = 50
-	// MaxRunListLimit bounds one listing. Past it a caller wants a query, not
-	// a list, and should say which runs it means.
-	MaxRunListLimit = 500
+	MaxRunListLimit     = 500
 )
 
 // RunSummary is one row of the listing: what a reader needs to recognise a run
@@ -44,15 +33,40 @@ type RunSummary struct {
 	FinishedAt  *time.Time `json:"finished_at,omitempty"`
 }
 
-// RunListPage is one listing. It carries no cursor for the reason above.
+// RunListPage is a bounded listing with an opaque continuation cursor.
 type RunListPage struct {
-	Runs []RunSummary `json:"runs"`
+	Runs       []RunSummary `json:"runs"`
+	NextCursor string       `json:"next_cursor,omitempty"`
 }
 
 // RunListFilter narrows the listing. An empty filter is every run.
 type RunListFilter struct {
 	Status contract.RunState
 	Limit  int
+	Cursor string
+	// Submitter is the exact immutable submitting actor, derived by the server.
+	Submitter string
+}
+
+type runListCursor struct {
+	Status    string `json:"status"`
+	Submitter string `json:"submitter"`
+	CreatedNS int64  `json:"created_ns"`
+	RunID     string `json:"run_id"`
+}
+
+func decodeRunListCursor(value, status, submitter string) (runListCursor, error) {
+	var cursor runListCursor
+	if value == "" {
+		return cursor, nil
+	}
+	if err := decodeRunCursor(value, &cursor); err != nil {
+		return cursor, err
+	}
+	if cursor.Status != status || cursor.Submitter != submitter || cursor.CreatedNS < 0 || strings.TrimSpace(cursor.RunID) == "" {
+		return runListCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid for this Run list scope")
+	}
+	return cursor, nil
 }
 
 // ListRuns returns the most recent runs, newest first.
@@ -70,14 +84,21 @@ func (s *Store) ListRuns(ctx context.Context, filter RunListFilter) (RunListPage
 		return RunListPage{}, protocolError(contract.ErrorInvalidRequest,
 			"status %q is not a Run state", status)
 	}
+	cursor, err := decodeRunListCursor(filter.Cursor, status, filter.Submitter)
+	if err != nil {
+		return RunListPage{}, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT r.run_id, r.parent_run_id, r.status, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
        t.actor, t.source, t.source_run_id, t.computer_id, t.computer_attempt_id,
        t.computer_storage_generation, t.submit_intent_revision
 FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
 WHERE (? = '' OR r.status = ?)
+ AND (? = '' OR t.actor = ?)
+ AND (? = '' OR r.created_ns < ? OR (r.created_ns = ? AND r.run_id < ?))
 ORDER BY r.created_ns DESC, r.run_id DESC
-LIMIT ?`, status, status, limit)
+LIMIT ?`, status, status, filter.Submitter, filter.Submitter,
+		filter.Cursor, cursor.CreatedNS, cursor.CreatedNS, cursor.RunID, limit+1)
 	if err != nil {
 		return RunListPage{}, internalError(err, "list Runs")
 	}
@@ -114,6 +135,14 @@ LIMIT ?`, status, status, limit)
 	}
 	if err := rows.Err(); err != nil {
 		return RunListPage{}, internalError(err, "read Run listing")
+	}
+	if err := rows.Close(); err != nil {
+		return RunListPage{}, internalError(err, "close Run listing")
+	}
+	if len(page.Runs) > limit {
+		page.Runs = page.Runs[:limit]
+		last := page.Runs[len(page.Runs)-1]
+		page.NextCursor = encodeRunCursor(runListCursor{Status: status, Submitter: filter.Submitter, CreatedNS: last.CreatedAt.UnixNano(), RunID: last.RunID})
 	}
 	// The current step is derived per run rather than joined, because it is a
 	// reading of an append-only log and not a column. A terminal run is not

@@ -579,6 +579,44 @@ authority-generation loss performs explicit audited revocation. The agent may
 re-mint a fresh pass for the same live attempt after a policy change or bounded
 transient failure.
 
+### General Run listing
+
+`GET /v1/runs` without `origin` lists all Runs visible to an authenticated
+L3 caller, newest first (`created_ns`, then `run_id`, both descending). Each
+page contains `runs` (summaries) and optional `next_cursor`, present only when
+another matching row exists. `limit` defaults to 50 and accepts 1–500; there
+is no total walk limit. `status` selects exactly one Run state.
+`submitter=me` selects exactly the immutable `run_triggers.actor` recorded at
+submission, using the same caller actor derivation as submit/rerun: Fabric
+user ID when present, otherwise node ID. It is not origin or lineage membership;
+children submitted as `run:<parent-id>` are not submissions by that parent's
+operator. Other submitter values are `invalid_request`.
+
+Cursors use the Computer-origin listing's opaque base64url JSON encoding and
+creation-time/Run-ID keyset semantics, with the general listing's descending
+order. A continuation selects rows strictly older than its position; concurrent
+newer inserts do not shift, skip, or repeat the pre-existing rows. Runs with
+identical creation timestamps are ordered by Run ID. This is not a status
+snapshot: status filters are evaluated on each request. Restart without a cursor
+to observe newer submissions. A cursor is bound to the exact status and resolved
+submitting actor filter. Changing those filters or mixing general and origin
+cursors returns `invalid_request`; changing `limit` is permitted.
+
+Run tokens cannot enumerate the general listing, including with `submitter=me`.
+Computer passes continue to require `origin=computer:self` and their existing
+Storage-generation scope. General listing filters do not widen either read
+scope. `status` and `submitter` are refused with `origin`; `include_descendants`
+is for origin listings only. Duplicate and unknown query parameters are refused.
+
+`wefty runs list` exposes `--status`, `--mine` (`submitter=me`), `--limit`, and
+`--cursor`. `--all` walks every remaining page (starting from `--cursor` when
+supplied), in order, and emits one combined result with no continuation cursor.
+`--json` preserves the page shape and optional `next_cursor`; human output
+prints `next_cursor: <opaque value>` when more rows remain. Existing origin
+listings also support `--all`, retaining their ordering and filters.
+
+### Computer pass Run scope
+
 The pass may create only root Runs. L3 derives immutable `computer` trigger
 provenance (`computer_id`, `computer_attempt_id`,
 `computer_storage_generation`, and `submit_intent_revision`); callers cannot

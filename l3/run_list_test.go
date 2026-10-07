@@ -37,7 +37,7 @@ func TestGeneralRunListingIsNewestFirstAndFiltersByStatus(t *testing.T) {
 		t.Fatalf("summary lost its provenance: %#v", page.Runs[0])
 	}
 
-	// A limit is the whole of the request: the head of the list.
+	// A limit bounds one page at the head of the list.
 	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs?limit=2", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("limited list status = %d body=%s", status, body)
@@ -94,7 +94,7 @@ func TestGeneralRunListingRefusesWhatItCannotAnswer(t *testing.T) {
 		"/v1/runs?origin=computer:one&status=",
 		"/v1/runs?limit=0",
 		"/v1/runs?limit=huge",
-		// A caller that sent a cursor believes this listing pages; it does not.
+		// Malformed cursors must be refused rather than restarting the walk.
 		"/v1/runs?cursor=abc",
 		"/v1/runs?include_descendants=true",
 	} {

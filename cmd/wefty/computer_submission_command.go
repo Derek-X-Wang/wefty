@@ -212,26 +212,24 @@ func writeComputerSubmissionOutput(writer io.Writer, output computerSubmissionOu
 	return table.Flush()
 }
 
-// executeRuns lists Runs. Without --origin it is the general listing -- the
-// most recent Runs on this fabric, which is what someone asking "what is
-// running" means. With --origin it stays the Computer-scoped, cursor-paged
-// membership listing it has always been; the two answer different questions and
-// share only a route.
+// executeRuns lists one page, or walks every remaining page with --all.
 func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] != "list" {
-		return usageError("usage: wefty runs list [--status STATUS] [--limit LIMIT]" +
-			" | wefty runs list --origin computer:COMPUTER_ID [--include-descendants] [--limit LIMIT] [--cursor CURSOR]")
+		return usageError("usage: wefty runs list [--status STATUS] [--mine] [--limit LIMIT] [--cursor CURSOR] [--all]" +
+			" | wefty runs list --origin computer:COMPUTER_ID [--include-descendants] [--limit LIMIT] [--cursor CURSOR] [--all]")
 	}
 	flags := flag.NewFlagSet("runs list", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var origin, cursor, status string
-	var includeDescendants bool
+	var includeDescendants, mine, all bool
 	var limit int
 	flags.StringVar(&origin, "origin", "", "immutable Run origin, currently computer:COMPUTER_ID")
 	flags.StringVar(&status, "status", "", "only Runs in this state")
 	flags.BoolVar(&includeDescendants, "include-descendants", false, "include chain descendants of matching roots")
 	flags.IntVar(&limit, "limit", 0, "how many Runs to list")
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor returned by the previous page")
+	flags.BoolVar(&mine, "mine", false, "only Runs submitted by the caller")
+	flags.BoolVar(&all, "all", false, "walk every remaining page")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -248,8 +246,8 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		}
 	})
 	if origin == "" {
-		if includeDescendants || cursor != "" {
-			return usageError("--include-descendants and --cursor apply to --origin listings")
+		if includeDescendants {
+			return usageError("--include-descendants applies to --origin listings")
 		}
 		if !limitSet {
 			limit = l3.DefaultRunListLimit
@@ -257,9 +255,17 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		if limit < 1 || limit > l3.MaxRunListLimit {
 			return usageError(fmt.Sprintf("--limit must be between 1 and %d", l3.MaxRunListLimit))
 		}
-		page, err := clients.listRuns(ctx, status, limit)
+		page, err := clients.listRunsPage(ctx, status, limit, cursor, mine)
 		if err != nil {
 			return err
+		}
+		for all && page.NextCursor != "" {
+			next, err := clients.listRunsPage(ctx, status, limit, page.NextCursor, mine)
+			if err != nil {
+				return err
+			}
+			page.Runs = append(page.Runs, next.Runs...)
+			page.NextCursor = next.NextCursor
 		}
 		annotated := annotateRunListing(ctx, clients, page)
 		if jsonOutput {
@@ -267,8 +273,8 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		}
 		return writeRunListing(stdout, annotated, time.Now().UTC())
 	}
-	if status != "" {
-		return usageError("--status applies to the general listing; an --origin listing is not filtered by state")
+	if status != "" || mine {
+		return usageError("--status and --mine apply to the general listing")
 	}
 	computerID, ok := strings.CutPrefix(origin, "computer:")
 	if !ok || strings.TrimSpace(computerID) == "" || computerID == "self" || computerID != strings.TrimSpace(computerID) {
@@ -283,6 +289,14 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	page, err := clients.listRunsByOrigin(ctx, origin, cursor, limit, includeDescendants)
 	if err != nil {
 		return err
+	}
+	for all && page.NextCursor != "" {
+		next, err := clients.listRunsByOrigin(ctx, origin, page.NextCursor, limit, includeDescendants)
+		if err != nil {
+			return err
+		}
+		page.Runs = append(page.Runs, next.Runs...)
+		page.NextCursor = next.NextCursor
 	}
 	if jsonOutput {
 		return writeJSON(stdout, page)
@@ -322,6 +336,10 @@ func writeRunListing(writer io.Writer, page runListingPage, now time.Time) error
 		if _, err := fmt.Fprintf(writer, "%s: %s\n", run.RunID, run.UnschedulableReason); err != nil {
 			return err
 		}
+	}
+	if page.NextCursor != "" {
+		_, err := fmt.Fprintf(writer, "next_cursor: %s\n", page.NextCursor)
+		return err
 	}
 	return nil
 }

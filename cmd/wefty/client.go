@@ -672,9 +672,19 @@ func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID st
 }
 
 func (c *apiClients) listRuns(ctx context.Context, status string, limit int) (l3.RunListPage, error) {
+	return c.listRunsPage(ctx, status, limit, "", false)
+}
+
+func (c *apiClients) listRunsPage(ctx context.Context, status string, limit int, cursor string, mine bool) (l3.RunListPage, error) {
 	query := url.Values{"limit": []string{strconv.Itoa(limit)}}
 	if status != "" {
 		query.Set("status", status)
+	}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	if mine {
+		query.Set("submitter", "me")
 	}
 	var page l3.RunListPage
 	err := c.l3.do(ctx, http.MethodGet, "/v1/runs?"+query.Encode(), nil, nil, &page, http.StatusOK)
