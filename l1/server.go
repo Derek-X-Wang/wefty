@@ -447,6 +447,8 @@ func (s *Server) routes() http.Handler {
 	// protocol later cannot become reachable with a credential by accident.
 	credential := http.NewServeMux()
 	credential.HandleFunc("POST /v1/jobs", s.createChildJob)
+	credential.HandleFunc("GET /v1/jobs", s.listJobs)
+	credential.HandleFunc("GET /v1/jobs/{$}", s.listJobs)
 	credential.HandleFunc("GET /v1/jobs/{job_id}", s.getAttemptScopedJob)
 	credential.HandleFunc("GET /v1/jobs/{job_id}/children", s.listAttemptScopedChildJobs)
 	credential.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.cancelJob)
@@ -2038,7 +2040,8 @@ func (s *Server) revokeComputerAttemptAuthority(ctx context.Context, computerID,
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
-	if err := requireServiceClass(r); err != nil {
+	filters, err := parseJobListFilters(r)
+	if err != nil {
 		writeError(w, err)
 		return
 	}
@@ -2047,7 +2050,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	page, err := s.store.ListServiceJobs(r.Context(), r.URL.Query().Get("cursor"), limit)
+	page, err := s.store.listReadableJobs(r.Context(), filters, r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
 		return

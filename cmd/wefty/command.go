@@ -41,6 +41,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeAdmins(ctx, clients, jsonOutput, args[1:], stdout)
 	case "nodes":
 		return executeNodes(ctx, clients, jsonOutput, args[1:], stdout)
+	case "jobs":
+		return executeJobs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "services":
 		return executeServices(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "runs":
