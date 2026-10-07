@@ -280,6 +280,14 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	if !helperClock.Now().After(originalDeadman) {
 		fatalf("helper clock did not cross the original deadman")
 	}
+	// Advance only delivers timer events; the helper consumes them on another
+	// goroutine. Allow one renewal interval of scheduler headroom (scaled under
+	// -race), observing an unexpected reap throughout that bounded settle.
+	select {
+	case <-engine.attemptReaped:
+		fatalf("helper attempt did not outlive its original InitialDeadman: reaps=%d", engine.attemptReapCount())
+	case <-time.After(200 * time.Millisecond * raceTimeoutScale):
+	}
 	if reaps := engine.attemptReapCount(); reaps != 0 {
 		fatalf("helper attempt did not outlive its original InitialDeadman: reaps=%d", reaps)
 	}
@@ -468,6 +476,7 @@ type preAdmissionRenewalEngine struct {
 	releaseWatch  chan struct{}
 	deleteEntered chan struct{}
 	releaseDelete chan struct{}
+	attemptReaped chan struct{}
 	imageOnce     sync.Once
 	watchOnce     sync.Once
 	deleteOnce    sync.Once
@@ -481,6 +490,7 @@ func newPreAdmissionRenewalEngine() *preAdmissionRenewalEngine {
 		releaseImage: make(chan struct{}), runEntered: make(chan ocihelper.AttemptAuthority, 1),
 		watchEntered: make(chan struct{}), releaseWatch: make(chan struct{}),
 		deleteEntered: make(chan struct{}), releaseDelete: make(chan struct{}),
+		attemptReaped: make(chan struct{}, 1),
 	}
 }
 
@@ -525,6 +535,10 @@ func (engine *preAdmissionRenewalEngine) ReapAttempt(_ context.Context, authorit
 	engine.mu.Lock()
 	engine.attemptReaps++
 	engine.mu.Unlock()
+	select {
+	case engine.attemptReaped <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
