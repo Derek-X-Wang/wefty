@@ -248,7 +248,8 @@ The closed wire error-code vocabulary is `invalid_request`,
 `insufficient_disk`, `engine_failure`, `diagnostic_failure`,
 `unsupported_operation`, `sweep_required`, `handoff_volume_live`,
 `startup_bound_tripped`, and `connection_limit`.
-Adding a code requires changing
+`attempt_expired` appears only in successful heartbeat bodies as an
+attempt-scoped refusal, not as a top-level RPC error. Adding a code requires changing
 this contract in the same commit as the wire implementation.
 
 The acquisition connection remains the control connection. Strictly increasing
@@ -256,7 +257,7 @@ heartbeats refresh a deadline measured only from the helper's monotonic clock.
 Control EOF invalidates the session immediately, while an open but blackholed
 connection is invalidated when that deadline expires. Invalid version,
 capability, sequence, or deadman content on the control stream also invalidates
-the session. A rejected heartbeat emits one typed helper log carrying the
+the session, except for the exact bounded late-renewal refusal described below. A rejected heartbeat emits one typed helper log carrying the
 session generation, attempt ID when present, and rejection code. The helper
 retains that closed receipt across replacement-session acquisition and exposes
 it through `DoctorStatus`; it contains no capability or raw privileged error.
@@ -468,6 +469,51 @@ containerd types, and host paths remain local. The Computer reimage preflight
 may additionally report the fixed positive-detachment refusal so native
 evidence distinguishes that durable authority mismatch; the closed fact,
 never that detail, remains policy authority.
+
+## Late attempt renewals
+
+A successful `Heartbeat` returns `HeartbeatResponse`, with an optional
+`refused_attempts` list. Each entry carries the complete admitted
+`AttemptAuthority` and the typed code `attempt_expired`. This is an
+attempt-scoped refusal, never a renewal: the helper leaves that attempt's
+expired authority expired, applies other valid renewals in the heartbeat, and
+advances the heartbeat sequence and session deadline without replacing the
+session generation.
+
+Only an exact tuple admitted by this session and subsequently expired or
+reported `Deleted=true` without error by the engine qualifies, including while
+Delete is still verifying absence through its attempt reap. The tuple includes
+Node, Job, Attempt, fencing token, boot session, workload class, and removal
+generation; matching just an Attempt ID is insufficient. Expiry is authoritative
+at the deadline even if the guardian timer has not run yet. Guardian reap failure still invalidates the
+session through the existing cleanup-failure path. Recognition during Delete
+reaping grants no authority and does not change cleanup-failure handling.
+
+The session keeps a FIFO record of at most 1024 expired/deleted tuples; repeated
+refusals do not refresh their position. Session invalidation clears the record,
+and a replacement session never inherits it, even with the same boot identity.
+An evicted tuple loses this narrow exception and is session-fatal. Existing
+attempt tombstones retained for replay fencing and deletion evidence do not
+extend the exception beyond this bounded record.
+
+All other invalid heartbeat authority remains session-fatal: unknown or forged
+attempts, any mismatched tuple field (including the fence), invalid authority
+or TTL, an invalid/stale sequence, wrong session capability, or a capability
+from another helper instance. These return the existing typed heartbeat error
+and invalidate/reap the session. No refusal restores authority (ADR-0003).
+
+The client validates that every refusal names an exact renewal it sent and
+uses the known refusal code. It drops further pending renewals for that tuple
+and notifies only its attempt owner. The adapter stops that attempt's Watch;
+the agent settles it through the existing lost-attempt/reap path without OCI
+embargo, helper recovery, or session replacement. Neighbouring services and
+Computers continue. Subscriptions exist only for active attempt owners and are
+released when each owner finishes.
+
+This heartbeat response change is a lockstep semantic within wire major 2.
+Agent and helper must be released and installed or rolled back together as the
+existing checksum-matched binary pair; an older client must not silently ignore
+these refusal entries.
 
 ## Boot sweep barrier
 

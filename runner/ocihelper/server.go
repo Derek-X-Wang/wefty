@@ -25,6 +25,7 @@ const (
 	defaultReapTimeout      = DefaultReapTimeout
 	defaultConnectionLimit  = 64
 	maximumReapedBoots      = 256
+	maximumExpiredAttempts  = 1024
 )
 
 type Peer struct {
@@ -245,6 +246,8 @@ type serverSession struct {
 	heartbeatChanged  chan struct{}
 	done              chan struct{}
 	attempts          map[string]*serverAttempt
+	expiredAttempts   map[AttemptAuthority]struct{}
+	expiredOrder      []AttemptAuthority
 	operations        map[*sessionOperation]struct{}
 	internalReaps     sync.WaitGroup
 	invalidateOnce    sync.Once
@@ -681,13 +684,14 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 			session.invalidate("invalid session heartbeat")
 			return
 		}
-		if rejection := session.applyHeartbeat(heartbeat.Body); rejection != nil {
+		response, rejection := session.applyHeartbeat(heartbeat.Body)
+		if rejection != nil {
 			_ = writeRPCError(wire, rejection.rpcErr)
 			session.recordHeartbeatInvalidation(rejection)
 			session.invalidate("invalid session heartbeat body")
 			return
 		}
-		if err := writeSuccess(wire, struct{}{}); err != nil {
+		if err := writeSuccess(wire, response); err != nil {
 			session.invalidate("session heartbeat response failed")
 			return
 		}
@@ -729,27 +733,59 @@ func (session *serverSession) beginOperation(parent context.Context, connection 
 	return operation, nil
 }
 
-func (session *serverSession) applyHeartbeat(raw json.RawMessage) *heartbeatRejection {
+// rememberExpiredLocked retains only recent exact admitted identities. Eviction
+// removes the narrow refusal exception; it never grants authority.
+func (session *serverSession) rememberExpiredLocked(authority AttemptAuthority) {
+	if session.closed {
+		return
+	}
+	if _, exists := session.expiredAttempts[authority]; exists {
+		return
+	}
+	if session.expiredAttempts == nil {
+		session.expiredAttempts = make(map[AttemptAuthority]struct{})
+	}
+	if len(session.expiredOrder) == maximumExpiredAttempts {
+		delete(session.expiredAttempts, session.expiredOrder[0])
+		copy(session.expiredOrder, session.expiredOrder[1:])
+		session.expiredOrder = session.expiredOrder[:len(session.expiredOrder)-1]
+	}
+	session.expiredAttempts[authority] = struct{}{}
+	session.expiredOrder = append(session.expiredOrder, authority)
+}
+
+func (session *serverSession) applyHeartbeat(raw json.RawMessage) (HeartbeatResponse, *heartbeatRejection) {
 	var heartbeat HeartbeatRequest
+	var response HeartbeatResponse
 	if err := decodeBody(raw, &heartbeat); err != nil {
-		return &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: err.Error()}}
+		return response, &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: err.Error()}}
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	now := session.server.config.Clock.Now()
 	if session.closed || !now.Before(session.heartbeatDeadline) || heartbeat.Sequence <= session.sequence {
-		return &heartbeatRejection{rpcErr: &RPCError{Code: CodeSessionStale, Message: "heartbeat sequence is stale"}}
+		return response, &heartbeatRejection{rpcErr: &RPCError{Code: CodeSessionStale, Message: "heartbeat sequence is stale"}}
 	}
 	for _, renewal := range heartbeat.RenewedAttempts {
 		if err := renewal.Authority.validate(); err != nil {
-			return &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: err.Error()}, attemptID: renewal.Authority.AttemptID}
+			return response, &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: err.Error()}, attemptID: renewal.Authority.AttemptID}
 		}
 		if renewal.TTL <= 0 || renewal.TTL > session.server.config.MaximumAttemptDeadman {
-			return &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: "attempt deadman TTL is outside helper bounds"}, attemptID: renewal.Authority.AttemptID}
+			return response, &heartbeatRejection{rpcErr: &RPCError{Code: CodeInvalidRequest, Message: "attempt deadman TTL is outside helper bounds"}, attemptID: renewal.Authority.AttemptID}
 		}
 		attempt := session.attempts[renewal.Authority.key()]
+		if attempt != nil && attempt.authority == renewal.Authority &&
+			(attempt.state == attemptStarting || attempt.state == attemptLive) && !now.Before(attempt.deadline) {
+			// The timer goroutine need not have been scheduled yet. Its expired
+			// authority is already gone and this heartbeat must not restore it.
+			session.rememberExpiredLocked(attempt.authority)
+		}
+		if _, known := session.expiredAttempts[renewal.Authority]; known {
+			response.RefusedAttempts = append(response.RefusedAttempts, AttemptRenewalRefusal{Authority: renewal.Authority, Code: CodeAttemptExpired})
+			continue
+		}
 		if attempt == nil || (attempt.state != attemptStarting && attempt.state != attemptLive) || !now.Before(attempt.deadline) || attempt.authority != renewal.Authority {
-			return &heartbeatRejection{rpcErr: &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt renewal is not owned by this session"}, attemptID: renewal.Authority.AttemptID}
+			return response, &heartbeatRejection{rpcErr: &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt renewal is not owned by this session"}, attemptID: renewal.Authority.AttemptID}
 		}
 		attempt.deadline = now.Add(renewal.TTL)
 		notify(attempt.deadlineChanged)
@@ -757,7 +793,7 @@ func (session *serverSession) applyHeartbeat(raw json.RawMessage) *heartbeatReje
 	session.sequence = heartbeat.Sequence
 	session.heartbeatDeadline = now.Add(session.server.config.HeartbeatTimeout)
 	notify(session.heartbeatChanged)
-	return nil
+	return response, nil
 }
 
 func (session *serverSession) recordHeartbeatInvalidation(rejection *heartbeatRejection) {
@@ -845,6 +881,8 @@ func (session *serverSession) invalidate(reason string) {
 		)
 		session.mu.Lock()
 		session.closed = true
+		session.expiredAttempts = nil
+		session.expiredOrder = nil
 		close(session.done)
 		_ = session.control.Close()
 		operations := make([]*sessionOperation, 0, len(session.operations))
@@ -1125,6 +1163,10 @@ func (session *serverSession) watchAttempt(attempt *serverAttempt) {
 }
 
 func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld, guardian bool) error {
+	return session.reapAttemptWithDeleteEvidence(attempt, createGateHeld, guardian, false)
+}
+
+func (session *serverSession) reapAttemptWithDeleteEvidence(attempt *serverAttempt, createGateHeld, guardian, deleted bool) error {
 	session.mu.Lock()
 	if session.closed {
 		session.mu.Unlock()
@@ -1146,6 +1188,9 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 	case attemptStarting, attemptLive:
 		attempt.state = attemptReaping
 		attempt.guardianReaping = guardian
+		if guardian || deleted {
+			session.rememberExpiredLocked(attempt.authority)
+		}
 		session.internalReaps.Add(1)
 		if attempt.runCancel != nil {
 			attempt.runCancel()
@@ -1709,8 +1754,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		response, err := server.engine.Delete(operation.ctx, body)
 		if alreadyReaped {
 			session.consumeGuardianDelete(attempt)
+			if err == nil && response.Deleted {
+				session.mu.Lock()
+				session.rememberExpiredLocked(attempt.authority)
+				session.mu.Unlock()
+			}
 		} else if err == nil && response.Deleted {
-			err = session.reapAttempt(attempt, false, false)
+			err = session.reapAttemptWithDeleteEvidence(attempt, false, false, true)
 		}
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDeleteVolume:

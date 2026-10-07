@@ -328,7 +328,7 @@
       "post": {
         "operationId": "renewAttemptLease",
         "summary": "Renew one attempt lease",
-        "description": "Distinct from node heartbeat. Process renewal retains legacy claimed-to-running promotion, but does not record payload start acknowledgement for never lease-loss policy. OCI renewal never promotes execution. A success returns a duration TTL and any attempt-scoped service or one-shot cancel directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
+        "description": "Distinct from node heartbeat. Process renewal retains legacy claimed-to-running promotion, but does not record payload start acknowledgement for never lease-loss policy. OCI renewal never promotes execution. A success returns a duration TTL and any attempt-scoped service or one-shot cancel directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority. A successful OCI lease renewal is only evidence for the node-local helper deadman: a delayed helper renewal may return attempt_expired for an exact recently expired attempt or one whose engine reported Deleted=true without error, including while Delete verifies reap absence. The agent settles a plain refusal as lost without live or durable completion, replacing the helper session, or affecting neighbouring attempts. Shutdown and cancel/stop/restart directives still persist their agent-terminated completion before delivery, even if Watch also reports attempt loss, so failed delivery remains replayable under L1 fencing. Unknown or mismatched helper authority remains session-fatal; the helper socket protocol is separate from this HTTP API.",
         "requestBody": {
           "required": true,
           "content": {
