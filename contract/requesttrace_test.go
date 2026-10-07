@@ -86,3 +86,17 @@ func TestRequestTraceQuotesUpstreamID(t *testing.T) {
 		t.Fatalf("unquoted ID: %s", logs.String())
 	}
 }
+
+func TestRequestTraceForbidsContentSniffing(t *testing.T) {
+	for _, status := range []int{200, 404, 500} {
+		handler := ObserveHTTPRequests("l3", nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte("<script>alert(1)</script>"))
+		}))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest("GET", "/v1/runs/run_x/logs", nil))
+		if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Fatalf("status %d: X-Content-Type-Options = %q, want nosniff", status, got)
+		}
+	}
+}

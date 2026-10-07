@@ -17,6 +17,10 @@ func ObserveHTTPRequests(layer string, logf func(string, ...any), next http.Hand
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := rand.Text()
 		w.Header().Set(RequestIDHeader, id)
+		// Every response is JSON or opaque workload bytes for programs, never a
+		// page. Forbid content sniffing so a browser can't render reflected or
+		// workload-produced bytes as HTML.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		if layer == "l3" {
 			w.Header().Set(L3RequestIDHeader, id)
 		}
