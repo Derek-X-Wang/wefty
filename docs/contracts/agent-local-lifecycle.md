@@ -529,10 +529,20 @@ configuration. Event operations retain their declared-mailbox authorization.
 Completion drains the
 mailbox, then uploads while still holding the handoff lease and before
 recording terminal retention, and writes the drain verdict on the upload
-record beside the upload outcome. Each admission clears the previous
-publication and records the producing attempt; restart recovery applies the
-same rule to that same attempt's upload record only. A legacy record that
-cannot show both halves never grants early-eviction priority. Unpublished
+record beside the upload outcome. A handoff belongs to its execution owner,
+and every attempt that writes into it must publish before it is published: a
+rerun, a retry, or a child naming its parent's run as `handoff_owner_run_id`
+cannot publish files an earlier attempt left there. Each admission clears the
+previous attempt's verdict, records the producing attempt, and carries the
+owner's answer for every earlier attempt forward on the admission record
+(`earlier_attempts_published`). That answer is true only when the replaced
+record was finished and published, or when nothing was written there before:
+an empty process directory with no record, or an OCI owner with neither an
+admission nor an upload record on this node, where another owner's upload
+record at a name this owner's could be filed under counts as one. Restart recovery applies the same
+rule to that same attempt's upload record only, and the admission's carried
+answer still applies. A legacy record that cannot show both halves, or that
+predates the carried answer, never grants early-eviction priority. Unpublished
 results remain subject to the existing bounded retention and last-resort
 budget eviction. L1's stored result has its own job retention, independent of
 node cleanup.

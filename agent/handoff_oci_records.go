@@ -63,16 +63,25 @@ type ociHandoffRecord struct {
 	// an admission and no RetainedAt is a run still writing.
 	AdmittedAt time.Time `json:"admitted_at"`
 	RetainedAt time.Time `json:"retained_at,omitempty"`
-	// Published and Uploaded together are the publication verdict
-	// (uploadRecord.publishes), and evidenceReachedLedger reads their
-	// conjunction. This agent writes both as that one verdict. Older agents
-	// wrote Published as the mailbox drain verdict and Uploaded as the
-	// document upload, so their conjunction is the same rule for a legacy
-	// record too: a document that reached L1 from an attempt whose mailbox
-	// did not drain is not published. Both are cleared by the next admission.
+	// Published and Uploaded together are this attempt's publication verdict
+	// (uploadRecord.publishes). This agent writes both as that one verdict.
+	// Older agents wrote Published as the mailbox drain verdict and Uploaded
+	// as the document upload, so their conjunction is the same rule for a
+	// legacy record too: a document that reached L1 from an attempt whose
+	// mailbox did not drain is not published. Both are cleared by the next
+	// admission.
 	Published bool `json:"published,omitempty"`
 	Succeeded bool `json:"succeeded,omitempty"`
 	Uploaded  bool `json:"uploaded,omitempty"`
+	// EarlierAttemptsPublished is the rest of the volume's answer: every
+	// attempt this node admitted to the same volume before this one
+	// published too. The volume is the owner's, and the next admission
+	// carries this forward rather than clearing it (ociEarlierAttemptsPublished),
+	// so one sharer whose upload was not accepted or whose mailbox did not
+	// drain keeps the volume unpublished for as long as this record names it.
+	// A record written before the field existed has none, and reads as
+	// unpublished.
+	EarlierAttemptsPublished bool `json:"earlier_attempts_published,omitempty"`
 	// Adopted marks terminal facts this node derived at startup rather than
 	// ones an attempt wrote, for an admission that never finished.
 	Adopted bool `json:"adopted,omitempty"`
@@ -83,9 +92,10 @@ type ociHandoffRecord struct {
 // the ownership it publishes under its own lock.
 func (record ociHandoffRecord) live() bool { return record.RetainedAt.IsZero() }
 
-// evidenceReachedLedger is the `published` fact the eviction order reads.
+// evidenceReachedLedger is the `published` fact the eviction order reads: this
+// attempt published, and so did every attempt admitted to the volume before it.
 func (record ociHandoffRecord) evidenceReachedLedger() bool {
-	return record.Published && record.Uploaded
+	return record.Published && record.Uploaded && record.EarlierAttemptsPublished
 }
 
 // usesOCIHandoffLifecycle is the set of jobs whose handoff volume this agent
@@ -131,9 +141,12 @@ func (m *handoffManager) ociRecordPath(ownerKey string) string {
 // lease, so the budget pass cannot select a volume an attempt is claiming and
 // cannot read a record an admission is half-way through writing.
 //
-// It replaces whatever stood at this owner key. That is the publication reset:
-// a rerun's contents are its own, and inheriting the previous attempt's
-// "published" would let the node give a run's only copy up first.
+// It replaces whatever stood at this owner key. That is the publication reset
+// for the attempt: a rerun's contents are its own, and inheriting the previous
+// attempt's "published" would let the node give a run's only copy up first.
+// It is not a reset for the volume. What the replaced record knew about the
+// attempts before this one is carried forward, because their files are still
+// in the volume and this attempt's upload says nothing about them.
 func (m *handoffManager) admitOCIHandoff(lease *handoffLease, execution executionHandoff, nodeID, attemptID string) error {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
 		return nil
@@ -145,8 +158,42 @@ func (m *handoffManager) admitOCIHandoff(lease *handoffLease, execution executio
 	return writeStateDocument(m.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), ociHandoffRecord{
 		OwnerKey: ownerKey, NodeID: strings.TrimSpace(nodeID),
 		RunID: strings.TrimSpace(execution.spec.Labels["run_id"]), AttemptID: strings.TrimSpace(attemptID),
-		AdmittedAt: m.now().UTC(),
+		AdmittedAt:               m.now().UTC(),
+		EarlierAttemptsPublished: m.ociEarlierAttemptsPublished(ownerKey),
 	})
+}
+
+// ociEarlierAttemptsPublished is what a new admission to ownerKey's volume
+// carries forward: whether every attempt that wrote there before it
+// published. It is the process root's rule (earlierAttemptsPublished) with one
+// difference the helper's ownership of the volume forces: this node cannot
+// look inside the volume, so it cannot tell an empty one from one an earlier
+// attempt filled. It answers true only when it has never recorded an attempt
+// for this owner at all -- no admission record and no upload record. A
+// finished admission answers with its own owner-wide verdict, and anything
+// else -- an admission that never finished, a record this node cannot read or
+// trust, or an upload record with no admission beside it -- is an earlier
+// attempt nobody can vouch for.
+//
+// An upload record belonging to another owner at a name this owner's could be
+// under is one of those (errUploadRecordBelongsToAnotherRun). An older agent
+// filed "run.a" and "run_a" under one name, so the other owner's record may
+// have replaced this one's, and its earlier attempt's outcome is unknown, not
+// absent.
+func (m *handoffManager) ociEarlierAttemptsPublished(ownerKey string) bool {
+	payload, err := readStateDocument(m.ociRecordPath(ownerKey))
+	if errors.Is(err, os.ErrNotExist) {
+		_, found, uploadErr := m.readUploadRecord(ownerKey)
+		return uploadErr == nil && !found
+	}
+	if err != nil {
+		return false
+	}
+	standing, ok := m.validOCIRecord(payload)
+	if !ok || standing.OwnerKey != ownerKey || standing.live() {
+		return false
+	}
+	return standing.evidenceReachedLedger()
 }
 
 // holdsOCIHandoffLease is the same receipt check preparation makes on the
@@ -333,8 +380,9 @@ func (m *handoffManager) reconcileOCIAdmissions() {
 		// The upload record is the one place an interrupted attempt's
 		// publication can still be read, and it is joined by attempt, not by
 		// owner: an upload another attempt made says nothing about this one's
-		// contents. It carries the drain verdict as well as the upload, so
-		// this is the classification the attempt's own finish would have
+		// contents. It carries the drain verdict as well as the upload, and
+		// the admission kept what it carried forward about earlier attempts,
+		// so this is the classification the attempt's own finish would have
 		// written.
 		published := false
 		if upload, found, err := m.readUploadRecord(record.OwnerKey); err == nil && found &&

@@ -1678,16 +1678,47 @@ func TestTheStartupPassMeasuresAndGivesNothingUp(t *testing.T) {
 	}
 }
 
-// TestARerunThatFinishesPublishedStopsTheWalkOfTheUnpublishedClass is the
-// defect the per-class advance introduced. Two unpublished candidates, A and
-// B, are sorted and walked in order; A reruns and finishes *published* while
+// joinPublishedClass rewrites one finished record as published, which is how
+// the walk-guard fixtures below make a candidate change class mid-pass.
+//
+// Those fixtures used to stage it as a rerun that finished published. Since
+// #661 no attempt can do that to a directory an earlier attempt left
+// unpublished -- one attempt's success does not speak for files another one
+// left there -- so the change is written directly. What the guard reacts to is
+// a record that changed class while the pass was walking a sorted list, and it
+// does not care what changed it.
+func (h *retentionHarness) joinPublishedClass(runID string) {
+	h.t.Helper()
+	record := h.record(runID)
+	record.Published, record.Uploaded, record.EarlierAttemptsPublished = true, true, true
+	if err := h.manager.writeRecord(record); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// joinPublishedClassOCI is joinPublishedClass for a handoff volume's record.
+func (h *retentionHarness) joinPublishedClassOCI(ownerKey string) {
+	h.t.Helper()
+	record, found, err := h.manager.readOCIRecord(ownerKey)
+	if err != nil || !found {
+		h.t.Fatalf("no OCI handoff record for %s: found=%t err=%v", ownerKey, found, err)
+	}
+	record.Published, record.Uploaded, record.EarlierAttemptsPublished = true, true, true
+	if err := writeStateDocument(h.manager.stateRoot, ociHandoffRecordDirectoryName, recordComponent(ownerKey), record); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// TestACandidateThatJoinsThePublishedClassStopsTheWalkOfTheUnpublishedClass is
+// the defect the per-class advance introduced. Two unpublished candidates, A
+// and B, are sorted and walked in order; A's record becomes *published* while
 // the pass is looking at it. A has left the unpublished class and joined the
 // one that must be given up first, so the sorted list the walk is reading is
 // no longer the right list -- and walking on from there gives up B's only copy
 // while a published result exists beside it.
-func TestARerunThatFinishesPublishedStopsTheWalkOfTheUnpublishedClass(t *testing.T) {
+func TestACandidateThatJoinsThePublishedClassStopsTheWalkOfTheUnpublishedClass(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
-	first := harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
 	harness.now = harness.now.Add(time.Hour)
 	harness.retain("run_b_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
 
@@ -1698,16 +1729,8 @@ func TestARerunThatFinishesPublishedStopsTheWalkOfTheUnpublishedClass(t *testing
 			return
 		}
 		republished = true
-		// The rerun: A runs again, finishes published, and releases its lease
-		// before the budget reaches its own. Nothing about A is held any more;
-		// what changed is which class it belongs to.
-		harness.now = harness.now.Add(time.Hour)
-		spec := handoffClaim("run_a_unpublished", first, []string{contract.StableNodeTagPrefix + "node-1"}).Job.Spec
-		ownership := prepareHandoffForTest(t, harness.manager, spec)
-		if err := harness.manager.finish(ownership, spec, "node-1", true, true); err != nil {
-			t.Error(err)
-		}
-		ownership.lease.release()
+		// Nothing about A is held; what changed is which class it belongs to.
+		harness.joinPublishedClass("run_a_unpublished")
 	}
 	t.Cleanup(func() { handoffBudgetRace = nil })
 	if err := harness.manager.accountNode(t.Context()); err != nil {
@@ -1840,13 +1863,13 @@ func TestAdoptionAndReconciliationTakeTheSameLeaseAnAttemptDoes(t *testing.T) {
 	}
 }
 
-// TestARerunThatFinishesPublishedWhileHoldingItsLeaseStopsTheWalk is the last
-// shape of the same defect. A and B are both unpublished; A reruns, finishes
-// *published*, and is still holding its lease when the budget reaches it. A
-// held lease used to be answered "unavailable" without looking at the record,
-// so the walk went on and deleted B's only copy while A -- now the published
-// result that should have gone first -- sat beside it.
-func TestARerunThatFinishesPublishedWhileHoldingItsLeaseStopsTheWalk(t *testing.T) {
+// TestAHeldCandidateThatJoinsThePublishedClassStopsTheWalk is the last shape of
+// the same defect. A and B are both unpublished; A's record becomes
+// *published* while an attempt is holding A's lease when the budget reaches
+// it. A held lease used to be answered "unavailable" without looking at the
+// record, so the walk went on and deleted B's only copy while A -- now the
+// published result that should have gone first -- sat beside it.
+func TestAHeldCandidateThatJoinsThePublishedClassStopsTheWalk(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	first := harness.retain("run_a_unpublished", true, false, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
 	harness.now = harness.now.Add(time.Hour)
@@ -1860,15 +1883,14 @@ func TestARerunThatFinishesPublishedWhileHoldingItsLeaseStopsTheWalk(t *testing.
 			return
 		}
 		republished = true
-		// The rerun finishes published and keeps its lease, which is what an
-		// attempt does until its result upload is recorded.
-		harness.now = harness.now.Add(time.Hour)
-		spec := handoffClaim("run_a_unpublished", first, []string{contract.StableNodeTagPrefix + "node-1"}).Job.Spec
-		ownership := prepareHandoffForTest(t, harness.manager, spec)
-		if err := harness.manager.finish(ownership, spec, "node-1", true, true); err != nil {
+		// The record changes class and an attempt keeps A's lease.
+		lease, err := harness.manager.lock(t.Context(), handoffClaim("run_a_unpublished", first, nil).Job.Spec)
+		if err != nil {
 			t.Error(err)
+			return
 		}
-		held = ownership.lease
+		harness.joinPublishedClass("run_a_unpublished")
+		held = lease
 	}
 	t.Cleanup(func() {
 		handoffBudgetRace = nil
@@ -1897,10 +1919,10 @@ func TestARerunThatFinishesPublishedWhileHoldingItsLeaseStopsTheWalk(t *testing.
 	}
 }
 
-// TestAnOCIVolumeHeldByARerunThatPublishedStopsTheWalk is the same case on the
-// other root, where the held lease is the volume's and the record read is the
-// node's own admission record.
-func TestAnOCIVolumeHeldByARerunThatPublishedStopsTheWalk(t *testing.T) {
+// TestAHeldOCIVolumeThatJoinsThePublishedClassStopsTheWalk is the same case on
+// the other root, where the held lease is the volume's and the record read is
+// the node's own admission record.
+func TestAHeldOCIVolumeThatJoinsThePublishedClassStopsTheWalk(t *testing.T) {
 	harness := newRetentionHarness(t, 7*24*time.Hour)
 	harness.retainOCI("run_a_oci", "attempt-1", false)
 	harness.now = harness.now.Add(time.Hour)
@@ -1920,13 +1942,13 @@ func TestAnOCIVolumeHeldByARerunThatPublishedStopsTheWalk(t *testing.T) {
 			return
 		}
 		republished = true
-		// The rerun admits the volume, finishes published, and keeps the
-		// volume's lease.
-		lease := harness.admitOCI("run_a_oci", "attempt-2")
-		spec := ociHandoffClaim("run_a_oci", "attempt-2").Job.Spec
-		if err := harness.manager.finishOCIHandoff(legacyExecutionHandoff(spec), "node-1", "attempt-2", true, true); err != nil {
+		// The record changes class and an attempt keeps the volume's lease.
+		lease, err := harness.manager.lockOCIHandoff(t.Context(), "run_a_oci")
+		if err != nil {
 			t.Error(err)
+			return
 		}
+		harness.joinPublishedClassOCI("run_a_oci")
 		held = lease
 	}
 	t.Cleanup(func() {

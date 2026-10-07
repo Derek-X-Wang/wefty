@@ -950,8 +950,9 @@ A handoff is published only after the producing attempt's result upload
 succeeds and its run mailbox drains. An attempt with no mailbox has nothing to
 drain; that alone is never upload success. A failed upload leaves the
 job-owned volume unpublished and protects it from eviction ahead of published
-output. The existing per-attempt publication rule for a shared run-owned
-volume is unchanged.
+output. A run-owned volume shared by several attempts is published only when
+every one of them published ("What the node gives up when it is over budget",
+below).
 
 Naming a run is a claim to speak for it: the node keys a one-shot's retained
 handoff directory or volume by the owner key and attributes the attempt's
@@ -1130,7 +1131,9 @@ writes it with an admission and no deadline, before the workload starts, so an
 executing run is accounted for and a crash leaves a record instead of residue;
 finish updates that same record with the terminal window and verdict rather
 than replacing it. A cold rerun prepares again, so its admission record resets
-the `published` fact to false until that attempt finishes. That is deliberate,
+the `published` fact to false until that attempt finishes, and carries forward
+whether every earlier attempt in that directory published; one that did not
+keeps the directory unpublished whatever the rerun does. That is deliberate,
 and it is the safe direction: eviction gives up published results first, so a
 run that looks unpublished is kept longer, never given up sooner.
 
@@ -1220,9 +1223,39 @@ runtime exposes no result reader. An OCI handoff result reader does not require
 a run mailbox.
 Publication never changes the workload's verdict.
 
+**A handoff is its owner's, so it is published only when every attempt that
+wrote into it published.** Several attempts can share one directory or volume:
+reruns and retries of the same owner, and child one-shots that name their
+parent's run as `handoff_owner_run_id`. Each attempt's verdict says nothing
+about the files another one left: a child with no mailbox of its own whose
+result reached L1 does not make its parent's undrained `.wefty/<run>/events`
+any less the only copy, and a later attempt refused before helper `Run`, whose
+accepted `absent` publishes that attempt, does not make an earlier attempt's
+unaccepted `result.json` any less the only copy. So each admission resets the
+attempt's own verdict and carries forward, on the admission record, whether
+every attempt admitted before it published. It is true only when the record it
+replaces was finished and published, or when nothing was written there before
+— a process directory that is empty and has no record, or an OCI owner for
+which this node holds neither an admission nor an upload record, since the
+helper's volume is one the agent cannot look inside. A record this node cannot
+read or trust, an admission that never finished, a record from before this
+rule, or an OCI volume known only through an upload record each answer false.
+So does another owner's upload record at a name this owner's could be filed
+under: an older agent filed `run.a` and `run_a` under one name, so the other
+owner's record may have replaced this one's, and that outcome is unknown, not
+absent.
+One unpublished attempt therefore keeps the handoff unpublished for as long as
+this node's record of it stands: a process directory's record goes when the
+directory expires or is given up, an OCI volume's when the budget gives the
+volume up. An OCI record outlives a volume the helper's own expiry reclaimed,
+so a later attempt for that owner starts from the record's answer rather than
+from an empty volume, which errs the same way. The handoff stays subject to
+retention and to last-resort eviction, so this keeps an owner's results
+longer, never forever.
+
 Publication is what L1 accepted, not what L1 serves later. L1 authorizes the
 upload on attempt evidence, so an attempt that lost its lease can still
-upload, and if L1 accepted it the handoff is published — even when the job is
+upload, and if L1 accepted it that attempt is published — even when the job is
 then retried on another node and that retry's row replaces this one. The node
 never learns of the replacement, so it can give that handoff up first while L1
 no longer serves its document.
@@ -1230,14 +1263,18 @@ no longer serves its document.
 The node writes the drain verdict on the run's upload record together with the
 upload outcome, after the drain has finished, so startup recovery classifies an
 attempt interrupted before terminal retention exactly as its finish would have.
-The agent's private records carry `published` and `uploaded`, and the eviction
-class and the retained-results projection read their conjunction. This agent
-writes both as the one verdict. An older agent wrote `published` as the drain
-verdict alone, true with no mailbox, and on an OCI record `uploaded` as the
-document upload, so the conjunction reads a legacy record by the same rule; a
-legacy process record has no `uploaded` and reads as unpublished, and an older
-agent's upload record carries no drain verdict and never publishes. Process
-admissions now carry `attempt_id`, as OCI admissions already do.
+The agent's private records carry `published` and `uploaded` for the attempt
+and `earlier_attempts_published` for the attempts before it, and the eviction
+class and the retained-results projection read the conjunction of all three.
+This agent writes `published` and `uploaded` as the attempt's one verdict. An
+older agent wrote `published` as the drain verdict alone, true with no
+mailbox, and on an OCI record `uploaded` as the document upload, so the
+conjunction reads a legacy record by the same rule; a legacy process record has
+no `uploaded` and reads as unpublished, a record from before
+`earlier_attempts_published` cannot vouch for the attempts before it and reads
+as unpublished, and an older agent's upload record carries no drain verdict and
+never publishes. Process admissions now carry `attempt_id`, as OCI admissions
+already do.
 Within each of those two classes the oldest terminal time goes first, except that a handoff
 volume with no helper-owned terminal receipt is given up **last** rather than
 first: that timestamp is one the workload could have written, and ordering
@@ -1318,15 +1355,18 @@ nothing and drop out of the published candidates entirely.
 The record carries whether the run's evidence reached the ledger, and that is
 what this order reads. For an OCI run that record is the node's own admission
 document, written before the runtime request and naming the attempt it admitted
-— which is what makes publication a fact about an attempt rather than about an
-owner. A rerun of a published owner replaces it, so the rerun's own contents,
-which no ledger has seen, are not given up first on the strength of what an
-earlier attempt uploaded. The upload outcome is joined to the attempt that
-produced it for both process directories and OCI volumes. Startup recovery
-may restore publication from a durable upload record only when its attempt ID
-matches the handoff admission and the record shows both halves of the rule
-above. An old upload for the same owner key grants no publication to a later
-attempt.
+— which is what binds each attempt's verdict to that attempt. A rerun of a
+published owner replaces it, so the rerun's own contents, which no ledger has
+seen, are not given up first on the strength of what an earlier attempt
+uploaded; and the replacement carries forward what the replaced record knew
+about earlier attempts, so a rerun's upload is not enough to give up what an
+earlier attempt left unpublished either. The upload outcome is joined to the
+attempt that produced it for both process directories and OCI volumes. Startup
+recovery may restore an attempt's verdict from a durable upload record only
+when its attempt ID matches the handoff admission and the record shows both
+halves of the rule above, and the handoff is published only if the admission's
+carried answer for the earlier attempts is too. An old upload for the same
+owner key grants no publication to a later attempt.
 
 These are the agent's own bounds. Cache-pressure rules elsewhere — the OCI image
 cache, a node running out of disk — govern their own resources and neither
@@ -1396,9 +1436,10 @@ files, for every runtime including `kind=oci`, whose handoff volume is the
 helper's. A missing OCI mailbox requires no drain and does not prevent result capture
 or upload; a failed upload records `transport`; a successful document upload records
 `uploaded=true`, and an accepted `absent` records that reason. The record also
-carries `mailbox_drained`. The handoff is published only when the result
-reached L1 — `uploaded=true`, or `absent` accepted — **and** `mailbox_drained`
-is true ("What the node gives up when it is over budget", above).
+carries `mailbox_drained`. An attempt publishes only when the result reached
+L1 — `uploaded=true`, or `absent` accepted — **and** `mailbox_drained` is true,
+and the handoff is published only when every attempt that wrote into it
+published ("What the node gives up when it is over budget", above).
 The upload stays best effort and never changes the workload's verdict.
 L1's result retention follows the job's own lifecycle independently of node
 handoff expiry or budget eviction; neither node operation deletes L1's copy.
