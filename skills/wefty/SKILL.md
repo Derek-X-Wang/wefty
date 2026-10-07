@@ -57,6 +57,21 @@ right. `wefty run ...` and `wefty workflow init` are
 the exceptions: they only write files, so they need no endpoint, no identity and
 no credential — see "Reporting from a workflow".
 
+## Retry safety and deliberate repeats
+
+**The same submit or rerun request means the same run**, permanently, within
+the authenticated actor's namespace. The CLI derives the key automatically.
+Use `--again` for a deliberate repeat. An explicit `--idempotency-key KEY`
+overrides derivation and `--again`; keep it stable across retries, and changed
+inputs under that key are refused. Do not mint timestamped keys: they defeat
+retry safety. JSON output's `idempotent_replay` distinguishes creation/replay.
+
+**Mutable references hash by name.** After pushing a new `reg/app:latest`, the
+same `submit --image reg/app:latest` replays the old run. Pin by digest
+(`reg/app@sha256:...`) or use `--again` to submit the current tag deliberately.
+Likewise, pin saved Workflows with `workflow://<id>/vN` or use `--again` after
+updating the latest version.
+
 ## The loop
 
 Submit, wait, inspect — and read the result document when there is one.
@@ -68,8 +83,7 @@ RUN_ID=$(wefty --json submit \
   --params-file=params.json \
   --tag=<routing-tag> \
   --required-envelope \
-  --max-runtime=7200 \
-  --idempotency-key=<stable-unique-key> | jq -er '.run_id')
+  --max-runtime=7200 | jq -er '.run_id')
 
 wefty wait "$RUN_ID" --timeout 30m     # exit 0 / 10 / 11; see below
 wefty --json inspect "$RUN_ID"         # the evidence
@@ -122,7 +136,8 @@ Everything else you will want:
 wefty --json runs list                    # the most recent runs, newest first
 wefty --json runs list --status running   # just what is in flight
 wefty logs <run_id> --follow              # live tail (poll-based)
-wefty rerun <run_id>                      # NEW run from the stored immutable snapshot
+wefty rerun <run_id>                      # first call creates; identical retries replay
+wefty rerun <run_id> --again              # deliberately repeat the stored snapshot
 ```
 
 Every command above accepts `--json`, and `--json` is what a script should use:
@@ -154,8 +169,7 @@ RUN_ID=$(wefty --json submit \
   --params '{"issue":"479"}' \
   --tag=wefty:node:<your-mac> \
   --required-envelope \
-  --max-runtime=5400 \
-  --idempotency-key="issue-to-pr-479-$(date -u +%s)" | jq -er '.run_id')
+  --max-runtime=5400 | jq -er '.run_id')
 
 wefty wait "$RUN_ID" --timeout 90m
 wefty --json results "$RUN_ID" | jq -er '.document.pr_url'
@@ -165,6 +179,8 @@ Six steps — `read-issue`, `plan`, `implement`, `gates`, `push`, `open-pr` — 
 `wefty runs list` names the one it is in and `inspect` shows how long each took.
 Each pushes a marker commit, so a run that stopped part-way resumes with
 `--params '{"issue":"479","continue_from":"<branch>"}'` and skips what is done.
+Submitting the same issue and `continue_from` twice
+replays the first resumed run; use `--again` for another resume attempt.
 
 The pull request is a draft and nobody has reviewed it. Read it before you ask
 anyone else to. Its URL is in the verdict document's `pr_url` and in `pr.json`

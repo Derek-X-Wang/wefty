@@ -456,18 +456,20 @@ func (c *apiClients) drainNode(ctx context.Context, nodeID string, observedRevis
 	return node, err
 }
 
-func (c *apiClients) submitRun(ctx context.Context, request l3.CreateRunRequest, idempotencyKey string) (l3.RunAccepted, error) {
-	var accepted l3.RunAccepted
+func (c *apiClients) submitRun(ctx context.Context, request l3.CreateRunRequest, idempotencyKey string) (acceptedOutput, error) {
+	var accepted acceptedOutput
 	headers := http.Header{"Idempotency-Key": []string{idempotencyKey}}
-	err := c.l3.do(ctx, http.MethodPost, "/v1/runs", request, headers, &accepted, http.StatusCreated, http.StatusOK)
+	response, err := c.l3.doWithResponse(ctx, http.MethodPost, "/v1/runs", request, headers, &accepted.RunAccepted, http.StatusCreated, http.StatusOK)
+	accepted.IdempotentReplay = response.Get("Idempotent-Replay") == "true"
 	return accepted, err
 }
 
-func (c *apiClients) rerun(ctx context.Context, runID, idempotencyKey string) (l3.RunAccepted, error) {
-	var accepted l3.RunAccepted
+func (c *apiClients) rerun(ctx context.Context, runID, idempotencyKey string) (acceptedOutput, error) {
+	var accepted acceptedOutput
 	headers := http.Header{"Idempotency-Key": []string{idempotencyKey}}
 	path := "/v1/runs/" + url.PathEscape(runID) + "/rerun"
-	err := c.l3.do(ctx, http.MethodPost, path, nil, headers, &accepted, http.StatusCreated, http.StatusOK)
+	response, err := c.l3.doWithResponse(ctx, http.MethodPost, path, nil, headers, &accepted.RunAccepted, http.StatusCreated, http.StatusOK)
+	accepted.IdempotentReplay = response.Get("Idempotent-Replay") == "true"
 	return accepted, err
 }
 

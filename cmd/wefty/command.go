@@ -423,13 +423,14 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	var workflowRef, scriptPath, params, paramsFile, envelopeSchema, envelopeSchemaFile, idempotencyKey string
 	var maxRuntime int
 	var maxCost float64
-	var requiredEnvelope, dispatchAuthority bool
+	var requiredEnvelope, dispatchAuthority, again bool
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var imageFlags imageFlagSet
-	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference")
+	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference (latest hashes by name: pin /vN or use --again after updating)")
 	flags.StringVar(&scriptPath, "script", "", "inline script file")
 	imageFlags.bind(flags)
+	flags.Lookup("image").Usage += "; mutable tags hash by name: pin by digest or use --again after moving a tag"
 	flags.StringVar(&params, "params", "", "params JSON object")
 	flags.StringVar(&paramsFile, "params-file", "", "file containing params JSON")
 	flags.Var(&tags, "tag", "routing tag (repeatable)")
@@ -442,7 +443,8 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	flags.BoolVar(&requiredEnvelope, "required-envelope", false, "require a valid envelope")
 	flags.BoolVar(&dispatchAuthority, "dispatch-authority", false,
 		"this run dispatches child work, so deliver the in-job credentials (default: report through the run mailbox and hold none)")
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "request idempotency key")
+	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
+	flags.BoolVar(&again, "again", false, "deliberately create a fresh run instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -500,7 +502,7 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 			Content: string(content), SHA256: hex.EncodeToString(digest[:]), Interpreter: interpreters, Mode: mode.value,
 		}
 	}
-	idempotencyKey, err = ensureIdempotencyKey(idempotencyKey)
+	idempotencyKey, err = runRequestKey("submit", request, idempotencyKey, again)
 	if err != nil {
 		return err
 	}
@@ -523,18 +525,25 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	flags := flag.NewFlagSet("rerun", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var idempotencyKey string
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "request idempotency key")
+	var again bool
+	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
+	flags.BoolVar(&again, "again", false, "deliberately create a fresh rerun instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty rerun RUN_ID")
 	}
-	key, err := ensureIdempotencyKey(idempotencyKey)
+	sourceRunID := strings.TrimSpace(flags.Arg(0))
+	// The rerun protocol currently accepts no overrides: its entire request
+	// is the source run, whose immutable inputs are copied by L3.
+	key, err := runRequestKey("rerun", struct {
+		SourceRunID string `json:"source_run_id"`
+	}{sourceRunID}, idempotencyKey, again)
 	if err != nil {
 		return err
 	}
-	accepted, err := clients.rerun(ctx, flags.Arg(0), key)
+	accepted, err := clients.rerun(ctx, sourceRunID, key)
 	if err != nil {
 		return err
 	}

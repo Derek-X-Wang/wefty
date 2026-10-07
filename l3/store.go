@@ -106,20 +106,12 @@ func sqliteDurabilityPragmas() []string {
 // TestOnlyTestsTurnOffTheL3DurabilityPragmas fails if any does.
 var sqliteFullFsyncOffInTests atomic.Bool
 
-func (s *Store) initialize(ctx context.Context) error {
-	var mode string
-	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
-		return fmt.Errorf("l3: enable SQLite WAL: %w", err)
-	}
-	if !strings.EqualFold(mode, "wal") {
-		return fmt.Errorf("l3: SQLite did not enable WAL (mode %q)", mode)
-	}
-	const schema = `
-CREATE TABLE IF NOT EXISTS runs (
+const runTableSchema = `CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
   parent_run_id TEXT REFERENCES runs(run_id),
   dispatch_key TEXT NOT NULL UNIQUE,
-  idempotency_key TEXT NOT NULL UNIQUE,
+  actor TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   status TEXT NOT NULL,
   params_json BLOB NOT NULL,
@@ -139,8 +131,20 @@ CREATE TABLE IF NOT EXISTS runs (
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
-  finished_ns INTEGER
+  finished_ns INTEGER,
+  UNIQUE(actor, idempotency_key)
 );
+`
+
+func (s *Store) initialize(ctx context.Context) error {
+	var mode string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		return fmt.Errorf("l3: enable SQLite WAL: %w", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		return fmt.Errorf("l3: SQLite did not enable WAL (mode %q)", mode)
+	}
+	const schema = runTableSchema + `
 CREATE INDEX IF NOT EXISTS runs_projection ON runs(status, l1_job_id, created_ns);
 CREATE INDEX IF NOT EXISTS runs_created ON runs(created_ns, run_id);
 CREATE INDEX IF NOT EXISTS runs_status_created ON runs(status, created_ns, run_id);
@@ -438,6 +442,9 @@ WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','faile
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS run_triggers_computer_origin
 		ON run_triggers(source, computer_id, run_id)`); err != nil {
 		return fmt.Errorf("l3: index Computer trigger provenance: %w", err)
+	}
+	if err := s.migrateRunActorKeys(ctx); err != nil {
+		return fmt.Errorf("l3: migrate actor-scoped run idempotency: %w", err)
 	}
 	if err := s.adoptComputerAuthorityInstance(ctx); err != nil {
 		return err
@@ -783,10 +790,10 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 	defer tx.Rollback()
 
 	var existingID, existingHash string
-	err = tx.QueryRowContext(ctx, "SELECT run_id, request_hash FROM runs WHERE idempotency_key=?", input.IdempotencyKey).Scan(&existingID, &existingHash)
+	err = tx.QueryRowContext(ctx, "SELECT run_id, request_hash FROM runs WHERE actor=? AND idempotency_key=?", input.Actor, input.IdempotencyKey).Scan(&existingID, &existingHash)
 	if err == nil {
 		if existingHash != requestHash {
-			return contract.RunRecord{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key %q was already used with a different run", input.IdempotencyKey)
+			return contract.RunRecord{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key %q was already used by this actor with a different request", input.IdempotencyKey)
 		}
 		_ = tx.Rollback()
 		record, err := s.GetRun(ctx, existingID)
@@ -871,8 +878,8 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		limitsJSON, _ = json.Marshal(input.Request.Limits)
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO runs(run_id, parent_run_id, dispatch_key, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, created_ns, updated_ns)
-VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request.ParentRunID, dispatchKey, input.IdempotencyKey, requestHash,
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, created_ns, updated_ns)
+VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request.ParentRunID, dispatchKey, input.Actor, input.IdempotencyKey, requestHash,
 		contract.RunPending, []byte(input.Request.Params), tagsJSON, nullableBytes(limitsJSON), nullableBytes(input.Request.EnvelopeSchema), input.Request.RequiredEnvelope,
 		input.Request.DispatchAuthority, now.UnixNano(), now.UnixNano())
 	if err != nil {
@@ -959,10 +966,10 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 	}
 	defer tx.Rollback()
 	var existingID, existingHash string
-	err = tx.QueryRowContext(ctx, "SELECT run_id, request_hash FROM runs WHERE idempotency_key=?", input.IdempotencyKey).Scan(&existingID, &existingHash)
+	err = tx.QueryRowContext(ctx, "SELECT run_id, request_hash FROM runs WHERE actor=? AND idempotency_key=?", input.Actor, input.IdempotencyKey).Scan(&existingID, &existingHash)
 	if err == nil {
 		if existingHash != requestHash {
-			return contract.RunRecord{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key %q was already used with a different run", input.IdempotencyKey)
+			return contract.RunRecord{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key %q was already used by this actor with a different request", input.IdempotencyKey)
 		}
 		_ = tx.Rollback()
 		record, err := s.GetRun(ctx, existingID)
@@ -1050,8 +1057,8 @@ WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, 
 	dispatchKey := "run:" + runID
 	now := canonicalTime(s.clock.Now())
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO runs(run_id, parent_run_id, dispatch_key, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, created_ns, updated_ns)
-VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.IdempotencyKey, requestHash, contract.RunPending,
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, created_ns, updated_ns)
+VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.Actor, input.IdempotencyKey, requestHash, contract.RunPending,
 		paramsJSON, tagsJSON, nullableBytes(limitsJSON), nullableBytes(envelopeSchemaJSON), requiredEnvelope, dispatchAuthority, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store rerun")

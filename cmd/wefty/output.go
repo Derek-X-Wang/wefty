@@ -66,22 +66,28 @@ func writeJSONLine(writer io.Writer, value any) error {
 	return json.NewEncoder(writer).Encode(value)
 }
 
-// acceptedOutput is the submit --json shape: the ledger's acceptance, plus
-// any warning about a run that was accepted but that nothing can run yet.
+// acceptedOutput is the submit/rerun --json shape: the ledger's acceptance,
+// its replay signal, and any routing warnings.
 type acceptedOutput struct {
 	l3.RunAccepted
-	Warnings []string `json:"warnings,omitempty"`
+	IdempotentReplay bool     `json:"idempotent_replay"`
+	Warnings         []string `json:"warnings,omitempty"`
 }
 
-func writeAccepted(writer io.Writer, accepted l3.RunAccepted, warnings []string, jsonOutput bool) error {
+func writeAccepted(writer io.Writer, accepted acceptedOutput, warnings []string, jsonOutput bool) error {
+	accepted.Warnings = warnings
 	if jsonOutput {
-		return writeJSON(writer, acceptedOutput{RunAccepted: accepted, Warnings: warnings})
+		return writeJSON(writer, accepted)
 	}
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "RUN ID\tSTATUS URL\tLOGS URL"); err != nil {
+	if _, err := fmt.Fprintln(table, "RUN ID\tSTATUS URL\tLOGS URL\tRESULT"); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n", accepted.RunID, accepted.StatusURL, accepted.LogsURL); err != nil {
+	result := "created"
+	if accepted.IdempotentReplay {
+		result = "replayed"
+	}
+	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", accepted.RunID, accepted.StatusURL, accepted.LogsURL, result); err != nil {
 		return err
 	}
 	return table.Flush()

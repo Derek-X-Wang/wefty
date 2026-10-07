@@ -426,8 +426,8 @@ func TestLineageQueryBoundsUnboundedCycleRecursion(t *testing.T) {
 	now := time.Now().UnixNano()
 	for _, id := range []string{"run_cycle_a", "run_cycle_b", "run_cycle_c"} {
 		if _, err := store.db.Exec(`
-INSERT INTO runs(run_id, parent_run_id, dispatch_key, idempotency_key, request_hash, status, params_json, tags_json, required_envelope, dispatch_authority, created_ns, updated_ns)
-VALUES(?, NULL, ?, ?, 'hash', 'pending', '{}', '[]', 0, 0, ?, ?)`,
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, required_envelope, dispatch_authority, created_ns, updated_ns)
+VALUES(?, NULL, ?, 'cycle-test', ?, 'hash', 'pending', '{}', '[]', 0, 0, ?, ?)`,
 			id, "dispatch:"+id, "idem:"+id, now, now); err != nil {
 			t.Fatalf("insert run %q: %v", id, err)
 		}
