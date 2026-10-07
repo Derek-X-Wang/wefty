@@ -101,17 +101,6 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 
-	cancellations, err := r.store.pendingRunCancellations(ctx, "")
-	if err != nil {
-		passErrors = append(passErrors, err)
-	} else {
-		for _, run := range cancellations {
-			if err := r.cancelRunJob(ctx, run); err != nil {
-				passErrors = append(passErrors, err)
-			}
-		}
-	}
-
 	runs, err := r.store.activeProjectedRuns(ctx)
 	if err != nil {
 		passErrors = append(passErrors, err)
@@ -139,7 +128,22 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	passErrors = append(passErrors, r.settlePendingNodeAttributions(ctx)...)
 	// Recovery runs last and within its budget: it serves ended runs, and must
 	// not delay dispatch, projection or node attribution of live ones.
-	passErrors = append(passErrors, r.recoverUnrecordedDispatches(ctx)...)
+	remote, cancel := context.WithTimeout(ctx, r.budget)
+	defer cancel()
+	cancellations, err := r.store.pendingRunCancellations(ctx, "")
+	if err != nil {
+		passErrors = append(passErrors, err)
+	} else {
+		for _, run := range cancellations {
+			if remote.Err() != nil {
+				break
+			}
+			if err := r.deliverRunCancellation(ctx, remote, run); err != nil {
+				passErrors = append(passErrors, err)
+			}
+		}
+	}
+	passErrors = append(passErrors, r.recoverUnrecordedDispatchesRemote(ctx, remote)...)
 	return errors.Join(passErrors...)
 }
 
@@ -159,6 +163,13 @@ func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 	}
 	remote, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
+	return r.recoverUnrecordedDispatchesRemote(ctx, remote)
+}
+
+func (r *Reconciler) recoverUnrecordedDispatchesRemote(ctx, remote context.Context) []error {
+	if r.lookup == nil || remote.Err() != nil {
+		return nil
+	}
 	pending, err := r.store.unrecordedDispatches(remote, unrecordedDispatchBatch)
 	if err != nil {
 		return []error{err}

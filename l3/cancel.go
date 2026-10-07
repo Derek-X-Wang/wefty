@@ -3,6 +3,7 @@ package l3
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -33,9 +34,22 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 		return internalError(err, "read run cancellation target")
 	}
 	if actor != submitter {
-		return protocolError(contract.ErrorForbidden, "only the submitting actor may cancel a run")
+		// Follow parent links only: a rerun starts a new lineage with its own
+		// submitter. Bound the walk and refuse corrupt or incomplete lineage.
+		var rootActor string
+		err := tx.QueryRowContext(ctx, `WITH RECURSIVE ancestors(run_id, parent_run_id, depth) AS (
+ SELECT run_id, parent_run_id, 0 FROM runs WHERE run_id=?
+ UNION ALL
+ SELECT r.run_id, r.parent_run_id, a.depth+1 FROM runs r JOIN ancestors a ON r.run_id=a.parent_run_id WHERE a.depth<?
+) SELECT t.actor FROM ancestors a JOIN run_triggers t ON t.run_id=a.run_id WHERE a.parent_run_id IS NULL`, runID, maxLineageTraversalDepth).Scan(&rootActor)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return internalError(err, "read cancellation lineage root")
+		}
+		if err != nil || actor != rootActor {
+			return protocolError(contract.ErrorForbidden, "only the submitting actor or lineage root's submitting actor may cancel a run")
+		}
 	}
-	if state == contract.RunSucceeded || state == contract.RunFailed {
+	if (state == contract.RunSucceeded || state == contract.RunFailed) && !jobID.Valid && !attempted.Valid {
 		return nil
 	}
 	now := canonicalTime(s.clock.Now())
@@ -61,13 +75,15 @@ type runCancellation struct {
 
 func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]runCancellation, error) {
 	query := `SELECT r.run_id, COALESCE(r.l1_job_id, ''), r.status, r.required_envelope, r.dispatch_key
- FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id`
-	var args []any
+ FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
+ WHERE c.completed_ns IS NULL AND c.retry_ns<=?`
+	args := []any{s.recoveryNow().UnixNano()}
 	if runID != "" {
-		query += " WHERE r.run_id=?"
+		query += " AND r.run_id=?"
 		args = append(args, runID)
 	}
-	query += " ORDER BY c.requested_ns, r.run_id"
+	query += " ORDER BY c.retry_ns, c.requested_ns, r.run_id LIMIT ?"
+	args = append(args, unrecordedDispatchBatch)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, internalError(err, "list run cancellations")
@@ -110,7 +126,7 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	if _, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1 WHERE run_id=?`, runID); err != nil {
 		return internalError(err, "settle canceled dispatch absence")
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM run_cancellations WHERE run_id=?`, runID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=? WHERE run_id=?`, s.recoveryNow().UnixNano(), runID); err != nil {
 		return internalError(err, "finish absent dispatch cancellation")
 	}
 	if err := tx.Commit(); err != nil {
@@ -120,8 +136,43 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 }
 
 func (s *Store) finishRunCancellation(ctx context.Context, runID string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM run_cancellations WHERE run_id=?`, runID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=? WHERE run_id=?`, s.recoveryNow().UnixNano(), runID); err != nil {
 		return internalError(err, "finish run cancellation delivery")
+	}
+	return nil
+}
+
+// deferRunCancellation uses the same durable exponential schedule as dispatch
+// recovery, including provisional dispatch absence. Explicit repeats honor it.
+func (s *Store) deferRunCancellation(ctx context.Context, runID string, cause error) error {
+	reason := contract.APIError{Code: contract.ErrorNotFound, Message: "dispatch absence remains provisional", Retryable: true}
+	if cause != nil {
+		reason = apiErrorFrom(cause)
+	}
+	payload, err := json.Marshal(reason)
+	if err != nil {
+		return internalError(err, "encode cancellation failure")
+	}
+	var failures int
+	if err := s.db.QueryRowContext(ctx, `SELECT failures FROM run_cancellations WHERE run_id=?`, runID).Scan(&failures); err != nil {
+		return internalError(err, "read cancellation failures")
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE run_cancellations SET failures=failures+1, retry_ns=?, last_error=? WHERE run_id=? AND completed_ns IS NULL AND failures=?`,
+		s.recoveryNow().Add(unrecordedDispatchBackoff(failures)).UnixNano(), string(payload), runID, failures)
+	if err != nil {
+		return internalError(err, "defer run cancellation")
+	}
+	return nil
+}
+
+func (s *Store) refuseRunCancellation(ctx context.Context, runID string, cause error) error {
+	payload, err := json.Marshal(apiErrorFrom(cause))
+	if err != nil {
+		return internalError(err, "encode cancellation refusal")
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=? WHERE run_id=? AND completed_ns IS NULL`, s.recoveryNow().UnixNano(), string(payload), runID)
+	if err != nil {
+		return internalError(err, "record cancellation refusal")
 	}
 	return nil
 }
@@ -156,8 +207,17 @@ func (s *Server) cancelRun(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 		if err := reconciler.cancelRunJob(ctx, run); err != nil {
-			writeError(w, err)
-			return
+			// A remote delivery failure cannot turn an existing terminal Run
+			// into a not-found/error response. Its durable intent still retries.
+			record, readErr := s.store.GetRun(ctx, runID)
+			if readErr != nil {
+				writeError(w, readErr)
+				return
+			}
+			if record.Status != contract.RunSucceeded && record.Status != contract.RunFailed {
+				writeError(w, err)
+				return
+			}
 		}
 	}
 	record, err := s.store.GetRun(ctx, runID)
@@ -170,18 +230,37 @@ func (s *Server) cancelRun(w http.ResponseWriter, req *http.Request) {
 
 // cancelRunJob uses the ledger's own client identity, the originating L1
 // submitter, rather than forwarding the operator's identity or bearer.
-// Delivery stays durable until L1 settles. Repeating it is an idempotent read
+// Delivery stays durable until L1 settles or returns a permanent refusal. Repeating it is an idempotent read
 // of the first committed outcome, including completion that beat cancel.
 func (r *Reconciler) cancelRunJob(ctx context.Context, cancellation runCancellation) error {
+	remote, cancel := context.WithTimeout(ctx, r.budget)
+	defer cancel()
+	return r.deliverRunCancellation(ctx, remote, cancellation)
+}
+
+func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancellation runCancellation) error {
+	err := r.cancelRunJobRemote(ctx, remote, cancellation)
+	if err != nil && ctx.Err() == nil {
+		return errors.Join(err, r.store.deferRunCancellation(ctx, cancellation.RunID, err))
+	}
+	return err
+}
+
+func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellation runCancellation) error {
 	run := cancellation.projectedRun
 	if run.JobID == "" {
 		if r.lookup == nil {
 			return internalError(errors.New("L1 dispatch lookup client is not configured"), "resolve canceled dispatch")
 		}
 		lookupStarted := r.store.recoveryNow()
-		job, err := r.lookup.LookupJobByDispatchKey(ctx, cancellation.DispatchKey)
+		job, err := r.lookup.LookupJobByDispatchKey(remote, cancellation.DispatchKey)
 		if isMissingDispatch(err, cancellation.DispatchKey) {
-			return r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted)
+			if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
+				return err
+			}
+			// If the absence was provisional, the row remains pending. Back
+			// it off even though the lookup itself succeeded.
+			return r.store.deferRunCancellation(ctx, run.RunID, err)
 		}
 		if err != nil {
 			return err
@@ -200,9 +279,28 @@ func (r *Reconciler) cancelRunJob(ctx context.Context, cancellation runCancellat
 	if !ok {
 		return internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
 	}
-	job, err := canceler.CancelJob(ctx, run.JobID)
+	job, err := canceler.CancelJob(remote, run.JobID)
 	if err != nil {
-		return err
+		var refusal *Error
+		var response *l1ResponseError
+		typedRefusal := errors.As(err, &refusal) && !refusal.Retryable
+		if errors.As(err, &response) && !response.validEnvelope {
+			typedRefusal = false
+		}
+		if !typedRefusal {
+			return err
+		}
+		// A cancel 404 can also hide an ownership refusal. Only the existing
+		// authoritative GetJob absence may fail the Run as an L1 regression.
+		if refusal.Code == contract.ErrorNotFound {
+			_, getErr := r.jobs.GetJob(remote, run.JobID)
+			if isMissingL1Job(getErr, run.JobID) {
+				if _, err := r.store.failMissingL1Job(ctx, run); err != nil {
+					return err
+				}
+			}
+		}
+		return r.store.refuseRunCancellation(ctx, run.RunID, err)
 	}
 	if err := r.projectObservedJob(ctx, run, job); err != nil {
 		return err

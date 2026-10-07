@@ -143,7 +143,11 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE TABLE IF NOT EXISTS run_cancellations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
-  requested_ns INTEGER NOT NULL
+  requested_ns INTEGER NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  retry_ns INTEGER NOT NULL DEFAULT 0,
+  completed_ns INTEGER,
+  last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_projection ON runs(status, l1_job_id, created_ns);
 CREATE TABLE IF NOT EXISTS run_scripts (
@@ -349,6 +353,20 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l3: apply SQLite schema: %w", err)
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"failures", "INTEGER NOT NULL DEFAULT 0"},
+		{"retry_ns", "INTEGER NOT NULL DEFAULT 0"},
+		{"completed_ns", "INTEGER"},
+		{"last_error", "TEXT"},
+	} {
+		if err := ensureSQLiteColumn(ctx, s.db, "run_cancellations", column.name, column.definition); err != nil {
+			return fmt.Errorf("l3: migrate run cancellation delivery: %w", err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS run_cancellations_due
+ON run_cancellations(retry_ns, requested_ns, run_id) WHERE completed_ns IS NULL`); err != nil {
+		return fmt.Errorf("l3: index pending run cancellations: %w", err)
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_id", "TEXT"); err != nil {
 		return fmt.Errorf("l3: migrate run node attribution: %w", err)
@@ -2079,6 +2097,13 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 	if err != nil {
 		return internalError(err, "read run association result")
 	}
+	if acknowledged == 1 {
+		// A late first acknowledgement ends lookup backoff immediately. It
+		// can also supersede a provisional absence settled before it arrived.
+		if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET failures=0, retry_ns=0, completed_ns=NULL, last_error=NULL WHERE run_id=?`, runID); err != nil {
+			return internalError(err, "wake cancellation after dispatch acknowledgement")
+		}
+	}
 	if acknowledged == 1 && queued == 0 {
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
 			return err
@@ -2122,6 +2147,7 @@ type unrecordedDispatch struct {
 const unrecordedDispatchesQuery = `SELECT r.run_id, r.dispatch_key, COALESCE(o.job_id, '')
 FROM runs r INDEXED BY runs_job_link_recovery CROSS JOIN dispatch_outbox o ON o.run_id=r.run_id
 WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed') AND r.dispatch_attempt_ns IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
   AND r.job_link_retry_ns<=?
 ORDER BY r.job_link_retry_ns, r.created_ns, r.run_id
 LIMIT ?`

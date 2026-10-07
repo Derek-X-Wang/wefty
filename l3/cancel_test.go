@@ -302,7 +302,7 @@ func TestCancelRunDeliverySurvivesRestart(t *testing.T) {
 	h.l3Server.jobs = unavailableCancelClient{h.l1Client}
 	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	assertAPIError(t, status, body, http.StatusServiceUnavailable, contract.ErrorInternal)
-	reopened, err := OpenStore(h.l3Path, StoreOptions{})
+	reopened, err := OpenStore(h.l3Path, StoreOptions{Clock: &mutableClock{now: time.Now().Add(unrecordedDispatchRetryBase)}})
 	if err != nil {
 		t.Fatal(err)
 	}
