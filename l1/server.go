@@ -2908,20 +2908,26 @@ type observedResponse struct {
 	logf    func(string, ...any)
 }
 
+func (o *observedResponse) Unwrap() http.ResponseWriter { return o.ResponseWriter }
+
 func (o *observedResponse) recordScrubbedInternalError(err error) {
 	if o == nil || o.logf == nil {
 		return
 	}
-	o.logf("event=l1_internal_error_scrubbed method=%s path=%s class=%s cause=%q",
-		o.request.Method, o.request.URL.Path, scrubbedClass(err), scrubbedCause(err))
+	o.logf("event=l1_internal_error_scrubbed request_id=%s method=%s path=%s class=%s cause=%q",
+		o.Header().Get(contract.RequestIDHeader), o.request.Method, o.request.URL.Path, scrubbedClass(err), scrubbedCause(err))
 }
 
 // observeInternalErrors installs the sink for one request. It wraps the whole
 // route tree, so authorization refusals and handler failures alike are seen.
 func (s *Server) observeInternalErrors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return contract.ObserveHTTPRequests("l1", func(format string, args ...any) {
+		if s.logf != nil {
+			s.logf(format, args...)
+		}
+	}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		next.ServeHTTP(&observedResponse{ResponseWriter: w, request: r, logf: s.logf}, r)
-	})
+	}))
 }
 
 func writeError(w http.ResponseWriter, err error) {
@@ -2952,5 +2958,5 @@ func writeError(w http.ResponseWriter, err error) {
 			sink.recordScrubbedInternalError(err)
 		}
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: *apiError})
+	writeJSON(w, status, contract.ErrorResponse{Error: contract.AttachRequestID(w, *apiError)})
 }

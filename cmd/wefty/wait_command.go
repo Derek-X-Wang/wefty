@@ -67,7 +67,7 @@ func (e *waitTimeoutError) Error() string {
 func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("wait", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var timeout time.Duration
 	flags.DurationVar(&timeout, "timeout", 0, "give up after this long (default: wait indefinitely)")
 	if err := flags.Parse(args); err != nil {

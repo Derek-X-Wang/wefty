@@ -214,11 +214,11 @@ const resultsNote = "files are scheduled under the default retention window," +
 func executeResults(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("results", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var out string
 	flags.StringVar(&out, "out", "", "write the result document to this file instead of stdout")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty results RUN_ID [--out FILE]")
@@ -286,7 +286,7 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	var includeExecution bool
 	flags.BoolVar(&includeExecution, "execution", false, "include L1 execution diagnostics")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty inspect RUN_ID [--execution]")
@@ -419,7 +419,7 @@ func executeSetNodeClaims(
 
 func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("submit", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var workflowRef, scriptPath, params, paramsFile, envelopeSchema, envelopeSchemaFile, idempotencyKey string
 	var maxRuntime int
 	var maxCost float64
@@ -446,7 +446,7 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
 	flags.BoolVar(&again, "again", false, "deliberately create a fresh run instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 0 {
 		return usageError("submit does not accept positional arguments")
@@ -523,13 +523,13 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("rerun", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var idempotencyKey string
 	var again bool
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
 	flags.BoolVar(&again, "again", false, "deliberately create a fresh rerun instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty rerun RUN_ID")
@@ -553,7 +553,7 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var follow bool
 	var pollInterval time.Duration
 	var limit int
@@ -561,7 +561,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.DurationVar(&pollInterval, "poll-interval", time.Second, "follow polling interval")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty logs RUN_ID [--follow]")

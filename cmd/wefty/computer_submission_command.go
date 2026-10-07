@@ -57,7 +57,7 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 	}
 	args = moveFirstPositionalToEnd(args[2:])
 	flags := flag.NewFlagSet("services submission "+verb, flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var policyRevision, submitIntentRevision optionalRevisionFlag
 	var maxInflight int
 	var idempotencyKey string
@@ -68,7 +68,7 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable mutation idempotency key")
 	flags.BoolVar(&expectCurrent, "expect-current", false, "read the current revisions before issuing the mutation")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
 		return usageError(computerSubmissionUsage)
@@ -219,7 +219,7 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			" | wefty runs list --origin computer:COMPUTER_ID [--include-descendants] [--limit LIMIT] [--cursor CURSOR] [--all]")
 	}
 	flags := flag.NewFlagSet("runs list", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var origin, cursor, status string
 	var includeDescendants, mine, all bool
 	var limit int
@@ -231,7 +231,7 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.BoolVar(&mine, "mine", false, "only Runs submitted by the caller")
 	flags.BoolVar(&all, "all", false, "walk every remaining page")
 	if err := flags.Parse(args[1:]); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 0 {
 		return usageError("runs list does not accept positional arguments")

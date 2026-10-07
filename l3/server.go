@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -84,7 +85,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
 		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants,
 		hostBootSessions: hostBootSessions}
-	server.handler = server.routes()
+	server.handler = contract.ObserveHTTPRequests("l3", log.Printf, server.routes())
 	return server, nil
 }
 
@@ -1089,5 +1090,5 @@ func writeError(w http.ResponseWriter, err error) {
 		apiError.Message = "internal server error"
 		apiError.Details = nil
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: apiError})
+	writeJSON(w, status, contract.ErrorResponse{Error: contract.AttachRequestID(w, apiError)})
 }

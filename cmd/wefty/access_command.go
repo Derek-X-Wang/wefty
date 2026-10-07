@@ -104,7 +104,7 @@ func executeComputerGrant(
 ) error {
 	args = moveFirstPositionalsToEnd(args, 2)
 	flags := flag.NewFlagSet("services grant", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var revision int64
 	var permission, fabricID, idempotencyKey string
 	var waitForCompletion bool
@@ -223,7 +223,7 @@ func executeComputerTakeover(
 	}
 	if len(args) > 0 && args[0] == "audit" {
 		flags := flag.NewFlagSet("services takeover audit", flag.ContinueOnError)
-		flags.SetOutput(stderr)
+		flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 		var cursor string
 		var limit int
 		flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
@@ -276,7 +276,7 @@ func executeComputerTakeoverAction(
 ) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services takeover "+action, flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var tokenFile string
 	flags.StringVar(&tokenFile, "session-token-file", "", "owner-readable file containing the capability issued by this live view session")
 	if err := flags.Parse(args); err != nil {

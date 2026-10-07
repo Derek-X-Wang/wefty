@@ -28,7 +28,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		return true, errors.New("Linux OCI setup must run with privilege; see " + ocicontrol.RunbookPath)
 	}
 	flags := flag.NewFlagSet("node setup-oci", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	agentPath := flags.String("agent-path", "/usr/local/libexec/wefty-agent", "installed Linux wefty-agent executable")
 	operatorUser := flags.String("operator-user", os.Getenv("SUDO_USER"), "unprivileged agent user")
 	workingDirectory := flags.String("working-directory", "/var/lib/wefty", "agent working directory")
@@ -60,7 +60,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	memoryReserveBytes := flags.Int64("memory-reserve-bytes", defaultReserveBytes, "configured infrastructure memory reserve")
 	sizing := lima.BindSizingFlags(flags, defaults)
 	if err := flags.Parse(args[1:]); err != nil {
-		return true, err
+		return true, usageError(err.Error())
 	}
 	if flags.NArg() != 0 {
 		return true, usageError("wefty node setup-oci does not accept positional arguments")

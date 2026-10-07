@@ -53,7 +53,7 @@ func TestDispatchKeyLookupReturnsOnlyTheRunLedgersRootOneShot(t *testing.T) {
 	}
 	unknownStatus, _, unknownBody := h.do(ledger, http.MethodGet, "/v1/dispatch-keys/unknown-dispatch/job", nil)
 	operatorStatus, _, operatorBody := h.do(ledger, http.MethodGet, "/v1/dispatch-keys/operator-dispatch/job", nil)
-	if unknownStatus != http.StatusNotFound || operatorStatus != http.StatusNotFound || !bytes.Equal(unknownBody, operatorBody) {
+	if unknownStatus != http.StatusNotFound || operatorStatus != http.StatusNotFound || !bytes.Equal(errorBodyWithoutRequestID(t, unknownBody), errorBodyWithoutRequestID(t, operatorBody)) {
 		t.Fatalf("out-of-scope lookups differ: unknown=%d/%s operator=%d/%s", unknownStatus, unknownBody, operatorStatus, operatorBody)
 	}
 	var response contract.ErrorResponse

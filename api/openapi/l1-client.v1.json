@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L1 client protocol",
     "version": "0.1.0-prerelease",
-    "description": "Fabric-authenticated job submission and polling surface for client principals, plus the separate stable-person administrator-policy routes. Agent-only mutation verbs are in l1-agent.v1.json."
+    "description": "Fabric-authenticated job submission and polling surface for client principals, plus the separate stable-person administrator-policy routes. Agent-only mutation verbs are in l1-agent.v1.json. Each HTTP request receives a server-generated X-Request-Id response header and completion log; error.request_id matches the header."
   },
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
@@ -114,7 +114,7 @@
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
-          "503": { "description": "run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
+          "503": { "description": "run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied.", "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -245,6 +245,7 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": {
             "description": "The authenticated principal is outside its scope, or run_identity_not_entitled when the spec names a run in run_id or handoff_owner_run_id that the submitter is not entitled to. Not retryable.",
+            "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } },
             "content": {
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" }
@@ -253,6 +254,7 @@
           },
           "409": {
             "description": "dispatch_key_conflict when the key was already used with a different canonical request, or when an attempt credential presents a key belonging to another parent. spawn_depth_exceeded when the credential's job already sits at the fixed spawn-depth cap of 8. instance_key_conflict when another live job holds the instance key in the authenticated Fabric identity namespace (root) or authenticated parent job namespace (child); error.details has instance_key and job_id only when readable within the caller scope. Successive parent attempts share the child namespace. Dispatch replay and tombstones take precedence. None is retryable.",
+            "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } },
             "content": {
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" }

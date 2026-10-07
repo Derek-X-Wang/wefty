@@ -152,7 +152,7 @@ func (e *notReadyError) Error() string { return e.verdict }
 
 func executeStatus(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var budget time.Duration
 	flags.DurationVar(&budget, "timeout", statusBudget, "give up probing after this long")
 	if err := flags.Parse(args); err != nil {
