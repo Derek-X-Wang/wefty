@@ -256,7 +256,13 @@ heartbeats refresh a deadline measured only from the helper's monotonic clock.
 Control EOF invalidates the session immediately, while an open but blackholed
 connection is invalidated when that deadline expires. Invalid version,
 capability, sequence, or deadman content on the control stream also invalidates
-the session. A rejected heartbeat emits one typed helper log carrying the
+the session, including a renewal for an attempt the helper has already expired
+or deleted. The client therefore sends a renewal only when the heartbeat
+carrying it is sure to be applied before the attempt's deadman: a heartbeat is
+answered within one interval or the session is lost, and the client knows, for
+each attempt it asked to `Run`, the earliest that deadman can expire. A
+renewal that might arrive later, or one for a deleted attempt, is dropped and
+the attempt expires. A rejected heartbeat emits one typed helper log carrying the
 session generation, attempt ID when present, and rejection code. The helper
 retains that closed receipt across replacement-session acquisition and exposes
 it through `DoctorStatus`; it contains no capability or raw privileged error.

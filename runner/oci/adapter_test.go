@@ -3766,18 +3766,18 @@ func TestAdapterWatchStartOutlastsSaturationBeyondAnyFixedBudget(t *testing.T) {
 	}
 }
 
-// The admission budget is the initial deadman less the margin a queued
-// renewal needs to reach the helper: one heartbeat timeout, or half the
-// deadman when that is shorter than two heartbeat timeouts.
+// The admission budget is the initial deadman less the time a renewal queued
+// at its end may take to reach the helper. A deadman too short for that
+// delivery leaves no budget at all, so the attempt is never admitted.
 func TestAdmissionBudgetLeavesRenewalDeliveryMargin(t *testing.T) {
-	for _, test := range []struct{ deadman, heartbeat, want time.Duration }{
-		{30 * time.Second, 3 * time.Second, 27 * time.Second},
-		{2 * time.Second, time.Second, time.Second},
-		{time.Second, time.Minute, 500 * time.Millisecond},
-		{3 * time.Second, 0, 1500 * time.Millisecond},
+	for _, test := range []struct{ deadman, delivery, want time.Duration }{
+		{30 * time.Second, 2 * time.Second, 28 * time.Second},
+		{2500 * time.Millisecond, 2 * time.Second, 500 * time.Millisecond},
+		{2 * time.Second, 2 * time.Second, 0},
+		{time.Second, 2 * time.Second, 0},
 	} {
-		if got := admissionBudget(test.deadman, test.heartbeat); got != test.want {
-			t.Errorf("admissionBudget(%s, %s) = %s, want %s", test.deadman, test.heartbeat, got, test.want)
+		if got := admissionBudget(test.deadman, test.delivery); got != test.want {
+			t.Errorf("admissionBudget(%s, %s) = %s, want %s", test.deadman, test.delivery, got, test.want)
 		}
 	}
 }
@@ -3786,8 +3786,12 @@ func TestAdmissionBudgetLeavesRenewalDeliveryMargin(t *testing.T) {
 // so the agent's window starts no later than the helper's initial deadman.
 func TestAdapterReportsAdmissionBudgetBeforeRun(t *testing.T) {
 	engine := &adapterTestEngine{}
-	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
 	defer closeAdapter()
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := adapterTestRequest()
 	var budgets []time.Duration
 	request.OCIAdmissionBudget = func(budget time.Duration) {
@@ -3804,8 +3808,12 @@ func TestAdapterReportsAdmissionBudgetBeforeRun(t *testing.T) {
 	engine.mu.Lock()
 	ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
 	engine.mu.Unlock()
-	// The test helper's heartbeat timeout exceeds this one-second deadman.
-	if !ran || len(budgets) != 1 || budgets[0] != request.InitialDeadman/2 {
-		t.Fatalf("admission budgets = %v (helper Run reached: %t), want one of %s before Run", budgets, ran, request.InitialDeadman/2)
+	// The test helper's one-minute heartbeat timeout leaves this one-second
+	// deadman no time to deliver a renewal, so there is no budget.
+	if bound := session.RenewalDeliveryBound(); bound <= request.InitialDeadman {
+		t.Fatalf("delivery bound = %s, want one longer than the %s deadman", bound, request.InitialDeadman)
+	}
+	if !ran || len(budgets) != 1 || budgets[0] != 0 {
+		t.Fatalf("admission budgets = %v (helper Run reached: %t), want one of 0 before Run", budgets, ran)
 	}
 }

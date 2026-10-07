@@ -63,9 +63,17 @@ type Session struct {
 	// it had before this channel existed.
 	suppress chan chan error
 
-	controlMu   sync.Mutex
-	queueMu     sync.Mutex
-	pending     map[string]pendingRenewal
+	controlMu sync.Mutex
+	queueMu   sync.Mutex
+	pending   map[string]pendingRenewal
+	// deadmanAt holds, for each attempt this session asked the helper to Run,
+	// the earliest its deadman can expire, on the client's clock: the Run
+	// request time plus its initial deadman, then the expiry each delivered
+	// renewal carried. The helper rejects a renewal for an attempt it already
+	// expired by ending the whole session, so a renewal that might arrive
+	// after this time is never sent; the attempt expires instead. Guarded by
+	// queueMu.
+	deadmanAt   map[string]time.Time
 	queueToken  uint64
 	sequence    uint64
 	queued      chan struct{}
@@ -187,7 +195,7 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 	pumpCtx, pumpCancel := context.WithCancel(context.Background())
 	session := &Session{
 		client: client, capability: response.SessionCapability, control: connection, controlWire: wire, response: response,
-		pending: make(map[string]pendingRenewal), queued: make(chan struct{}, 1),
+		pending: make(map[string]pendingRenewal), deadmanAt: make(map[string]time.Time), queued: make(chan struct{}, 1),
 		pumpCtx: pumpCtx, pumpCancel: pumpCancel, pumpDone: make(chan struct{}),
 		suppress: make(chan chan error),
 	}
@@ -390,15 +398,34 @@ func (session *Session) drainSuppress() bool {
 	}
 }
 
-func (session *Session) heartbeatPump() {
-	defer close(session.pumpDone)
-	interval := session.client.HeartbeatInterval
+// heartbeatInterval is how often the pump sends a heartbeat, and the time
+// each heartbeat has to be answered before the session is given up as lost.
+func (session *Session) heartbeatInterval() time.Duration {
+	var interval time.Duration
+	if session.client != nil {
+		interval = session.client.HeartbeatInterval
+	}
 	if interval <= 0 || interval >= session.response.HeartbeatTimeout {
 		interval = session.response.HeartbeatTimeout / 3
 	}
 	if interval <= 0 {
 		interval = time.Millisecond
 	}
+	return interval
+}
+
+// RenewalDeliveryBound is the longest a renewal queued now can take to be
+// applied by the helper while the session stays healthy. It may wait behind a
+// heartbeat already in flight, which is answered within one heartbeat interval
+// or ends the session, and then travels in the next heartbeat under the same
+// bound.
+func (session *Session) RenewalDeliveryBound() time.Duration {
+	return 2 * session.heartbeatInterval()
+}
+
+func (session *Session) heartbeatPump() {
+	defer close(session.pumpDone)
+	interval := session.heartbeatInterval()
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	suppressed := false
@@ -454,14 +481,25 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 	session.queueMu.Lock()
 	renewals := make([]DeadmanRenewal, 0, len(session.pending))
 	snapshot := make(map[string]uint64, len(session.pending))
+	sent := make(map[string]time.Time, len(session.pending))
 	now := session.client.currentTime()
+	// This heartbeat is answered within one interval or the session is lost,
+	// so the helper applies what it carries before then.
+	appliedBy := now.Add(session.heartbeatInterval())
 	for key, pending := range session.pending {
 		snapshot[key] = pending.token
 		remaining := pending.expiresAt.Sub(now)
 		if remaining <= 0 {
 			continue
 		}
+		if expiry, tracked := session.deadmanAt[key]; tracked && !appliedBy.Before(expiry) {
+			// It might reach the helper after the attempt's deadman, and the
+			// helper would end the whole session over it. Losing the attempt
+			// is the smaller harm.
+			continue
+		}
 		renewals = append(renewals, DeadmanRenewal{Authority: pending.authority, TTL: remaining})
+		sent[key] = pending.expiresAt
 	}
 	session.sequence++
 	sequence := session.sequence
@@ -483,6 +521,13 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 	for key, token := range snapshot {
 		if session.pending[key].token == token {
 			delete(session.pending, key)
+		}
+	}
+	for key, expiresAt := range sent {
+		// The helper set the deadline to its own now plus the TTL, which is
+		// no earlier than the expiry the renewal was computed from.
+		if _, tracked := session.deadmanAt[key]; tracked {
+			session.deadmanAt[key] = expiresAt
 		}
 	}
 	session.queueMu.Unlock()
@@ -635,6 +680,17 @@ func (session *Session) receiveImageEvents(ctx context.Context, wire *framedConn
 }
 
 func (session *Session) Run(ctx context.Context, request RunRequest) (RunResponse, error) {
+	// The helper arms the initial deadman when it reserves the attempt, which
+	// is after this moment, so this is the earliest it can expire.
+	session.queueMu.Lock()
+	key := request.Authority.key()
+	if session.deadmanAt == nil {
+		session.deadmanAt = make(map[string]time.Time)
+	}
+	if _, tracked := session.deadmanAt[key]; !tracked {
+		session.deadmanAt[key] = session.client.currentTime().Add(request.InitialDeadman)
+	}
+	session.queueMu.Unlock()
 	var response RunResponse
 	err := session.call(ctx, MethodRun, request, &response)
 	return response, err
@@ -678,6 +734,15 @@ func (session *Session) Watch(ctx context.Context, request WatchRequest, receive
 func (session *Session) Delete(ctx context.Context, request DeleteRequest) (DeleteResponse, error) {
 	var response DeleteResponse
 	err := session.call(ctx, MethodDelete, request, &response)
+	if err == nil && response.Deleted {
+		// The attempt is gone. A renewal still queued for it would be
+		// rejected, ending the whole session, so none is sent.
+		session.queueMu.Lock()
+		key := request.Authority.key()
+		delete(session.pending, key)
+		delete(session.deadmanAt, key)
+		session.queueMu.Unlock()
+	}
 	return response, err
 }
 

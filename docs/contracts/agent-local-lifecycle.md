@@ -963,11 +963,21 @@ helper Started-evidence check and the fenced L1 `StartAttempt` succeed, and
 only inside the attempt's admission window. The helper arms `Run`'s initial
 deadman when it reserves the attempt and rejects a renewal for an attempt it
 has already expired by invalidating the whole session. So just before `Run` the
-adapter opens the window, on the agent's clock: the initial deadman less one
-helper heartbeat timeout, the most a queued renewal waits to reach the helper
-(half the deadman when it is shorter than two heartbeat timeouts). After the
-window closes the agent never admits the attempt and never forwards its
-pending renewal; the attempt stops as a refused start, and L1 settles it. The
+adapter opens the window, on the agent's clock: the initial deadman less the
+longest a renewal queued at that moment can take to be applied by a healthy
+helper, two heartbeat intervals (one waiting behind a heartbeat already in
+flight, which must be answered within an interval or the session is lost, and
+one for the heartbeat that carries it). A deadman no longer than that leaves
+no window: the start is never acknowledged and the attempt never admitted.
+After the window closes the agent never admits the attempt and never forwards
+its pending renewal; the attempt stops as a refused start, and L1 settles it.
+The heartbeat client enforces the same bound at every flush: for each attempt
+it asked the helper to `Run` it knows the earliest the deadman can expire (the
+`Run` request time plus the initial deadman, then the expiry of each delivered
+renewal), and it never sends a renewal that the heartbeat might deliver at or
+after that time. A renewal queued for an attempt the helper has since deleted
+is dropped as well. Such an attempt expires; the session and its other
+attempts never pay for it. The
 queued value retains its absolute monotonic L1 expiry; the heartbeat client
 derives its relative TTL only when the queued heartbeat is flushed, and drops
 an expiry already reached at that edge. It therefore never extends helper
