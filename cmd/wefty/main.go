@@ -476,8 +476,12 @@ Commands:
   runs list [--status STATUS --limit LIMIT]
                              List the most recent Runs, newest first
     --origin computer:ID     List Runs by immutable Computer origin instead
-  submit                     Submit a saved Workflow or an inline-script/image run
-  rerun RUN_ID               Create a new run from a stored snapshot
+  submit [--again] [--idempotency-key KEY]
+                             Submit a saved Workflow or an inline-script/image run
+  rerun RUN_ID [--again] [--idempotency-key KEY]
+                             Rerun a stored snapshot
+  Same submit/rerun request permanently replays its run. --again creates fresh
+  work; an explicit --idempotency-key wins. Output distinguishes created/replayed.
   logs RUN_ID [--follow]     Read or follow run logs
   cancel JOB_ID              Cancel a queued or active one-shot job
   wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout

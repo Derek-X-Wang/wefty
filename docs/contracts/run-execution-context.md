@@ -5,6 +5,43 @@ the attempt-credential contract delivered to every one-shot attempt. The
 variable names below are stable API surface; clients must not invent aliases or
 depend on additional variables.
 
+## Operator submit and rerun retries
+
+`wefty submit` derives its default L3 `Idempotency-Key` from the complete
+request: the program content or reference, params, routing tags, run limits,
+envelope schema and requirement, dispatch authority, parent run, and all image
+program fields (including argv, working directory, mounts, resource limits,
+and runtime handler). Script paths and JSON file paths are local input sources;
+their contents participate, not their filenames. JSON objects are recursively
+key-sorted, with untyped numeric values normalized as L3 normalizes them
+(for example, `1`, `1.0` and `1e0` agree). Typed image resource integers retain
+their exact values. Routing tags are trimmed, lowercased, deduplicated and sorted;
+ordered program vectors such as argv retain their order. The key has the form
+`wefty-cli-submit-v1-<sha256>` and includes every field of the request rather
+than a selected subset. Any future request field must participate as well.
+
+`wefty rerun RUN_ID` derives `wefty-cli-rerun-v1-<sha256>` from the source run
+ID. The current rerun protocol accepts no overrides; all program fields and
+inputs come from the stored immutable snapshot. Any future overrides must join
+that canonical request. Submit and rerun occupy separate key namespaces.
+
+Matching requests replay the same run permanently, with no expiry or time
+window. This includes saved Workflow references to the latest version: updating
+the Workflow does not turn the same reference request into a deliberate repeat.
+`--again` generates a fresh random key for each invocation and creates a new
+run. An explicit `--idempotency-key KEY` overrides both derivation and `--again`;
+reusing it with changed inputs retains L3's `idempotency_conflict` refusal.
+L3 also retains its authenticated-actor binding; a different actor cannot use
+another actor's key to obtain that run.
+
+L3 already distinguishes these outcomes: creation is HTTP 201, and replay is
+HTTP 200 with `Idempotent-Replay: true`. Both return the existing `RunAccepted`
+shape. The CLI preserves the run ID and URLs, adds `idempotent_replay` (always
+`true` or `false`) to submit/rerun JSON, and adds a `RESULT` table column with
+`created` or `replayed`. These describe the request outcome, not execution state.
+
+## Attempt environment
+
 | Variable | Visibility | Value |
 | --- | --- | --- |
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
