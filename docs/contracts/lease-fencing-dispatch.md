@@ -281,8 +281,17 @@ that attempt. Neither reaction fabricates operator stop intent or a policy stop.
 
 Lease renewal continues after the subprocess exits while redacted output is
 flushed, durable logs are acknowledged, and the idempotent completion request
-is retrying. Renewal stops only after L1 accepts completion or the agent loses
-attempt authority. A redaction, spool, or uploader finalization failure is
+is retrying. Renewal stops only after L1 accepts completion, L1 permanently
+rejects it, or the agent loses attempt authority. A permanent rejection is
+`invalid_request`, `conflict`, `idempotency_conflict`, `not_found`,
+`unsupported_class`, `unsupported_kind`, `unsupported_runtime_handler`, or
+`not_implemented`; while the attempt renews, an identical replay only repeats
+it (a post-`Started` OCI `spawn_error` is one). The agent sends that
+completion once, stops the attempt without ending its node session, and
+leaves the durable completion to evidence recovery, which drains logs,
+replays it, and seals it when L1 permanently rejects it again
+(`agent-local-lifecycle.md`). With renewal stopped, L1 settles the attempt by
+lease expiry. A redaction, spool, or uploader finalization failure is
 reported as `output_error`, never as a successful exit code.
 
 For `kind=process`, first renewal retains the legacy claimed-to-running
@@ -307,6 +316,16 @@ no verdict within the window, cancels the payload; it cannot remain running
 under refused or unanswered authority. For `kind=oci`, renewal changes only the lease and directive;
 it never acknowledges execution or starts the portless-service stability
 clock. Successful completion likewise never supplies a missing OCI `Started`.
+The OCI `Started` acknowledgement, sent after the helper proves payload start
+and before the agent admits the attempt or reports it running, follows the
+same answer rule: an answer that never arrived or a 5xx other than 501 is
+retried within one lease window, so a lost answer to a committed start gets
+its replay and the attempt proceeds as started. The retry also ends at the
+node helper's initial deadman for the attempt, after which an acceptance could
+only lose it (`agent-local-lifecycle.md`). A refusal, or no verdict before
+either bound, stops the payload as a refused post-start mutation. A one-shot's
+acknowledgement and its retries are not abandoned when the attempt is
+canceled; L1 arbitrates a pending cancel against an earlier durable start.
 
 ## Log retention
 
@@ -738,7 +757,9 @@ another primary arm; OOM is never inferred from exit 137, and log corruption
 never replaces a real exit result. A signal still requires exactly one termination cause.
 For OCI, L1 validates that arm against durable `started_at` before accepting
 authoritative or late evidence: pre-start accepts only a sole `spawn_error`
-without OOM, while post-start rejects `spawn_error`.
+without OOM, while post-start rejects `spawn_error`. Either mismatch is HTTP
+409 `conflict`, a permanent rejection: the live attempt sends it once, and
+evidence recovery replays it once more before sealing it.
 
 The awaiting-input prompt verbs remain reserved and return HTTP `501`,
 `not_implemented`, `retryable=false` without mutation. Job cancellation is

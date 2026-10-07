@@ -887,6 +887,19 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 				}
 				return destinationError{destination: classification.destination, err: err}
 			}
+			if code := protocolErrorCode(err); permanentEvidenceRejection(code) {
+				// L1 permanently rejected this completion -- a spawn_error after
+				// a committed OCI Started, for one, is a 409 conflict. While the
+				// attempt renews, an identical replay only repeats that verdict,
+				// so the live attempt stops here, ending its renewal. The refusal
+				// is this attempt's own, not the node session's. Evidence recovery
+				// applies its rules to the durable completion: it drains logs L1
+				// still accepts, replays the completion, and seals it when L1
+				// permanently rejects it again. L1 settles the attempt when its
+				// lease expires.
+				lifecycle.log("attempt %s completion permanently rejected by L1; releasing it to evidence recovery: %v", claim.Lease.AttemptID, err)
+				return destinationError{destination: errorDestinationAttemptAuthority, err: err}
+			}
 			delay := lifecycle.dependencies.completionRetry
 			if protocolErrorCode(err) == contract.ErrorRunLedgerUnavailable {
 				ledgerRefusals++
@@ -912,15 +925,21 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	}
 }
 
-// acknowledgeProcessStart records the runner's start through the fenced,
-// idempotent /started call. An answer that never arrived is not a refusal: L1
-// may already have committed the start, and an identical retry replays it. So
-// a transport failure, a timeout or a 5xx other than 501 is retried at the
-// completion interval within one lease window, the budget renewal spends on
-// its own transient failures. Every request and every wait ends at that
-// window. A refusal, a canceled attempt, or no verdict within the window
-// returns the error, and the caller cancels the payload.
-func (lifecycle *attemptLifecycle) acknowledgeProcessStart(ctx context.Context, claim l1.Claim) error {
+// acknowledgeStart records a payload start, a process runner's or an OCI
+// helper's, through the fenced, idempotent /started call. An answer that never
+// arrived is not a refusal: L1 may already have committed the start, and an
+// identical retry replays it. So a transport failure, a timeout or a 5xx other
+// than 501 is retried at the completion interval within one lease window, the
+// budget renewal spends on its own transient failures. Every request and every
+// wait ends at that window. A refusal, a canceled context, or no verdict within
+// the window returns the error, and the caller stops the payload.
+func (lifecycle *attemptLifecycle) acknowledgeStart(ctx context.Context, claim l1.Claim) error {
+	return lifecycle.acknowledgeStartBefore(ctx, claim, time.Time{})
+}
+
+// acknowledgeStartBefore is acknowledgeStart that also ends at notAfter, when
+// it is set and earlier than the lease window: no request or wait outlives it.
+func (lifecycle *attemptLifecycle) acknowledgeStartBefore(ctx context.Context, claim l1.Claim, notAfter time.Time) error {
 	client, clock := lifecycle.dependencies.client, lifecycle.dependencies.clock
 	request := l1.StartedRequest{FencingToken: claim.Lease.FencingToken}
 	if claim.Lease.LeaseTTL <= 0 {
@@ -929,11 +948,15 @@ func (lifecycle *attemptLifecycle) acknowledgeProcessStart(ctx context.Context, 
 		return startAcknowledgementOutcome(err)
 	}
 	deadline := clock.Now().Add(claim.Lease.LeaseTTL)
+	err := fmt.Errorf("no L1 verdict within the %s lease window", claim.Lease.LeaseTTL)
+	if !notAfter.IsZero() && notAfter.Before(deadline) {
+		deadline = notAfter
+		err = errors.New("no L1 verdict before the OCI helper's initial deadman")
+	}
 	retryDelay := lifecycle.dependencies.completionRetry
 	if retryDelay <= 0 {
 		retryDelay = DefaultLogRetryInterval
 	}
-	err := fmt.Errorf("no L1 verdict within the %s lease window", claim.Lease.LeaseTTL)
 	for retried := false; ; retried = true {
 		remaining := deadline.Sub(clock.Now())
 		if remaining <= 0 {
@@ -1071,6 +1094,22 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		request.OCIImageReady = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
 		}
+		// The helper arms the attempt's initial deadman no earlier than the
+		// adapter reports Run, and no renewal reaches it before admission. So
+		// the Started retry ends at that deadman: an acceptance after it could
+		// only lose the attempt. Admission needs no gate of its own. A renewal
+		// forwarded after the deadman is refused as attempt_expired, which
+		// loses this attempt alone (oci-helper-protocol.md).
+		var helperDeadman atomic.Pointer[time.Time]
+		initialDeadman := request.InitialDeadman
+		request.OCIRunRequested = func() {
+			clock := lifecycle.dependencies.clock
+			if clock == nil {
+				clock = systemClock{}
+			}
+			deadman := clock.Now().Add(initialDeadman)
+			helperDeadman.Store(&deadman)
+		}
 		if deadmanAdmission != nil {
 			admitDeadman := deadmanAdmission.admit
 			request.OCIHelperAdmitted = func(generation workloadrunner.RuntimeGeneration) error {
@@ -1124,17 +1163,30 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			// The helper already proved payload start. Cancellation must not
-			// abandon a response for a Started transaction that committed: L1
-			// still arbitrates cancel-before-start versus durable-start replay.
+			// abandon a one-shot's response for a Started transaction that
+			// committed, nor the retry that recovers a lost one: L1 still
+			// arbitrates cancel-before-start versus durable-start replay. The
+			// observation is bounded by one operation, the acknowledgement by
+			// its lease window and the helper's initial deadman, whichever
+			// ends first.
+			observationContext, acknowledgementContext := startContext, startContext
 			if claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.client != nil {
-				boundedContext, cancelStart := context.WithTimeout(context.WithoutCancel(startContext), lifecycle.dependencies.client.operationTimeout)
-				defer cancelStart()
-				startContext = boundedContext
+				acknowledgementContext = context.WithoutCancel(startContext)
+				boundedContext, cancelObservation := context.WithTimeout(acknowledgementContext, lifecycle.dependencies.client.operationTimeout)
+				defer cancelObservation()
+				observationContext = boundedContext
 			}
-			if err := observeImage(startContext, observation); err != nil {
+			if err := observeImage(observationContext, observation); err != nil {
 				return err
 			}
-			if _, err := lifecycle.dependencies.client.StartAttempt(startContext, claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+			// A lost answer to a committed Started is retried into L1's replay.
+			// Without that, the adapter would stop a payload L1 records as
+			// running and report a spawn_error L1 can never accept.
+			var notAfter time.Time
+			if deadman := helperDeadman.Load(); deadman != nil {
+				notAfter = *deadman
+			}
+			if err := lifecycle.acknowledgeStartBefore(acknowledgementContext, claim, notAfter); err != nil {
 				return fmt.Errorf("acknowledge OCI Started: %w", err)
 			}
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
@@ -1186,7 +1238,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 					cancelStart(err)
 					return err
 				}
-				if err := lifecycle.acknowledgeProcessStart(acknowledgementContext, claim); err != nil {
+				if err := lifecycle.acknowledgeStart(acknowledgementContext, claim); err != nil {
 					if acknowledgementContext.Err() != nil {
 						// The payload ended, or the attempt was canceled, first.
 						return nil

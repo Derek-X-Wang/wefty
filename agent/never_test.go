@@ -221,7 +221,7 @@ func TestNeverProcessStartRetryEndsWithLeaseWindow(t *testing.T) {
 			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, clock: clock, completionRetry: window})
 			result := make(chan error, 1)
 			go func() {
-				result <- lifecycle.acknowledgeProcessStart(t.Context(), neverProcessClaim(t, window, nil, "/bin/true", "true"))
+				result <- lifecycle.acknowledgeStart(t.Context(), neverProcessClaim(t, window, nil, "/bin/true", "true"))
 			}()
 			select {
 			case <-answered:

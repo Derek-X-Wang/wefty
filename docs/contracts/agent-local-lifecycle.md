@@ -405,7 +405,16 @@ response. If a one-shot cancel interrupts completion after execution already
 ended, the lifecycle joins the abandoned request and immediately retries its
 identical durable completion under a bounded uncanceled context, then performs
 normal result upload and retention. Other authority loss releases ownership
-and wakes the bounded outbox reconciler.
+and wakes the bounded outbox reconciler. So does a completion L1 permanently
+rejects, on the codes on which recovery seals a completion: `invalid_request`,
+`conflict`, `idempotency_conflict`, `not_found`, `unsupported_class`,
+`unsupported_kind`, `unsupported_runtime_handler`, or `not_implemented`. A
+post-`Started` OCI `spawn_error`, refused with 409 `conflict`, is one. The live
+attempt sends it once and stops, which ends its renewal; the refusal is the
+attempt's, never the node session's. Recovery drains the logs L1 still
+accepts, replays the identical completion, and seals it when L1 permanently
+rejects it again. With renewal stopped, L1 settles the attempt by lease
+expiry.
 The reconciler survives the attempt authority context, runs at most eight
 attempt workers, and retries both spool scan failures and per-attempt failures
 on the injected clock: the configured retry interval, doubled per consecutive
@@ -950,7 +959,11 @@ boundary described in [OCI helper protocol](oci-helper-protocol.md). The agent
 refreshes an attempt's helper deadman only after the matching L1 lease renewal
 succeeds and helper `Run` has admitted that exact attempt. Renewals during image
 delivery remain pending in the agent and the latest is queued only after every
-helper Started-evidence check and the fenced L1 `StartAttempt` succeed. The
+helper Started-evidence check and the fenced L1 `StartAttempt` succeed. An
+admission after the helper's initial deadman has expired the attempt needs no
+gate of its own: the helper refuses the forwarded renewal as `attempt_expired`,
+which ends that attempt alone
+([OCI attempt-scoped late renewal loss](#oci-attempt-scoped-late-renewal-loss)). The
 queued value retains its absolute monotonic L1 expiry; the heartbeat client
 derives its relative TTL only when the queued heartbeat is flushed, and drops
 an expiry already reached at that edge. It therefore never extends helper
@@ -968,7 +981,18 @@ image. Successful `EnsureImage` returns the complete immutable image evidence;
 the agent persists it before invoking helper `Run`. The helper then registers
 `Wait`, starts runc-v2, and returns `Started` plus the same image evidence. The
 agent replays the observation, performs fenced L1 `StartAttempt`, and only after
-both succeed marks its local observer running. Lease renewal, log append, and
+both succeed marks its local observer running. `StartAttempt` is idempotent, so
+an answer that never arrived (a transport failure or timeout) or a 5xx other
+than 501 is retried at the completion retry interval within one lease window,
+as for a process start: a lost answer to a committed start gets L1's replay and
+the attempt proceeds as started. The retry also ends at the helper's initial
+deadman. The adapter reports the `Run` request just before sending it, and
+the helper arms that deadman no earlier, so the agent ends the retry the
+initial deadman after the report; until admission nothing renews it, and an
+acceptance after it could only lose the attempt. Any other status is L1's
+verdict even with an unreadable body; a 2xx is the committed start. A
+refusal, or no verdict before either bound, is a refused post-start mutation.
+Lease renewal, log append, and
 completion remain incapable of implicitly promoting the attempt. If the
 pre-Run observation is refused, no runtime resource is created; if either
 post-start mutation is refused for a service, the adapter kills and verifies
@@ -1038,8 +1062,10 @@ the same handoff owner cannot become this attempt's result. Normal publication
 and retention rules apply to that absence.
 
 After the helper proves payload start, the image observation and `Started`
-acknowledgement use a bounded uncanceled context: an execution cancel cannot erase a response for a transaction
-that already committed. L1 still refuses a new start after cancellation and
+acknowledgement use uncanceled contexts, the observation bounded by one
+operation and the acknowledgement, with its retries, by one lease window and
+the helper's initial deadman: an execution cancel cannot erase a response for a transaction that already
+committed, nor the retry that recovers a lost one. L1 still refuses a new start after cancellation and
 returns the stored job for an earlier durable start. OCI one-shots keep Watch
 alive across execution cancellation to observe the existing TERM, five-second
 grace and KILL path. Failed signal delivery remains runtime-failure evidence,

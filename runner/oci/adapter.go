@@ -1108,6 +1108,9 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	adapter.trackRun(request.Authority, entry)
 	attemptLoss, releaseAttemptLoss := session.ObserveAttemptLoss(authority)
 	defer releaseAttemptLoss()
+	if request.OCIRunRequested != nil {
+		request.OCIRunRequested()
+	}
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
 		AllocateEndpoints:          request.AttemptEndpoints,

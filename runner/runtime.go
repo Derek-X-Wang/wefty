@@ -476,6 +476,13 @@ type Request struct {
 	// evidence, every Started validation succeeded, and the exact attempt is now
 	// eligible for deadman renewals in the named helper generation.
 	OCIHelperAdmitted func(RuntimeGeneration) error
+	// OCIRunRequested is called immediately before the helper is asked to Run
+	// the attempt. The helper arms InitialDeadman when it reserves the attempt,
+	// no earlier, so InitialDeadman after this call is the earliest the helper
+	// can expire an attempt that was never admitted. The agent ends the Started
+	// acknowledgement's retries there: an acceptance after it could only lose
+	// the attempt.
+	OCIRunRequested func()
 	// OCIRuntimeUnavailable reports helper/session or engine loss to the agent.
 	// The agent performs recovery later under its finalization context. L1
 	// transport failures must not call this hook.

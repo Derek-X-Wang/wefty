@@ -3765,3 +3765,31 @@ func TestAdapterWatchStartOutlastsSaturationBeyondAnyFixedBudget(t *testing.T) {
 		t.Fatalf("Watch attached after %s of simulated saturation, want at least %s", observed, saturation)
 	}
 }
+
+// The adapter reports the Run request before it asks the helper to Run, so
+// the agent's bound on the Started retry starts no later than the helper's
+// initial deadman.
+func TestAdapterReportsRunRequestBeforeRun(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, _, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	request := adapterTestRequest()
+	reports := 0
+	request.OCIRunRequested = func() {
+		engine.mu.Lock()
+		ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
+		engine.mu.Unlock()
+		if ran {
+			t.Error("Run request reported after helper Run")
+		}
+		reports++
+	}
+	// Only the order matters here; how the payload ends does not.
+	_, _ = adapter.Run(t.Context(), request, nil)
+	engine.mu.Lock()
+	ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
+	engine.mu.Unlock()
+	if !ran || reports != 1 {
+		t.Fatalf("Run request reported %d times (helper Run reached: %t), want once before Run", reports, ran)
+	}
+}
