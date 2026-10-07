@@ -23,8 +23,8 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	defer tx.Rollback()
 
 	result := ReconcileResult{}
-	dead, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?
-		WHERE state IN (?, ?, ?) AND last_heartbeat_ns<=?`, contract.NodeDead,
+	dead, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_condition_json=?
+		WHERE state IN (?, ?, ?) AND last_heartbeat_ns<=?`, contract.NodeDead, conditionJSON("node_dead", "node_liveness", now, nil),
 		contract.NodeAlive, contract.NodeStale, contract.NodeDraining, now.Add(-s.nodeDeadAfter).UnixNano())
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "mark dead nodes")
@@ -42,8 +42,8 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, internalError(err, "settle a dead host's owed Computer revocations")
 	}
 
-	stale, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?
-		WHERE state=? AND last_heartbeat_ns<=?`, contract.NodeStale, contract.NodeAlive,
+	stale, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_condition_json=?
+		WHERE state=? AND last_heartbeat_ns<=?`, contract.NodeStale, conditionJSON("node_stale", "node_liveness", now, nil), contract.NodeAlive,
 		now.Add(-s.nodeStaleAfter).UnixNano())
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "mark stale nodes")
@@ -266,7 +266,7 @@ func (s *Store) reconcileClaimingNode(ctx context.Context, tx *sql.Tx, nodeID st
 	if next == state {
 		return state, nil
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE nodes SET state=? WHERE node_id=? AND state=?", next, nodeID, state); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE nodes SET state=?, last_condition_json=? WHERE node_id=? AND state=?", next, conditionJSON("node_"+string(next), "node_liveness", now, nil), nodeID, state); err != nil {
 		return state, internalError(err, "reconcile claiming node liveness")
 	}
 	return next, nil
@@ -278,9 +278,15 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	if bootSessionID == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "boot_session_id is required")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET state=?
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Node{}, internalError(err, "begin agent drain")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?,
+		last_condition_json=CASE WHEN state=? THEN last_condition_json ELSE ? END
 		WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
-		contract.NodeDraining, nodeID, identityNodeID, bootSessionID,
+		contract.NodeDraining, contract.NodeDraining, conditionJSON("node_draining", "node_liveness", s.clock.Now(), nil), nodeID, identityNodeID, bootSessionID,
 		contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
 	if err != nil {
 		return Node{}, internalError(err, "drain node")
@@ -290,11 +296,14 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 		return Node{}, internalError(err, "read node drain result")
 	}
 	if changed == 0 {
-		return Node{}, s.nodeSessionError(ctx, s.db, nodeID, identityNodeID, bootSessionID, "drain")
+		return Node{}, s.nodeSessionError(ctx, tx, nodeID, identityNodeID, bootSessionID, "drain")
 	}
-	node, err := getNode(ctx, s.db, nodeID)
+	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read draining node")
+	}
+	if err := tx.Commit(); err != nil {
+		return Node{}, internalError(err, "commit agent drain")
 	}
 	return node, nil
 }
@@ -330,14 +339,15 @@ func (s *Store) nodeSessionError(ctx context.Context, q nodeQueryer, nodeID, ide
 // CAS is deliberately independent of node liveness so work can be forbidden
 // while a node is dead, without fencing attempts already in progress.
 func (s *Store) SetNodeClaimsByOperator(ctx context.Context, nodeID, actor string, request NodeIntentRequest) (Node, error) {
+	return s.setNodeIntentByOperator(ctx, nodeID, nodeVerbSetClaims, actor, request)
+}
+
+func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb, actor string, request NodeIntentRequest) (Node, error) {
 	if nodeID == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node_id is required")
 	}
-	if request.IntentRevision < 0 {
-		return Node{}, protocolError(contract.ErrorInvalidRequest, "intent_revision must be non-negative")
-	}
-	if strings.TrimSpace(request.Reason) == "" || strings.TrimSpace(actor) == "" {
-		return Node{}, protocolError(contract.ErrorInvalidRequest, "intent reason and actor are required")
+	if err := validateNodeIntentRequest(verb, actor, request); err != nil {
+		return Node{}, err
 	}
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -345,9 +355,24 @@ func (s *Store) SetNodeClaimsByOperator(ctx context.Context, nodeID, actor strin
 		return Node{}, internalError(err, "begin operator intent mutation")
 	}
 	defer tx.Rollback()
+	current, err := getNode(ctx, tx, nodeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Node{}, protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
+	}
+	if err != nil {
+		return Node{}, internalError(err, "read operator intent target")
+	}
+	if err := nodeIntentDecision(current, verb, actor, request); err != nil {
+		return Node{}, err
+	}
+	code := "claims_disabled"
+	if request.ClaimsEnabled {
+		code = "claims_enabled"
+	}
+	condition := conditionJSON(code, "node_intent", now, map[string]any{"reason": strings.TrimSpace(request.Reason), "actor": strings.TrimSpace(actor), "revision": current.IntentRevision + 1})
 	result, err := tx.ExecContext(ctx, `UPDATE nodes
-		SET claims_enabled=?, intent_revision=intent_revision+1, intent_reason=?, intent_updated_at=?, intent_actor=?
-		WHERE node_id=? AND intent_revision=?`, request.ClaimsEnabled, strings.TrimSpace(request.Reason), now.UnixNano(), strings.TrimSpace(actor), nodeID, request.IntentRevision)
+		SET claims_enabled=?, intent_revision=intent_revision+1, intent_reason=?, intent_updated_at=?, intent_actor=?, last_condition_json=?
+		WHERE node_id=? AND intent_revision=?`, request.ClaimsEnabled, strings.TrimSpace(request.Reason), now.UnixNano(), strings.TrimSpace(actor), condition, nodeID, request.IntentRevision)
 	if err != nil {
 		return Node{}, internalError(err, "write operator node intent")
 	}
@@ -356,14 +381,14 @@ func (s *Store) SetNodeClaimsByOperator(ctx context.Context, nodeID, actor strin
 		return Node{}, internalError(err, "read operator node intent result")
 	}
 	if changed == 0 {
-		_, readErr := getNode(ctx, tx, nodeID)
-		if errors.Is(readErr, sql.ErrNoRows) {
-			return Node{}, protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
+		current, err = getNode(ctx, tx, nodeID)
+		if err != nil {
+			return Node{}, internalError(err, "read operator intent target")
 		}
-		if readErr != nil {
-			return Node{}, internalError(readErr, "read operator intent target")
+		if err := nodeIntentDecision(current, verb, actor, request); err != nil {
+			return Node{}, err
 		}
-		return Node{}, protocolError(contract.ErrorConflict, "node %q intent revision has changed", nodeID)
+		return Node{}, internalError(errors.New("intent CAS changed no row"), "write operator node intent")
 	}
 	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {

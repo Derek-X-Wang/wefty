@@ -219,6 +219,7 @@ var driftRows = []driftRow{
 	{requestBody(clientDoc, "post", "/v1/computers/{computer_id}/projections"), typeOf[l1.ComputerProjectionRequest]()},
 	{requestBody(clientDoc, "post", "/v1/computers/{computer_id}/remove"), typeOf[l1.ComputerRemoveRequest]()},
 	{responseBody(clientDoc, "get", "/v1/nodes", "200"), typeOf[l1.NodeList]()},
+	{responseBody(clientDoc, "get", "/v1/nodes/{node_id}", "200"), typeOf[l1.Node]()},
 	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/drain"), typeOf[l1.NodeIntentRequest]()},
 	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/claims"), typeOf[l1.NodeIntentRequest]()},
 
@@ -1014,6 +1015,9 @@ func TestNodeProjectionsValidateAgainstPublishedSchemas(t *testing.T) {
 		MaxOneshotSlots: 2, MaxServiceSlots: 1, OneshotOccupancy: 1, ServiceOccupancy: 1, Overcommitted: false,
 		AuthorityGeneration: 4, ClaimsEnabled: true, IntentRevision: 2, IntentReason: "maintenance done",
 		IntentUpdatedAt: &observed, IntentActor: "operator", LastHeartbeatAt: observed,
+		ActiveAttempts: []l1.NodeActiveAttempt{{JobID: "job-1", AttemptID: "attempt-1", BootSessionID: "boot-1", Kind: "process", Class: contract.JobClassOneShot, State: contract.AttemptRunning, LeaseExpiresAt: observed.Add(time.Minute)}},
+		LastCondition:  &contract.Condition{Code: "claims_enabled", Scope: "node_intent", Since: observed, Details: map[string]any{"reason": "maintenance done"}},
+		AllowedActions: []contract.AllowedAction{{Verb: "drain", Requires: map[string]any{"revision": int64(2), "reason": true}}},
 	}
 	heartbeat := l1.HeartbeatResponse{
 		Node: node, OneShotCancelDirectives: []l1.OneShotCancelDirective{}, RemovalDirectives: []l1.RemovalDirective{}, StorageResetDirectives: []l1.ComputerStorageResetDirective{},

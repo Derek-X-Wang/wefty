@@ -392,6 +392,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/computers/{computer_id}/token-scope-proof", s.proveComputerTokenScope)
 	client.HandleFunc("POST /v1/host-boot-session-proof", s.proveHostBootSession)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
+	client.HandleFunc("GET /v1/nodes/{node_id}", s.getNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
 
@@ -677,17 +678,26 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, NodeList{Nodes: nodes})
 }
 
+func (s *Server) getNode(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.store.Reconcile(r.Context()); err != nil {
+		writeError(w, err)
+		return
+	}
+	node, err := s.store.GetNode(r.Context(), r.PathValue("node_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
+}
+
 func (s *Server) operatorDrainNode(w http.ResponseWriter, r *http.Request) {
 	var request NodeIntentRequest
 	if err := decodeJSON(r, &request); err != nil {
 		writeError(w, err)
 		return
 	}
-	if request.ClaimsEnabled {
-		writeError(w, protocolError(contract.ErrorInvalidRequest, "drain requires claims_enabled=false"))
-		return
-	}
-	s.writeNodeIntent(w, r, request)
+	s.writeNodeIntent(w, r, nodeVerbDrain, request)
 }
 
 func (s *Server) setNodeClaims(w http.ResponseWriter, r *http.Request) {
@@ -696,12 +706,12 @@ func (s *Server) setNodeClaims(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	s.writeNodeIntent(w, r, request)
+	s.writeNodeIntent(w, r, nodeVerbSetClaims, request)
 }
 
-func (s *Server) writeNodeIntent(w http.ResponseWriter, r *http.Request, request NodeIntentRequest) {
+func (s *Server) writeNodeIntent(w http.ResponseWriter, r *http.Request, verb string, request NodeIntentRequest) {
 	identity := identityFromRequest(r)
-	node, err := s.store.SetNodeClaimsByOperator(r.Context(), r.PathValue("node_id"), identity.NodeID, request)
+	node, err := s.store.setNodeIntentByOperator(r.Context(), r.PathValue("node_id"), verb, identity.NodeID, request)
 	if err != nil {
 		writeError(w, err)
 		return

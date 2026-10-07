@@ -349,10 +349,20 @@ func executeNodes(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 		}
 		return writeNodesTable(stdout, result.Nodes)
 	}
+	if len(args) == 2 && args[0] == "inspect" {
+		node, err := clients.getNode(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		if jsonOutput {
+			return writeJSON(stdout, node)
+		}
+		return writeNodesTable(stdout, []l1.Node{node})
+	}
 	if len(args) > 0 && args[0] == "set-claims" {
 		return executeSetNodeClaims(ctx, clients, jsonOutput, args[1:], stdout)
 	}
-	return usageError("usage: wefty nodes list | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
+	return usageError("usage: wefty nodes list | wefty nodes inspect NODE_ID | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
 }
 
 func executeSetNodeClaims(
@@ -657,10 +667,29 @@ func moveFirstPositionalToEnd(args []string) []string {
 }
 
 func executeDrain(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return usageError("usage: wefty drain NODE_ID")
+	flags := flag.NewFlagSet("drain", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	revision := flags.Int64("revision", 0, "intent revision observed in nodes list or inspect")
+	reason := flags.String("reason", "operator requested drain", "operator reason recorded with the intent")
+	if err := flags.Parse(moveFirstPositionalToEnd(args)); err != nil {
+		return usageError(err.Error())
 	}
-	node, err := clients.drainNode(ctx, args[0])
+	if flags.NArg() != 1 {
+		return usageError("usage: wefty drain NODE_ID [--revision REVISION] [--reason REASON]")
+	}
+	var observedRevision *int64
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "revision" {
+			observedRevision = revision
+		}
+	})
+	if observedRevision != nil && *revision < 0 {
+		return usageError("drain requires a non-negative --revision")
+	}
+	if strings.TrimSpace(*reason) == "" {
+		return usageError("drain requires a non-empty --reason")
+	}
+	node, err := clients.drainNode(ctx, flags.Arg(0), observedRevision, strings.TrimSpace(*reason))
 	if err != nil {
 		return err
 	}

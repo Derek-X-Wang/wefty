@@ -1183,3 +1183,77 @@ best-effort and independent of terminal Job success. A failed upload leaves
 that attempt's handoff unpublished; an absent run mailbox does not publish it.
 Run-identity entitlement, dispatch replay and tombstones keep their existing
 ordering and authority rules.
+
+## Node operator facts and guarded actions
+
+`GET /v1/nodes` and `GET /v1/nodes/{node_id}` return the same Node
+projection after reconciling node liveness and attempt expiry. `wefty nodes
+list` and `wefty nodes inspect NODE_ID` show these facts in table or JSON form:
+
+- `active_attempts`: nonterminal persisted attempts (`claimed`, `running`,
+  `awaiting-input`), ordered by creation time and attempt ID. Each includes
+  `job_id`, `attempt_id`, `boot_session_id`, `kind`, `class`, `state`, and
+  `lease_expires_at`. Prior-boot attempts remain visible until reconciliation
+  settles their leases. Neither an attempt credential nor a fencing token is
+  exposed. This records execution state, not verified physical process presence.
+- `last_condition`: the last recorded notable event, or `null` for an upgraded
+  Node with no recorded event. `{code, scope, since, details}` uses open string
+  vocabularies and an object of factual details. `since` is the control-plane
+  recording time. Normal heartbeats and reads preserve it, including after a
+  capability recovers. A later notable event replaces it atomically with that
+  event's mutation. No pre-upgrade event or timestamp is fabricated.
+- `allowed_actions`: the shared `contract.AllowedAction` shape below. It
+  reports rules for this snapshot, never advice or a recommended next action.
+
+The shared wire shape for Nodes, services, and Computers is:
+
+```json
+{
+  "verb": "drain",
+  "requires": {"revision": 7, "reason": true},
+  "refused_because": {
+    "code": "conflict",
+    "message": "factual refusal",
+    "retryable": false,
+    "details": {}
+  }
+}
+```
+
+`requires` is an open object. `revision` is the exact revision to send in the
+resource's revision field; `reason: true` requires a nonempty operator reason.
+`claims_enabled: true` on `set-claims` means a boolean input is required, **not**
+that its value must be true. `refused_because` uses the shared APIError shape
+and is omitted when the verb is legal with the required inputs. A later write
+always rechecks the same decision predicate inside its transaction; listing an
+allowed action does not reserve authority.
+
+The complete L1 Node operator verb set is currently:
+
+| Verb | Endpoint | Preconditions | Legal Node states |
+| --- | --- | --- | --- |
+| `drain` | `POST /v1/nodes/{node_id}/drain` | `claims_enabled=false`, matching `intent_revision`, nonempty `reason`, authenticated client actor | `alive`, `stale`, `draining`, `dead` |
+| `set-claims` | `POST /v1/nodes/{node_id}/claims` | boolean `claims_enabled` input, matching `intent_revision`, nonempty `reason`, authenticated client actor | `alive`, `stale`, `draining`, `dead` |
+
+Both verbs are legal whether claims are already enabled or disabled, and do not
+fence or kill resident attempts. Capacity, capability withdrawal, and prior-boot
+attempts do not prevent these intent writes. There is no L1 Node `remove` or
+`forget` endpoint or CLI verb to advertise; service/Computer removal and local
+`wefty node` OCI/setup controls are separate resources and authority surfaces.
+
+A stale Node intent revision returns HTTP 409, code `stale_intent_revision`,
+`retryable=false`, and `details: {node_id, current_revision, provided_revision}`.
+It changes neither intent nor the last condition. `wefty drain NODE_ID
+--revision REV --reason REASON` sends the observed revision without refreshing
+it. Omitting `--revision` reads the current Node revision first; omitting
+`--reason` records `operator requested drain`. Node commands publish typed CLI
+exits, including 5 for revision conflicts and 2 for invalid flag values.
+
+Recorded Node condition facts are `node_registered` (`node_session`, with boot
+and initial claims intent), `node_alive`, `node_stale`, `node_dead`, and
+`node_draining` (`node_liveness`); `claims_enabled` and `claims_disabled`
+(`node_intent`, with actor, reason, and resulting revision); and the agent's
+capability withdrawal reason code (`node_capability`, with missing capabilities
+and capability revision). A repeated observation does not advance `since`.
+Registration never overwrites durable operator intent. The last event may have
+cleared: its presence is historical evidence, not a current eligibility answer.

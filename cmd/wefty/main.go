@@ -47,6 +47,9 @@ var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
 func isTypedExitCLIArgs(args []string) bool {
 	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
 	// the service creation exit contract.
+	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil && len(commandArgs) > 0 && (commandArgs[0] == "drain" || commandArgs[0] == "nodes") {
+		return true
+	}
 	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
 		len(commandArgs) >= 2 && commandArgs[0] == "services" && commandArgs[1] == "create" {
 		return true
@@ -443,7 +446,8 @@ Commands:
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
     [--reference REFERENCE]  Name an archive whose export named no artifact
-  nodes list                 List node reachability, eligibility, and capacity
+  nodes list                 List node facts and legal operator actions
+  nodes inspect NODE_ID      Read one node and its resident attempts
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
@@ -485,7 +489,7 @@ Commands:
                              Read the result document the run uploaded
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
-  drain NODE_ID              Disable new claims using the current intent revision
+  drain NODE_ID              Disable new claims [--revision REV] [--reason REASON]
   run <envelope|step|gate|result|params>
                              Report from inside a running job by writing run
                              mailbox events; needs no credential and no cluster

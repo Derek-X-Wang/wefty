@@ -1126,7 +1126,7 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", NodeIntentRequest{
 		ClaimsEnabled: false, IntentRevision: 0, Reason: "stale replay",
 	})
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorStaleIntentRevision)
 	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/missing/drain", NodeIntentRequest{
 		ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance",
 	})

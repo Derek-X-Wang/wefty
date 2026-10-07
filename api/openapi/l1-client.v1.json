@@ -1611,6 +1611,47 @@
         }
       }
     },
+    "/v1/nodes/{node_id}": {
+      "parameters": [
+        {
+          "name": "node_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getNode",
+        "summary": "Read one operator-visible node",
+        "description": "Returns the same Node projection as the fleet listing after applying liveness and attempt expiry. Includes active_attempts, the durable last_condition and allowed_actions with current preconditions.",
+        "responses": {
+          "200": {
+            "description": "Current Node facts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/Node"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
+    },
     "/v1/nodes/{node_id}/drain": {
       "parameters": [
         {
@@ -1623,7 +1664,7 @@
       "post": {
         "operationId": "operatorDrainNode",
         "summary": "Stop new claims on a node",
-        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes.",
+        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes. A stale revision is refused as stale_intent_revision with node_id, current_revision and provided_revision in error.details.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1670,7 +1711,7 @@
       "post": {
         "operationId": "setNodeClaims",
         "summary": "Set durable node claim intent",
-        "description": "Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts.",
+        "description": "Stale intent revisions return stale_intent_revision with node_id, current_revision and provided_revision in error.details. Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts.",
         "requestBody": {
           "required": true,
           "content": {
