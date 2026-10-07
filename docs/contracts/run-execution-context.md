@@ -210,7 +210,9 @@ principal may read, including one-shots and services. An attempt credential
 returns only its own Job and that Job's immediate children, using the same
 read scope as the individual Job route. It is authenticated against its live
 attempt and holding node on every page; a cursor never grants authority.
-Removed service tombstones are exact-ID resources, outside the collection.
+Removed service tombstones and retired Computer Job projections are exact-ID
+resources, outside every collection filter. Only current Computer projections
+appear, so the one-shot and service sets together equal the unfiltered set.
 
 The optional filters intersect, with exact case-sensitive comparison:
 
@@ -219,7 +221,7 @@ The optional filters intersect, with exact case-sensitive comparison:
 | `class=one-shot` or `class=service` | Workload lifecycle class. Omission selects both. |
 | `kind=KIND` | Workload isolation kind; an open vocabulary. |
 | `state=STATE` | Persisted Job state, not a derived status such as `restart-pending` or `unschedulable`. |
-| `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. |
+| `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. If that identity is empty, the request returns `400 invalid_request`. |
 | `limit=N` | Page size, default 100, range 1–1000. |
 | `cursor=CURSOR` | Opaque continuation from `next_cursor`; absent on the final page. |
 

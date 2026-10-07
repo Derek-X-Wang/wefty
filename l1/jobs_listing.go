@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -48,6 +49,9 @@ func parseJobListFilters(r *http.Request) (jobListFilters, error) {
 		filters.Submitter = identityFromRequest(r).NodeID
 		if scope.JobID != "" {
 			filters.Submitter = scope.OriginatingSubmitter
+		}
+		if filters.Submitter == "" {
+			return jobListFilters{}, protocolError(contract.ErrorInvalidRequest, "submitter=me requires a resolved submitter identity")
 		}
 	}
 	return filters, nil
@@ -142,7 +146,9 @@ func (s *Store) listReadableJobs(ctx context.Context, filters jobListFilters, cu
 			return JobList{}, err
 		}
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	// The store's default transaction mode is IMMEDIATE. A read-only page
+	// must retain its snapshot without taking the SQLite writer lock.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return JobList{}, internalError(err, "begin job listing")
 	}
@@ -154,39 +160,8 @@ func (s *Store) listReadableJobs(ctx context.Context, filters jobListFilters, cu
 		cursor.Version = 1
 		cursor.Filters = jobFilterFingerprint(filters)
 	}
-	predicates := []string{"job_listing_order.sequence<=?"}
-	args := []any{cursor.HighWater}
-	if cursor.JobID != "" {
-		predicates = append(predicates, "(jobs.created_ns>? OR (jobs.created_ns=? AND jobs.job_id>?))")
-		args = append(args, cursor.CreatedNS, cursor.CreatedNS, cursor.JobID)
-	}
-	if filters.Class != "" {
-		predicates = append(predicates, "json_extract(jobs.spec_json, '$.class')=?")
-		args = append(args, filters.Class)
-	}
-	// Keep the service collection's current-projection and removal semantics.
-	if filters.Class == contract.JobClassService {
-		predicates = append(predicates, "EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=jobs.job_id)",
-			"NOT EXISTS (SELECT 1 FROM computer_job_projections WHERE computer_job_projections.job_id=jobs.job_id AND current=0)")
-	}
-	if filters.Kind != "" {
-		predicates = append(predicates, "json_extract(jobs.spec_json, '$.kind')=?")
-		args = append(args, filters.Kind)
-	}
-	if filters.State != "" {
-		predicates = append(predicates, "jobs.state=?")
-		args = append(args, filters.State)
-	}
-	if filters.Submitter != "" {
-		predicates = append(predicates, "jobs.originating_submitter=?")
-		args = append(args, filters.Submitter)
-	}
-	if filters.ParentJobID != "" {
-		predicates = append(predicates, "(jobs.job_id=? OR jobs.parent_job_id=?)")
-		args = append(args, filters.ParentJobID, filters.ParentJobID)
-	}
-	args = append(args, limit+1)
-	rows, err := tx.QueryContext(ctx, `SELECT jobs.job_id, jobs.created_ns FROM jobs JOIN job_listing_order ON job_listing_order.job_id=jobs.job_id WHERE `+strings.Join(predicates, " AND ")+` ORDER BY jobs.created_ns, jobs.job_id LIMIT ?`, args...)
+	query, args := jobListingQuery(filters, cursor, limit)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return JobList{}, internalError(err, "list readable job IDs")
 	}
@@ -240,4 +215,45 @@ func (s *Store) listReadableJobs(ctx context.Context, filters jobListFilters, cu
 		page.NextCursor = base64.RawURLEncoding.EncodeToString(payload)
 	}
 	return page, nil
+}
+
+func jobListingQuery(filters jobListFilters, cursor jobCollectionCursor, limit int) (string, []any) {
+	predicates := []string{"job_listing_order.sequence<=?",
+		"NOT EXISTS (SELECT 1 FROM computer_job_projections WHERE computer_job_projections.job_id=jobs.job_id AND current=0)"}
+	args := []any{cursor.HighWater}
+	if cursor.JobID != "" {
+		predicates = append(predicates, "jobs.created_ns>=? AND (jobs.created_ns>? OR jobs.job_id>?)")
+		args = append(args, cursor.CreatedNS, cursor.CreatedNS, cursor.JobID)
+	}
+	// Service membership is indexed; avoid decoding every candidate's spec.
+	// Its complement is the one-shot set, with retired projections excluded
+	// from both classes and the unfiltered collection above.
+	switch filters.Class {
+	case contract.JobClassService:
+		predicates = append(predicates, "EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=jobs.job_id)")
+	case contract.JobClassOneShot:
+		predicates = append(predicates, "NOT EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=jobs.job_id)")
+	}
+	if filters.Kind != "" {
+		predicates = append(predicates, "json_extract(jobs.spec_json, '$.kind')=?")
+		args = append(args, filters.Kind)
+	}
+	if filters.State != "" {
+		predicates = append(predicates, "jobs.state=?")
+		args = append(args, filters.State)
+	}
+	if filters.Submitter != "" {
+		predicates = append(predicates, "jobs.originating_submitter=?")
+		args = append(args, filters.Submitter)
+	}
+	if filters.ParentJobID != "" {
+		predicates = append(predicates, "(jobs.job_id=? OR jobs.parent_job_id=?)")
+		args = append(args, filters.ParentJobID, filters.ParentJobID)
+	}
+	args = append(args, limit+1)
+	// CROSS JOIN keeps jobs as the outer loop: SQLite streams the creation
+	// index (seeking created_ns on continuation), probes insertion membership
+	// by job_id, and stops at LIMIT without a whole-collection temp B-tree.
+	// TestJobsListingPlanUsesCreationIndex pins the actual EXPLAIN plan.
+	return `SELECT jobs.job_id, jobs.created_ns FROM jobs CROSS JOIN job_listing_order ON job_listing_order.job_id=jobs.job_id WHERE ` + strings.Join(predicates, " AND ") + ` ORDER BY jobs.created_ns, jobs.job_id LIMIT ?`, args
 }

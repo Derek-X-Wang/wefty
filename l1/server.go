@@ -775,7 +775,7 @@ func attemptCredentialFromRequest(r *http.Request) AttemptCredentialScope {
 // not publish. It is the reason no operator verb is reachable in-job.
 func (s *Server) attemptCredentialOutOfScope(w http.ResponseWriter, _ *http.Request) {
 	writeError(w, protocolError(contract.ErrorPrincipalForbidden,
-		"an attempt credential may only submit a child job, read its own job, list or read its children, and cancel its children"))
+		"an attempt credential may only submit a child job, list its own job and immediate children, read its own job, list or read its children, and cancel its children"))
 }
 
 // createChildJob is POST /v1/jobs presented with an attempt credential. Every

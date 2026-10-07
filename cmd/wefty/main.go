@@ -449,7 +449,7 @@ Commands:
     [--reference REFERENCE]  Name an archive whose export named no artifact
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
-  jobs list                 List readable jobs with filters and cursor paging
+  jobs list                  List readable jobs with filters and cursor paging
     [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]

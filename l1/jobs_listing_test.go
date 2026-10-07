@@ -2,13 +2,17 @@ package l1
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -339,5 +343,241 @@ func TestJobsListingWatermarkSurvivesRemovalAndReopen(t *testing.T) {
 	var count int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM job_listing_order WHERE job_id=?`, lastJob.JobID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("removed job listing metadata count=%d err=%v", count, err)
+	}
+}
+
+// Seed in one transaction so the regression fixtures can be large without
+// thousands of HTTP submissions or timing-dependent setup.
+func seedJobListingRows(t *testing.T, store *Store, count int) {
+	t.Helper()
+	oneShot, err := json.Marshal(validJobSpec("listing-fixture", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := json.Marshal(operatorServiceSpec("listing-fixture", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(t.Context(), `WITH RECURSIVE fixture(n) AS (
+		SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<?
+	) INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state, created_ns, updated_ns)
+	SELECT printf('listing-%06d', n), printf('listing-%06d', n), 'fixture',
+		CASE WHEN n%2=0 THEN ? ELSE ? END, 'queued', n, n FROM fixture`, count, service, oneShot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO service_jobs(job_id, desired_state)
+		SELECT job_id, 'running' FROM jobs WHERE json_extract(spec_json, '$.class')='service'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
+	for _, handle := range []string{"main", "settlement"} {
+		t.Run(handle, func(t *testing.T) {
+			store, err := OpenStore(filepath.Join(t.TempDir(), "listing.sqlite"), StoreOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			seedJobListingRows(t, store, 10000)
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+			now := store.clock.Now()
+			// listReadableJobs reads its clock after selecting the IDs, before
+			// loading up to 1000 projections in the still-open transaction.
+			store.clock = ClockFunc(func() time.Time {
+				select {
+				case <-entered:
+				default:
+					close(entered)
+				}
+				<-release
+				return now
+			})
+			var page JobList
+			var listErr error
+			listed := make(chan struct{})
+			go func() {
+				page, listErr = store.listReadableJobs(t.Context(), jobListFilters{}, "", MaxJobPageLimit)
+				close(listed)
+			}()
+			defer func() { unblock(); <-listed }()
+			select {
+			case <-entered:
+			case <-listed:
+				t.Fatalf("listing ended before the read barrier: %v", listErr)
+			case <-time.After(10 * time.Second):
+				t.Fatal("listing did not reach the read barrier")
+			}
+			db := store.db
+			if handle == "settlement" {
+				db = store.settlementDB
+			}
+			written := make(chan error, 1)
+			started := time.Now()
+			go func() {
+				_, err := db.ExecContext(t.Context(), `UPDATE jobs SET state='failed' WHERE job_id='listing-000001'`)
+				written <- err
+			}()
+			// The reader remains paused throughout this generous deadline. This
+			// tests lock ownership, not how fast the machine reads 1000 jobs.
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatalf("concurrent %s write failed while listing held its snapshot: %v", handle, err)
+				}
+				t.Logf("concurrent %s write completed in %s with the listing paused", handle, time.Since(started))
+			case <-time.After(2 * time.Second):
+				unblock()
+				<-written
+				t.Fatalf("concurrent %s write did not complete within 2s while the listing was paused", handle)
+			}
+			unblock()
+			<-listed
+			if listErr != nil || len(page.Jobs) != MaxJobPageLimit {
+				t.Fatalf("large page: jobs=%d err=%v", len(page.Jobs), listErr)
+			}
+			if page.Jobs[0].State != contract.JobQueued {
+				t.Fatalf("listing lost its read snapshot: first state=%s", page.Jobs[0].State)
+			}
+			var state contract.JobState
+			if err := db.QueryRow(`SELECT state FROM jobs WHERE job_id='listing-000001'`).Scan(&state); err != nil || state != contract.JobFailed {
+				t.Fatalf("concurrent write was not persisted: state=%s err=%v", state, err)
+			}
+		})
+	}
+}
+
+func TestJobsListingPlanUsesCreationIndex(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "listing.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedJobListingRows(t, store, 100000)
+	for _, class := range []string{"", contract.JobClassOneShot, contract.JobClassService} {
+		for _, continuation := range []bool{false, true} {
+			t.Run(fmt.Sprintf("class=%s/continuation=%t", class, continuation), func(t *testing.T) {
+				cursor := jobCollectionCursor{HighWater: 100000}
+				if continuation {
+					cursor.CreatedNS, cursor.JobID = 90000, "listing-090000"
+				}
+				query, args := jobListingQuery(jobListFilters{Class: class}, cursor, 100)
+				rows, err := store.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, args...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer rows.Close()
+				var plan []string
+				for rows.Next() {
+					var id, parent, unused int
+					var detail string
+					if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+						t.Fatal(err)
+					}
+					plan = append(plan, detail)
+				}
+				if err := rows.Err(); err != nil {
+					t.Fatal(err)
+				}
+				details := strings.Join(plan, "\n")
+				t.Log(details)
+				if len(plan) == 0 || !strings.Contains(plan[0], "jobs_listing_creation_order") || strings.Contains(details, "TEMP B-TREE") {
+					t.Errorf("page must stream jobs in creation-index order without sorting the collection:\n%s", details)
+				}
+				if continuation && (!strings.Contains(plan[0], "SEARCH jobs") || !strings.Contains(plan[0], "created_ns>")) {
+					t.Errorf("continuation must seek the creation index:\n%s", details)
+				}
+				if class != "" && strings.Contains(query, "json_extract(jobs.spec_json, '$.class')") {
+					t.Error("class selection must use service membership, not deserialize every spec")
+				}
+			})
+		}
+	}
+}
+
+func TestJobsListingExcludesRetiredComputerProjections(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "listing-computer", Spec: computerCapabilityJobSpec("listing-computer-v1"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.SetComputerDesiredState(t.Context(), computer.ComputerID,
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "listing-stop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiredID := computer.CurrentJobID
+	computer, err = h.store.InstallComputerProjection(t.Context(), computer.ComputerID, ComputerProjectionRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "listing-project"),
+		Spec:                         computerCapabilityJobSpec("listing-computer-v2"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range []contract.JobSpec{validJobSpec("listing-one-shot", nil), operatorServiceSpec("listing-service", nil)} {
+		if _, _, err := h.store.CreateJobAs(t.Context(), spec, JobOrigin{OriginatingSubmitter: "operator"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.store.db.Exec(`UPDATE jobs SET originating_submitter='operator' WHERE job_id IN (?, ?)`, retiredID, computer.CurrentJobID); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{"", "class=service", "class=one-shot", "kind=oci", "state=stopped", "submitter=me", "kind=oci&state=stopped&submitter=me"} {
+		t.Run(query, func(t *testing.T) {
+			page := listingPage(t, h, client, "/v1/jobs?"+query)
+			for _, job := range page.Jobs {
+				if job.JobID == retiredID {
+					t.Errorf("retired Computer projection appeared in collection: %s", job.JobID)
+				}
+				if job.JobID == computer.CurrentJobID && job.ComputerID != computer.ComputerID {
+					t.Errorf("current projection lost Computer identity: %#v", job)
+				}
+			}
+		})
+	}
+	all := jobListingIDs(listingPage(t, h, client, "/v1/jobs"))
+	partition := append(jobListingIDs(listingPage(t, h, client, "/v1/jobs?class=one-shot")),
+		jobListingIDs(listingPage(t, h, client, "/v1/jobs?class=service"))...)
+	sort.Strings(partition)
+	if len(all) != 3 || !reflect.DeepEqual(all, partition) {
+		t.Fatalf("unfiltered=%v, want one-shot plus service=%v (3 jobs)", all, partition)
+	}
+}
+
+func TestJobsListingRejectsUnresolvedMe(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	parent, _, err := h.store.CreateJob(t.Context(), validJobSpec("unowned-listing", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range []AttemptCredentialScope{{}, {JobID: parent.JobID}} {
+		t.Run(fmt.Sprintf("attempt=%t", scope.JobID != ""), func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/v1/jobs?submitter=me", nil)
+			ctx := context.WithValue(r.Context(), identityContextKey{}, fabric.Identity{})
+			if scope.JobID != "" {
+				// An attempt's inherited identity must not fall back to the
+				// holding node's identity when the inherited identity is empty.
+				ctx = context.WithValue(ctx, identityContextKey{}, fabric.Identity{NodeID: "holding-node"})
+				ctx = context.WithValue(ctx, attemptCredentialContextKey{}, scope)
+			}
+			w := httptest.NewRecorder()
+			h.server.listJobs(w, r.WithContext(ctx))
+			assertAPIError(t, w.Code, w.Body.Bytes(), http.StatusBadRequest, contract.ErrorInvalidRequest)
+		})
 	}
 }
