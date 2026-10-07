@@ -97,8 +97,15 @@ func TestUnavailableL1CannotHoldARecoveryPassPastItsBudget(t *testing.T) {
 		}
 	}
 
+	// The second pass proves the backed-off row is skipped, not the budget, so
+	// it runs with the default budget: on a loaded runner, 100ms of wall time
+	// can run out after one healthy lookup and cut the pass short again.
 	lookup.hang, lookup.looked = false, nil
-	_ = reconciler.ReconcileOnce(context.Background())
+	relaxed, err := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = relaxed.ReconcileOnce(context.Background())
 	if want := keys[1:]; fmt.Sprint(lookup.looked) != fmt.Sprint(want) {
 		t.Fatalf("second pass looked up %v, want the rows behind the backed-off one %v", lookup.looked, want)
 	}
