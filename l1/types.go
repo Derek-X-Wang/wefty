@@ -105,6 +105,7 @@ type Job struct {
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
 	*ServiceJob
+	*ServiceOperatorFacts
 	Removal *ServiceRemoval `json:"removal,omitempty"`
 }
 

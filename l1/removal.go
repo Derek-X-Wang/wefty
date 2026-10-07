@@ -61,6 +61,10 @@ type serviceTombstoneRow struct {
 // controller state in one transaction. A service that has never been bound is
 // finalized immediately because no node could have created a managed resource.
 func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
+	return s.removeService(ctx, jobID, nil)
+}
+
+func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceActionActor) (Job, error) {
 	if strings.TrimSpace(jobID) == "" {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "job_id is required")
 	}
@@ -89,17 +93,20 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 		if tombstoneErr != nil {
 			return Job{}, internalError(tombstoneErr, "read removed service")
 		}
+		if err := serviceActionDecision(ctx, tx, tombstone.job(), "remove", actor); err != nil {
+			return Job{}, err
+		}
 		return tombstone.job(), nil
 	}
 	if err != nil {
 		return Job{}, internalError(err, "read service removal target")
 	}
-	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
-		return Job{}, mapErr
-	} else if mapped {
-		return Job{}, protocolErrorWithDetails(contract.ErrorComputerResourceRequired,
-			map[string]any{"computer_id": computerID},
-			"Computer %q is the sole removal authority for Job %q", computerID, jobID)
+	target, err := getJobByID(ctx, tx, jobID, now)
+	if err != nil {
+		return Job{}, internalError(err, "read service removal decision")
+	}
+	if err := serviceActionDecision(ctx, tx, target, "remove", actor); err != nil {
+		return Job{}, err
 	}
 
 	if removal, removalErr := readServiceRemoval(ctx, tx, jobID); removalErr == nil {
@@ -183,7 +190,11 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 // directive. The active rows remain until a returning node actually cleans and
 // acknowledges; the tombstone's force-forgotten outcome never changes.
 func (s *Store) ForceForgetService(ctx context.Context, jobID string) (Job, error) {
-	job, err := s.RemoveService(ctx, jobID)
+	return s.forceForgetService(ctx, jobID, nil)
+}
+
+func (s *Store) forceForgetService(ctx context.Context, jobID string, actor *serviceActionActor) (Job, error) {
+	job, err := s.removeService(ctx, jobID, actor)
 	if err != nil {
 		return Job{}, err
 	}

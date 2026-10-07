@@ -1,0 +1,273 @@
+package l1
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
+)
+
+// ServiceOperatorFacts is present only on caller-facing service reads, including
+// removal tombstones. Store snapshots do not confer operator authority.
+type ServiceOperatorFacts struct {
+	AllowedActions []contract.AllowedAction `json:"allowed_actions"`
+	LastCondition  *contract.Condition      `json:"last_condition"`
+}
+
+type serviceActionActor struct {
+	Identity           fabric.Identity
+	ClientPrincipalTag string
+	AttemptCredential  bool
+}
+
+func (s *Server) serviceActionActor(r *http.Request) *serviceActionActor {
+	return &serviceActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag,
+		AttemptCredential: attemptCredentialFromRequest(r).JobID != ""}
+}
+
+// A nil actor is the existing trusted Store API, used by internal callers and
+// store tests. HTTP reads and writes always supply the authenticated actor.
+func serviceActionAuthority(ctx context.Context, q queryer, job Job, verb string, actor *serviceActionActor) error {
+	if actor != nil {
+		if actor.AttemptCredential {
+			return protocolError(contract.ErrorPrincipalForbidden, "an attempt credential may only submit a child job, list its own job and immediate children, read its own job, list or read its children, and cancel its children")
+		}
+		if err := taggedIdentityDecision(actor.Identity, actor.ClientPrincipalTag); err != nil {
+			return err
+		}
+	}
+	if job.ServiceJob == nil && job.Removal == nil {
+		return protocolError(contract.ErrorNotFound, "service job %q was not found", job.JobID)
+	}
+	// Finalized tombstones have no mutable service row. Remove/forget remain
+	// idempotent; start/restart retain the existing not-found answer.
+	if job.ServiceJob == nil && (verb == "start" || verb == "stop" || verb == "restart") {
+		return protocolError(contract.ErrorNotFound, "service job %q was not found", job.JobID)
+	}
+	if computerID, mapped, err := computerIDForJob(ctx, q, job.JobID); err != nil {
+		return err
+	} else if mapped {
+		authority := "lifecycle"
+		if verb == "start" || verb == "stop" {
+			authority = "desired-state"
+		}
+		if verb == "remove" || verb == "forget" {
+			authority = "removal"
+		}
+		return protocolErrorWithDetails(contract.ErrorComputerResourceRequired, map[string]any{"computer_id": computerID},
+			"Computer %q is the sole %s authority for Job %q", computerID, authority, job.JobID)
+	}
+	return nil
+}
+
+// serviceActionDecision is the single source for advertised actions and the
+// enforcing mutation. Chosen inputs are validated by their request decoder;
+// restart describes a fresh key, while accepted key replays retain their path.
+func serviceActionDecision(ctx context.Context, q queryer, job Job, verb string, actor *serviceActionActor) error {
+	if err := serviceActionAuthority(ctx, q, job, verb, actor); err != nil {
+		return err
+	}
+	if verb == "remove" || verb == "forget" {
+		if job.Removal != nil || job.BoundNodeID == "" {
+			return nil
+		}
+		var root sql.NullString
+		err := q.QueryRowContext(ctx, "SELECT root_instance_id FROM nodes WHERE node_id=?", job.BoundNodeID).Scan(&root)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return internalError(err, "read service removal root")
+		}
+		if !root.Valid || strings.TrimSpace(root.String) == "" {
+			return protocolError(contract.ErrorConflict, "bound node %q has no registered managed-root instance", job.BoundNodeID)
+		}
+		return nil
+	}
+	if job.Removal != nil {
+		return protocolError(contract.ErrorConflict, "service job %q is being removed", job.JobID)
+	}
+	switch verb {
+	case "start":
+		switch job.State {
+		case contract.JobFailed, contract.JobStopped:
+			_, resumable, err := neverAutomaticFailureCause(ctx, q, job)
+			if err != nil {
+				return err
+			}
+			if job.State == contract.JobFailed && job.PolicyStop == nil && !resumable {
+				return protocolError(contract.ErrorConflict, "service job %q is latched failed; use restart", job.JobID)
+			}
+			if !job.HoldsSlot(job.State) {
+				return ensureBoundServiceCapacity(ctx, q, job)
+			}
+		case contract.JobStopping:
+			return protocolError(contract.ErrorConflict, "service job %q is still stopping; wait for stopped before start", job.JobID)
+		case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
+			if job.DesiredState != contract.ServiceDesiredRunning {
+				return protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", job.JobID)
+			}
+		default:
+			return protocolError(contract.ErrorConflict, "service job %q cannot be started from %q", job.JobID, job.State)
+		}
+	case "stop":
+		switch job.State {
+		case contract.JobQueued, contract.JobClaimed, contract.JobRunning, contract.JobFailed:
+		case contract.JobStopped:
+			if job.DesiredState != contract.ServiceDesiredStopped && job.PolicyStop == nil {
+				return protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", job.JobID)
+			}
+		case contract.JobStopping:
+			if job.DesiredState != contract.ServiceDesiredStopped {
+				return protocolError(contract.ErrorConflict, "service job %q has inconsistent desired state", job.JobID)
+			}
+		default:
+			return protocolError(contract.ErrorConflict, "service job %q cannot be stopped from %q", job.JobID, job.State)
+		}
+	case "restart":
+		// Preserve capacity-before-state refusal precedence from the write.
+		if !job.HoldsSlot(job.State) {
+			if err := ensureBoundServiceCapacity(ctx, q, job); err != nil {
+				return err
+			}
+		}
+		switch job.State {
+		case contract.JobStopped, contract.JobFailed, contract.JobQueued, contract.JobClaimed, contract.JobRunning:
+		case contract.JobStopping:
+			return protocolError(contract.ErrorConflict, "service job %q is still stopping; wait for stopped before restart", job.JobID)
+		default:
+			return protocolError(contract.ErrorConflict, "service job %q cannot be restarted from %q", job.JobID, job.State)
+		}
+	default:
+		return protocolError(contract.ErrorInvalidRequest, "unknown service verb %q", verb)
+	}
+	return nil
+}
+
+func serviceAllowedActions(ctx context.Context, q queryer, job Job, actor *serviceActionActor) []contract.AllowedAction {
+	actions := make([]contract.AllowedAction, 0, 5)
+	for _, verb := range []string{"start", "stop", "restart", "remove", "forget"} {
+		action := contract.AllowedAction{Verb: verb, Requires: map[string]any{}}
+		switch verb {
+		case "start":
+			action.Requires["desired_state"] = contract.ServiceDesiredRunning
+		case "stop":
+			action.Requires["desired_state"] = contract.ServiceDesiredStopped
+		case "restart":
+			action.Inputs = []contract.ActionInput{{Name: "idempotency_key", Type: "string", Required: true}}
+		case "forget":
+			action.Requires["force"] = true
+		}
+		action.RefusedBecause = apiErrorFromDecision(serviceActionDecision(ctx, q, job, verb, actor))
+		actions = append(actions, action)
+	}
+	return actions
+}
+
+// Closest persisted state-machine condition, rather than an invented event log.
+// Its timestamp comes from the relevant existing row, never the read clock.
+func serviceLastCondition(ctx context.Context, q queryer, job Job) (*contract.Condition, error) {
+	condition := &contract.Condition{Since: job.UpdatedAt, Details: map[string]any{"state": job.State}}
+	if removal := job.Removal; removal != nil {
+		condition.Code, condition.Scope, condition.Since = string(job.State), "service_removal", removal.RemovalRequestedAt
+		condition.Details["cleanup_status"] = removal.CleanupStatus
+		condition.Details["removal_outcome"] = removal.RemovalOutcome
+		condition.Details["removal_generation"] = removal.RemovalGeneration
+		if removal.CleanupAcknowledgedAt != nil {
+			condition.Since = *removal.CleanupAcknowledgedAt
+		}
+		if removal.RemovedAt != nil {
+			condition.Since = *removal.RemovedAt
+		}
+		if removal.StalledAt != nil {
+			condition.Since = *removal.StalledAt
+		}
+		if removal.Stall != nil {
+			condition.Details["stall"] = removal.Stall
+		}
+		return condition, nil
+	}
+	switch {
+	case job.PolicyStop != nil:
+		condition.Code, condition.Scope = "policy_stop", "service_restart"
+		condition.Details["restart"] = job.Spec.Restart
+		condition.Details["policy_stop"] = job.PolicyStop
+		if job.CurrentAttemptID != "" {
+			var updatedNS int64
+			if err := q.QueryRowContext(ctx, "SELECT updated_ns FROM attempts WHERE attempt_id=? AND job_id=?", job.CurrentAttemptID, job.JobID).Scan(&updatedNS); err != nil {
+				return nil, internalError(err, "read policy stop time")
+			}
+			condition.Since = time.Unix(0, updatedNS).UTC()
+		}
+	case job.State == contract.JobFailed:
+		_, resumable, err := neverAutomaticFailureCause(ctx, q, job)
+		if err != nil {
+			return nil, err
+		}
+		condition.Code, condition.Scope = "failure_latched", "service_restart"
+		if resumable {
+			condition.Code = "never_automatic_restart_suppressed"
+		}
+		condition.Details["restart_streak"] = job.RestartStreak
+		if job.Spec.MaxRestartStreak != nil {
+			condition.Details["max_restart_streak"] = *job.Spec.MaxRestartStreak
+		}
+		if job.FailureReason != "" {
+			condition.Details["failure_reason"] = job.FailureReason
+		}
+	default:
+		return nil, nil
+	}
+	return condition, nil
+}
+
+// projectServiceOperatorFacts is shared by collection and detail reads. The
+// caller supplies the read snapshot containing this Job and its prerequisites.
+func projectServiceOperatorFacts(ctx context.Context, q queryer, job Job, actor *serviceActionActor) (Job, error) {
+	if job.ServiceJob == nil && job.Removal == nil {
+		return job, nil
+	}
+	condition, err := serviceLastCondition(ctx, q, job)
+	if err != nil {
+		return Job{}, err
+	}
+	job.ServiceOperatorFacts = &ServiceOperatorFacts{AllowedActions: serviceAllowedActions(ctx, q, job, actor), LastCondition: condition}
+	return job, nil
+}
+
+// Every service collection/detail response uses this per-caller projection.
+// ReadOnly is essential: the store's default SQLite transaction is IMMEDIATE.
+func (s *Server) projectServiceForCaller(r *http.Request, job Job) (Job, error) {
+	if job.ServiceJob == nil && job.Removal == nil || job.ServiceOperatorFacts != nil {
+		return job, nil
+	}
+	tx, err := s.store.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Job{}, internalError(err, "begin service operator read")
+	}
+	defer tx.Rollback()
+	snapshot, err := getJobByID(r.Context(), tx, job.JobID, canonicalTime(s.store.clock.Now()))
+	if errors.Is(err, sql.ErrNoRows) {
+		tombstone, tombstoneErr := readServiceTombstoneByID(r.Context(), tx, job.JobID)
+		err = tombstoneErr
+		snapshot = tombstone.job()
+	}
+	if err != nil {
+		return Job{}, internalError(err, "read service operator snapshot")
+	}
+	snapshot, err = projectServiceOperatorFacts(r.Context(), tx, snapshot, s.serviceActionActor(r))
+	if err != nil {
+		return Job{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, internalError(err, "finish service operator read")
+	}
+	snapshot, err = s.store.projectServiceJob(r.Context(), snapshot)
+	if err != nil {
+		return Job{}, err
+	}
+	snapshot.Attempts = job.Attempts
+	return snapshot, nil
+}
