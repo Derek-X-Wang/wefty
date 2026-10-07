@@ -2046,10 +2046,28 @@ socket activation.
 ## Agent-side client responsibilities
 
 The client owns the control-stream heartbeat pump and its strictly monotonic
-sequence counter. Ordinary callers cannot submit arbitrary heartbeat renewal
-lists. The agent queues one attempt renewal only on the successful L1 renewal
-path, only when the returned directive is empty, and only after helper `Run`
-has admitted that exact tuple and its full Started evidence has reached L1. A
+sequence counter. A heartbeat reply is bounded from the start of that send by
+`HeartbeatTimeout - min(100 ms, HeartbeatTimeout / 10)`, using the timeout
+advertised in the authenticated helper handshake (2.9 s for the default 3 s).
+The one-second default send interval is not a reply timeout. The oldest
+outstanding reply keeps its original deadline: later sends never extend it.
+Missing that bound or a control transport/protocol failure loses the session
+and closes the control connection as before.
+
+Heartbeats are pipelined on the control stream: sends keep their configured
+cadence (default `HeartbeatTimeout / 3`) while an earlier reply is outstanding,
+and a queued attempt renewal wakes the sender immediately. Replies are consumed
+in FIFO order and attempt refusals are validated against the exact renewal
+batch in the corresponding send. Successfully written evidence is removed
+only if no newer renewal replaced it; the TTL still derives from absolute L1
+expiry at each send. Reply delay must not postpone renewal delivery before an
+attempt's deadman. Acceptance heartbeat suppression stops new sends and waits
+for all outstanding replies before acknowledging its open, unread stream fence.
+
+Ordinary callers cannot submit arbitrary heartbeat renewal lists. The agent
+queues one attempt renewal only on the successful L1 renewal path, only when
+the returned directive is empty, and only after helper `Run` has admitted that
+exact tuple and its full Started evidence has reached L1. A
 pre-admission renewal is retained as an absolute expiry and the latest one is
 queued after authoritative `Started`; its remaining lifetime is calculated
 only when the heartbeat is flushed. Failed, timed-out, stale, `stop`, and
