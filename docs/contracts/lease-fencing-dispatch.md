@@ -320,12 +320,10 @@ The OCI `Started` acknowledgement, sent after the helper proves payload start
 and before the agent admits the attempt or reports it running, follows the
 same answer rule: an answer that never arrived or a 5xx other than 501 is
 retried within one lease window, so a lost answer to a committed start gets
-its replay and the attempt proceeds as started. The retry also ends with the
-attempt's helper admission window (`agent-local-lifecycle.md`), which closes
-before the helper's initial deadman can expire the attempt. A refusal, no
-verdict within either window, or an acceptance after the admission window
-stops the payload as a refused post-start mutation; the late case is never
-admitted for deadman renewal. A one-shot's
+its replay and the attempt proceeds as started. The retry also ends at the
+node helper's initial deadman for the attempt, after which an acceptance could
+only lose it (`agent-local-lifecycle.md`). A refusal, or no verdict before
+either bound, stops the payload as a refused post-start mutation. A one-shot's
 acknowledgement and its retries are not abandoned when the attempt is
 canceled; L1 arbitrates a pending cancel against an earlier durable start.
 
@@ -760,7 +758,8 @@ never replaces a real exit result. A signal still requires exactly one terminati
 For OCI, L1 validates that arm against durable `started_at` before accepting
 authoritative or late evidence: pre-start accepts only a sole `spawn_error`
 without OOM, while post-start rejects `spawn_error`. Either mismatch is HTTP
-409 `conflict`, a permanent rejection the agent never retries.
+409 `conflict`, a permanent rejection: the live attempt sends it once, and
+evidence recovery replays it once more before sealing it.
 
 The awaiting-input prompt verbs remain reserved and return HTTP `501`,
 `not_implemented`, `retryable=false` without mutation. Job cancellation is

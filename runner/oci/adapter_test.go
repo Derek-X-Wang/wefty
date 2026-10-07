@@ -3766,54 +3766,30 @@ func TestAdapterWatchStartOutlastsSaturationBeyondAnyFixedBudget(t *testing.T) {
 	}
 }
 
-// The admission budget is the initial deadman less the time a renewal queued
-// at its end may take to reach the helper. A deadman too short for that
-// delivery leaves no budget at all, so the attempt is never admitted.
-func TestAdmissionBudgetLeavesRenewalDeliveryMargin(t *testing.T) {
-	for _, test := range []struct{ deadman, delivery, want time.Duration }{
-		{30 * time.Second, 2 * time.Second, 28 * time.Second},
-		{2500 * time.Millisecond, 2 * time.Second, 500 * time.Millisecond},
-		{2 * time.Second, 2 * time.Second, 0},
-		{time.Second, 2 * time.Second, 0},
-	} {
-		if got := admissionBudget(test.deadman, test.delivery); got != test.want {
-			t.Errorf("admissionBudget(%s, %s) = %s, want %s", test.deadman, test.delivery, got, test.want)
-		}
-	}
-}
-
-// The adapter reports the admission budget before it asks the helper to Run,
-// so the agent's window starts no later than the helper's initial deadman.
-func TestAdapterReportsAdmissionBudgetBeforeRun(t *testing.T) {
+// The adapter reports the Run request before it asks the helper to Run, so
+// the agent's bound on the Started retry starts no later than the helper's
+// initial deadman.
+func TestAdapterReportsRunRequestBeforeRun(t *testing.T) {
 	engine := &adapterTestEngine{}
-	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	adapter, _, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
 	defer closeAdapter()
-	session, err := barrier.Session()
-	if err != nil {
-		t.Fatal(err)
-	}
 	request := adapterTestRequest()
-	var budgets []time.Duration
-	request.OCIAdmissionBudget = func(budget time.Duration) {
+	reports := 0
+	request.OCIRunRequested = func() {
 		engine.mu.Lock()
 		ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
 		engine.mu.Unlock()
 		if ran {
-			t.Error("admission budget reported after helper Run")
+			t.Error("Run request reported after helper Run")
 		}
-		budgets = append(budgets, budget)
+		reports++
 	}
 	// Only the order matters here; how the payload ends does not.
 	_, _ = adapter.Run(t.Context(), request, nil)
 	engine.mu.Lock()
 	ran := engine.lastRun.Authority != (ocihelper.AttemptAuthority{})
 	engine.mu.Unlock()
-	// The test helper's one-minute heartbeat timeout leaves this one-second
-	// deadman no time to deliver a renewal, so there is no budget.
-	if bound := session.RenewalDeliveryBound(); bound <= request.InitialDeadman {
-		t.Fatalf("delivery bound = %s, want one longer than the %s deadman", bound, request.InitialDeadman)
-	}
-	if !ran || len(budgets) != 1 || budgets[0] != 0 {
-		t.Fatalf("admission budgets = %v (helper Run reached: %t), want one of 0 before Run", budgets, ran)
+	if !ran || reports != 1 {
+		t.Fatalf("Run request reported %d times (helper Run reached: %t), want once before Run", reports, ran)
 	}
 }
