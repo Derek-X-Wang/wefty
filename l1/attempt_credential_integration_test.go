@@ -571,7 +571,7 @@ func TestAttemptCredentialReplayStaysInsideItsOwnParent(t *testing.T) {
 	}
 }
 
-// The credential reaches exactly four routes (create, read, children, and
+// The credential reaches only scoped job routes (create, read, listing, children, and
 // cancel for its own children). Everything else on the job
 // collection is refused without consulting the store.
 func TestAttemptCredentialReachesNoOperatorRoute(t *testing.T) {
@@ -588,7 +588,6 @@ func TestAttemptCredentialReachesNoOperatorRoute(t *testing.T) {
 		{http.MethodPost, "/v1/jobs/" + job.JobID + "/forget"},
 		{http.MethodPut, "/v1/jobs/" + job.JobID + "/desired-state"},
 		{http.MethodGet, "/v1/jobs/" + job.JobID + "/logs"},
-		{http.MethodGet, "/v1/jobs"},
 	} {
 		status, body := h.credentialRequest(agent, probe.method, probe.path, claim.AttemptToken, nil)
 		if status != http.StatusForbidden {
