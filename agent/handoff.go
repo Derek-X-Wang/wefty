@@ -106,6 +106,10 @@ type handoffOwnership struct {
 	// on Linux -- os.Root reaches it through /proc/self/fd/N -- so asking the
 	// handle what it is would fail exactly in the case worth detecting.
 	prepared os.FileInfo
+	// earlierAttemptsPublished is what preparation recorded on the admission:
+	// whether every attempt that wrote to this directory before this one
+	// published. finish carries it onto the terminal record unchanged.
+	earlierAttemptsPublished bool
 }
 
 type handoffLease struct {
@@ -439,13 +443,23 @@ func (m *handoffManager) prepareExecution(lease *handoffLease, execution executi
 	// write the record is a node that will not be able to account for, bound
 	// or expire this run's results, and saying so before the workload starts
 	// is better than discovering it at finish with the files already written.
+	//
+	// The admission resets this attempt's own verdict and carries the
+	// owner's forward. A directory is the owner's, and another attempt -- a
+	// child naming handoff_owner_run_id, a rerun, a retry -- may have left an
+	// undrained mailbox or an unaccepted result in it. Starting this
+	// attempt's publication from nothing is right; starting the directory's
+	// from nothing would let this attempt's success publish files it did not
+	// write and nobody else holds.
+	earlier := m.earlierAttemptsPublished(runID, path, hasFiles)
 	if err := m.writeRecord(retentionRecord{
 		RunID: runID, NodeID: nodeID, Directory: path, HandoffOwnerKey: execution.ownerKey,
-		AdmittedAt: m.now().UTC(), AttemptID: attemptID,
+		AdmittedAt: m.now().UTC(), AttemptID: attemptID, EarlierAttemptsPublished: earlier,
 	}); err != nil {
 		return nil, fmt.Errorf("record the admission of handoff directory %q: %w", path, err)
 	}
-	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, attemptID: attemptID, run: run, prepared: prepared}
+	owner := &handoffOwnership{lease: lease, runID: runID, nodeID: nodeID, attemptID: attemptID, run: run, prepared: prepared,
+		earlierAttemptsPublished: earlier}
 	m.mu.Lock()
 	lease.ownership = owner
 	m.mu.Unlock()
@@ -486,6 +500,7 @@ func (m *handoffManager) finishExecution(owner *handoffOwnership, execution exec
 		AdmittedAt: m.admissionOf(runID, nodeID, path, now),
 		RetainedAt: now, RetainUntil: now.Add(m.retention),
 		Published: published, Uploaded: published, Succeeded: succeeded, AttemptID: owner.attemptID,
+		EarlierAttemptsPublished: owner.earlierAttemptsPublished,
 	}
 	// The record is written before the bound runs, so a run whose trimming
 	// fails is still an accounted directory that expires on schedule rather
@@ -1003,6 +1018,7 @@ func sameRetainedRun(left, right retentionRecord) bool {
 		left.RetainedAt.Equal(right.RetainedAt) &&
 		left.RetainUntil.Equal(right.RetainUntil) &&
 		left.Published == right.Published && left.Uploaded == right.Uploaded &&
+		left.EarlierAttemptsPublished == right.EarlierAttemptsPublished &&
 		left.AttemptID == right.AttemptID && left.Succeeded == right.Succeeded
 }
 

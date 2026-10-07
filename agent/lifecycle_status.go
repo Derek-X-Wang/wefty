@@ -208,10 +208,9 @@ type RetainedOCIVolumeFigures struct {
 	TerminalKnown bool      `json:"terminal_known,omitempty"`
 	Live          bool      `json:"live,omitempty"`
 	Truncated     bool      `json:"truncated,omitempty"`
-	// Published is the node's own record that this run's evidence reached the
-	// ledger. For an OCI run that is the result upload, which is the only
-	// place this agent names such a run at all: the handoff volume is the
-	// helper's and carries no retention record.
+	// Published is the node's own record that the evidence of every attempt
+	// admitted to this volume reached the ledger: its OCI handoff record, never
+	// the helper's, which knows nothing about publication.
 	Published bool `json:"published,omitempty"`
 }
 

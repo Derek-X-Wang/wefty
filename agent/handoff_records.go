@@ -145,14 +145,24 @@ type retentionRecord struct {
 	// without the other is not trusted at all.
 	RetainedAt  time.Time `json:"retained_at,omitempty"`
 	RetainUntil time.Time `json:"retain_until,omitempty"`
-	// Published and Uploaded together are the publication verdict
-	// (uploadRecord.publishes); evidenceReachedLedger reads their
-	// conjunction. This agent writes both as that one verdict. Older agents
-	// wrote Published as the mailbox drain verdict alone, true with no
-	// mailbox at all, and no Uploaded, so a legacy record reads as
+	// Published and Uploaded together are this attempt's publication verdict
+	// (uploadRecord.publishes). This agent writes both as that one verdict.
+	// Older agents wrote Published as the mailbox drain verdict alone, true
+	// with no mailbox at all, and no Uploaded, so a legacy record reads as
 	// unpublished. Both are reset on each admission.
 	Published bool `json:"published,omitempty"`
 	Uploaded  bool `json:"uploaded,omitempty"`
+	// EarlierAttemptsPublished is the rest of the owner's answer: every
+	// attempt this node admitted to the same handoff before this one
+	// published too. The directory belongs to the owner, not the attempt --
+	// a rerun, a child naming handoff_owner_run_id, or a retry writes into
+	// the same one -- so one attempt's verdict says nothing about the files
+	// an earlier sharer left there. Admission derives it from the record it
+	// replaces (earlierAttemptsPublished) and it is never reset, so one
+	// unpublished sharer keeps the directory unpublished until it is gone.
+	// A record written before this field existed has none, and reads as
+	// unpublished: it cannot show who else wrote there.
+	EarlierAttemptsPublished bool `json:"earlier_attempts_published,omitempty"`
 	// AttemptID binds crash-recovered upload evidence to this admission.
 	AttemptID string `json:"attempt_id,omitempty"`
 	Succeeded bool   `json:"succeeded,omitempty"`
@@ -230,7 +240,9 @@ type uploadRecord struct {
 
 // publishes is the node's publication rule for one attempt's handoff: L1
 // holds its result and L3 holds its events, so nothing on the node is the
-// only copy of either.
+// only copy of either. It is one attempt's half of the owner's answer; a
+// handoff several attempts wrote to is published only when every one of them
+// published (retentionRecord.EarlierAttemptsPublished).
 //
 // L1 holds the result when the document was uploaded, or when L1 accepted
 // `absent`: a run that wrote no result.json has no document to lose, and
@@ -351,10 +363,45 @@ func (record retentionRecord) handoffOwnerKey() string {
 }
 
 // evidenceReachedLedger is the `published` fact the eviction order and the
-// retained-results projection read. Requiring both members is what keeps a
-// legacy record, whose Published was the mailbox drain alone, unpublished.
+// retained-results projection read. It is the owner's, not the attempt's:
+// this attempt published and so did every attempt admitted to the same
+// directory before it. Requiring Uploaded is what keeps a legacy record, whose
+// Published was the mailbox drain alone, unpublished; requiring
+// EarlierAttemptsPublished is what keeps one attempt's verdict from speaking
+// for files an earlier sharer left behind.
 func (record retentionRecord) evidenceReachedLedger() bool {
-	return record.Published && record.Uploaded
+	return record.Published && record.Uploaded && record.EarlierAttemptsPublished
+}
+
+// earlierAttemptsPublished is what a new admission to runID's directory
+// carries forward: whether every attempt that wrote there before it
+// published. The answer is folded into the standing record at each admission
+// rather than kept as a list of attempts, because admissions to one directory
+// are serialized by its path lease -- the record being replaced is the whole
+// history that still matters.
+//
+// It errs toward keeping data. A record this node cannot read or trust, one
+// another run holds, an admission that never finished, a record written
+// before the field existed, and files with no record at all each mean an
+// earlier attempt whose evidence nobody can vouch for, so each answers false.
+// Only an empty directory with no record is a handoff nobody wrote to yet.
+func (m *handoffManager) earlierAttemptsPublished(runID, path string, hasFiles bool) bool {
+	if strings.TrimSpace(m.stateRoot) == "" {
+		return !hasFiles
+	}
+	recordPath := m.existingRecordPath(runID)
+	standing, err := m.readRecord(recordPath)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return !hasFiles
+	case err != nil:
+		return false
+	case standing.RunID != runID || standing.Directory != path || standing.RetainUntil.IsZero():
+		return false
+	case validRetentionRecord(standing, filepath.Base(recordPath), m.root, m.nodeID, m.retention, m.now().UTC()) != nil:
+		return false
+	}
+	return standing.evidenceReachedLedger()
 }
 
 func (m *handoffManager) recordRoot() string {
