@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -140,7 +141,7 @@ func TestProcessManagedHandoffPublicationAndCleanup(t *testing.T) {
 			path := filepath.Join(h.root, tc.owner)
 			run := completionDirectiveRunFunc(func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
 				if request.Execution.HandoffDirectory != path || request.Execution.Env[contract.EnvHandoffDir] != path {
-					t.Fatalf("execution=%+v", request.Execution)
+					return failWorkload(t, fmt.Errorf("execution=%+v", request.Execution))
 				}
 				if tc.write {
 					if err := os.WriteFile(filepath.Join(path, "result.json"), []byte(`{"ok":true}`), 0o600); err != nil {
@@ -199,15 +200,15 @@ func TestProcessExplicitHandoffWithoutRunLabelsStaysUnowned(t *testing.T) {
 			run := completionDirectiveRunFunc(func(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
 				called = true
 				if request.Execution.HandoffDirectory != path {
-					t.Fatalf("handoff directory=%q want=%q", request.Execution.HandoffDirectory, path)
+					return failWorkload(t, fmt.Errorf("handoff directory=%q want=%q", request.Execution.HandoffDirectory, path))
 				}
 				value, present := request.Execution.Env[contract.EnvHandoffDir]
 				if present != suppliedEnv || (suppliedEnv && value != path) {
-					t.Fatalf("WEFTY_HANDOFF_DIR=(%q, %v), want submitted environment unchanged", value, present)
+					return failWorkload(t, fmt.Errorf("WEFTY_HANDOFF_DIR=(%q, %v), want submitted environment unchanged", value, present))
 				}
 				info, err := os.Stat(path)
 				if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
-					t.Fatalf("explicit directory=(%v, %v), want a private directory before execution", info, err)
+					return failWorkload(t, fmt.Errorf("explicit directory=(%v, %v), want a private directory before execution", info, err))
 				}
 				if err := os.WriteFile(filepath.Join(path, "result.json"), document, 0o600); err != nil {
 					return contract.ProcessResult{}, err

@@ -294,7 +294,12 @@ func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *tes
 	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
 	defer stopServer()
 	defer client.Close()
-	outbox, err := newEvidenceOutbox(t.TempDir(), "bounded-log-node", 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	// Batch size 1 starts the durable sink's upload while the payload runs, and
+	// the payload exits only once L1 holds that upload. The 25 ms bound then
+	// starts with the upload already stuck and expires on it. An upload first
+	// sent at close can lose the whole bound to the sink's own spool read on a
+	// loaded runner, before AppendLogs is ever sent (#662).
+	outbox, err := newEvidenceOutbox(t.TempDir(), "bounded-log-node", 1024*1024, systemClock{}, 1, time.Hour, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,24 +310,48 @@ func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *tes
 		}},
 		Lease: l1.AttemptLease{AttemptID: "bounded-log-attempt", FencingToken: "fence"},
 	}
+	runtime := &uploadHeldCrashRuntime{uploadStarted: uploadStarted}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 		client: client, outbox: outbox,
-		runtimes: workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: runtime},
 		clock:    systemClock{}, finalizationTimeout: 25 * time.Millisecond,
 	})
 	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	if !runtime.uploadHeld.Load() {
+		t.Fatal("durable log sink never attempted AppendLogs")
+	}
 	if runErr != nil || result.Signal != "killed" || result.OutputError != "" || !result.LogEvidenceIncomplete {
 		t.Fatalf("bounded production log finalization = %#v err=%v", result, runErr)
-	}
-	select {
-	case <-uploadStarted:
-	default:
-		t.Fatal("durable log sink never attempted AppendLogs")
 	}
 	pending, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8)
 	if err != nil || len(pending) != 1 || string(pending[0].Bytes) != "before crash" {
 		t.Fatalf("recoverable spooled log events = %#v err=%v", pending, err)
 	}
+}
+
+// uploadHeldCrashRuntime crashes only after L1 holds the durable sink's upload
+// of its output, or after a hang guard that lets the test report a sink that
+// never uploaded.
+type uploadHeldCrashRuntime struct {
+	restartableCrashRuntime
+	uploadStarted <-chan struct{}
+	uploadHeld    atomic.Bool
+}
+
+func (r *uploadHeldCrashRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if sink == nil {
+		return workloadrunner.Result{}, errors.New("the payload has no output sink")
+	}
+	result, err := r.restartableCrashRuntime.Run(ctx, request, sink)
+	if err != nil {
+		return result, err
+	}
+	select {
+	case <-r.uploadStarted:
+		r.uploadHeld.Store(true)
+	case <-time.After(10 * time.Second):
+	}
+	return result, nil
 }
 
 func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
@@ -3494,4 +3523,15 @@ type completionDirectiveRunFunc func(context.Context, processrunner.Request, pro
 
 func (run completionDirectiveRunFunc) Run(ctx context.Context, request processrunner.Request, output processrunner.OutputSink) (contract.ProcessResult, error) {
 	return run(ctx, request, output)
+}
+
+// failWorkload reports a check that failed inside a workload. A workload that
+// lifecycle.execute runs is on the attempt's goroutine, where t.Fatal would
+// stop only that goroutine and leave execute waiting for it until the package
+// timeout (#667). Returning the error ends the attempt instead, so the test
+// fails promptly with this message.
+func failWorkload(t *testing.T, err error) (contract.ProcessResult, error) {
+	t.Helper()
+	t.Error(err)
+	return contract.ProcessResult{}, err
 }

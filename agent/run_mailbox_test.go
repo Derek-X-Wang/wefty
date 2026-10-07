@@ -187,13 +187,21 @@ func (r *mailboxRunner) Run(ctx context.Context, request processrunner.Request, 
 
 func writeMailboxEvent(t *testing.T, runDirectory, name, content string) {
 	t.Helper()
+	if err := stageMailboxEvent(runDirectory, name, content); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// stageMailboxEvent writes one event the way a workload does. A workload that
+// lifecycle.execute runs must use it rather than writeMailboxEvent and return
+// the error with failWorkload, since t.Fatal off the test goroutine hangs the
+// attempt (#667).
+func stageMailboxEvent(runDirectory, name, content string) error {
 	staging := filepath.Join(runDirectory, runMailboxStagingDirectoryName, name)
 	if err := os.WriteFile(staging, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
+		return err
 	}
-	if err := os.Rename(staging, filepath.Join(runDirectory, runMailboxEventsDirectoryName, name)); err != nil {
-		t.Fatal(err)
-	}
+	return os.Rename(staging, filepath.Join(runDirectory, runMailboxEventsDirectoryName, name))
 }
 
 func decodeEnvelope(t *testing.T, body []byte) contract.Envelope {
