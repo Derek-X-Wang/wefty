@@ -322,7 +322,7 @@ func writeServiceList(writer io.Writer, page l1.JobList, jsonOutput bool) error 
 
 func writeServicesTable(writer io.Writer, services []serviceOutput) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "KIND\tCOMPUTER ID\tJOB ID\tSTATE\tSTATUS\tDESIRED\tBOUND NODE\tNODE STATE\tATTEMPT\tHOLDS SLOT\tREADY\tPORT\tRESTART STREAK\tNEXT RESTART\tRESTART SUPPRESSED\tPOLICY STOP\tLAST FAILURE\tCREATED\tUPDATED\tMANAGED DATA\tWORKING DIRECTORY"); err != nil {
+	if _, err := fmt.Fprintln(table, "KIND\tCOMPUTER ID\tJOB ID\tSTATE\tSTATUS\tDESIRED\tBOUND NODE\tNODE STATE\tATTEMPT\tHOLDS SLOT\tREADY\tPORT\tRESTART STREAK\tNEXT RESTART\tRESTART SUPPRESSED\tPOLICY STOP\tLAST FAILURE\tCREATED\tUPDATED\tMANAGED DATA\tWORKING DIRECTORY\tLAST CONDITION\tALLOWED ACTIONS"); err != nil {
 		return err
 	}
 	for _, service := range services {
@@ -330,7 +330,7 @@ func writeServicesTable(writer io.Writer, services []serviceOutput) error {
 		if service.ComputerID != "" {
 			kind = "Computer"
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			kind,
 			valueOrNA(service.ComputerID),
 			service.JobID,
@@ -352,6 +352,8 @@ func writeServicesTable(writer io.Writer, services []serviceOutput) error {
 			service.UpdatedAt.Format(time.RFC3339),
 			pointerOrNA(service.ManagedDataPath, " (deleted by remove)"),
 			pointerOrNA(service.WorkingDirectory, " (external; never deleted)"),
+			serviceConditionText(service.Job),
+			serviceActionsText(service.Job),
 		); err != nil {
 			return err
 		}
@@ -613,4 +615,20 @@ func jsonValueOrNA(value *l1.ProcessResult) string {
 		return "N/A"
 	}
 	return string(payload)
+}
+
+func serviceConditionText(job l1.Job) string {
+	if job.ServiceOperatorFacts == nil {
+		return "none"
+	}
+	data, _ := json.Marshal(job.LastCondition)
+	return string(data)
+}
+
+func serviceActionsText(job l1.Job) string {
+	if job.ServiceOperatorFacts == nil {
+		return "none"
+	}
+	data, _ := json.Marshal(job.AllowedActions)
+	return string(data)
 }

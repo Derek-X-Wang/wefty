@@ -668,19 +668,29 @@ func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r
 }
 
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.Reconcile(r.Context()); err != nil {
-		writeError(w, err)
-		return
-	}
-	nodes, err := s.store.ListNodes(r.Context())
+	filters, err := parseNodeListFilters(r)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	for i := range nodes {
-		nodes[i] = s.projectNodeForCaller(r, nodes[i])
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
 	}
-	writeJSON(w, http.StatusOK, NodeList{Nodes: nodes})
+	if _, err := s.store.Reconcile(r.Context()); err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.listNodesPage(r.Context(), filters, r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for i := range page.Nodes {
+		page.Nodes[i] = s.projectNodeForCaller(r, page.Nodes[i])
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) getNode(w http.ResponseWriter, r *http.Request) {
@@ -815,6 +825,11 @@ func (s *Server) createChildJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	job, err = s.projectServiceForCaller(r, job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, status, redactJob(job))
 }
 
@@ -868,7 +883,12 @@ func (s *Server) listChildJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for index := range page.Jobs {
-		page.Jobs[index] = redactJob(page.Jobs[index])
+		projected, projectErr := s.projectServiceForCaller(r, page.Jobs[index])
+		if projectErr != nil {
+			writeError(w, projectErr)
+			return
+		}
+		page.Jobs[index] = redactJob(projected)
 	}
 	writeJSON(w, http.StatusOK, page)
 }
@@ -1172,6 +1192,11 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	job, err = s.store.projectJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.projectServiceForCaller(r, job)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -2069,13 +2094,18 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	page, err := s.store.listReadableJobs(r.Context(), filters, r.URL.Query().Get("cursor"), limit)
+	page, err := s.store.listReadableJobsForCaller(r.Context(), filters, r.URL.Query().Get("cursor"), limit, s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	for index := range page.Jobs {
-		page.Jobs[index] = redactJob(page.Jobs[index])
+		projected, projectErr := s.projectServiceForCaller(r, page.Jobs[index])
+		if projectErr != nil {
+			writeError(w, projectErr)
+			return
+		}
+		page.Jobs[index] = redactJob(projected)
 	}
 	writeJSON(w, http.StatusOK, page)
 }
@@ -2131,6 +2161,11 @@ func (s *Server) writeJobResource(w http.ResponseWriter, r *http.Request, job Jo
 		writeError(w, err)
 		return
 	}
+	job, err = s.projectServiceForCaller(r, job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
@@ -2167,12 +2202,17 @@ func (s *Server) setServiceDesiredState(w http.ResponseWriter, r *http.Request) 
 		writeError(w, err)
 		return
 	}
-	job, err := s.store.SetServiceDesiredState(r.Context(), r.PathValue("job_id"), request.DesiredState)
+	job, err := s.store.setServiceDesiredState(r.Context(), r.PathValue("job_id"), request.DesiredState, s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	job, err = s.store.projectServiceJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.projectServiceForCaller(r, job)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -2190,7 +2230,7 @@ func (s *Server) restartService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	job, replayed, err := s.store.RestartService(r.Context(), r.PathValue("job_id"), request)
+	job, replayed, err := s.store.restartService(r.Context(), r.PathValue("job_id"), request, s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -2205,6 +2245,11 @@ func (s *Server) restartService(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
+	job, err = s.projectServiceForCaller(r, job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, status, redactJob(job))
 }
 
@@ -2213,12 +2258,17 @@ func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	job, err := s.store.RemoveService(r.Context(), r.PathValue("job_id"))
+	job, err := s.store.removeService(r.Context(), r.PathValue("job_id"), s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	job, err = s.store.projectServiceJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.projectServiceForCaller(r, job)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -2240,12 +2290,17 @@ func (s *Server) forceForgetService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocolError(contract.ErrorInvalidRequest, "forget requires force=true"))
 		return
 	}
-	job, err := s.store.ForceForgetService(r.Context(), r.PathValue("job_id"))
+	job, err := s.store.forceForgetService(r.Context(), r.PathValue("job_id"), s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	job, err = s.store.projectServiceJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.projectServiceForCaller(r, job)
 	if err != nil {
 		writeError(w, err)
 		return

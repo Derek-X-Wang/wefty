@@ -135,6 +135,10 @@ INSERT INTO job_listing_order(job_id)
 }
 
 func (s *Store) listReadableJobs(ctx context.Context, filters jobListFilters, cursorValue string, limit int) (JobList, error) {
+	return s.listReadableJobsForCaller(ctx, filters, cursorValue, limit, nil)
+}
+
+func (s *Store) listReadableJobsForCaller(ctx context.Context, filters jobListFilters, cursorValue string, limit int, actor *serviceActionActor) (JobList, error) {
 	if limit < 1 || limit > MaxJobPageLimit {
 		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxJobPageLimit)
 	}
@@ -195,6 +199,14 @@ func (s *Store) listReadableJobs(ctx context.Context, filters jobListFilters, cu
 		job, err := getJobByID(ctx, tx, item.jobID, now)
 		if err != nil {
 			return JobList{}, internalError(err, "read listed job")
+		}
+		// Only caller-facing service facts are added here; ordinary Job
+		// listing/filter semantics remain in this same read-only snapshot.
+		if actor != nil {
+			job, err = projectServiceOperatorFacts(ctx, tx, job, actor)
+			if err != nil {
+				return JobList{}, err
+			}
 		}
 		page.Jobs = append(page.Jobs, job)
 	}

@@ -786,6 +786,13 @@ state (including an already-terminal target), 2 for usage/invalid requests,
 3 for authentication or principal refusals, 4 for `not_found`, 5 for
 `cancel_service`/`cancel_not_queued` or another conflict, and 1 for other errors.
 
+`wefty cancel RUN_ID` recognizes the `run_` prefix (and legacy `run-`) and calls
+L3's `POST /v1/runs/{run_id}/cancel`, returning the current Run record in
+`--json` mode or its ID, status and failure reason as text. It uses the same
+typed exit codes as job cancel; HTTP 200 is success even while cancellation
+awaits settlement or when the job already finished. An L1-only installation
+receives a usage error explaining that `--l3` is required for Run cancellation.
+
 ### Service policy stops and CLI
 
 A clean payload exit under `on-failure` or `never` records `policy_stop` (a
@@ -927,3 +934,50 @@ transaction so a lease that expires while waiting is refused. Expired or
 superseded credentials cannot reserve a key or learn its holder. Dispatch replay retains its existing parent
 and originating-submitter scope checks; a removal tombstone with no provable
 parentage remains a dispatch conflict for an Attempt credential.
+
+## Node and Computer enumeration
+
+`GET /v1/nodes` is a client-principal read, returning
+`{nodes: [...], next_cursor: "..."}`. Node facts, active attempts, allowed actions
+and last condition retain the same per-caller projection as node detail. The
+array is empty, never null, when no nodes match. An empty `next_cursor` means
+there are no remaining rows.
+
+The optional `limit` defaults to 100 and accepts 1 through 1000. `cursor` is an
+opaque continuation from the same filter query; page size may change during a
+walk. Results remain in ascending stable node ID order. A durable insertion
+watermark freezes membership at the first page, so concurrent new nodes never
+join that walk, even if their IDs sort before or between existing nodes.
+Re-registration keeps the same membership and identity binding. The watermark
+survives reopen, deletion and VACUUM. This is a membership boundary, not a
+snapshot of mutable facts across requests: state, claims intent, capabilities
+and operator projections are read together in each page's read-only snapshot.
+Liveness reconciliation still runs before the HTTP listing.
+
+Filters combine with AND and apply before the page limit:
+
+- `state`: exactly one of `alive`, `stale`, `draining`, `dead`, after liveness
+  reconciliation.
+- `claims_enabled`: exactly `true` or `false`, matching durable operator intent.
+- `capability`: an exact capability key with advertised JSON value `true`;
+  absent and false entries do not match. Unknown keys return an empty set.
+
+Repeated listing parameters, empty filters, invalid states/booleans/limits,
+malformed cursors and cursors reused with different filters return
+`invalid_request`. Omitted or empty `cursor`/`limit` select the first page/default
+size. Enumeration uses a row-value index seek with query variants for the
+selected state and claims filters; capability matching compares literal JSON
+keys, without interpreting them as JSON paths.
+
+`wefty nodes list` exposes `--state`, `--claims-enabled`, `--capability`,
+`--cursor`, `--limit` and `--all`. `wefty computers list` exposes the existing
+`GET /v1/computers` via `--cursor`, `--limit` and `--all`; Computer IDs remain
+distinct from their current Job IDs. Both support the global `--json` flag,
+returning the endpoint's page shape. Table output includes `NEXT CURSOR` when
+another page exists. `--all` follows all remaining pages from the supplied
+cursor and returns one combined result with no continuation (an empty cursor
+for nodes, omitted for Computers). The Computer
+endpoint retains its existing creation-time/ID cursor semantics. Both commands
+work with only `--l1` configured and publish the existing typed exit codes;
+usage errors, including invalid paging arguments, are `invalid_request` (exit 2)
+and honour `--json`.

@@ -268,7 +268,7 @@
       "get": {
         "operationId": "listJobs",
         "summary": "List all readable jobs, including one-shots",
-        "description": "Client principals may list every ordinary persisted Job. Attempt credentials may list only their own Job and its immediate children, authenticated against the live attempt and holding node on every page. Filters intersect with exact case-sensitive comparison before LIMIT; state is persisted Job state, not derived status. submitter=me uses the client Fabric node ID or an attempt credential's inherited originating submitter, without widening scope; an empty resolved identity returns invalid_request. Pages retain ascending creation-time/Job-ID order. The first page fixes an insertion watermark: jobs inserted later are excluded for the rest of the walk, even with equal or earlier timestamps; a fresh walk includes them. Mutable state and removals remain live reads. Cursors are opaque and bind filters and attempt scope; limit may change. Malformed or mismatched cursors and invalid or duplicate selectors return invalid_request. Kind is open; an unknown kind yields an empty page. class=service preserves active service selection, current Computer projections and service status projection; removed tombstones and retired Computer Job projections remain exact-ID resources outside every collection filter. Only current Computer projections appear, so the one-shot and service sets together equal the unfiltered set. Legacy service cursors remain valid for the unfiltered service query and establish their watermark when first resumed. Individual job-read class selectors are unchanged.",
+        "description": "Client principals may list every ordinary persisted Job. Attempt credentials may list only their own Job and its immediate children, authenticated against the live attempt and holding node on every page. Filters intersect with exact case-sensitive comparison before LIMIT; state is persisted Job state, not derived status. submitter=me uses the client Fabric node ID or an attempt credential's inherited originating submitter, without widening scope; an empty resolved identity returns invalid_request. Pages retain ascending creation-time/Job-ID order. The first page fixes an insertion watermark: jobs inserted later are excluded for the rest of the walk, even with equal or earlier timestamps; a fresh walk includes them. Mutable state and removals remain live reads. Cursors are opaque and bind filters and attempt scope; limit may change. Malformed or mismatched cursors and invalid or duplicate selectors return invalid_request. Kind is open; an unknown kind yields an empty page. class=service preserves active service selection, current Computer projections and service status projection; removed tombstones and retired Computer Job projections remain exact-ID resources outside every collection filter. Only current Computer projections appear, so the one-shot and service sets together equal the unfiltered set. Legacy service cursors remain valid for the unfiltered service query and establish their watermark when first resumed. Individual job-read class selectors are unchanged. Every service result includes per-caller allowed_actions and the closest persisted last_condition, using the same actor-aware lifecycle predicates as writes; one-shots omit both fields.",
         "security": [
           { "fabricIdentity": [] },
           { "fabricIdentity": [], "attemptCredential": [] }
@@ -317,7 +317,7 @@
       "get": {
         "operationId": "getJob",
         "summary": "Read one job's status",
-        "description": "The class selector is mechanically required for a service job and must be absent for a one-shot; an unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found. A request carrying Authorization: Bearer <attempt credential> reads the credential's own job or one of that job's children under exactly that same rule: a service target still requires class=service and a one-shot target still omits it. An attempt credential addressing any other job, or one that does not exist, receives the identical forbidden answer.",
+        "description": "The class selector is mechanically required for a service job and must be absent for a one-shot; an unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found. A request carrying Authorization: Bearer <attempt credential> reads the credential's own job or one of that job's children under exactly that same rule: a service target still requires class=service and a one-shot target still omits it. An attempt credential addressing any other job, or one that does not exist, receives the identical forbidden answer. Service detail and removal tombstones include per-caller allowed_actions and last_condition. Attempt credentials receive principal_forbidden for every service lifecycle action even when their holding Fabric identity also has the client tag.",
         "security": [
           { "fabricIdentity": [] },
           { "fabricIdentity": [], "attemptCredential": [] }
@@ -1594,7 +1594,14 @@
       "get": {
         "operationId": "listNodes",
         "summary": "List operator-visible nodes",
-        "description": "Returns every registered node after applying liveness thresholds. Results are ordered by stable node ID.",
+        "description": "Returns a page of registered nodes after applying liveness thresholds, ordered by stable node ID. Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
+        "parameters": [
+          { "name": "cursor", "in": "query", "description": "Opaque continuation cursor from the same filter query. Limit may change between pages.", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+          { "name": "state", "in": "query", "description": "Exact observed node state after liveness reconciliation.", "schema": { "type": "string", "enum": ["alive", "stale", "draining", "dead"] } },
+          { "name": "claims_enabled", "in": "query", "description": "Exact durable claims intent; accepts only true or false.", "schema": { "type": "boolean" } },
+          { "name": "capability", "in": "query", "description": "Exact advertised capability key whose JSON value is true. Missing and false entries do not match.", "schema": { "type": "string", "minLength": 1 } }
+        ],
         "responses": {
           "200": {
             "description": "Current fleet state.",
@@ -1603,8 +1610,9 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["nodes"],
+                  "required": ["nodes", "next_cursor"],
                   "properties": {
+                    "next_cursor": { "type": "string", "description": "Opaque continuation cursor, or an empty string on the last page." },
                     "nodes": {
                       "type": "array",
                       "items": { "$ref": "./common.v1.json#/components/schemas/Node" }
@@ -1614,6 +1622,7 @@
               }
             }
           },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

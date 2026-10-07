@@ -105,6 +105,7 @@ type Job struct {
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
 	*ServiceJob
+	*ServiceOperatorFacts
 	Removal *ServiceRemoval `json:"removal,omitempty"`
 }
 
@@ -503,7 +504,8 @@ type ServiceImageReconciliationFailureRequest struct {
 
 // NodeList is the L1 client representation of the operator-visible fleet.
 type NodeList struct {
-	Nodes []Node `json:"nodes"`
+	Nodes      []Node `json:"nodes"`
+	NextCursor string `json:"next_cursor"`
 }
 
 // ProcessResult matches the M0 completion contract. Pointer fields preserve

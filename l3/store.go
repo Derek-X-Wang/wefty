@@ -145,6 +145,14 @@ func (s *Store) initialize(ctx context.Context) error {
 		return fmt.Errorf("l3: SQLite did not enable WAL (mode %q)", mode)
 	}
 	const schema = runTableSchema + `
+CREATE TABLE IF NOT EXISTS run_cancellations (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+  requested_ns INTEGER NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  retry_ns INTEGER NOT NULL DEFAULT 0,
+  completed_ns INTEGER,
+  last_error TEXT
+);
 CREATE INDEX IF NOT EXISTS runs_projection ON runs(status, l1_job_id, created_ns);
 CREATE INDEX IF NOT EXISTS runs_created ON runs(created_ns, run_id);
 CREATE INDEX IF NOT EXISTS runs_status_created ON runs(status, created_ns, run_id);
@@ -352,6 +360,20 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l3: apply SQLite schema: %w", err)
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"failures", "INTEGER NOT NULL DEFAULT 0"},
+		{"retry_ns", "INTEGER NOT NULL DEFAULT 0"},
+		{"completed_ns", "INTEGER"},
+		{"last_error", "TEXT"},
+	} {
+		if err := ensureSQLiteColumn(ctx, s.db, "run_cancellations", column.name, column.definition); err != nil {
+			return fmt.Errorf("l3: migrate run cancellation delivery: %w", err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS run_cancellations_due
+ON run_cancellations(retry_ns, requested_ns, run_id) WHERE completed_ns IS NULL`); err != nil {
+		return fmt.Errorf("l3: index pending run cancellations: %w", err)
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_id", "TEXT"); err != nil {
 		return fmt.Errorf("l3: migrate run node attribution: %w", err)
@@ -1924,7 +1946,9 @@ SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
 FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
+WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
+ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
 	if err != nil {
 		return nil, internalError(err, "list pending dispatches")
 	}
@@ -1969,18 +1993,16 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 	return intents, nil
 }
 
-// errDispatchAbandoned reports that the run was terminal when its dispatch
-// attempt would have begun. The caller must not submit: the terminal
-// transition cleared the staged bearer, and a submit L1 accepts as new work
-// (because it lost the original job) would start an ended run again.
-var errDispatchAbandoned = errors.New("l3: run is terminal; dispatch attempt abandoned")
+// errDispatchAbandoned reports that a terminal transition or cancellation
+// request won before this dispatch attempt began. The caller must not submit:
+// replay could create new work after the run ended or was told to stop.
+var errDispatchAbandoned = errors.New("l3: dispatch attempt abandoned")
 
 // beginDispatch starts one submit attempt and returns the bearer it carries.
-// The run-status guard, the bearer hand-out and the attempt count share one
-// transaction, so a run that is terminal when the attempt begins is never
-// handed a bearer to submit with. A run that ends after this commit, while the
-// submit is in flight, is linked by completeDispatch when L1 acknowledges the
-// job, or by lookup recovery when it does not.
+// The run-status and cancellation guards, bearer hand-out and attempt count
+// share one transaction. A run that ends or is canceled after this commit,
+// while the submit is in flight, is linked by completeDispatch when L1
+// acknowledges the job, or by lookup recovery when it does not.
 func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error) {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1989,7 +2011,8 @@ func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error)
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=?, dispatch_attempt_ns=?
-WHERE run_id=? AND status IN (?, ?)`,
+WHERE run_id=? AND status IN (?, ?)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)`,
 		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
 	if err != nil {
 		return "", internalError(err, "mark dispatch attempt")
@@ -2084,6 +2107,13 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 	if err != nil {
 		return internalError(err, "read run association result")
 	}
+	if acknowledged == 1 {
+		// A late first acknowledgement ends lookup backoff immediately. It
+		// can also supersede a provisional absence settled before it arrived.
+		if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET failures=0, retry_ns=0, completed_ns=NULL, last_error=NULL WHERE run_id=?`, runID); err != nil {
+			return internalError(err, "wake cancellation after dispatch acknowledgement")
+		}
+	}
 	if acknowledged == 1 && queued == 0 {
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
 			return err
@@ -2127,6 +2157,7 @@ type unrecordedDispatch struct {
 const unrecordedDispatchesQuery = `SELECT r.run_id, r.dispatch_key, COALESCE(o.job_id, '')
 FROM runs r INDEXED BY runs_job_link_recovery CROSS JOIN dispatch_outbox o ON o.run_id=r.run_id
 WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed') AND r.dispatch_attempt_ns IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
   AND r.job_link_retry_ns<=?
 ORDER BY r.job_link_retry_ns, r.created_ns, r.run_id
 LIMIT ?`

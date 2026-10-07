@@ -629,7 +629,7 @@ func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine, now func() t
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(serveContext, listener) }()
 	client := ocihelper.NewUnixClient(path, "checksum-test")
-	client.HeartbeatInterval = 20 * time.Millisecond
+	client.HeartbeatInterval = hostedHeartbeatInterval
 	client.Now = now
 	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
 		NodeID: "pre-admission-node", BootSessionID: "pre-admission-boot",

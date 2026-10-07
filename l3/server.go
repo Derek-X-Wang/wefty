@@ -144,7 +144,7 @@ func (s *Server) routes() http.Handler {
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
 	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.appendGateResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
-	runs.HandleFunc("POST /v1/runs/{run_id}/cancel", s.notImplemented)
+	runs.HandleFunc("POST /v1/runs/{run_id}/cancel", s.cancelRun)
 
 	workflows := http.NewServeMux()
 	workflows.HandleFunc("POST /v1/workflows/{workflow_id}/versions", s.createWorkflowVersion)
