@@ -54,21 +54,27 @@ const sharedHandoffPendingEvent = "wefty-protocol: 1\nkind: gate\nname: test\nou
 // the handoff; any other run is a child naming it as handoff_owner_run_id.
 func runSharer(t *testing.T, h *retentionHarness, kind, runID, attemptID string, outcome sharerOutcome) {
 	t.Helper()
-	if kind == "process" {
-		runProcessSharer(t, h, runID, attemptID, outcome)
-		return
-	}
-	runOCISharer(t, h, runID, attemptID, outcome)
+	runSharerFor(t, h, kind, sharedHandoffOwner, runID, attemptID, outcome)
 }
 
-func runProcessSharer(t *testing.T, h *retentionHarness, runID, attemptID string, outcome sharerOutcome) {
+// runSharerFor is runSharer for a handoff owned by the run named owner.
+func runSharerFor(t *testing.T, h *retentionHarness, kind, owner, runID, attemptID string, outcome sharerOutcome) {
 	t.Helper()
-	path := filepath.Join(h.root, sharedHandoffOwner)
+	if kind == "process" {
+		runProcessSharer(t, h, owner, runID, attemptID, outcome)
+		return
+	}
+	runOCISharer(t, h, owner, runID, attemptID, outcome)
+}
+
+func runProcessSharer(t *testing.T, h *retentionHarness, owner, runID, attemptID string, outcome sharerOutcome) {
+	t.Helper()
+	path := filepath.Join(h.root, owner)
 	claim := retentionClaim(t, runID, path)
 	claim.Lease.AttemptID = attemptID
 	claim.Job.Spec.RoutingTags = []string{contract.StableNodeTagPrefix + "node-1"}
-	if runID != sharedHandoffOwner {
-		claim.Job.Spec.Labels["handoff_owner_run_id"] = sharedHandoffOwner
+	if runID != owner {
+		claim.Job.Spec.Labels["handoff_owner_run_id"] = owner
 	}
 	recorder := &resultUploadRecorder{}
 	if outcome == sharerUploadRefused {
@@ -96,13 +102,13 @@ func runProcessSharer(t *testing.T, h *retentionHarness, runID, attemptID string
 	}
 }
 
-func runOCISharer(t *testing.T, h *retentionHarness, runID, attemptID string, outcome sharerOutcome) {
+func runOCISharer(t *testing.T, h *retentionHarness, owner, runID, attemptID string, outcome sharerOutcome) {
 	t.Helper()
 	claim := remoteMailboxClaim("")
 	claim.Job.JobID = "job-" + attemptID
 	claim.Job.Spec.Labels = map[string]string{"run_id": runID}
-	if runID != sharedHandoffOwner {
-		claim.Job.Spec.Labels["handoff_owner_run_id"] = sharedHandoffOwner
+	if runID != owner {
+		claim.Job.Spec.Labels["handoff_owner_run_id"] = owner
 	}
 	claim.Lease.AttemptID, claim.Lease.FencingToken, claim.Lease.LeaseTTL = attemptID, "fence-"+attemptID, time.Minute
 	recorder := &resultUploadRecorder{}
@@ -197,10 +203,16 @@ func (r *refusedBeforeRunOCIRuntime) Run(ctx context.Context, request workloadru
 // sharedHandoffPublished is the owner's answer as the eviction order reads it.
 func sharedHandoffPublished(t *testing.T, manager *handoffManager, kind string) bool {
 	t.Helper()
+	return handoffPublishedFor(t, manager, kind, sharedHandoffOwner)
+}
+
+// handoffPublishedFor is sharedHandoffPublished for the handoff owned by owner.
+func handoffPublishedFor(t *testing.T, manager *handoffManager, kind, owner string) bool {
+	t.Helper()
 	if kind == "process" {
-		return requireRetentionRecord(t, manager, sharedHandoffOwner).evidenceReachedLedger()
+		return requireRetentionRecord(t, manager, owner).evidenceReachedLedger()
 	}
-	record, found, err := manager.readOCIRecord(sharedHandoffOwner)
+	record, found, err := manager.readOCIRecord(owner)
 	if err != nil || !found || record.live() {
 		t.Fatalf("the shared volume has no finished record: %+v found=%t err=%v", record, found, err)
 	}
@@ -440,6 +452,91 @@ func TestAnEarlierRecordThatCannotVouchForItsSharersKeepsTheHandoffUnpublished(t
 			}
 			if sharedHandoffPublished(t, reopenedHandoffManager(t, h), tc.kind) {
 				t.Fatal("restart published a handoff whose earlier sharers nobody can vouch for")
+			}
+		})
+	}
+}
+
+// TestAnotherOwnersRecordAtThisOwnersNameIsNotAbsence is the older file-name
+// mapping meeting the owner-wide rule. That mapping folded every byte outside
+// [A-Za-z0-9_-] to "_", so "run.collide" and "run_collide" were filed under
+// one name, and an older agent's record for one of them may have been
+// replaced by the other's. Another owner's record at a name this owner's could
+// be under says this owner's earlier outcome is unknown, never that there was
+// none, so a later sharer's success must not publish this owner's handoff.
+//
+// The process rows are guards rather than red checks: a process admission
+// decides from the directory itself, whose contents are whatever an earlier
+// attempt left, so a foreign record at the older name never made it fresh.
+// The current-name process case is not reachable at all: writeRecord refuses
+// to write over another run's record, so the sharer is never admitted.
+func TestAnotherOwnersRecordAtThisOwnersNameIsNotAbsence(t *testing.T) {
+	const dotted, underscored = "run.collide", "run_collide"
+	if legacyRecordComponent(dotted) != recordComponent(underscored) {
+		t.Fatalf("the fixture's owners do not collide: %q, %q", legacyRecordComponent(dotted), recordComponent(underscored))
+	}
+	for _, tc := range []struct {
+		kind, collision string
+	}{
+		// This owner has no record under its current name, and its older
+		// name holds the other owner's current record.
+		{"oci", "legacy_name_holds_another_owner"},
+		// This owner's current name holds the record an older agent filed
+		// there for the other owner.
+		{"oci", "current_name_holds_another_owner"},
+		{"process", "legacy_name_holds_another_owner"},
+	} {
+		t.Run(tc.kind+"/"+tc.collision, func(t *testing.T) {
+			h := newRetentionHarness(t, time.Hour)
+			owner, other := dotted, underscored
+			if tc.collision == "current_name_holds_another_owner" {
+				owner, other = underscored, dotted
+			}
+			// This owner's earlier attempt left its only copy on the node.
+			parent := sharerUploadRefused
+			if tc.kind == "process" {
+				parent = sharerUndrained
+			}
+			runSharerFor(t, h, tc.kind, owner, owner, "attempt-parent", parent)
+			if handoffPublishedFor(t, h.manager, tc.kind, owner) {
+				t.Fatal("the fixture's earlier attempt published")
+			}
+			// What the node is left with after an older agent's shared name:
+			// nothing under this owner's own current name, and the other
+			// owner's record where this owner's could be.
+			ownRecord := h.manager.recordPath(owner)
+			if tc.kind == "oci" {
+				ownRecord = h.manager.ociRecordPath(owner)
+			}
+			if err := os.Remove(ownRecord); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(h.manager.uploadRecordRoot(), recordComponent(owner))); err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(time.Minute)
+			if tc.collision == "current_name_holds_another_owner" {
+				foreign := h.manager.newUploadRecord(other, "node-1", "attempt-other", attemptResult{document: []byte(`{}`)}, true)
+				if err := writeStateDocument(h.manager.stateRoot, uploadRecordDirectoryName, legacyRecordComponent(other), foreign); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				runSharerFor(t, h, tc.kind, other, other, "attempt-other", sharerPublishes)
+				if !handoffPublishedFor(t, h.manager, tc.kind, other) {
+					t.Fatal("the other owner's own handoff did not publish")
+				}
+			}
+
+			h.now = h.now.Add(time.Minute)
+			runSharerFor(t, h, tc.kind, owner, "run_child", "attempt-child", sharerPublishes)
+			if upload := requireUploadRecord(t, h.manager, owner); upload.AttemptID != "attempt-child" || !upload.publishes() {
+				t.Fatalf("the child's own upload = %+v, want a published attempt", upload)
+			}
+			if handoffPublishedFor(t, h.manager, tc.kind, owner) {
+				t.Fatalf("another owner's record at %s's name read as no earlier attempt, and a later sharer published its handoff", owner)
+			}
+			if handoffPublishedFor(t, reopenedHandoffManager(t, h), tc.kind, owner) {
+				t.Fatal("restart published a handoff whose earlier attempt's outcome is unknown")
 			}
 		})
 	}

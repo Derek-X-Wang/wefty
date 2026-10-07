@@ -288,9 +288,22 @@ func (m *handoffManager) writeUploadRecord(record uploadRecord) error {
 	return writeStateDocument(m.stateRoot, uploadRecordDirectoryName, recordComponent(record.RunID), record)
 }
 
+// errUploadRecordBelongsToAnotherRun is a name this run's upload record would
+// be read from holding another run's record instead. The older file name was
+// shared between run IDs ("run.a" and "run_a" were one name), so an older
+// agent may have written this run's record there and another run's write
+// replaced it. That is not "this node never recorded an upload for this run":
+// what this run's record said is unknown, and every reader that would act on
+// absence must treat it as unknown.
+var errUploadRecordBelongsToAnotherRun = errors.New("the upload record at this name belongs to another run")
+
 // readUploadRecord reads one run's upload outcome back. Startup recovery joins
 // it to the admitted attempt; an operator can also see why a result never
 // reached L1.
+//
+// It reports found=false with a nil error only when neither name this run's
+// record could be filed under holds a record. A name holding another run's
+// record is errUploadRecordBelongsToAnotherRun, never a quiet absence.
 func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, error) {
 	if m == nil || strings.TrimSpace(m.stateRoot) == "" {
 		return uploadRecord{}, false, nil
@@ -315,7 +328,8 @@ func (m *handoffManager) readUploadRecord(runID string) (uploadRecord, bool, err
 		return uploadRecord{}, false, err
 	}
 	if record.RunID != runID {
-		return uploadRecord{}, false, nil
+		return uploadRecord{}, false, fmt.Errorf("%w: run %q's record stands where run %q's would be",
+			errUploadRecordBelongsToAnotherRun, record.RunID, runID)
 	}
 	return record, true, nil
 }
@@ -385,6 +399,13 @@ func (record retentionRecord) evidenceReachedLedger() bool {
 // before the field existed, and files with no record at all each mean an
 // earlier attempt whose evidence nobody can vouch for, so each answers false.
 // Only an empty directory with no record is a handoff nobody wrote to yet.
+//
+// "No record" here includes another run's record standing at this run's older
+// file name, which existingRecordPath does not follow. That is safe on this
+// root, unlike the OCI one (ociEarlierAttemptsPublished), because the
+// directory itself is the evidence: whatever an earlier attempt left -- its
+// result, its undrained mailbox -- is a file in it, so a directory with
+// anything in it answers false whatever the records say.
 func (m *handoffManager) earlierAttemptsPublished(runID, path string, hasFiles bool) bool {
 	if strings.TrimSpace(m.stateRoot) == "" {
 		return !hasFiles

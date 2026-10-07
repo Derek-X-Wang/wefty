@@ -174,6 +174,12 @@ func (m *handoffManager) admitOCIHandoff(lease *handoffLease, execution executio
 // else -- an admission that never finished, a record this node cannot read or
 // trust, or an upload record with no admission beside it -- is an earlier
 // attempt nobody can vouch for.
+//
+// An upload record belonging to another owner at a name this owner's could be
+// under is one of those (errUploadRecordBelongsToAnotherRun). An older agent
+// filed "run.a" and "run_a" under one name, so the other owner's record may
+// have replaced this one's, and its earlier attempt's outcome is unknown, not
+// absent.
 func (m *handoffManager) ociEarlierAttemptsPublished(ownerKey string) bool {
 	payload, err := readStateDocument(m.ociRecordPath(ownerKey))
 	if errors.Is(err, os.ErrNotExist) {

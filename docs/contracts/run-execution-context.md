@@ -1240,6 +1240,10 @@ which this node holds neither an admission nor an upload record, since the
 helper's volume is one the agent cannot look inside. A record this node cannot
 read or trust, an admission that never finished, a record from before this
 rule, or an OCI volume known only through an upload record each answer false.
+So does another owner's upload record at a name this owner's could be filed
+under: an older agent filed `run.a` and `run_a` under one name, so the other
+owner's record may have replaced this one's, and that outcome is unknown, not
+absent.
 One unpublished attempt therefore keeps the handoff unpublished for as long as
 this node's record of it stands: a process directory's record goes when the
 directory expires or is given up, an OCI volume's when the budget gives the

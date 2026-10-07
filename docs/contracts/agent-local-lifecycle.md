@@ -538,7 +538,8 @@ owner's answer for every earlier attempt forward on the admission record
 (`earlier_attempts_published`). That answer is true only when the replaced
 record was finished and published, or when nothing was written there before:
 an empty process directory with no record, or an OCI owner with neither an
-admission nor an upload record on this node. Restart recovery applies the same
+admission nor an upload record on this node, where another owner's upload
+record at a name this owner's could be filed under counts as one. Restart recovery applies the same
 rule to that same attempt's upload record only, and the admission's carried
 answer still applies. A legacy record that cannot show both halves, or that
 predates the carried answer, never grants early-eviction priority. Unpublished
