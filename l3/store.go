@@ -141,6 +141,10 @@ CREATE TABLE IF NOT EXISTS runs (
   started_ns INTEGER,
   finished_ns INTEGER
 );
+CREATE TABLE IF NOT EXISTS run_cancellations (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+  requested_ns INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS runs_projection ON runs(status, l1_job_id, created_ns);
 CREATE TABLE IF NOT EXISTS run_scripts (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
@@ -1914,7 +1918,9 @@ SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
 FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
+WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
+ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
 	if err != nil {
 		return nil, internalError(err, "list pending dispatches")
 	}
@@ -1959,18 +1965,16 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 	return intents, nil
 }
 
-// errDispatchAbandoned reports that the run was terminal when its dispatch
-// attempt would have begun. The caller must not submit: the terminal
-// transition cleared the staged bearer, and a submit L1 accepts as new work
-// (because it lost the original job) would start an ended run again.
-var errDispatchAbandoned = errors.New("l3: run is terminal; dispatch attempt abandoned")
+// errDispatchAbandoned reports that a terminal transition or cancellation
+// request won before this dispatch attempt began. The caller must not submit:
+// replay could create new work after the run ended or was told to stop.
+var errDispatchAbandoned = errors.New("l3: dispatch attempt abandoned")
 
 // beginDispatch starts one submit attempt and returns the bearer it carries.
-// The run-status guard, the bearer hand-out and the attempt count share one
-// transaction, so a run that is terminal when the attempt begins is never
-// handed a bearer to submit with. A run that ends after this commit, while the
-// submit is in flight, is linked by completeDispatch when L1 acknowledges the
-// job, or by lookup recovery when it does not.
+// The run-status and cancellation guards, bearer hand-out and attempt count
+// share one transaction. A run that ends or is canceled after this commit,
+// while the submit is in flight, is linked by completeDispatch when L1
+// acknowledges the job, or by lookup recovery when it does not.
 func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error) {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1979,7 +1983,8 @@ func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error)
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=?, dispatch_attempt_ns=?
-WHERE run_id=? AND status IN (?, ?)`,
+WHERE run_id=? AND status IN (?, ?)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)`,
 		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
 	if err != nil {
 		return "", internalError(err, "mark dispatch attempt")

@@ -786,6 +786,13 @@ state (including an already-terminal target), 2 for usage/invalid requests,
 3 for authentication or principal refusals, 4 for `not_found`, 5 for
 `cancel_service`/`cancel_not_queued` or another conflict, and 1 for other errors.
 
+`wefty cancel RUN_ID` recognizes the `run_` prefix (and legacy `run-`) and calls
+L3's `POST /v1/runs/{run_id}/cancel`, returning the current Run record in
+`--json` mode or its ID, status and failure reason as text. It uses the same
+typed exit codes as job cancel; HTTP 200 is success even while cancellation
+awaits settlement or when the job already finished. An L1-only installation
+receives a usage error explaining that `--l3` is required for Run cancellation.
+
 ### Service policy stops and CLI
 
 A clean payload exit under `on-failure` or `never` records `policy_stop` (a

@@ -383,7 +383,6 @@ func TestReservedRoutesExplicitlyReturn501(t *testing.T) {
 		path string
 	}{
 		{"l1-client.v1.json", "/v1/jobs/{job_id}/prompt"},
-		{"l3.v1.json", "/v1/runs/{run_id}/cancel"},
 	}
 
 	for _, tc := range cases {

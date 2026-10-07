@@ -479,7 +479,7 @@ Commands:
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
-  cancel JOB_ID              Cancel a queued or active one-shot job
+  cancel JOB_ID|RUN_ID       Cancel a run or one-shot job
   wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout
   results RUN_ID [--out FILE]
                              Read the result document the run uploaded

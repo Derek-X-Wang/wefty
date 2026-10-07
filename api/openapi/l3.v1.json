@@ -586,12 +586,23 @@
       ],
       "post": {
         "operationId": "cancelRun",
-        "summary": "Reserved run cancellation",
-        "description": "Always returns 501 in v0.1 and does not mutate run or job state.",
-        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
-        "x-wefty-implementation": "reserved",
+        "summary": "Cancel a run's current job",
+        "description": "Requires the caller principal and the submitting actor; run and Computer tokens are forbidden. Returns the current RunRecord. A never-attempted dispatch is canceled directly as failed with a cancellation failure_reason. Otherwise L3 durably records intent and calls the public L1 cancel route using the ledger's originating-submitter identity; further submits are blocked, and an ambiguous dispatch is resolved by the public dispatch-key lookup before cancellation. An absent dispatch settles locally only beyond the existing one-hour settlement horizon, with no acknowledgement recorded meanwhile. Active runs remain nonterminal until L1 settles. Cancellation projects failed/outcome=canceled as failed with failure_reason=the L1 job was canceled. A completion that wins retains its actual outcome and normal workflow gates; terminal run outcomes remain unchanged. Repeated calls are idempotent. Existing children are independent and are not canceled.",
+        "security": [{ "fabricIdentity": [] }],
         "responses": {
-          "501": { "$ref": "./common.v1.json#/components/responses/NotImplemented" }
+          "200": {
+            "description": "Current run; cancellation may still be pending on an active job",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/RunRecord" } } }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": {
+            "description": "Retryable internal failure; if cancellation intent was recorded, reconciliation retries delivery",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } }
+          }
         }
       }
     }

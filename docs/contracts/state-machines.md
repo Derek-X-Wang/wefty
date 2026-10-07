@@ -1104,7 +1104,7 @@ operator intent.
 | `running` | The workflow job is executing. | `awaiting-input`, `succeeded`, `failed` |
 | `awaiting-input` | Mirrors the reserved job state. Observable but not enterable in v0.1. | `running`, `failed` |
 | `succeeded` | The job succeeded and every required envelope validated. Terminal. | none |
-| `failed` | Dispatch, job execution, gate, or required-envelope protocol failed. Terminal. | none |
+| `failed` | Dispatch, job execution, gate, or required-envelope protocol failed, or cancellation settled. Terminal. | none |
 
 Terminal job mapping is deterministic: `succeeded` maps to run `succeeded`
 only after required envelope validation; job `failed` maps to run `failed`.
@@ -1119,7 +1119,41 @@ applied deepest-child-first so one pass can settle an already-terminal chain.
 L1 queued one-shot cancellation records `state=failed`, `outcome=canceled`; it
 does not add a job state. L3 projects this job-level outcome as "the L1 job was
 canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
-Cancellation of an L3 Run remains reserved and returns `501`.
+
+### Run cancellation (#691)
+
+`POST /v1/runs/{run_id}/cancel` requires the existing L3 caller principal and
+an actor matching the Run's immutable submitting actor. L3 has no person-admin
+arm. Run tokens and Computer tokens receive `403 forbidden`; an unknown Run
+receives `404 not_found`. The response is HTTP 200 with the current `RunRecord`,
+including for a terminal or already-canceled Run.
+
+Cancellation arbitrates with the first dispatch attempt inside the ledger
+transaction. If no attempt has begun and no L1 job is linked, L3 directly
+settles the Run as `failed`, with `failure_reason=the run was canceled before
+dispatch`, expires its run token, and clears staged token delivery. The outbox
+cannot dispatch it afterward. Once a dispatch has begun, a lost acknowledgement
+is not proof that no job exists: L3 durably records cancellation intent, blocks
+further submits, links the job by the public dispatch-key lookup, and delivers
+cancellation to `POST /v1/jobs/{job_id}/cancel` through the public L1 client
+contract, as the ledger's own originating-submitter identity. Intent survives
+ledger restart;
+transient delivery failures are retried by reconciliation. A dispatch-key
+absence remains provisional until the existing one-hour dispatch settlement
+horizon has passed since the last attempt; only then, with no acknowledgement
+recorded meanwhile, can the Run settle locally as canceled before dispatch.
+An ambiguous dispatch is never replayed to create work after cancellation.
+
+For a live job, the Run remains nonterminal until L1 settles, then projects
+`failed`/`outcome=canceled` as Run `failed`, with `failure_reason=the L1 job was
+canceled`. No new Run state is added. If the job finished before cancellation,
+L3 projects its actual outcome with the ordinary image-evidence, envelope, gate
+and child-lineage rules. The cancel response performs both legal projection
+steps if it first observes a succeeded job from `queued`. A terminal Run's
+status, reason and timestamps are never rewritten, and repeats preserve the
+first outcome. Children remain independent; cancel does not cascade. A rerun
+uses the stored immutable snapshot and creates a fresh Run without inheriting
+cancellation intent.
 
 ### One-shot cancellation (#650, #651, #652)
 
