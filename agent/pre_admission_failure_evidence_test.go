@@ -322,7 +322,7 @@ func (e preAdmissionFailureEngine) ReapSession(ctx context.Context, s ocihelper.
 	e.trace.add("engine ReapSession exit", err, context.Cause(ctx))
 	return v, err
 }
-func startPreAdmissionFailureHelper(t *testing.T, engine ocihelper.Engine, now func() time.Time, trace *preAdmissionFailureTrace) (*ocihelper.BootBarrier, func()) {
+func startPreAdmissionFailureHelper(t *testing.T, engine ocihelper.Engine, now func() time.Time, trace *preAdmissionFailureTrace, clocks ...ocihelper.Clock) (*ocihelper.BootBarrier, func()) {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "wefty-332-")
 	if err != nil {
@@ -344,9 +344,13 @@ func startPreAdmissionFailureHelper(t *testing.T, engine ocihelper.Engine, now f
 		trace.emit(t.Logf)
 		t.Fatal(err)
 	}
+	var helperClock ocihelper.Clock
+	if len(clocks) != 0 {
+		helperClock = clocks[0]
+	}
 	server, err := ocihelper.NewServer(engine, ocihelper.ServerConfig{
 		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
-		HeartbeatTimeout: time.Second, MaximumAttemptDeadman: 5 * time.Second, Logf: trace.serverLogf,
+		HeartbeatTimeout: hostedFixtureTimeout, MaximumAttemptDeadman: 5 * time.Second, Logf: trace.serverLogf, Clock: helperClock,
 	})
 	if err != nil {
 		_ = listener.Close()
@@ -439,7 +443,7 @@ func startPreAdmissionFailureHelper(t *testing.T, engine ocihelper.Engine, now f
 // return receipt, and contains a broken shutdown in its child test process.
 func finishPreAdmissionFailureServe(t *testing.T, done <-chan error, trace *preAdmissionFailureTrace) {
 	t.Helper()
-	if err := waitPreAdmissionFailureServe(done); err != nil {
+	if err := waitPreAdmissionFailureServe(done, hostedFixtureTimeout); err != nil {
 		trace.add("helper Serve cleanup error", err)
 		trace.emit(t.Logf)
 		if err == errPreAdmissionHelperDidNotStop {
@@ -454,8 +458,12 @@ func finishPreAdmissionFailureServe(t *testing.T, done <-chan error, trace *preA
 
 var errPreAdmissionHelperDidNotStop = errors.New("helper server did not stop")
 
-func waitPreAdmissionFailureServe(done <-chan error) error {
-	timer := time.NewTimer(time.Second)
+func waitPreAdmissionFailureServe(done <-chan error, budgets ...time.Duration) error {
+	budget := time.Second
+	if len(budgets) != 0 {
+		budget = budgets[0]
+	}
+	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	select {
 	case err := <-done:
@@ -476,7 +484,7 @@ func TestPreAdmissionFailureEarlyExitChild(t *testing.T) {
 	// Registered before the fixture, so this runs after every fixture cleanup.
 	// Inspect only function identities; no raw stack text is constructed or logged.
 	t.Cleanup(func() {
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(hostedFixtureTimeout)
 		for {
 			remaining, complete := preAdmissionFailureOwnedGoroutines()
 			if complete && remaining == 0 {
@@ -526,10 +534,10 @@ func TestPreAdmissionFailureEarlyExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), hostedFixtureTimeout+10*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, executable, "-test.run=^TestPreAdmissionFailureEarlyExitChild$", "-test.v", "-test.timeout=20s")
-	command.Env = append(os.Environ(), "WEFTY_PRE_ADMISSION_FAILURE_CHILD=1")
+	command := exec.CommandContext(ctx, executable, "-test.run=^TestPreAdmissionFailureEarlyExitChild$", "-test.v", "-test.timeout="+(hostedFixtureTimeout+5*time.Second).String())
+	command.Env = append(hostedFixtureChildEnvironment(t), "WEFTY_PRE_ADMISSION_FAILURE_CHILD=1")
 	output, err := command.CombinedOutput()
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || exit.ExitCode() != 1 {

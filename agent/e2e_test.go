@@ -298,7 +298,7 @@ func TestE2EWorkloadReleaseCleanupOnFailure(t *testing.T) {
 	if os.Getenv(childEnvironment) == "1" {
 		directory := t.TempDir()
 		ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
-		payload := startManagedProcess(t, agentHelperPath, "wait-release", ready, release, "10s")
+		payload := startManagedProcess(t, agentHelperPath, "wait-release", ready, release, hostedFixtureTimeout.String())
 		// This callback occupies the agent-shutdown position in the real fixture.
 		// A zero exit proves the release was observed before any stop signal.
 		t.Cleanup(func() {
@@ -308,7 +308,7 @@ func TestE2EWorkloadReleaseCleanupOnFailure(t *testing.T) {
 					t.Errorf("payload did not exit by release: %v", err)
 					return
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(hostedFixtureTimeout):
 				t.Error("payload was not released before shutdown cleanup")
 				return
 			}
@@ -318,7 +318,7 @@ func TestE2EWorkloadReleaseCleanupOnFailure(t *testing.T) {
 		})
 		registerE2EWorkloadRelease(t, release)
 		payload.start(t)
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(hostedFixtureTimeout)
 		for {
 			if _, err := os.Stat(ready); err == nil {
 				break
@@ -331,10 +331,10 @@ func TestE2EWorkloadReleaseCleanupOnFailure(t *testing.T) {
 		t.Fatal("injected renewal assertion failure")
 	}
 	marker := filepath.Join(t.TempDir(), "cleanup-marker")
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), hostedFixtureTimeout+10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestE2EWorkloadReleaseCleanupOnFailure$", "-test.count=1")
-	command.Env = append(os.Environ(), childEnvironment+"=1", "WEFTY_RELEASE_CLEANUP_MARKER="+marker)
+	command.Env = append(hostedFixtureChildEnvironment(t), childEnvironment+"=1", "WEFTY_RELEASE_CLEANUP_MARKER="+marker)
 	output, err := command.CombinedOutput()
 	if err == nil || !bytes.Contains(output, []byte("injected renewal assertion failure")) {
 		t.Fatalf("expected injected child-test failure: err=%v output=%s", err, output)

@@ -732,7 +732,7 @@ func TestComputerSubmissionPolicyRemintDrainsFourWaitingHostBridgePumpsWithoutFo
 	for pump := 0; pump < bridgeConcurrency; pump++ {
 		select {
 		case <-engine.bridgeEntered:
-		case <-time.After(time.Second):
+		case <-time.After(hostedFixtureTimeout):
 			t.Fatalf("host-bridge pump %d/%d did not reach helper readiness", pump+1, bridgeConcurrency)
 		}
 	}
@@ -756,7 +756,7 @@ func TestComputerSubmissionPolicyRemintDrainsFourWaitingHostBridgePumpsWithoutFo
 		if err != nil {
 			t.Fatalf("one-shot host-bridge termination = %v, want confirmed completion", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		t.Fatal("adapter did not finish after canceling the waiting host-bridge pumps")
 	}
 }
@@ -982,7 +982,8 @@ func workflowBridgeMarkerImage() ocihelper.EnsureImageResponse {
 
 func startWorkflowBridgeMarkerAdapter(t *testing.T, engine ocihelper.Engine) (*ocirunner.Adapter, func()) {
 	t.Helper()
-	barrier, stop := startPreAdmissionHelper(t, engine, time.Now)
+	clock := hostedHelperClock{newManualClock(time.Now())}
+	barrier, stop := startPreAdmissionHelper(t, engine, clock.Now, clock)
 	if err := barrier.Ensure(t.Context()); err != nil {
 		stop()
 		t.Fatal(err)

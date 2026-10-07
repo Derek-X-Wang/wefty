@@ -42,15 +42,16 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 			trace.emit(t.Logf)
 		}
 	})
+	clock := newManualClock(time.Now())
+	helperClock := hostedHelperClock{newManualClock(time.Now())}
 	network := plain.NewNetwork()
-	store, stopL1 := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+	store, stopL1 := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"pre-admission-node": {Tags: []string{"pre-admission"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, 2*time.Second)
 	defer stopL1()
 
 	engine := newPreAdmissionRenewalEngine()
-	clock := newManualClock(time.Unix(10_000, 0))
-	barrier, stopHelper := startPreAdmissionFailureHelper(t, preAdmissionFailureEngine{preAdmissionRenewalEngine: engine, trace: trace}, clock.Now, trace)
+	barrier, stopHelper := startPreAdmissionFailureHelper(t, preAdmissionFailureEngine{preAdmissionRenewalEngine: engine, trace: trace}, clock.Now, trace, helperClock)
 	defer stopHelper()
 	helperRenewals := make(chan struct{}, 8)
 	adapter := ocirunner.NewAdapter(barrier)
@@ -148,7 +149,7 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		if authority.AttemptID != claim.Lease.AttemptID {
 			fatalf("image delivery attempt=%q, want %q", authority.AttemptID, claim.Lease.AttemptID)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "attempt did not reach held pre-admission image delivery")
 	}
 
@@ -157,8 +158,13 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	}
 
 	trace.add("advance agent manual clock 200ms")
+	if err := awaitFixtureCondition(t.Context(), "L1 renewal timer", func() bool {
+		return clock.hasDeadline(clock.Now().Add(200 * time.Millisecond))
+	}); err != nil {
+		fatalf("%v", err)
+	}
 	clock.Advance(200 * time.Millisecond)
-	renewalDeadline := time.Now().Add(3 * time.Second)
+	renewalDeadline := time.Now().Add(hostedFixtureTimeout)
 	for {
 		attempts, listErr := store.ListJobAttempts(t.Context(), job.JobID)
 		if listErr != nil {
@@ -173,15 +179,21 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Give the independently scheduled helper heartbeat ample time to expose
-	// an unauthorized pre-admission tuple. The helper session must remain the
-	// same authority until Run reserves this attempt.
-	continuityDeadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(continuityDeadline) {
-		if _, err := barrier.Session(); err != nil {
-			fatalf("pre-admission L1 renewal invalidated the helper session: %v", err)
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Rearming the renewal timer proves the successful renewal has also
+	// passed its deadman-admission gate, not merely committed in SQLite.
+	if err := awaitFixtureCondition(t.Context(), "pre-admission renewal gate settled", func() bool {
+		return clock.hasDeadline(clock.Now().Add(200 * time.Millisecond))
+	}); err != nil {
+		fatalf("%v", err)
+	}
+	// Observe a heartbeat applied after the pre-admission L1 renewal. The
+	// helper watchdog reset is a receipt, unlike sleeping for several pump
+	// intervals. An unauthorized tuple would invalidate the session instead.
+	helperClock.Advance(300 * time.Millisecond)
+	if err := awaitFixtureCondition(t.Context(), "pre-admission heartbeat receipt", func() bool {
+		return helperClock.hasDeadline(helperClock.Now().Add(hostedFixtureTimeout))
+	}); err != nil {
+		fatalf("%v", err)
 	}
 	session, err := barrier.Session()
 	if err != nil {
@@ -203,32 +215,43 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		if authority.AttemptID != claim.Lease.AttemptID {
 			fatalf("helper admitted attempt=%q, want original %q", authority.AttemptID, claim.Lease.AttemptID)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "original attempt did not reach helper Run admission")
 	}
 	select {
 	case <-engine.watchEntered:
 		trace.add("Watch entered observed")
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "original attempt did not continue through Started into Watch")
 	}
 	select {
 	case <-helperRenewals:
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "admission did not flush the retained helper renewal")
 	}
 
 	// A later admitted renewal must move the helper deadline. Waiting before
 	// this renewal gives a stuck-closed gate enough separation for the original
 	// InitialDeadman edge to be observed independently.
-	time.Sleep(time.Second)
+	originalDeadman := helperClock.Now().Add(claim.Lease.LeaseTTL)
+	if err := awaitFixtureCondition(t.Context(), "initial helper deadman armed", func() bool {
+		return helperClock.hasDeadline(originalDeadman)
+	}); err != nil {
+		fatalf("%v", err)
+	}
+	helperClock.Advance(time.Second)
 	beforeRenewal, err := store.ListJobAttempts(t.Context(), job.JobID)
 	if err != nil || len(beforeRenewal) != 1 {
 		fatalf("attempt before admitted renewal = %+v err=%v", beforeRenewal, err)
 	}
 	trace.add("advance agent manual clock 200ms")
+	if err := awaitFixtureCondition(t.Context(), "L1 renewal timer", func() bool {
+		return clock.hasDeadline(clock.Now().Add(200 * time.Millisecond))
+	}); err != nil {
+		fatalf("%v", err)
+	}
 	clock.Advance(200 * time.Millisecond)
-	admittedRenewalDeadline := time.Now().Add(time.Second)
+	admittedRenewalDeadline := time.Now().Add(hostedFixtureTimeout)
 	for {
 		afterRenewal, listErr := store.ListJobAttempts(t.Context(), job.JobID)
 		if listErr != nil {
@@ -244,17 +267,26 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 	}
 	select {
 	case <-helperRenewals:
-	case <-time.After(time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "post-admission renewal did not reach the helper session")
 	}
-	time.Sleep(1200 * time.Millisecond)
+	renewedDeadman := helperClock.Now().Add(claim.Lease.LeaseTTL)
+	if err := awaitFixtureCondition(t.Context(), "admitted helper renewal applied", func() bool {
+		return helperClock.hasDeadline(renewedDeadman)
+	}); err != nil {
+		fatalf("%v", err)
+	}
+	helperClock.Advance(1200 * time.Millisecond)
+	if !helperClock.Now().After(originalDeadman) {
+		fatalf("helper clock did not cross the original deadman")
+	}
 	if reaps := engine.attemptReapCount(); reaps != 0 {
 		fatalf("helper attempt did not outlive its original InitialDeadman: reaps=%d", reaps)
 	}
 	releaseWatch()
 	select {
 	case <-engine.deleteEntered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "terminal attempt did not enter helper reap")
 	}
 	beforeTerminalRenewal, err := store.ListJobAttempts(t.Context(), job.JobID)
@@ -262,8 +294,13 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		fatalf("attempt before terminal renewal = %+v err=%v", beforeTerminalRenewal, err)
 	}
 	trace.add("advance agent manual clock 200ms")
+	if err := awaitFixtureCondition(t.Context(), "L1 renewal timer", func() bool {
+		return clock.hasDeadline(clock.Now().Add(200 * time.Millisecond))
+	}); err != nil {
+		fatalf("%v", err)
+	}
 	clock.Advance(200 * time.Millisecond)
-	terminalRenewalDeadline := time.Now().Add(time.Second)
+	terminalRenewalDeadline := time.Now().Add(hostedFixtureTimeout)
 	for {
 		afterTerminalRenewal, listErr := store.ListJobAttempts(t.Context(), job.JobID)
 		if listErr != nil {
@@ -301,7 +338,7 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		if err != nil {
 			fatalf("%v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hostedFixtureTimeout):
 		fatalf("%v", "original attempt did not finish")
 	}
 	attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
@@ -551,7 +588,7 @@ func preAdmissionImageResponse() ocihelper.EnsureImageResponse {
 	return ocihelper.EnsureImageResponse{TopLevelDigest: preAdmissionImageDigest, PlatformDigest: preAdmissionImageDigest, Evidence: evidence}
 }
 
-func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine, now func() time.Time) (*ocihelper.BootBarrier, func()) {
+func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine, now func() time.Time, clocks ...ocihelper.Clock) (*ocihelper.BootBarrier, func()) {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "wefty-332-")
 	if err != nil {
@@ -563,9 +600,13 @@ func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine, now func() t
 	if err != nil {
 		t.Fatal(err)
 	}
+	var helperClock ocihelper.Clock
+	if len(clocks) != 0 {
+		helperClock = clocks[0]
+	}
 	server, err := ocihelper.NewServer(engine, ocihelper.ServerConfig{
 		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
-		HeartbeatTimeout: time.Second, MaximumAttemptDeadman: 5 * time.Second,
+		HeartbeatTimeout: hostedFixtureTimeout, MaximumAttemptDeadman: 5 * time.Second, Clock: helperClock,
 	})
 	if err != nil {
 		t.Fatal(err)
