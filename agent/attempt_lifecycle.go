@@ -520,6 +520,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err}
 	}()
 	persistCompletion := func(outcome *runOutcome) error {
+		// The helper has refused expired authority. L1 may still hold a lease,
+		// but replaying a payload failure would convert this lost attempt into a
+		// completion. Retain other evidence and let its lease expire normally.
+		var attemptLost *ocihelper.AttemptLostError
+		if errors.As(outcome.err, &attemptLost) {
+			return nil
+		}
 		if lifecycle.dependencies.outbox == nil || outcome.durabilityErr != nil {
 			return outcome.durabilityErr
 		}
@@ -618,6 +625,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		finalization.stop()
 		outcome := <-completed
 		<-renewalDone
+		var attemptLost *ocihelper.AttemptLostError
+		if errors.As(failure.err, &attemptLost) {
+			// Queueing can observe the refusal before Watch does. Preserve that
+			// authority-loss fact even if Watch concurrently returned a result.
+			outcome.err = errors.Join(outcome.err, failure.err)
+		}
 		if err := persistCompletion(&outcome); err != nil {
 			return errorDestinationUnclassified, errors.Join(fmt.Errorf("agent: renew lease: %w", failure.err), fmt.Errorf("agent: persist durable completion: %w", err))
 		}
@@ -639,6 +652,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}
 	if err := persistCompletion(&outcome); err != nil {
 		return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+	}
+	var attemptLost *ocihelper.AttemptLostError
+	if errors.As(outcome.err, &attemptLost) {
+		reconcileCompletion = true
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, outcome.err)
+		cancelAttempt(outcome.err)
+		<-renewalDone
+		return errorDestinationAttemptAuthority, outcome.err
 	}
 	var routed *routedDestinationError
 	if errors.As(outcome.err, &routed) && routed.destination != errorDestinationUnclassified {

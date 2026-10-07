@@ -63,20 +63,21 @@ type Session struct {
 	// it had before this channel existed.
 	suppress chan chan error
 
-	controlMu   sync.Mutex
-	queueMu     sync.Mutex
-	pending     map[string]pendingRenewal
-	queueToken  uint64
-	sequence    uint64
-	queued      chan struct{}
-	pumpCtx     context.Context
-	pumpCancel  context.CancelFunc
-	pumpDone    chan struct{}
-	pumpErr     error
-	lossHandler func(error)
-	closed      bool
-	closeOnce   sync.Once
-	lossOnce    sync.Once
+	controlMu     sync.Mutex
+	queueMu       sync.Mutex
+	pending       map[string]pendingRenewal
+	attemptLosses map[AttemptAuthority]map[*attemptLossSubscription]struct{}
+	queueToken    uint64
+	sequence      uint64
+	queued        chan struct{}
+	pumpCtx       context.Context
+	pumpCancel    context.CancelFunc
+	pumpDone      chan struct{}
+	pumpErr       error
+	lossHandler   func(error)
+	closed        bool
+	closeOnce     sync.Once
+	lossOnce      sync.Once
 }
 
 func (client *Client) protocolVersion() int {
@@ -278,6 +279,49 @@ func (session *Session) SetLossHandler(handler func(error)) {
 	}
 }
 
+// AttemptLostError means a known attempt's expired authority was refused;
+// it is not helper-session loss and must never trigger session recovery.
+type AttemptLostError struct{ Authority AttemptAuthority }
+
+func (err *AttemptLostError) Error() string {
+	return fmt.Sprintf("OCI attempt %s lost: %s", err.Authority.AttemptID, CodeAttemptExpired)
+}
+
+type attemptLossSubscription struct {
+	channel chan *AttemptLostError
+	err     *AttemptLostError // guarded by queueMu
+}
+
+// ObserveAttemptLoss registers before Run so even a refusal racing Watch setup
+// reaches the owner. release bounds this client record to the owner's lifetime.
+func (session *Session) ObserveAttemptLoss(authority AttemptAuthority) (<-chan *AttemptLostError, func()) {
+	subscription := &attemptLossSubscription{channel: make(chan *AttemptLostError, 1)}
+	session.queueMu.Lock()
+	if session.attemptLosses == nil {
+		session.attemptLosses = make(map[AttemptAuthority]map[*attemptLossSubscription]struct{})
+	}
+	if session.attemptLosses[authority] == nil {
+		session.attemptLosses[authority] = make(map[*attemptLossSubscription]struct{})
+	}
+	for existing := range session.attemptLosses[authority] {
+		if existing.err != nil {
+			subscription.err = existing.err
+			subscription.channel <- existing.err
+			break
+		}
+	}
+	session.attemptLosses[authority][subscription] = struct{}{}
+	session.queueMu.Unlock()
+	return subscription.channel, func() {
+		session.queueMu.Lock()
+		delete(session.attemptLosses[authority], subscription)
+		if len(session.attemptLosses[authority]) == 0 {
+			delete(session.attemptLosses, authority)
+		}
+		session.queueMu.Unlock()
+	}
+}
+
 // QueueAttemptRenewal records successful L1 lease evidence for the heartbeat
 // pump. The relative TTL is anchored here and clamped again when the queued
 // heartbeat is flushed, so queue and transport delay cannot extend authority.
@@ -309,6 +353,12 @@ func (session *Session) QueueAttemptRenewalUntil(authority AttemptAuthority, exp
 		}
 	}
 	session.queueMu.Lock()
+	for subscription := range session.attemptLosses[authority] {
+		if subscription.err != nil {
+			session.queueMu.Unlock()
+			return subscription.err
+		}
+	}
 	session.queueToken++
 	session.pending[authority.key()] = pendingRenewal{
 		authority: authority, expiresAt: expiresAt, token: session.queueToken,
@@ -476,10 +526,30 @@ func (session *Session) flushHeartbeat(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("send OCI helper heartbeat: %w", err)
 	}
-	if err := decodeResponse(session.controlWire, &struct{}{}); err != nil {
+	var response HeartbeatResponse
+	if err := decodeResponse(session.controlWire, &response); err != nil {
 		return err
 	}
+	sent := make(map[AttemptAuthority]bool, len(renewals))
+	for _, renewal := range renewals {
+		sent[renewal.Authority] = true
+	}
+	for _, refusal := range response.RefusedAttempts {
+		if refusal.Code != CodeAttemptExpired || !sent[refusal.Authority] {
+			return errors.New("OCI helper returned an invalid attempt renewal refusal")
+		}
+	}
 	session.queueMu.Lock()
+	for _, refusal := range response.RefusedAttempts {
+		delete(session.pending, refusal.Authority.key())
+		for subscription := range session.attemptLosses[refusal.Authority] {
+			if subscription.err == nil {
+				subscription.err = &AttemptLostError{Authority: refusal.Authority}
+				subscription.channel <- subscription.err
+			}
+		}
+	}
+
 	for key, token := range snapshot {
 		if session.pending[key].token == token {
 			delete(session.pending, key)

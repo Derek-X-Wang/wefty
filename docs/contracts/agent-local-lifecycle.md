@@ -1057,3 +1057,15 @@ ending the agent session; recovery later delivers the same evidence. A distinct
 L1 authority/session verdict or local persistence failure keeps its own error
 scope. L1's 30-second settlement deadline remains independent of runtime
 confirmation, so a silent node still settles without inventing a stop.
+
+## OCI attempt-scoped late renewal loss
+
+An OCI helper heartbeat may refuse one exact, recently expired or deleted
+attempt with `attempt_expired` while retaining the helper session. The client
+notifies that attempt owner, stops its pending renewals, and the adapter ends
+its Watch. The lifecycle classifies the typed refusal as attempt authority
+loss and uses normal reap and lost-attempt evidence reconciliation, rather
+than publishing it as successful completion or recovering the helper session.
+Other attempts, OCI capability, and helper generation remain live. The exact
+identity, bounded recognition record, and session-fatal exceptions are defined
+in [OCI helper protocol](oci-helper-protocol.md#late-attempt-renewals).

@@ -494,6 +494,19 @@ type HeartbeatRequest struct {
 	RenewedAttempts []DeadmanRenewal `json:"renewed_attempts,omitempty"`
 }
 
+// AttemptRenewalRefusal is a non-restoring, attempt-scoped heartbeat result.
+// The full admitted tuple is echoed so a client cannot lose a neighbouring fence.
+type AttemptRenewalRefusal struct {
+	Authority AttemptAuthority `json:"authority"`
+	Code      ErrorCode        `json:"code"`
+}
+
+const CodeAttemptExpired ErrorCode = "attempt_expired"
+
+type HeartbeatResponse struct {
+	RefusedAttempts []AttemptRenewalRefusal `json:"refused_attempts,omitempty"`
+}
+
 type EnsureImageRequest struct {
 	Reference        string        `json:"reference"`
 	Digest           string        `json:"digest"`

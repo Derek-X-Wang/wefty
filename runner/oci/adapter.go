@@ -1106,6 +1106,8 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
 	adapter.trackRun(request.Authority, entry)
+	attemptLoss, releaseAttemptLoss := session.ObserveAttemptLoss(authority)
+	defer releaseAttemptLoss()
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
 		AllocateEndpoints:          request.AttemptEndpoints,
@@ -1268,11 +1270,22 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, termination)
 		}
 		if !gracefulTermination {
-			return <-watchDone
+			select {
+			case watchErr := <-watchDone:
+				return watchErr
+			case lost := <-attemptLoss:
+				cancelWatch()
+				<-watchDone
+				return lost
+			}
 		}
 		select {
 		case watchErr := <-watchDone:
 			return watchErr
+		case lost := <-attemptLoss:
+			cancelWatch()
+			<-watchDone
+			return lost
 		case <-ctx.Done():
 			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, termination)
 		}
