@@ -351,9 +351,13 @@ func (observer *lifecycleObserver) setServiceReadiness(attemptID string, startup
 		}
 		readyValue := ready
 		status.Ready = &readyValue
-		if ready {
+		switch {
+		case status.State == AttemptReaping || status.State == AttemptFinalizing:
+			// Teardown withdraws forwarding and readiness; neither makes an
+			// attempt already being torn down read as live again.
+		case ready:
 			status.State = AttemptServing
-		} else if *status.StartupSatisfied {
+		case *status.StartupSatisfied:
 			status.State = AttemptRunning
 		}
 		observer.attempts[attemptID] = status
