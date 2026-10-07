@@ -64,6 +64,8 @@ type Session struct {
 	// it had before this channel existed.
 	suppress chan chan error
 
+	// controlMu serializes test-only flushHeartbeat calls with the pump disabled.
+	// The production pump owns control I/O and does not take this mutex.
 	controlMu     sync.Mutex
 	queueMu       sync.Mutex
 	pending       map[string]pendingRenewal
@@ -325,7 +327,11 @@ func (session *Session) ObserveAttemptLoss(authority AttemptAuthority) (<-chan *
 
 // QueueAttemptRenewal records successful L1 lease evidence for the heartbeat
 // pump. The relative TTL is anchored here and clamped again when the queued
-// heartbeat is flushed, so queue and transport delay cannot extend authority.
+// heartbeat is sent, so time in the local queue does not extend the wire TTL.
+// The helper starts that TTL at apply time: send-to-apply delay can overshoot
+// the agent's L1-derived expiry by up to the reply wait budget for an accepted
+// reply (2.9 s by default, previously about 1 s). L1's first lease-loss requeue
+// backoff is about 1 s, so it does not by itself cover this overshoot.
 func (session *Session) QueueAttemptRenewal(authority AttemptAuthority, ttl time.Duration) error {
 	if session == nil || session.client == nil {
 		return errors.New("OCI helper session is closed")
@@ -426,19 +432,6 @@ func (session *Session) suppressionAcknowledgement() error {
 		return fmt.Errorf("suppress OCI helper heartbeats: %w", err)
 	}
 	return nil
-}
-
-// drainSuppress non-blockingly takes one waiting blackhole command, if any,
-// and acknowledges it. It reports whether it did, so a caller can fold the
-// result into the pump's own "suppressed" state.
-func (session *Session) drainSuppress() bool {
-	select {
-	case acknowledge := <-session.suppress:
-		acknowledge <- session.suppressionAcknowledgement()
-		return true
-	default:
-		return false
-	}
 }
 
 // heartbeatReplyWait reserves a small part of the helper's advertised timeout
@@ -615,6 +608,9 @@ func (session *Session) heartbeatPump() {
 	}
 }
 
+// flushHeartbeat is a synchronous test helper for sessions opened with
+// disableHeartbeatPump. controlMu only serializes these calls; it cannot
+// protect them from the production pump's pipelined control I/O.
 func (session *Session) flushHeartbeat(ctx context.Context) error {
 	session.controlMu.Lock()
 	defer session.controlMu.Unlock()

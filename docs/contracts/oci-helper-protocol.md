@@ -254,6 +254,13 @@ this contract in the same commit as the wire implementation.
 
 The acquisition connection remains the control connection. Strictly increasing
 heartbeats refresh a deadline measured only from the helper's monotonic clock.
+The helper must read, apply, and write each heartbeat reply on one goroutine,
+in request order, finishing that write before reading the next heartbeat. It
+must never send unrequested frames on the admitted control stream.
+`HeartbeatResponse` carries no sequence number: these helper-side duties are
+what let the client match pipelined replies to their renewal batches in FIFO
+order. Concurrent processing, reordered writes, or unsolicited control frames
+would break that attribution.
 Control EOF invalidates the session immediately, while an open but blackholed
 connection is invalidated when that deadline expires. Invalid version,
 capability, sequence, or deadman content on the control stream also invalidates
@@ -660,7 +667,18 @@ flush from its remaining monotonic lifetime. An expiry reached before flush is
 dropped. Terminal authority or reap closes the gate; a late flush is
 a no-op, and a replacement helper generation drops the renewal with typed
 evidence rather than targeting the replacement session.
-Receipt sets an absolute deadline from the helper's monotonic clock.
+Applying a renewal sets an absolute deadline from the helper's monotonic clock,
+using the TTL calculated at client send time. Local queue time reduces that
+TTL, but transport and helper-side delay between send and apply shift the
+helper deadline past the agent's L1-derived expiry by that delay. For a reply
+accepted within the client's wait budget, this overshoot is at most
+`HeartbeatTimeout - min(100 ms, HeartbeatTimeout / 10)`: about 2.9 s with the
+default 3 s timeout, previously about 1 s. A missing or late reply instead
+loses the session and triggers session reap; the reply budget is not a hard
+wall-clock bound on process scheduling or completion of that reap. L1's first
+lease-loss requeue backoff (`prestartRetryDelay` in `l1/restart_policy.go`) is
+about 1 s before jitter and increases on repeated losses, so the first backoff
+does not by itself exclude overlap with the old helper deadline.
 Timer wakeups re-read that deadline before expiring authority, so a superseded
 timer cannot reap a renewed attempt. A missing renewal reaps that attempt even
 while session heartbeats continue.
@@ -2059,8 +2077,9 @@ cadence (default `HeartbeatTimeout / 3`) while an earlier reply is outstanding,
 and a queued attempt renewal wakes the sender immediately. Replies are consumed
 in FIFO order and attempt refusals are validated against the exact renewal
 batch in the corresponding send. Successfully written evidence is removed
-only if no newer renewal replaced it; the TTL still derives from absolute L1
-expiry at each send. Reply delay must not postpone renewal delivery before an
+only if no newer renewal replaced it; the wire TTL derives from absolute L1
+expiry at each send, with the send-to-apply overshoot described under Attempt
+authority and deadmen. Reply delay must not postpone renewal delivery before an
 attempt's deadman. Acceptance heartbeat suppression stops new sends and waits
 for all outstanding replies before acknowledging its open, unread stream fence.
 
