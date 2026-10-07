@@ -665,7 +665,14 @@ return `unauthorized`.
 Computer submission idempotency binds the stable principal (`ComputerID`) and
 normalized request only. Attempt, grant, Storage, intent, and L3 authority
 generations remain commit-time fences, not request identity, so replay after a
-re-mint returns the original Run while another Computer conflicts.
+re-mint returns the original Run. Idempotency keys are scoped per actor
+(`computer:<id>` for a Computer), so another Computer using the same key gets
+its own Run rather than a conflict.
+
+The per-actor idempotency upgrade rebuilds the L3 `runs` table once at startup
+and is forward-only: an older L3 binary still opens a migrated ledger and
+replays existing runs, but every new run creation fails with an internal error
+until L3 is upgraded again. Nothing is corrupted.
 
 ## Run mailbox
 
