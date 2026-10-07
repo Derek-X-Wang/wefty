@@ -448,7 +448,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(intent_revision >= 0),
   intent_reason TEXT NOT NULL DEFAULT '',
   intent_updated_at INTEGER,
-  intent_actor TEXT NOT NULL DEFAULT ''
+  intent_actor TEXT NOT NULL DEFAULT '',
+  last_condition_json BLOB
 );
 CREATE TABLE IF NOT EXISTS node_tags (
   node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -1174,6 +1175,12 @@ DROP TABLE IF EXISTS job_log_jsonl;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "nodes", "last_condition_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.initializeJobListing(ctx); err != nil {
+		return err
 	}
 	if err := s.seedLogContinuity(ctx); err != nil {
 		return err
@@ -2531,7 +2538,12 @@ func (s *Store) ListJobAttempts(ctx context.Context, jobID string) ([]Attempt, e
 
 // ListNodes returns the operator-visible fleet in stable node ID order.
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT node_id FROM nodes ORDER BY node_id")
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, internalError(err, "begin node listing")
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, "SELECT node_id FROM nodes ORDER BY node_id")
 	if err != nil {
 		return nil, internalError(err, "list node IDs")
 	}
@@ -2551,11 +2563,14 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 
 	nodes := make([]Node, 0, len(nodeIDs))
 	for _, nodeID := range nodeIDs {
-		node, err := getNode(ctx, s.db, nodeID)
+		node, err := getNode(ctx, tx, nodeID)
 		if err != nil {
 			return nil, internalError(err, "read listed node")
 		}
 		nodes = append(nodes, node)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, internalError(err, "commit node listing")
 	}
 	return nodes, nil
 }
@@ -2701,6 +2716,34 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 			return Node{}, internalError(err, "store node tag")
 		}
 	}
+	code, scope := "node_registered", "node_session"
+	details := map[string]any{"boot_session_id": registration.BootSessionID}
+	if errors.Is(readErr, sql.ErrNoRows) {
+		details["claims_enabled"] = operatorExpected
+	}
+	notable := errors.Is(readErr, sql.ErrNoRows) || storedBoot != registration.BootSessionID
+	if storedState != contract.NodeAlive && storedState != contract.NodeDraining && readErr == nil {
+		code, scope = "node_alive", "node_liveness"
+		details = nil
+		notable = true
+	}
+	if replaceCapabilities {
+		capabilityCode := string(incoming.observation.ReasonCode)
+		changed := incoming.observation.ReasonCode != storedReason || !bytes.Equal(storedMissingJSON, incoming.missingJSON) || storedBoot != registration.BootSessionID
+		if capabilityCode == "" && storedReason != "" {
+			capabilityCode = "node_capability_recovered"
+		}
+		if capabilityCode != "" && changed {
+			code, scope = capabilityCode, "node_capability"
+			details = map[string]any{"missing_capabilities": incoming.observation.MissingCapabilities, "capability_revision": incoming.observation.Revision}
+			notable = true
+		}
+	}
+	if notable {
+		if err := recordNodeCondition(ctx, tx, registration.NodeID, code, scope, now, details); err != nil {
+			return Node{}, internalError(err, "record node registration condition")
+		}
+	}
 	node, err := getNode(ctx, tx, registration.NodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read registered node")
@@ -2801,6 +2844,24 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	}
 	if err != nil {
 		return Node{}, internalError(err, "update node heartbeat")
+	}
+	if state != storedState {
+		if err := recordNodeCondition(ctx, tx, nodeID, "node_"+string(state), "node_liveness", now, nil); err != nil {
+			return Node{}, internalError(err, "record heartbeat liveness condition")
+		}
+	}
+	if replaceCapabilities && (incoming.observation.ReasonCode != storedReason || !bytes.Equal(storedMissingJSON, incoming.missingJSON)) {
+		code := string(incoming.observation.ReasonCode)
+		if code == "" && storedReason != "" {
+			code = "node_capability_recovered"
+		}
+		if code != "" {
+			if err := recordNodeCondition(ctx, tx, nodeID, code, "node_capability", now, map[string]any{
+				"missing_capabilities": incoming.observation.MissingCapabilities, "capability_revision": incoming.observation.Revision,
+			}); err != nil {
+				return Node{}, internalError(err, "record heartbeat capability condition")
+			}
+		}
 	}
 	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {
@@ -4891,17 +4952,17 @@ type nodeQueryer interface {
 
 func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var node Node
-	var capabilitiesJSON, missingCapabilitiesJSON []byte
+	var capabilitiesJSON, missingCapabilitiesJSON, conditionData []byte
 	var heartbeatNS, capabilityObservedNS int64
 	var intentUpdatedNS sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json,
 	capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, state, max_oneshot_slots, max_service_slots,
-	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns
+	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, last_condition_json
 	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.ConnectHost, &node.RootInstanceID, &node.OS, &node.Architecture,
 		&node.AgentVersion, &capabilitiesJSON, &node.CapabilityRevision, &capabilityObservedNS, &missingCapabilitiesJSON,
 		&node.CapabilityReasonCode, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
 		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
-		&node.IntentActor, &heartbeatNS)
+		&node.IntentActor, &heartbeatNS, &conditionData)
 	if err != nil {
 		return Node{}, err
 	}
@@ -4952,6 +5013,33 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 		nodeID, contract.JobQueued, contract.ServiceDesiredRunning, contract.JobClaimed, contract.JobRunning,
 		contract.JobStopping, contract.JobRemovalPending, contract.JobAgentCleaned,
 	).Scan(&node.OneshotOccupancy, &node.ServiceOccupancy); err != nil {
+		return Node{}, err
+	}
+	if len(conditionData) > 0 {
+		if err := json.Unmarshal(conditionData, &node.LastCondition); err != nil {
+			return Node{}, err
+		}
+	}
+	node.ActiveAttempts = make([]NodeActiveAttempt, 0)
+	attempts, err := q.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.boot_session_id, json_extract(CAST(j.spec_json AS TEXT),'$.kind'),
+		json_extract(CAST(j.spec_json AS TEXT),'$.class'), a.state, a.lease_expires_ns
+		FROM attempts a JOIN jobs j ON j.job_id=a.job_id
+		WHERE a.node_id=? AND a.state IN (?, ?, ?) ORDER BY a.created_ns, a.attempt_id`, nodeID,
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput)
+	if err != nil {
+		return Node{}, err
+	}
+	defer attempts.Close()
+	for attempts.Next() {
+		var attempt NodeActiveAttempt
+		var leaseNS int64
+		if err := attempts.Scan(&attempt.JobID, &attempt.AttemptID, &attempt.BootSessionID, &attempt.Kind, &attempt.Class, &attempt.State, &leaseNS); err != nil {
+			return Node{}, err
+		}
+		attempt.LeaseExpiresAt = time.Unix(0, leaseNS).UTC()
+		node.ActiveAttempts = append(node.ActiveAttempts, attempt)
+	}
+	if err := attempts.Err(); err != nil {
 		return Node{}, err
 	}
 	node.Overcommitted = node.OneshotOccupancy > node.MaxOneshotSlots || node.ServiceOccupancy > node.MaxServiceSlots

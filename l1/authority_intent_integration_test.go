@@ -199,7 +199,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		status, _, body = h.do(operator, http.MethodPost, "/v1/nodes/live-node/claims", NodeIntentRequest{
 			ClaimsEnabled: true, IntentRevision: 0, Reason: "stale operator view",
 		})
-		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorStaleIntentRevision)
 		renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", liveJob.JobID, liveClaim.Lease.AttemptID)
 		status, _, body = h.do(liveAgent, http.MethodPost, renewPath, RenewalRequest{FencingToken: liveClaim.Lease.FencingToken})
 		if status != http.StatusOK {

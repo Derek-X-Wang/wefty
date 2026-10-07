@@ -95,7 +95,7 @@ func assertNodeCLIIntentAndCapacity(t *testing.T) {
 		"--claims-enabled=true", "--intent-revision=0", "--reason", "stale enable",
 	}, &conflictOut, &conflictErr)
 	var responseError *apiResponseError
-	if !errors.As(err, &responseError) || responseError.APIError.Code != contract.ErrorConflict {
+	if !errors.As(err, &responseError) || responseError.APIError.Code != contract.ErrorStaleIntentRevision {
 		t.Fatalf("stale intent mutation = %v, want typed conflict", err)
 	}
 

@@ -12,7 +12,7 @@
       "post": {
         "operationId": "registerNode",
         "summary": "Register a stable node and per-boot session",
-        "description": "The request cannot self-report tags. The response includes authoritative tags derived from Fabric identity and operator configuration.",
+        "description": "The request cannot self-report tags. The response includes authoritative tags derived from Fabric identity and operator configuration. Node actions are evaluated for this authenticated caller: agent-only principals receive principal_forbidden for the client operator verbs.",
         "requestBody": {
           "required": true,
           "content": {
@@ -44,7 +44,7 @@
       "post": {
         "operationId": "heartbeatNode",
         "summary": "Update liveness and capabilities, then receive node-scoped directives",
-        "description": "Boot-session-scoped and never attempt-authority-generation-fenced. Capability replacement, liveness, and effective capacity commit atomically without changing durable claim intent. The response carries claim intent, effective class capacities, and pending removal directives even when the node owns no attempt.",
+        "description": "Boot-session-scoped and never attempt-authority-generation-fenced. Capability replacement, liveness, and effective capacity commit atomically without changing durable claim intent. The response carries claim intent, effective class capacities, and pending removal directives even when the node owns no attempt. allowed_actions is evaluated for this authenticated caller, and agent-only principals are refused for the client operator verbs.",
         "requestBody": {
           "required": true,
           "content": {
@@ -149,7 +149,7 @@
       "post": {
         "operationId": "drainNode",
         "summary": "Drain this agent boot session for graceful shutdown",
-        "description": "Changes boot-session liveness to draining without mutating durable operator claim intent or fencing existing attempts. Fenced attempt completions continue through the ordinary completion route.",
+        "description": "Changes boot-session liveness to draining without mutating durable operator claim intent or fencing existing attempts. Fenced attempt completions continue through the ordinary completion route. The returned Node evaluates allowed_actions for this authenticated caller, refusing client operator verbs for agent-only principals.",
         "requestBody": {
           "required": true,
           "content": {

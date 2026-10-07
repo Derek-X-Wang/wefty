@@ -95,60 +95,7 @@ func decodeServiceJobCursor(value string) (serviceJobCursor, error) {
 // remain addressable by exact tombstone ID but no longer belong to the active
 // collection.
 func (s *Store) ListServiceJobs(ctx context.Context, cursorValue string, limit int) (JobList, error) {
-	if limit < 1 || limit > MaxJobPageLimit {
-		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxJobPageLimit)
-	}
-	cursor, err := decodeServiceJobCursor(cursorValue)
-	if err != nil {
-		return JobList{}, err
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT jobs.job_id, jobs.created_ns
-		FROM jobs JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-		LEFT JOIN computer_job_projections ON computer_job_projections.job_id=jobs.job_id
-		WHERE (jobs.created_ns>? OR (jobs.created_ns=? AND jobs.job_id>?))
-			AND (computer_job_projections.job_id IS NULL OR computer_job_projections.current=1)
-		ORDER BY jobs.created_ns, jobs.job_id LIMIT ?`, cursor.CreatedNS, cursor.CreatedNS, cursor.JobID, limit+1)
-	if err != nil {
-		return JobList{}, internalError(err, "list service job IDs")
-	}
-	defer rows.Close()
-	type listedID struct {
-		jobID     string
-		createdNS int64
-	}
-	listed := make([]listedID, 0, limit+1)
-	for rows.Next() {
-		var item listedID
-		if err := rows.Scan(&item.jobID, &item.createdNS); err != nil {
-			return JobList{}, internalError(err, "scan service job ID")
-		}
-		listed = append(listed, item)
-	}
-	if err := rows.Err(); err != nil {
-		return JobList{}, internalError(err, "iterate service job IDs")
-	}
-
-	page := JobList{Jobs: []Job{}}
-	hasMore := len(listed) > limit
-	if hasMore {
-		listed = listed[:limit]
-	}
-	for _, item := range listed {
-		job, err := s.GetJob(ctx, item.jobID)
-		if err != nil {
-			return JobList{}, err
-		}
-		job, err = s.projectServiceJob(ctx, job)
-		if err != nil {
-			return JobList{}, err
-		}
-		page.Jobs = append(page.Jobs, job)
-	}
-	if hasMore && len(listed) > 0 {
-		last := listed[len(listed)-1]
-		page.NextCursor = encodeServiceJobCursor(serviceJobCursor{CreatedNS: last.createdNS, JobID: last.jobID})
-	}
-	return page, nil
+	return s.listReadableJobs(ctx, jobListFilters{Class: contract.JobClassService}, cursorValue, limit)
 }
 
 func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desired contract.ServiceDesiredState) (Job, error) {

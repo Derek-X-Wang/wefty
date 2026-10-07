@@ -697,7 +697,6 @@ func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 		method   string
 		required bool
 	}{
-		{path: "/v1/jobs", method: "get", required: true},
 		{path: "/v1/jobs/{job_id}/desired-state", method: "put", required: true},
 		{path: "/v1/jobs/{job_id}/restart", method: "post", required: true},
 		{path: "/v1/jobs/{job_id}/remove", method: "post", required: true},
@@ -883,6 +882,7 @@ func TestL1PublishesAttemptCredentialSurface(t *testing.T) {
 	paths := object(t, client["paths"], "paths")
 	for _, published := range []struct{ path, method string }{
 		{"/v1/jobs", "post"},
+		{"/v1/jobs", "get"},
 		{"/v1/jobs/{job_id}", "get"},
 		{"/v1/jobs/{job_id}/children", "get"},
 	} {
@@ -906,7 +906,6 @@ func TestL1PublishesAttemptCredentialSurface(t *testing.T) {
 	}
 	// Every other job route stays unreachable in-job.
 	for _, closed := range []struct{ path, method string }{
-		{"/v1/jobs", "get"},
 		{"/v1/jobs/{job_id}/logs", "get"},
 		{"/v1/jobs/{job_id}/remove", "post"},
 		{"/v1/jobs/{job_id}/restart", "post"},
@@ -916,7 +915,7 @@ func TestL1PublishesAttemptCredentialSurface(t *testing.T) {
 		name := closed.method + " " + closed.path
 		operation := object(t, object(t, paths[closed.path], closed.path)[closed.method], name)
 		if _, scoped := operation["security"]; scoped {
-			t.Errorf("%s publishes its own security requirement; only the three in-job routes may", name)
+			t.Errorf("%s publishes its own security requirement; only the in-job routes may", name)
 		}
 	}
 

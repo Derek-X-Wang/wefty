@@ -5,6 +5,53 @@ the attempt-credential contract delivered to every one-shot attempt. The
 variable names below are stable API surface; clients must not invent aliases or
 depend on additional variables.
 
+## Operator submit and rerun retries
+
+`wefty submit` derives its default L3 `Idempotency-Key` from the complete
+request: the program content or reference, params, routing tags, run limits,
+envelope schema and requirement, dispatch authority, parent run, and all image
+program fields (including argv, working directory, mounts, resource limits,
+and runtime handler). Script paths and JSON file paths are local input sources;
+their contents participate, not their filenames. JSON objects are recursively
+key-sorted, with untyped numeric values normalized as L3 normalizes them
+(for example, `1`, `1.0` and `1e0` agree). Typed image resource integers retain
+their exact values. Routing tags are trimmed, lowercased, deduplicated and sorted;
+ordered program vectors such as argv retain their order. The key has the form
+`wefty-cli-submit-v1-<sha256>` and includes every field of the request rather
+than a selected subset. Any future request field must participate as well.
+
+`wefty rerun RUN_ID` derives `wefty-cli-rerun-v1-<sha256>` from the source run
+ID. The current rerun protocol accepts no overrides; all program fields and
+inputs come from the stored immutable snapshot. Any future overrides must join
+that canonical request. Derived submit and rerun keys have distinct operation
+prefixes; explicit keys share the actor's namespace across both operations.
+
+Matching requests replay the same run permanently, with no expiry or time
+window. **Mutable references are hashed by name, not their current contents.**
+For example, `submit --image reg/app:latest` after pushing a new `latest` still
+replays the old run. Pin images by digest (`reg/app@sha256:...`) or use `--again`
+to deliberately submit the current tag. The same rule applies to saved Workflow
+references to the latest version: pin `workflow://<id>/vN` or use `--again`
+after updating the Workflow.
+
+`--again` generates a fresh random key for each invocation and creates a new
+run. An explicit `--idempotency-key KEY` overrides both derivation and `--again`;
+reusing it with changed inputs retains L3's `idempotency_conflict` refusal.
+L3 scopes all idempotency keys, including explicit keys, to the authenticated
+actor: uniqueness and replay lookup use `(actor, key)`. Two actors sending the
+same submit or rerun request create independent runs; neither can reserve the
+other's key or replay the other's run. Within one actor's namespace, reusing a
+key for a different request returns `idempotency_conflict`. Existing ledgers
+retain each key under the actor recorded in immutable trigger provenance.
+
+L3 already distinguishes these outcomes: creation is HTTP 201, and replay is
+HTTP 200 with `Idempotent-Replay: true`. Both return the existing `RunAccepted`
+shape. The CLI preserves the run ID and URLs, adds `idempotent_replay` (always
+`true` or `false`) to submit/rerun JSON, and adds a `RESULT` table column with
+`created` or `replayed`. These describe the request outcome, not execution state.
+
+## Attempt environment
+
 | Variable | Visibility | Value |
 | --- | --- | --- |
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
@@ -203,9 +250,62 @@ at `/wefty/service`; Computers additionally receive read-only
 after normalization: it may not equal a target, contain it, or be contained by
 it.
 
+## Job collection listing
+
+`GET /v1/jobs` (also `/v1/jobs/`) returns every ordinary persisted Job a client
+principal may read, including one-shots and services. An attempt credential
+returns only its own Job and that Job's immediate children, using the same
+read scope as the individual Job route. It is authenticated against its live
+attempt and holding node on every page; a cursor never grants authority.
+Removed service tombstones and retired Computer Job projections are exact-ID
+resources, outside every collection filter. Only current Computer projections
+appear, so the one-shot and service sets together equal the unfiltered set.
+
+The optional filters intersect, with exact case-sensitive comparison:
+
+| Query | Meaning |
+| --- | --- |
+| `class=one-shot` or `class=service` | Workload lifecycle class. Omission selects both. |
+| `kind=KIND` | Workload isolation kind; an open vocabulary. |
+| `state=STATE` | Persisted Job state, not a derived status such as `restart-pending` or `unschedulable`. |
+| `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. If that identity is empty, the request returns `400 invalid_request`. |
+| `limit=N` | Page size, default 100, range 1–1000. |
+| `cursor=CURSOR` | Opaque continuation from `next_cursor`; absent on the final page. |
+
+The response is `{jobs: [...], next_cursor?: string}` and uses the same redacted
+Job projection as other client reads. Filters and authorization are applied
+before the page limit. Invalid selectors, duplicate query parameters, a
+malformed cursor, or a cursor reused with different filters or attempt scope
+return `400 invalid_request`. Kind is open; an unknown kind returns an empty
+page. Explicit empty `limit` and `cursor` retain their default/first-page meaning.
+
+Pages retain ascending creation-time/Job-ID order. The first page establishes
+an insertion watermark carried in the opaque cursor. Inserts after that page
+are excluded from the rest of the walk, even with equal or earlier creation
+timestamps; start a fresh walk to see them. Existing rows are neither skipped
+nor repeated because of concurrent inserts. Limit may change between pages,
+but filters and scope must stay the same. This bounds insertion membership,
+not mutable state: state changes and removals remain live between requests.
+
+`class=service` retains the active service collection, current Computer
+projection selection, service status projection, ordering and page-size
+semantics. Previously issued service cursors are accepted for the unfiltered
+service query; their insertion watermark is established when first resumed.
+The class selector on individual Job reads and service mutations is unchanged.
+
+`wefty jobs list` exposes `--class`, `--kind`, `--state`, `--submitter me`,
+`--cursor`, and `--limit`, with global `--json`. Each invocation returns one
+page. JSON preserves the API's `jobs` and `next_cursor`; table output shows
+Job ID, class, kind, state, status and originating submitter, followed by the
+next cursor when present. It works with only `--l1` configured. The existing
+`wefty services list` command keeps its service-specific output. `jobs` uses
+typed exits: usage or `invalid_request` is 2, unauthorized/forbidden is 3, and
+other failures use the existing typed command map; `--json` errors preserve
+the shared error shape for API and local usage refusals.
+
 ## Attempt-credential authentication and scope
 
-`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/children`, and
+`POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/children`, and
 `POST /v1/jobs/{job_id}/cancel` (for the parent's own children) accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
 `WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
 attempt and stores only its SHA-256 digest.
@@ -220,10 +320,12 @@ to the workload. Withholding it removes only the workload's copy.
 The credential authorizes exactly
 four things: submitting a child job, reading its own job, listing and
 reading that job's children, and canceling a queued one-shot or active process or OCI one-shot child. No other
-route accepts it, so no operator-level action is reachable with it; the service collection read `GET /v1/jobs` is
-refused with `principal_forbidden` like every other job route.
+route accepts it, so no operator-level action is reachable with it. Collection
+reads (`GET /v1/jobs`) apply the same own-job and immediate-child read scope
+before filtering and paging. Siblings, ancestors and grandchildren stay outside
+that scope, even when their originating submitter is the same.
 
-Reads follow the ordinary class-selector rule rather than a credential-specific
+Individual job reads follow the ordinary class-selector rule rather than a credential-specific
 one: `class=service` is required when the target is a service job and must be
 absent when it is a one-shot, exactly as for a client principal. A job that is
 neither the credential's own nor one of its children receives `forbidden`, and
@@ -579,6 +681,44 @@ authority-generation loss performs explicit audited revocation. The agent may
 re-mint a fresh pass for the same live attempt after a policy change or bounded
 transient failure.
 
+### General Run listing
+
+`GET /v1/runs` without `origin` lists all Runs visible to an authenticated
+L3 caller, newest first (`created_ns`, then `run_id`, both descending). Each
+page contains `runs` (summaries) and optional `next_cursor`, present only when
+another matching row exists. `limit` defaults to 50 and accepts 1–500; there
+is no total walk limit. `status` selects exactly one Run state.
+`submitter=me` selects exactly the immutable `run_triggers.actor` recorded at
+submission, using the same caller actor derivation as submit/rerun: Fabric
+user ID when present, otherwise node ID. It is not origin or lineage membership;
+children submitted as `run:<parent-id>` are not submissions by that parent's
+operator. Other submitter values are `invalid_request`.
+
+Cursors use the Computer-origin listing's opaque base64url JSON encoding and
+creation-time/Run-ID keyset semantics, with the general listing's descending
+order. A continuation selects rows strictly older than its position; concurrent
+newer inserts do not shift, skip, or repeat the pre-existing rows. Runs with
+identical creation timestamps are ordered by Run ID. This is not a status
+snapshot: status filters are evaluated on each request. Restart without a cursor
+to observe newer submissions. A cursor is bound to the exact status and resolved
+submitting actor filter. Changing those filters or mixing general and origin
+cursors returns `invalid_request`; changing `limit` is permitted.
+
+Run tokens cannot enumerate the general listing, including with `submitter=me`.
+Computer passes continue to require `origin=computer:self` and their existing
+Storage-generation scope. General listing filters do not widen either read
+scope. `status` and `submitter` are refused with `origin`; `include_descendants`
+is for origin listings only. Duplicate and unknown query parameters are refused.
+
+`wefty runs list` exposes `--status`, `--mine` (`submitter=me`), `--limit`, and
+`--cursor`. `--all` walks every remaining page (starting from `--cursor` when
+supplied), in order, and emits one combined result with no continuation cursor.
+`--json` preserves the page shape and optional `next_cursor`; human output
+prints `next_cursor: <opaque value>` when more rows remain. Existing origin
+listings also support `--all`, retaining their ordering and filters.
+
+### Computer pass Run scope
+
 The pass may create only root Runs. L3 derives immutable `computer` trigger
 provenance (`computer_id`, `computer_attempt_id`,
 `computer_storage_generation`, and `submit_intent_revision`); callers cannot
@@ -618,7 +758,14 @@ return `unauthorized`.
 Computer submission idempotency binds the stable principal (`ComputerID`) and
 normalized request only. Attempt, grant, Storage, intent, and L3 authority
 generations remain commit-time fences, not request identity, so replay after a
-re-mint returns the original Run while another Computer conflicts.
+re-mint returns the original Run. Idempotency keys are scoped per actor
+(`computer:<id>` for a Computer), so another Computer using the same key gets
+its own Run rather than a conflict.
+
+The per-actor idempotency upgrade rebuilds the L3 `runs` table once at startup
+and is forward-only: an older L3 binary still opens a migrated ledger and
+replays existing runs, but every new run creation fails with an internal error
+until L3 is upgraded again. Nothing is corrupted.
 
 ## Run mailbox
 

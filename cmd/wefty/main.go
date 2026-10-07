@@ -45,8 +45,15 @@ func commandExitCodeForArgs(err error, args []string) int {
 var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
 
 func isTypedExitCLIArgs(args []string) bool {
+	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
+		len(commandArgs) >= 1 && commandArgs[0] == "jobs" {
+		return true
+	}
 	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
 	// the service creation exit contract.
+	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil && len(commandArgs) > 0 && (commandArgs[0] == "drain" || commandArgs[0] == "nodes") {
+		return true
+	}
 	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
 		len(commandArgs) >= 2 && commandArgs[0] == "services" && commandArgs[1] == "create" {
 		return true
@@ -443,8 +450,11 @@ Commands:
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
     [--reference REFERENCE]  Name an archive whose export named no artifact
-  nodes list                 List node reachability, eligibility, and capacity
+  nodes list                 List node facts and legal operator actions
+  nodes inspect NODE_ID      Read one node and its resident attempts
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
+  jobs list                  List readable jobs with filters and cursor paging
+    [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]
@@ -473,11 +483,18 @@ Commands:
                              Clone one Backup into a new stopped Computer with no grants
   services custody <verb>    Export, import, or attest external storage custody
     export|import|attest
-  runs list [--status STATUS --limit LIMIT]
-                             List the most recent Runs, newest first
+  runs list [--status STATUS] [--mine] [--limit LIMIT] [--cursor CURSOR] [--all]
+                             List Runs, newest first; --all walks every remaining page
     --origin computer:ID     List Runs by immutable Computer origin instead
-  submit                     Submit a saved Workflow or an inline-script/image run
-  rerun RUN_ID               Create a new run from a stored snapshot
+  submit [--again] [--idempotency-key KEY]
+                             Submit a saved Workflow or an inline-script/image run
+  rerun RUN_ID [--again] [--idempotency-key KEY]
+                             Rerun a stored snapshot
+  Same actor + submit/rerun request permanently replays its run. --again creates
+  fresh work; an explicit --idempotency-key wins, scoped per authenticated actor.
+  Output distinguishes created/replayed. Mutable references hash by name:
+  pushing a new reg/app:latest still replays the old run. Pin images by digest
+  (reg/app@sha256:...) or use --again; pin Workflow versions or use --again too.
   logs RUN_ID [--follow]     Read or follow run logs
   cancel JOB_ID|RUN_ID       Cancel a run or one-shot job
   wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout
@@ -485,7 +502,7 @@ Commands:
                              Read the result document the run uploaded
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
-  drain NODE_ID              Disable new claims using the current intent revision
+  drain NODE_ID              Disable new claims [--revision REV] [--reason REASON]
   run <envelope|step|gate|result|params>
                              Report from inside a running job by writing run
                              mailbox events; needs no credential and no cluster

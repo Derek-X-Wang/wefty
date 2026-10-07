@@ -454,7 +454,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	for name, values := range query {
 		switch name {
-		case "origin", "include_descendants", "limit", "cursor", "status":
+		case "origin", "include_descendants", "limit", "cursor", "status", "submitter":
 			if len(values) != 1 {
 				writeError(w, protocolError(contract.ErrorInvalidRequest, "%s must be supplied at most once", name))
 				return
@@ -483,6 +483,10 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	if _, present := query["status"]; present {
 		writeError(w, protocolError(contract.ErrorInvalidRequest,
 			"status applies to the general listing; an origin listing is not filtered by state"))
+		return
+	}
+	if _, present := query["submitter"]; present {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "submitter applies to the general Run listing"))
 		return
 	}
 	includeDescendants := false
@@ -614,7 +618,18 @@ func (s *Server) listRecentRuns(w http.ResponseWriter, r *http.Request, query ur
 			"Computer tokens list their own Runs with origin=computer:self"))
 		return
 	}
-	filter := RunListFilter{Status: contract.RunState(strings.TrimSpace(query.Get("status")))}
+	filter := RunListFilter{Status: contract.RunState(strings.TrimSpace(query.Get("status"))), Cursor: query.Get("cursor")}
+	if values, present := query["submitter"]; present {
+		if values[0] != "me" {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "submitter must be me"))
+			return
+		}
+		filter.Submitter = actorFromIdentity(identityFromRequest(r))
+		if strings.TrimSpace(filter.Submitter) == "" {
+			writeError(w, protocolError(contract.ErrorUnauthorized, "authenticated submitting actor is required"))
+			return
+		}
+	}
 	if value := query.Get("limit"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1 || parsed > MaxRunListLimit {
@@ -627,13 +642,6 @@ func (s *Server) listRecentRuns(w http.ResponseWriter, r *http.Request, query ur
 	if value := query.Get("include_descendants"); value != "" {
 		writeError(w, protocolError(contract.ErrorInvalidRequest,
 			"include_descendants applies to an origin listing"))
-		return
-	}
-	if value := query.Get("cursor"); value != "" {
-		// Saying so is better than ignoring it: a caller that sent a cursor
-		// believes this listing pages, and it does not.
-		writeError(w, protocolError(contract.ErrorInvalidRequest,
-			"the general Run listing is not paged; narrow it with status and limit"))
 		return
 	}
 	page, err := s.store.ListRuns(r.Context(), filter)

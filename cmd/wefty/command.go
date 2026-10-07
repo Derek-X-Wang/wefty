@@ -41,6 +41,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeAdmins(ctx, clients, jsonOutput, args[1:], stdout)
 	case "nodes":
 		return executeNodes(ctx, clients, jsonOutput, args[1:], stdout)
+	case "jobs":
+		return executeJobs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "services":
 		return executeServices(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "runs":
@@ -349,10 +351,20 @@ func executeNodes(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 		}
 		return writeNodesTable(stdout, result.Nodes)
 	}
+	if len(args) == 2 && args[0] == "inspect" {
+		node, err := clients.getNode(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		if jsonOutput {
+			return writeJSON(stdout, node)
+		}
+		return writeNodesTable(stdout, []l1.Node{node})
+	}
 	if len(args) > 0 && args[0] == "set-claims" {
 		return executeSetNodeClaims(ctx, clients, jsonOutput, args[1:], stdout)
 	}
-	return usageError("usage: wefty nodes list | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
+	return usageError("usage: wefty nodes list | wefty nodes inspect NODE_ID | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
 }
 
 func executeSetNodeClaims(
@@ -372,7 +384,7 @@ func executeSetNodeClaims(
 	flags.Int64Var(&intentRevision, "intent-revision", 0, "intent revision observed in nodes list")
 	flags.StringVar(&reason, "reason", "", "operator reason recorded with the intent")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
@@ -411,13 +423,14 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	var workflowRef, scriptPath, params, paramsFile, envelopeSchema, envelopeSchemaFile, idempotencyKey string
 	var maxRuntime int
 	var maxCost float64
-	var requiredEnvelope, dispatchAuthority bool
+	var requiredEnvelope, dispatchAuthority, again bool
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var imageFlags imageFlagSet
-	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference")
+	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference (latest hashes by name: pin /vN or use --again after updating)")
 	flags.StringVar(&scriptPath, "script", "", "inline script file")
 	imageFlags.bind(flags)
+	flags.Lookup("image").Usage += "; mutable tags hash by name: pin by digest or use --again after moving a tag"
 	flags.StringVar(&params, "params", "", "params JSON object")
 	flags.StringVar(&paramsFile, "params-file", "", "file containing params JSON")
 	flags.Var(&tags, "tag", "routing tag (repeatable)")
@@ -430,7 +443,8 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	flags.BoolVar(&requiredEnvelope, "required-envelope", false, "require a valid envelope")
 	flags.BoolVar(&dispatchAuthority, "dispatch-authority", false,
 		"this run dispatches child work, so deliver the in-job credentials (default: report through the run mailbox and hold none)")
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "request idempotency key")
+	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
+	flags.BoolVar(&again, "again", false, "deliberately create a fresh run instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -488,7 +502,7 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 			Content: string(content), SHA256: hex.EncodeToString(digest[:]), Interpreter: interpreters, Mode: mode.value,
 		}
 	}
-	idempotencyKey, err = ensureIdempotencyKey(idempotencyKey)
+	idempotencyKey, err = runRequestKey("submit", request, idempotencyKey, again)
 	if err != nil {
 		return err
 	}
@@ -511,18 +525,25 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	flags := flag.NewFlagSet("rerun", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var idempotencyKey string
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "request idempotency key")
+	var again bool
+	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
+	flags.BoolVar(&again, "again", false, "deliberately create a fresh rerun instead of replaying the same request")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty rerun RUN_ID")
 	}
-	key, err := ensureIdempotencyKey(idempotencyKey)
+	sourceRunID := strings.TrimSpace(flags.Arg(0))
+	// The rerun protocol currently accepts no overrides: its entire request
+	// is the source run, whose immutable inputs are copied by L3.
+	key, err := runRequestKey("rerun", struct {
+		SourceRunID string `json:"source_run_id"`
+	}{sourceRunID}, idempotencyKey, again)
 	if err != nil {
 		return err
 	}
-	accepted, err := clients.rerun(ctx, flags.Arg(0), key)
+	accepted, err := clients.rerun(ctx, sourceRunID, key)
 	if err != nil {
 		return err
 	}
@@ -657,10 +678,29 @@ func moveFirstPositionalToEnd(args []string) []string {
 }
 
 func executeDrain(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return usageError("usage: wefty drain NODE_ID")
+	flags := flag.NewFlagSet("drain", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	revision := flags.Int64("revision", 0, "intent revision observed in nodes list or inspect")
+	reason := flags.String("reason", "operator requested drain", "operator reason recorded with the intent")
+	if err := flags.Parse(moveFirstPositionalToEnd(args)); err != nil {
+		return usageError(err.Error())
 	}
-	node, err := clients.drainNode(ctx, args[0])
+	if flags.NArg() != 1 {
+		return usageError("usage: wefty drain NODE_ID [--revision REVISION] [--reason REASON]")
+	}
+	var observedRevision *int64
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "revision" {
+			observedRevision = revision
+		}
+	})
+	if observedRevision != nil && *revision < 0 {
+		return usageError("drain requires a non-negative --revision")
+	}
+	if strings.TrimSpace(*reason) == "" {
+		return usageError("drain requires a non-empty --reason")
+	}
+	node, err := clients.drainNode(ctx, flags.Arg(0), observedRevision, strings.TrimSpace(*reason))
 	if err != nil {
 		return err
 	}

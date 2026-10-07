@@ -158,6 +158,9 @@ var driftRows = []driftRow{
 	{component(commonDoc, "ComputerStorageGrowDirective"), typeOf[l1.ComputerStorageGrowDirective]()},
 	{component(commonDoc, "ComputerReimagePreflightDirective"), typeOf[l1.ComputerReimagePreflightDirective]()},
 	{component(commonDoc, "Node"), typeOf[l1.Node]()},
+	{component(commonDoc, "AllowedAction"), typeOf[contract.AllowedAction]()},
+	{component(commonDoc, "ActionInput"), typeOf[contract.ActionInput]()},
+	{component(commonDoc, "Condition"), typeOf[contract.Condition]()},
 	{component(commonDoc, "HeartbeatResponse"), typeOf[l1.HeartbeatResponse]()},
 	{component(commonDoc, "OneShotCancelDirective"), typeOf[l1.OneShotCancelDirective]()},
 	{component(commonDoc, "JobSpec"), typeOf[contract.JobSpec]()},
@@ -220,6 +223,7 @@ var driftRows = []driftRow{
 	{requestBody(clientDoc, "post", "/v1/computers/{computer_id}/projections"), typeOf[l1.ComputerProjectionRequest]()},
 	{requestBody(clientDoc, "post", "/v1/computers/{computer_id}/remove"), typeOf[l1.ComputerRemoveRequest]()},
 	{responseBody(clientDoc, "get", "/v1/nodes", "200"), typeOf[l1.NodeList]()},
+	{responseBody(clientDoc, "get", "/v1/nodes/{node_id}", "200"), typeOf[l1.Node]()},
 	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/drain"), typeOf[l1.NodeIntentRequest]()},
 	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/claims"), typeOf[l1.NodeIntentRequest]()},
 
@@ -1015,6 +1019,9 @@ func TestNodeProjectionsValidateAgainstPublishedSchemas(t *testing.T) {
 		MaxOneshotSlots: 2, MaxServiceSlots: 1, OneshotOccupancy: 1, ServiceOccupancy: 1, Overcommitted: false,
 		AuthorityGeneration: 4, ClaimsEnabled: true, IntentRevision: 2, IntentReason: "maintenance done",
 		IntentUpdatedAt: &observed, IntentActor: "operator", LastHeartbeatAt: observed,
+		ActiveAttempts: []l1.NodeActiveAttempt{{JobID: "job-1", AttemptID: "attempt-1", BootSessionID: "boot-1", Kind: "process", Class: contract.JobClassOneShot, State: contract.AttemptRunning, LeaseExpiresAt: observed.Add(time.Minute)}},
+		LastCondition:  &contract.Condition{Code: "claims_enabled", Scope: "node_intent", Since: observed, Details: map[string]any{"reason": "maintenance done"}},
+		AllowedActions: []contract.AllowedAction{{Verb: "drain", Requires: map[string]any{"intent_revision": int64(2), "claims_enabled": false}, Inputs: []contract.ActionInput{{Name: "reason", Type: "string", Required: true}}}},
 	}
 	heartbeat := l1.HeartbeatResponse{
 		Node: node, OneShotCancelDirectives: []l1.OneShotCancelDirective{}, RemovalDirectives: []l1.RemovalDirective{}, StorageResetDirectives: []l1.ComputerStorageResetDirective{},
@@ -2654,4 +2661,28 @@ func validatorCases(t *testing.T, dir, function string, constants goConstants) m
 	}
 	t.Fatalf("validator %s.%s not found", dir, function)
 	return nil
+}
+
+func TestAllowedActionSchemaSeparatesPreconditionsAndInputs(t *testing.T) {
+	schema := compileProtocolSchema(t, "file:///api/openapi/common.v1.json#/components/schemas/AllowedAction")
+	for _, check := range []struct {
+		payload string
+		valid   bool
+	}{
+		{`{"verb":"inspect"}`, true},
+		{`{"verb":"set-claims","requires":{"intent_revision":7},"inputs":[{"name":"reason","type":"string","required":true},{"name":"claims_enabled","type":"boolean","required":true}]}`, true},
+		{`{"verb":"inspect","requires":null}`, false},
+		{`{"verb":"inspect","inputs":null}`, false},
+		{`{"verb":"set-claims","inputs":[{"name":"claims_enabled","type":"boolean"}]}`, false},
+		{`{"verb":"set-claims","inputs":[{"name":"claims_enabled","type":"true","required":true}]}`, false},
+	} {
+		instance, err := jsonschema.UnmarshalJSON(strings.NewReader(check.payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = schema.Validate(instance)
+		if (err == nil) != check.valid {
+			t.Errorf("valid=%t instance=%s error=%v", check.valid, check.payload, err)
+		}
+	}
 }
