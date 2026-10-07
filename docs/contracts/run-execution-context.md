@@ -203,9 +203,62 @@ at `/wefty/service`; Computers additionally receive read-only
 after normalization: it may not equal a target, contain it, or be contained by
 it.
 
+## Job collection listing
+
+`GET /v1/jobs` (also `/v1/jobs/`) returns every ordinary persisted Job a client
+principal may read, including one-shots and services. An attempt credential
+returns only its own Job and that Job's immediate children, using the same
+read scope as the individual Job route. It is authenticated against its live
+attempt and holding node on every page; a cursor never grants authority.
+Removed service tombstones and retired Computer Job projections are exact-ID
+resources, outside every collection filter. Only current Computer projections
+appear, so the one-shot and service sets together equal the unfiltered set.
+
+The optional filters intersect, with exact case-sensitive comparison:
+
+| Query | Meaning |
+| --- | --- |
+| `class=one-shot` or `class=service` | Workload lifecycle class. Omission selects both. |
+| `kind=KIND` | Workload isolation kind; an open vocabulary. |
+| `state=STATE` | Persisted Job state, not a derived status such as `restart-pending` or `unschedulable`. |
+| `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. If that identity is empty, the request returns `400 invalid_request`. |
+| `limit=N` | Page size, default 100, range 1–1000. |
+| `cursor=CURSOR` | Opaque continuation from `next_cursor`; absent on the final page. |
+
+The response is `{jobs: [...], next_cursor?: string}` and uses the same redacted
+Job projection as other client reads. Filters and authorization are applied
+before the page limit. Invalid selectors, duplicate query parameters, a
+malformed cursor, or a cursor reused with different filters or attempt scope
+return `400 invalid_request`. Kind is open; an unknown kind returns an empty
+page. Explicit empty `limit` and `cursor` retain their default/first-page meaning.
+
+Pages retain ascending creation-time/Job-ID order. The first page establishes
+an insertion watermark carried in the opaque cursor. Inserts after that page
+are excluded from the rest of the walk, even with equal or earlier creation
+timestamps; start a fresh walk to see them. Existing rows are neither skipped
+nor repeated because of concurrent inserts. Limit may change between pages,
+but filters and scope must stay the same. This bounds insertion membership,
+not mutable state: state changes and removals remain live between requests.
+
+`class=service` retains the active service collection, current Computer
+projection selection, service status projection, ordering and page-size
+semantics. Previously issued service cursors are accepted for the unfiltered
+service query; their insertion watermark is established when first resumed.
+The class selector on individual Job reads and service mutations is unchanged.
+
+`wefty jobs list` exposes `--class`, `--kind`, `--state`, `--submitter me`,
+`--cursor`, and `--limit`, with global `--json`. Each invocation returns one
+page. JSON preserves the API's `jobs` and `next_cursor`; table output shows
+Job ID, class, kind, state, status and originating submitter, followed by the
+next cursor when present. It works with only `--l1` configured. The existing
+`wefty services list` command keeps its service-specific output. `jobs` uses
+typed exits: usage or `invalid_request` is 2, unauthorized/forbidden is 3, and
+other failures use the existing typed command map; `--json` errors preserve
+the shared error shape for API and local usage refusals.
+
 ## Attempt-credential authentication and scope
 
-`POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/children`, and
+`POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/children`, and
 `POST /v1/jobs/{job_id}/cancel` (for the parent's own children) accept `Authorization: Bearer <WEFTY_ATTEMPT_TOKEN>` against
 `WEFTY_L1_ENDPOINT`. L1 mints the bearer once when the node agent claims the
 attempt and stores only its SHA-256 digest.
@@ -220,10 +273,12 @@ to the workload. Withholding it removes only the workload's copy.
 The credential authorizes exactly
 four things: submitting a child job, reading its own job, listing and
 reading that job's children, and canceling a queued one-shot or active process or OCI one-shot child. No other
-route accepts it, so no operator-level action is reachable with it; the service collection read `GET /v1/jobs` is
-refused with `principal_forbidden` like every other job route.
+route accepts it, so no operator-level action is reachable with it. Collection
+reads (`GET /v1/jobs`) apply the same own-job and immediate-child read scope
+before filtering and paging. Siblings, ancestors and grandchildren stay outside
+that scope, even when their originating submitter is the same.
 
-Reads follow the ordinary class-selector rule rather than a credential-specific
+Individual job reads follow the ordinary class-selector rule rather than a credential-specific
 one: `class=service` is required when the target is a service job and must be
 absent when it is a one-shot, exactly as for a client principal. A job that is
 neither the credential's own nor one of its children receives `forbidden`, and
