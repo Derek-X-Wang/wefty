@@ -1368,8 +1368,11 @@ closed as scrubbed internal errors. Client-tag authority is checked from the
 actual request identity, including custom configured tags. An attempt credential
 has no service mutation authority even if its holding node has a client tag.
 Services have no desired-state revision field or service-scoped grant/revoke
-endpoint. Active Computer-owned Jobs refuse these verbs with `computer_resource_required`;
-the Computer endpoints remain their sole lifecycle and grant authority.
+endpoint. Active and retired Computer-owned Job projections refuse these verbs
+with `computer_resource_required`. During Computer removal, `start`, `stop` and
+`restart` refuse with `not_found` because the mutable service row is absent;
+`remove` and `forget` still refuse with `computer_resource_required`. The
+Computer endpoints remain their sole lifecycle and grant authority.
 
 | Verb | Endpoint | Exact `requires` | Caller `inputs` | Enforced rules |
 | --- | --- | --- | --- | --- |
@@ -1385,6 +1388,10 @@ exact value. The server rechecks the shared actor-aware decision in the mutation
 transaction. Read projections use read-only transactions, avoiding the store's
 default immediate writer lock. State and actions share a fresh read snapshot;
 collection membership and filters retain their existing paging semantics.
+Child pages select membership, read Job rows and compute per-caller operator
+facts in one read-only transaction, so concurrent row deletion cannot break a
+selected page. For operator facts, ownership and failure evidence are read once
+per service; node capacity counts and removal roots are shared within each page snapshot.
 
 `last_condition` is the **closest existing state-machine fact**, rather than a
 new event history. It is null when no policy stop, failure or removal condition
@@ -1396,8 +1403,10 @@ is retained. It uses the shared `contract.Condition` shape:
   stop does not advance that completion time.
 - `failure_latched` or `never_automatic_restart_suppressed`, scope
   `service_restart`: the failed Job snapshot, restart streak/limit and any
-  controller failure reason. `since` is the existing Job update time; an intent
-  mutation may update that snapshot, while reads never do.
+  controller failure reason. `since` is the current attempt's recorded update
+  time, when an attempt is retained; otherwise the existing Job timestamp.
+  Unrelated Job updates, including an explicit stop, do not advance the
+  retained attempt's condition time.
 - The persisted removal state (for example `removal_pending`, `agent_cleaned`,
   `removed_verified`, `forgotten_cleanup_unverified`, or
   `stalled_cleanup_unverified`), scope `service_removal`: cleanup status, outcome,

@@ -351,7 +351,7 @@
       "get": {
         "operationId": "listChildJobs",
         "summary": "List the jobs spawned by one job",
-        "description": "Returns the jobs whose parent_job_id is this job, of either class, in stable creation/job-ID order. Children are a job-level resource: a retried parent attempt sees the children spawned by earlier attempts. An attempt credential may list only its own job's children.",
+        "description": "Returns the jobs whose parent_job_id is this job, of either class, in stable creation/job-ID order. Children are a job-level resource: a retried parent attempt sees the children spawned by earlier attempts. An attempt credential may list only its own job's children. Each page selects membership, reads Job rows and computes service allowed_actions and last_condition in one read-only snapshot, so concurrent deletion cannot break a selected page. One-shots omit those fields. Attempt credentials receive principal_forbidden for every service lifecycle action, even when the holding node also has the client tag. An unknown parent returns not_found; an existing parent with no children returns an empty page.",
         "security": [
           { "fabricIdentity": [] },
           { "fabricIdentity": [], "attemptCredential": [] }

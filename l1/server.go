@@ -871,24 +871,13 @@ func (s *Server) listChildJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parentJobID := r.PathValue("job_id")
-	// Distinguish "no children" from "no such job": an unknown parent is a
-	// 404, not an empty page.
-	if _, err := s.store.GetJob(r.Context(), parentJobID); err != nil {
-		writeError(w, err)
-		return
-	}
-	page, err := s.store.ListChildJobs(r.Context(), parentJobID, r.URL.Query().Get("cursor"), limit)
+	page, err := s.store.listChildJobsForCaller(r.Context(), parentJobID, r.URL.Query().Get("cursor"), limit, s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	for index := range page.Jobs {
-		projected, projectErr := s.projectServiceForCaller(r, page.Jobs[index])
-		if projectErr != nil {
-			writeError(w, projectErr)
-			return
-		}
-		page.Jobs[index] = redactJob(projected)
+		page.Jobs[index] = redactJob(page.Jobs[index])
 	}
 	writeJSON(w, http.StatusOK, page)
 }
